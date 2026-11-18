@@ -1,0 +1,29 @@
+# Phase 1a: two desktops on a LAN, in person only (docs/PLAN.md, "Phase 1a";
+# docs/phase1a-design.md §9).
+#
+# Owner check: `mousse-check phase1a` shows PASS in every target cell, with
+# no INCOMPLETE. Format: checks/README.md. The design's other cells join this
+# file with the slices that build their tests.
+
+phase = "phase1a"
+title = "Two desktops on a LAN (in-person only)"
+plan = "docs/PLAN.md#phase-1a-two-desktops-on-a-lan-in-person-only"
+# `local = [...]` and `control = [...]` are the inline form of [[check.local]] and [[check.control]].
+
+[[check]]
+id = "phase1a.app-channel"
+title = "Unique handles under equal wire stream ids, FIN after a stalled final write, engine admission bounds with app reads stalled, priority with bulk stalled both ways"
+plan = "docs/phase1a-design.md §2 and §10 (E1, E2)"
+targets = ["windows-x64", "macos-arm64", "linux-x64"]
+min_tests = 14
+local = [
+  { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_channel", "--test", "app_streams", "--no-fail-fast"] },
+  { target = "macos-arm64", host = "macos-aarch64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_channel", "--test", "app_streams", "--no-fail-fast"] },
+  { target = "linux-x64", host = "linux-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_channel", "--test", "app_streams", "--no-fail-fast"] },
+]
+control = [
+  { name = "read-without-credit", breaks = "the helper reads engine streams without app credit", env = { RUSTFLAGS = '--cfg mousse_control="read-without-credit"' } },
+  { name = "fifo-writer", breaks = "one FIFO writer queue for control, interactive and bulk", env = { RUSTFLAGS = '--cfg mousse_control="fifo-writer"' } },
+  { name = "fin-overtakes", breaks = "FIN is sent as a control message ahead of the stream's queued DATA", env = { RUSTFLAGS = '--cfg mousse_control="fin-overtakes"' } },
+  { name = "no-stream-cap", breaks = "the engine admits every peer stream at full initial credit", env = { RUSTFLAGS = '--cfg mousse_control="no-stream-cap"' } },
+]
