@@ -356,8 +356,12 @@ includes both identity keys.
   of 60, 120 and 240 s, then every 300 s, until the effective deadline. A
   new path whose renewal time is no later than the old one's (the peer has
   not renewed yet, for example because its clock is behind) becomes current
-  as usual but keeps the pending retries and their waits. A retry is
-  skipped while a candidate path is still being brought up. Vectors:
+  as usual but keeps the pending retries and their waits. Each wait starts
+  when its retry actually runs (a late clock tick pushes the schedule back;
+  it never fires twice to catch up). A retry that falls due while a
+  candidate path is still being brought up is skipped, but it still counts:
+  the next wait starts then and grows as if the retry had run, and the
+  skipped retry is not made up when the candidate fails. Vectors:
   `session-lifecycle.json`.
 - **Path switch:** open a new connection to the same peer, run step 1 with
   the **same pin**, reopen channels on it (the application resumes from its
@@ -417,7 +421,9 @@ After TLS completes, both sides start the mux (section 9). The **caller** is
 the TLS client and the **host** is the TLS server.
 
 1. Each side sends `HELLO` first (control message type 1), without waiting
-   for the peer's (section 2).
+   for the peer's (section 2). Message logs in the vectors
+   (`pairing-attempts.json`) leave these two out and start at the next
+   message, such as `JOIN_PROOF`.
 2. The host runs **step 2** for the peer identity from step 1, as soon as
    the connection starts and before it reads any control message from the
    caller. It sends nothing to say that it awaits a proof:
@@ -517,9 +523,10 @@ An unknown error code in `RESET` or `GOAWAY` is not a frame error; treat it as
 ### 9.2 Streams
 
 - The caller opens streams with **odd** ids starting at 1; the host with
-  **even** ids starting at 2. Each side's ids strictly increase. A peer-opened
-  id with the wrong parity, or not above the highest one seen, is
-  `PROTOCOL_ERROR`.
+  **even** ids starting at 2. Each side opens its ids in order with no gaps
+  (1, 3, 5, … and 2, 4, 6, …), so every id up to a side's highest opened id
+  was opened. A peer `OPEN` with any other id (wrong parity, repeated, lower
+  or skipping one) is `PROTOCOL_ERROR`.
 - A stream starts with `OPEN`. `DATA` may follow at once.
 - `FIN` ends one direction. `DATA` or a second `FIN` after the peer's `FIN`
   is `STREAM_CLOSED`. A stream is gone when both sides have sent `FIN`.

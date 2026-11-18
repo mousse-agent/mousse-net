@@ -93,9 +93,14 @@ command = ["cargo", "test", "-p", "mousse-net-core", "--no-fail-fast", "--lib", 
 placeholder = "core tests need a wasm32 test runner before they can run on wasm32"
 
 [[check.control]]
-name = "break-cpace"
-breaks = "CPace leaves the session id out of the generator, so the draft vectors no longer match"
-env = { RUSTFLAGS = '--cfg mousse_control="break-cpace"' }
+name = "break-cpace-confirm"
+breaks = "the CPace confirmation compare always passes, so a wrong code, channel identifier, session id or tampered message is accepted"
+env = { RUSTFLAGS = '--cfg mousse_control="break-cpace-confirm"' }
+
+[[check.control]]
+name = "break-cpace-sid"
+breaks = "CPace leaves the session id out of the generator, so the draft vectors no longer match and two sessions with the same code share a generator"
+env = { RUSTFLAGS = '--cfg mousse_control="break-cpace-sid"' }
 
 [[check]]
 id = "phase0.cpace-review"

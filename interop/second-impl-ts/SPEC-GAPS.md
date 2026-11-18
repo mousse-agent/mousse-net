@@ -12,26 +12,12 @@
 | Inputs for attempt replays | `wire.md` §10.6 and `pairing-attempts.json` conventions. The fixture supplies the ticket, draws, exporter derivation and expected wire bytes. |
 | CBOR, link and route parsing | `wire.md` §§3, 10.2 and 10.2.1. The spec defines CBOR error precedence, canonical unpadded base64url and IPv6 address equality. The route fixture gives the 16 IPv6 bytes in hex. |
 | Draft-only CPace outputs | `cpace.md` §§2 and 7. Ordered concatenation, its derived values and the CPace sid output are informative. Mousse pairing uses the initiator-responder transcript and the supplied sid. The vector runner also verifies the informative draft values. |
+| Renewal retry timing | `wire.md` §6 and `session-lifecycle.json` (`retry_while_candidate`). Each wait starts when its retry actually runs. A retry that falls due while a candidate is coming up is skipped but counts as run: the next wait starts then and doubles, and the skipped retry is not made up when the candidate fails. |
+| Attempt replay logging | `wire.md` §8 step 1 and the `pairing-attempts.json` description. `out` leaves out both HELLOs; a replay over real connections exchanges them and compares from `JOIN_PROOF`. For `submit_first`, `redeliver` and `inject`, the host's reply is recorded but not delivered. Each side keeps its own send order; on connect the joiner's sends are listed before the host's. |
 
 ## Open
 
-- **Renewal retry timing, `wire.md` §6 and `session-lifecycle.json`.**
-  The spec skips a retry while a candidate is coming up. It does not say
-  whether the skipped retry advances the backoff or when to start the
-  next wait if ticks arrive late. The implementation leaves a suppressed
-  retry due and starts the next wait at the actual retry. The fixture
-  covers a late tick and a completed switch with unchanged certificates.
-  It has no tick while a candidate is in progress.
-- **Attempt replay logging, `pairing-attempts.json` description and
-  `wire.md` §8.** The description says `out` lists every control
-  message, but the connect rows omit both mandatory `HELLO` messages.
-  The replay sends and delivers both, verifies the negotiated versions,
-  and starts its comparison with `JOIN_PROOF`. For `submit_first`,
-  `redeliver` and `inject`, the replay records the host's reply without
-  delivering it to the joiner. Only `submit` runs the exchange to
-  completion. For end-to-end connect rows, the replay reports the two
-  peers' independent sends in fixture order while preserving each
-  peer's send order.
+None.
 
 The browser Worker certificate is pending in `session-cert.json` and
 has no certificate bytes.

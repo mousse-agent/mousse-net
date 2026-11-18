@@ -69,6 +69,12 @@ fn prepend_len_size(data: &[u8]) -> usize {
 /// generator_string(G.DSI, PRS, CI, sid, H.s_in_bytes) (section 8.1, Appendix A.2).
 /// Holds the password, so it is wiped on drop.
 pub(crate) fn generator_string(prs: &[u8], ci: &[u8], sid: &[u8]) -> Zeroizing<Vec<u8>> {
+    // Must-fail control: the generator leaves the session id out.
+    #[cfg(mousse_control = "break-cpace-sid")]
+    let sid: &[u8] = {
+        let _ = sid;
+        &[]
+    };
     let len_zpad = S_IN_BYTES
         .saturating_sub(1)
         .saturating_sub(prepend_len_size(prs))

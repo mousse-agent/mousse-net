@@ -29,11 +29,11 @@ conforming implementation passes every case, including every rejection.
 | `hello.json` | 2, 11 | This build's versions and `HELLO` bytes; negotiation cases with the agreed minor version or `close:unsupported_version`; `repeated`: several `HELLO`s on one connection, where only the first counts. |
 | `ticket.json` | 10.2 | Two valid tickets with fields, binary, fragment and hash; rejections in binary and fragment form; joiner-side expiry edge. `route_hints`: hints that read as tcp or mdns routes, and hints skipped as `reserved`, `unknown_scheme` or `malformed` (10.2.1). IPv6 hosts are given as their 16 bytes, so every text form of one address gives the same value; DNS names lowercased. Fragment rejections include a length of 1 mod 4 and set unused bits. |
 | `join-proof.json` | 10.3, 10.5 | Join-proof key, input record and MAC; the binding transcript (initiator first); an attempt's session id with its input record. Exporters are fixed stand-in values. |
-| `pairing-attempts.json` | 10.6, 10.7, 10.8 | Sequences with the real code exchange: three wrong codes, a right code after a wrong one, a stale code after a new one was shown, resends (also after the joiner aborted), a different payload on a running attempt, bad first messages that still use the next code and the scalar, an attempt replayed on another connection (refused before any debit), attempts shared across routes, a dropped attempt, and two joiners racing for one in-person invitation. Each sequence lists its ticket and every party's random draws in order; each step lists every message and shown code byte for byte (`out`) and the state that must hold after it. |
+| `pairing-attempts.json` | 10.6, 10.7, 10.8 | Sequences with the real code exchange: three wrong codes, a right code after a wrong one, a stale code after a new one was shown, resends (also after the joiner aborted), a different payload on a running attempt, bad first messages that still use the next code and the scalar, an attempt replayed on another connection (refused before any debit), attempts shared across routes, a dropped attempt, and two joiners racing for one in-person invitation. Each sequence lists its ticket and every party's random draws in order; each step lists every message after the two HELLOs and every shown code byte for byte (`out`) and the state that must hold after it. |
 | `pairing-e2e.json` | 8, 10, 11 | Whole pairings between a host and joiners, replayable byte for byte from the scripted random draws (`rng`): in person, "Send link" (including a redrawn code), three wrong codes ending the invitation, the joiner's own 3-attempt limit against a fake host, tampered tickets (secret and invitation id), a proof made on another TLS session, and a lost `PAIRED` learned on the next connection (the host sends `AUTHORIZED {live}` and ignores the join proof). Every step lists what each side does: messages as control bytes and mux frames, closes, shown codes, attempt ids with their `CI` and `sid`, and the final state. |
 | `cbor.json` | 3 | Canonical CBOR that must decode and re-encode unchanged, and inputs that must be rejected with the given error, including indefinite lengths (`non_canonical`) and inputs that break several rules (the first in wire.md's order wins). |
 | `der-raw.json` | 4.2, 4.3 | DER to raw conversion and its rejections; inputs where only raw is accepted. |
-| `mux.json` | 9.1 | Frames that decode and re-encode unchanged; inputs that need more bytes or are rejected, with the reason. |
+| `mux.json` | 9.1, 9.2 | Frames that decode and re-encode unchanged; inputs that need more bytes or are rejected, with the reason; stream rules on a receiving mux (`streams`): ids opened in order with no gaps, frames on never-opened ids, frames on gone streams, `DATA` after `FIN`. |
 | `control.json` | 11 | Control messages that decode and re-encode unchanged; messages that must be rejected. |
 
 Code-exchange (CPace) vectors live in `cpace*.json` files, documented in
@@ -53,11 +53,14 @@ RUSTFLAGS='--cfg mousse_control="break-authz"' cargo test -p mousse-net-core
 | `break-session-cert` | Step 1 skips the identity-signature check. | `session_certificates` (`delegation_over_wrong_tls_key`) |
 | `break-authz` | A connection with no grant may open streams. | `authorization` (`valid_identity_without_grant_attempting_rpc`) |
 | `break-raw-signature` | DER is quietly converted where a raw signature is required. | `der_to_raw`, `session_certificates` (`identity_signature_der`) |
-| `break-cpace` | The CPace confirmation compare always passes. | `pairing_e2e_vectors`, `pairing_attempt_sequences_hold`, the CPace rejection vectors |
+| `break-cpace-confirm` | The CPace confirmation compare always passes. | `pairing_e2e_vectors`, `pairing_attempt_sequences_hold`, the CPace rejection vectors |
+| `break-cpace-sid` | The CPace generator leaves the session id out. | `generator_matches_draft_b3_1`, `session_id_changes_the_generator`, the Mousse CPace vectors |
 
 Each control runs the same tests as a normal build; at least one must fail.
-The cfg names are declared in the workspace lints. A release build with any
-control set does not compile.
+The cfg names are declared in the workspace lints. A build with any control
+set fails when debug assertions are off, and the build scripts of
+`mousse-net-core`, `mousse-net-io` and `mousse-helper` refuse the release
+profile (and any profile that inherits it) even with debug assertions on.
 
 ## Pending
 

@@ -302,8 +302,9 @@ impl PeerSession {
                     backoff: RENEW_RETRY_FIRST_SECS,
                 });
                 if now >= renewal.next_at {
-                    // Ask again later unless a new path becomes current. A
-                    // candidate still being brought up is left alone.
+                    // Ask again later unless a new path becomes current. The
+                    // next wait starts now. A candidate still being brought
+                    // up is left alone, but the skipped retry still counts.
                     let in_progress = self.candidate.is_some();
                     renewal.next_at = now.plus(renewal.backoff);
                     renewal.backoff = (renewal.backoff * 2).min(RENEW_RETRY_MAX_SECS);
