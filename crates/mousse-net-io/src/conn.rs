@@ -714,6 +714,9 @@ impl Driver {
                         }
                         Ok(n) => {
                             inbuf.extend_from_slice(&buf[..n]);
+                            // A read can win the race with a timer that is
+                            // already due: the deadlines bound what is read.
+                            self.enforce_deadlines();
                             self.process_inbound(&mut inbuf);
                         }
                         Err(e) => {
@@ -793,6 +796,22 @@ impl Driver {
             self.reason.get_or_insert(CloseReason::Local(e.code));
         }
         if !self.mux.is_closing() {
+            let mut out = Outbox::default();
+            self.role.on_wake(mono, &mut out);
+            self.apply(out);
+        }
+    }
+
+    /// Act on the deadlines that have passed before handling more traffic:
+    /// the certificate deadline, then the role's own (a proof or answer
+    /// wait), as the timer would have.
+    fn enforce_deadlines(&mut self) {
+        if self.expired() {
+            self.close(ErrorCode::CertExpired);
+            return;
+        }
+        let mono = self.clock.mono();
+        if !self.mux.is_closing() && self.role.wake_at().is_some_and(|t| t <= mono) {
             let mut out = Outbox::default();
             self.role.on_wake(mono, &mut out);
             self.apply(out);

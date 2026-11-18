@@ -63,6 +63,8 @@ pub struct ManualClock {
     mono_offset_ms: AtomicU64,
     /// A stopped wall clock, or -1.
     frozen: AtomicI64,
+    /// The monotonic time it stopped at, or `u64::MAX` while it runs.
+    mono_frozen: AtomicU64,
 }
 
 impl ManualClock {
@@ -73,7 +75,17 @@ impl ManualClock {
             offset_secs: AtomicI64::new(0),
             mono_offset_ms: AtomicU64::new(0),
             frozen: AtomicI64::new(-1),
+            mono_frozen: AtomicU64::new(u64::MAX),
         }
+    }
+
+    /// Stop the monotonic clock where it is, so it moves only by
+    /// [`ManualClock::advance_mono`]: a check at an exact millisecond.
+    pub fn freeze_mono(&self) {
+        let at = self.origin.elapsed().as_millis() as u64;
+        let _ = self
+            .mono_frozen
+            .compare_exchange(u64::MAX, at, Ordering::SeqCst, Ordering::SeqCst);
     }
 
     /// Move the monotonic clock forward by `ms` (the wall clock stays).
@@ -117,9 +129,11 @@ impl Clock for ManualClock {
     }
 
     fn mono(&self) -> Millis {
-        Millis(
-            self.origin.elapsed().as_millis() as u64 + self.mono_offset_ms.load(Ordering::SeqCst),
-        )
+        let base = match self.mono_frozen.load(Ordering::SeqCst) {
+            u64::MAX => self.origin.elapsed().as_millis() as u64,
+            frozen => frozen,
+        };
+        Millis(base + self.mono_offset_ms.load(Ordering::SeqCst))
     }
 }
 
