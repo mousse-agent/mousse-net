@@ -1,0 +1,12 @@
+[package]
+name = "mousse-net-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Mousse networking state machines: identity, pairing, grants, session, mux. No I/O; builds for wasm32."
+
+[lints]
+workspace = true
+
+[dependencies]
