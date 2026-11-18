@@ -21,11 +21,14 @@ use crate::identity::{IdentityPublicKey, RawSignature, SoftwareKey};
 use crate::mux::{Frame, PriorityClass, StreamId};
 use crate::pairing::insecure::InsecureTestExchangeFactory;
 use crate::pairing::{
-    binding_transcript, join_proof_input, join_proof_mac, AttemptId, HostAction, HostPairing, HostPairingError,
-    InvitationId, InvitationKind, InvitationParams, InvitationStatus, JoinerAction, JoinerPairing, JoinerState,
-    PairingCode, SessionExporters, Ticket, TicketSecret, JOIN_PROOF_KEY_INFO, TICKET_VERSION,
+    binding_transcript, join_proof_input, join_proof_mac, AttemptId, HostAction, HostPairing,
+    HostPairingError, InvitationId, InvitationKind, InvitationParams, InvitationStatus,
+    JoinerAction, JoinerPairing, JoinerState, PairingCode, SessionExporters, Ticket, TicketSecret,
+    JOIN_PROOF_KEY_INFO, TICKET_VERSION,
 };
-use crate::session_cert::{self, build_certificate, PendingCertificate, SessionKey, ValidityWindow};
+use crate::session_cert::{
+    self, build_certificate, PendingCertificate, SessionKey, ValidityWindow,
+};
 use crate::time::UnixTime;
 use crate::{ConnectionId, ErrorCode, PROTOCOL_VERSION};
 
@@ -71,11 +74,25 @@ fn vectors_dir() -> PathBuf {
 fn honest_cert(id: &SoftwareKey, key: &SessionKey, nb: u64, na: u64, version: u64) -> Vec<u8> {
     let record = session_cert::session_record(&key.spki_der(), UnixTime(nb), UnixTime(na), version);
     let sig = id.sign_raw(&record);
-    build_certificate(key, UnixTime(nb), UnixTime(na), version, id.public_key().as_bytes(), sig.as_bytes())
-        .expect("encodable")
+    build_certificate(
+        key,
+        UnixTime(nb),
+        UnixTime(na),
+        version,
+        id.public_key().as_bytes(),
+        sig.as_bytes(),
+    )
+    .expect("encodable")
 }
 
-fn cert_case(name: &str, description: &str, cert: &[u8], now: u64, pin: Option<&IdentityPublicKey>, result: &str) -> J {
+fn cert_case(
+    name: &str,
+    description: &str,
+    cert: &[u8],
+    now: u64,
+    pin: Option<&IdentityPublicKey>,
+    result: &str,
+) -> J {
     json!({
         "name": name,
         "description": description,
@@ -97,7 +114,9 @@ fn session_cert_vectors() -> J {
     let pending = PendingCertificate::new(session(&SESSION_1), window);
     let record = pending.record().to_vec();
     let identity_signature = a.sign_raw(&record);
-    let cert = pending.finish(a.public_key(), identity_signature).expect("issue");
+    let cert = pending
+        .finish(a.public_key(), identity_signature)
+        .expect("issue");
     let der = cert.der().to_vec();
     assert_eq!(der, honest_cert(&a, &s1, nb, na, PROTOCOL_VERSION));
     let spki = s1.spki_der();
@@ -134,9 +153,15 @@ fn session_cert_vectors() -> J {
     bad_self[last] ^= 0x01;
     let mut off_curve = [0u8; 65];
     off_curve[0] = 0x04;
-    let bad_identity_key =
-        build_certificate(&s1, UnixTime(nb), UnixTime(na), PROTOCOL_VERSION, &off_curve, identity_signature.as_bytes())
-            .expect("encodable");
+    let bad_identity_key = build_certificate(
+        &s1,
+        UnixTime(nb),
+        UnixTime(na),
+        PROTOCOL_VERSION,
+        &off_curve,
+        identity_signature.as_bytes(),
+    )
+    .expect("encodable");
     let mut trailing = der.clone();
     trailing.push(0);
 
@@ -358,7 +383,10 @@ fn ticket_fields(kind: u64) -> Vec<(u64, Value)> {
     vec![
         (1, Value::Uint(TICKET_VERSION)),
         (2, Value::Uint(kind)),
-        (3, Value::Bytes(identity(&IDENTITY_A).public_key().as_bytes().to_vec())),
+        (
+            3,
+            Value::Bytes(identity(&IDENTITY_A).public_key().as_bytes().to_vec()),
+        ),
         (4, Value::Bytes(INVITATION.to_vec())),
         (5, Value::Bytes(SECRET.to_vec())),
         (6, Value::Uint(T + 600)),
@@ -393,7 +421,8 @@ fn ticket_vectors() -> J {
     let valid = ticket(InvitationKind::SendLink);
     let in_person = ticket(InvitationKind::InPerson);
     let base = || ticket_fields(2);
-    let routes = |n: usize, s: &str| Value::Array((0..n).map(|_| Value::Text(s.to_owned())).collect());
+    let routes =
+        |n: usize, s: &str| Value::Array((0..n).map(|_| Value::Text(s.to_owned())).collect());
     let mut off_curve = vec![0u8; 65];
     off_curve[0] = 0x04;
     let mut unsorted = cbor::encode(&Value::Map(base()));
@@ -454,7 +483,8 @@ fn proof_vectors() -> J {
         .expand(JOIN_PROOF_KEY_INFO.as_bytes(), &mut key)
         .expect("hkdf");
     let mac = join_proof_mac(&t.secret, &t.invitation, &host, &joiner, &join_exporter);
-    let transcript = binding_transcript(&t.hash(), t.kind, t.version, &host, &joiner, &pair_exporter);
+    let transcript =
+        binding_transcript(&t.hash(), t.kind, t.version, &host, &joiner, &pair_exporter);
     json!({
         "description": "Join proof and binding transcript (spec wire.md, \"Join proof\" and \"Binding transcript\"). Exporter values are fixed stand-ins for the TLS exporters.",
         "ticket_binary": hex(&t.encode()),
@@ -565,7 +595,11 @@ fn der_raw_vectors() -> J {
             break;
         }
     }
-    let (high, short, plain) = (high.expect("found"), short.expect("found"), plain.expect("found"));
+    let (high, short, plain) = (
+        high.expect("found"),
+        short.expect("found"),
+        plain.expect("found"),
+    );
     let ok = |name: &str, sig: &RawSignature| json!({ "name": name, "der": hex(&sig.to_der()), "raw": hex(sig.as_bytes()) });
     let bad = |name: &str, der: &str, error: &str| json!({ "name": name, "der": der.replace(' ', ""), "error": error });
     let r = "2a".repeat(32);
@@ -601,13 +635,23 @@ fn der_raw_vectors() -> J {
 
 fn frame_json(frame: &Frame) -> J {
     match frame {
-        Frame::Data { stream, payload } => json!({ "type": "data", "stream": stream.0, "payload": hex(payload) }),
-        Frame::Open { stream, class, label } => {
+        Frame::Data { stream, payload } => {
+            json!({ "type": "data", "stream": stream.0, "payload": hex(payload) })
+        }
+        Frame::Open {
+            stream,
+            class,
+            label,
+        } => {
             json!({ "type": "open", "stream": stream.0, "class": *class as u8, "label": label })
         }
-        Frame::Credit { stream, increment } => json!({ "type": "credit", "stream": stream.0, "increment": increment }),
+        Frame::Credit { stream, increment } => {
+            json!({ "type": "credit", "stream": stream.0, "increment": increment })
+        }
         Frame::Fin { stream } => json!({ "type": "fin", "stream": stream.0 }),
-        Frame::Reset { stream, code } => json!({ "type": "reset", "stream": stream.0, "code": code.as_u16() }),
+        Frame::Reset { stream, code } => {
+            json!({ "type": "reset", "stream": stream.0, "code": code.as_u16() })
+        }
         Frame::Ping { opaque } => json!({ "type": "ping", "opaque": hex(opaque) }),
         Frame::Pong { opaque } => json!({ "type": "pong", "opaque": hex(opaque) }),
         Frame::Control { payload } => json!({ "type": "control", "payload": hex(payload) }),
@@ -625,28 +669,63 @@ fn header(stream: u32, kind: u8, len: u32) -> String {
 fn mux_vectors() -> J {
     let hello = ControlMessage::Hello { minor_version: 0 }.encode();
     let frames = [
-        Frame::Data { stream: StreamId(1), payload: b"hi".to_vec() },
-        Frame::Open { stream: StreamId(1), class: PriorityClass::Interactive, label: "rpc".into() },
-        Frame::Open { stream: StreamId(2), class: PriorityClass::Bulk, label: "files".into() },
-        Frame::Credit { stream: StreamId(3), increment: 65_536 },
-        Frame::Fin { stream: StreamId(5) },
-        Frame::Reset { stream: StreamId(7), code: ErrorCode::Cancelled },
-        Frame::Ping { opaque: [1, 2, 3, 4, 5, 6, 7, 8] },
-        Frame::Pong { opaque: [1, 2, 3, 4, 5, 6, 7, 8] },
+        Frame::Data {
+            stream: StreamId(1),
+            payload: b"hi".to_vec(),
+        },
+        Frame::Open {
+            stream: StreamId(1),
+            class: PriorityClass::Interactive,
+            label: "rpc".into(),
+        },
+        Frame::Open {
+            stream: StreamId(2),
+            class: PriorityClass::Bulk,
+            label: "files".into(),
+        },
+        Frame::Credit {
+            stream: StreamId(3),
+            increment: 65_536,
+        },
+        Frame::Fin {
+            stream: StreamId(5),
+        },
+        Frame::Reset {
+            stream: StreamId(7),
+            code: ErrorCode::Cancelled,
+        },
+        Frame::Ping {
+            opaque: [1, 2, 3, 4, 5, 6, 7, 8],
+        },
+        Frame::Pong {
+            opaque: [1, 2, 3, 4, 5, 6, 7, 8],
+        },
         Frame::Control { payload: hello },
-        Frame::GoAway { code: ErrorCode::IdleTimeout },
+        Frame::GoAway {
+            code: ErrorCode::IdleTimeout,
+        },
     ];
     let valid: Vec<J> = frames
         .iter()
         .map(|f| json!({ "hex": hex(&f.encode()), "frame": frame_json(f) }))
         .collect();
     let open = |class: u64, label: &str| {
-        cbor::encode(&Value::Map(vec![(1, Value::Uint(class)), (2, Value::Text(label.into()))]))
+        cbor::encode(&Value::Map(vec![
+            (1, Value::Uint(class)),
+            (2, Value::Text(label.into())),
+        ]))
     };
-    let with_payload = |stream: u32, kind: u8, payload: &[u8]| format!("{}{}", header(stream, kind, payload.len() as u32), hex(payload));
+    let with_payload = |stream: u32, kind: u8, payload: &[u8]| {
+        format!(
+            "{}{}",
+            header(stream, kind, payload.len() as u32),
+            hex(payload)
+        )
+    };
     // Class 0 written as 0x18 0x00 instead of 0x00.
     let open_non_canonical = [0xa2, 0x01, 0x18, 0x00, 0x02, 0x61, 0x78];
-    let bad = |name: &str, h: String, result: &str| json!({ "name": name, "hex": h, "result": result });
+    let bad =
+        |name: &str, h: String, result: &str| json!({ "name": name, "hex": h, "result": result });
     json!({
         "description": "Mux frames (spec wire.md, \"Mux framing\"). `valid` frames decode to `frame` and re-encode to `hex`. `invalid` inputs give the decode result: need_more (wait for bytes), or an error that closes the connection (too_large -> frame_too_large, others -> protocol_error).",
         "valid": valid,
@@ -684,12 +763,29 @@ fn mux_vectors() -> J {
 fn control_vectors() -> J {
     let messages = [
         ControlMessage::Hello { minor_version: 0 },
-        ControlMessage::Authorized { state: AuthorizedState::Live },
-        ControlMessage::Authorized { state: AuthorizedState::JoinOnly },
-        ControlMessage::JoinProof { invitation: InvitationId(INVITATION), mac: [0xaa; 32], name: "Phone".into() },
-        ControlMessage::CodeExchange { attempt: AttemptId([0xbb; 16]), payload: vec![1, 2, 3] },
-        ControlMessage::CodeAbort { attempt: AttemptId([0xbb; 16]), code: ErrorCode::PairingFailed },
-        ControlMessage::Paired { host_name: "Desk".into(), role: Role::owner() },
+        ControlMessage::Authorized {
+            state: AuthorizedState::Live,
+        },
+        ControlMessage::Authorized {
+            state: AuthorizedState::JoinOnly,
+        },
+        ControlMessage::JoinProof {
+            invitation: InvitationId(INVITATION),
+            mac: [0xaa; 32],
+            name: "Phone".into(),
+        },
+        ControlMessage::CodeExchange {
+            attempt: AttemptId([0xbb; 16]),
+            payload: vec![1, 2, 3],
+        },
+        ControlMessage::CodeAbort {
+            attempt: AttemptId([0xbb; 16]),
+            code: ErrorCode::PairingFailed,
+        },
+        ControlMessage::Paired {
+            host_name: "Desk".into(),
+            role: Role::owner(),
+        },
     ];
     let valid: Vec<J> = messages
         .iter()
@@ -716,6 +812,9 @@ fn control_vectors() -> J {
             ]) },
             { "name": "code_exchange_empty_payload", "hex": enc(vec![
                 (0, Value::Uint(4)), (1, Value::Bytes(vec![0; 16])), (2, Value::Bytes(Vec::new())),
+            ]) },
+            { "name": "code_abort_code_over_16_bits", "hex": enc(vec![
+                (0, Value::Uint(5)), (1, Value::Bytes(vec![0; 16])), (2, Value::Uint(65_536)),
             ]) },
             { "name": "code_exchange_payload_1025_bytes", "hex": enc(vec![
                 (0, Value::Uint(4)), (1, Value::Bytes(vec![0; 16])), (2, Value::Bytes(vec![0; 1025])),
@@ -844,7 +943,11 @@ struct Replay {
 impl Replay {
     fn new(kind: InvitationKind) -> Self {
         let mut rng = ChaCha20Rng::from_seed([7; 32]);
-        let mut host = HostPairing::new(identity(&IDENTITY_A).public_key(), "Desk".into(), InsecureTestExchangeFactory);
+        let mut host = HostPairing::new(
+            identity(&IDENTITY_A).public_key(),
+            "Desk".into(),
+            InsecureTestExchangeFactory,
+        );
         let params = InvitationParams {
             kind,
             role: Role::owner(),
@@ -852,34 +955,68 @@ impl Replay {
             routes: vec![ROUTE.into()],
             grant_expires_at: None,
         };
-        let ticket = host.create(params, UnixTime(T), &mut rng).expect("create").ticket;
-        Self { rng, joiner_rng: ChaCha20Rng::from_seed([9; 32]), host, grants: GrantTable::new(), ticket, joiners: Vec::new(), first: Vec::new(), last_reply: None }
+        let ticket = host
+            .create(params, UnixTime(T), &mut rng)
+            .expect("create")
+            .ticket;
+        Self {
+            rng,
+            joiner_rng: ChaCha20Rng::from_seed([9; 32]),
+            host,
+            grants: GrantTable::new(),
+            ticket,
+            joiners: Vec::new(),
+            first: Vec::new(),
+            last_reply: None,
+        }
     }
 
     fn joiner(&mut self, name: &str) -> &mut JoinerPairing<InsecureTestExchangeFactory> {
         if !self.joiners.iter().any(|(n, _, _)| n == name) {
             let seed = 0x50 + self.joiners.len() as u8;
             let key = identity(&[seed; 32]).public_key();
-            let j = JoinerPairing::new(self.ticket.clone(), key, name.into(), InsecureTestExchangeFactory, UnixTime(T))
-                .expect("joiner");
+            let j = JoinerPairing::new(
+                self.ticket.clone(),
+                key,
+                name.into(),
+                InsecureTestExchangeFactory,
+                UnixTime(T),
+            )
+            .expect("joiner");
             self.joiners.push((name.into(), seed, j));
         }
-        let i = self.joiners.iter().position(|(n, _, _)| n == name).expect("present");
+        let i = self
+            .joiners
+            .iter()
+            .position(|(n, _, _)| n == name)
+            .expect("present");
         &mut self.joiners[i].2
     }
 
     fn joiner_key(&self, name: &str) -> IdentityPublicKey {
-        let seed = self.joiners.iter().find(|(n, _, _)| n == name).expect("present").1;
+        let seed = self
+            .joiners
+            .iter()
+            .find(|(n, _, _)| n == name)
+            .expect("present")
+            .1;
         identity(&[seed; 32]).public_key()
     }
 
     fn deliver_to_host(&mut self, conn: u64, m: ControlMessage) -> Vec<HostAction> {
         let now = UnixTime(T);
         match m {
-            ControlMessage::CodeExchange { attempt, payload } => {
-                self.host.on_code_exchange(ConnectionId(conn), attempt, &payload, &mut self.grants, now, &mut self.rng)
+            ControlMessage::CodeExchange { attempt, payload } => self.host.on_code_exchange(
+                ConnectionId(conn),
+                attempt,
+                &payload,
+                &mut self.grants,
+                now,
+                &mut self.rng,
+            ),
+            ControlMessage::CodeAbort { attempt, .. } => {
+                self.host.on_code_abort(ConnectionId(conn), attempt)
             }
-            ControlMessage::CodeAbort { attempt, .. } => self.host.on_code_abort(ConnectionId(conn), attempt),
             other => panic!("unexpected {other:?}"),
         }
     }
@@ -892,23 +1029,59 @@ impl Replay {
         let mut host_log: Vec<HostAction> = Vec::new();
         match op {
             "connect" => {
-                let exporters = SessionExporters { join: [conn as u8; 32], pair: [conn as u8 + 100; 32] };
-                let proof = self.joiner(&who).on_connected(exporters, UnixTime(T)).expect("connect");
-                let ControlMessage::JoinProof { invitation, mac, name } = proof else { panic!("proof") };
+                let exporters = SessionExporters {
+                    join: [conn as u8; 32],
+                    pair: [conn as u8 + 100; 32],
+                };
+                let proof = self
+                    .joiner(&who)
+                    .on_connected(exporters, UnixTime(T))
+                    .expect("connect");
+                let ControlMessage::JoinProof {
+                    invitation,
+                    mac,
+                    name,
+                } = proof
+                else {
+                    panic!("proof")
+                };
                 let key = self.joiner_key(&who);
-                let actions =
-                    self.host.on_join_proof(ConnectionId(conn), &key, &exporters, &invitation, &mac, &name, &self.grants, UnixTime(T));
-                if actions.iter().any(|a| matches!(a, HostAction::AdmittedJoinOnly { .. })) {
+                let actions = self.host.on_join_proof(
+                    ConnectionId(conn),
+                    &key,
+                    &exporters,
+                    &invitation,
+                    &mac,
+                    &name,
+                    &self.grants,
+                    UnixTime(T),
+                );
+                if actions
+                    .iter()
+                    .any(|a| matches!(a, HostAction::AdmittedJoinOnly { .. }))
+                {
                     self.joiner(&who).on_authorized(AuthorizedState::JoinOnly);
                 }
                 host_log.extend(actions);
             }
             "submit" | "submit_first" => {
                 let code = if step["code"] == "right" {
-                    self.host.code(&self.ticket.invitation).expect("code").clone()
+                    self.host
+                        .code(&self.ticket.invitation)
+                        .expect("code")
+                        .clone()
                 } else {
-                    let right = self.host.code(&self.ticket.invitation).expect("code").as_str().to_owned();
-                    let wrong = if right == "000000" { "000001" } else { "000000" };
+                    let right = self
+                        .host
+                        .code(&self.ticket.invitation)
+                        .expect("code")
+                        .as_str()
+                        .to_owned();
+                    let wrong = if right == "000000" {
+                        "000001"
+                    } else {
+                        "000000"
+                    };
                     PairingCode::parse(wrong).expect("code")
                 };
                 let mut rng = self.joiner_rng.clone();
@@ -960,9 +1133,13 @@ impl Replay {
                     for m in to_joiner {
                         let j = self.joiner(&who);
                         let actions = match m {
-                            ControlMessage::CodeExchange { attempt, payload } => j.on_code_exchange(attempt, &payload),
+                            ControlMessage::CodeExchange { attempt, payload } => {
+                                j.on_code_exchange(attempt, &payload)
+                            }
                             ControlMessage::CodeAbort { attempt, .. } => j.on_code_abort(attempt),
-                            ControlMessage::Paired { host_name, role } => j.on_paired(host_name, role),
+                            ControlMessage::Paired { host_name, role } => {
+                                j.on_paired(host_name, role)
+                            }
                             other => panic!("unexpected {other:?}"),
                         };
                         to_host.extend(actions.into_iter().filter_map(|a| match a {
@@ -972,7 +1149,10 @@ impl Replay {
                     }
                 }
                 // Closes reach the joiner as a closed connection.
-                if host_log.iter().any(|a| matches!(a, HostAction::Close { conn: c, .. } if c.0 == conn)) {
+                if host_log
+                    .iter()
+                    .any(|a| matches!(a, HostAction::Close { conn: c, .. } if c.0 == conn))
+                {
                     let code = host_log.iter().find_map(|a| match a {
                         HostAction::Close { conn: c, code } if c.0 == conn => Some(*code),
                         _ => None,
@@ -981,7 +1161,13 @@ impl Replay {
                 }
             }
             "redeliver" => {
-                let m = self.first.iter().find(|(n, _)| *n == who).expect("first message").1.clone();
+                let m = self
+                    .first
+                    .iter()
+                    .find(|(n, _)| *n == who)
+                    .expect("first message")
+                    .1
+                    .clone();
                 let before = self.last_reply.clone();
                 let actions = self.deliver_to_host(conn, m);
                 if step["same_reply"] == true {
@@ -996,7 +1182,12 @@ impl Replay {
             }
             "approve" => {
                 let invitation = self.ticket.invitation;
-                match self.host.approve(&invitation, ConnectionId(conn), &mut self.grants, UnixTime(T)) {
+                match self.host.approve(
+                    &invitation,
+                    ConnectionId(conn),
+                    &mut self.grants,
+                    UnixTime(T),
+                ) {
                     Ok(actions) => {
                         assert_eq!(step["result"], "ok");
                         host_log.extend(actions);
@@ -1020,9 +1211,8 @@ impl Replay {
 #[test]
 fn pairing_attempt_sequences_hold() {
     let file = vectors_dir().join("pairing-attempts.json");
-    let text = std::fs::read_to_string(&file).unwrap_or_else(|_| {
-        serde_json::to_string(&pairing_attempt_vectors()).expect("json")
-    });
+    let text = std::fs::read_to_string(&file)
+        .unwrap_or_else(|_| serde_json::to_string(&pairing_attempt_vectors()).expect("json"));
     let doc: J = serde_json::from_str(&text).expect("json");
     for seq in doc["sequences"].as_array().expect("sequences") {
         let name = seq["name"].as_str().expect("name");
@@ -1036,7 +1226,11 @@ fn pairing_attempt_sequences_hold() {
             let ctx = format!("{name} step {i}");
             let closed = r.step(step);
             if let Some(n) = step["host_attempts_left"].as_u64() {
-                assert_eq!(r.host.attempts_left(&r.ticket.invitation).map(u64::from), Some(n), "{ctx}");
+                assert_eq!(
+                    r.host.attempts_left(&r.ticket.invitation).map(u64::from),
+                    Some(n),
+                    "{ctx}"
+                );
             }
             if let Some(who) = step["joiner"].as_str() {
                 if let Some(n) = step["joiner_attempts_left"].as_u64() {
@@ -1047,13 +1241,22 @@ fn pairing_attempt_sequences_hold() {
                 }
             }
             if let Some(s) = step["host_status"].as_str() {
-                assert_eq!(host_status_name(r.host.status(&r.ticket.invitation).expect("status")), s, "{ctx}");
+                assert_eq!(
+                    host_status_name(r.host.status(&r.ticket.invitation).expect("status")),
+                    s,
+                    "{ctx}"
+                );
             }
             let mut expected: Vec<(u64, String)> = step["closed"]
                 .as_array()
                 .map(|list| {
                     list.iter()
-                        .map(|c| (c[0].as_u64().expect("conn"), c[1].as_str().expect("code").to_owned()))
+                        .map(|c| {
+                            (
+                                c[0].as_u64().expect("conn"),
+                                c[1].as_str().expect("code").to_owned(),
+                            )
+                        })
                         .collect()
                 })
                 .unwrap_or_default();

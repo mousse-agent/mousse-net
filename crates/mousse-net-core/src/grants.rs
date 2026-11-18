@@ -39,7 +39,9 @@ impl Role {
     pub fn new(name: &str) -> Result<Self, GrantError> {
         let ok = !name.is_empty()
             && name.len() <= 32
-            && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
         if ok {
             Ok(Self(name.to_owned()))
         } else {
@@ -246,7 +248,11 @@ impl GrantTable {
 
     /// Add a local grant. If the identity already has one, the old grant is
     /// replaced and its channels are closed (they must re-authorize).
-    pub fn add(&mut self, new: NewGrant, now: UnixTime) -> Result<(GrantId, Vec<GrantEvent>), GrantError> {
+    pub fn add(
+        &mut self,
+        new: NewGrant,
+        now: UnixTime,
+    ) -> Result<(GrantId, Vec<GrantEvent>), GrantError> {
         if self.denials.contains_key(&new.identity) {
             return Err(GrantError::Denied);
         }
@@ -334,11 +340,20 @@ impl GrantTable {
     }
 
     /// Bind a channel to the grant that authorized it. The grant must be live.
-    pub fn bind(&mut self, channel: ConnectionId, id: GrantId, now: UnixTime) -> Result<(), GrantError> {
+    pub fn bind(
+        &mut self,
+        channel: ConnectionId,
+        id: GrantId,
+        now: UnixTime,
+    ) -> Result<(), GrantError> {
         if self.bindings.contains_key(&channel) {
             return Err(GrantError::AlreadyBound);
         }
-        let grant = self.grants.get(&id).filter(|g| g.is_live(now)).ok_or(GrantError::UnknownGrant)?;
+        let grant = self
+            .grants
+            .get(&id)
+            .filter(|g| g.is_live(now))
+            .ok_or(GrantError::UnknownGrant)?;
         if self.denials.contains_key(&grant.identity) {
             return Err(GrantError::Denied);
         }
@@ -450,7 +465,10 @@ mod tests {
         let events = t.deny(id(1), NOW);
         assert_eq!(events.len(), 1);
         assert!(t.live_grant(&id(1), NOW).is_none());
-        assert_eq!(t.add(new_grant(1, None), NOW).unwrap_err(), GrantError::Denied);
+        assert_eq!(
+            t.add(new_grant(1, None), NOW).unwrap_err(),
+            GrantError::Denied
+        );
         // Undeny lifts the block but grants nothing.
         assert!(t.undeny(&id(1)));
         assert!(t.live_grant(&id(1), NOW).is_none());
@@ -463,7 +481,14 @@ mod tests {
         t.add(new_grant(1, None), NOW).unwrap();
         t.add(new_grant(2, None), NOW).unwrap();
         let grants: Vec<Grant> = t.grants().cloned().collect();
-        let restored = GrantTable::restore(grants, vec![Denial { identity: id(2), denied_at: NOW }]).unwrap();
+        let restored = GrantTable::restore(
+            grants,
+            vec![Denial {
+                identity: id(2),
+                denied_at: NOW,
+            }],
+        )
+        .unwrap();
         assert!(restored.live_grant(&id(1), NOW).is_some());
         assert!(restored.live_grant(&id(2), NOW).is_none());
         // New ids continue after restored ones.

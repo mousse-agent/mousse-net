@@ -9,12 +9,12 @@
 mod frame;
 
 use std::collections::{BTreeMap, VecDeque};
-use std::ops::Bound;
 use std::fmt;
+use std::ops::Bound;
 
 pub use frame::{
-    decode as decode_frame, frame_type, Frame, FrameError, PriorityClass, StreamId, HEADER_LEN, MAX_CONTROL_PAYLOAD,
-    MAX_LABEL_LEN, MAX_OPEN_PAYLOAD, MAX_PAYLOAD,
+    decode as decode_frame, frame_type, Frame, FrameError, PriorityClass, StreamId, HEADER_LEN,
+    MAX_CONTROL_PAYLOAD, MAX_LABEL_LEN, MAX_OPEN_PAYLOAD, MAX_PAYLOAD,
 };
 
 use crate::time::Millis;
@@ -97,10 +97,16 @@ pub enum MuxEvent {
 impl fmt::Debug for MuxEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            MuxEvent::StreamOpened { stream, class, label } => {
+            MuxEvent::StreamOpened {
+                stream,
+                class,
+                label,
+            } => {
                 write!(f, "StreamOpened({}, {class:?}, {label:?})", stream.0)
             }
-            MuxEvent::Data { stream, bytes } => write!(f, "Data({}, {} bytes)", stream.0, bytes.len()),
+            MuxEvent::Data { stream, bytes } => {
+                write!(f, "Data({}, {} bytes)", stream.0, bytes.len())
+            }
             MuxEvent::Finished { stream } => write!(f, "Finished({})", stream.0),
             MuxEvent::Reset { stream, code } => write!(f, "Reset({}, {code:?})", stream.0),
             MuxEvent::Control(bytes) => write!(f, "Control({} bytes)", bytes.len()),
@@ -193,7 +199,8 @@ impl Stream {
     }
 
     fn ready(&self) -> bool {
-        (!self.out.is_empty() && self.send_credit > 0) || (self.out.is_empty() && self.fin_queued && !self.fin_sent)
+        (!self.out.is_empty() && self.send_credit > 0)
+            || (self.out.is_empty() && self.fin_queued && !self.fin_sent)
     }
 
     fn done(&self) -> bool {
@@ -261,7 +268,11 @@ impl Mux {
     }
 
     /// Open a stream. The `OPEN` frame is queued ahead of its data.
-    pub fn open_stream(&mut self, class: PriorityClass, label: &str) -> Result<StreamId, StreamError> {
+    pub fn open_stream(
+        &mut self,
+        class: PriorityClass,
+        label: &str,
+    ) -> Result<StreamId, StreamError> {
         if self.closing.is_some() {
             return Err(StreamError::Closing);
         }
@@ -284,7 +295,10 @@ impl Mux {
         if self.closing.is_some() {
             return Err(StreamError::Closing);
         }
-        let s = self.streams.get_mut(&stream.0).ok_or(StreamError::UnknownStream)?;
+        let s = self
+            .streams
+            .get_mut(&stream.0)
+            .ok_or(StreamError::UnknownStream)?;
         if s.fin_queued {
             return Err(StreamError::Finished);
         }
@@ -294,7 +308,10 @@ impl Mux {
 
     /// Finish sending on a stream (`FIN` after all queued bytes).
     pub fn finish(&mut self, stream: StreamId) -> Result<(), StreamError> {
-        let s = self.streams.get_mut(&stream.0).ok_or(StreamError::UnknownStream)?;
+        let s = self
+            .streams
+            .get_mut(&stream.0)
+            .ok_or(StreamError::UnknownStream)?;
         if s.fin_queued {
             return Err(StreamError::Finished);
         }
@@ -304,7 +321,9 @@ impl Mux {
 
     /// Abort a stream in both directions. Queued bytes are dropped.
     pub fn reset(&mut self, stream: StreamId, code: ErrorCode) -> Result<(), StreamError> {
-        self.streams.remove(&stream.0).ok_or(StreamError::UnknownStream)?;
+        self.streams
+            .remove(&stream.0)
+            .ok_or(StreamError::UnknownStream)?;
         self.control.push_back(Frame::Reset { stream, code });
         Ok(())
     }
@@ -388,20 +407,36 @@ impl Mux {
         Ok(events)
     }
 
-    fn handle(&mut self, frame: Frame, now: Millis, events: &mut Vec<MuxEvent>) -> Result<(), MuxError> {
+    fn handle(
+        &mut self,
+        frame: Frame,
+        now: Millis,
+        events: &mut Vec<MuxEvent>,
+    ) -> Result<(), MuxError> {
         match frame {
-            Frame::Open { stream, class, label } => {
+            Frame::Open {
+                stream,
+                class,
+                label,
+            } => {
                 if !self.is_peer_id(stream.0) || stream.0 <= self.highest_peer_id {
                     return Err(self.fail(ErrorCode::ProtocolError));
                 }
                 self.highest_peer_id = stream.0;
                 let open_by_peer = self.streams.values().filter(|s| s.peer_initiated).count();
                 if open_by_peer >= MAX_PEER_STREAMS {
-                    self.control.push_back(Frame::Reset { stream, code: ErrorCode::RefusedStream });
+                    self.control.push_back(Frame::Reset {
+                        stream,
+                        code: ErrorCode::RefusedStream,
+                    });
                     return Ok(());
                 }
                 self.streams.insert(stream.0, Stream::new(class, true));
-                events.push(MuxEvent::StreamOpened { stream, class, label });
+                events.push(MuxEvent::StreamOpened {
+                    stream,
+                    class,
+                    label,
+                });
             }
             Frame::Data { stream, payload } => {
                 self.check_known(stream)?;
@@ -417,7 +452,10 @@ impl Mux {
                 }
                 s.recv_window -= len;
                 s.recv_unreleased += len;
-                events.push(MuxEvent::Data { stream, bytes: payload });
+                events.push(MuxEvent::Data {
+                    stream,
+                    bytes: payload,
+                });
             }
             Frame::Credit { stream, increment } => {
                 self.check_known(stream)?;
@@ -453,7 +491,9 @@ impl Mux {
                 if let Some((expected, sent_at)) = self.outstanding_ping {
                     if expected == opaque {
                         self.outstanding_ping = None;
-                        events.push(MuxEvent::Pong { rtt_ms: now.since(sent_at) });
+                        events.push(MuxEvent::Pong {
+                            rtt_ms: now.since(sent_at),
+                        });
                     }
                 }
             }
@@ -493,7 +533,8 @@ impl Mux {
         }
         let frame = match self.control.pop_front() {
             Some(frame) => Some(frame),
-            None => self.next_stream_frame(PriorityClass::Interactive)
+            None => self
+                .next_stream_frame(PriorityClass::Interactive)
                 .or_else(|| self.next_stream_frame(PriorityClass::Bulk)),
         }?;
         if matches!(frame, Frame::GoAway { .. }) {
@@ -552,7 +593,9 @@ impl Mux {
         if now.since(self.last_received) >= IDLE_TIMEOUT_MS {
             return Err(self.fail(ErrorCode::IdleTimeout));
         }
-        if now.since(self.last_sent) >= KEEPALIVE_MS && !self.control.iter().any(|f| matches!(f, Frame::Ping { .. })) {
+        if now.since(self.last_sent) >= KEEPALIVE_MS
+            && !self.control.iter().any(|f| matches!(f, Frame::Ping { .. }))
+        {
             self.ping_counter += 1;
             self.control.push_back(Frame::Ping {
                 opaque: self.ping_counter.to_be_bytes(),
@@ -575,15 +618,27 @@ mod tests {
     }
 
     fn pair() -> (Mux, Mux) {
-        (Mux::new(MuxRole::Caller, Millis(0)), Mux::new(MuxRole::Host, Millis(0)))
+        (
+            Mux::new(MuxRole::Caller, Millis(0)),
+            Mux::new(MuxRole::Host, Millis(0)),
+        )
     }
 
     #[test]
     fn stream_ids_follow_role_parity() {
         let (mut c, mut h) = pair();
-        assert_eq!(c.open_stream(PriorityClass::Interactive, "a").unwrap(), StreamId(1));
-        assert_eq!(c.open_stream(PriorityClass::Interactive, "b").unwrap(), StreamId(3));
-        assert_eq!(h.open_stream(PriorityClass::Interactive, "c").unwrap(), StreamId(2));
+        assert_eq!(
+            c.open_stream(PriorityClass::Interactive, "a").unwrap(),
+            StreamId(1)
+        );
+        assert_eq!(
+            c.open_stream(PriorityClass::Interactive, "b").unwrap(),
+            StreamId(3)
+        );
+        assert_eq!(
+            h.open_stream(PriorityClass::Interactive, "c").unwrap(),
+            StreamId(2)
+        );
     }
 
     #[test]
@@ -616,13 +671,30 @@ mod tests {
         let s = c.open_stream(PriorityClass::Bulk, "x").unwrap();
         let open = c.poll_transmit(Millis(0)).unwrap();
         h.receive(&open, Millis(0)).unwrap();
-        let chunk = Frame::Data { stream: s, payload: vec![0; MAX_PAYLOAD] }.encode();
+        let chunk = Frame::Data {
+            stream: s,
+            payload: vec![0; MAX_PAYLOAD],
+        }
+        .encode();
         for _ in 0..(INITIAL_CREDIT as usize / MAX_PAYLOAD) {
             h.receive(&chunk, Millis(0)).unwrap();
         }
-        assert_eq!(h.receive(&chunk, Millis(0)), Err(MuxError { code: ErrorCode::FlowControl }));
+        assert_eq!(
+            h.receive(&chunk, Millis(0)),
+            Err(MuxError {
+                code: ErrorCode::FlowControl
+            })
+        );
         assert!(h.is_closing());
-        assert_eq!(h.poll_transmit(Millis(0)), Some(Frame::GoAway { code: ErrorCode::FlowControl }.encode()));
+        assert_eq!(
+            h.poll_transmit(Millis(0)),
+            Some(
+                Frame::GoAway {
+                    code: ErrorCode::FlowControl
+                }
+                .encode()
+            )
+        );
     }
 
     #[test]
@@ -637,7 +709,13 @@ mod tests {
         assert_eq!(first.len(), HEADER_LEN + SEND_CHUNK);
         c.send(typing, b"ls\n").unwrap();
         let next = c.poll_transmit(Millis(0)).unwrap();
-        assert_eq!(decode_frame(&next).unwrap().unwrap().0, Frame::Data { stream: typing, payload: b"ls\n".to_vec() });
+        assert_eq!(
+            decode_frame(&next).unwrap().unwrap().0,
+            Frame::Data {
+                stream: typing,
+                payload: b"ls\n".to_vec()
+            }
+        );
     }
 
     #[test]
@@ -658,20 +736,54 @@ mod tests {
     #[test]
     fn opening_with_the_wrong_parity_or_reusing_an_id_is_rejected() {
         let (_, mut h) = pair();
-        let even = Frame::Open { stream: StreamId(2), class: PriorityClass::Bulk, label: "x".into() }.encode();
-        assert_eq!(h.receive(&even, Millis(0)), Err(MuxError { code: ErrorCode::ProtocolError }));
+        let even = Frame::Open {
+            stream: StreamId(2),
+            class: PriorityClass::Bulk,
+            label: "x".into(),
+        }
+        .encode();
+        assert_eq!(
+            h.receive(&even, Millis(0)),
+            Err(MuxError {
+                code: ErrorCode::ProtocolError
+            })
+        );
         let (_, mut h) = pair();
-        let five = Frame::Open { stream: StreamId(5), class: PriorityClass::Bulk, label: "x".into() }.encode();
-        let three = Frame::Open { stream: StreamId(3), class: PriorityClass::Bulk, label: "x".into() }.encode();
+        let five = Frame::Open {
+            stream: StreamId(5),
+            class: PriorityClass::Bulk,
+            label: "x".into(),
+        }
+        .encode();
+        let three = Frame::Open {
+            stream: StreamId(3),
+            class: PriorityClass::Bulk,
+            label: "x".into(),
+        }
+        .encode();
         h.receive(&five, Millis(0)).unwrap();
-        assert_eq!(h.receive(&three, Millis(0)), Err(MuxError { code: ErrorCode::ProtocolError }));
+        assert_eq!(
+            h.receive(&three, Millis(0)),
+            Err(MuxError {
+                code: ErrorCode::ProtocolError
+            })
+        );
     }
 
     #[test]
     fn data_on_a_never_opened_stream_is_rejected() {
         let (_, mut h) = pair();
-        let data = Frame::Data { stream: StreamId(1), payload: vec![1] }.encode();
-        assert_eq!(h.receive(&data, Millis(0)), Err(MuxError { code: ErrorCode::ProtocolError }));
+        let data = Frame::Data {
+            stream: StreamId(1),
+            payload: vec![1],
+        }
+        .encode();
+        assert_eq!(
+            h.receive(&data, Millis(0)),
+            Err(MuxError {
+                code: ErrorCode::ProtocolError
+            })
+        );
     }
 
     #[test]
@@ -682,21 +794,39 @@ mod tests {
         assert_eq!(m.poll_transmit(Millis(KEEPALIVE_MS - 1)), None);
         m.on_timeout(Millis(KEEPALIVE_MS)).unwrap();
         let ping = m.poll_transmit(Millis(KEEPALIVE_MS)).unwrap();
-        assert!(matches!(decode_frame(&ping).unwrap().unwrap().0, Frame::Ping { .. }));
+        assert!(matches!(
+            decode_frame(&ping).unwrap().unwrap().0,
+            Frame::Ping { .. }
+        ));
         // The peer answers; round-trip is measured.
-        let pong = Frame::Pong { opaque: 1u64.to_be_bytes() }.encode();
-        assert_eq!(m.receive(&pong, Millis(KEEPALIVE_MS + 40)).unwrap(), vec![MuxEvent::Pong { rtt_ms: 40 }]);
+        let pong = Frame::Pong {
+            opaque: 1u64.to_be_bytes(),
+        }
+        .encode();
+        assert_eq!(
+            m.receive(&pong, Millis(KEEPALIVE_MS + 40)).unwrap(),
+            vec![MuxEvent::Pong { rtt_ms: 40 }]
+        );
         // Nothing more from the peer: idle close 45 s after the last receive.
         let last = KEEPALIVE_MS + 40;
         assert!(m.on_timeout(Millis(last + IDLE_TIMEOUT_MS - 1)).is_ok());
-        assert_eq!(m.on_timeout(Millis(last + IDLE_TIMEOUT_MS)), Err(MuxError { code: ErrorCode::IdleTimeout }));
+        assert_eq!(
+            m.on_timeout(Millis(last + IDLE_TIMEOUT_MS)),
+            Err(MuxError {
+                code: ErrorCode::IdleTimeout
+            })
+        );
     }
 
     #[test]
     fn ping_is_answered_with_the_same_bytes() {
         let mut m = Mux::new(MuxRole::Host, Millis(0));
-        m.receive(&Frame::Ping { opaque: [9; 8] }.encode(), Millis(5)).unwrap();
-        assert_eq!(m.poll_transmit(Millis(5)), Some(Frame::Pong { opaque: [9; 8] }.encode()));
+        m.receive(&Frame::Ping { opaque: [9; 8] }.encode(), Millis(5))
+            .unwrap();
+        assert_eq!(
+            m.poll_transmit(Millis(5)),
+            Some(Frame::Pong { opaque: [9; 8] }.encode())
+        );
     }
 
     #[test]
@@ -713,6 +843,12 @@ mod tests {
             events.extend(h.receive(&[byte], Millis(0)).unwrap());
         }
         assert_eq!(events.len(), 2);
-        assert_eq!(events[1], MuxEvent::Data { stream: s, bytes: b"hello".to_vec() });
+        assert_eq!(
+            events[1],
+            MuxEvent::Data {
+                stream: s,
+                bytes: b"hello".to_vec()
+            }
+        );
     }
 }

@@ -131,8 +131,14 @@ pub enum Frame {
 impl fmt::Debug for Frame {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Frame::Data { stream, payload } => write!(f, "Data({}, {} bytes)", stream.0, payload.len()),
-            Frame::Open { stream, class, label } => write!(f, "Open({}, {class:?}, {label:?})", stream.0),
+            Frame::Data { stream, payload } => {
+                write!(f, "Data({}, {} bytes)", stream.0, payload.len())
+            }
+            Frame::Open {
+                stream,
+                class,
+                label,
+            } => write!(f, "Open({}, {class:?}, {label:?})", stream.0),
             Frame::Credit { stream, increment } => write!(f, "Credit({}, {increment})", stream.0),
             Frame::Fin { stream } => write!(f, "Fin({})", stream.0),
             Frame::Reset { stream, code } => write!(f, "Reset({}, {code:?})", stream.0),
@@ -209,7 +215,9 @@ impl Frame {
                     (2, Value::Text(label.clone())),
                 ])),
             ),
-            Frame::Credit { increment, .. } => (frame_type::CREDIT, increment.to_be_bytes().to_vec()),
+            Frame::Credit { increment, .. } => {
+                (frame_type::CREDIT, increment.to_be_bytes().to_vec())
+            }
             Frame::Fin { .. } => (frame_type::FIN, Vec::new()),
             Frame::Reset { code, .. } => (frame_type::RESET, code.as_u16().to_be_bytes().to_vec()),
             Frame::Ping { opaque } => (frame_type::PING, opaque.to_vec()),
@@ -269,7 +277,10 @@ pub fn decode(input: &[u8]) -> Result<Option<(Frame, usize)>, FrameError> {
             if payload.is_empty() {
                 return Err(FrameError::BadPayload);
             }
-            Frame::Data { stream, payload: payload.to_vec() }
+            Frame::Data {
+                stream,
+                payload: payload.to_vec(),
+            }
         }
         frame_type::OPEN => {
             let mut f = Fields::decode(payload).map_err(|_| FrameError::BadPayload)?;
@@ -283,7 +294,11 @@ pub fn decode(input: &[u8]) -> Result<Option<(Frame, usize)>, FrameError> {
             if label.is_empty() || label.len() > MAX_LABEL_LEN {
                 return Err(FrameError::BadPayload);
             }
-            Frame::Open { stream, class, label }
+            Frame::Open {
+                stream,
+                class,
+                label,
+            }
         }
         frame_type::CREDIT => {
             let bytes: [u8; 4] = payload.try_into().map_err(|_| FrameError::BadPayload)?;
@@ -303,7 +318,8 @@ pub fn decode(input: &[u8]) -> Result<Option<(Frame, usize)>, FrameError> {
             let bytes: [u8; 2] = payload.try_into().map_err(|_| FrameError::BadPayload)?;
             // Unknown codes are kept as INTERNAL_ERROR for display; the frame
             // itself is still valid.
-            let code = ErrorCode::from_u16(u16::from_be_bytes(bytes)).unwrap_or(ErrorCode::InternalError);
+            let code =
+                ErrorCode::from_u16(u16::from_be_bytes(bytes)).unwrap_or(ErrorCode::InternalError);
             if kind == frame_type::RESET {
                 Frame::Reset { stream, code }
             } else {
@@ -322,7 +338,9 @@ pub fn decode(input: &[u8]) -> Result<Option<(Frame, usize)>, FrameError> {
             if payload.is_empty() {
                 return Err(FrameError::BadPayload);
             }
-            Frame::Control { payload: payload.to_vec() }
+            Frame::Control {
+                payload: payload.to_vec(),
+            }
         }
         other => return Err(FrameError::UnknownType(other)),
     };
@@ -335,15 +353,34 @@ mod tests {
 
     fn every_frame() -> Vec<Frame> {
         vec![
-            Frame::Data { stream: StreamId(1), payload: b"hi".to_vec() },
-            Frame::Open { stream: StreamId(3), class: PriorityClass::Bulk, label: "file".into() },
-            Frame::Credit { stream: StreamId(1), increment: 65_536 },
-            Frame::Fin { stream: StreamId(1) },
-            Frame::Reset { stream: StreamId(2), code: ErrorCode::Cancelled },
+            Frame::Data {
+                stream: StreamId(1),
+                payload: b"hi".to_vec(),
+            },
+            Frame::Open {
+                stream: StreamId(3),
+                class: PriorityClass::Bulk,
+                label: "file".into(),
+            },
+            Frame::Credit {
+                stream: StreamId(1),
+                increment: 65_536,
+            },
+            Frame::Fin {
+                stream: StreamId(1),
+            },
+            Frame::Reset {
+                stream: StreamId(2),
+                code: ErrorCode::Cancelled,
+            },
             Frame::Ping { opaque: [1; 8] },
             Frame::Pong { opaque: [1; 8] },
-            Frame::Control { payload: vec![0xa0] },
-            Frame::GoAway { code: ErrorCode::IdleTimeout },
+            Frame::Control {
+                payload: vec![0xa0],
+            },
+            Frame::GoAway {
+                code: ErrorCode::IdleTimeout,
+            },
         ]
     }
 
@@ -368,7 +405,25 @@ mod tests {
 
     #[test]
     fn stream_zero_rules_are_enforced() {
-        let ping_on_stream = [0, 0, 0, 1, frame_type::PING, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0];
+        let ping_on_stream = [
+            0,
+            0,
+            0,
+            1,
+            frame_type::PING,
+            0,
+            0,
+            0,
+            8,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ];
         assert_eq!(decode(&ping_on_stream), Err(FrameError::BadStream));
         let data_on_control = [0, 0, 0, 0, frame_type::DATA, 0, 0, 0, 1, 7];
         assert_eq!(decode(&data_on_control), Err(FrameError::BadStream));
@@ -376,9 +431,21 @@ mod tests {
 
     #[test]
     fn bad_payloads_and_unknown_types_are_rejected() {
-        assert_eq!(decode(&[0, 0, 0, 1, 9, 0, 0, 0, 0]), Err(FrameError::UnknownType(9)));
-        assert_eq!(decode(&[0, 0, 0, 1, frame_type::DATA, 0, 0, 0, 0]), Err(FrameError::BadPayload));
-        assert_eq!(decode(&[0, 0, 0, 1, frame_type::CREDIT, 0, 0, 0, 4, 0, 0, 0, 0]), Err(FrameError::BadPayload));
-        assert_eq!(decode(&[0, 0, 0, 1, frame_type::FIN, 0, 0, 0, 1, 0]), Err(FrameError::BadPayload));
+        assert_eq!(
+            decode(&[0, 0, 0, 1, 9, 0, 0, 0, 0]),
+            Err(FrameError::UnknownType(9))
+        );
+        assert_eq!(
+            decode(&[0, 0, 0, 1, frame_type::DATA, 0, 0, 0, 0]),
+            Err(FrameError::BadPayload)
+        );
+        assert_eq!(
+            decode(&[0, 0, 0, 1, frame_type::CREDIT, 0, 0, 0, 4, 0, 0, 0, 0]),
+            Err(FrameError::BadPayload)
+        );
+        assert_eq!(
+            decode(&[0, 0, 0, 1, frame_type::FIN, 0, 0, 0, 1, 0]),
+            Err(FrameError::BadPayload)
+        );
     }
 }

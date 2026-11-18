@@ -10,8 +10,8 @@ use mousse_net_core::grants::{GrantTable, NewGrant, OwnerRef, Role};
 use mousse_net_core::identity::{IdentityPublicKey, RawSignature, SoftwareKey};
 use mousse_net_core::mux::{decode_frame, Frame, PriorityClass, StreamId};
 use mousse_net_core::pairing::{
-    binding_transcript, join_proof_input, join_proof_mac, verify_join_proof, InvitationId, InvitationKind, Ticket,
-    TicketSecret,
+    binding_transcript, join_proof_input, join_proof_mac, verify_join_proof, InvitationId,
+    InvitationKind, Ticket, TicketSecret,
 };
 use mousse_net_core::session::{PeerSession, SessionEvent};
 use mousse_net_core::session_cert::{self, PendingCertificate, SessionKey, ValidityWindow};
@@ -19,14 +19,17 @@ use mousse_net_core::{ConnectionId, ErrorCode, Millis, UnixTime};
 use serde_json::Value as J;
 
 fn load(name: &str) -> J {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../spec/vectors").join(name);
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../spec/vectors")
+        .join(name);
+    let text =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     serde_json::from_str(&text).expect("valid JSON")
 }
 
 fn unhex(v: &J) -> Vec<u8> {
     let text = v.as_str().expect("hex string");
-    assert!(text.len() % 2 == 0, "odd hex length");
+    assert!(text.len().is_multiple_of(2), "odd hex length");
     (0..text.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&text[i..i + 2], 16).expect("hex"))
@@ -64,15 +67,23 @@ fn session_certificates() {
 
     // Keys and record.
     let id = SoftwareKey::from_secret_bytes(&fixed(&v["identity_secret"])).expect("identity");
-    assert_eq!(id.public_key().as_bytes().as_slice(), unhex(&v["identity_public"]));
+    assert_eq!(
+        id.public_key().as_bytes().as_slice(),
+        unhex(&v["identity_public"])
+    );
     let sk = SessionKey::from_secret_bytes(&fixed(&v["session_secret"])).expect("session");
-    assert_eq!(sk.public_key().as_bytes().as_slice(), unhex(&v["session_public"]));
+    assert_eq!(
+        sk.public_key().as_bytes().as_slice(),
+        unhex(&v["session_public"])
+    );
     assert_eq!(sk.spki_der(), unhex(&v["spki"]));
     let (nb, na) = (UnixTime(u(&v["not_before"])), UnixTime(u(&v["not_after"])));
     let record = session_cert::session_record(&sk.spki_der(), nb, na, u(&v["version"]));
     assert_eq!(record, unhex(&v["record"]));
     let sig = RawSignature::from_slice(&unhex(&v["identity_signature"])).expect("raw");
-    id.public_key().verify(&record, &sig).expect("identity signature");
+    id.public_key()
+        .verify(&record, &sig)
+        .expect("identity signature");
 
     // Rebuilding the certificate from its parts gives the same bytes.
     let pending = PendingCertificate::new(sk, ValidityWindow::new(nb, na).expect("window"));
@@ -80,24 +91,39 @@ fn session_certificates() {
     let cert = pending.finish(id.public_key(), sig).expect("finish");
     assert_eq!(cert.der(), unhex(&v["certificate"]));
     let der = cert.der();
-    let pos = der.windows(unhex(&v["serial"]).len()).position(|w| w == unhex(&v["serial"]).as_slice());
+    let pos = der
+        .windows(unhex(&v["serial"]).len())
+        .position(|w| w == unhex(&v["serial"]).as_slice());
     assert!(pos.is_some(), "serial appears in the certificate");
     let ext = unhex(&v["extension_value"]);
-    assert!(der.windows(ext.len()).any(|w| w == ext.as_slice()), "extension value appears in the certificate");
+    assert!(
+        der.windows(ext.len()).any(|w| w == ext.as_slice()),
+        "extension value appears in the certificate"
+    );
 
     // TLS CertificateVerify signatures.
     let verified = session_cert::verify(der, nb.plus(60), Some(&id.public_key())).expect("verify");
     let t = &v["tls_signature"];
     let msg = unhex(&t["message"]);
-    verified.verify_tls_signature(&msg, &unhex(&t["signature"])).expect("tls signature");
-    assert!(verified.verify_tls_signature(&msg, &unhex(&t["wrong_key_signature"])).is_err());
+    verified
+        .verify_tls_signature(&msg, &unhex(&t["signature"]))
+        .expect("tls signature");
+    assert!(verified
+        .verify_tls_signature(&msg, &unhex(&t["wrong_key_signature"]))
+        .is_err());
 
     // Every case.
     let cases = list(&doc["cases"]);
     assert!(cases.len() >= 15);
     for case in cases {
-        let pin = case["expected_identity"].as_str().map(|_| key(&case["expected_identity"]));
-        let result = session_cert::verify(&unhex(&case["certificate"]), UnixTime(u(&case["now"])), pin.as_ref());
+        let pin = case["expected_identity"]
+            .as_str()
+            .map(|_| key(&case["expected_identity"]));
+        let result = session_cert::verify(
+            &unhex(&case["certificate"]),
+            UnixTime(u(&case["now"])),
+            pin.as_ref(),
+        );
         let got = match result {
             Ok(_) => "ok",
             Err(e) => e.code(),
@@ -112,7 +138,8 @@ fn live_path_closes_at_certificate_expiry() {
     let doc = load("session-lifecycle.json");
     let pin = key(&doc["pin"]);
     let at = UnixTime(u(&doc["authenticated_at"]));
-    let peer = session_cert::verify(&unhex(&doc["peer_certificate"]), at, Some(&pin)).expect("peer cert");
+    let peer =
+        session_cert::verify(&unhex(&doc["peer_certificate"]), at, Some(&pin)).expect("peer cert");
     let local = ValidityWindow::new(
         UnixTime(u(&doc["local_window"]["not_before"])),
         UnixTime(u(&doc["local_window"]["not_after"])),
@@ -121,7 +148,9 @@ fn live_path_closes_at_certificate_expiry() {
     let mut session = PeerSession::new(pin);
     let conn = ConnectionId(1);
     session.begin_path(conn);
-    session.on_authenticated(conn, &peer, local, at).expect("authenticated");
+    session
+        .on_authenticated(conn, &peer, local, at)
+        .expect("authenticated");
     session.on_reopened(conn).expect("reopened");
     let path = *session.current().expect("current");
     assert_eq!(path.renew_at, UnixTime(u(&doc["renew_at"])));
@@ -132,7 +161,9 @@ fn live_path_closes_at_certificate_expiry() {
             .into_iter()
             .map(|e| match e {
                 SessionEvent::RenewDue { conn } => format!("renew_due/{}", conn.0),
-                SessionEvent::Close { conn, code } => format!("close/{}/{}", conn.0, code_name(code)),
+                SessionEvent::Close { conn, code } => {
+                    format!("close/{}/{}", conn.0, code_name(code))
+                }
                 other => format!("{other:?}"),
             })
             .collect();
@@ -147,7 +178,12 @@ fn live_path_closes_at_certificate_expiry() {
         assert_eq!(events, expected, "tick at {}", u(&tick["now"]));
     }
     let late = &doc["new_connection_after_deadline"];
-    let err = session_cert::verify(&unhex(&doc["peer_certificate"]), UnixTime(u(&late["now"])), Some(&pin)).unwrap_err();
+    let err = session_cert::verify(
+        &unhex(&doc["peer_certificate"]),
+        UnixTime(u(&late["now"])),
+        Some(&pin),
+    )
+    .unwrap_err();
     assert_eq!(err.code(), s(&late["result"]));
 }
 
@@ -197,7 +233,13 @@ fn authorization() {
         for d in list(&case["denied"]) {
             grants.deny(key(&ids[s(d)]), now);
         }
-        let mut gate = ConnectionGate::open(ConnectionId(1), key(&ids[s(&case["peer"])]), &mut grants, now, Millis(0));
+        let mut gate = ConnectionGate::open(
+            ConnectionId(1),
+            key(&ids[s(&case["peer"])]),
+            &mut grants,
+            now,
+            Millis(0),
+        );
         let step2 = match gate.state() {
             GateState::Live { .. } => "live".to_owned(),
             GateState::AwaitingJoinProof { .. } => "await_join_proof".to_owned(),
@@ -213,7 +255,9 @@ fn authorization() {
                 }
                 "admit_join_only" => gate.admit_join_only(InvitationId([0; 16])),
                 "timeout" => {
-                    let got = gate.on_timeout(Millis(u(&step["mono_ms"]))).map(|c| c.name());
+                    let got = gate
+                        .on_timeout(Millis(u(&step["mono_ms"])))
+                        .map(|c| c.name());
                     assert_eq!(got, step["result"].as_str(), "{name}");
                 }
                 other => panic!("op {other}"),
@@ -234,7 +278,10 @@ fn check_ticket(v: &J) -> Ticket {
     assert_eq!(t.routes, routes);
     assert_eq!(t.encode(), unhex(&v["binary"]));
     assert_eq!(t.to_fragment(), s(&v["fragment"]));
-    assert_eq!(Ticket::from_fragment(s(&v["fragment"])).expect("fragment"), t);
+    assert_eq!(
+        Ticket::from_fragment(s(&v["fragment"])).expect("fragment"),
+        t
+    );
     assert_eq!(t.hash().as_slice(), unhex(&v["hash"]));
     t
 }
@@ -244,7 +291,10 @@ fn tickets() {
     let doc = load("ticket.json");
     let t = check_ticket(&doc["valid"]);
     assert_eq!(t.kind, InvitationKind::SendLink);
-    assert_eq!(check_ticket(&doc["valid_in_person"]).kind, InvitationKind::InPerson);
+    assert_eq!(
+        check_ticket(&doc["valid_in_person"]).kind,
+        InvitationKind::InPerson
+    );
     for case in list(&doc["rejections"]) {
         let result = if case["binary"].is_string() {
             Ticket::decode(&unhex(&case["binary"]))
@@ -277,14 +327,31 @@ fn join_proof_and_binding_transcript() {
     let inv = InvitationId(fixed(&p["invitation"]));
     let secret = TicketSecret::from_bytes(fixed(&p["secret"]));
     let exporter: [u8; 32] = fixed(&p["join_exporter"]);
-    assert_eq!(join_proof_input(&inv, &host, &joiner, &exporter), unhex(&p["input"]));
+    assert_eq!(
+        join_proof_input(&inv, &host, &joiner, &exporter),
+        unhex(&p["input"])
+    );
     let mac: [u8; 32] = fixed(&p["mac"]);
-    assert_eq!(join_proof_mac(&secret, &inv, &host, &joiner, &exporter), mac);
-    assert!(verify_join_proof(&secret, &inv, &host, &joiner, &exporter, &mac));
-    assert!(!verify_join_proof(&secret, &inv, &joiner, &host, &exporter, &mac));
+    assert_eq!(
+        join_proof_mac(&secret, &inv, &host, &joiner, &exporter),
+        mac
+    );
+    assert!(verify_join_proof(
+        &secret, &inv, &host, &joiner, &exporter, &mac
+    ));
+    assert!(!verify_join_proof(
+        &secret, &inv, &joiner, &host, &exporter, &mac
+    ));
     let b = &doc["binding_transcript"];
     let kind = InvitationKind::from_u64(u(&b["kind"])).expect("kind");
-    let transcript = binding_transcript(&t.hash(), kind, u(&b["ticket_version"]), &host, &joiner, &fixed(&b["pair_exporter"]));
+    let transcript = binding_transcript(
+        &t.hash(),
+        kind,
+        u(&b["ticket_version"]),
+        &host,
+        &joiner,
+        &fixed(&b["pair_exporter"]),
+    );
     assert_eq!(transcript.as_bytes(), unhex(&b["transcript"]));
 }
 
@@ -293,7 +360,8 @@ fn canonical_cbor() {
     let doc = load("cbor.json");
     for case in list(&doc["valid"]) {
         let bytes = unhex(&case["hex"]);
-        let value = cbor::decode(&bytes).unwrap_or_else(|e| panic!("{}: {e}", s(&case["diagnostic"])));
+        let value =
+            cbor::decode(&bytes).unwrap_or_else(|e| panic!("{}: {e}", s(&case["diagnostic"])));
         assert_eq!(cbor::encode(&value), bytes);
     }
     for case in list(&doc["invalid"]) {
@@ -327,20 +395,40 @@ fn der_to_raw() {
 
 fn frame_from_json(v: &J) -> Frame {
     let stream = || StreamId(u32::try_from(u(&v["stream"])).expect("u32"));
-    let code = || ErrorCode::from_u16(u16::try_from(u(&v["code"])).expect("u16")).expect("known code");
+    let code =
+        || ErrorCode::from_u16(u16::try_from(u(&v["code"])).expect("u16")).expect("known code");
     match s(&v["type"]) {
-        "data" => Frame::Data { stream: stream(), payload: unhex(&v["payload"]) },
+        "data" => Frame::Data {
+            stream: stream(),
+            payload: unhex(&v["payload"]),
+        },
         "open" => Frame::Open {
             stream: stream(),
-            class: if u(&v["class"]) == 0 { PriorityClass::Interactive } else { PriorityClass::Bulk },
+            class: if u(&v["class"]) == 0 {
+                PriorityClass::Interactive
+            } else {
+                PriorityClass::Bulk
+            },
             label: s(&v["label"]).to_owned(),
         },
-        "credit" => Frame::Credit { stream: stream(), increment: u32::try_from(u(&v["increment"])).expect("u32") },
+        "credit" => Frame::Credit {
+            stream: stream(),
+            increment: u32::try_from(u(&v["increment"])).expect("u32"),
+        },
         "fin" => Frame::Fin { stream: stream() },
-        "reset" => Frame::Reset { stream: stream(), code: code() },
-        "ping" => Frame::Ping { opaque: fixed(&v["opaque"]) },
-        "pong" => Frame::Pong { opaque: fixed(&v["opaque"]) },
-        "control" => Frame::Control { payload: unhex(&v["payload"]) },
+        "reset" => Frame::Reset {
+            stream: stream(),
+            code: code(),
+        },
+        "ping" => Frame::Ping {
+            opaque: fixed(&v["opaque"]),
+        },
+        "pong" => Frame::Pong {
+            opaque: fixed(&v["opaque"]),
+        },
+        "control" => Frame::Control {
+            payload: unhex(&v["payload"]),
+        },
         "goaway" => Frame::GoAway { code: code() },
         other => panic!("frame type {other}"),
     }
@@ -360,7 +448,10 @@ fn mux_frames() {
         assert_eq!(decode_frame(&bytes[..bytes.len() - 1]), Ok(None));
     }
     let unknown = unhex(&doc["unknown_error_code"]["hex"]);
-    assert!(matches!(decode_frame(&unknown), Ok(Some((Frame::Reset { .. }, _)))));
+    assert!(matches!(
+        decode_frame(&unknown),
+        Ok(Some((Frame::Reset { .. }, _)))
+    ));
     for case in list(&doc["invalid"]) {
         let name = s(&case["name"]);
         let got = match decode_frame(&unhex(&case["hex"])) {
@@ -382,6 +473,10 @@ fn control_messages() {
         assert_eq!(m.encode(), bytes);
     }
     for case in list(&doc["invalid"]) {
-        assert!(ControlMessage::decode(&unhex(&case["hex"])).is_err(), "{}", s(&case["name"]));
+        assert!(
+            ControlMessage::decode(&unhex(&case["hex"])).is_err(),
+            "{}",
+            s(&case["name"])
+        );
     }
 }

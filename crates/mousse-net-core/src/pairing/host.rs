@@ -12,7 +12,9 @@ use rand_core::CryptoRng;
 
 use super::exchange::{CodeExchange, CodeExchangeFactory, ExchangeRole, PairingCode};
 use super::proof::{binding_transcript, verify_join_proof, SessionExporters, EXPORTER_LEN};
-use super::ticket::{Ticket, TicketSecret, MAX_ROUTES, MAX_ROUTE_LEN, TICKET_LIFETIME_SECS, TICKET_VERSION};
+use super::ticket::{
+    Ticket, TicketSecret, MAX_ROUTES, MAX_ROUTE_LEN, TICKET_LIFETIME_SECS, TICKET_VERSION,
+};
 use super::{AttemptId, InvitationId, InvitationKind};
 use crate::control::{AuthorizedState, ControlMessage};
 use crate::grants::{GrantError, GrantEvent, GrantId, GrantTable, NewGrant, OwnerRef, Role};
@@ -222,7 +224,10 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
         rng: &mut R,
     ) -> Result<CreatedInvitation, HostPairingError> {
         if params.routes.len() > MAX_ROUTES
-            || params.routes.iter().any(|r| r.is_empty() || r.len() > MAX_ROUTE_LEN)
+            || params
+                .routes
+                .iter()
+                .any(|r| r.is_empty() || r.len() > MAX_ROUTE_LEN)
         {
             return Err(HostPairingError::InvalidRoutes);
         }
@@ -275,7 +280,9 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
 
     /// The code to show for a send-link invitation.
     pub fn code(&self, invitation: &InvitationId) -> Option<&PairingCode> {
-        self.invitations.get(invitation).and_then(|i| i.code.as_ref())
+        self.invitations
+            .get(invitation)
+            .and_then(|i| i.code.as_ref())
     }
 
     /// The invitation a pairing connection belongs to.
@@ -341,7 +348,14 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
             return close(ErrorCode::InvitationInvalid);
         };
         if !inv.is_open(now)
-            || !verify_join_proof(&inv.ticket.secret, invitation, &self.host_identity, joiner, &exporters.join, mac)
+            || !verify_join_proof(
+                &inv.ticket.secret,
+                invitation,
+                &self.host_identity,
+                joiner,
+                &exporters.join,
+                mac,
+            )
         {
             return close(ErrorCode::InvitationInvalid);
         }
@@ -355,10 +369,15 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
         );
         self.by_conn.insert(conn, *invitation);
         let mut actions = vec![
-            HostAction::AdmittedJoinOnly { conn, invitation: *invitation },
+            HostAction::AdmittedJoinOnly {
+                conn,
+                invitation: *invitation,
+            },
             HostAction::Send {
                 conn,
-                message: ControlMessage::Authorized { state: AuthorizedState::JoinOnly },
+                message: ControlMessage::Authorized {
+                    state: AuthorizedState::JoinOnly,
+                },
             },
         ];
         match (&inv.code, inv.params.kind) {
@@ -384,7 +403,10 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
         grants: &mut GrantTable,
         now: UnixTime,
     ) -> Result<Vec<HostAction>, HostPairingError> {
-        let inv = self.invitations.get(invitation).ok_or(HostPairingError::UnknownInvitation)?;
+        let inv = self
+            .invitations
+            .get(invitation)
+            .ok_or(HostPairingError::UnknownInvitation)?;
         if inv.params.kind != InvitationKind::InPerson {
             return Err(HostPairingError::WrongKind);
         }
@@ -408,13 +430,22 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
         rng: &mut R,
     ) -> Vec<HostAction> {
         let Some(invitation) = self.by_conn.get(&conn).copied() else {
-            return vec![HostAction::Close { conn, code: ErrorCode::NotAuthorized }];
+            return vec![HostAction::Close {
+                conn,
+                code: ErrorCode::NotAuthorized,
+            }];
         };
         let Some(inv) = self.invitations.get_mut(&invitation) else {
-            return vec![HostAction::Close { conn, code: ErrorCode::InvitationInvalid }];
+            return vec![HostAction::Close {
+                conn,
+                code: ErrorCode::InvitationInvalid,
+            }];
         };
         if inv.params.kind != InvitationKind::SendLink {
-            return vec![HostAction::Close { conn, code: ErrorCode::ProtocolError }];
+            return vec![HostAction::Close {
+                conn,
+                code: ErrorCode::ProtocolError,
+            }];
         }
         if !inv.is_open(now) {
             return self.end_if_open(&invitation, ErrorCode::InvitationInvalid);
@@ -428,23 +459,35 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
                 return existing
                     .last_reply
                     .iter()
-                    .map(|m| HostAction::Send { conn, message: m.clone() })
+                    .map(|m| HostAction::Send {
+                        conn,
+                        message: m.clone(),
+                    })
                     .collect();
             }
             if existing.state != AttemptState::Running {
                 return vec![HostAction::Send {
                     conn,
-                    message: ControlMessage::CodeAbort { attempt, code: ErrorCode::PairingFailed },
+                    message: ControlMessage::CodeAbort {
+                        attempt,
+                        code: ErrorCode::PairingFailed,
+                    },
                 }];
             }
         } else {
             if inv.attempts_left == 0 {
-                return vec![HostAction::Close { conn, code: ErrorCode::AttemptsExhausted }];
+                return vec![HostAction::Close {
+                    conn,
+                    code: ErrorCode::AttemptsExhausted,
+                }];
             }
             // Debit first. Nothing below runs on an undebited attempt.
             inv.attempts_left -= 1;
             let (Some(joiner), Some(code)) = (inv.joiners.get(&conn), inv.code.as_ref()) else {
-                return vec![HostAction::Close { conn, code: ErrorCode::InternalError }];
+                return vec![HostAction::Close {
+                    conn,
+                    code: ErrorCode::InternalError,
+                }];
             };
             let binding = binding_transcript(
                 &inv.ticket_hash,
@@ -454,7 +497,9 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
                 &joiner.identity,
                 &joiner.pair_exporter,
             );
-            let exchange = self.factory.start(ExchangeRole::Responder, code, &binding, rng);
+            let exchange = self
+                .factory
+                .start(ExchangeRole::Responder, code, &binding, rng);
             inv.attempts.insert(
                 key,
                 HostAttempt {
@@ -476,10 +521,14 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
         };
         match result {
             Ok(step) => {
-                let reply = step.send.map(|payload| ControlMessage::CodeExchange { attempt, payload });
+                let reply = step
+                    .send
+                    .map(|payload| ControlMessage::CodeExchange { attempt, payload });
                 record.last_reply = reply.clone();
-                let mut actions: Vec<HostAction> =
-                    reply.into_iter().map(|message| HostAction::Send { conn, message }).collect();
+                let mut actions: Vec<HostAction> = reply
+                    .into_iter()
+                    .map(|message| HostAction::Send { conn, message })
+                    .collect();
                 if step.peer_confirmed {
                     record.state = AttemptState::Succeeded;
                     record.exchange = None;
@@ -488,11 +537,17 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
                 actions
             }
             Err(_) => {
-                let abort = ControlMessage::CodeAbort { attempt, code: ErrorCode::PairingFailed };
+                let abort = ControlMessage::CodeAbort {
+                    attempt,
+                    code: ErrorCode::PairingFailed,
+                };
                 record.state = AttemptState::Failed;
                 record.exchange = None;
                 record.last_reply = Some(abort.clone());
-                let mut actions = vec![HostAction::Send { conn, message: abort }];
+                let mut actions = vec![HostAction::Send {
+                    conn,
+                    message: abort,
+                }];
                 actions.extend(self.end_if_exhausted(&invitation));
                 actions
             }
@@ -546,7 +601,10 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
             return Vec::new();
         };
         if !inv.is_open(now) {
-            return vec![HostAction::Close { conn, code: ErrorCode::InvitationInvalid }];
+            return vec![HostAction::Close {
+                conn,
+                code: ErrorCode::InvitationInvalid,
+            }];
         }
         let Some(joiner) = inv.joiners.remove(&conn) else {
             return Vec::new();
@@ -562,16 +620,25 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
             Ok(added) => added,
             Err(GrantError::Denied) => {
                 self.by_conn.remove(&conn);
-                return vec![HostAction::Close { conn, code: ErrorCode::NotAuthorized }];
+                return vec![HostAction::Close {
+                    conn,
+                    code: ErrorCode::NotAuthorized,
+                }];
             }
             Err(_) => {
                 self.by_conn.remove(&conn);
-                return vec![HostAction::Close { conn, code: ErrorCode::InternalError }];
+                return vec![HostAction::Close {
+                    conn,
+                    code: ErrorCode::InternalError,
+                }];
             }
         };
         if grants.bind(conn, grant, now).is_err() {
             self.by_conn.remove(&conn);
-            return vec![HostAction::Close { conn, code: ErrorCode::InternalError }];
+            return vec![HostAction::Close {
+                conn,
+                code: ErrorCode::InternalError,
+            }];
         }
         inv.status = InvitationStatus::Consumed { grant };
         inv.attempts.clear();
@@ -604,7 +671,11 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
 
     fn end_if_exhausted(&mut self, invitation: &InvitationId) -> Vec<HostAction> {
         let exhausted = self.invitations.get(invitation).is_some_and(|inv| {
-            inv.attempts_left == 0 && !inv.attempts.values().any(|a| a.state == AttemptState::Running)
+            inv.attempts_left == 0
+                && !inv
+                    .attempts
+                    .values()
+                    .any(|a| a.state == AttemptState::Running)
         });
         if exhausted {
             self.end_if_open(invitation, ErrorCode::AttemptsExhausted)

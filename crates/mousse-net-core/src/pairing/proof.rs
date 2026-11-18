@@ -89,7 +89,8 @@ fn join_mac(
     join_exporter: &[u8; EXPORTER_LEN],
 ) -> Hmac<Sha256> {
     let key = join_proof_key(secret, invitation);
-    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key.as_slice()).expect("HMAC accepts any key length");
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key.as_slice())
+        .expect("HMAC accepts any key length");
     mac.update(&join_proof_input(invitation, host, joiner, join_exporter));
     mac
 }
@@ -168,8 +169,14 @@ pub fn binding_transcript(
         (
             5,
             Value::Array(vec![
-                Value::Array(vec![Value::Uint(ROLE_HOST), Value::Bytes(host.as_bytes().to_vec())]),
-                Value::Array(vec![Value::Uint(ROLE_JOINER), Value::Bytes(joiner.as_bytes().to_vec())]),
+                Value::Array(vec![
+                    Value::Uint(ROLE_HOST),
+                    Value::Bytes(host.as_bytes().to_vec()),
+                ]),
+                Value::Array(vec![
+                    Value::Uint(ROLE_JOINER),
+                    Value::Bytes(joiner.as_bytes().to_vec()),
+                ]),
             ]),
         ),
         (6, Value::Bytes(pair_exporter.to_vec())),
@@ -195,11 +202,36 @@ mod tests {
         let exp = [3u8; 32];
         let tag = join_proof_mac(&secret, &inv, &host, &joiner, &exp);
         assert!(verify_join_proof(&secret, &inv, &host, &joiner, &exp, &tag));
-        assert!(!verify_join_proof(&TicketSecret::from_bytes([9; 16]), &inv, &host, &joiner, &exp, &tag));
-        assert!(!verify_join_proof(&secret, &InvitationId([9; 16]), &host, &joiner, &exp, &tag));
-        assert!(!verify_join_proof(&secret, &inv, &joiner, &host, &exp, &tag));
-        assert!(!verify_join_proof(&secret, &inv, &host, &key(3), &exp, &tag));
-        assert!(!verify_join_proof(&secret, &inv, &host, &joiner, &[4; 32], &tag));
+        assert!(!verify_join_proof(
+            &TicketSecret::from_bytes([9; 16]),
+            &inv,
+            &host,
+            &joiner,
+            &exp,
+            &tag
+        ));
+        assert!(!verify_join_proof(
+            &secret,
+            &InvitationId([9; 16]),
+            &host,
+            &joiner,
+            &exp,
+            &tag
+        ));
+        assert!(!verify_join_proof(
+            &secret, &inv, &joiner, &host, &exp, &tag
+        ));
+        assert!(!verify_join_proof(
+            &secret,
+            &inv,
+            &host,
+            &key(3),
+            &exp,
+            &tag
+        ));
+        assert!(!verify_join_proof(
+            &secret, &inv, &host, &joiner, &[4; 32], &tag
+        ));
     }
 
     #[test]

@@ -21,8 +21,8 @@ use zeroize::Zeroizing;
 use crate::asn1::{self, Reader};
 use crate::cbor::{self, Value};
 use crate::identity::{
-    IdentityPublicKey, IdentitySigner, KeyError, PublicKey, RawSignature, SignatureError, SignerError,
-    SoftwareKey, PUBLIC_KEY_LEN,
+    IdentityPublicKey, IdentitySigner, KeyError, PublicKey, RawSignature, SignatureError,
+    SignerError, SoftwareKey, PUBLIC_KEY_LEN,
 };
 use crate::time::{UnixTime, CLOCK_SKEW_SECS};
 use crate::PROTOCOL_VERSION;
@@ -39,8 +39,8 @@ pub const EXTENSION_OID: &str = "2.25.67239088527495828216221962252461137669";
 
 /// DER content octets of [`EXTENSION_OID`].
 pub const EXTENSION_OID_DER: [u8; 19] = [
-    0x69, 0xe5, 0x95, 0xe3, 0xc0, 0xfb, 0xf6, 0x8a, 0x84, 0xf5, 0x95, 0xc9, 0xda, 0xbe, 0xf4, 0xe2, 0xf7,
-    0xbe, 0x05,
+    0x69, 0xe5, 0x95, 0xe3, 0xc0, 0xfb, 0xf6, 0x8a, 0x84, 0xf5, 0x95, 0xc9, 0xda, 0xbe, 0xf4, 0xe2,
+    0xf7, 0xbe, 0x05,
 ];
 
 /// Common name used for both issuer and subject.
@@ -54,14 +54,16 @@ pub const CLOCK_ERROR_MESSAGE: &str =
 
 /// `AlgorithmIdentifier` for ecdsa-with-SHA256 (1.2.840.10045.4.3.2), no
 /// parameters.
-const ECDSA_WITH_SHA256: [u8; 12] = [0x30, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
+const ECDSA_WITH_SHA256: [u8; 12] = [
+    0x30, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02,
+];
 
 /// SPKI DER prefix for an uncompressed P-256 point: id-ecPublicKey with
 /// namedCurve prime256v1, then the BIT STRING header and its zero
 /// unused-bits byte. The 65-byte point follows.
 const SPKI_PREFIX: [u8; 26] = [
-    0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86,
-    0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
+    0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a,
+    0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
 ];
 
 /// OID 2.5.4.3 (commonName), content octets.
@@ -138,7 +140,10 @@ impl ValidityWindow {
         if not_after.secs() > MAX_ENCODABLE_TIME {
             return Err(CertError::WindowInvalid);
         }
-        Ok(Self { not_before, not_after })
+        Ok(Self {
+            not_before,
+            not_after,
+        })
     }
 
     /// A window from `start` lasting `lifetime_secs`.
@@ -179,7 +184,12 @@ fn spki_from_point(point: &[u8]) -> Vec<u8> {
 
 /// The canonical CBOR record the identity key signs:
 /// `{1: "mousse-session-v1", 2: spki_der, 3: not_before, 4: not_after, 5: version}`.
-pub fn session_record(spki_der: &[u8], not_before: UnixTime, not_after: UnixTime, version: u64) -> Vec<u8> {
+pub fn session_record(
+    spki_der: &[u8],
+    not_before: UnixTime,
+    not_after: UnixTime,
+    version: u64,
+) -> Vec<u8> {
     cbor::encode(&Value::Map(vec![
         (1, Value::Text(SESSION_DOMAIN.to_owned())),
         (2, Value::Bytes(spki_der.to_vec())),
@@ -264,8 +274,17 @@ pub struct PendingCertificate {
 impl PendingCertificate {
     /// Prepare the record for `key` and `window` at [`PROTOCOL_VERSION`].
     pub fn new(key: SessionKey, window: ValidityWindow) -> Self {
-        let record = session_record(&key.spki_der(), window.not_before, window.not_after, PROTOCOL_VERSION);
-        Self { key, window, record }
+        let record = session_record(
+            &key.spki_der(),
+            window.not_before,
+            window.not_after,
+            PROTOCOL_VERSION,
+        );
+        Self {
+            key,
+            window,
+            record,
+        }
     }
 
     /// The exact bytes the identity key must sign (ECDSA P-256, SHA-256).
@@ -275,7 +294,11 @@ impl PendingCertificate {
 
     /// Assemble the certificate. The identity signature is checked first, so
     /// a broken signer can never produce a certificate.
-    pub fn finish(self, identity: IdentityPublicKey, signature: RawSignature) -> Result<SessionCertificate, CertError> {
+    pub fn finish(
+        self,
+        identity: IdentityPublicKey,
+        signature: RawSignature,
+    ) -> Result<SessionCertificate, CertError> {
         identity
             .verify(&self.record, &signature)
             .map_err(|_| CertError::IdentitySignatureInvalid)?;
@@ -324,7 +347,9 @@ pub fn issue<R: CryptoRng + ?Sized>(
 ) -> Result<SessionCertificate, IssueError> {
     let pending = PendingCertificate::new(SessionKey::generate(rng), window);
     let signature = signer.sign(pending.record()).map_err(IssueError::Signer)?;
-    pending.finish(signer.public_key(), signature).map_err(IssueError::Cert)
+    pending
+        .finish(signer.public_key(), signature)
+        .map_err(IssueError::Cert)
 }
 
 /// Our own certificate and its session private key.
@@ -376,7 +401,11 @@ pub struct VerifiedSessionCert {
 impl VerifiedSessionCert {
     /// Verify a TLS 1.3 CertificateVerify signature (`ecdsa_secp256r1_sha256`,
     /// DER) made by this certificate's session key over `message`.
-    pub fn verify_tls_signature(&self, message: &[u8], der_signature: &[u8]) -> Result<(), SignatureError> {
+    pub fn verify_tls_signature(
+        &self,
+        message: &[u8],
+        der_signature: &[u8],
+    ) -> Result<(), SignatureError> {
         let raw = RawSignature::from_der(der_signature)?;
         self.session_key.verify(message, &raw)
     }
@@ -398,8 +427,10 @@ pub fn verify(
     if parts.version != PROTOCOL_VERSION {
         return Err(CertError::UnsupportedVersion);
     }
-    let identity = PublicKey::from_sec1(parts.identity_key).map_err(|_| CertError::IdentityKeyInvalid)?;
-    let session_key = PublicKey::from_sec1(&parts.session_point).map_err(|_| CertError::SessionKeyInvalid)?;
+    let identity =
+        PublicKey::from_sec1(parts.identity_key).map_err(|_| CertError::IdentityKeyInvalid)?;
+    let session_key =
+        PublicKey::from_sec1(&parts.session_point).map_err(|_| CertError::SessionKeyInvalid)?;
     let identity_signature = match RawSignature::from_slice(parts.identity_signature) {
         Ok(sig) => Some(sig),
         Err(SignatureError::NotRaw) => return Err(CertError::IdentitySignatureNotRaw),
@@ -408,7 +439,8 @@ pub fn verify(
     };
     let window = ValidityWindow::new(parts.not_before, parts.not_after)?;
 
-    let self_signature = RawSignature::from_der(parts.self_signature_der).map_err(|_| CertError::SelfSignatureInvalid)?;
+    let self_signature = RawSignature::from_der(parts.self_signature_der)
+        .map_err(|_| CertError::SelfSignatureInvalid)?;
     session_key
         .verify(parts.tbs, &self_signature)
         .map_err(|_| CertError::SelfSignatureInvalid)?;
@@ -487,13 +519,19 @@ fn tbs_der(
     let spki = spki_from_point(session_point);
     let validity = asn1::wrap(
         asn1::SEQUENCE,
-        &[&encode_time(not_before.secs())?, &encode_time(not_after.secs())?],
+        &[
+            &encode_time(not_before.secs())?,
+            &encode_time(not_after.secs())?,
+        ],
     );
     let extension = asn1::wrap(
         asn1::SEQUENCE,
         &[
             &asn1::tlv(asn1::OID, &EXTENSION_OID_DER),
-            &asn1::tlv(asn1::OCTET_STRING, &binding_der(version, identity_key, identity_signature)),
+            &asn1::tlv(
+                asn1::OCTET_STRING,
+                &binding_der(version, identity_key, identity_signature),
+            ),
         ],
     );
     let extensions = asn1::tlv(asn1::CONTEXT_3, &asn1::tlv(asn1::SEQUENCE, &extension));
@@ -516,7 +554,10 @@ fn tbs_der(
 fn certificate_der(tbs: &[u8], self_signature: &RawSignature) -> Vec<u8> {
     let mut bits = vec![0u8];
     bits.extend_from_slice(&self_signature.to_der());
-    asn1::wrap(asn1::SEQUENCE, &[tbs, &ECDSA_WITH_SHA256, &asn1::tlv(asn1::BIT_STRING, &bits)])
+    asn1::wrap(
+        asn1::SEQUENCE,
+        &[tbs, &ECDSA_WITH_SHA256, &asn1::tlv(asn1::BIT_STRING, &bits)],
+    )
 }
 
 /// Build a certificate from raw parts. Does not check the identity parts, so
@@ -530,7 +571,14 @@ pub(crate) fn build_certificate(
     identity_signature: &[u8],
 ) -> Result<Vec<u8>, CertError> {
     let point = key.public_key();
-    let tbs = tbs_der(point.as_bytes(), not_before, not_after, version, identity_key, identity_signature)?;
+    let tbs = tbs_der(
+        point.as_bytes(),
+        not_before,
+        not_after,
+        version,
+        identity_key,
+        identity_signature,
+    )?;
     let self_signature = key.sign_raw(&tbs);
     Ok(certificate_der(&tbs, &self_signature))
 }
@@ -569,7 +617,14 @@ fn parse(der: &[u8]) -> Result<Parts<'_>, CertError> {
     }
     let mut bits = vec![0u8];
     bits.extend_from_slice(parts.self_signature_der);
-    let rebuilt = asn1::wrap(asn1::SEQUENCE, &[&tbs, &ECDSA_WITH_SHA256, &asn1::tlv(asn1::BIT_STRING, &bits)]);
+    let rebuilt = asn1::wrap(
+        asn1::SEQUENCE,
+        &[
+            &tbs,
+            &ECDSA_WITH_SHA256,
+            &asn1::tlv(asn1::BIT_STRING, &bits),
+        ],
+    );
     if rebuilt != der {
         return Err(CertError::Malformed);
     }
@@ -626,7 +681,9 @@ fn parse_fields(der: &[u8]) -> Result<Parts<'_>, asn1::DerError> {
     if version_bytes.len() > 8 {
         return Err(DerError);
     }
-    let version = version_bytes.iter().fold(0u64, |acc, x| (acc << 8) | u64::from(*x));
+    let version = version_bytes
+        .iter()
+        .fold(0u64, |acc, x| (acc << 8) | u64::from(*x));
     let identity_key = b.read(asn1::OCTET_STRING)?;
     let identity_signature = b.read(asn1::OCTET_STRING)?;
     b.finish()?;
@@ -679,7 +736,10 @@ fn encode_time(secs: u64) -> Result<Vec<u8>, CertError> {
     let rem = secs.rem_euclid(86_400);
     let (hour, minute, second) = (rem / 3600, rem % 3600 / 60, rem % 60);
     if year < 2050 {
-        let text = format!("{:02}{month:02}{day:02}{hour:02}{minute:02}{second:02}Z", year % 100);
+        let text = format!(
+            "{:02}{month:02}{day:02}{hour:02}{minute:02}{second:02}Z",
+            year % 100
+        );
         Ok(asn1::tlv(asn1::UTC_TIME, text.as_bytes()))
     } else {
         let text = format!("{year:04}{month:02}{day:02}{hour:02}{minute:02}{second:02}Z");
@@ -774,7 +834,9 @@ mod tests {
         assert_eq!(v.spki_der, c.key().spki_der());
         let msg = b"tls transcript";
         assert_eq!(v.verify_tls_signature(msg, &c.key().sign_tls(msg)), Ok(()));
-        assert!(v.verify_tls_signature(b"other", &c.key().sign_tls(msg)).is_err());
+        assert!(v
+            .verify_tls_signature(b"other", &c.key().sign_tls(msg))
+            .is_err());
     }
 
     #[test]
@@ -809,7 +871,10 @@ mod tests {
     #[test]
     fn pin_mismatch_is_rejected_even_when_everything_else_is_valid() {
         let c = cert(&identity(1), 2);
-        assert_eq!(verify(c.der(), T0, Some(&identity(9).public_key())), Err(CertError::PinMismatch));
+        assert_eq!(
+            verify(c.der(), T0, Some(&identity(9).public_key())),
+            Err(CertError::PinMismatch)
+        );
     }
 
     #[test]
@@ -818,10 +883,26 @@ mod tests {
         let tls_key = SessionKey::generate(&mut rng(2));
         let other_key = SessionKey::generate(&mut rng(3));
         let window = ValidityWindow::starting_at(T0, 3600).unwrap();
-        let record = session_record(&other_key.spki_der(), window.not_before(), window.not_after(), 1);
+        let record = session_record(
+            &other_key.spki_der(),
+            window.not_before(),
+            window.not_after(),
+            1,
+        );
         let sig = id.sign_raw(&record);
-        let der = build_certificate(&tls_key, window.not_before(), window.not_after(), 1, id.public_key().as_bytes(), sig.as_bytes()).unwrap();
-        assert_eq!(verify(&der, T0, None), Err(CertError::IdentitySignatureInvalid));
+        let der = build_certificate(
+            &tls_key,
+            window.not_before(),
+            window.not_after(),
+            1,
+            id.public_key().as_bytes(),
+            sig.as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            verify(&der, T0, None),
+            Err(CertError::IdentitySignatureInvalid)
+        );
     }
 
     #[test]
@@ -831,20 +912,35 @@ mod tests {
         let window = ValidityWindow::starting_at(T0, 3600).unwrap();
         let record = session_record(&key.spki_der(), window.not_before(), window.not_after(), 1);
         let der_sig = id.sign_raw(&record).to_der();
-        let der = build_certificate(&key, window.not_before(), window.not_after(), 1, id.public_key().as_bytes(), &der_sig).unwrap();
-        assert_eq!(verify(&der, T0, None), Err(CertError::IdentitySignatureNotRaw));
+        let der = build_certificate(
+            &key,
+            window.not_before(),
+            window.not_after(),
+            1,
+            id.public_key().as_bytes(),
+            &der_sig,
+        )
+        .unwrap();
+        assert_eq!(
+            verify(&der, T0, None),
+            Err(CertError::IdentitySignatureNotRaw)
+        );
     }
 
     #[test]
     fn long_windows_are_rejected_at_build_and_verify() {
-        assert_eq!(ValidityWindow::starting_at(T0, 86_401), Err(CertError::WindowInvalid));
+        assert_eq!(
+            ValidityWindow::starting_at(T0, 86_401),
+            Err(CertError::WindowInvalid)
+        );
         assert_eq!(ValidityWindow::new(T0, T0), Err(CertError::WindowInvalid));
         let id = identity(1);
         let key = SessionKey::generate(&mut rng(2));
         let na = T0.plus(86_401);
         let record = session_record(&key.spki_der(), T0, na, 1);
         let sig = id.sign_raw(&record);
-        let der = build_certificate(&key, T0, na, 1, id.public_key().as_bytes(), sig.as_bytes()).unwrap();
+        let der =
+            build_certificate(&key, T0, na, 1, id.public_key().as_bytes(), sig.as_bytes()).unwrap();
         assert_eq!(verify(&der, T0, None), Err(CertError::WindowInvalid));
     }
 
@@ -860,7 +956,10 @@ mod tests {
         let mut longer = der.clone();
         longer.push(0);
         assert_eq!(verify(&longer, T0, None), Err(CertError::Malformed));
-        assert_eq!(verify(&der[..der.len() - 1], T0, None), Err(CertError::Malformed));
+        assert_eq!(
+            verify(&der[..der.len() - 1], T0, None),
+            Err(CertError::Malformed)
+        );
     }
 
     #[test]
@@ -870,7 +969,11 @@ mod tests {
         // re-encoding check must refuse it.
         let der = c.der();
         let oid_tlv = asn1::tlv(asn1::OID, &EXTENSION_OID_DER);
-        let at = der.windows(oid_tlv.len()).position(|w| w == oid_tlv).unwrap() + oid_tlv.len();
+        let at = der
+            .windows(oid_tlv.len())
+            .position(|w| w == oid_tlv)
+            .unwrap()
+            + oid_tlv.len();
         let mut bad = der[..at].to_vec();
         bad.extend_from_slice(&[0x01, 0x01, 0xff]);
         bad.extend_from_slice(&der[at..]);
@@ -884,15 +987,34 @@ mod tests {
         let window = ValidityWindow::starting_at(T0, 3600).unwrap();
         let record = session_record(&key.spki_der(), window.not_before(), window.not_after(), 2);
         let sig = id.sign_raw(&record);
-        let der = build_certificate(&key, window.not_before(), window.not_after(), 2, id.public_key().as_bytes(), sig.as_bytes()).unwrap();
+        let der = build_certificate(
+            &key,
+            window.not_before(),
+            window.not_after(),
+            2,
+            id.public_key().as_bytes(),
+            sig.as_bytes(),
+        )
+        .unwrap();
         assert_eq!(verify(&der, T0, None), Err(CertError::UnsupportedVersion));
     }
 
     #[test]
     fn times_round_trip_across_the_utc_generalized_boundary() {
-        for secs in [0u64, 951_782_400, 1_790_000_000, 2_524_607_999, 2_524_608_000, MAX_ENCODABLE_TIME] {
+        for secs in [
+            0u64,
+            951_782_400,
+            1_790_000_000,
+            2_524_607_999,
+            2_524_608_000,
+            MAX_ENCODABLE_TIME,
+        ] {
             let tlv = encode_time(secs).unwrap();
-            let expected_tag = if secs < 2_524_608_000 { asn1::UTC_TIME } else { asn1::GENERALIZED_TIME };
+            let expected_tag = if secs < 2_524_608_000 {
+                asn1::UTC_TIME
+            } else {
+                asn1::GENERALIZED_TIME
+            };
             assert_eq!(tlv[0], expected_tag, "secs={secs}");
             assert_eq!(parse_time(tlv[0], &tlv[2..]), Ok(UnixTime(secs)));
         }
@@ -913,8 +1035,14 @@ mod tests {
     #[test]
     fn pending_certificate_refuses_a_bad_identity_signature() {
         let id = identity(1);
-        let pending = PendingCertificate::new(SessionKey::generate(&mut rng(2)), ValidityWindow::starting_at(T0, 60).unwrap());
+        let pending = PendingCertificate::new(
+            SessionKey::generate(&mut rng(2)),
+            ValidityWindow::starting_at(T0, 60).unwrap(),
+        );
         let wrong = id.sign_raw(b"not the record");
-        assert_eq!(pending.finish(id.public_key(), wrong).unwrap_err(), CertError::IdentitySignatureInvalid);
+        assert_eq!(
+            pending.finish(id.public_key(), wrong).unwrap_err(),
+            CertError::IdentitySignatureInvalid
+        );
     }
 }

@@ -108,7 +108,9 @@ impl<'a> Reader<'a> {
             if bytes[0] == 0 {
                 return Err(DerError);
             }
-            let len = bytes.iter().fold(0usize, |acc, b| (acc << 8) | usize::from(*b));
+            let len = bytes
+                .iter()
+                .fold(0usize, |acc, b| (acc << 8) | usize::from(*b));
             if len < 0x80 {
                 return Err(DerError);
             }
@@ -164,7 +166,10 @@ mod tests {
     fn lengths_use_minimal_forms() {
         assert_eq!(tlv(OCTET_STRING, &[0; 0x7f])[..2], [0x04, 0x7f]);
         assert_eq!(tlv(OCTET_STRING, &[0; 0x80])[..3], [0x04, 0x81, 0x80]);
-        assert_eq!(tlv(OCTET_STRING, &[0; 0x100])[..4], [0x04, 0x82, 0x01, 0x00]);
+        assert_eq!(
+            tlv(OCTET_STRING, &[0; 0x100])[..4],
+            [0x04, 0x82, 0x01, 0x00]
+        );
     }
 
     #[test]

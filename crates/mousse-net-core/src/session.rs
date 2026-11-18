@@ -154,7 +154,10 @@ impl PeerSession {
         let mut events = Vec::new();
         if let Some(old) = self.candidate.take() {
             if old.conn != conn {
-                events.push(SessionEvent::Close { conn: old.conn, code: ErrorCode::PathReplaced });
+                events.push(SessionEvent::Close {
+                    conn: old.conn,
+                    code: ErrorCode::PathReplaced,
+                });
             }
         }
         self.candidate = Some(Candidate {
@@ -203,13 +206,20 @@ impl PeerSession {
     /// the old path closes.
     pub fn on_reopened(&mut self, conn: ConnectionId) -> Result<Vec<SessionEvent>, PathError> {
         let info = match self.candidate {
-            Some(Candidate { conn: c, phase: CandidatePhase::Reopening, info: Some(info) }) if c == conn => info,
+            Some(Candidate {
+                conn: c,
+                phase: CandidatePhase::Reopening,
+                info: Some(info),
+            }) if c == conn => info,
             _ => return Err(PathError::UnknownPath),
         };
         self.candidate = None;
         let mut events = Vec::new();
         if let Some(old) = self.current.replace(info) {
-            events.push(SessionEvent::Close { conn: old.conn, code: ErrorCode::PathReplaced });
+            events.push(SessionEvent::Close {
+                conn: old.conn,
+                code: ErrorCode::PathReplaced,
+            });
         }
         self.renewal_requested = false;
         events.push(SessionEvent::Switched { conn });
@@ -229,7 +239,13 @@ impl PeerSession {
 
     /// When [`PeerSession::tick`] must next run.
     pub fn next_deadline(&self) -> Option<UnixTime> {
-        let current = self.current.map(|p| if self.renewal_requested { p.deadline } else { p.renew_at });
+        let current = self.current.map(|p| {
+            if self.renewal_requested {
+                p.deadline
+            } else {
+                p.renew_at
+            }
+        });
         let candidate = self.candidate.and_then(|c| c.info).map(|i| i.deadline);
         current.into_iter().chain(candidate).min()
     }
@@ -240,14 +256,20 @@ impl PeerSession {
         if let Some(info) = self.candidate.and_then(|c| c.info) {
             if now > info.deadline {
                 self.candidate = None;
-                events.push(SessionEvent::Close { conn: info.conn, code: ErrorCode::CertExpired });
+                events.push(SessionEvent::Close {
+                    conn: info.conn,
+                    code: ErrorCode::CertExpired,
+                });
             }
         }
         if let Some(path) = self.current {
             if now > path.deadline {
                 self.current = None;
                 self.renewal_requested = false;
-                events.push(SessionEvent::Close { conn: path.conn, code: ErrorCode::CertExpired });
+                events.push(SessionEvent::Close {
+                    conn: path.conn,
+                    code: ErrorCode::CertExpired,
+                });
             } else if now >= path.renew_at && !self.renewal_requested {
                 self.renewal_requested = true;
                 events.push(SessionEvent::RenewDue { conn: path.conn });
@@ -270,7 +292,12 @@ mod tests {
 
     fn peer_cert(seed: u8, lifetime: u64) -> VerifiedSessionCert {
         let id = SoftwareKey::generate(&mut ChaCha20Rng::from_seed([seed; 32]));
-        let c = issue(&id, &mut ChaCha20Rng::from_seed([seed + 100; 32]), ValidityWindow::starting_at(T0, lifetime).unwrap()).unwrap();
+        let c = issue(
+            &id,
+            &mut ChaCha20Rng::from_seed([seed + 100; 32]),
+            ValidityWindow::starting_at(T0, lifetime).unwrap(),
+        )
+        .unwrap();
         verify(c.der(), T0, None).unwrap()
     }
 
@@ -283,15 +310,24 @@ mod tests {
         let peer = peer_cert(1, 3_600);
         let mut s = PeerSession::new(peer.identity);
         s.begin_path(ConnectionId(1));
-        s.on_authenticated(ConnectionId(1), &peer, local(86_400), T0).unwrap();
+        s.on_authenticated(ConnectionId(1), &peer, local(86_400), T0)
+            .unwrap();
         s.on_reopened(ConnectionId(1)).unwrap();
         let deadline = T0.plus(3_600 + CLOCK_SKEW_SECS);
         assert_eq!(s.current().unwrap().deadline, deadline);
-        assert_eq!(s.tick(T0.plus(3_600 - RENEW_LEAD_SECS)), vec![SessionEvent::RenewDue { conn: ConnectionId(1) }]);
+        assert_eq!(
+            s.tick(T0.plus(3_600 - RENEW_LEAD_SECS)),
+            vec![SessionEvent::RenewDue {
+                conn: ConnectionId(1)
+            }]
+        );
         assert_eq!(s.tick(deadline), vec![]);
         assert_eq!(
             s.tick(deadline.plus(1)),
-            vec![SessionEvent::Close { conn: ConnectionId(1), code: ErrorCode::CertExpired }]
+            vec![SessionEvent::Close {
+                conn: ConnectionId(1),
+                code: ErrorCode::CertExpired
+            }]
         );
         assert!(s.current().is_none());
     }
@@ -301,18 +337,36 @@ mod tests {
         let peer = peer_cert(1, 86_400);
         let mut s = PeerSession::new(peer.identity);
         s.begin_path(ConnectionId(1));
-        s.on_authenticated(ConnectionId(1), &peer, local(86_400), T0).unwrap();
+        s.on_authenticated(ConnectionId(1), &peer, local(86_400), T0)
+            .unwrap();
         s.on_reopened(ConnectionId(1)).unwrap();
         s.begin_path(ConnectionId(2));
-        let events = s.on_authenticated(ConnectionId(2), &peer, local(86_400), T0).unwrap();
-        assert_eq!(events, vec![SessionEvent::Reopen { from: Some(ConnectionId(1)), to: ConnectionId(2) }]);
-        assert_eq!(s.current().unwrap().conn, ConnectionId(1), "old path stays until reopen is done");
+        let events = s
+            .on_authenticated(ConnectionId(2), &peer, local(86_400), T0)
+            .unwrap();
+        assert_eq!(
+            events,
+            vec![SessionEvent::Reopen {
+                from: Some(ConnectionId(1)),
+                to: ConnectionId(2)
+            }]
+        );
+        assert_eq!(
+            s.current().unwrap().conn,
+            ConnectionId(1),
+            "old path stays until reopen is done"
+        );
         let events = s.on_reopened(ConnectionId(2)).unwrap();
         assert_eq!(
             events,
             vec![
-                SessionEvent::Close { conn: ConnectionId(1), code: ErrorCode::PathReplaced },
-                SessionEvent::Switched { conn: ConnectionId(2) }
+                SessionEvent::Close {
+                    conn: ConnectionId(1),
+                    code: ErrorCode::PathReplaced
+                },
+                SessionEvent::Switched {
+                    conn: ConnectionId(2)
+                }
             ]
         );
     }
@@ -323,10 +377,14 @@ mod tests {
         let impostor = peer_cert(2, 86_400);
         let mut s = PeerSession::new(peer.identity);
         s.begin_path(ConnectionId(1));
-        s.on_authenticated(ConnectionId(1), &peer, local(86_400), T0).unwrap();
+        s.on_authenticated(ConnectionId(1), &peer, local(86_400), T0)
+            .unwrap();
         s.on_reopened(ConnectionId(1)).unwrap();
         s.begin_path(ConnectionId(2));
-        assert_eq!(s.on_authenticated(ConnectionId(2), &impostor, local(86_400), T0), Err(PathError::PinMismatch));
+        assert_eq!(
+            s.on_authenticated(ConnectionId(2), &impostor, local(86_400), T0),
+            Err(PathError::PinMismatch)
+        );
         assert_eq!(s.current().unwrap().conn, ConnectionId(1));
         assert!(s.candidate().is_none());
     }
@@ -336,9 +394,16 @@ mod tests {
         let peer = peer_cert(1, 86_400);
         let mut s = PeerSession::new(peer.identity);
         s.begin_path(ConnectionId(1));
-        s.on_authenticated(ConnectionId(1), &peer, local(7_200), T0).unwrap();
+        s.on_authenticated(ConnectionId(1), &peer, local(7_200), T0)
+            .unwrap();
         s.on_reopened(ConnectionId(1)).unwrap();
-        assert_eq!(s.current().unwrap().deadline, T0.plus(7_200 + CLOCK_SKEW_SECS));
-        assert_eq!(s.current().unwrap().renew_at, T0.plus(7_200 - RENEW_LEAD_SECS));
+        assert_eq!(
+            s.current().unwrap().deadline,
+            T0.plus(7_200 + CLOCK_SKEW_SECS)
+        );
+        assert_eq!(
+            s.current().unwrap().renew_at,
+            T0.plus(7_200 - RENEW_LEAD_SECS)
+        );
     }
 }

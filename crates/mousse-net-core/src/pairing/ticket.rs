@@ -108,7 +108,9 @@ impl fmt::Display for TicketError {
         match self {
             TicketError::Encoding => f.write_str("pairing link is not valid base64url"),
             TicketError::Field(e) => write!(f, "pairing ticket is malformed: {e}"),
-            TicketError::UnsupportedVersion(v) => write!(f, "pairing ticket version {v} is not supported"),
+            TicketError::UnsupportedVersion(v) => {
+                write!(f, "pairing ticket version {v} is not supported")
+            }
             TicketError::UnknownKind(k) => write!(f, "pairing ticket kind {k} is not known"),
             TicketError::Expired => f.write_str("pairing ticket has expired"),
         }
@@ -153,7 +155,10 @@ impl Ticket {
             (4, Value::Bytes(self.invitation.0.to_vec())),
             (5, Value::Bytes(self.secret.0.to_vec())),
             (6, Value::Uint(self.expires_at.secs())),
-            (7, Value::Array(self.routes.iter().map(|r| Value::Text(r.clone())).collect())),
+            (
+                7,
+                Value::Array(self.routes.iter().map(|r| Value::Text(r.clone())).collect()),
+            ),
         ]))
     }
 
@@ -166,8 +171,10 @@ impl Ticket {
             return Err(TicketError::UnsupportedVersion(version));
         }
         let kind_value = f.uint(2)?;
-        let kind = InvitationKind::from_u64(kind_value).ok_or(TicketError::UnknownKind(kind_value))?;
-        let host_identity = IdentityPublicKey::from_sec1(&f.bytes(3)?).map_err(|_| FieldError::Invalid(3))?;
+        let kind =
+            InvitationKind::from_u64(kind_value).ok_or(TicketError::UnknownKind(kind_value))?;
+        let host_identity =
+            IdentityPublicKey::from_sec1(&f.bytes(3)?).map_err(|_| FieldError::Invalid(3))?;
         let invitation = InvitationId(f.fixed::<16>(4)?);
         let secret = TicketSecret(f.fixed::<16>(5)?);
         let expires_at = UnixTime(f.uint(6)?);
@@ -252,7 +259,10 @@ mod tests {
     #[test]
     fn version_is_checked_first() {
         let bytes = cbor::encode(&Value::Map(vec![(1, Value::Uint(2))]));
-        assert_eq!(Ticket::decode(&bytes), Err(TicketError::UnsupportedVersion(2)));
+        assert_eq!(
+            Ticket::decode(&bytes),
+            Err(TicketError::UnsupportedVersion(2))
+        );
     }
 
     #[test]
@@ -262,19 +272,28 @@ mod tests {
         if let Value::Map(entries) = &mut value {
             entries[4].1 = Value::Bytes(vec![0; 15]);
         }
-        assert_eq!(Ticket::decode(&cbor::encode(&value)), Err(TicketError::Field(FieldError::Invalid(5))));
+        assert_eq!(
+            Ticket::decode(&cbor::encode(&value)),
+            Err(TicketError::Field(FieldError::Invalid(5)))
+        );
         let mut value = cbor::decode(&t.encode()).unwrap();
         if let Value::Map(entries) = &mut value {
             entries.push((8, Value::Uint(0)));
         }
-        assert_eq!(Ticket::decode(&cbor::encode(&value)), Err(TicketError::Field(FieldError::Unknown(8))));
+        assert_eq!(
+            Ticket::decode(&cbor::encode(&value)),
+            Err(TicketError::Field(FieldError::Unknown(8)))
+        );
     }
 
     #[test]
     fn joiner_freshness_allows_ten_minutes_of_skew() {
         let t = ticket();
         assert_eq!(t.check_fresh_for_joiner(t.expires_at.plus(599)), Ok(()));
-        assert_eq!(t.check_fresh_for_joiner(t.expires_at.plus(600)), Err(TicketError::Expired));
+        assert_eq!(
+            t.check_fresh_for_joiner(t.expires_at.plus(600)),
+            Err(TicketError::Expired)
+        );
     }
 
     #[test]

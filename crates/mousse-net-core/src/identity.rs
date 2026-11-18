@@ -168,12 +168,17 @@ impl RawSignature {
     pub fn from_der(der: &[u8]) -> Result<Self, SignatureError> {
         let seq = asn1::single(der, asn1::SEQUENCE).map_err(|_| SignatureError::BadDer)?;
         let mut reader = asn1::Reader::new(seq);
-        let r = reader.read(asn1::INTEGER).map_err(|_| SignatureError::BadDer)?;
-        let s = reader.read(asn1::INTEGER).map_err(|_| SignatureError::BadDer)?;
+        let r = reader
+            .read(asn1::INTEGER)
+            .map_err(|_| SignatureError::BadDer)?;
+        let s = reader
+            .read(asn1::INTEGER)
+            .map_err(|_| SignatureError::BadDer)?;
         reader.finish().map_err(|_| SignatureError::BadDer)?;
         let mut raw = [0u8; RAW_SIGNATURE_LEN];
         for (content, half) in [(r, 0usize), (s, 1usize)] {
-            let magnitude = asn1::parse_uint_content(content).map_err(|_| SignatureError::BadDer)?;
+            let magnitude =
+                asn1::parse_uint_content(content).map_err(|_| SignatureError::BadDer)?;
             if magnitude.len() > 32 {
                 return Err(SignatureError::OutOfRange);
             }
@@ -309,8 +314,37 @@ mod tests {
         let k = key(1);
         let sig = k.sign_raw(b"hello");
         assert_eq!(k.public_key().verify(b"hello", &sig), Ok(()));
-        assert_eq!(k.public_key().verify(b"hellO", &sig), Err(SignatureError::Invalid));
-        assert_eq!(key(2).public_key().verify(b"hello", &sig), Err(SignatureError::Invalid));
+        assert_eq!(
+            k.public_key().verify(b"hellO", &sig),
+            Err(SignatureError::Invalid)
+        );
+        assert_eq!(
+            key(2).public_key().verify(b"hello", &sig),
+            Err(SignatureError::Invalid)
+        );
+    }
+
+    #[test]
+    fn high_s_signatures_are_accepted() {
+        // P-256 group order n, big-endian.
+        const N: [u8; 32] = [
+            0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2,
+            0xfc, 0x63, 0x25, 0x51,
+        ];
+        let k = key(1);
+        let sig = k.sign_raw(b"m");
+        // s' = n - s also verifies; verifiers must not demand low s.
+        let mut flipped = *sig.as_bytes();
+        let mut borrow = 0i16;
+        for i in (0..32).rev() {
+            let d = i16::from(N[i]) - i16::from(sig.as_bytes()[32 + i]) - borrow;
+            borrow = i16::from(d < 0);
+            flipped[32 + i] = d.rem_euclid(256) as u8;
+        }
+        assert_ne!(&flipped, sig.as_bytes());
+        let other = RawSignature::from_slice(&flipped).unwrap();
+        k.public_key().verify(b"m", &other).unwrap();
     }
 
     #[test]
@@ -330,7 +364,10 @@ mod tests {
     #[test]
     fn der_where_raw_is_required_is_rejected() {
         let raw = key(4).sign_raw(b"x");
-        assert_eq!(RawSignature::from_slice(&raw.to_der()), Err(SignatureError::NotRaw));
+        assert_eq!(
+            RawSignature::from_slice(&raw.to_der()),
+            Err(SignatureError::NotRaw)
+        );
     }
 
     #[test]
@@ -340,15 +377,24 @@ mod tests {
         // Trailing byte after the SEQUENCE.
         let mut trailing = der.clone();
         trailing.push(0);
-        assert_eq!(RawSignature::from_der(&trailing), Err(SignatureError::BadDer));
+        assert_eq!(
+            RawSignature::from_der(&trailing),
+            Err(SignatureError::BadDer)
+        );
         // r padded with a needless leading zero.
-        let r = asn1::tlv(asn1::INTEGER, &[&[0u8][..], &asn1::uint_content(&raw.0[..32])].concat());
+        let r = asn1::tlv(
+            asn1::INTEGER,
+            &[&[0u8][..], &asn1::uint_content(&raw.0[..32])].concat(),
+        );
         let s = asn1::tlv(asn1::INTEGER, &asn1::uint_content(&raw.0[32..]));
         let padded = asn1::wrap(asn1::SEQUENCE, &[&r, &s]);
         assert_eq!(RawSignature::from_der(&padded), Err(SignatureError::BadDer));
         // Zero r.
         let zero = asn1::wrap(asn1::SEQUENCE, &[&asn1::tlv(asn1::INTEGER, &[0]), &s]);
-        assert_eq!(RawSignature::from_der(&zero), Err(SignatureError::OutOfRange));
+        assert_eq!(
+            RawSignature::from_der(&zero),
+            Err(SignatureError::OutOfRange)
+        );
     }
 
     #[test]
@@ -360,7 +406,13 @@ mod tests {
         assert_eq!(PublicKey::from_sec1(&off_curve), Err(KeyError::NotOnCurve));
         let mut compressed_tag = *pk.as_bytes();
         compressed_tag[0] = 0x02;
-        assert_eq!(PublicKey::from_sec1(&compressed_tag), Err(KeyError::NotUncompressed));
-        assert_eq!(PublicKey::from_sec1(&pk.as_bytes()[..33]), Err(KeyError::NotUncompressed));
+        assert_eq!(
+            PublicKey::from_sec1(&compressed_tag),
+            Err(KeyError::NotUncompressed)
+        );
+        assert_eq!(
+            PublicKey::from_sec1(&pk.as_bytes()[..33]),
+            Err(KeyError::NotUncompressed)
+        );
     }
 }

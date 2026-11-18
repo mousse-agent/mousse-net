@@ -180,8 +180,14 @@ pub mod insecure {
     }
 
     impl InsecureTestExchange {
-        fn tag(&self, initiator_nonce: &[u8; 16], responder_nonce: &[u8; 16], label: u8) -> [u8; 32] {
-            let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(self.code.as_bytes()).expect("any key length");
+        fn tag(
+            &self,
+            initiator_nonce: &[u8; 16],
+            responder_nonce: &[u8; 16],
+            label: u8,
+        ) -> [u8; 32] {
+            let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(self.code.as_bytes())
+                .expect("any key length");
             mac.update(&self.binding);
             mac.update(initiator_nonce);
             mac.update(responder_nonce);
@@ -220,7 +226,10 @@ pub mod insecure {
                     self.stage = 1;
                     let mut m = vec![1u8];
                     m.extend_from_slice(&self.own_nonce);
-                    Ok(ExchangeStep { send: Some(m), peer_confirmed: false })
+                    Ok(ExchangeStep {
+                        send: Some(m),
+                        peer_confirmed: false,
+                    })
                 }
                 (ExchangeRole::Responder, 0, Some(m)) => {
                     let peer: [u8; 16] = match m {
@@ -233,7 +242,10 @@ pub mod insecure {
                     let mut out = vec![2u8];
                     out.extend_from_slice(&self.own_nonce);
                     out.extend_from_slice(&tag);
-                    Ok(ExchangeStep { send: Some(out), peer_confirmed: false })
+                    Ok(ExchangeStep {
+                        send: Some(out),
+                        peer_confirmed: false,
+                    })
                 }
                 (ExchangeRole::Initiator, 1, Some(m)) => {
                     let (nonce, tag) = match m {
@@ -249,7 +261,10 @@ pub mod insecure {
                     let mine = self.tag(&self.own_nonce, &peer, b'i');
                     let mut out = vec![3u8];
                     out.extend_from_slice(&mine);
-                    Ok(ExchangeStep { send: Some(out), peer_confirmed: true })
+                    Ok(ExchangeStep {
+                        send: Some(out),
+                        peer_confirmed: true,
+                    })
                 }
                 (ExchangeRole::Responder, 1, Some(m)) => {
                     let tag = match m {
@@ -262,7 +277,10 @@ pub mod insecure {
                         return Err(ExchangeError::ConfirmationFailed);
                     }
                     self.stage = 2;
-                    Ok(ExchangeStep { send: None, peer_confirmed: true })
+                    Ok(ExchangeStep {
+                        send: None,
+                        peer_confirmed: true,
+                    })
                 }
                 _ => Err(ExchangeError::OutOfOrder),
             }
@@ -288,24 +306,55 @@ mod tests {
         assert!(PairingCode::parse("12345").is_none());
         assert!(PairingCode::parse("12345a").is_none());
         assert!(PairingCode::parse("１２３４５６").is_none());
-        assert_eq!(format!("{:?}", PairingCode::parse("123456").unwrap()), "PairingCode(******)");
+        assert_eq!(
+            format!("{:?}", PairingCode::parse("123456").unwrap()),
+            "PairingCode(******)"
+        );
     }
 
     fn binding() -> BindingTranscript {
-        let key = crate::identity::SoftwareKey::generate(&mut ChaCha20Rng::from_seed([9; 32])).public_key();
-        crate::pairing::binding_transcript(&[0; 32], crate::pairing::InvitationKind::SendLink, 1, &key, &key, &[0; 32])
+        let key = crate::identity::SoftwareKey::generate(&mut ChaCha20Rng::from_seed([9; 32]))
+            .public_key();
+        crate::pairing::binding_transcript(
+            &[0; 32],
+            crate::pairing::InvitationKind::SendLink,
+            1,
+            &key,
+            &key,
+            &[0; 32],
+        )
     }
 
-    fn run(initiator_code: &str, responder_code: &str) -> (Result<ExchangeStep, ExchangeError>, Option<Result<ExchangeStep, ExchangeError>>) {
+    fn run(
+        initiator_code: &str,
+        responder_code: &str,
+    ) -> (
+        Result<ExchangeStep, ExchangeError>,
+        Option<Result<ExchangeStep, ExchangeError>>,
+    ) {
         let mut rng = ChaCha20Rng::from_seed([2; 32]);
         let f = InsecureTestExchangeFactory;
         let b = binding();
-        let mut i = f.start(ExchangeRole::Initiator, &PairingCode::parse(initiator_code).unwrap(), &b, &mut rng);
-        let mut r = f.start(ExchangeRole::Responder, &PairingCode::parse(responder_code).unwrap(), &b, &mut rng);
+        let mut i = f.start(
+            ExchangeRole::Initiator,
+            &PairingCode::parse(initiator_code).unwrap(),
+            &b,
+            &mut rng,
+        );
+        let mut r = f.start(
+            ExchangeRole::Responder,
+            &PairingCode::parse(responder_code).unwrap(),
+            &b,
+            &mut rng,
+        );
         let m1 = i.step(None).unwrap().send.unwrap();
         let m2 = r.step(Some(&m1)).unwrap().send.unwrap();
         let i2 = i.step(Some(&m2));
-        let r2 = i2.as_ref().ok().and_then(|s| s.send.clone()).map(|m3| r.step(Some(&m3)));
+        let r2 = i2
+            .as_ref()
+            .ok()
+            .and_then(|s| s.send.clone())
+            .map(|m3| r.step(Some(&m3)));
         (i2, r2)
     }
 

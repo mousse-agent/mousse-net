@@ -76,14 +76,20 @@ impl fmt::Debug for ControlMessage {
         match self {
             ControlMessage::Hello { minor_version } => write!(f, "Hello({minor_version})"),
             ControlMessage::Authorized { state } => write!(f, "Authorized({state:?})"),
-            ControlMessage::JoinProof { invitation, name, .. } => {
+            ControlMessage::JoinProof {
+                invitation, name, ..
+            } => {
                 write!(f, "JoinProof({invitation:?}, {name:?})")
             }
             ControlMessage::CodeExchange { attempt, payload } => {
                 write!(f, "CodeExchange({attempt:?}, {} bytes)", payload.len())
             }
-            ControlMessage::CodeAbort { attempt, code } => write!(f, "CodeAbort({attempt:?}, {code:?})"),
-            ControlMessage::Paired { host_name, role } => write!(f, "Paired({host_name:?}, {role:?})"),
+            ControlMessage::CodeAbort { attempt, code } => {
+                write!(f, "CodeAbort({attempt:?}, {code:?})")
+            }
+            ControlMessage::Paired { host_name, role } => {
+                write!(f, "Paired({host_name:?}, {role:?})")
+            }
         }
     }
 }
@@ -135,9 +141,15 @@ impl ControlMessage {
     pub fn encode(&self) -> Vec<u8> {
         let mut entries = vec![(0, Value::Uint(self.type_number()))];
         match self {
-            ControlMessage::Hello { minor_version } => entries.push((1, Value::Uint(*minor_version))),
+            ControlMessage::Hello { minor_version } => {
+                entries.push((1, Value::Uint(*minor_version)))
+            }
             ControlMessage::Authorized { state } => entries.push((1, Value::Uint(*state as u64))),
-            ControlMessage::JoinProof { invitation, mac, name } => {
+            ControlMessage::JoinProof {
+                invitation,
+                mac,
+                name,
+            } => {
                 entries.push((1, Value::Bytes(invitation.0.to_vec())));
                 entries.push((2, Value::Bytes(mac.to_vec())));
                 entries.push((3, Value::Text(name.clone())));
@@ -166,7 +178,9 @@ impl ControlMessage {
         let mut f = Fields::decode(bytes)?;
         let kind = f.uint(0)?;
         let message = match kind {
-            1 => ControlMessage::Hello { minor_version: f.uint(1)? },
+            1 => ControlMessage::Hello {
+                minor_version: f.uint(1)?,
+            },
             2 => ControlMessage::Authorized {
                 state: match f.uint(1)? {
                     1 => AuthorizedState::Live,
@@ -179,7 +193,11 @@ impl ControlMessage {
                 let mac = f.fixed::<32>(2)?;
                 let name = f.text(3)?;
                 validate_name(&name).map_err(|_| FieldError::Invalid(3))?;
-                ControlMessage::JoinProof { invitation, mac, name }
+                ControlMessage::JoinProof {
+                    invitation,
+                    mac,
+                    name,
+                }
             }
             4 => {
                 let attempt = AttemptId(f.fixed::<16>(1)?);
@@ -191,10 +209,9 @@ impl ControlMessage {
             }
             5 => {
                 let attempt = AttemptId(f.fixed::<16>(1)?);
-                let code = u16::try_from(f.uint(2)?)
-                    .ok()
-                    .and_then(ErrorCode::from_u16)
-                    .ok_or(FieldError::Invalid(2))?;
+                let raw = u16::try_from(f.uint(2)?).map_err(|_| FieldError::Invalid(2))?;
+                // Unknown codes are read as INTERNAL_ERROR, as in RESET and GOAWAY.
+                let code = ErrorCode::from_u16(raw).unwrap_or(ErrorCode::InternalError);
                 ControlMessage::CodeAbort { attempt, code }
             }
             6 => {
@@ -217,11 +234,26 @@ mod tests {
     fn all() -> Vec<ControlMessage> {
         vec![
             ControlMessage::Hello { minor_version: 0 },
-            ControlMessage::Authorized { state: AuthorizedState::JoinOnly },
-            ControlMessage::JoinProof { invitation: InvitationId([1; 16]), mac: [2; 32], name: "Laptop".into() },
-            ControlMessage::CodeExchange { attempt: AttemptId([3; 16]), payload: vec![4; 40] },
-            ControlMessage::CodeAbort { attempt: AttemptId([3; 16]), code: ErrorCode::PairingFailed },
-            ControlMessage::Paired { host_name: "Desk".into(), role: Role::owner() },
+            ControlMessage::Authorized {
+                state: AuthorizedState::JoinOnly,
+            },
+            ControlMessage::JoinProof {
+                invitation: InvitationId([1; 16]),
+                mac: [2; 32],
+                name: "Laptop".into(),
+            },
+            ControlMessage::CodeExchange {
+                attempt: AttemptId([3; 16]),
+                payload: vec![4; 40],
+            },
+            ControlMessage::CodeAbort {
+                attempt: AttemptId([3; 16]),
+                code: ErrorCode::PairingFailed,
+            },
+            ControlMessage::Paired {
+                host_name: "Desk".into(),
+                role: Role::owner(),
+            },
         ]
     }
 
@@ -235,20 +267,58 @@ mod tests {
     #[test]
     fn unknown_types_extra_fields_and_bad_values_are_rejected() {
         let unknown = cbor::encode(&Value::Map(vec![(0, Value::Uint(99))]));
-        assert_eq!(ControlMessage::decode(&unknown), Err(ControlError::UnknownType(99)));
-        let extra = cbor::encode(&Value::Map(vec![(0, Value::Uint(1)), (1, Value::Uint(0)), (7, Value::Uint(0))]));
-        assert_eq!(ControlMessage::decode(&extra), Err(ControlError::Field(FieldError::Unknown(7))));
+        assert_eq!(
+            ControlMessage::decode(&unknown),
+            Err(ControlError::UnknownType(99))
+        );
+        let extra = cbor::encode(&Value::Map(vec![
+            (0, Value::Uint(1)),
+            (1, Value::Uint(0)),
+            (7, Value::Uint(0)),
+        ]));
+        assert_eq!(
+            ControlMessage::decode(&extra),
+            Err(ControlError::Field(FieldError::Unknown(7)))
+        );
         let empty_payload = cbor::encode(&Value::Map(vec![
             (0, Value::Uint(4)),
             (1, Value::Bytes(vec![0; 16])),
             (2, Value::Bytes(vec![])),
         ]));
-        assert_eq!(ControlMessage::decode(&empty_payload), Err(ControlError::Field(FieldError::Invalid(2))));
+        assert_eq!(
+            ControlMessage::decode(&empty_payload),
+            Err(ControlError::Field(FieldError::Invalid(2)))
+        );
         let short_id = cbor::encode(&Value::Map(vec![
             (0, Value::Uint(5)),
             (1, Value::Bytes(vec![0; 15])),
             (2, Value::Uint(10)),
         ]));
-        assert_eq!(ControlMessage::decode(&short_id), Err(ControlError::Field(FieldError::Invalid(1))));
+        assert_eq!(
+            ControlMessage::decode(&short_id),
+            Err(ControlError::Field(FieldError::Invalid(1)))
+        );
+    }
+
+    #[test]
+    fn abort_codes_unknown_are_internal_error_and_over_u16_are_rejected() {
+        let abort = |code: u64| {
+            cbor::encode(&Value::Map(vec![
+                (0, Value::Uint(5)),
+                (1, Value::Bytes(vec![0; 16])),
+                (2, Value::Uint(code)),
+            ]))
+        };
+        assert_eq!(
+            ControlMessage::decode(&abort(999)),
+            Ok(ControlMessage::CodeAbort {
+                attempt: AttemptId([0; 16]),
+                code: ErrorCode::InternalError
+            })
+        );
+        assert_eq!(
+            ControlMessage::decode(&abort(65_536)),
+            Err(ControlError::Field(FieldError::Invalid(2)))
+        );
     }
 }

@@ -20,19 +20,27 @@ mod ticket;
 
 use std::fmt;
 
-pub use exchange::{CodeExchange, CodeExchangeFactory, ExchangeError, ExchangeRole, ExchangeStep, PairingCode};
 #[cfg(any(test, feature = "insecure-test-exchange"))]
 pub use exchange::insecure;
+pub use exchange::{
+    CodeExchange, CodeExchangeFactory, ExchangeError, ExchangeRole, ExchangeStep, PairingCode,
+};
 pub use host::{
-    CreatedInvitation, HostAction, HostPairing, HostPairingError, InvitationParams, InvitationStatus,
-    HOST_ATTEMPTS_PER_INVITATION,
+    CreatedInvitation, HostAction, HostPairing, HostPairingError, InvitationParams,
+    InvitationStatus, HOST_ATTEMPTS_PER_INVITATION,
 };
-pub use joiner::{JoinerAction, JoinerError, JoinerPairing, JoinerState, PairedHost, JOINER_ATTEMPTS_PER_FLOW};
+pub use joiner::{
+    JoinerAction, JoinerError, JoinerPairing, JoinerState, PairedHost, JOINER_ATTEMPTS_PER_FLOW,
+};
 pub use proof::{
-    binding_transcript, join_proof_input, join_proof_mac, verify_join_proof, BindingTranscript, SessionExporters, EXPORTER_LEN,
-    JOIN_EXPORTER_LABEL, JOIN_PROOF_DOMAIN, JOIN_PROOF_KEY_INFO, PAIR_EXPORTER_LABEL, PAIR_TRANSCRIPT_DOMAIN,
+    binding_transcript, join_proof_input, join_proof_mac, verify_join_proof, BindingTranscript,
+    SessionExporters, EXPORTER_LEN, JOIN_EXPORTER_LABEL, JOIN_PROOF_DOMAIN, JOIN_PROOF_KEY_INFO,
+    PAIR_EXPORTER_LABEL, PAIR_TRANSCRIPT_DOMAIN,
 };
-pub use ticket::{Ticket, TicketError, TicketSecret, MAX_ROUTES, MAX_ROUTE_LEN, TICKET_LIFETIME_SECS, TICKET_VERSION};
+pub use ticket::{
+    Ticket, TicketError, TicketSecret, MAX_ROUTES, MAX_ROUTE_LEN, TICKET_LIFETIME_SECS,
+    TICKET_VERSION,
+};
 
 /// A 16-byte random invitation id, chosen by the host.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

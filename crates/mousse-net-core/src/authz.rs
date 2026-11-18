@@ -158,7 +158,9 @@ impl ConnectionGate {
             (_, Keepalive | Hello | GoAway) => Verdict::Allow,
             (_, HostOnly) => Verdict::Close(ErrorCode::ProtocolError),
             (GateState::AwaitingJoinProof { .. }, JoinProof) => Verdict::Allow,
-            (GateState::AwaitingJoinProof { .. }, Pairing | Stream) => Verdict::Close(ErrorCode::NotAuthorized),
+            (GateState::AwaitingJoinProof { .. }, Pairing | Stream) => {
+                Verdict::Close(ErrorCode::NotAuthorized)
+            }
             (GateState::JoinOnly { .. }, Pairing) => Verdict::Allow,
             (GateState::JoinOnly { .. }, JoinProof) => Verdict::Close(ErrorCode::ProtocolError),
             (GateState::JoinOnly { .. }, Stream) => Verdict::Close(ErrorCode::NotAuthorized),
@@ -253,7 +255,10 @@ mod tests {
         let mut gate = ConnectionGate::open(ConnectionId(1), id(2), &mut grants, NOW, Millis(0));
         assert!(matches!(gate.state(), GateState::AwaitingJoinProof { .. }));
         assert_eq!(gate.check(Traffic::Hello), Verdict::Allow);
-        assert_eq!(gate.check(Traffic::Stream), Verdict::Close(ErrorCode::NotAuthorized));
+        assert_eq!(
+            gate.check(Traffic::Stream),
+            Verdict::Close(ErrorCode::NotAuthorized)
+        );
         assert_eq!(gate.state(), &GateState::Closed(ErrorCode::NotAuthorized));
     }
 
@@ -273,7 +278,10 @@ mod tests {
         assert_eq!(gate.check(Traffic::JoinProof), Verdict::Allow);
         gate.admit_join_only(InvitationId([0; 16]));
         assert_eq!(gate.check(Traffic::Pairing), Verdict::Allow);
-        assert_eq!(gate.check(Traffic::Stream), Verdict::Close(ErrorCode::NotAuthorized));
+        assert_eq!(
+            gate.check(Traffic::Stream),
+            Verdict::Close(ErrorCode::NotAuthorized)
+        );
     }
 
     #[test]
@@ -290,6 +298,9 @@ mod tests {
         let mut gate = ConnectionGate::open(ConnectionId(1), id(2), &mut grants, NOW, Millis(100));
         assert_eq!(gate.poll_timeout(), Some(Millis(100 + JOIN_PROOF_WAIT_MS)));
         assert_eq!(gate.on_timeout(Millis(100 + JOIN_PROOF_WAIT_MS - 1)), None);
-        assert_eq!(gate.on_timeout(Millis(100 + JOIN_PROOF_WAIT_MS)), Some(ErrorCode::NotAuthorized));
+        assert_eq!(
+            gate.on_timeout(Millis(100 + JOIN_PROOF_WAIT_MS)),
+            Some(ErrorCode::NotAuthorized)
+        );
     }
 }

@@ -123,7 +123,11 @@ fn encode_into(value: &Value, out: &mut Vec<u8>) {
             let mut sorted: Vec<&(u64, Value)> = entries.iter().collect();
             sorted.sort_by_key(|(key, _)| *key);
             for pair in sorted.windows(2) {
-                assert!(pair[0].0 != pair[1].0, "duplicate CBOR map key {}", pair[0].0);
+                assert!(
+                    pair[0].0 != pair[1].0,
+                    "duplicate CBOR map key {}",
+                    pair[0].0
+                );
             }
             write_head(out, 5, sorted.len() as u64);
             for (key, item) in sorted {
@@ -455,7 +459,10 @@ mod tests {
 
     #[test]
     fn indefinite_lengths_and_unsupported_types_are_rejected() {
-        assert_eq!(decode(&[0x5f, 0x41, 0x00, 0xff]), Err(CborError::NonCanonical));
+        assert_eq!(
+            decode(&[0x5f, 0x41, 0x00, 0xff]),
+            Err(CborError::NonCanonical)
+        );
         assert_eq!(decode(&[0x9f, 0xff]), Err(CborError::NonCanonical));
         assert_eq!(decode(&[0x20]), Err(CborError::Unsupported)); // -1
         assert_eq!(decode(&[0xc0, 0x00]), Err(CborError::Unsupported)); // tag
@@ -465,9 +472,18 @@ mod tests {
 
     #[test]
     fn map_keys_must_be_strictly_ascending_unsigned_integers() {
-        assert_eq!(decode(&[0xa2, 0x02, 0x00, 0x01, 0x00]), Err(CborError::UnsortedKeys));
-        assert_eq!(decode(&[0xa2, 0x01, 0x00, 0x01, 0x00]), Err(CborError::UnsortedKeys));
-        assert_eq!(decode(&[0xa1, 0x61, 0x61, 0x00]), Err(CborError::NonIntegerKey));
+        assert_eq!(
+            decode(&[0xa2, 0x02, 0x00, 0x01, 0x00]),
+            Err(CborError::UnsortedKeys)
+        );
+        assert_eq!(
+            decode(&[0xa2, 0x01, 0x00, 0x01, 0x00]),
+            Err(CborError::UnsortedKeys)
+        );
+        assert_eq!(
+            decode(&[0xa1, 0x61, 0x61, 0x00]),
+            Err(CborError::NonIntegerKey)
+        );
         assert_eq!(
             decode(&[0xa2, 0x01, 0x00, 0x02, 0x00]),
             Ok(Value::Map(vec![(1, Value::Uint(0)), (2, Value::Uint(0))]))
@@ -487,7 +503,10 @@ mod tests {
         assert_eq!(decode(&[0x00, 0x00]), Err(CborError::TrailingBytes));
         assert_eq!(decode(&[0x62, 0xc3, 0x28]), Err(CborError::InvalidUtf8));
         // A huge claimed array count must not allocate.
-        assert_eq!(decode(&[0x9b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]), Err(CborError::Truncated));
+        assert_eq!(
+            decode(&[0x9b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]),
+            Err(CborError::Truncated)
+        );
     }
 
     #[test]
@@ -505,7 +524,10 @@ mod tests {
         round_trip(Value::Map(vec![
             (1, Value::Text("héllo".into())),
             (2, Value::Bytes(vec![0; 300])),
-            (3, Value::Array(vec![Value::Uint(70_000), Value::Text(String::new())])),
+            (
+                3,
+                Value::Array(vec![Value::Uint(70_000), Value::Text(String::new())]),
+            ),
         ]));
     }
 

@@ -126,7 +126,9 @@ impl<F: CodeExchangeFactory> JoinerPairing<F> {
         factory: F,
         now: UnixTime,
     ) -> Result<Self, JoinerError> {
-        ticket.check_fresh_for_joiner(now).map_err(|_| JoinerError::Expired)?;
+        ticket
+            .check_fresh_for_joiner(now)
+            .map_err(|_| JoinerError::Expired)?;
         validate_name(&name).map_err(|_| JoinerError::InvalidName)?;
         Ok(Self {
             ticket_hash: ticket.hash(),
@@ -164,7 +166,11 @@ impl<F: CodeExchangeFactory> JoinerPairing<F> {
     /// A new TLS connection to the pinned host is up. Returns the
     /// `JOIN_PROOF` to send after `HELLO`. Any attempt in progress on an
     /// older connection is abandoned; its debit stays.
-    pub fn on_connected(&mut self, exporters: SessionExporters, now: UnixTime) -> Result<ControlMessage, JoinerError> {
+    pub fn on_connected(
+        &mut self,
+        exporters: SessionExporters,
+        now: UnixTime,
+    ) -> Result<ControlMessage, JoinerError> {
         if matches!(
             self.state,
             JoinerState::Paired | JoinerState::AlreadyPaired | JoinerState::Failed(_)
@@ -239,7 +245,9 @@ impl<F: CodeExchangeFactory> JoinerPairing<F> {
             &self.joiner,
             &exporters.pair,
         );
-        let mut exchange = self.factory.start(ExchangeRole::Initiator, code, &binding, rng);
+        let mut exchange = self
+            .factory
+            .start(ExchangeRole::Initiator, code, &binding, rng);
         match exchange.step(None) {
             Ok(step) => {
                 let Some(payload) = step.send else {
@@ -310,7 +318,10 @@ impl<F: CodeExchangeFactory> JoinerPairing<F> {
     pub fn on_code_abort(&mut self, attempt: AttemptId) -> Vec<JoinerAction> {
         let current = self.attempt.as_ref().map(|a| a.id);
         if current != Some(attempt)
-            || !matches!(self.state, JoinerState::Exchanging | JoinerState::AwaitingPaired)
+            || !matches!(
+                self.state,
+                JoinerState::Exchanging | JoinerState::AwaitingPaired
+            )
         {
             return Vec::new();
         }
