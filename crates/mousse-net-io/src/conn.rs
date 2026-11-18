@@ -14,14 +14,21 @@
 //!   of the two certificates. The deadline is checked before every inbound
 //!   frame, every stream open or send, and every write, not only when the
 //!   timer fires: after it nothing but the closing `GOAWAY` goes out, and
-//!   queued stream data is dropped.
+//!   queued stream data is dropped. A write still waiting on the pipe when
+//!   the deadline passes is abandoned with the pipe, so its bytes never
+//!   leave after the deadline.
+//! - A step that ends the connection (for example a joiner's last failed
+//!   code attempt) sends the messages it produced, then one `GOAWAY`
+//!   (wire.md 10.6, rule 9).
 //! - Each stream half can wait for its connection to start closing
 //!   ([`StreamWriter::closing`]), so a task serving a stream ends with the
 //!   connection even after the peer finished its side of the stream.
 //! - A separate writer task owns the write half, so a slow peer never stops
-//!   us reading.
+//!   us reading. It takes one frame at a time from the mux, only when the
+//!   pipe has taken the previous one, so nothing queues between the mux and
+//!   TLS: a `CREDIT` due when the peer's `FIN` arrives is dropped, not sent.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,6 +38,7 @@ use mousse_net_core::control::{negotiate_version, ControlMessage, VersionSupport
 use mousse_net_core::identity::IdentityPublicKey;
 use mousse_net_core::mux::{
     decode_frame, frame_type, Frame, Mux, MuxEvent, MuxRole, PriorityClass, StreamError, StreamId,
+    MAX_CONTROL_PAYLOAD,
 };
 use mousse_net_core::pairing::{PairedHost, PairingCode};
 use mousse_net_core::{ConnectionId, ErrorCode, UnixTime};
@@ -45,6 +53,13 @@ use crate::pipe::Pipe;
 
 /// Queued bytes per stream above which [`StreamWriter::write`] waits.
 pub const WRITE_HIGH_WATER: usize = 256 * 1024;
+
+/// How long a closing connection may take to send its last frame and shut
+/// the pipe down before it is dropped.
+const CLOSE_LINGER: Duration = Duration::from_secs(2);
+
+/// How often a write still pending checks the deadline.
+const DEADLINE_POLL: Duration = Duration::from_millis(50);
 
 /// Why a connection ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -508,6 +523,7 @@ pub(crate) fn spawn<P: Pipe>(
         blocked: Vec::new(),
         peer_hello: None,
         reason: None,
+        before_close: VecDeque::new(),
     };
     tokio::spawn(driver.run(start.tls, cmd_rx));
     connection
@@ -526,6 +542,8 @@ struct Driver {
     blocked: Vec<(StreamId, oneshot::Sender<Result<(), NetError>>)>,
     peer_hello: Option<u64>,
     reason: Option<CloseReason>,
+    /// Encoded frames a closing step produced, sent before the GOAWAY.
+    before_close: VecDeque<Vec<u8>>,
 }
 
 fn classify(frame: &Frame) -> Result<(Traffic, Option<ControlMessage>), ErrorCode> {
@@ -553,8 +571,13 @@ fn classify(frame: &Frame) -> Result<(Traffic, Option<ControlMessage>), ErrorCod
 impl Driver {
     async fn run<P: Pipe>(mut self, tls: TlsStream<P>, mut cmd_rx: mpsc::UnboundedReceiver<Cmd>) {
         let (mut rd, wr) = tokio::io::split(tls);
-        let (wtx, wrx) = mpsc::channel::<Vec<u8>>(16);
-        let writer = tokio::spawn(writer_task(wr, wrx, self.clock.clone(), self.deadline));
+        // The writer asks for each frame when it can send it, so a frame is
+        // chosen at send time: nothing waits in a queue between the mux and
+        // TLS (where a credit could go stale after a FIN, or data outlive
+        // the deadline).
+        let (ask_tx, mut ask_rx) = mpsc::channel::<oneshot::Sender<Vec<u8>>>(1);
+        let mut writer = tokio::spawn(writer_task(wr, ask_tx, self.clock.clone(), self.deadline));
+        let mut slot: Option<oneshot::Sender<Vec<u8>>> = None;
 
         let hello = ControlMessage::Hello {
             major_version: VersionSupport::LOCAL.major,
@@ -567,40 +590,46 @@ impl Driver {
 
         let mut buf = vec![0u8; 32 * 1024];
         let mut inbuf: Vec<u8> = Vec::new();
-        let mut pending: Option<Vec<u8>> = None;
+        // Once closing, the writer has this long to take the GOAWAY.
+        let mut give_up: Option<Instant> = None;
         loop {
             if self.expired() {
                 self.close(ErrorCode::CertExpired);
-                // A frame taken before the deadline does not go out after it.
-                if pending.as_deref().is_some_and(|f| !is_goaway(f)) {
-                    pending = None;
-                }
+                self.before_close.clear();
             }
             if self.reason.is_some() || self.mux.is_closing() {
                 self.mark_closing();
             }
-            if pending.is_none() {
-                pending = self.mux.poll_transmit(self.clock.mono());
+            if self.mux.is_closing() && give_up.is_none() {
+                give_up = Some(Instant::now() + CLOSE_LINGER);
+            }
+            if slot.is_some() {
+                if let Some(frame) = self.next_frame() {
+                    if let Some(tx) = slot.take() {
+                        let _ = tx.send(frame);
+                    }
+                }
             }
             self.release_blocked();
-            if pending.is_none() && self.mux.is_closed() {
+            if self.before_close.is_empty() && self.mux.is_closed() {
                 break;
             }
             let wake = self.next_wake();
             tokio::select! {
-                permit = wtx.reserve(), if pending.is_some() => {
-                    match permit {
-                        Ok(permit) => {
-                            if let Some(frame) = pending.take() {
-                                permit.send(frame);
-                            }
-                        }
-                        Err(_) => {
-                            self.reason.get_or_insert(CloseReason::PipeClosed);
-                            break;
-                        }
+                ask = ask_rx.recv(), if slot.is_none() => match ask {
+                    Some(tx) => slot = Some(tx),
+                    // The writer stopped: the pipe failed, or a write was
+                    // still pending at the deadline.
+                    None => {
+                        let reason = if self.expired() {
+                            CloseReason::Local(ErrorCode::CertExpired)
+                        } else {
+                            CloseReason::PipeClosed
+                        };
+                        self.reason.get_or_insert(reason);
+                        break;
                     }
-                }
+                },
                 cmd = cmd_rx.recv() => {
                     if let Some(cmd) = cmd {
                         self.handle_cmd(cmd);
@@ -623,6 +652,8 @@ impl Driver {
                     }
                 }
                 _ = tokio::time::sleep_until(wake) => self.on_timer(),
+                // A writer stuck on a pipe that takes nothing.
+                _ = sleep_until_some(give_up) => break,
             }
         }
 
@@ -636,8 +667,25 @@ impl Driver {
         }
         self.role.on_closed(&reason);
         let _ = self.status.send(ConnStatus::Closed(reason));
-        drop(wtx);
-        let _ = tokio::time::timeout(Duration::from_secs(2), writer).await;
+        // The writer sends what it holds (the closing GOAWAY) and shuts the
+        // pipe down when it asks for more. One that cannot finish in time is
+        // stopped, so the pipe does not stay open.
+        drop(slot);
+        drop(ask_rx);
+        if tokio::time::timeout(CLOSE_LINGER, &mut writer)
+            .await
+            .is_err()
+        {
+            writer.abort();
+        }
+    }
+
+    /// The next frame to send: the messages a closing step produced, then
+    /// the mux's frames.
+    fn next_frame(&mut self) -> Option<Vec<u8>> {
+        self.before_close
+            .pop_front()
+            .or_else(|| self.mux.poll_transmit(self.clock.mono()))
     }
 
     fn next_wake(&self) -> Instant {
@@ -699,8 +747,25 @@ impl Driver {
     }
 
     fn apply(&mut self, out: Outbox) {
-        for message in out.control {
-            let _ = self.mux.send_control(message.encode());
+        match out.close {
+            // A step that ends the connection sends its own messages first,
+            // then one GOAWAY (wire.md 10.6, rule 9). Closing the mux drops
+            // what it has queued, so these wait outside it.
+            Some(_) if !self.mux.is_closing() => {
+                for message in out.control {
+                    let payload = message.encode();
+                    if !payload.is_empty() && payload.len() <= MAX_CONTROL_PAYLOAD {
+                        self.before_close
+                            .push_back(Frame::Control { payload }.encode());
+                    }
+                }
+            }
+            Some(_) => {}
+            None => {
+                for message in out.control {
+                    let _ = self.mux.send_control(message.encode());
+                }
+            }
         }
         if let Some(status) = out.status {
             let _ = self.status.send(status);
@@ -948,25 +1013,454 @@ fn is_goaway(frame: &[u8]) -> bool {
     frame.get(4) == Some(&frame_type::GOAWAY)
 }
 
-/// Writes frames in order. Past the deadline it writes only `GOAWAY`: frames
-/// handed over just before the deadline are dropped.
+/// Sends frames one at a time. It asks the driver for the next frame only
+/// once the previous one has left TLS for the pipe (written and flushed), so
+/// each frame is chosen when it can go out.
+///
+/// The deadline bounds every write: past it only `GOAWAY` goes out, and if
+/// the write or flush of any other frame is still pending when the deadline
+/// passes, the writer gives up the pipe, so those bytes never leave after
+/// it. After `GOAWAY`, or when the driver has nothing more, it shuts the
+/// pipe down.
 async fn writer_task<P: Pipe>(
     mut wr: WriteHalf<TlsStream<P>>,
-    mut rx: mpsc::Receiver<Vec<u8>>,
+    ask: mpsc::Sender<oneshot::Sender<Vec<u8>>>,
     clock: Arc<dyn Clock>,
     deadline: UnixTime,
 ) {
-    while let Some(frame) = rx.recv().await {
-        if clock.now() > deadline && !is_goaway(&frame) {
+    loop {
+        let (tx, rx) = oneshot::channel();
+        if ask.send(tx).await.is_err() {
+            break;
+        }
+        let Ok(frame) = rx.await else {
+            break;
+        };
+        let goaway = is_goaway(&frame);
+        if !goaway && clock.now() > deadline {
             continue;
         }
-        if wr.write_all(&frame).await.is_err() {
+        let send = async {
+            wr.write_all(&frame).await?;
+            wr.flush().await
+        };
+        let sent = if goaway {
+            matches!(tokio::time::timeout(CLOSE_LINGER, send).await, Ok(Ok(())))
+        } else {
+            // The deadline is checked first on every poll, so the pipe can
+            // take more of the frame only while the deadline has not passed.
+            tokio::select! {
+                biased;
+                () = past(&*clock, deadline) => return,
+                result = send => result.is_ok(),
+            }
+        };
+        if !sent {
             return;
         }
-        if rx.is_empty() && wr.flush().await.is_err() {
-            return;
+        if goaway {
+            break;
         }
     }
-    let _ = wr.flush().await;
-    let _ = wr.shutdown().await;
+    let _ = tokio::time::timeout(CLOSE_LINGER, wr.shutdown()).await;
+}
+
+async fn sleep_until_some(at: Option<Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Ready once `clock` is past `deadline`. The clock is read on every poll
+/// (also when whatever it races against wakes the task) and at least every
+/// [`DEADLINE_POLL`].
+fn past(clock: &dyn Clock, deadline: UnixTime) -> impl std::future::Future<Output = ()> + '_ {
+    let mut tick = tokio::time::interval(DEADLINE_POLL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    std::future::poll_fn(move |cx| {
+        if clock.now() > deadline {
+            return std::task::Poll::Ready(());
+        }
+        while tick.poll_tick(cx).is_ready() {}
+        std::task::Poll::Pending
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::pin::Pin;
+    use std::sync::Mutex;
+    use std::task::{Context, Poll, Waker};
+
+    use mousse_net_core::identity::SoftwareKey;
+    use mousse_net_core::pairing::AttemptId;
+    use mousse_net_core::Millis;
+    use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
+
+    use super::*;
+    use crate::certs::CertManager;
+    use crate::clock::ManualClock;
+    use crate::rng::os_rng;
+    use crate::tls::{self, TlsPolicy};
+
+    const WAIT: Duration = Duration::from_secs(5);
+
+    async fn within<T>(what: &str, fut: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(WAIT, fut)
+            .await
+            .unwrap_or_else(|_| panic!("timed out: {what}"))
+    }
+
+    /// Holds back everything our side writes while closed.
+    #[derive(Clone, Default)]
+    struct Valve(Arc<Mutex<(bool, Option<Waker>)>>);
+
+    impl Valve {
+        fn close(&self) {
+            self.0.lock().unwrap().0 = true;
+        }
+
+        fn open(&self) {
+            let waker = {
+                let mut state = self.0.lock().unwrap();
+                state.0 = false;
+                state.1.take()
+            };
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }
+
+        /// `Pending` while closed.
+        fn wait(&self, cx: &Context<'_>) -> Poll<()> {
+            let mut state = self.0.lock().unwrap();
+            if state.0 {
+                state.1 = Some(cx.waker().clone());
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            }
+        }
+    }
+
+    struct HeldPipe {
+        io: DuplexStream,
+        valve: Valve,
+    }
+
+    impl AsyncRead for HeldPipe {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.io).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for HeldPipe {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            data: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            std::task::ready!(self.valve.wait(cx));
+            Pin::new(&mut self.io).poll_write(cx, data)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            std::task::ready!(self.valve.wait(cx));
+            Pin::new(&mut self.io).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.io).poll_shutdown(cx)
+        }
+    }
+
+    /// Lets everything through. A `CODE_EXCHANGE` ends the flow the way a
+    /// joiner's third failed attempt does: `CODE_ABORT`, then close.
+    struct OpenRole;
+
+    impl Role for OpenRole {
+        fn on_start(&mut self, _out: &mut Outbox) {}
+
+        fn check(&mut self, _traffic: Traffic, _message: Option<&ControlMessage>) -> Verdict {
+            Verdict::Allow
+        }
+
+        fn on_control(&mut self, message: ControlMessage, out: &mut Outbox) {
+            if let ControlMessage::CodeExchange { attempt, .. } = message {
+                out.control.push(ControlMessage::CodeAbort {
+                    attempt,
+                    code: ErrorCode::PairingFailed,
+                });
+                out.close = Some(ErrorCode::AttemptsExhausted);
+            }
+        }
+
+        fn may_open(&self) -> bool {
+            true
+        }
+
+        fn on_closed(&mut self, _reason: &CloseReason) {}
+    }
+
+    /// The other end, writing and reading raw frames. Every frame received
+    /// is kept, in order.
+    struct Peer {
+        tls: TlsStream<DuplexStream>,
+        mux: Mux,
+        inbuf: Vec<u8>,
+        frames: Vec<Frame>,
+    }
+
+    impl Peer {
+        async fn flush(&mut self) {
+            while let Some(bytes) = self.mux.poll_transmit(Millis(0)) {
+                self.tls.write_all(&bytes).await.unwrap();
+            }
+            self.tls.flush().await.unwrap();
+        }
+
+        /// Read until a received frame matches `until` (true) or the pipe
+        /// ends (false).
+        async fn read_until(&mut self, until: impl Fn(&Frame) -> bool) -> bool {
+            let mut buf = [0u8; 16 * 1024];
+            loop {
+                while let Ok(Some((frame, used))) = decode_frame(&self.inbuf) {
+                    let _ = self.mux.receive(&self.inbuf[..used], Millis(0));
+                    self.inbuf.drain(..used);
+                    let hit = until(&frame);
+                    self.frames.push(frame);
+                    if hit {
+                        return true;
+                    }
+                }
+                match self.tls.read(&mut buf).await {
+                    Ok(0) | Err(_) => return false,
+                    Ok(n) => self.inbuf.extend_from_slice(&buf[..n]),
+                }
+            }
+        }
+    }
+
+    /// Our driver (caller side) and a raw peer over TLS on an in-memory
+    /// pipe. Our deadline is `deadline_in` seconds from now.
+    async fn connected(deadline_in: u64) -> (Connection, Peer, Valve, Arc<ManualClock>) {
+        let clock = Arc::new(ManualClock::new());
+        let cert = |clock: Arc<ManualClock>| {
+            CertManager::new(Arc::new(SoftwareKey::generate(&mut os_rng())), clock)
+                .current()
+                .unwrap()
+        };
+        let (ours, theirs) = (cert(clock.clone()), cert(clock.clone()));
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let valve = Valve::default();
+        let pipe = HeldPipe {
+            io: a,
+            valve: valve.clone(),
+        };
+        let (connected, accepted) = tokio::join!(
+            tls::connect(
+                pipe,
+                &ours,
+                *theirs.identity(),
+                clock.clone(),
+                TlsPolicy::default()
+            ),
+            tls::accept(b, &theirs, clock.clone(), TlsPolicy::default()),
+        );
+        let (tls, handshake) = connected.unwrap();
+        let (peer_tls, _) = accepted.unwrap();
+        let (cmd_tx, cmd_rx) = channel();
+        let conn = spawn(
+            Start {
+                tls,
+                side: MuxRole::Caller,
+                conn: ConnectionId(1),
+                peer: handshake.peer.identity,
+                kx_group: handshake.kx_group,
+                deadline: UnixTime(clock.now().0 + deadline_in),
+                clock: clock.clone(),
+            },
+            Box::new(OpenRole),
+            cmd_tx,
+            cmd_rx,
+        );
+        let mut peer = Peer {
+            tls: peer_tls,
+            mux: Mux::new(MuxRole::Host, Millis(0)),
+            inbuf: Vec::new(),
+            frames: Vec::new(),
+        };
+        let hello = ControlMessage::Hello {
+            major_version: VersionSupport::LOCAL.major,
+            minor_version: VersionSupport::LOCAL.minor,
+        };
+        peer.mux.send_control(hello.encode()).unwrap();
+        peer.flush().await;
+        assert!(
+            within(
+                "our HELLO",
+                peer.read_until(|f| matches!(f, Frame::Control { .. }))
+            )
+            .await
+        );
+        (conn, peer, valve, clock)
+    }
+
+    fn data_of(frames: &[Frame]) -> Vec<&[u8]> {
+        frames
+            .iter()
+            .filter_map(|f| match f {
+                Frame::Data { payload, .. } => Some(payload.as_slice()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_closing_step_sends_its_message_then_one_goaway() {
+        let (conn, mut peer, _valve, _clock) = connected(3_600).await;
+        let attempt = AttemptId([7; 16]);
+        let exchange = ControlMessage::CodeExchange {
+            attempt,
+            payload: vec![1; 32],
+        };
+        peer.mux.send_control(exchange.encode()).unwrap();
+        peer.flush().await;
+        let from = peer.frames.len();
+        assert!(
+            within(
+                "GOAWAY",
+                peer.read_until(|f| matches!(f, Frame::GoAway { .. }))
+            )
+            .await
+        );
+        let abort = ControlMessage::CodeAbort {
+            attempt,
+            code: ErrorCode::PairingFailed,
+        };
+        assert_eq!(
+            peer.frames[from..],
+            [
+                Frame::Control {
+                    payload: abort.encode()
+                },
+                Frame::GoAway {
+                    code: ErrorCode::AttemptsExhausted
+                },
+            ]
+        );
+        assert!(!within("the end", peer.read_until(|_| true)).await);
+        assert_eq!(
+            within("closed", conn.closed()).await,
+            CloseReason::Local(ErrorCode::AttemptsExhausted)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_write_still_waiting_on_the_pipe_at_the_deadline_never_sends_its_data() {
+        let (conn, mut peer, valve, clock) = connected(60).await;
+        let stream = conn
+            .open_stream(PriorityClass::Interactive, "terminal")
+            .await
+            .unwrap();
+        stream.writer.write(b"early").await.unwrap();
+        assert!(
+            within(
+                "early data",
+                peer.read_until(|f| matches!(f, Frame::Data { .. }))
+            )
+            .await
+        );
+
+        // In the deadline second the app writes, but the pipe takes nothing:
+        // the write waits.
+        clock.freeze_at(conn.deadline());
+        valve.close();
+        stream.writer.write(b"late").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!matches!(conn.status(), ConnStatus::Closed(_)));
+
+        // The deadline passes while it waits; then the pipe would take it.
+        clock.freeze_at(UnixTime(conn.deadline().0 + 1));
+        assert_eq!(
+            within("closed", conn.closed()).await,
+            CloseReason::Local(ErrorCode::CertExpired)
+        );
+        valve.open();
+        let from = peer.frames.len();
+        assert!(!within("the end", peer.read_until(|_| false)).await);
+        assert!(
+            data_of(&peer.frames[from..]).is_empty(),
+            "data went out after the deadline: {:?}",
+            &peer.frames[from..]
+        );
+    }
+
+    #[tokio::test]
+    async fn credit_due_while_the_pipe_is_full_is_not_sent_after_the_peers_fin() {
+        let (conn, mut peer, valve, _clock) = connected(3_600).await;
+        let mut stream = conn
+            .open_stream(PriorityClass::Interactive, "terminal")
+            .await
+            .unwrap();
+        let id = stream.id();
+        stream.writer.write(b"open").await.unwrap();
+        assert!(
+            within(
+                "the open",
+                peer.read_until(|f| matches!(f, Frame::Data { .. }))
+            )
+            .await
+        );
+
+        // Our writer waits on the pipe with a frame of its own.
+        valve.close();
+        stream.writer.write(b"held").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The app reads more than a credit batch, so a CREDIT is due...
+        let sent = vec![0u8; 70_000];
+        peer.mux.send(id, &sent).unwrap();
+        peer.flush().await;
+        let mut read = 0;
+        while read < sent.len() {
+            read += within("the peer's data", stream.reader.read())
+                .await
+                .unwrap()
+                .unwrap()
+                .len();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // ...and the peer finishes the stream before it could go out.
+        peer.mux.finish(id).unwrap();
+        peer.flush().await;
+        assert_eq!(within("the FIN", stream.reader.read()).await.unwrap(), None);
+
+        valve.open();
+        stream.writer.finish();
+        let from = peer.frames.len();
+        assert!(
+            within(
+                "our FIN",
+                peer.read_until(|f| matches!(f, Frame::Fin { .. }))
+            )
+            .await
+        );
+        let after = &peer.frames[from..];
+        assert_eq!(data_of(after), [b"held".as_slice()]);
+        assert!(
+            !after
+                .iter()
+                .any(|f| matches!(f, Frame::Credit { stream, .. } if *stream == id)),
+            "credit after the FIN: {after:?}"
+        );
+    }
 }
