@@ -201,7 +201,9 @@ function parseCertificate(certificate: Uint8Array) {
   const extValue = new DerReader(extension);
   const binding = extValue.nested(0x30);
   extValue.done();
-  const version = integer(positive(binding.read(2).value, 'malformed'));
+  const versionBytes = binding.read(2).value;
+  requireThat(versionBytes.length <= 8, 'malformed');
+  const version = integer(positive(versionBytes, 'malformed'));
   const identity = binding.read(4).value;
   const rawIdentity = binding.read(4).value;
   binding.done();
@@ -229,26 +231,35 @@ export function lanCandidate(result: string) {
   return result === 'pin_mismatch' ? { action: 'try_next', send: false, warn: false, repin: false } : null;
 }
 
+const renewalWaits = [30, 60, 120, 240, 300];
+
 export class SessionLifetime {
   readonly renewAt: number;
   readonly deadline: number;
-  private renewing = false;
+  private nextRetry?: number;
+  private retry = 0;
   private closed = false;
 
-  constructor(local: Window, peer: Window) {
+  constructor(local: Window, peer: Window, previous?: SessionLifetime) {
     const end = Math.min(local.not_after, peer.not_after);
     this.renewAt = Math.max(local.not_before, peer.not_before, end - 1800);
     this.deadline = end + 600;
+    if (previous && this.renewAt <= previous.renewAt) {
+      this.nextRetry = previous.nextRetry;
+      this.retry = previous.retry;
+    }
   }
 
-  tick(now: number): 'cert_expired' | 'renew_due' | null {
+  tick(now: number, mono: number, candidateInProgress = false): 'cert_expired' | 'renew_due' | null {
     if (this.closed) return null;
     if (now > this.deadline) {
       this.closed = true;
       return 'cert_expired';
     }
-    if (now >= this.renewAt && !this.renewing) {
-      this.renewing = true;
+    const due = this.nextRetry === undefined ? now >= this.renewAt : mono >= this.nextRetry;
+    if (due && !candidateInProgress) {
+      this.nextRetry = mono + renewalWaits[this.retry] * 1000;
+      this.retry = Math.min(this.retry + 1, renewalWaits.length - 1);
       return 'renew_due';
     }
     return null;

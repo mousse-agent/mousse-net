@@ -15,10 +15,10 @@ npm test
 ```
 
 The tests count every runnable JSON case and print `PASS second-impl` or
-`FAIL second-impl` on the last line. They compare the full output of six
-pairing flows with the supplied bytes and run all eight attempt sequences
-through real CPace exchanges. The stream checks cover credit and stream
-limits that are not in the frame fixtures.
+`FAIL second-impl` on the last line. They replay seven pairing flows and
+eleven attempt sequences with the supplied random draws, and compare
+the resulting messages byte for byte. The suite also checks retry
+scheduling, reconnect after ticket expiry, and stream limits.
 
 Run the same tests with the identity-signature check deliberately disabled.
 

@@ -5,6 +5,7 @@ import { bytes, decode, encode, hex } from './cbor.ts';
 import { checkRaw, derToRaw, issueCertificate, lanCandidate, publicKey, rawToDer, SessionLifetime,
   sha256, sign, verify, verifyCertificate } from './certificate.ts';
 import * as cpace from './cpace.ts';
+import { PairingJoiner } from './pairing.ts';
 import { Gate, step2, Streams } from './session.ts';
 import * as wire from './wire.ts';
 import { replayAttemptSequence, replayEndToEnd } from './pairing-replay.mjs';
@@ -78,17 +79,28 @@ function outcome(expected, fn) {
 
 {
   const [v, add] = file('session-lifecycle.json');
-  const authenticate = () => verifyCertificate(bytes(v.peer_certificate), v.authenticated_at, bytes(v.pin));
+  const authenticate = (now = v.authenticated_at) => verifyCertificate(bytes(v.peer_certificate), now, bytes(v.pin));
+  const mono = now => (now - v.authenticated_at) * 1000;
+  function checkTimeline(life, conn, ticks) {
+    for (const item of ticks) {
+      const event = life.tick(item.now, mono(item.now));
+      const events = event === null ? [] : event === 'renew_due' ? [{ conn, event }] :
+        [{ conn, event: 'close', code: event }];
+      assert.deepEqual(events, item.events, `tick ${item.now}`);
+    }
+  }
   add('renewal and expiration timeline', () => {
     const life = new SessionLifetime(v.local_window, authenticate().window);
     assert.equal(life.deadline, v.deadline);
     assert.equal(life.renewAt, v.renew_at);
-    for (const item of v.ticks) {
-      const event = life.tick(item.now);
-      const events = event === null ? [] : event === 'renew_due' ? [{ conn: 1, event }] :
-        [{ conn: 1, event: 'close', code: event }];
-      assert.deepEqual(events, item.events, `tick ${item.now}`);
-    }
+    checkTimeline(life, 1, v.ticks);
+  });
+  add('switch without renewing keeps pending retries', () => {
+    const life = new SessionLifetime(v.local_window, authenticate().window);
+    const switchAt = v.switch_without_renewal.switch_at;
+    checkTimeline(life, 1, v.ticks.filter(tick => tick.now < switchAt));
+    const replacement = new SessionLifetime(v.local_window, authenticate(switchAt).window, life);
+    checkTimeline(replacement, 2, v.switch_without_renewal.ticks);
   });
   add('handshake after expiration', () => {
     const item = v.new_connection_after_deadline;
@@ -318,8 +330,56 @@ function outcome(expected, fn) {
 
 {
   const [v, add] = file('pairing-attempts.json');
-  for (const sequence of v.sequences) add(sequence.name, () => replayAttemptSequence(sequence));
+  for (const sequence of v.sequences) add(sequence.name, () => replayAttemptSequence(sequence, v.conventions));
 }
+
+test('lifecycle checks / a pending candidate defers a retry and a later path resets the backoff', () => {
+  const window = { not_before: 1000, not_after: 5000 };
+  const life = new SessionLifetime(window, window);
+  assert.equal(life.tick(life.renewAt, 0), 'renew_due');
+  assert.equal(life.tick(life.renewAt + 30, 30000, true), null);
+  assert.equal(life.tick(life.renewAt + 40, 40000), 'renew_due');
+  assert.equal(life.tick(life.renewAt + 99, 99000), null);
+
+  const renewed = { ...window, not_after: 6000 };
+  const replacement = new SessionLifetime(renewed, renewed, life);
+  assert.equal(replacement.tick(life.renewAt + 100, 100000), null);
+  assert.equal(replacement.tick(replacement.renewAt, 1000000), 'renew_due');
+  assert.equal(replacement.tick(replacement.renewAt + 30, 1030000), 'renew_due');
+});
+
+test('lifecycle checks / losing PAIRED on the last attempt permits an expired-ticket reconnect', () => {
+  const fixture = fixtures.get('pairing-e2e.json');
+  const { time, joiner: endpoint } = fixture.conventions;
+  const flow = fixture.flows.find(flow => flow.name === 'outcome_after_lost_paired');
+  const ticket = bytes(flow.steps.find(step => step.event === 'start').ticket);
+  let draw = 0;
+  const joiner = new PairingJoiner({ name: endpoint.name, identity: bytes(endpoint.identity) },
+    ticket, { bytes: length => Buffer.alloc(length, ++draw) }, time);
+  const exporters = { join: Buffer.alloc(32, 1), pair: Buffer.alloc(32, 2) };
+  joiner.connect(1, exporters, time);
+  joiner.receive(wire.hello);
+  joiner.receive({ type: 'AUTHORIZED', state: 'join_only' });
+
+  const code = '012345';
+  for (let i = 0; i < 2; i++) {
+    const [, { send }] = joiner.submit(code);
+    joiner.receive({ type: 'CODE_ABORT', attempt: send.attempt, code: wire.errorNumber('pairing_failed') });
+  }
+  const [{ attempt: { ci, sid } }, { send: first }] = joiner.submit(code);
+  const host = cpace.respond({ ci: bytes(ci), sid: bytes(sid), prs: Buffer.from(code), ad: Buffer.alloc(0) },
+    first.payload, length => Buffer.alloc(length, 42));
+  const [{ send: last }] = joiner.receive({ type: 'CODE_EXCHANGE', attempt: first.attempt, payload: host.message });
+  host.finish(last.payload).isk.fill(0);
+
+  joiner.drop();
+  const retryExporters = { join: Buffer.alloc(32, 3), pair: Buffer.alloc(32, 4) };
+  const messages = joiner.connect(2, retryExporters, Number(joiner.ticket.expiresAt) + 600);
+  assert.deepEqual(messages.map(effect => effect.send.type), ['HELLO', 'JOIN_PROOF']);
+  joiner.receive(wire.hello);
+  assert.deepEqual(joiner.receive({ type: 'AUTHORIZED', state: 'live' }), [{ already_paired: true }]);
+  assert.deepEqual(joiner.snapshot(), { attempts_left: 0, live: true, state: 'already_paired' });
+});
 
 test('coverage / all JSON files registered', () => assert.deepEqual([...used].sort(), [...fixtures.keys()].sort()));
 

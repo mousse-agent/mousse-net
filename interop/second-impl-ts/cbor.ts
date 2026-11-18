@@ -87,6 +87,8 @@ export function decode(input: Uint8Array): Value {
       try { return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(data); }
       catch { return fail('invalid_utf8'); }
     }
+    const minimumItemBytes = major === 4 ? 1n : 2n;
+    requireThat(size * minimumItemBytes <= input.length - cursor, 'truncated');
     const array: Value[] = [];
     const map = new Map<bigint, Value>();
     let last = -1n;
