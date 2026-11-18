@@ -21,7 +21,7 @@ fn json(text: &str) -> Value {
 
 fn hex(v: &Value) -> Vec<u8> {
     let s = v.as_str().expect("hex string");
-    assert!(s.len() % 2 == 0, "odd hex length");
+    assert!(s.len().is_multiple_of(2), "odd hex length");
     (0..s.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex digit"))
@@ -87,7 +87,11 @@ fn lexiographically_larger(a: &[u8], b: &[u8]) -> bool {
 }
 
 fn o_cat(a: &[u8], b: &[u8]) -> Vec<u8> {
-    let (first, second) = if lexiographically_larger(a, b) { (a, b) } else { (b, a) };
+    let (first, second) = if lexiographically_larger(a, b) {
+        (a, b)
+    } else {
+        (b, a)
+    };
     [b"oc".as_slice(), first, second].concat()
 }
 
@@ -102,7 +106,12 @@ fn transcript_oc(ya: &[u8], ada: &[u8], yb: &[u8], adb: &[u8]) -> Vec<u8> {
 const SID: &[u8] = b"0123456789abcdef-attempt-1";
 
 fn inputs<'a>(prs: &'a [u8], ci: &'a [u8], ad: &'a [u8]) -> Inputs<'a> {
-    Inputs { prs, ci, sid: SID, ad }
+    Inputs {
+        prs,
+        ci,
+        sid: SID,
+        ad,
+    }
 }
 
 // ---- Draft Appendix A ----
@@ -127,14 +136,25 @@ fn string_functions_match_draft_appendix_a() {
         );
     }
     for case in v["o_cat"].as_array().unwrap() {
-        assert_eq!(o_cat(&hex(&case["a"]), &hex(&case["b"])), hex(&case["output"]));
+        assert_eq!(
+            o_cat(&hex(&case["a"]), &hex(&case["b"])),
+            hex(&case["output"])
+        );
     }
     for (name, f) in [
-        ("transcript_ir", transcript_ir as fn(&[u8], &[u8], &[u8], &[u8]) -> Vec<u8>),
+        (
+            "transcript_ir",
+            transcript_ir as fn(&[u8], &[u8], &[u8], &[u8]) -> Vec<u8>,
+        ),
         ("transcript_oc", transcript_oc),
     ] {
         for case in v[name].as_array().unwrap() {
-            let got = f(&hex(&case["Ya"]), &hex(&case["ADa"]), &hex(&case["Yb"]), &hex(&case["ADb"]));
+            let got = f(
+                &hex(&case["Ya"]),
+                &hex(&case["ADa"]),
+                &hex(&case["Yb"]),
+                &hex(&case["ADb"]),
+            );
             assert_eq!(got, hex(&case["output"]), "{name}");
         }
     }
@@ -147,12 +167,18 @@ fn generator_matches_draft_b3_1() {
     let d = &json(DRAFT)["cpace"];
     let (prs, ci, sid) = (hex(&d["PRS"]), hex(&d["CI"]), hex(&d["sid"]));
     assert_eq!(hex(&d["DSI"]), primitives::DSI);
-    assert_eq!(d["s_in_bytes"].as_u64(), Some(primitives::S_IN_BYTES as u64));
+    assert_eq!(
+        d["s_in_bytes"].as_u64(),
+        Some(primitives::S_IN_BYTES as u64)
+    );
     let gen_str = generator_string(&prs, &ci, &sid);
     assert_eq!(&gen_str[..], &hex(&d["generator_string"])[..]);
     // DSI (1+17) and PRS (1+8) are followed by the zero padding's length byte.
     assert_eq!(gen_str[18 + 9], d["zpad_len"].as_u64().unwrap() as u8);
-    assert_eq!(&generator_hash(&prs, &ci, &sid)[..], &hex(&d["generator_hash"])[..]);
+    assert_eq!(
+        &generator_hash(&prs, &ci, &sid)[..],
+        &hex(&d["generator_hash"])[..]
+    );
     let g = calculate_generator(&prs, &ci, &sid);
     assert_eq!(g.compress().to_bytes(), arr32(&d["g"]));
 }
@@ -171,7 +197,12 @@ fn shares_and_k_match_draft_b3_2_to_b3_4() {
 
     // The same values through the public state machine.
     let ada = hex(&d["ADa"]);
-    let a_in = Inputs { prs: &prs, ci: &ci, sid: &sid, ad: &ada };
+    let a_in = Inputs {
+        prs: &prs,
+        ci: &ci,
+        sid: &sid,
+        ad: &ada,
+    };
     let (_, msg_a) = Initiator::start_with_scalar(&a_in, ya);
     assert_eq!(msg_a, lv_cat(&[&ya_pt, &ada]));
 }
@@ -186,13 +217,25 @@ fn isk_matches_draft_b3_5_to_b3_7() {
 
     let t_ir = transcript_ir(&ya_pt, &ada, &yb_pt, &adb);
     assert_eq!(t_ir, hex(&d["transcript_ir"]));
-    assert_eq!(&isk_input(&sid, &k, &[&t_ir])[..], &hex(&d["isk_input_ir"])[..]);
-    assert_eq!(&primitives::isk(&sid, &k, &[&t_ir])[..], &hex(&d["ISK_IR"])[..]);
+    assert_eq!(
+        &isk_input(&sid, &k, &[&t_ir])[..],
+        &hex(&d["isk_input_ir"])[..]
+    );
+    assert_eq!(
+        &primitives::isk(&sid, &k, &[&t_ir])[..],
+        &hex(&d["ISK_IR"])[..]
+    );
 
     let t_oc = transcript_oc(&ya_pt, &ada, &yb_pt, &adb);
     assert_eq!(t_oc, hex(&d["transcript_oc"]));
-    assert_eq!(&isk_input(&sid, &k, &[&t_oc])[..], &hex(&d["isk_input_oc"])[..]);
-    assert_eq!(&primitives::isk(&sid, &k, &[&t_oc])[..], &hex(&d["ISK_SY"])[..]);
+    assert_eq!(
+        &isk_input(&sid, &k, &[&t_oc])[..],
+        &hex(&d["isk_input_oc"])[..]
+    );
+    assert_eq!(
+        &primitives::isk(&sid, &k, &[&t_oc])[..],
+        &hex(&d["ISK_SY"])[..]
+    );
 
     let sid_out = |t: &[u8]| Sha512::digest([b"CPaceSidOutput".as_slice(), t].concat()).to_vec();
     assert_eq!(sid_out(&t_ir), hex(&d["sid_output_ir"]));
@@ -202,9 +245,25 @@ fn isk_matches_draft_b3_5_to_b3_7() {
 #[test]
 fn full_run_with_draft_scalars_gives_draft_isk() {
     let d = &json(DRAFT)["cpace"];
-    let (prs, ci, sid, ada, adb) = (hex(&d["PRS"]), hex(&d["CI"]), hex(&d["sid"]), hex(&d["ADa"]), hex(&d["ADb"]));
-    let a_in = Inputs { prs: &prs, ci: &ci, sid: &sid, ad: &ada };
-    let b_in = Inputs { prs: &prs, ci: &ci, sid: &sid, ad: &adb };
+    let (prs, ci, sid, ada, adb) = (
+        hex(&d["PRS"]),
+        hex(&d["CI"]),
+        hex(&d["sid"]),
+        hex(&d["ADa"]),
+        hex(&d["ADb"]),
+    );
+    let a_in = Inputs {
+        prs: &prs,
+        ci: &ci,
+        sid: &sid,
+        ad: &ada,
+    };
+    let b_in = Inputs {
+        prs: &prs,
+        ci: &ci,
+        sid: &sid,
+        ad: &adb,
+    };
     let (a, msg_a) = Initiator::start_with_scalar(&a_in, scalar(&d["ya"]));
     let (b, msg_b) = Responder::respond_with_scalar(&b_in, &msg_a, scalar(&d["yb"])).unwrap();
     let (a_done, msg_c) = a.finish(&msg_b).unwrap();
@@ -221,7 +280,9 @@ fn scalar_mult_matches_draft_b3_10_and_b3_11() {
     let ok = &v["scalar_mult_valid"];
     let s = scalar(&ok["s"]);
     let x = arr32(&ok["X"]);
-    let decoded = curve25519_dalek::ristretto::CompressedRistretto(x).decompress().unwrap();
+    let decoded = curve25519_dalek::ristretto::CompressedRistretto(x)
+        .decompress()
+        .unwrap();
     assert_eq!(scalar_mult(&s, &decoded), arr32(&ok["scalar_mult"]));
     assert_eq!(*scalar_mult_vfy(&s, &x), arr32(&ok["scalar_mult_vfy"]));
 
@@ -248,8 +309,18 @@ fn mousse_vectors_reproduce_bit_exact() {
     let (prs, ci, sid) = mousse_inputs(c);
     for vec in v["vectors"].as_array().unwrap() {
         let (ada, adb) = (hex(&vec["ADa"]), hex(&vec["ADb"]));
-        let a_in = Inputs { prs: &prs, ci: &ci, sid: &sid, ad: &ada };
-        let b_in = Inputs { prs: &prs, ci: &ci, sid: &sid, ad: &adb };
+        let a_in = Inputs {
+            prs: &prs,
+            ci: &ci,
+            sid: &sid,
+            ad: &ada,
+        };
+        let b_in = Inputs {
+            prs: &prs,
+            ci: &ci,
+            sid: &sid,
+            ad: &adb,
+        };
         let (a, msg_a) = Initiator::start_with_scalar(&a_in, scalar(&c["ya"]));
         assert_eq!(msg_a, hex(&vec["msg_a"]));
         let (b, msg_b) = Responder::respond_with_scalar(&b_in, &msg_a, scalar(&c["yb"])).unwrap();
@@ -286,17 +357,32 @@ fn mousse_rejection_vectors_fail_with_the_listed_error() {
     let (prs, ci, sid) = mousse_inputs(c);
     let good = &v["vectors"][0];
     let (ada, adb) = (hex(&good["ADa"]), hex(&good["ADb"]));
-    let a_in = Inputs { prs: &prs, ci: &ci, sid: &sid, ad: &ada };
-    let b_in = Inputs { prs: &prs, ci: &ci, sid: &sid, ad: &adb };
+    let a_in = Inputs {
+        prs: &prs,
+        ci: &ci,
+        sid: &sid,
+        ad: &ada,
+    };
+    let b_in = Inputs {
+        prs: &prs,
+        ci: &ci,
+        sid: &sid,
+        ad: &adb,
+    };
     let rejections = v["rejections"].as_array().unwrap();
     assert!(rejections.len() >= 20);
     for r in rejections {
         let msg = hex(&r["message"]);
         let got = match r["stage"].as_str().unwrap() {
             "msg_a" => Responder::respond_with_scalar(&b_in, &msg, scalar(&c["yb"])).err(),
-            "msg_b" => Initiator::start_with_scalar(&a_in, scalar(&c["ya"])).0.finish(&msg).err(),
+            "msg_b" => Initiator::start_with_scalar(&a_in, scalar(&c["ya"]))
+                .0
+                .finish(&msg)
+                .err(),
             "msg_c" => {
-                let (b, _) = Responder::respond_with_scalar(&b_in, &hex(&good["msg_a"]), scalar(&c["yb"])).unwrap();
+                let (b, _) =
+                    Responder::respond_with_scalar(&b_in, &hex(&good["msg_a"]), scalar(&c["yb"]))
+                        .unwrap();
                 b.finish(&msg).err()
             }
             other => panic!("unknown stage {other}"),
@@ -329,7 +415,12 @@ fn run(
 
 #[test]
 fn same_code_and_inputs_agree_on_isk() {
-    let (a, b) = run(&inputs(b"493017", b"ci", b"joiner"), &inputs(b"493017", b"ci", b"host"), 1).unwrap();
+    let (a, b) = run(
+        &inputs(b"493017", b"ci", b"joiner"),
+        &inputs(b"493017", b"ci", b"host"),
+        1,
+    )
+    .unwrap();
     assert_eq!(a.isk().as_bytes(), b.isk().as_bytes());
     assert_eq!(a.peer_ad(), b"host");
     assert_eq!(b.peer_ad(), b"joiner");
@@ -349,21 +440,37 @@ fn each_run_uses_fresh_scalars() {
 
 #[test]
 fn wrong_code_fails_confirmation() {
-    let err = run(&inputs(b"493017", b"ci", b""), &inputs(b"493018", b"ci", b""), 2).unwrap_err();
+    let err = run(
+        &inputs(b"493017", b"ci", b""),
+        &inputs(b"493018", b"ci", b""),
+        2,
+    )
+    .unwrap_err();
     assert_eq!(err, CpaceError::ConfirmationFailed);
 }
 
 #[test]
 fn different_channel_identifier_fails_confirmation() {
-    let err = run(&inputs(b"493017", b"ticket-1", b""), &inputs(b"493017", b"ticket-2", b""), 3).unwrap_err();
+    let err = run(
+        &inputs(b"493017", b"ticket-1", b""),
+        &inputs(b"493017", b"ticket-2", b""),
+        3,
+    )
+    .unwrap_err();
     assert_eq!(err, CpaceError::ConfirmationFailed);
 }
 
 #[test]
 fn different_session_id_fails_confirmation() {
     let a_in = inputs(b"493017", b"ci", b"");
-    let b_in = Inputs { sid: b"0123456789abcdef-attempt-2", ..a_in };
-    assert_eq!(run(&a_in, &b_in, 4).unwrap_err(), CpaceError::ConfirmationFailed);
+    let b_in = Inputs {
+        sid: b"0123456789abcdef-attempt-2",
+        ..a_in
+    };
+    assert_eq!(
+        run(&a_in, &b_in, 4).unwrap_err(),
+        CpaceError::ConfirmationFailed
+    );
 }
 
 /// The initiator's view of ADb differs from what the responder sent.
@@ -371,9 +478,13 @@ fn different_session_id_fails_confirmation() {
 fn responder_ad_changed_in_transit_fails_at_initiator() {
     let mut rng = TestRng::new(5);
     let (a, msg_a) = Initiator::start(&inputs(b"493017", b"ci", b"A"), &mut rng).unwrap();
-    let (_, mut msg_b) = Responder::respond(&inputs(b"493017", b"ci", b"B"), &msg_a, &mut rng).unwrap();
+    let (_, mut msg_b) =
+        Responder::respond(&inputs(b"493017", b"ci", b"B"), &msg_a, &mut rng).unwrap();
     msg_b[34] ^= 0x01; // the AD byte after 0x20, Yb and the length byte
-    assert_eq!(a.finish(&msg_b).unwrap_err(), CpaceError::ConfirmationFailed);
+    assert_eq!(
+        a.finish(&msg_b).unwrap_err(),
+        CpaceError::ConfirmationFailed
+    );
 }
 
 /// The responder's view of ADa differs from what the initiator sent.
@@ -383,7 +494,10 @@ fn initiator_ad_changed_in_transit_fails() {
     let (a, mut msg_a) = Initiator::start(&inputs(b"493017", b"ci", b"A"), &mut rng).unwrap();
     msg_a[34] ^= 0x01;
     let (_, msg_b) = Responder::respond(&inputs(b"493017", b"ci", b"B"), &msg_a, &mut rng).unwrap();
-    assert_eq!(a.finish(&msg_b).unwrap_err(), CpaceError::ConfirmationFailed);
+    assert_eq!(
+        a.finish(&msg_b).unwrap_err(),
+        CpaceError::ConfirmationFailed
+    );
 }
 
 #[test]
@@ -398,7 +512,13 @@ fn tampered_point_is_rejected() {
             Err(e) => e,
             Ok((_, msg_b)) => a.finish(&msg_b).unwrap_err(),
         };
-        assert!(matches!(err, CpaceError::InvalidPoint | CpaceError::ConfirmationFailed), "{err:?}");
+        assert!(
+            matches!(
+                err,
+                CpaceError::InvalidPoint | CpaceError::ConfirmationFailed
+            ),
+            "{err:?}"
+        );
     }
 }
 
@@ -407,7 +527,10 @@ fn identity_point_is_rejected_by_both_roles() {
     let i = inputs(b"493017", b"ci", b"");
     let identity_msg = lv_cat(&[&IDENTITY, b""]);
     let mut rng = TestRng::new(20);
-    assert_eq!(Responder::respond(&i, &identity_msg, &mut rng).unwrap_err(), CpaceError::InvalidPoint);
+    assert_eq!(
+        Responder::respond(&i, &identity_msg, &mut rng).unwrap_err(),
+        CpaceError::InvalidPoint
+    );
     let (a, _) = Initiator::start(&i, &mut rng).unwrap();
     let msg_b = [identity_msg, vec![0u8; TAG_LEN]].concat();
     assert_eq!(a.finish(&msg_b).unwrap_err(), CpaceError::InvalidPoint);
@@ -429,9 +552,16 @@ fn truncated_messages_are_rejected() {
     for len in 0..msg_b.len() {
         let mut rng = TestRng::new(21);
         let (a, _) = Initiator::start(&i, &mut rng).unwrap();
-        assert_eq!(a.finish(&msg_b[..len]).unwrap_err(), CpaceError::Malformed, "len {len}");
+        assert_eq!(
+            a.finish(&msg_b[..len]).unwrap_err(),
+            CpaceError::Malformed,
+            "len {len}"
+        );
     }
-    assert_eq!(b.finish(&[0u8; TAG_LEN - 1]).unwrap_err(), CpaceError::Malformed);
+    assert_eq!(
+        b.finish(&[0u8; TAG_LEN - 1]).unwrap_err(),
+        CpaceError::Malformed
+    );
 }
 
 #[test]
@@ -446,7 +576,10 @@ fn swapped_roles_do_not_confirm() {
     let (a1, _) = Initiator::start(&i, &mut rng).unwrap();
     let (_, msg_a2) = Initiator::start(&i, &mut rng).unwrap();
     let forged = [msg_a2, vec![0u8; TAG_LEN]].concat();
-    assert_eq!(a1.finish(&forged).unwrap_err(), CpaceError::ConfirmationFailed);
+    assert_eq!(
+        a1.finish(&forged).unwrap_err(),
+        CpaceError::ConfirmationFailed
+    );
 
     // The responder's own tag echoed back as the initiator's tag.
     let (a, msg_a) = Initiator::start(&i, &mut rng).unwrap();
@@ -454,7 +587,10 @@ fn swapped_roles_do_not_confirm() {
     let tb = msg_b[msg_b.len() - TAG_LEN..].to_vec();
     assert_eq!(b.finish(&tb).unwrap_err(), CpaceError::ConfirmationFailed);
     // A responder's msg_b fed to a responder is not a msg_a.
-    assert_eq!(Responder::respond(&i, &msg_b, &mut rng).unwrap_err(), CpaceError::Malformed);
+    assert_eq!(
+        Responder::respond(&i, &msg_b, &mut rng).unwrap_err(),
+        CpaceError::Malformed
+    );
     drop(a);
 }
 
@@ -463,14 +599,32 @@ fn own_inputs_are_checked() {
     let mut rng = TestRng::new(40);
     let msg = lv_cat(&[&IDENTITY, b""]);
     let empty = inputs(b"", b"ci", b"");
-    assert_eq!(Initiator::start(&empty, &mut rng).unwrap_err(), CpaceError::EmptyPassword);
-    assert_eq!(Responder::respond(&empty, &msg, &mut rng).unwrap_err(), CpaceError::EmptyPassword);
-    let short_sid = Inputs { sid: &SID[..MIN_SID_LEN - 1], ..inputs(b"1", b"", b"") };
-    assert_eq!(Initiator::start(&short_sid, &mut rng).unwrap_err(), CpaceError::SidTooShort);
+    assert_eq!(
+        Initiator::start(&empty, &mut rng).unwrap_err(),
+        CpaceError::EmptyPassword
+    );
+    assert_eq!(
+        Responder::respond(&empty, &msg, &mut rng).unwrap_err(),
+        CpaceError::EmptyPassword
+    );
+    let short_sid = Inputs {
+        sid: &SID[..MIN_SID_LEN - 1],
+        ..inputs(b"1", b"", b"")
+    };
+    assert_eq!(
+        Initiator::start(&short_sid, &mut rng).unwrap_err(),
+        CpaceError::SidTooShort
+    );
     let long_ad = vec![7u8; MAX_AD_LEN + 1];
     let too_long = inputs(b"1", b"", &long_ad);
-    assert_eq!(Initiator::start(&too_long, &mut rng).unwrap_err(), CpaceError::AdTooLong);
-    assert_eq!(Responder::respond(&too_long, &msg, &mut rng).unwrap_err(), CpaceError::AdTooLong);
+    assert_eq!(
+        Initiator::start(&too_long, &mut rng).unwrap_err(),
+        CpaceError::AdTooLong
+    );
+    assert_eq!(
+        Responder::respond(&too_long, &msg, &mut rng).unwrap_err(),
+        CpaceError::AdTooLong
+    );
 }
 
 #[test]

@@ -52,7 +52,9 @@ pub(crate) fn parse_share(msg: &[u8]) -> Result<Share<'_>, CpaceError> {
     let (ad_len, len_size) = read_len(after_point)?;
     let ad_start = len_size;
     let ad_end = ad_start.checked_add(ad_len).ok_or(CpaceError::Malformed)?;
-    let ad = after_point.get(ad_start..ad_end).ok_or(CpaceError::Malformed)?;
+    let ad = after_point
+        .get(ad_start..ad_end)
+        .ok_or(CpaceError::Malformed)?;
     let body_len = 1 + POINT_LEN + ad_end;
     Ok(Share {
         point: *point,

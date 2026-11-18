@@ -138,7 +138,11 @@ pub(crate) fn is_identity(encoded: &[u8; POINT_LEN]) -> Choice {
 
 /// lv_cat(G.DSI || b"_ISK", sid, K) || transcript (section 7.2). Holds K, so it
 /// is wiped on drop.
-pub(crate) fn isk_input(sid: &[u8], k: &[u8; POINT_LEN], transcript: &[&[u8]]) -> Zeroizing<Vec<u8>> {
+pub(crate) fn isk_input(
+    sid: &[u8],
+    k: &[u8; POINT_LEN],
+    transcript: &[&[u8]],
+) -> Zeroizing<Vec<u8>> {
     let mut out = Zeroizing::new(Vec::with_capacity(
         prepend_len_size(DSI_ISK)
             + prepend_len_size(sid)
@@ -155,7 +159,11 @@ pub(crate) fn isk_input(sid: &[u8], k: &[u8; POINT_LEN], transcript: &[&[u8]]) -
 }
 
 /// ISK = H.hash(isk_input) (section 7.2).
-pub(crate) fn isk(sid: &[u8], k: &[u8; POINT_LEN], transcript: &[&[u8]]) -> Zeroizing<[u8; ISK_LEN]> {
+pub(crate) fn isk(
+    sid: &[u8],
+    k: &[u8; POINT_LEN],
+    transcript: &[&[u8]],
+) -> Zeroizing<[u8; ISK_LEN]> {
     Zeroizing::new(Sha512::digest(&isk_input(sid, k, transcript)[..]).into())
 }
 

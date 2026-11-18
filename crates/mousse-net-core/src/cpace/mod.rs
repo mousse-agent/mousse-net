@@ -34,7 +34,9 @@ pub use primitives::{ISK_LEN, POINT_LEN, TAG_LEN};
 pub use wire::MAX_AD_LEN;
 
 use curve25519_dalek::scalar::Scalar;
-use primitives::{calculate_generator, isk, mac_key, sample_scalar, scalar_mult, scalar_mult_vfy, tag};
+use primitives::{
+    calculate_generator, isk, mac_key, sample_scalar, scalar_mult, scalar_mult_vfy, tag,
+};
 
 /// The shortest session id Mousse accepts.
 pub const MIN_SID_LEN: usize = 16;
