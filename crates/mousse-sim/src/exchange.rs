@@ -1,8 +1,9 @@
 //! The code exchange the simulated devices run, and a counter around it.
 //!
 //! Pairing core only sees the [`CodeExchangeFactory`] trait. The simulator
-//! picks the implementation with the single alias [`ExchangeImpl`]; moving to
-//! the real CPace factory is a change to that one line.
+//! picks the implementation with the single alias [`ExchangeImpl`]: real
+//! CPace by default, or core's insecure stand-in with the
+//! `insecure-exchange` feature (only for speed comparisons).
 //!
 //! [`CountingFactory`] wraps it and records every exchange start. Starting an
 //! exchange is the first piece of code work for an attempt, so the record is
@@ -12,13 +13,20 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use mousse_net_core::pairing::{BindingTranscript, CodeExchangeFactory, ExchangeRole, PairingCode};
+use mousse_net_core::pairing::{
+    BindingTranscript, CodeExchangeFactory, ExchangeRole, PairingCode, SID_LEN,
+};
 use rand_core::CryptoRng;
 
-/// The code-exchange factory the simulated devices use.
-///
-/// For now this is core's stand-in exchange (feature `insecure-test-exchange`):
-/// same three-message shape and confirmation semantics as CPace, not secure.
+/// The code-exchange factory the simulated devices use: real CPace (the
+/// joiner is the initiator, the host the responder).
+#[cfg(not(feature = "insecure-exchange"))]
+pub type ExchangeImpl = mousse_net_core::pairing::CpaceExchangeFactory;
+
+/// The code-exchange factory the simulated devices use: core's insecure
+/// stand-in (same message shape and confirmation rules as CPace, not
+/// secure), for speed comparisons only.
+#[cfg(feature = "insecure-exchange")]
 pub type ExchangeImpl = mousse_net_core::pairing::insecure::InsecureTestExchangeFactory;
 
 fn new_exchange_impl() -> ExchangeImpl {
@@ -74,6 +82,7 @@ impl CodeExchangeFactory for CountingFactory {
         role: ExchangeRole,
         code: &PairingCode,
         binding: &BindingTranscript,
+        sid: &[u8; SID_LEN],
         rng: &mut R,
     ) -> Self::Exchange {
         self.log.borrow_mut().push(WorkRecord {
@@ -83,7 +92,7 @@ impl CodeExchangeFactory for CountingFactory {
             role,
             transcript: binding.as_bytes().to_vec(),
         });
-        self.inner.start(role, code, binding, rng)
+        self.inner.start(role, code, binding, sid, rng)
     }
 }
 

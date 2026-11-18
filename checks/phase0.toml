@@ -203,11 +203,13 @@ env = { MOUSSE_MATRIX_BREAK = "1" }
 args = ["--same-only"]
 
 # ---------------------------------------------------------------------------
-# mousse-sim: the first seeds (handshake, pairing attempt limits).
-# Convention: the drill prints `PASS sim <drill>` or `FAIL sim <drill>` last
-# and exits 0 or 1. `--plant-bug <name>` turns on a planted bug in the
-# simulated engine (a cargo feature or a test-only switch), never in a
-# shipped build.
+# mousse-sim: the first seeds (handshake, pairing attempt limits, endpoints
+# that share a computer). Convention: the drill prints `PASS sim <drill>` or
+# `FAIL sim <drill>` last and exits 0 or 1. `--bug <name>` plants a bug in the
+# simulated devices (a run-time switch of the simulator, which never ships);
+# the verdict then counts only the invariant that bug must break, so the
+# control prints FAIL exactly when the drill caught it.
+# `mousse-sim list` shows every drill, invariant and planted bug.
 
 [[check]]
 id = "phase0.sim-handshake"
@@ -217,22 +219,36 @@ targets = ["windows-x64"]
 judge = "marker"
 pass_marker = "PASS sim handshake"
 fail_marker = "FAIL sim handshake"
-placeholder = "mousse-sim has no command line yet (branch p0-sim)"
 
 [[check.local]]
 target = "windows-x64"
 host = "windows-x86_64"
-command = ["cargo", "run", "-p", "mousse-sim", "--", "run", "handshake", "--seeds", "1000"]
+command = ["cargo", "run", "--release", "-p", "mousse-sim", "--", "run", "handshake", "--seeds", "1000"]
 
 [[check.control]]
-name = "skip-pin-check"
-breaks = "the simulated client accepts a peer whose identity does not match its pin"
-args = ["--plant-bug", "skip-pin-check"]
+name = "no-pin-on-reconnect"
+breaks = "the simulated client verifies the host without its pin on reconnects and path switches"
+args = ["--bug", "no-pin-on-reconnect"]
 
 [[check.control]]
 name = "accept-expired-cert"
 breaks = "the simulated verifier ignores the session certificate's validity window"
-args = ["--plant-bug", "accept-expired-cert"]
+args = ["--bug", "accept-expired-cert"]
+
+[[check.control]]
+name = "skip-deadline"
+breaks = "the simulated devices never run the session deadline, so traffic outlives the certificates"
+args = ["--bug", "skip-deadline"]
+
+[[check.control]]
+name = "keep-channel-after-removal"
+breaks = "the simulated host ignores the grant table's close-channels event after a removal"
+args = ["--bug", "keep-channel-after-removal"]
+
+[[check.control]]
+name = "host-ignore-gate"
+breaks = "the simulated host hands stream traffic to the application without asking the gate"
+args = ["--bug", "host-ignore-gate"]
 
 [[check]]
 id = "phase0.sim-pairing-attempts"
@@ -240,24 +256,47 @@ title = "Simulator: pairing attempt limits over many seeds"
 plan = "Phase 0 \"mousse-sim\": the first seeds cover the pairing attempt limits; PLAN §3 \"Attempt limits\""
 targets = ["windows-x64"]
 judge = "marker"
-pass_marker = "PASS sim pairing-attempts"
-fail_marker = "FAIL sim pairing-attempts"
-placeholder = "mousse-sim has no command line yet (branch p0-sim)"
+pass_marker = "PASS sim pairing-limits"
+fail_marker = "FAIL sim pairing-limits"
 
 [[check.local]]
 target = "windows-x64"
 host = "windows-x86_64"
-command = ["cargo", "run", "-p", "mousse-sim", "--", "run", "pairing-attempts", "--seeds", "1000"]
+command = ["cargo", "run", "--release", "-p", "mousse-sim", "--", "run", "pairing-limits", "--seeds", "1000"]
 
 [[check.control]]
-name = "debit-after-work"
-breaks = "the host debits an attempt only after CPace work, so an aborted attempt is free"
-args = ["--plant-bug", "debit-after-work"]
+name = "host-work-before-debit"
+breaks = "the simulated host starts CPace work before the attempt is debited"
+args = ["--bug", "host-work-before-debit"]
+
+[[check.control]]
+name = "joiner-work-before-debit"
+breaks = "the simulated joiner starts CPace work before the attempt is debited"
+args = ["--bug", "joiner-work-before-debit"]
 
 [[check.control]]
 name = "new-session-retry-free"
-breaks = "a retry on a new TLS session is not counted as a new attempt"
-args = ["--plant-bug", "new-session-retry-free"]
+breaks = "the simulated joiner starts a fresh attempt counter on every new TLS session, so retries are free"
+args = ["--bug", "joiner-new-flow-on-reconnect"]
+
+[[check]]
+id = "phase0.sim-shared-endpoints"
+title = "Simulator: two endpoints on one computer stay independent"
+plan = "docs/PLAN.md §1 \"Endpoint\": a profile's endpoint has its own key and grant table; a local denial never reaches another endpoint"
+targets = ["windows-x64"]
+judge = "marker"
+pass_marker = "PASS sim shared-endpoints"
+fail_marker = "FAIL sim shared-endpoints"
+
+[[check.local]]
+target = "windows-x64"
+host = "windows-x86_64"
+command = ["cargo", "run", "--release", "-p", "mousse-sim", "--", "run", "shared-endpoints", "--seeds", "1000"]
+
+[[check.control]]
+name = "shared-grant-table"
+breaks = "the two endpoints on the computer share one grant table"
+args = ["--bug", "shared-grant-table"]
 
 # ---------------------------------------------------------------------------
 # Thin slice: two desktop processes pair in person, open a terminal channel,

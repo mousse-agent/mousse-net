@@ -6,12 +6,41 @@ use std::ops::Range;
 
 use mousse_sim::{run, Bug, Drill, Invariant, RunConfig, RunOutcome};
 
-/// Violations the drills report against the current core. Each has a pinned
-/// seed below. A smoke run may hit these and nothing else.
-const KNOWN_CORE_FINDINGS: &[(Drill, Invariant)] = &[
-    (Drill::PairingLimits, Invariant::PairingAgreement),
-    (Drill::Handshake, Invariant::GrantIdsUnique),
+/// A violation the drills report against the current core: the drill, the
+/// invariant, a seed that shows it, and what is wrong. Smoke runs may hit
+/// these and nothing else.
+///
+/// When core fixes one, its seed passes and
+/// `known_core_findings_still_reproduce` fails: delete the entry. The list
+/// should end empty.
+#[cfg_attr(feature = "insecure-exchange", allow(dead_code))]
+struct Finding {
+    drill: Drill,
+    invariant: Invariant,
+    seed: u64,
+    what: &'static str,
+}
+
+const KNOWN_CORE_FINDINGS: &[Finding] = &[
+    Finding {
+        drill: Drill::PairingLimits,
+        invariant: Invariant::PairingAgreement,
+        seed: 2171,
+        what: "a joiner whose third attempt succeeded but whose PAIRED was lost                with the connection ends as AttemptsExhausted while the host keeps                the grant",
+    },
+    Finding {
+        drill: Drill::Handshake,
+        invariant: Invariant::GrantIdsUnique,
+        seed: 21,
+        what: "GrantTable::restore takes the next grant id from the stored grants                only, so the id of a removed newest grant is reused after a restart",
+    },
 ];
+
+fn is_known(drill: Drill, invariant: Invariant) -> bool {
+    KNOWN_CORE_FINDINGS
+        .iter()
+        .any(|f| f.drill == drill && f.invariant == invariant)
+}
 
 fn config(drill: Drill, seed: u64, bug: Option<Bug>) -> RunConfig {
     RunConfig {
@@ -90,7 +119,7 @@ fn smoke(drill: Drill, range: Range<u64>) {
         variants.insert(o.variant);
         if let Some(v) = &o.violation {
             assert!(
-                KNOWN_CORE_FINDINGS.contains(&(drill, v.invariant)),
+                is_known(drill, v.invariant),
                 "{drill} seed {}: {v}\n  replay: {}",
                 o.config.seed,
                 o.config.replay_command()
@@ -159,23 +188,22 @@ fn a_planted_bug_is_named_in_the_replay_command() {
     );
 }
 
-/// Core finding: a joiner whose third attempt succeeded but whose `PAIRED`
-/// was lost with the connection ends as `AttemptsExhausted`, while the host
-/// keeps the grant. When core fixes this, this seed passes and the entry in
-/// `KNOWN_CORE_FINDINGS` should go.
+/// The seeds are for the default exchange (CPace); the insecure stand-in
+/// draws different randomness, so its runs differ.
+#[cfg(not(feature = "insecure-exchange"))]
 #[test]
-fn known_core_finding_joiner_fails_after_a_lost_paired() {
-    let o = run(&config(Drill::PairingLimits, 2352, None));
-    let v = o.violation.expect("the finding still reproduces");
-    assert_eq!(v.invariant, Invariant::PairingAgreement, "{v}");
-}
-
-/// Core finding: `GrantTable::restore` sets the next id from the stored
-/// grants only, so after removing the newest grant and restarting, the next
-/// grant reuses its id.
-#[test]
-fn known_core_finding_grant_id_reused_after_restore() {
-    let o = run(&config(Drill::Handshake, 21, None));
-    let v = o.violation.expect("the finding still reproduces");
-    assert_eq!(v.invariant, Invariant::GrantIdsUnique, "{v}");
+fn known_core_findings_still_reproduce() {
+    for f in KNOWN_CORE_FINDINGS {
+        let o = run(&config(f.drill, f.seed, None));
+        let got = o.violation.as_ref().map(|v| v.invariant);
+        assert_eq!(
+            got,
+            Some(f.invariant),
+            "{} seed {} no longer reports {} ({}): if core fixed it, delete this entry",
+            f.drill,
+            f.seed,
+            f.invariant,
+            f.what
+        );
+    }
 }

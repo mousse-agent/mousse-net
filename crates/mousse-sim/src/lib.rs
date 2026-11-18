@@ -129,11 +129,13 @@ pub enum Bug {
     /// The endpoints on one computer share one grant table, so a deny or
     /// removal on one endpoint also applies on the other.
     SharedGrantTable,
+    /// The verifier ignores the session certificate's validity window.
+    AcceptExpiredCert,
 }
 
 impl Bug {
     /// Every planted bug.
-    pub const ALL: [Bug; 8] = [
+    pub const ALL: [Bug; 9] = [
         Bug::KeepChannelAfterRemoval,
         Bug::HostWorkBeforeDebit,
         Bug::JoinerWorkBeforeDebit,
@@ -142,6 +144,7 @@ impl Bug {
         Bug::HostIgnoreGate,
         Bug::NoPinOnReconnect,
         Bug::SharedGrantTable,
+        Bug::AcceptExpiredCert,
     ];
 
     /// The CLI name.
@@ -155,6 +158,7 @@ impl Bug {
             Bug::HostIgnoreGate => "host-ignore-gate",
             Bug::NoPinOnReconnect => "no-pin-on-reconnect",
             Bug::SharedGrantTable => "shared-grant-table",
+            Bug::AcceptExpiredCert => "accept-expired-cert",
         }
     }
 
@@ -164,7 +168,8 @@ impl Bug {
             Bug::KeepChannelAfterRemoval
             | Bug::SkipDeadline
             | Bug::HostIgnoreGate
-            | Bug::NoPinOnReconnect => Drill::Handshake,
+            | Bug::NoPinOnReconnect
+            | Bug::AcceptExpiredCert => Drill::Handshake,
             Bug::HostWorkBeforeDebit
             | Bug::JoinerWorkBeforeDebit
             | Bug::JoinerNewFlowOnReconnect => Drill::PairingLimits,
@@ -182,6 +187,7 @@ impl Bug {
             Bug::HostIgnoreGate => Invariant::NoTrafficWithoutGrant,
             Bug::NoPinOnReconnect => Invariant::PinMatch,
             Bug::SharedGrantTable => Invariant::EndpointIsolation,
+            Bug::AcceptExpiredCert => Invariant::Step1Spec,
         }
     }
 }

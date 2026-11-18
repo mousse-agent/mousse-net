@@ -4,7 +4,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use mousse_net_core::control::{AuthorizedState, ControlMessage};
+use mousse_net_core::authz::{CallerGate, CallerTraffic, Verdict};
+use mousse_net_core::control::{
+    negotiate_version, AuthorizedState, ControlMessage, VersionSupport,
+};
 use mousse_net_core::identity::IdentityPublicKey;
 use mousse_net_core::mux::{MuxEvent, PriorityClass, StreamId};
 use mousse_net_core::pairing::{
@@ -13,7 +16,7 @@ use mousse_net_core::pairing::{
 };
 use mousse_net_core::session::{PeerSession, SessionEvent, RENEW_LEAD_SECS};
 use mousse_net_core::session_cert::SessionCertificate;
-use mousse_net_core::{ConnectionId, ErrorCode, PROTOCOL_MINOR_VERSION};
+use mousse_net_core::{ConnectionId, ErrorCode};
 
 use crate::certs;
 use crate::check::Invariant;
@@ -48,6 +51,8 @@ pub(crate) struct CallerConn {
     /// Deadline for connections outside the paired session (joining,
     /// intruding).
     own_session: Option<PeerSession>,
+    /// The caller-side gate: what the host may send on this connection.
+    gate: CallerGate,
     authorized: Option<AuthorizedState>,
     terminal: Option<StreamId>,
 }
@@ -347,9 +352,7 @@ impl CallerDev {
             );
         }
         let mut ep = Endpoint::new(conn, Side::Client, auth, sim.mono());
-        ep.send(&ControlMessage::Hello {
-            minor_version: PROTOCOL_MINOR_VERSION,
-        });
+        ep.send(&ControlMessage::hello());
         let mut own_session = PeerSession::new(peer);
         own_session.begin_path(conn);
         let own_ok = own_session
@@ -359,6 +362,7 @@ impl CallerDev {
         let mut cc = CallerConn {
             ep,
             own_session: Some(own_session),
+            gate: CallerGate::new(),
             authorized: None,
             terminal: None,
         };
@@ -483,14 +487,23 @@ impl CallerDev {
     fn on_mux_event(&mut self, sim: &mut Sim, conn: ConnectionId, event: MuxEvent) {
         match event {
             MuxEvent::Control(bytes) => match ControlMessage::decode(&bytes) {
-                Ok(msg) => self.on_control(sim, conn, msg),
+                Ok(msg) => {
+                    if self.gate_allows(sim, conn, CallerTraffic::of(&msg)) {
+                        self.on_control(sim, conn, msg)
+                    }
+                }
                 Err(_) => self.close(sim, conn, ErrorCode::ProtocolError),
             },
             MuxEvent::Data { stream, bytes } => {
-                if let Some(cc) = self.conns.get_mut(&conn) {
-                    cc.ep.mux.release(stream, bytes.len() as u64);
-                    self.echoed += bytes.len() as u64;
+                if self.gate_allows(sim, conn, CallerTraffic::Stream) {
+                    if let Some(cc) = self.conns.get_mut(&conn) {
+                        cc.ep.mux.release(stream, bytes.len() as u64);
+                        self.echoed += bytes.len() as u64;
+                    }
                 }
+            }
+            MuxEvent::StreamOpened { .. } | MuxEvent::Finished { .. } | MuxEvent::Reset { .. } => {
+                self.gate_allows(sim, conn, CallerTraffic::Stream);
             }
             MuxEvent::GoAway { code } => {
                 sim.say(
@@ -506,7 +519,42 @@ impl CallerDev {
         }
     }
 
+    /// Ask the caller gate about inbound traffic; close on its verdict.
+    fn gate_allows(&mut self, sim: &mut Sim, conn: ConnectionId, traffic: CallerTraffic) -> bool {
+        let Some(cc) = self.conns.get_mut(&conn) else {
+            return false;
+        };
+        match cc.gate.check(traffic) {
+            Verdict::Allow => true,
+            Verdict::Ignore => false,
+            Verdict::Close(code) => {
+                sim.say(
+                    self.id,
+                    format_args!("conn {}: caller gate refuses {traffic:?}", conn.0),
+                );
+                self.close(sim, conn, code);
+                false
+            }
+        }
+    }
+
     fn on_control(&mut self, sim: &mut Sim, conn: ConnectionId, msg: ControlMessage) {
+        if let ControlMessage::Hello {
+            major_version,
+            minor_version,
+        } = msg
+        {
+            if let Err(code) =
+                negotiate_version(VersionSupport::LOCAL, major_version, minor_version)
+            {
+                sim.say(
+                    self.id,
+                    format_args!("conn {}: no common protocol version", conn.0),
+                );
+                self.close(sim, conn, code);
+            }
+            return;
+        }
         if !matches!(msg, ControlMessage::Hello { .. }) {
             sim.say(self.id, format_args!("conn {}: gets {msg:?}", conn.0));
         }
@@ -630,6 +678,7 @@ impl CallerDev {
                 let _ = session.on_reopened(conn);
             }
             cc.own_session = None;
+            cc.gate.promote();
             cc.authorized = Some(AuthorizedState::Live);
             Self::open_terminal(cc);
         }
@@ -692,7 +741,8 @@ impl CallerDev {
                     &self.identity,
                     &hc.ep.auth.exporters.pair,
                 );
-                let _ = factory.start(ExchangeRole::Initiator, &code, &binding, &mut sim.rng);
+                let sid = [0; mousse_net_core::pairing::SID_LEN];
+                let _ = factory.start(ExchangeRole::Initiator, &code, &binding, &sid, &mut sim.rng);
             }
         }
         match flow.submit_code(&code, &mut sim.rng) {
@@ -785,6 +835,7 @@ impl CallerDev {
             format_args!("closes conn {} with {code:?}", conn.0),
         );
         cc.ep.mux.close(code);
+        cc.gate.close(code);
         self.ended(sim, conn);
     }
 

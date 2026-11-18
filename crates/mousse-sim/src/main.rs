@@ -1,7 +1,8 @@
 //! Command line for the simulator.
 //!
 //! ```text
-//! mousse-sim run --drill pairing-limits --seeds 0..5000 [--bug NAME] [--full-verify] [--jobs N]
+//! mousse-sim run pairing-limits --seeds 5000 [--bug NAME] [--full-verify] [--jobs N]
+//! mousse-sim run --drill all --seeds 1000..2000
 //! mousse-sim replay --drill handshake --seed 42 [--bug NAME] [--full-verify]
 //! mousse-sim must-fail [--seeds 0..500]
 //! mousse-sim list
@@ -11,8 +12,15 @@
 //! still single-threaded and deterministic; threads only run different
 //! seeds side by side.
 //!
-//! Exit status: 0 when every run keeps every invariant (for `must-fail`:
-//! when every planted bug is caught), 1 otherwise, 2 for a usage error.
+//! `--seeds N` means seeds `0..N`; `--seeds A..B` a range; `--seed N` one
+//! seed. The drill is the first plain argument or `--drill`.
+//!
+//! `run` ends each drill with `PASS sim <drill>` or `FAIL sim <drill>`. With
+//! `--bug`, the verdict counts only the invariant that bug must break, so a
+//! must-fail control prints `FAIL` exactly when its bug was caught.
+//!
+//! Exit status: 0 when every drill passes (for `must-fail`: when every
+//! planted bug is caught), 1 otherwise, 2 for a usage error.
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
@@ -23,7 +31,7 @@ use std::time::Instant;
 use mousse_sim::{run, Bug, Drill, Invariant, RunConfig, RunOutcome};
 
 const USAGE: &str = "usage:
-  mousse-sim run --drill <name|all> --seeds <A..B|N> [--bug <name>] [--full-verify] [--jobs <N>]
+  mousse-sim run <drill|all> --seeds <N|A..B> [--bug <name>] [--full-verify] [--jobs <N>]
   mousse-sim replay --drill <name> --seed <N> [--bug <name>] [--full-verify]
   mousse-sim must-fail [--seeds <A..B>] [--jobs <N>]
   mousse-sim list";
@@ -56,8 +64,9 @@ fn run_all(configs: &[RunConfig], jobs: usize) -> Vec<RunOutcome> {
     })
 }
 
-fn parse_seeds(s: &str) -> Result<Range<u64>, String> {
-    let bad = || format!("bad seed range {s:?}; use A..B or N");
+/// `A..B`, or `N` meaning `0..N` (`--seeds`) or the one seed `N` (`--seed`).
+fn parse_seeds(s: &str, single: bool) -> Result<Range<u64>, String> {
+    let bad = || format!("bad seeds {s:?}; use A..B or N");
     match s.split_once("..") {
         Some((a, b)) => {
             let a: u64 = a.parse().map_err(|_| bad())?;
@@ -69,7 +78,11 @@ fn parse_seeds(s: &str) -> Result<Range<u64>, String> {
         }
         None => {
             let n: u64 = s.parse().map_err(|_| bad())?;
-            Ok(n..n.saturating_add(1))
+            match (single, n) {
+                (true, _) => Ok(n..n.saturating_add(1)),
+                (false, 0) => Err(bad()),
+                (false, _) => Ok(0..n),
+            }
         }
     }
 }
@@ -82,8 +95,23 @@ fn parse_args(rest: &[String]) -> Result<Args, String> {
         full_verify: false,
         jobs: std::thread::available_parallelism().map_or(1, |n| n.get()),
     };
+    let set_drill = |args: &mut Args, v: &str| -> Result<(), String> {
+        args.drills = if v == "all" {
+            Drill::ALL.to_vec()
+        } else {
+            vec![v.parse()?]
+        };
+        Ok(())
+    };
     let mut it = rest.iter();
     while let Some(flag) = it.next() {
+        if !flag.starts_with("--") {
+            if !args.drills.is_empty() {
+                return Err(format!("unexpected argument {flag:?}"));
+            }
+            set_drill(&mut args, flag)?;
+            continue;
+        }
         let mut value = || {
             it.next()
                 .cloned()
@@ -92,13 +120,10 @@ fn parse_args(rest: &[String]) -> Result<Args, String> {
         match flag.as_str() {
             "--drill" => {
                 let v = value()?;
-                args.drills = if v == "all" {
-                    Drill::ALL.to_vec()
-                } else {
-                    vec![v.parse()?]
-                };
+                set_drill(&mut args, &v)?;
             }
-            "--seeds" | "--seed" => args.seeds = Some(parse_seeds(&value()?)?),
+            "--seeds" => args.seeds = Some(parse_seeds(&value()?, false)?),
+            "--seed" => args.seeds = Some(parse_seeds(&value()?, true)?),
             "--bug" => args.bug = Some(value()?.parse()?),
             "--full-verify" => args.full_verify = true,
             "--jobs" => {
@@ -145,7 +170,7 @@ fn main() -> ExitCode {
 
 fn cmd_run(args: &Args) -> ExitCode {
     let (Some(seeds), false) = (args.seeds.clone(), args.drills.is_empty()) else {
-        eprintln!("run needs --drill and --seeds\n{USAGE}");
+        eprintln!("run needs a drill and --seeds\n{USAGE}");
         return ExitCode::from(2);
     };
     let mut failed = false;
@@ -168,7 +193,12 @@ fn cmd_run(args: &Args) -> ExitCode {
             events += outcome.events;
             let entry = by_variant.entry(outcome.variant).or_default();
             entry.0 += 1;
-            if outcome.violation.is_some() {
+            let counts = match (&outcome.violation, args.bug) {
+                (None, _) => false,
+                (Some(_), None) => true,
+                (Some(v), Some(bug)) => v.invariant == bug.expected(),
+            };
+            if counts {
                 entry.1 += 1;
                 failures.push(outcome);
             }
@@ -208,6 +238,18 @@ fn cmd_run(args: &Args) -> ExitCode {
             runs as f64 / secs.max(1e-9),
             variants.join(", ")
         );
+        if let Some(bug) = args.bug {
+            println!(
+                "planted bug {bug}: {}",
+                if failures.is_empty() {
+                    format!("not caught (no seed reported {})", bug.expected())
+                } else {
+                    format!("caught as {} in {} seeds", bug.expected(), failures.len())
+                }
+            );
+        }
+        let verdict = if failures.is_empty() { "PASS" } else { "FAIL" };
+        println!("{verdict} sim {drill}");
         failed |= !failures.is_empty();
     }
     if failed {

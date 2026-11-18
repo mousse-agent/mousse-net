@@ -1,7 +1,7 @@
 //! Drill scenarios. Each seed picks a variant, the devices, their clocks and
 //! certificate lifetimes, the people's behaviour and the faults.
 
-use mousse_net_core::pairing::InvitationKind;
+use mousse_net_core::pairing::{InvitationKind, Route as RouteHint, Ticket};
 
 use crate::caller::Typist;
 use crate::host::OwnerChoice;
@@ -112,7 +112,29 @@ fn maybe_partition(world: &mut World, permille: u32, routes: &[usize], window: (
 
 const LAN: &str = "tcp://192.168.1.20:7443";
 const TAILNET: &str = "tcp://100.101.102.103:7443";
-const FAKE: &str = "wss://tunnel.example.net/join";
+const FAKE: &str = "tcp://203.0.113.9:7443";
+/// A hint the joiner must skip (reserved scheme).
+const RESERVED: &str = "wss://tunnel.example.net/join";
+
+/// The routes a joiner dials: the ticket's hints, read with core's route
+/// parser, mapped to simulated routes. Hints core skips are not dialled.
+fn ticket_routes(world: &mut World, ticket: &Ticket) -> Vec<usize> {
+    let mut out = Vec::new();
+    for hint in &ticket.routes {
+        match RouteHint::parse(hint) {
+            Ok(_) => {
+                if let Some(i) = world.sim.routes.iter().position(|r| r.name == hint) {
+                    out.push(i);
+                }
+            }
+            Err(skip) => world.sim.note(
+                "sim",
+                format_args!("joiner skips route hint {hint}: {skip:?}"),
+            ),
+        }
+    }
+    out
+}
 
 fn pairing_limits(world: &mut World) -> &'static str {
     let variant = world.sim.pick(PAIRING_VARIANTS);
@@ -134,7 +156,9 @@ fn pairing_limits(world: &mut World) -> &'static str {
 
     let lan = route(world, LAN, host, (1, 8));
     let tailnet = route(world, TAILNET, host, (20, 150));
-    let fake_route = fake.map(|f| route(world, FAKE, f, (20, 80)));
+    if let Some(f) = fake {
+        route(world, FAKE, f, (20, 80));
+    }
 
     let s = &mut world.sim;
     s.drop_permille = s.pick(&[0, 0, 100, 300]);
@@ -166,16 +190,21 @@ fn pairing_limits(world: &mut World) -> &'static str {
     };
     let (h, sim) = world.hs(host);
     h.owner_choices = owner_choices.to_vec();
-    let created = h.create_invitation(sim, kind, vec![LAN.to_owned(), TAILNET.to_owned()]);
-    let (ticket, ticket_host, routes) = match (fake, fake_route) {
-        (Some(f), Some(r)) => {
+    let mut hints = vec![LAN.to_owned(), TAILNET.to_owned()];
+    if sim.chance(200) {
+        hints.insert(0, RESERVED.to_owned());
+    }
+    let created = h.create_invitation(sim, kind, hints);
+    let (ticket, ticket_host) = match fake {
+        Some(f) => {
             let (fh, sim) = world.hs(f);
             fh.malicious = true;
             let c = fh.create_invitation(sim, InvitationKind::SendLink, vec![FAKE.to_owned()]);
-            (c.ticket, f, vec![r])
+            (c.ticket, f)
         }
-        _ => (created.ticket, host, vec![lan, tailnet]),
+        _ => (created.ticket, host),
     };
+    let routes = ticket_routes(world, &ticket);
 
     let mut joiners = vec![phone];
     joiners.extend(laptop);

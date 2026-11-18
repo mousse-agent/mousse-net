@@ -5,17 +5,19 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use mousse_net_core::authz::{ConnectionGate, GateState, Traffic, Verdict};
-use mousse_net_core::control::{AuthorizedState, ControlMessage};
+use mousse_net_core::control::{
+    negotiate_version, AuthorizedState, ControlMessage, VersionSupport,
+};
 use mousse_net_core::grants::{GrantEvent, GrantId, GrantTable, NewGrant, OwnerRef, Role};
 use mousse_net_core::identity::IdentityPublicKey;
 use mousse_net_core::mux::{MuxEvent, StreamId};
 use mousse_net_core::pairing::{
     binding_transcript, CodeExchangeFactory, CreatedInvitation, ExchangeRole, HostAction,
-    HostPairing, InvitationId, InvitationKind, InvitationParams, PairingCode,
+    HostPairing, InvitationId, InvitationKind, InvitationParams, PairingCode, SID_LEN,
 };
 use mousse_net_core::session::{PeerSession, SessionEvent, RENEW_LEAD_SECS};
 use mousse_net_core::session_cert::SessionCertificate;
-use mousse_net_core::{ConnectionId, ErrorCode, PROTOCOL_MINOR_VERSION};
+use mousse_net_core::{ConnectionId, ErrorCode};
 
 use crate::certs;
 use crate::check::Invariant;
@@ -67,6 +69,9 @@ pub(crate) struct HostDev {
     pub enrolled: Vec<(InvitationId, IdentityPublicKey, GrantId, Role)>,
     pub owner_choices: Vec<OwnerChoice>,
 }
+
+/// The profile that authorizes every grant in the simulation.
+const PROFILE_ID: [u8; OwnerRef::LEN] = [0x51; OwnerRef::LEN];
 
 fn classify(msg: &ControlMessage) -> Traffic {
     match msg {
@@ -125,7 +130,7 @@ impl HostDev {
                 identity,
                 name: name.to_owned(),
                 role: Role::owner(),
-                authorizing_owner: OwnerRef::new("profile-1").expect("valid owner"),
+                authorizing_owner: OwnerRef::from_bytes(PROFILE_ID),
                 expires_at: expires_in.map(|s| wall.plus(s)),
             },
             wall,
@@ -167,7 +172,7 @@ impl HostDev {
                 InvitationParams {
                     kind,
                     role: Role::owner(),
-                    authorizing_owner: OwnerRef::new("profile-1").expect("valid owner"),
+                    authorizing_owner: OwnerRef::from_bytes(PROFILE_ID),
                     routes,
                     grant_expires_at: None,
                 },
@@ -220,9 +225,7 @@ impl HostDev {
         let mono = sim.mono();
         let peer = auth.peer.identity;
         let mut ep = Endpoint::new(conn, Side::Server, auth, mono);
-        ep.send(&ControlMessage::Hello {
-            minor_version: PROTOCOL_MINOR_VERSION,
-        });
+        ep.send(&ControlMessage::hello());
         let mut session = PeerSession::new(peer);
         session.begin_path(conn);
         let mut close = None;
@@ -425,7 +428,21 @@ impl HostDev {
         let peer = hc.ep.auth.peer.identity;
         let exporters = hc.ep.auth.exporters;
         let actions = match msg {
-            ControlMessage::Hello { .. } => return,
+            ControlMessage::Hello {
+                major_version,
+                minor_version,
+            } => {
+                if let Err(code) =
+                    negotiate_version(VersionSupport::LOCAL, major_version, minor_version)
+                {
+                    sim.say(
+                        self.id,
+                        format_args!("conn {}: no common protocol version", conn.0),
+                    );
+                    self.close(sim, conn, code);
+                }
+                return;
+            }
             ControlMessage::JoinProof {
                 invitation,
                 mac,
@@ -606,7 +623,8 @@ impl HostDev {
             &hc.ep.auth.exporters.pair,
         );
         let factory = CountingFactory::new(self.id, self.instance, 0, sim.work.clone());
-        let _ = factory.start(ExchangeRole::Responder, code, &binding, &mut sim.rng);
+        let sid = [0; SID_LEN];
+        let _ = factory.start(ExchangeRole::Responder, code, &binding, &sid, &mut sim.rng);
         sim.say(self.id, format_args!("precomputes its exchange share"));
     }
 
@@ -949,14 +967,17 @@ impl HostDev {
     /// drops the connection so the joiner has to reconnect.
     fn fake_host_control(&mut self, sim: &mut Sim, conn: ConnectionId, msg: ControlMessage) {
         let reply = match msg {
-            ControlMessage::JoinProof { .. } => Some(ControlMessage::Authorized {
-                state: AuthorizedState::JoinOnly,
-            }),
-            ControlMessage::CodeExchange { attempt, payload } if payload.first() == Some(&1) => {
-                let mut junk = vec![2u8; 49];
-                for b in junk.iter_mut().skip(1) {
-                    *b = sim.range(0, 255) as u8;
+            ControlMessage::JoinProof { invitation, .. } => {
+                if let Some(hc) = self.conns.get_mut(&conn) {
+                    hc.gate.admit_join_only(invitation);
                 }
+                Some(ControlMessage::Authorized {
+                    state: AuthorizedState::JoinOnly,
+                })
+            }
+            ControlMessage::CodeExchange { attempt, .. } => {
+                let len = sim.range(32, 96) as usize;
+                let junk: Vec<u8> = (0..len).map(|_| sim.range(0, 255) as u8).collect();
                 let delay = sim.range(500, 3_000);
                 sim.after(
                     delay,

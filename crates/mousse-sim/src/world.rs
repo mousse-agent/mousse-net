@@ -401,6 +401,7 @@ impl World {
         // TLS 1.3: the client checks the server's certificate first.
         let client_wall = self.sim.wall(client);
         let at_client = certs::verify(server_cert.der(), client_wall, pin.as_ref(), full);
+        let at_client = self.planted_window_skip(at_client, &server_cert, pin.as_ref());
         self.step1_oracle(client, &server_cert, client_wall, pin, &at_client);
         let at_client = match at_client {
             Ok(v) => v,
@@ -422,6 +423,7 @@ impl World {
         };
         let server_wall = self.sim.wall(server);
         let at_server = certs::verify(client_cert.der(), server_wall, None, full);
+        let at_server = self.planted_window_skip(at_server, &client_cert, None);
         self.step1_oracle(server, &client_cert, server_wall, None, &at_server);
         let at_server = match at_server {
             Ok(v) => v,
@@ -475,6 +477,23 @@ impl World {
         caller.run_timers(&mut self.sim);
         let caller = caller_of(&mut self.devs, client);
         caller.on_connected(&mut self.sim, conn, client_auth);
+    }
+
+    /// Planted bug: the verifier ignores the validity window, so a
+    /// certificate outside it is accepted (as if checked at its start).
+    fn planted_window_skip(
+        &self,
+        got: Result<VerifiedSessionCert, CertError>,
+        cert: &SessionCertificate,
+        pin: Option<&IdentityPublicKey>,
+    ) -> Result<VerifiedSessionCert, CertError> {
+        match got {
+            Err(CertError::OutsideWindow) if self.sim.bug(Bug::AcceptExpiredCert) => {
+                let start = cert.window().not_before();
+                certs::verify(cert.der(), start, pin, self.sim.cfg.full_verify)
+            }
+            other => other,
+        }
     }
 
     /// Step 1 must accept exactly when the spec's window and pin rules say.
