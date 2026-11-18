@@ -93,6 +93,27 @@ Error names used in vectors: `truncated`, `trailing_bytes`, `non_canonical`,
 `unsorted_keys`, `non_integer_key`, `unsupported`, `invalid_utf8`,
 `too_deep`.
 
+**Which error.** A decoder reads from the first byte on and reports the
+first rule broken. For each item, in this order:
+
+1. The item would sit inside more than 8 arrays or maps: `too_deep`.
+2. Major type 1, 6 or 7 (so a lone break byte `ff` too): `unsupported`.
+3. Additional information 28 to 30: `unsupported`. Additional information
+   31 (an indefinite length, on any major type): `non_canonical`.
+4. Bytes of the head are missing: `truncated`. A head that is not in its
+   shortest form: `non_canonical`.
+5. Byte and text strings: fewer bytes left than the length says,
+   `truncated`; text that is not UTF-8, `invalid_utf8`.
+6. Arrays: a count larger than the bytes left (every item takes at least
+   one byte) is `truncated` before any item is read. Maps: a count larger
+   than half the bytes left is `truncated` in the same way. Then, for each
+   entry: a key whose major type is not 0, `non_integer_key`; the key's
+   head by rules 3 and 4; a key not greater than the one before,
+   `unsorted_keys`, before its value is read; then the value.
+
+After the top-level item, any byte left is `trailing_bytes`. Vectors:
+`cbor.json`.
+
 **Records with fixed fields.** When this document lists a record as
 `{1: ..., 2: ...}`, every listed key is required unless marked optional, the
 value type is as listed, and **any other key is an error**. A record whose
@@ -578,8 +599,10 @@ The ticket is a canonical CBOR map:
   same.
 - **Link form:** the ticket bytes in base64url (RFC 4648 section 5) **without
   padding**, placed in the URL fragment after `#`. Decoders reject `=`, the
-  standard alphabet's `+` and `/`, and any other character (`encoding`). The
-  fragment never reaches a web server.
+  standard alphabet's `+` and `/`, any other character, a length of 1 mod 4,
+  and a last character whose unused low bits are not all zero (all
+  `encoding`). So each byte string has exactly one accepted text form, the
+  one an encoder writes. The fragment never reaches a web server.
 
 Expiry:
 
@@ -622,11 +645,18 @@ A `tcp` or `mdns` hint that breaks its grammar is skipped as `malformed`:
     names);
   - anything else: a DNS name. Labels of 1 to 63 ASCII letters, digits and
     `-`, not starting or ending with `-`, joined by single dots; at most 253
-    bytes; no trailing dot; the last label is not all digits. The name is
-    compared lowercased.
+    bytes; no trailing dot; the last label is not all digits. A reader
+    lowercases the name (ASCII letters only) and uses and compares only the
+    lowercased form.
 - Nothing else may appear: no user part, path, query or fragment.
 - `<instance>`: 1 to 63 bytes of UTF-8 with no control characters (Unicode
   general category Cc).
+
+An IPv6 host is its 128-bit address: every accepted text form of the same
+address (upper or lower case hex, leading zeros in a group, `::`, an
+embedded IPv4 part) is the same host, and the text form is not kept.
+Vectors give it as the 16 address bytes in hex. An IPv4 host is given in
+dotted decimal, and a DNS name lowercased.
 
 Whichever route reaches it, the host is checked against the ticket's pin. A
 pin mismatch on a LAN candidate means another endpoint holds that address

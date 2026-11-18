@@ -1,5 +1,5 @@
 {
-  "description": "The canonical CBOR subset (spec wire.md, \"Canonical CBOR\"). Valid items decode and re-encode to the same bytes. Invalid items are rejected with the given error.",
+  "description": "The canonical CBOR subset (spec wire.md, \"Canonical CBOR\"). Valid items decode and re-encode to the same bytes. Invalid items are rejected with the given error; where an input breaks several rules, the error is the first one in the order wire.md gives.",
   "invalid": [
     {
       "description": "empty input",
@@ -85,6 +85,66 @@
       "description": "9 nested arrays",
       "error": "too_deep",
       "hex": "81818181818181818100"
+    },
+    {
+      "description": "indefinite text string",
+      "error": "non_canonical",
+      "hex": "7f6161ff"
+    },
+    {
+      "description": "indefinite map",
+      "error": "non_canonical",
+      "hex": "bf0101ff"
+    },
+    {
+      "description": "additional info 31 on an unsigned integer",
+      "error": "non_canonical",
+      "hex": "1f"
+    },
+    {
+      "description": "break byte alone",
+      "error": "unsupported",
+      "hex": "ff"
+    },
+    {
+      "description": "reserved additional info 28",
+      "error": "unsupported",
+      "hex": "1c"
+    },
+    {
+      "description": "reserved additional info 30 on bytes",
+      "error": "unsupported",
+      "hex": "5e"
+    },
+    {
+      "description": "array count above the bytes left, before its items",
+      "error": "truncated",
+      "hex": "8220"
+    },
+    {
+      "description": "map count above half the bytes left",
+      "error": "truncated",
+      "hex": "a2010102"
+    },
+    {
+      "description": "negative integer as map key",
+      "error": "non_integer_key",
+      "hex": "a12001"
+    },
+    {
+      "description": "indefinite head on a map key",
+      "error": "non_canonical",
+      "hex": "a11f01"
+    },
+    {
+      "description": "key order checked before the value",
+      "error": "unsorted_keys",
+      "hex": "a202000120"
+    },
+    {
+      "description": "major type checked before the head",
+      "error": "unsupported",
+      "hex": "3b00"
     }
   ],
   "valid": [

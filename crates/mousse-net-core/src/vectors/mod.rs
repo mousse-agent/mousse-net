@@ -660,6 +660,8 @@ fn ticket_vectors() -> J {
             { "name": "fragment_with_padding", "fragment": format!("{fragment}=="), "result": "encoding" },
             { "name": "fragment_with_hash", "fragment": format!("#{fragment}"), "result": "encoding" },
             { "name": "fragment_standard_alphabet", "fragment": fragment.replace('-', "+").replace('_', "/") + "+", "result": "encoding" },
+            { "name": "fragment_length_1_mod_4", "fragment": format!("{fragment}{}", "A".repeat((5 - fragment.len() % 4) % 4)), "result": "encoding" },
+            { "name": "fragment_unused_bits_set", "fragment": dirty_fragment(&fragment), "result": "encoding" },
         ],
         "route_hints": route_hint_vectors(),
         "joiner_freshness": {
@@ -673,12 +675,40 @@ fn ticket_vectors() -> J {
     })
 }
 
+/// The fragment with a non-zero unused bit in its last character (or, if it
+/// has no unused bits, with a one-byte tail whose unused bits are set). It
+/// decodes to the same bytes in a lax decoder.
+fn dirty_fragment(fragment: &str) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    if fragment.len() % 4 == 0 {
+        return format!("{fragment}AB");
+    }
+    let mut bytes = fragment.as_bytes().to_vec();
+    let last = bytes.len() - 1;
+    let index = ALPHABET.iter().position(|c| *c == bytes[last]).expect("alphabet");
+    bytes[last] = ALPHABET[index | 1];
+    String::from_utf8(bytes).expect("ascii")
+}
+
 fn route_hint_vectors() -> J {
     let hints = [
         "tcp://192.168.1.20:7443",
         "tcp://[fd00::20]:7443",
         "tcp://[::ffff:192.168.1.20]:1",
         "tcp://Desk-1.example.org:65535",
+        "tcp://DESK.EXAMPLE.ORG:1",
+        "tcp://[FD00:0:0::20]:7443",
+        "tcp://[fd00:0000:0000:0000:0000:0000:0000:0020]:7443",
+        "tcp://[::ffff:c0a8:114]:1",
+        "tcp://[::1.2.3.4]:1",
+        "tcp://[::]:7443",
+        "tcp://[fd00::00020]:7443",
+        "tcp://[fd00::20::1]:7443",
+        "tcp://[1:2:3:4:5:6:7:8:9]:7443",
+        "tcp://[1::2:3:4:5:6:7:8]:7443",
+        "tcp://[1.2.3.4::]:7443",
+        "tcp://[fd00::g]:7443",
+        "tcp://[]:7443",
         "mdns:Desk",
         "mdns:Bureau d’Anaïs",
         "tcp://192.168.1.20",
@@ -718,7 +748,7 @@ fn route_hint_vectors() -> J {
                 Ok(Route::Tcp { host, port }) => {
                     let host = match host {
                         RouteHost::Ipv4(a) => json!({ "ipv4": a.to_string() }),
-                        RouteHost::Ipv6(a) => json!({ "ipv6": a.to_string() }),
+                        RouteHost::Ipv6(a) => json!({ "ipv6": hex(&a.octets()) }),
                         RouteHost::Dns(name) => json!({ "dns": name }),
                     };
                     json!({ "tcp": { "host": host, "port": port } })
@@ -730,7 +760,7 @@ fn route_hint_vectors() -> J {
         })
         .collect();
     json!({
-        "description": "Route hints (spec wire.md, \"Route hints\"). Each hint reads as a tcp route (host as ipv4, ipv6 in its shortest text form, or a lowercased dns name, and a port), an mdns instance, or is skipped with a reason: reserved, unknown_scheme or malformed.",
+        "description": "Route hints (spec wire.md, \"Route hints\"). Each hint reads as a tcp route (host as ipv4 in dotted decimal, ipv6 as its 16 bytes in hex, or a dns name lowercased, and a port), an mdns instance, or is skipped with a reason: reserved, unknown_scheme or malformed.",
         "cases": cases,
     })
 }
@@ -823,6 +853,18 @@ fn cbor_vectors() -> J {
         ("bad UTF-8", "62c328", "invalid_utf8"),
         ("trailing byte", "0000", "trailing_bytes"),
         ("9 nested arrays", "81818181818181818100", "too_deep"),
+        ("indefinite text string", "7f6161ff", "non_canonical"),
+        ("indefinite map", "bf0101ff", "non_canonical"),
+        ("additional info 31 on an unsigned integer", "1f", "non_canonical"),
+        ("break byte alone", "ff", "unsupported"),
+        ("reserved additional info 28", "1c", "unsupported"),
+        ("reserved additional info 30 on bytes", "5e", "unsupported"),
+        ("array count above the bytes left, before its items", "8220", "truncated"),
+        ("map count above half the bytes left", "a2010102", "truncated"),
+        ("negative integer as map key", "a12001", "non_integer_key"),
+        ("indefinite head on a map key", "a11f01", "non_canonical"),
+        ("key order checked before the value", "a202000120", "unsorted_keys"),
+        ("major type checked before the head", "3b00", "unsupported"),
     ];
     let valid: Vec<J> = valid
         .iter()
@@ -843,7 +885,7 @@ fn cbor_vectors() -> J {
         })
         .collect();
     json!({
-        "description": "The canonical CBOR subset (spec wire.md, \"Canonical CBOR\"). Valid items decode and re-encode to the same bytes. Invalid items are rejected with the given error.",
+        "description": "The canonical CBOR subset (spec wire.md, \"Canonical CBOR\"). Valid items decode and re-encode to the same bytes. Invalid items are rejected with the given error; where an input breaks several rules, the error is the first one in the order wire.md gives.",
         "valid": valid,
         "invalid": invalid,
     })

@@ -449,7 +449,7 @@ fn tickets() {
                 assert_eq!(u(&tcp["port"]), u64::from(port), "{hint}");
                 let host_ok = match host {
                     RouteHost::Ipv4(a) => tcp["host"]["ipv4"] == a.to_string(),
-                    RouteHost::Ipv6(a) => tcp["host"]["ipv6"] == a.to_string(),
+                    RouteHost::Ipv6(a) => unhex(&tcp["host"]["ipv6"]) == a.octets(),
                     RouteHost::Dns(n) => tcp["host"]["dns"] == n,
                 };
                 assert!(host_ok, "{hint}");
