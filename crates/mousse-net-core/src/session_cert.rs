@@ -512,7 +512,7 @@ pub(crate) fn binding_der(version: u64, identity_key: &[u8], identity_signature:
     )
 }
 
-fn tbs_der(
+pub(crate) fn tbs_der(
     session_point: &[u8],
     not_before: UnixTime,
     not_after: UnixTime,
@@ -556,8 +556,14 @@ fn tbs_der(
 }
 
 fn certificate_der(tbs: &[u8], self_signature: &RawSignature) -> Vec<u8> {
+    certificate_with_signature_value(tbs, &self_signature.to_der())
+}
+
+/// The certificate around `tbs` with these signature-value bytes (normally
+/// a DER `Ecdsa-Sig-Value`). Vectors use it to build bad self-signatures.
+pub(crate) fn certificate_with_signature_value(tbs: &[u8], signature_value: &[u8]) -> Vec<u8> {
     let mut bits = vec![0u8];
-    bits.extend_from_slice(&self_signature.to_der());
+    bits.extend_from_slice(signature_value);
     asn1::wrap(
         asn1::SEQUENCE,
         &[tbs, &ECDSA_WITH_SHA256, &asn1::tlv(asn1::BIT_STRING, &bits)],
@@ -630,6 +636,15 @@ fn parse(der: &[u8]) -> Result<Parts<'_>, CertError> {
         ],
     );
     if rebuilt != der {
+        return Err(CertError::Malformed);
+    }
+    // The signature value is part of the profile: a strict DER
+    // `Ecdsa-Sig-Value` (spec 4.3). Well-formed scalars that are zero or not
+    // below the group order fail later, as a self-signature error.
+    if matches!(
+        RawSignature::from_der(parts.self_signature_der),
+        Err(SignatureError::BadDer)
+    ) {
         return Err(CertError::Malformed);
     }
     Ok(parts)

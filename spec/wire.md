@@ -222,10 +222,17 @@ Certificate ::= SEQUENCE {
     `69 e5 95 e3 c0 fb f6 8a 84 f5 95 c9 da be f4 e2 f7 be 05`.
   - binding: `SEQUENCE { INTEGER version, OCTET STRING identity_key (65 bytes),
     OCTET STRING identity_signature (64 bytes) }`. `version` is the major
-    protocol version.
+    protocol version. The lengths are what an issuer writes. For the
+    verifier, `version` is any non-negative minimal INTEGER of at most 8
+    content bytes, and the two OCTET STRINGs may have any length; checks 2,
+    3 and 5 of 5.4 judge their values.
 - **signatureValue:** a signature by the **session** key over the DER bytes of
   `tbsCertificate`, ECDSA P-256 with SHA-256, DER encoded (this is X.509, so
-  DER is correct here).
+  DER is correct here). Read the value with the strict conversion of 4.3:
+  a value it rejects as `bad_der` is not this profile (`malformed`, check
+  1); a value it rejects as `out_of_range` (a well-formed INTEGER that is
+  zero, too long or not below the group order) fails check 7
+  (`self_signature_invalid`).
 
 A verifier MUST reject (`malformed`) any certificate that is not exactly this
 profile: other names, serials, algorithms, time forms, extension sets,
@@ -254,16 +261,19 @@ Pins belong to one endpoint. Another profile's endpoint on the same device
 has its own pins and never uses these.
 
 Checks run in this order; the first failure is the result. Vectors expect
-this exact order.
+this exact order, including certificates that break more than one rule
+(`session-cert.json` cases named `precedence_*`).
 
 1. Profile and DER (5.3), else `malformed`.
 2. Extension version is supported, else `unsupported_version`.
 3. Identity key is a valid point (4.1), else `identity_key_invalid`.
 4. Session key is a valid point, else `session_key_invalid`.
-5. Identity signature is 64 bytes, else `identity_signature_not_raw`.
+5. Identity signature is 64 bytes, else `identity_signature_not_raw`. (A
+   64-byte value whose `r` or `s` is zero or not below the group order
+   passes here and fails check 8.)
 6. Window rules (5.2), else `window_invalid`.
-7. The self-signature verifies with the session key over `tbsCertificate`,
-   else `self_signature_invalid`.
+7. The self-signature's scalars are in range and it verifies with the
+   session key over `tbsCertificate`, else `self_signature_invalid`.
 8. Build the session record (5.1) from **this certificate's** SPKI, window
    and version; the identity signature verifies over it with the identity
    key, else `identity_signature_invalid`. (An identity signature made for

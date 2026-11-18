@@ -37,6 +37,12 @@ const T: u64 = 1_790_000_000;
 const DAY: u64 = 86_400;
 const SKEW: u64 = 600;
 
+/// The P-256 group order n, big-endian.
+const P256_ORDER: [u8; 32] = [
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2, 0xfc, 0x63, 0x25, 0x51,
+];
+
 const IDENTITY_A: [u8; 32] = [0x11; 32];
 const IDENTITY_B: [u8; 32] = [0x22; 32];
 const SESSION_1: [u8; 32] = [0x33; 32];
@@ -166,6 +172,104 @@ fn session_cert_vectors() -> J {
     trailing.push(0);
     let other_endpoint = honest_cert(&b, &s2, nb, na, PROTOCOL_VERSION);
 
+    // Error precedence. The same to-be-signed part with other signature
+    // values: the profile requires strict DER; scalars out of range are a
+    // self-signature error.
+    let tbs = session_cert::tbs_der(
+        s1.public_key().as_bytes(),
+        UnixTime(nb),
+        UnixTime(na),
+        PROTOCOL_VERSION,
+        pin_a.as_bytes(),
+        identity_signature.as_bytes(),
+    )
+    .expect("encodable");
+    // Outer header (4 bytes), tbs, the 12-byte algorithm, BIT STRING header
+    // and its unused-bits byte (3 bytes), then the signature value.
+    let self_der = der[4 + tbs.len() + 12 + 3..].to_vec();
+    assert_eq!(
+        session_cert::certificate_with_signature_value(&tbs, &self_der),
+        der
+    );
+    let r_len = usize::from(self_der[3]);
+    let s_part = &self_der[4 + r_len..];
+    let with_r = |r_content: &[u8]| {
+        let mut body = vec![0x02, r_content.len() as u8];
+        body.extend_from_slice(r_content);
+        body.extend_from_slice(s_part);
+        let mut sig = vec![0x30, body.len() as u8];
+        sig.extend_from_slice(&body);
+        session_cert::certificate_with_signature_value(&tbs, &sig)
+    };
+    let mut padded_r = vec![0u8];
+    padded_r.extend_from_slice(&self_der[4..4 + r_len]);
+    let self_non_minimal = with_r(&padded_r);
+    let mut r_order = vec![0u8];
+    r_order.extend_from_slice(&P256_ORDER);
+    let self_r_order = with_r(&r_order);
+    let self_r_zero = with_r(&[0]);
+    let compressed_identity = {
+        let mut k = vec![0x02 | (pin_a.as_bytes()[64] & 1)];
+        k.extend_from_slice(&pin_a.as_bytes()[1..33]);
+        k
+    };
+    let identity_key_compressed = build_certificate(
+        &s1,
+        UnixTime(nb),
+        UnixTime(na),
+        PROTOCOL_VERSION,
+        &compressed_identity,
+        identity_signature.as_bytes(),
+    )
+    .expect("encodable");
+    let identity_signature_63 = build_certificate(
+        &s1,
+        UnixTime(nb),
+        UnixTime(na),
+        PROTOCOL_VERSION,
+        pin_a.as_bytes(),
+        &identity_signature.as_bytes()[..63],
+    )
+    .expect("encodable");
+    let mut zero_r = *identity_signature.as_bytes();
+    zero_r[..32].fill(0);
+    let identity_signature_r_zero = build_certificate(
+        &s1,
+        UnixTime(nb),
+        UnixTime(na),
+        PROTOCOL_VERSION,
+        pin_a.as_bytes(),
+        &zero_r,
+    )
+    .expect("encodable");
+    let off_curve_and_der = build_certificate(
+        &s1,
+        UnixTime(nb),
+        UnixTime(na),
+        PROTOCOL_VERSION,
+        &off_curve,
+        &identity_signature.to_der(),
+    )
+    .expect("encodable");
+    let version_2_off_curve =
+        build_certificate(&s1, UnixTime(nb), UnixTime(na), 2, &off_curve, identity_signature.as_bytes())
+            .expect("encodable");
+    let short_signature_empty_window = build_certificate(
+        &s1,
+        UnixTime(nb),
+        UnixTime(nb),
+        PROTOCOL_VERSION,
+        pin_a.as_bytes(),
+        &identity_signature.as_bytes()[..63],
+    )
+    .expect("encodable");
+    let empty_window_bad_self = {
+        let mut c = honest_cert(&a, &s1, nb, nb, PROTOCOL_VERSION);
+        let last = c.len() - 1;
+        c[last] ^= 0x01;
+        c
+    };
+
     let cases = vec![
         cert_case("valid", "Valid certificate, pinned identity matches.", &der, T + 60, Some(&pin_a), "ok"),
         cert_case("valid_first_contact", "Valid certificate, no pin given (host before step 2).", &der, T + 60, None, "ok"),
@@ -185,6 +289,16 @@ fn session_cert_vectors() -> J {
         cert_case("identity_key_off_curve", "Identity key 0x04 followed by zeros.", &bad_identity_key, T + 60, Some(&pin_a), "identity_key_invalid"),
         cert_case("trailing_byte", "One byte after the certificate.", &trailing, T + 60, Some(&pin_a), "malformed"),
         cert_case("truncated", "Last byte missing.", &der[..der.len() - 1], T + 60, Some(&pin_a), "malformed"),
+        cert_case("self_signature_not_strict_der", "The self-signature's r has an extra leading zero byte: not strict DER, so not the profile (check 1).", &self_non_minimal, T + 60, Some(&pin_a), "malformed"),
+        cert_case("self_signature_r_is_group_order", "The self-signature's r is a well-formed INTEGER equal to the P-256 group order: out of range, a self-signature error (check 7).", &self_r_order, T + 60, Some(&pin_a), "self_signature_invalid"),
+        cert_case("self_signature_r_is_zero", "The self-signature's r is a well-formed INTEGER 0: a self-signature error (check 7).", &self_r_zero, T + 60, Some(&pin_a), "self_signature_invalid"),
+        cert_case("identity_key_compressed", "The identity key is the 33-byte compressed form of a valid key. Its length is not a profile check; check 3 rejects it.", &identity_key_compressed, T + 60, Some(&pin_a), "identity_key_invalid"),
+        cert_case("identity_signature_63_bytes", "The identity signature is 63 bytes. Its length is not a profile check; check 5 rejects it.", &identity_signature_63, T + 60, Some(&pin_a), "identity_signature_not_raw"),
+        cert_case("identity_signature_r_zero", "The identity signature is 64 bytes with r = 0. It passes check 5 and fails check 8.", &identity_signature_r_zero, T + 60, Some(&pin_a), "identity_signature_invalid"),
+        cert_case("precedence_identity_key_before_signature_form", "Off-curve identity key and a DER identity signature: check 3 comes before check 5.", &off_curve_and_der, T + 60, Some(&pin_a), "identity_key_invalid"),
+        cert_case("precedence_version_before_identity_key", "Version 2 and an off-curve identity key: check 2 comes before check 3.", &version_2_off_curve, T + 60, Some(&pin_a), "unsupported_version"),
+        cert_case("precedence_signature_form_before_window", "A 63-byte identity signature and an empty window: check 5 comes before check 6.", &short_signature_empty_window, T, Some(&pin_a), "identity_signature_not_raw"),
+        cert_case("precedence_window_before_self_signature", "An empty window and a changed self-signature: check 6 comes before check 7.", &empty_window_bad_self, T, Some(&pin_a), "window_invalid"),
     ];
 
     json!({
