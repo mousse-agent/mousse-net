@@ -2,8 +2,7 @@
 # docs/phase1a-design.md §9).
 #
 # Owner check: `mousse-check phase1a` shows PASS in every target cell, with
-# no INCOMPLETE. Format: checks/README.md. The design's other cells join this
-# file with the slices that build their tests.
+# no INCOMPLETE. Format: checks/README.md.
 
 phase = "phase1a"
 title = "Two desktops on a LAN (in-person only)"
@@ -106,3 +105,99 @@ local = [
 control = [
   { name = "no-host-dedupe", expect_reason = "duplicate_effect", breaks = "the host runs a repeated call id or input sequence again", env = { MOUSSE_NET_ENGINE_CONTROL = "no-host-dedupe" } },
 ]
+
+[[check]]
+id = "phase1a.pair-both-ways"
+title = "Consent, recovery from a crash in every state, Connected only when both directions work, no automatic removal"
+plan = "docs/phase1a-design.md §5 and §10 (M5a)"
+targets = ["windows-x64", "linux-x64"]
+judge = "marker"
+app = true
+local = [
+  { target = "windows-x64", host = "windows-x86_64", command = ["node", "{root}/tools/app-check/run.mjs", "phase1a.pair-both-ways", "--out", "{out}"] },
+  { target = "linux-x64", host = "linux-x86_64", command = ["node", "{root}/tools/app-check/run.mjs", "phase1a.pair-both-ways", "--out", "{out}"] },
+]
+control = [
+  { name = "no-consent-journal", expect_reason = "one_way_stuck", breaks = "the joiner writes nothing before join, so a crash after PAIRED loses the pairing", env = { MOUSSE_NET_ENGINE_CONTROL = "no-consent-journal" } },
+]
+
+[[check]]
+id = "phase1a.removal"
+title = "Removal refused at once, tears down Bridge work (also when the helper dies after saving it with a PTY open), prunes rows, fails closed"
+plan = "docs/phase1a-design.md §5.4, §3.7 and §10 (M5a)"
+targets = ["windows-x64", "linux-x64"]
+judge = "marker"
+app = true
+local = [
+  { target = "windows-x64", host = "windows-x86_64", command = ["node", "{root}/tools/app-check/run.mjs", "phase1a.removal", "--out", "{out}"] },
+  { target = "linux-x64", host = "linux-x86_64", command = ["node", "{root}/tools/app-check/run.mjs", "phase1a.removal", "--out", "{out}"] },
+]
+control = [
+  { name = "keep-removed-grant", expect_reason = "still_connected", breaks = "removing a grant leaves it in force", env = { RUSTFLAGS = '--cfg mousse_control="keep-removed-grant"' } },
+  { name = "keep-engine-work", expect_reason = "stale_work", breaks = "the host keeps handlers and subscriptions after grant.closed", env = { MOUSSE_NET_ENGINE_CONTROL = "keep-engine-work" } },
+  { name = "teardown-on-event-only", expect_reason = "stale_work", breaks = "teardown waits for grant.closed; the helper dies after saving the removal with a PTY open", env = { MOUSSE_NET_ENGINE_CONTROL = "teardown-on-event-only" } },
+]
+
+[[check]]
+id = "phase1a.path-switch"
+title = "A multi-minute call and a terminal survive a path switch with no gap in output"
+plan = "docs/phase1a-design.md §3.7 and §10 (M5b)"
+targets = ["windows-x64", "linux-x64"]
+judge = "marker"
+app = true
+local = [
+  { target = "windows-x64", host = "windows-x86_64", command = ["node", "{root}/tools/app-check/run.mjs", "phase1a.path-switch", "--out", "{out}"] },
+  { target = "linux-x64", host = "linux-x86_64", command = ["node", "{root}/tools/app-check/run.mjs", "phase1a.path-switch", "--out", "{out}"] },
+]
+control = [
+  { name = "abort-on-path-replaced", expect_reason = "false_outcome", breaks = "closing the old path aborts its running handlers", env = { MOUSSE_NET_ENGINE_CONTROL = "abort-on-path-replaced" } },
+]
+
+[[check]]
+id = "phase1a.reconnect"
+title = "Reconnects after either side restarts and after the host's address changes (browse file)"
+plan = "docs/phase1a-design.md §6 and §10 (M5a)"
+targets = ["windows-x64", "linux-x64"]
+judge = "marker"
+app = true
+local = [
+  { target = "windows-x64", host = "windows-x86_64", command = ["node", "{root}/tools/app-check/run.mjs", "phase1a.reconnect", "--out", "{out}"] },
+  { target = "linux-x64", host = "linux-x86_64", command = ["node", "{root}/tools/app-check/run.mjs", "phase1a.reconnect", "--out", "{out}"] },
+]
+control = [
+  { name = "no-rediscovery", expect_reason = "unreachable", breaks = "the caller tries only the last working route", env = { RUSTFLAGS = '--cfg mousse_control="no-rediscovery"' } },
+]
+
+[[check]]
+id = "phase1a.pair-offline"
+title = "Internet unreachable: pair over LAN, connected both ways within the bound (10 s; MOUSSE_NET_ENGINE_CHECK_PAIR_WITHIN_MS), ticket and approval injected"
+plan = "docs/phase1a-design.md §9 and §10 (M7)"
+targets = ["pc-to-mac-lan"]
+judge = "marker"
+cross_machine = true
+app = true
+device_steps = "Mac: node tools/app-check/run.mjs phase1a.pair-offline --role host. PC: mousse-check config-digest phase1a.pair-offline --target pc-to-mac-lan, then node tools/app-check/run.mjs phase1a.pair-offline --role caller --result r.json, then mousse-check sign --device-key <key> --config <digest> r.json. Controls: add --control <name> to all three."
+control = [
+  { name = "cable-plugged", expect_reason = "internet_reachable", breaks = "run with the WAN cable in; the harness must refuse it", env = { MOUSSE_CHECK_EXPECT_ONLINE = "1" } },
+]
+
+[[check]]
+id = "phase1a.shared-computer"
+title = "PC A pairs with Mac C, PC B with Mac D. A removes C: A's channels close; B's terminal to D stays usable throughout and reconnects after a restart; A cannot dial D and B cannot dial C"
+plan = "docs/phase1a-design.md §9 and §10 (M7)"
+targets = ["pc-to-mac-lan", "macos-arm64"]
+judge = "marker"
+cross_machine = true
+app = true
+device_steps = "pc-to-mac-lan: as phase1a.pair-offline, with phase1a.shared-computer and --topology four-endpoints on both run.mjs commands. macos-arm64: both roles on the Mac, in its desktop session (macOS denies local-network dials to a helper started over ssh): the host as on pc-to-mac-lan, the caller with MOUSSE_NET_ENGINE_CHECK_HOST=127.0.0.1 and --target macos-arm64."
+control = [
+  { name = "shared-endpoint-state", expect_reason = "other_profile_affected", breaks = "one key and one grant table for every endpoint on the machine", env = { RUSTFLAGS = '--cfg mousse_control="shared-endpoint-state"' } },
+]
+
+[[check]]
+id = "phase1a.pair-in-person"
+title = "WAN cable unplugged: webcam scan, Connect, Yes, connected both ways in under 10 s"
+plan = "docs/phase1a-design.md §9 and §10 (M7)"
+targets = ["pc-to-mac-lan"]
+manual = true
+steps = "Unplug WAN; Show QR on the Mac; Scan on the PC; Connect; Yes; time to Connected on both; attest with both app and helper builds."
