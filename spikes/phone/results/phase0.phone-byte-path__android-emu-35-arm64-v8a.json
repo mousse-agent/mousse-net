@@ -1,0 +1,265 @@
+{
+  "build": "b7bdf85+release",
+  "check": "phase0.phone-byte-path",
+  "details": {
+    "breakMode": null,
+    "budgets": {
+      "fileMBps": 10,
+      "terminalP95Ms": 16
+    },
+    "client": "android.webkit.WebView page over ws://127.0.0.1",
+    "failures": [],
+    "libTarget": "aarch64-linux-android",
+    "page": {
+      "burst": {
+        "ms": 246.8,
+        "n": 5000,
+        "ok": true,
+        "writesPerSec": 20259
+      },
+      "download": {
+        "bytes": 33554432,
+        "mbps": 125.297,
+        "ms": 267.8,
+        "ok": true
+      },
+      "echo": {
+        "maxMs": 15.4,
+        "n": 2000,
+        "ok": 2000,
+        "p50Ms": 0.2,
+        "p95Ms": 0.8
+      },
+      "errors": [],
+      "origin": "https://localhost",
+      "timerStepMs": 0.1,
+      "upload": {
+        "bytes": 33554432,
+        "mbps": 283.399,
+        "ms": 118.4,
+        "ok": true,
+        "serverUs": 117353
+      },
+      "userAgent": "Mozilla/5.0 (Linux; Android 15; sdk_gphone64_arm64 Build/AE3A.240806.043; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/124.0.6367.219 Mobile Safari/537.36",
+      "wrongTokenRefused": true
+    },
+    "pageOrigin": "https://localhost",
+    "probes": [
+      {
+        "case": "valid",
+        "expectAccept": true,
+        "ok": true,
+        "status": 101
+      },
+      {
+        "case": "wrong-token",
+        "expectAccept": false,
+        "ok": true,
+        "status": 403
+      },
+      {
+        "case": "missing-token",
+        "expectAccept": false,
+        "ok": true,
+        "status": 403
+      },
+      {
+        "case": "wrong-host",
+        "expectAccept": false,
+        "ok": true,
+        "status": 403
+      },
+      {
+        "case": "localhost-host",
+        "expectAccept": false,
+        "ok": true,
+        "status": 403
+      },
+      {
+        "case": "missing-host",
+        "expectAccept": false,
+        "ok": true,
+        "status": 403
+      },
+      {
+        "case": "wrong-origin",
+        "expectAccept": false,
+        "ok": true,
+        "status": 403
+      },
+      {
+        "case": "null-origin",
+        "expectAccept": false,
+        "ok": true,
+        "status": 403
+      },
+      {
+        "case": "missing-origin",
+        "expectAccept": false,
+        "ok": true,
+        "status": 403
+      }
+    ],
+    "server": {
+      "acceptedConnections": 2,
+      "allowedOrigin": "https://localhost",
+      "refusals": [
+        "bad token",
+        "bad token",
+        "missing token",
+        "bad host",
+        "bad host",
+        "missing host",
+        "bad origin",
+        "bad origin",
+        "missing origin"
+      ],
+      "tokenCheck": true
+    },
+    "steps": {
+      "budget-file-throughput": {
+        "failures": 0,
+        "max": 125.297,
+        "p50": 125.297,
+        "p95": 125.297,
+        "runs": 1
+      },
+      "budget-terminal-p95": {
+        "failures": 0,
+        "max": 0.8,
+        "p50": 0.8,
+        "p95": 0.8,
+        "runs": 1
+      },
+      "file-download": {
+        "failures": 0,
+        "max": 125.297,
+        "p50": 125.297,
+        "p95": 125.297,
+        "runs": 1
+      },
+      "file-upload": {
+        "failures": 0,
+        "max": 283.399,
+        "p50": 283.399,
+        "p95": 283.399,
+        "runs": 1
+      },
+      "page-no-errors": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 1
+      },
+      "page-report": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 1
+      },
+      "page-wrong-token-refused": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 1
+      },
+      "probe-localhost-host": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 1
+      },
+      "probe-missing-host": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 1
+      },
+      "probe-missing-origin": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 1
+      },
+      "probe-missing-token": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 1
+      },
+      "probe-null-origin": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 1
+      },
+      "probe-valid": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 1
+      },
+      "probe-wrong-host": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 1
+      },
+      "probe-wrong-origin": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 1
+      },
+      "probe-wrong-token": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 1
+      },
+      "server-refused-page-wrong-token": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 1
+      },
+      "server-verified-upload": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 1
+      },
+      "terminal-burst": {
+        "failures": 0,
+        "max": 246.8,
+        "p50": 246.8,
+        "p95": 246.8,
+        "runs": 1
+      },
+      "terminal-echo": {
+        "failures": 0,
+        "max": 0.8,
+        "p50": 0.8,
+        "p95": 0.8,
+        "runs": 1
+      }
+    },
+    "webView": "Mozilla/5.0 (Linux; Android 15; sdk_gphone64_arm64 Build/AE3A.240806.043; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/124.0.6367.219 Mobile Safari/537.36"
+  },
+  "outcome": "PASS",
+  "target": "android-emu-35-arm64-v8a"
+}

@@ -345,6 +345,12 @@ fn handshake(world: &mut World) -> &'static str {
     let grant_expiry = (variant == "removal" && s.chance(300)).then(|| s.range(10 * 60, 2 * 3_600));
     let eager = s.chance(300);
 
+    world.sim.note(
+        "sim",
+        format_args!(
+            "host skew {skew_host}s cert {host_life}s lead {host_lead}s, laptop skew {skew_laptop}s cert {laptop_life}s lead {laptop_lead}s"
+        ),
+    );
     let host_identity = world.sim.identities[host];
     let laptop_identity = world.sim.identities[laptop];
     let (h, sim) = world.hs(host);

@@ -1,0 +1,187 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Byte path</title>
+<style>
+  body { font: 12px ui-monospace, Menlo, monospace; margin: 8px; background: #fff; color: #111; }
+  @media (prefers-color-scheme: dark) { body { background: #111; color: #eee; } }
+</style>
+</head>
+<body>
+<pre id="log">byte path: loading</pre>
+<script>
+// Phase 0 spike 3: the page side of the phone byte path. Parameters come in the
+// fragment: url (ws://127.0.0.1:<port>/bytes), token, and optional sizes.
+// Pattern shared with the Rust side: byte i = (31 i + 7) mod 251.
+(async () => {
+  const out = document.getElementById('log');
+  const log = (s) => {
+    out.textContent += '\n' + s;
+    try { console.log('bytepath: ' + s); } catch (_) {}
+    try { window.webkit.messageHandlers.log.postMessage(String(s)); } catch (_) {}
+  };
+  const q = new URLSearchParams(location.hash.slice(1));
+  const url = q.get('url');
+  const token = q.get('token');
+  const UP = Number(q.get('up') || 32 * 1024 * 1024);
+  const DOWN = Number(q.get('down') || 32 * 1024 * 1024);
+  const ECHO_N = Number(q.get('echo') || 2000);
+  const BURST_N = Number(q.get('burst') || 5000);
+  const FRAME = 64 * 1024;
+  const errors = [];
+  const rep = { userAgent: navigator.userAgent, origin: location.origin, errors };
+
+  const base = new Uint8Array(FRAME + 251);
+  for (let i = 0; i < base.length; i++) base[i] = (i * 31 + 7) % 251;
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const pctl = (sorted, p) => sorted.length ? sorted[Math.min(sorted.length - 1, Math.round((p / 100) * (sorted.length - 1)))] : null;
+  const round = (x) => Math.round(x * 1000) / 1000;
+
+  // Smallest step performance.now() shows: WebKit coarsens timers, so latencies
+  // below it read as 0 or one step.
+  const timerStep = () => {
+    let best = Infinity;
+    for (let k = 0; k < 50; k++) {
+      const a = performance.now();
+      let b = performance.now();
+      while (b === a) b = performance.now();
+      best = Math.min(best, b - a);
+    }
+    return round(best);
+  };
+
+  const open = (u, ms) => new Promise((resolve) => {
+    let ws;
+    try { ws = new WebSocket(u); } catch (e) { resolve({ opened: false, error: String(e) }); return; }
+    ws.binaryType = 'arraybuffer';
+    let done = false;
+    const finish = (v) => { if (!done) { done = true; clearTimeout(t); resolve(v); } };
+    const t = setTimeout(() => { try { ws.close(); } catch (_) {} finish({ opened: false, timeout: true }); }, ms);
+    ws.onopen = () => finish({ opened: true, ws });
+    ws.onerror = () => finish({ opened: false });
+    ws.onclose = () => finish({ opened: false });
+  });
+
+  try {
+    if (!url || !token) throw new Error('missing url or token');
+    rep.timerStepMs = timerStep();
+
+    // 1. A wrong token must be refused before the socket opens.
+    const bad = await open(url + '?t=' + '0'.repeat(64), 5000);
+    rep.wrongTokenRefused = !bad.opened;
+    if (bad.opened) bad.ws.close();
+    log('wrong token refused: ' + rep.wrongTokenRefused);
+
+    // 2. The real connection.
+    const good = await open(url + '?t=' + token, 5000);
+    if (!good.opened) throw new Error('could not open the byte path');
+    const ws = good.ws;
+    let onData = null;
+    const pending = [];
+    ws.onmessage = (ev) => { if (onData) onData(ev.data); else pending.push(ev.data); };
+    const next = () => new Promise((resolve) => {
+      if (pending.length) { resolve(pending.shift()); return; }
+      onData = (d) => { onData = null; resolve(d); };
+    });
+    ws.onclose = () => log('closed');
+
+    // 3. Terminal-like small writes, one at a time: round trip per write.
+    const rtts = [];
+    let echoOk = 0;
+    for (let i = 0; i < ECHO_N; i++) {
+      const msg = 'e:' + i + ' ' + 'x'.repeat(16 + (i % 48));
+      const t0 = performance.now();
+      ws.send(msg);
+      const back = await next();
+      rtts.push(performance.now() - t0);
+      if (back === msg) echoOk++;
+    }
+    rtts.sort((a, b) => a - b);
+    rep.echo = { n: ECHO_N, ok: echoOk, p50Ms: round(pctl(rtts, 50)), p95Ms: round(pctl(rtts, 95)), maxMs: round(rtts[rtts.length - 1]) };
+    log('echo p50 ' + rep.echo.p50Ms + ' ms, p95 ' + rep.echo.p95Ms + ' ms');
+
+    // 4. A burst of small writes (a paste): all sent at once, all echoed in order.
+    {
+      const sent = [];
+      for (let i = 0; i < BURST_N; i++) sent.push('e:b' + i + ' ' + 'y'.repeat(1 + (i % 64)));
+      let got = 0, inOrder = true;
+      const t0 = performance.now();
+      const done = new Promise((resolve) => {
+        onData = function h(d) {
+          if (d !== sent[got]) inOrder = false;
+          got++;
+          if (got === BURST_N) { onData = null; resolve(); } else onData = h;
+        };
+      });
+      for (const m of sent) ws.send(m);
+      await done;
+      const ms = performance.now() - t0;
+      rep.burst = { n: BURST_N, ok: inOrder, ms: round(ms), writesPerSec: Math.round(BURST_N / (ms / 1000)) };
+      log('burst ' + BURST_N + ' writes in ' + rep.burst.ms + ' ms');
+    }
+
+    // 5. File-like upload, paced by bufferedAmount.
+    {
+      const t0 = performance.now();
+      ws.send('upload:' + UP);
+      let off = 0;
+      while (off < UP) {
+        while (ws.bufferedAmount > 8 * 1024 * 1024) await sleep(1);
+        const len = Math.min(FRAME, UP - off);
+        const s = off % 251;
+        ws.send(base.subarray(s, s + len));
+        off += len;
+      }
+      const reply = await next();
+      const ms = performance.now() - t0;
+      const parts = String(reply).split(':');
+      const ok = parts[0] === 'upload-ok' && Number(parts[1]) === UP && parts[2] === '1';
+      rep.upload = { bytes: UP, ms: round(ms), mbps: round(UP / 1e6 / (ms / 1000)), ok, serverUs: Number(parts[3]) };
+      log('upload ' + rep.upload.mbps + ' MB/s ok=' + ok);
+    }
+
+    // 6. File-like download; every byte is checked.
+    {
+      let got = 0, ok = true;
+      const t0 = performance.now();
+      const done = new Promise((resolve) => {
+        onData = function h(d) {
+          if (typeof d === 'string') {
+            onData = null;
+            resolve(d);
+            return;
+          }
+          const u = new Uint8Array(d);
+          const s = got % 251;
+          // base[s + i] equals the pattern at got + i, since the pattern repeats every 251.
+          if (u.length > FRAME) ok = false;
+          for (let i = 0; i < u.length && ok; i++) if (u[i] !== base[s + i]) ok = false;
+          got += u.length;
+          onData = h;
+        };
+      });
+      ws.send('download:' + DOWN);
+      const end = await done;
+      const ms = performance.now() - t0;
+      ok = ok && got === DOWN && end === 'download-done:' + DOWN;
+      rep.download = { bytes: DOWN, ms: round(ms), mbps: round(DOWN / 1e6 / (ms / 1000)), ok };
+      log('download ' + rep.download.mbps + ' MB/s ok=' + ok);
+    }
+
+    ws.send('report:' + JSON.stringify(rep));
+    await sleep(50);
+    ws.close();
+    log('done');
+  } catch (e) {
+    errors.push(String(e && e.message || e));
+    log('error: ' + errors[errors.length - 1]);
+    // Report what we have, if a socket can still be opened.
+    const last = await open(url + '?t=' + token, 3000);
+    if (last.opened) { last.ws.send('report:' + JSON.stringify(rep)); await sleep(50); last.ws.close(); }
+  }
+})();
+</script>
+</body>
+</html>
