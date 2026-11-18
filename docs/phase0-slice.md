@@ -28,7 +28,31 @@ cargo test -p mousse-helper --test loopback --no-fail-fast
   A's peer cannot reach B;
 - a second process for the same endpoint does not start;
 - send link: the right code pairs; three wrong codes end the invitation, a
-  fresh code is shown for each attempt and the ended ticket is refused.
+  fresh code is shown for each attempt and the ended ticket is refused;
+- removing the grant kills a silent command even after the caller finished
+  sending (its stdin was empty);
+- two devices join with one in-person ticket: "yes" to the question about
+  the first pairs only the first, though the second asked meanwhile;
+- the state folder, `control.json` and (on Windows) the control pipe are
+  owner-only.
+
+## Local state and the control channel
+
+The endpoint's state folder and every file the helper writes in it are
+owner-only: on Windows a protected DACL that allows the current user alone,
+on Unix `0700` folders and `0600` files. `serve` takes local commands
+(`invite`, `grants`, `remove`, `stop`) over a control channel: on Windows a
+named pipe that only the current user can open and that refuses remote
+clients, on Unix 127.0.0.1. `control.json` holds where it listens and a
+random token that every request must carry.
+
+An in-person approval question names its request: the joining connection
+and the device shown. `invite` answers with that request id, so an answer
+never applies to another device or to a newer request.
+
+A removal or denial ends access at once. If saving the grant table fails,
+`remove` reports it; the host retries the save every second, and if it
+stops before a retry works the grant is back after a restart.
 
 The owner test kit runs the same suite and its controls:
 
@@ -44,10 +68,10 @@ Each control is a compile-time cfg and only builds with debug assertions:
 RUSTFLAGS='--cfg mousse_control="skip-pin-check"' cargo test -p mousse-helper --test loopback --no-fail-fast
 ```
 
-| Control | Breaks | Tests that fail (of 5) |
+| Control | Breaks | Tests that fail (of 8) |
 |---|---|---|
 | `skip-pin-check` | the dialler accepts a host whose identity does not match the pin | 2 |
-| `keep-removed-grant` | removing a grant leaves it in force | 2 |
+| `keep-removed-grant` | removing a grant leaves it in force | 3 |
 | `shared-endpoint-state` | every endpoint on the machine uses one key and one grant table | 3 |
 | `allow-break-env` | lets `serve` read `MOUSSE_HELPER_BREAK` (cross-machine control) | none on its own |
 
@@ -57,6 +81,13 @@ Use a separate `CARGO_TARGET_DIR` for control builds.
 
 The Mac listens and the PC only dials. Both sides keep the key in a plain file
 (`--insecure-file-key`) because the Mac side runs over ssh.
+
+Both binaries carry their build id, fixed when they are compiled:
+`<commit>[-dirty]+<profile>`, where dirty means any uncommitted change
+(untracked files included, except `checks/results` and `checks/runs`).
+`MOUSSE_BUILD_ID` set at build time replaces it, for example when the
+source was copied without its git folder. `serve` prints it in its `ready`
+line (`ready <device> port <port> build <id> routes ...`).
 
 Mac:
 
@@ -71,8 +102,14 @@ PC (Windows):
 ```
 mousse-helper --state J:\...\pc-state --insecure-file-key init
 mousse-helper --state J:\...\pc-state --insecure-file-key slice-check --name pc ^
-  --route tcp://192.168.0.59:58505 --ticket <TICKET> --out result.json -- uname -a
+  --route tcp://192.168.0.59:58505 --ticket <TICKET> --host-build <MAC BUILD> ^
+  --out result.json -- uname -a
 ```
+
+After pairing, `slice-check` asks the host for its build over a
+`helper-info` stream. `--host-build` (copied from the Mac's `ready` line)
+fills in when the run never gets that far, as in the control below; when
+both exist they must agree.
 
 When the PC prints `WAITING`, the Mac removes the grant:
 
@@ -117,11 +154,12 @@ An earlier run without `--route` paired over the first route in the ticket
 ### Control: the Mac presents another identity
 
 The Mac runs a build with `--cfg mousse_control="allow-break-env"` and
-`MOUSSE_HELPER_BREAK=wrong-identity`, so the listener uses a fresh key while
-its tickets name the real one. The PC must refuse:
+`MOUSSE_HELPER_BREAK=wrong-identity`. Tickets and pairing use the endpoint's
+real key; only TLS presents a fresh one, so the PC's pin check is the one
+thing that fails. The PC must refuse, for that reason:
 
 ```
-FAIL pair in person: tcp://192.168.0.59:58505: another device answered (pin mismatch)
+FAIL pair in person: tcp://192.168.0.59:58505: another device answered (pin mismatch) reason=pin_mismatch
 RESULT FAIL
 ```
 
@@ -136,9 +174,13 @@ Mac: `refused 192.168.0.9:19038: TLS handshake failed: received fatal alert: Cer
   "check": "phase0.thin-slice-cross-machine",
   "target": "pc-to-mac-lan",
   "outcome": "PASS",
-  "build": "165425b3351193d57c7e7be02b9b7367dde74c0c+debug",
-  "details": "PASS paired with ...; PASS terminal ran ...; PASS removal closed the live terminal with GRANT_REVOKED; PASS a new connection was refused: ..."
+  "build": "<commit>+debug",
+  "caller_build": "<commit>+debug",
+  "host_build": "<commit>+debug",
+  "details": "PASS paired with ...; PASS the host runs build ...; PASS terminal ran ...; PASS removal closed the live terminal with GRANT_REVOKED; PASS a new connection was refused: ..."
 }
 ```
 
-The control run adds `"control": "wrong-identity"` and has `"outcome": "FAIL"`.
+`build` and `caller_build` are the PC's build, `host_build` the Mac's. The
+control run adds `"control": "wrong-identity"`, `"outcome": "FAIL"` and
+`"reason": "pin_mismatch"`.
