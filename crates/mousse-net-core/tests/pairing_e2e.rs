@@ -14,7 +14,9 @@ use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
 use std::path::PathBuf;
 
-use mousse_net_core::authz::{CallerGate, CallerTraffic, ConnectionGate, Traffic, Verdict};
+use mousse_net_core::authz::{
+    CallerGate, CallerTraffic, ConnectionGate, GateState, Traffic, Verdict,
+};
 use mousse_net_core::control::{
     negotiate_version, AuthorizedState, ControlMessage, VersionSupport,
 };
@@ -406,9 +408,21 @@ impl World {
                         now,
                         Millis(0),
                     );
+                    out.push(send("host", conn, &ControlMessage::hello()));
+                    // Step 2 runs at once. Awaiting a proof sends nothing.
+                    match gate.state() {
+                        GateState::Live { .. } => out.push(send(
+                            "host",
+                            conn,
+                            &ControlMessage::Authorized {
+                                state: AuthorizedState::Live,
+                            },
+                        )),
+                        GateState::Closed(code) => out.push(close("host", conn, *code)),
+                        _ => {}
+                    }
                     self.gates.insert(conn, gate);
                     self.host_exporters.insert(conn, host_exp);
-                    out.push(send("host", conn, &ControlMessage::hello()));
                 }
                 let j = self.joiner(name);
                 j.conn = Some(conn);
@@ -463,6 +477,20 @@ impl World {
                     other => panic!("gate let {other:?} through"),
                 };
                 self.joiner_actions(name, actions)
+            }
+            (name, "drop") => {
+                // The connection breaks: no GOAWAY reaches either side.
+                let j = self.joiner(name);
+                let conn = j.conn.take().expect("connected");
+                let joiner_side = j.pairing.as_mut().expect("started").on_closed(None);
+                let mut out = Vec::new();
+                if self.gates.remove(&conn).is_some() {
+                    self.grants.unbind(ConnectionId(conn));
+                    let actions = self.host.on_connection_closed(ConnectionId(conn));
+                    out.extend(self.host_actions(actions));
+                }
+                out.extend(self.joiner_actions(name, joiner_side));
+                out
             }
             (name, "goaway") => {
                 let code = code_by_name(s(&step["code"]));
@@ -915,6 +943,46 @@ fn proof_on_another_session() -> J {
     )
 }
 
+/// The control bytes of the first message `from` sent in `out`.
+fn sent_control(out: &[J], from: &str, kind: &str) -> J {
+    out.iter()
+        .filter_map(|o| o.get("send"))
+        .find(|m| m["from"] == from && m["type"] == kind)
+        .map(|m| m["control"].clone())
+        .unwrap_or_else(|| panic!("{from} sent no {kind}"))
+}
+
+fn outcome_after_lost_paired() -> J {
+    let flow = "lost_paired";
+    let mut host = ticket_draws(flow);
+    host.push(u32_draw("code", 246_810));
+    host.push(u32_draw("next_code", 135_791));
+    host.push(bytes_draw("cpace_scalar_yb", "lost_paired/yb1", 32));
+    let mut r = Recorder::new(json!({ "host": host, "joiners": { "a": attempt_draws(flow, 1) } }));
+    r.event(create(2));
+    let t = r.ticket();
+    r.event(start(&t));
+    r.event(connect("a", 1, exporter_pair("lost_paired/conn1")));
+    // Deliver by hand from here, so that PAIRED can be lost.
+    r.pump = false;
+    let out = r.event(submit("246810"));
+    let msg_a = sent_control(&out, "a", "CODE_EXCHANGE");
+    let out = r.event(json!({ "party": "host", "event": "receive", "conn": 1, "control": msg_a }));
+    let msg_b = sent_control(&out, "host", "CODE_EXCHANGE");
+    let out = r.event(json!({ "party": "a", "event": "receive", "control": msg_b }));
+    let msg_c = sent_control(&out, "a", "CODE_EXCHANGE");
+    let out = r.event(json!({ "party": "host", "event": "receive", "conn": 1, "control": msg_c }));
+    sent_control(&out, "host", "PAIRED");
+    r.event(json!({ "party": "a", "event": "drop" }));
+    r.pump = true;
+    r.event(connect("a", 2, exporter_pair("lost_paired/conn2")));
+    r.finish(
+        "outcome_after_lost_paired",
+        "The host verifies the joiner's confirmation, enrolls it and sends PAIRED, but the connection breaks before PAIRED arrives. The joiner keeps its outcome pending, reconnects with the same ticket and, as on every connection of a pairing flow, sends JOIN_PROOF right after its HELLO without waiting for the host. Step 2 finds the live grant: the host sends AUTHORIZED live and ignores the proof. The joiner ends already paired.",
+        2,
+    )
+}
+
 fn document() -> J {
     json!({
         "description": "End-to-end pairing (spec wire.md, sections 8, 10 and 11, and cpace.md). Each flow lists scripted random draws per party, then events in order with every output. Replaying the events with the same draws must give the same outputs byte for byte.",
@@ -925,7 +993,7 @@ fn document() -> J {
             "invitation": { "role": ROLE, "authorizing_owner": hex(&AUTHORIZING_OWNER), "routes": [ROUTE], "grant_expires_at": null },
             "draws": "Each party takes its draws in order. A `bytes` draw fills a request of exactly that length; a `u32` draw answers a request for a 32-bit integer. Host: invitation id (16), ticket secret (16), for send link the code (u32, drawn again while at least 4294000000); then for each new attempt the next code (u32, only while attempts are left after the debit) and the CPace scalar yb (32). Joiner: for each attempt the attempt id (16) and the CPace scalar ya (32). A CPace scalar is the 32 bytes with the top four bits of the last byte cleared, read little-endian.",
             "exporters": "Stand-in TLS exporter values per connection. Unless `host_exporters` is given, both ends see the same session.",
-            "events": "host/create: create an invitation of `kind`. <joiner>/start: the joiner opens `ticket`. <joiner>/connect: a new TLS connection `conn`; both ends send HELLO, the host runs step 2 (no grant: await the join proof) and the joiner sends JOIN_PROOF; with `host: false` the far end is scripted. host/receive and <joiner>/receive: a CONTROL message arrives (checked by that end's gate first). <joiner>/goaway: the host's GOAWAY arrives. <joiner>/submit_code: the owner types `code`. host/approve: the host owner approves the device on `conn`.",
+            "events": "host/create: create an invitation of `kind`. <joiner>/start: the joiner opens `ticket`. <joiner>/connect: a new TLS connection `conn`; both ends send HELLO, the host runs step 2 at once (a live grant: AUTHORIZED live; no grant: await the join proof, sending nothing) and the joiner sends JOIN_PROOF right after its HELLO without waiting; with `host: false` the far end is scripted. <joiner>/drop: the joiner's connection breaks with no GOAWAY either way. host/receive and <joiner>/receive: a CONTROL message arrives (checked by that end's gate first). <joiner>/goaway: the host's GOAWAY arrives. <joiner>/submit_code: the owner types `code`. host/approve: the host owner approves the device on `conn`.",
             "outputs": "send: a control message with its CONTROL frame. close: GOAWAY with its frame. attempt: the CPace inputs of a new attempt (CI is the binding transcript; sid as in wire.md). version: the minor version agreed from a HELLO. Others name host or joiner events: show_code, ask_approval, admitted_join_only, enrolled, invitation_ended, paired, code_rejected, failed, error, ignored.",
         },
         "flows": [
@@ -935,6 +1003,7 @@ fn document() -> J {
             joiner_cap_against_fake_host(),
             tampered_tickets(),
             proof_on_another_session(),
+            outcome_after_lost_paired(),
         ],
     })
 }

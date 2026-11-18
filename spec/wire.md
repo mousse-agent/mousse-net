@@ -416,8 +416,11 @@ has replaced, leaves the newer grant alone.
 After TLS completes, both sides start the mux (section 9). The **caller** is
 the TLS client and the **host** is the TLS server.
 
-1. Each side sends `HELLO` first (control message type 1).
-2. The host runs **step 2** for the peer identity from step 1:
+1. Each side sends `HELLO` first (control message type 1), without waiting
+   for the peer's (section 2).
+2. The host runs **step 2** for the peer identity from step 1, as soon as
+   the connection starts and before it reads any control message from the
+   caller. It sends nothing to say that it awaits a proof:
    - identity denied: close with `NOT_AUTHORIZED`;
    - a live grant: bind the connection to it and send
      `AUTHORIZED {state: live}`;
@@ -665,7 +668,16 @@ pin mismatch on a LAN candidate means another endpoint holds that address
 
 ### 10.3 Join proof
 
-After `HELLO`, a joiner without a grant sends `JOIN_PROOF`:
+A joiner in a pairing flow sends `JOIN_PROOF` on **every** connection of
+the flow, right after its own `HELLO`, without waiting for anything from
+the host. It cannot know whether the host already holds a grant for it
+(after a lost `PAIRED`, 10.6, it may), and the host never says that it is
+waiting for a proof. A host whose step 2 found a live grant ignores the
+proof (8.1) and has already sent `AUTHORIZED {live}`. A caller that is not
+in a pairing flow never sends `JOIN_PROOF`. Vectors: `pairing-e2e.json`
+(the `connect` steps, and `outcome_after_lost_paired`).
+
+The proof is:
 
 ```
 key   = HKDF-SHA256(salt = invitation id, IKM = secret,
