@@ -58,18 +58,28 @@ mod imp {
 mod imp {
     use std::sync::OnceLock;
 
+    /// `mach_timebase_info_data_t`: ticks times `numer / denom` is
+    /// nanoseconds. Declared here; the `libc` one is deprecated.
+    #[repr(C)]
+    struct Timebase {
+        numer: u32,
+        denom: u32,
+    }
+
     unsafe extern "C" {
         /// Like `mach_absolute_time`, but it keeps counting while the
         /// system sleeps (macOS 10.12, iOS 10).
         fn mach_continuous_time() -> u64;
+        /// Returns `KERN_SUCCESS` (0) on success.
+        fn mach_timebase_info(info: *mut Timebase) -> i32;
     }
 
     pub fn now_ms() -> u64 {
         static TIMEBASE: OnceLock<(u64, u64)> = OnceLock::new();
         let (numer, denom) = *TIMEBASE.get_or_init(|| {
-            let mut info = libc::mach_timebase_info { numer: 0, denom: 0 };
+            let mut info = Timebase { numer: 0, denom: 0 };
             // SAFETY: `info` is a valid place for the result.
-            let rc = unsafe { libc::mach_timebase_info(&mut info) };
+            let rc = unsafe { mach_timebase_info(&mut info) };
             assert!(rc == 0 && info.denom != 0, "mach_timebase_info failed");
             (u64::from(info.numer), u64::from(info.denom))
         });
