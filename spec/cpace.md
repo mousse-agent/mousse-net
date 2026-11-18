@@ -48,12 +48,13 @@ Each party gets the following. A party MUST reject its own inputs if they break 
 | Input | Mousse meaning | Rules |
 |---|---|---|
 | `PRS` | The pairing code: the 6 digits shown by the host, as ASCII bytes `0x30`–`0x39`. No spaces or separators; leading zeros are kept. | Not empty (`EmptyPassword`). CPace accepts any bytes here; the pairing layer MUST pass exactly the 6 digits. |
-| `CI` | The pairing binding transcript defined by the pairing spec: ticket hash, mode, version, the ordered identities and roles, and the peer session's TLS exporter. | Opaque. Never sent. Both sides MUST build identical bytes. Any length. |
-| `sid` | The attempt's session id, defined by the pairing spec. | At least 16 bytes (`SidTooShort`). Public. Identical on both sides. MUST NOT be reused across attempts (§10.9). |
-| `ADa`, `ADb` | Each party's associated data. Sent in clear inside its message. MAY be empty. | At most 4096 bytes (`AdTooLong`). |
+| `CI` | The binding transcript ([`wire.md`](wire.md) 10.5): ticket hash, mode, version, the identities with their roles (initiator first), and the peer session's TLS exporter. | Opaque. Never sent. Both sides MUST build identical bytes. Any length. |
+| `sid` | The attempt's session id ([`wire.md`](wire.md) 10.5, "Session id"): 32 bytes, a hash of the attempt id and the peer session's TLS exporter. | At least 16 bytes (`SidTooShort`). Public. Identical on both sides. MUST NOT be reused across attempts (§10.9). |
+| `ADa`, `ADb` | Each party's associated data. Sent in clear inside its message. Mousse pairing sends both empty and refuses a share that carries AD (`Malformed`). | At most 4096 bytes (`AdTooLong`). |
 
 Requirements on the pairing layer (from §10.1.1 and §10.1.2):
 
+- The joiner is the initiator (A) and the host the responder (B).
 - Party identities and roles that CPace must authenticate go into `CI`. The encoding MUST tie each identity to its role and MUST put the initiator's identity first. It MUST be unambiguous, so that no two different binding transcripts give the same bytes.
 - A party MUST NOT take both roles for the same (`PRS`, `sid`).
 - `ADa` and `ADb` are authenticated only once confirmation succeeds. If the pairing layer depends on their content, it MUST check that content after confirmation.
@@ -155,8 +156,8 @@ What a reviewer should check:
 
 1. **MAC choice.** §10.4 says "such as HMAC". We use HMAC-SHA-512 with full 64-byte tags. The draft has no confirmation vectors, so ours come from an independent Python script built on the draft's values.
 2. **Confirmation order.** B sends `Tb` together with its share, and A sends `Ta` third. The §10.4 construction doesn't depend on order. Because `Tb` goes first, an active attacker playing A gets one offline check of one guessed code per attempt. That is the usual online guess, and the pairing layer's 3-attempt limits bound it.
-3. **Binding goes through CI.** The plan requires both confirmations to bind the ticket hash, mode, version, ordered identities and roles, and the peer session's TLS exporter. Here they reach the tags through `CI → g → K → ISK → mac_key`, not as extra MAC input. Check that the pairing spec's `CI` encoding is unambiguous, ties roles to identities, and uses the peer session's exporter, not the outer connection's.
-4. **Roles.** The draft requires fixed roles (§10.1). Approval needs both confirmations, and only B sees `Ta` checked, so the host should be the responder and the joiner the initiator. The pairing spec makes the final call.
+3. **Binding goes through CI.** The plan requires both confirmations to bind the ticket hash, mode, version, ordered identities and roles, and the peer session's TLS exporter. Here they reach the tags through `CI → g → K → ISK → mac_key`, not as extra MAC input. The pairing spec's `CI` ([`wire.md`](wire.md) 10.5) is a canonical CBOR map, so it reads only one way; it pairs each identity with its role number, puts the initiator first, and uses the inner peer session's exporter (5.5). The `sid` also mixes in that exporter, so the same attempt id on another session gives another generator.
+4. **Roles.** The draft requires fixed roles (§10.1). Approval needs both confirmations, and only B sees `Ta` checked, so the host is the responder and the joiner the initiator ([`wire.md`](wire.md) 10.5). The joiner learns that `Ta` was accepted from the host's `PAIRED`.
 5. **Mousse restrictions.** `sid` must be at least 16 bytes (the draft allows an empty sid), `PRS` must not be empty, and AD may be at most 4096 bytes. These narrow what the draft allows; they don't change it.
 6. **Framing.** The wire form of a share is `lv_cat(Y, AD)` itself, with the shortest-LEB128 rule added. The draft leaves encodings to the application (§4.3).
 7. **Loose text in the draft.** §8.3's `sample_scalar` uses `G.group_size_bytes`, which the draft never defines for ristretto255. We read it as 32, and peers can't tell the difference. §8.3 says "element derivation function from the abstraction" without naming RFC 9496 §4.3.4. Vector B.3.1 confirms the one-way map is meant. Resampling a zero scalar isn't in the draft; the chance of hitting one is 2^-252.

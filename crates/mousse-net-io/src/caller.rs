@@ -3,23 +3,26 @@
 //!
 //! - Every connection pins the host in step 1: the stored pin for a paired
 //!   host, the ticket's host identity on first contact.
-//! - The caller does not trust the host's streams before the host said
-//!   `AUTHORIZED {live}` (or `PAIRED`): stream frames before that close the
-//!   connection.
+//! - Core's [`CallerGate`] decides what the host may send: nothing on
+//!   streams before the host said `AUTHORIZED {live}` (or `PAIRED`).
+//! - A "send link" ticket pairs with the 6-digit code the host shows, over
+//!   CPace; the owner types it through a [`CodeEntry`].
 //! - A [`PeerSession`] per pinned host tracks the current path. A new live
 //!   connection to the same host replaces the old one, which closes with
 //!   `PATH_REPLACED`.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use mousse_net_core::authz::{Traffic, Verdict};
+use mousse_net_core::authz::{CallerGate, CallerTraffic, Traffic, Verdict};
 use mousse_net_core::control::{AuthorizedState, ControlMessage};
 use mousse_net_core::identity::IdentityPublicKey;
 use mousse_net_core::mux::MuxRole;
 use mousse_net_core::pairing::{
-    CodeExchangeFactory, InvitationKind, JoinerAction, JoinerPairing, PairedHost, Ticket,
+    CodeExchangeFactory, CpaceExchangeFactory, InvitationKind, JoinerAction, JoinerPairing,
+    PairedHost, PairingCode, Ticket,
 };
 use mousse_net_core::session::{PeerSession, SessionEvent};
 use mousse_net_core::session_cert::CertError;
@@ -30,8 +33,8 @@ use crate::certs::CertManager;
 use crate::clock::Clock;
 use crate::conn::{self, CloseReason, Cmd, ConnStatus, Connection, Outbox, Role as ConnRole};
 use crate::error::NetError;
-use crate::exchange::InPersonOnly;
-use crate::pipe::{connect_tcp, Pipe, Route};
+use crate::pipe::{connect_tcp, route_uri, Pipe, Route};
+use crate::rng::os_rng;
 use crate::tls::{self, Handshake, TlsPolicy};
 use crate::SharedSigner;
 
@@ -42,6 +45,22 @@ pub enum JoinOutcome {
     Paired(PairedHost),
     /// The host already had a live grant for this device.
     AlreadyPaired,
+}
+
+/// Where the owner types the code a "send link" host shows.
+pub trait CodeEntry: Send {
+    /// Ask for the code. `retry` is `Some(attempts left)` after a wrong
+    /// code. `None` gives up.
+    fn code(&mut self, retry: Option<u8>) -> impl Future<Output = Option<String>> + Send;
+}
+
+/// For in-person tickets: there is never a code to type.
+pub struct NoCode;
+
+impl CodeEntry for NoCode {
+    async fn code(&mut self, _retry: Option<u8>) -> Option<String> {
+        None
+    }
 }
 
 #[derive(Default)]
@@ -63,7 +82,7 @@ impl Paths {
 }
 
 /// The caller side of the session.
-pub struct Caller<F: CodeExchangeFactory + Clone = InPersonOnly> {
+pub struct Caller<F: CodeExchangeFactory + Clone = CpaceExchangeFactory> {
     certs: Arc<CertManager>,
     clock: Arc<dyn Clock>,
     policy: TlsPolicy,
@@ -76,10 +95,10 @@ fn lock(paths: &Mutex<Paths>) -> MutexGuard<'_, Paths> {
     paths.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-impl Caller<InPersonOnly> {
-    /// A caller that pairs in person only.
+impl Caller<CpaceExchangeFactory> {
+    /// A caller that pairs in person or with a send link (CPace).
     pub fn new(signer: SharedSigner, clock: Arc<dyn Clock>, policy: TlsPolicy) -> Self {
-        Self::with_factory(signer, clock, policy, InPersonOnly)
+        Self::with_factory(signer, clock, policy, CpaceExchangeFactory)
     }
 }
 
@@ -88,7 +107,7 @@ where
     F: CodeExchangeFactory + Clone + Send + 'static,
     F::Exchange: Send,
 {
-    /// A caller with a code exchange for "send link" tickets.
+    /// A caller with another code exchange for "send link" tickets.
     pub fn with_factory(
         signer: SharedSigner,
         clock: Arc<dyn Clock>,
@@ -175,7 +194,7 @@ where
             None => (None, None),
         };
         let role = CallerRole {
-            state: CallerState::AwaitingAuthorized,
+            gate: CallerGate::new(),
             joiner,
             proof,
             paths: self.paths.clone(),
@@ -266,22 +285,36 @@ where
                 Err(e) => last = Some(e),
             }
         }
-        Err(last.unwrap_or_else(|| NetError::Refused("no candidate answered as this host".into())))
+        Err(last.unwrap_or_else(|| {
+            NetError::Refused(format!(
+                "no candidate answered as this host ({})",
+                routes.iter().map(route_uri).collect::<Vec<_>>().join(", ")
+            ))
+        }))
     }
 
-    /// Pair with the host in `ticket` over `pipe`. In-person tickets wait
-    /// for the host owner's approval.
+    /// Pair with the host in an in-person `ticket` over `pipe`. Waits for
+    /// the host owner's approval.
     pub async fn join<P: Pipe>(
         &self,
         pipe: P,
         ticket: &Ticket,
         name: &str,
     ) -> Result<(Connection, JoinOutcome), NetError> {
-        if ticket.kind != InvitationKind::InPerson {
-            return Err(NetError::Ticket(
-                "this ticket needs a pairing code, which this build cannot use yet".into(),
-            ));
-        }
+        self.join_with_code(pipe, ticket, name, &mut NoCode).await
+    }
+
+    /// Pair with the host in `ticket` over `pipe`. In person, wait for the
+    /// host owner's approval. With a send link, ask `codes` for the code the
+    /// host shows, and again after each wrong code until the attempts run
+    /// out.
+    pub async fn join_with_code<P: Pipe, C: CodeEntry>(
+        &self,
+        pipe: P,
+        ticket: &Ticket,
+        name: &str,
+        codes: &mut C,
+    ) -> Result<(Connection, JoinOutcome), NetError> {
         let mut joiner = JoinerPairing::new(
             ticket.clone(),
             self.identity(),
@@ -296,30 +329,46 @@ where
             .on_connected(handshake.exporters, self.clock.now())
             .map_err(|e| NetError::Ticket(e.to_string()))?;
         let connection = self.start(conn, stream, handshake, pin, Some((joiner, proof)));
-        match connection.settled(true).await {
-            ConnStatus::Paired(host) => {
-                self.promote(&connection);
-                Ok((connection, JoinOutcome::Paired(host)))
+        let mut status = connection.settled(true).await;
+        loop {
+            match status {
+                ConnStatus::CodeNeeded {
+                    attempts_left,
+                    retry,
+                } => {
+                    let asked = status.clone();
+                    let Some(typed) = codes.code(retry.then_some(attempts_left)).await else {
+                        connection.close(ErrorCode::Cancelled);
+                        return Err(NetError::Refused("pairing cancelled".into()));
+                    };
+                    match PairingCode::parse(typed.trim()) {
+                        Some(code) => {
+                            connection.submit_code(code)?;
+                            status = connection.next_status(&asked).await;
+                        }
+                        // Not six digits: ask again without using an attempt.
+                        None => status = asked,
+                    }
+                }
+                ConnStatus::Paired(host) => {
+                    self.promote(&connection);
+                    return Ok((connection, JoinOutcome::Paired(host)));
+                }
+                ConnStatus::AlreadyPaired | ConnStatus::Live => {
+                    self.promote(&connection);
+                    return Ok((connection, JoinOutcome::AlreadyPaired));
+                }
+                ConnStatus::Closed(reason) => return Err(NetError::Closed(reason)),
+                other => {
+                    return Err(NetError::Refused(format!("unexpected state {other:?}")));
+                }
             }
-            ConnStatus::AlreadyPaired | ConnStatus::Live => {
-                self.promote(&connection);
-                Ok((connection, JoinOutcome::AlreadyPaired))
-            }
-            ConnStatus::Closed(reason) => Err(NetError::Closed(reason)),
-            other => Err(NetError::Refused(format!("unexpected state {other:?}"))),
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CallerState {
-    AwaitingAuthorized,
-    JoinOnly,
-    Live,
-}
-
 struct CallerRole<F: CodeExchangeFactory> {
-    state: CallerState,
+    gate: CallerGate,
     joiner: Option<JoinerPairing<F>>,
     proof: Option<ControlMessage>,
     paths: Arc<Mutex<Paths>>,
@@ -333,15 +382,20 @@ impl<F: CodeExchangeFactory> CallerRole<F> {
             match action {
                 JoinerAction::Send(message) => out.control.push(message),
                 JoinerAction::Paired(host) => {
-                    self.state = CallerState::Live;
+                    self.gate.promote();
                     out.status = Some(ConnStatus::Paired(host));
                 }
-                JoinerAction::AlreadyPaired => {
-                    self.state = CallerState::Live;
-                    out.status = Some(ConnStatus::AlreadyPaired);
+                JoinerAction::AlreadyPaired => out.status = Some(ConnStatus::AlreadyPaired),
+                JoinerAction::CodeRejected { attempts_left } => {
+                    out.status = Some(ConnStatus::CodeNeeded {
+                        attempts_left,
+                        retry: true,
+                    });
                 }
-                JoinerAction::CodeRejected { .. } => {}
-                JoinerAction::Failed(code) => out.close = Some(code),
+                JoinerAction::Failed(code) => {
+                    self.gate.close(code);
+                    out.close = Some(code);
+                }
             }
         }
     }
@@ -358,74 +412,74 @@ where
         }
     }
 
-    fn check(&mut self, traffic: Traffic) -> Verdict {
-        match traffic {
-            Traffic::Keepalive | Traffic::Hello | Traffic::GoAway | Traffic::HostOnly => {
-                Verdict::Allow
-            }
-            Traffic::JoinProof => Verdict::Close(ErrorCode::ProtocolError),
-            Traffic::Pairing if self.state == CallerState::JoinOnly => Verdict::Allow,
-            Traffic::Pairing => Verdict::Close(ErrorCode::ProtocolError),
-            Traffic::Stream if self.state == CallerState::Live => Verdict::Allow,
-            Traffic::Stream => Verdict::Close(ErrorCode::NotAuthorized),
-        }
+    fn check(&mut self, traffic: Traffic, message: Option<&ControlMessage>) -> Verdict {
+        let traffic = match (traffic, message) {
+            (_, Some(message)) => CallerTraffic::of(message),
+            (Traffic::Keepalive, None) => CallerTraffic::Keepalive,
+            (Traffic::GoAway, None) => CallerTraffic::GoAway,
+            (_, None) => CallerTraffic::Stream,
+        };
+        self.gate.check(traffic)
     }
 
     fn on_control(&mut self, message: ControlMessage, out: &mut Outbox) {
-        match (message, self.state) {
-            (ControlMessage::Authorized { state }, CallerState::AwaitingAuthorized) => {
-                match self.joiner.as_mut() {
-                    Some(joiner) => {
-                        let actions = joiner.on_authorized(state);
-                        if state == AuthorizedState::JoinOnly {
-                            self.state = CallerState::JoinOnly;
-                            out.status = Some(ConnStatus::JoinOnly);
-                        }
-                        self.joiner_actions(actions, out);
-                    }
-                    None => match state {
-                        AuthorizedState::Live => {
-                            self.state = CallerState::Live;
-                            out.status = Some(ConnStatus::Live);
-                        }
-                        // We sent no join proof.
-                        AuthorizedState::JoinOnly => out.close = Some(ErrorCode::ProtocolError),
-                    },
+        // The gate already let this through, and moved on `AUTHORIZED`.
+        let Some(joiner) = self.joiner.as_mut() else {
+            match message {
+                ControlMessage::Authorized {
+                    state: AuthorizedState::Live,
+                } => out.status = Some(ConnStatus::Live),
+                // We sent no join proof, so there is nothing to pair.
+                _ => {
+                    self.gate.close(ErrorCode::ProtocolError);
+                    out.close = Some(ErrorCode::ProtocolError);
                 }
             }
-            (ControlMessage::Paired { host_name, role }, CallerState::JoinOnly) => {
-                let actions = match self.joiner.as_mut() {
-                    Some(joiner) => joiner.on_paired(host_name, role),
-                    None => vec![JoinerAction::Failed(ErrorCode::ProtocolError)],
-                };
-                self.joiner_actions(actions, out);
+            return;
+        };
+        let actions = match message {
+            ControlMessage::Authorized { state } => {
+                let actions = joiner.on_authorized(state);
+                if state == AuthorizedState::JoinOnly {
+                    out.status = Some(match joiner.ticket().kind {
+                        InvitationKind::InPerson => ConnStatus::JoinOnly,
+                        InvitationKind::SendLink => ConnStatus::CodeNeeded {
+                            attempts_left: joiner.attempts_left(),
+                            retry: false,
+                        },
+                    });
+                }
+                actions
             }
-            (ControlMessage::CodeExchange { attempt, payload }, CallerState::JoinOnly) => {
-                let actions = match self.joiner.as_mut() {
-                    Some(joiner) => joiner.on_code_exchange(attempt, &payload),
-                    None => vec![JoinerAction::Failed(ErrorCode::ProtocolError)],
-                };
-                self.joiner_actions(actions, out);
+            ControlMessage::Paired { host_name, role } => joiner.on_paired(host_name, role),
+            ControlMessage::CodeExchange { attempt, payload } => {
+                joiner.on_code_exchange(attempt, &payload)
             }
-            (ControlMessage::CodeAbort { attempt, .. }, CallerState::JoinOnly) => {
-                let actions = match self.joiner.as_mut() {
-                    Some(joiner) => joiner.on_code_abort(attempt),
-                    None => vec![JoinerAction::Failed(ErrorCode::ProtocolError)],
-                };
-                self.joiner_actions(actions, out);
-            }
-            _ => out.close = Some(ErrorCode::ProtocolError),
-        }
+            ControlMessage::CodeAbort { attempt, .. } => joiner.on_code_abort(attempt),
+            _ => vec![JoinerAction::Failed(ErrorCode::ProtocolError)],
+        };
+        self.joiner_actions(actions, out);
+    }
+
+    fn on_code(&mut self, code: PairingCode, out: &mut Outbox) {
+        let actions = match self.joiner.as_mut() {
+            Some(joiner) => joiner
+                .submit_code(&code, &mut os_rng())
+                .unwrap_or_else(|_| vec![JoinerAction::Failed(ErrorCode::ProtocolError)]),
+            None => vec![JoinerAction::Failed(ErrorCode::ProtocolError)],
+        };
+        self.joiner_actions(actions, out);
     }
 
     fn may_open(&self) -> bool {
-        self.state == CallerState::Live
+        self.gate.is_live()
     }
 
     fn on_closed(&mut self, reason: &CloseReason) {
         if let Some(joiner) = self.joiner.as_mut() {
             let _ = joiner.on_closed(reason.code());
         }
+        self.gate.close(reason.code().unwrap_or(ErrorCode::NoError));
         let mut paths = lock(&self.paths);
         paths.conns.remove(&self.conn);
         if let Some(session) = paths.sessions.get_mut(&self.pin) {

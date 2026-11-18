@@ -11,7 +11,9 @@ use std::fmt;
 use rand_core::CryptoRng;
 
 use super::exchange::{CodeExchange, CodeExchangeFactory, ExchangeRole, PairingCode};
-use super::proof::{binding_transcript, verify_join_proof, SessionExporters, EXPORTER_LEN};
+use super::proof::{
+    attempt_sid, binding_transcript, verify_join_proof, SessionExporters, EXPORTER_LEN,
+};
 use super::ticket::{
     Ticket, TicketSecret, MAX_ROUTES, MAX_ROUTE_LEN, TICKET_LIFETIME_SECS, TICKET_VERSION,
 };
@@ -99,7 +101,9 @@ pub enum HostAction {
         /// Its display name.
         name: String,
     },
-    /// Send link: show this code on the host's screen.
+    /// Send link: show this code on the host's screen, replacing any code
+    /// shown before for the invitation. Emitted when a joiner is admitted and
+    /// whenever an attempt starts (the next attempt uses a fresh code).
     ShowCode {
         /// Invitation.
         invitation: InvitationId,
@@ -278,10 +282,14 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
         self.invitations.get(invitation).map(|i| i.attempts_left)
     }
 
-    /// The code to show for a send-link invitation.
+    /// The code to show now for a send-link invitation: the one the next
+    /// attempt will use. Each attempt replaces it with a fresh code (see
+    /// [`HostAction::ShowCode`]); `None` once no attempts are left or the
+    /// invitation is no longer open.
     pub fn code(&self, invitation: &InvitationId) -> Option<&PairingCode> {
         self.invitations
             .get(invitation)
+            .filter(|i| i.status == InvitationStatus::Open)
             .and_then(|i| i.code.as_ref())
     }
 
@@ -452,6 +460,7 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
         }
 
         let key = (conn, attempt);
+        let mut actions = Vec::new();
         if let Some(existing) = inv.attempts.get(&key) {
             if existing.last_received == payload {
                 // A byte-identical resend on the same attempt and session:
@@ -475,6 +484,19 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
                 }];
             }
         } else {
+            // An attempt id already seen on another connection is a replay:
+            // its binding holds the old session's exporter, so it can never
+            // succeed. Refuse it before the debit, with no exchange work, so
+            // replays cannot spend the invitation's attempts.
+            if inv.attempts.keys().any(|(_, seen)| *seen == attempt) {
+                return vec![HostAction::Send {
+                    conn,
+                    message: ControlMessage::CodeAbort {
+                        attempt,
+                        code: ErrorCode::PairingFailed,
+                    },
+                }];
+            }
             if inv.attempts_left == 0 {
                 return vec![HostAction::Close {
                     conn,
@@ -483,12 +505,23 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
             }
             // Debit first. Nothing below runs on an undebited attempt.
             inv.attempts_left -= 1;
-            let (Some(joiner), Some(code)) = (inv.joiners.get(&conn), inv.code.as_ref()) else {
+            let (Some(joiner), Some(code)) = (inv.joiners.get(&conn), inv.code.take()) else {
                 return vec![HostAction::Close {
                     conn,
                     code: ErrorCode::InternalError,
                 }];
             };
+            // This attempt uses the code shown until now. The next attempt
+            // gets a fresh code, shown from now on; none once no attempts
+            // are left.
+            if inv.attempts_left > 0 {
+                let next = PairingCode::generate(rng);
+                actions.push(HostAction::ShowCode {
+                    invitation,
+                    code: next.clone(),
+                });
+                inv.code = Some(next);
+            }
             let binding = binding_transcript(
                 &inv.ticket_hash,
                 inv.ticket.kind,
@@ -497,9 +530,10 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
                 &joiner.identity,
                 &joiner.pair_exporter,
             );
+            let sid = attempt_sid(&attempt, &joiner.pair_exporter);
             let exchange = self
                 .factory
-                .start(ExchangeRole::Responder, code, &binding, rng);
+                .start(ExchangeRole::Responder, &code, &binding, &sid, rng);
             inv.attempts.insert(
                 key,
                 HostAttempt {
@@ -512,12 +546,12 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
         }
 
         let Some(record) = inv.attempts.get_mut(&key) else {
-            return Vec::new();
+            return actions;
         };
         record.last_received = payload.to_vec();
         let result = match record.exchange.as_mut() {
             Some(exchange) => exchange.step(Some(payload)),
-            None => return Vec::new(),
+            None => return actions,
         };
         match result {
             Ok(step) => {
@@ -525,10 +559,11 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
                     .send
                     .map(|payload| ControlMessage::CodeExchange { attempt, payload });
                 record.last_reply = reply.clone();
-                let mut actions: Vec<HostAction> = reply
-                    .into_iter()
-                    .map(|message| HostAction::Send { conn, message })
-                    .collect();
+                actions.extend(
+                    reply
+                        .into_iter()
+                        .map(|message| HostAction::Send { conn, message }),
+                );
                 if step.peer_confirmed {
                     record.state = AttemptState::Succeeded;
                     record.exchange = None;
@@ -544,10 +579,10 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
                 record.state = AttemptState::Failed;
                 record.exchange = None;
                 record.last_reply = Some(abort.clone());
-                let mut actions = vec![HostAction::Send {
+                actions.push(HostAction::Send {
                     conn,
                     message: abort,
-                }];
+                });
                 actions.extend(self.end_if_exhausted(&invitation));
                 actions
             }
@@ -613,7 +648,7 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
             identity: joiner.identity,
             name: joiner.name,
             role: inv.params.role.clone(),
-            authorizing_owner: inv.params.authorizing_owner.clone(),
+            authorizing_owner: inv.params.authorizing_owner,
             expires_at: inv.params.grant_expires_at,
         };
         let (grant, events) = match grants.add(new_grant, now) {

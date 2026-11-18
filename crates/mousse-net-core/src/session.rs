@@ -10,7 +10,10 @@
 //!   that second and closes with `CERT_EXPIRED` at the first second after it.
 //! - **Renewal.** [`RENEW_LEAD_SECS`] before the earlier `not_after`, the
 //!   session asks for a new path (a fresh handshake, with a fresh certificate
-//!   if ours is the one running out). Renewal is just a path switch.
+//!   if ours is the one running out). Renewal is just a path switch. If no
+//!   new path is current by the next retry time, it asks again: after
+//!   [`RENEW_RETRY_FIRST_SECS`], doubling up to [`RENEW_RETRY_MAX_SECS`],
+//!   until the path's deadline.
 //! - **Path switch.** Authenticate the new path (step 1 with the same pin),
 //!   reopen channels on it from the app's cursors, then close the old path
 //!   with `PATH_REPLACED`.
@@ -26,6 +29,22 @@ use crate::{ConnectionId, ErrorCode};
 /// Start renewal this long before the earlier certificate's `not_after`
 /// (30 minutes).
 pub const RENEW_LEAD_SECS: u64 = 1_800;
+
+/// First wait before asking again for a renewal that has not happened
+/// (30 seconds).
+pub const RENEW_RETRY_FIRST_SECS: u64 = 30;
+
+/// Longest wait between renewal requests (5 minutes).
+pub const RENEW_RETRY_MAX_SECS: u64 = 300;
+
+/// Pending renewal of the current path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Renewal {
+    /// When to ask (again).
+    next_at: UnixTime,
+    /// The wait after the next request.
+    backoff: u64,
+}
 
 /// One authenticated path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,7 +137,8 @@ pub enum PathError {
 pub struct PeerSession {
     pin: IdentityPublicKey,
     current: Option<PathInfo>,
-    renewal_requested: bool,
+    /// Set once renewal is due; cleared when a new path becomes current.
+    renewal: Option<Renewal>,
     candidate: Option<Candidate>,
 }
 
@@ -128,7 +148,7 @@ impl PeerSession {
         Self {
             pin,
             current: None,
-            renewal_requested: false,
+            renewal: None,
             candidate: None,
         }
     }
@@ -221,7 +241,7 @@ impl PeerSession {
                 code: ErrorCode::PathReplaced,
             });
         }
-        self.renewal_requested = false;
+        self.renewal = None;
         events.push(SessionEvent::Switched { conn });
         Ok(events)
     }
@@ -233,18 +253,15 @@ impl PeerSession {
         }
         if self.current.is_some_and(|p| p.conn == conn) {
             self.current = None;
-            self.renewal_requested = false;
+            self.renewal = None;
         }
     }
 
     /// When [`PeerSession::tick`] must next run.
     pub fn next_deadline(&self) -> Option<UnixTime> {
-        let current = self.current.map(|p| {
-            if self.renewal_requested {
-                p.deadline
-            } else {
-                p.renew_at
-            }
+        let current = self.current.map(|p| match self.renewal {
+            Some(r) => r.next_at.min(p.deadline.plus(1)),
+            None => p.renew_at,
         });
         let candidate = self.candidate.and_then(|c| c.info).map(|i| i.deadline);
         current.into_iter().chain(candidate).min()
@@ -265,14 +282,26 @@ impl PeerSession {
         if let Some(path) = self.current {
             if now > path.deadline {
                 self.current = None;
-                self.renewal_requested = false;
+                self.renewal = None;
                 events.push(SessionEvent::Close {
                     conn: path.conn,
                     code: ErrorCode::CertExpired,
                 });
-            } else if now >= path.renew_at && !self.renewal_requested {
-                self.renewal_requested = true;
-                events.push(SessionEvent::RenewDue { conn: path.conn });
+            } else if now >= path.renew_at {
+                let renewal = self.renewal.get_or_insert(Renewal {
+                    next_at: path.renew_at,
+                    backoff: RENEW_RETRY_FIRST_SECS,
+                });
+                if now >= renewal.next_at {
+                    // Ask again later unless a new path becomes current. A
+                    // candidate still being brought up is left alone.
+                    let in_progress = self.candidate.is_some();
+                    renewal.next_at = now.plus(renewal.backoff);
+                    renewal.backoff = (renewal.backoff * 2).min(RENEW_RETRY_MAX_SECS);
+                    if !in_progress {
+                        events.push(SessionEvent::RenewDue { conn: path.conn });
+                    }
+                }
             }
         }
         events
@@ -321,7 +350,12 @@ mod tests {
                 conn: ConnectionId(1)
             }]
         );
-        assert_eq!(s.tick(deadline), vec![]);
+        // Still open through the deadline second (renewal is asked again).
+        assert!(s
+            .tick(deadline)
+            .iter()
+            .all(|e| matches!(e, SessionEvent::RenewDue { .. })));
+        assert!(s.current().is_some());
         assert_eq!(
             s.tick(deadline.plus(1)),
             vec![SessionEvent::Close {
@@ -330,6 +364,79 @@ mod tests {
             }]
         );
         assert!(s.current().is_none());
+    }
+
+    /// The first renewal fails: the session asks again on a growing
+    /// backoff until the deadline, and stops once a new path is current.
+    #[test]
+    fn a_failed_renewal_is_asked_for_again_until_the_deadline() {
+        let peer = peer_cert(1, 3_600);
+        let mut s = PeerSession::new(peer.identity);
+        s.begin_path(ConnectionId(1));
+        s.on_authenticated(ConnectionId(1), &peer, local(86_400), T0)
+            .unwrap();
+        s.on_reopened(ConnectionId(1)).unwrap();
+        let renew_at = T0.plus(3_600 - RENEW_LEAD_SECS);
+        let due = vec![SessionEvent::RenewDue {
+            conn: ConnectionId(1),
+        }];
+        assert_eq!(s.tick(renew_at), due);
+        assert_eq!(s.next_deadline(), Some(renew_at.plus(30)));
+
+        // The new path fails.
+        s.begin_path(ConnectionId(2));
+        s.on_path_closed(ConnectionId(2));
+        assert_eq!(s.tick(renew_at.plus(29)), vec![]);
+        assert_eq!(s.tick(renew_at.plus(30)), due);
+        assert_eq!(s.next_deadline(), Some(renew_at.plus(30 + 60)));
+
+        // A candidate still being brought up is not interrupted.
+        s.begin_path(ConnectionId(3));
+        assert_eq!(s.tick(renew_at.plus(90)), vec![]);
+        s.on_path_closed(ConnectionId(3));
+        assert_eq!(s.tick(renew_at.plus(90 + 120)), due);
+
+        // Waits double up to the cap, and requests continue until the
+        // deadline.
+        let mut t = renew_at.plus(210);
+        let mut waits = Vec::new();
+        let deadline = s.current().unwrap().deadline;
+        while let Some(next) = s.next_deadline() {
+            if next > deadline {
+                break;
+            }
+            waits.push(next.secs() - t.secs());
+            t = next;
+            assert_eq!(s.tick(t), due);
+        }
+        assert_eq!(&waits[..3], &[240, 300, 300]);
+        assert_eq!(s.next_deadline(), Some(deadline.plus(1)));
+        assert_eq!(
+            s.tick(deadline.plus(1)),
+            vec![SessionEvent::Close {
+                conn: ConnectionId(1),
+                code: ErrorCode::CertExpired
+            }]
+        );
+    }
+
+    #[test]
+    fn a_new_current_path_ends_renewal_requests() {
+        let peer = peer_cert(1, 3_600);
+        let mut s = PeerSession::new(peer.identity);
+        s.begin_path(ConnectionId(1));
+        s.on_authenticated(ConnectionId(1), &peer, local(86_400), T0)
+            .unwrap();
+        s.on_reopened(ConnectionId(1)).unwrap();
+        let renew_at = T0.plus(3_600 - RENEW_LEAD_SECS);
+        assert_eq!(s.tick(renew_at).len(), 1);
+        let fresh = peer_cert(1, 86_400);
+        s.begin_path(ConnectionId(2));
+        s.on_authenticated(ConnectionId(2), &fresh, local(86_400), renew_at)
+            .unwrap();
+        s.on_reopened(ConnectionId(2)).unwrap();
+        assert_eq!(s.tick(renew_at.plus(30)), vec![]);
+        assert_eq!(s.tick(renew_at.plus(3_600)), vec![]);
     }
 
     #[test]

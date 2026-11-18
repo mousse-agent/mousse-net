@@ -10,11 +10,10 @@ use std::time::Duration;
 
 use mousse_net_core::grants::GrantId;
 use mousse_net_core::identity::{IdentityPublicKey, SoftwareKey};
-use mousse_net_core::pairing::{InvitationId, Ticket};
+use mousse_net_core::pairing::{CpaceExchangeFactory, InvitationId, InvitationKind, Ticket};
 use mousse_net_core::ErrorCode;
 use mousse_net_io::discovery::Advertiser;
-use mousse_net_io::exchange::InPersonOnly;
-use mousse_net_io::pipe::accept_tcp;
+use mousse_net_io::pipe::{accept_tcp, route_from_addr, route_uri};
 use mousse_net_io::rng::{os_rng, random_bytes};
 use mousse_net_io::store::{hex, short_id};
 use mousse_net_io::{
@@ -59,7 +58,7 @@ struct State {
 /// expands to this machine's LAN addresses.
 pub fn route_hints(ip: IpAddr, port: u16) -> Vec<String> {
     if !ip.is_unspecified() {
-        return vec![mousse_net_io::pipe::Route::from_addr(SocketAddr::new(ip, port)).to_uri()];
+        return vec![route_uri(&route_from_addr(SocketAddr::new(ip, port)))];
     }
     let mut out = Vec::new();
     if let Ok(ifaces) = if_addrs::get_if_addrs() {
@@ -73,9 +72,7 @@ pub fn route_hints(ip: IpAddr, port: u16) -> Vec<String> {
                 IpAddr::V6(v6) => ip.is_ipv6() && !v6.is_unicast_link_local(),
             };
             if usable {
-                out.push(
-                    mousse_net_io::pipe::Route::from_addr(SocketAddr::new(addr, port)).to_uri(),
-                );
+                out.push(route_uri(&route_from_addr(SocketAddr::new(addr, port))));
             }
         }
     }
@@ -113,7 +110,8 @@ pub async fn run(
     let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
     let config = HostConfig::for_endpoint(&endpoint, opts.name.clone(), clock.clone())
         .map_err(|e| e.to_string())?;
-    let (host, mut events) = Host::new(signer, config, InPersonOnly).map_err(|e| e.to_string())?;
+    let (host, mut events) =
+        Host::new(signer, config, CpaceExchangeFactory).map_err(|e| e.to_string())?;
     if opts.approve_next {
         host.set_approve_next(true);
     }
@@ -236,6 +234,12 @@ fn on_event(state: &State, event: HostEvent) {
                 }
             }
         }
+        HostEvent::ShowCode { invitation, code } => {
+            // Only the inviting command shows the code; it is never logged.
+            if let Some(tx) = waiter(&invitation) {
+                let _ = tx.send(json!({"event": "code", "code": code.as_str()}));
+            }
+        }
         HostEvent::Enrolled {
             invitation,
             grant,
@@ -340,7 +344,11 @@ async fn control_session(state: Arc<State>, stream: TcpStream) {
             return;
         }
         "invite" => {
-            invite_session(&state, &mut ch).await;
+            let link = request
+                .get("link")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            invite_session(&state, &mut ch, link).await;
             return;
         }
         other => reply_error(format!("unknown command {other:?}")),
@@ -348,10 +356,16 @@ async fn control_session(state: Arc<State>, stream: TcpStream) {
     let _ = ch.send(&reply).await;
 }
 
-/// One invitation, from ticket to enrolment, with the approval question
-/// answered over the control channel.
-async fn invite_session(state: &State, ch: &mut Channel) {
-    let created = match state.host.invite(state.routes.clone()) {
+/// One invitation, from ticket to enrolment. In person, the approval
+/// question is answered over the control channel; with a send link, each
+/// fresh code is sent to the inviting command to show.
+async fn invite_session(state: &State, ch: &mut Channel, link: bool) {
+    let kind = if link {
+        InvitationKind::SendLink
+    } else {
+        InvitationKind::InPerson
+    };
+    let created = match state.host.invite(kind, state.routes.clone()) {
         Ok(c) => c,
         Err(e) => {
             let _ = ch.send(&reply_error(e.to_string())).await;

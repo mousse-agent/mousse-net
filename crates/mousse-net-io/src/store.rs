@@ -27,6 +27,15 @@ pub fn hex(bytes: &[u8]) -> String {
     out
 }
 
+/// The grants file format. Version 2 added `next_grant_id`.
+const GRANT_FILE_VERSION: u32 = 2;
+
+/// A 16-byte owner (profile id) from hex.
+pub fn owner_from_hex(text: &str) -> Option<OwnerRef> {
+    let bytes: [u8; OwnerRef::LEN] = unhex(text).ok()?.try_into().ok()?;
+    Some(OwnerRef::from_bytes(bytes))
+}
+
 /// Parse lowercase or uppercase hex.
 pub fn unhex(text: &str) -> Result<Vec<u8>, NetError> {
     let bytes = text.as_bytes();
@@ -124,6 +133,9 @@ struct DenialRecord {
 #[derive(Serialize, Deserialize)]
 struct GrantFile {
     version: u32,
+    /// Grant ids are never reused: the next id survives restarts even when
+    /// the grant that last used an id was removed.
+    next_grant_id: u64,
     grants: Vec<GrantRecord>,
     denials: Vec<DenialRecord>,
 }
@@ -154,7 +166,7 @@ impl GrantStore {
         };
         let file: GrantFile =
             serde_json::from_slice(&bytes).map_err(|e| store_err(&self.path, e.into()))?;
-        if file.version != 1 {
+        if file.version != GRANT_FILE_VERSION {
             return Err(NetError::Store(format!(
                 "{}: unsupported version {}",
                 self.path.display(),
@@ -173,7 +185,8 @@ impl GrantStore {
                 name: g.name,
                 role: Role::new(&g.role).map_err(|_| bad("role"))?,
                 source: GrantSource::Local,
-                authorizing_owner: OwnerRef::new(&g.authorizing_owner).map_err(|_| bad("owner"))?,
+                authorizing_owner: owner_from_hex(&g.authorizing_owner)
+                    .ok_or_else(|| bad("owner"))?,
                 adopted_into: None,
                 granted_at: UnixTime(g.granted_at),
                 expires_at: g.expires_at.map(UnixTime),
@@ -186,13 +199,15 @@ impl GrantStore {
                 denied_at: UnixTime(d.denied_at),
             });
         }
-        GrantTable::restore(grants, denials).map_err(|e| NetError::Store(e.to_string()))
+        GrantTable::restore(grants, denials, file.next_grant_id)
+            .map_err(|e| NetError::Store(format!("{}: {e}", self.path.display())))
     }
 
     /// Save the table atomically.
     pub fn save(&self, table: &GrantTable) -> Result<(), NetError> {
         let file = GrantFile {
-            version: 1,
+            version: GRANT_FILE_VERSION,
+            next_grant_id: table.next_grant_id(),
             grants: table
                 .grants()
                 .map(|g| GrantRecord {
@@ -201,7 +216,7 @@ impl GrantStore {
                     name: g.name.clone(),
                     role: g.role.as_str().to_owned(),
                     source: "local".into(),
-                    authorizing_owner: g.authorizing_owner.as_str().to_owned(),
+                    authorizing_owner: hex(g.authorizing_owner.as_bytes()),
                     granted_at: g.granted_at.secs(),
                     expires_at: g.expires_at.map(|t| t.secs()),
                 })
@@ -341,7 +356,7 @@ mod tests {
                     identity: a,
                     name: "laptop".into(),
                     role: Role::owner(),
-                    authorizing_owner: OwnerRef::new("owner").unwrap(),
+                    authorizing_owner: OwnerRef::from_bytes([7; 16]),
                     expires_at: Some(UnixTime(9_999)),
                 },
                 UnixTime(100),
@@ -354,6 +369,7 @@ mod tests {
         assert_eq!(g.identity, a);
         assert_eq!(g.name, "laptop");
         assert_eq!(g.expires_at, Some(UnixTime(9_999)));
+        assert_eq!(g.authorizing_owner, OwnerRef::from_bytes([7; 16]));
         assert!(loaded.is_denied(&b));
         // No temporary files are left behind.
         let leftovers: Vec<_> = fs::read_dir(&dir)
@@ -366,12 +382,36 @@ mod tests {
     }
 
     #[test]
+    fn a_removed_grant_id_is_not_reused_after_a_restart() {
+        let dir = temp_dir("grant-ids");
+        let store = GrantStore::in_dir(&dir);
+        let new = |identity| NewGrant {
+            identity,
+            name: "phone".into(),
+            role: Role::owner(),
+            authorizing_owner: OwnerRef::from_bytes([1; 16]),
+            expires_at: None,
+        };
+        let mut table = GrantTable::new();
+        let a = SoftwareKey::generate(&mut os_rng()).public_key();
+        let (first, _) = table.add(new(a), UnixTime(1)).unwrap();
+        table.remove(first);
+        store.save(&table).unwrap();
+        let mut loaded = store.load().unwrap();
+        assert_eq!(loaded.grants().count(), 0);
+        let b = SoftwareKey::generate(&mut os_rng()).public_key();
+        let (second, _) = loaded.add(new(b), UnixTime(2)).unwrap();
+        assert!(second.0 > first.0, "grant id {first:?} was reused");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn a_tampered_grant_file_is_refused() {
         let dir = temp_dir("tampered");
         let store = GrantStore::in_dir(&dir);
         fs::write(
             store.path(),
-            br#"{"version":1,"grants":[{"id":0,"identity":"04ff","name":"x","role":"owner","source":"local","authorizing_owner":"o","granted_at":1,"expires_at":null}],"denials":[]}"#,
+            br#"{"version":2,"next_grant_id":1,"grants":[{"id":0,"identity":"04ff","name":"x","role":"owner","source":"local","authorizing_owner":"o","granted_at":1,"expires_at":null}],"denials":[]}"#,
         )
         .unwrap();
         assert!(store.load().is_err());

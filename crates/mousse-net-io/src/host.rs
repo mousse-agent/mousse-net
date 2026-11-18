@@ -19,8 +19,9 @@ use mousse_net_core::grants::{Denial, Grant, GrantEvent, GrantId, GrantTable, Ow
 use mousse_net_core::identity::IdentityPublicKey;
 use mousse_net_core::mux::MuxRole;
 use mousse_net_core::pairing::{
-    CodeExchangeFactory, CreatedInvitation, HostAction, HostPairing, InvitationId, InvitationKind,
-    InvitationParams, InvitationStatus, SessionExporters,
+    CodeExchangeFactory, CpaceExchangeFactory, CreatedInvitation, HostAction, HostPairing,
+    InvitationId, InvitationKind, InvitationParams, InvitationStatus, PairingCode,
+    SessionExporters,
 };
 use mousse_net_core::{ConnectionId, ErrorCode};
 use tokio::sync::mpsc;
@@ -30,7 +31,6 @@ use crate::clock::Clock;
 use crate::conn::{self, CloseReason, Cmd, ConnStatus, Connection, Outbox, Role as ConnRole};
 use crate::endpoint::Endpoint;
 use crate::error::NetError;
-use crate::exchange::InPersonOnly;
 use crate::pipe::Pipe;
 use crate::rng::os_rng;
 use crate::store::GrantStore;
@@ -89,6 +89,14 @@ pub struct ApprovalRequest {
 pub enum HostEvent {
     /// Ask the owner, then call [`Host::approve`] or [`Host::decline`].
     ApprovalRequested(ApprovalRequest),
+    /// Send link: show this code to the owner, replacing any code shown
+    /// before for the invitation. Each attempt uses a fresh code.
+    ShowCode {
+        /// The invitation.
+        invitation: InvitationId,
+        /// The code.
+        code: PairingCode,
+    },
     /// A device was paired.
     Enrolled {
         /// The invitation it used.
@@ -136,7 +144,7 @@ struct Shared<F: CodeExchangeFactory> {
 }
 
 /// A host. Cheap to clone; all clones share state.
-pub struct Host<F: CodeExchangeFactory = InPersonOnly> {
+pub struct Host<F: CodeExchangeFactory = CpaceExchangeFactory> {
     shared: Arc<Shared<F>>,
 }
 
@@ -232,8 +240,8 @@ where
                             }));
                     }
                 }
-                HostAction::ShowCode { .. } => {
-                    // Only in-person invitations are created in this slice.
+                HostAction::ShowCode { invitation, code } => {
+                    let _ = self.events.send(HostEvent::ShowCode { invitation, code });
                 }
                 HostAction::Enrolled {
                     invitation,
@@ -361,10 +369,16 @@ where
         ))
     }
 
-    /// Create an in-person invitation with these route hints.
-    pub fn invite(&self, routes: Vec<String>) -> Result<CreatedInvitation, NetError> {
+    /// Create an invitation of `kind` with these route hints. In person,
+    /// the owner confirms the device is next to them; a send link asks the
+    /// joiner for the code the host shows ([`HostEvent::ShowCode`]).
+    pub fn invite(
+        &self,
+        kind: InvitationKind,
+        routes: Vec<String>,
+    ) -> Result<CreatedInvitation, NetError> {
         let params = InvitationParams {
-            kind: InvitationKind::InPerson,
+            kind,
             role: Role::owner(),
             authorizing_owner: self.shared.owner.clone(),
             routes,
@@ -539,7 +553,7 @@ where
         }
     }
 
-    fn check(&mut self, traffic: Traffic) -> Verdict {
+    fn check(&mut self, traffic: Traffic, _message: Option<&ControlMessage>) -> Verdict {
         let mut inner = lock(&self.shared);
         match inner.gates.get_mut(&self.conn) {
             Some(gate) => gate.check(traffic),

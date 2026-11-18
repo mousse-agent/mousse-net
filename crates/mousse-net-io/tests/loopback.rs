@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use common::*;
 use mousse_net_core::control::ControlMessage;
 use mousse_net_core::mux::{Mux, MuxEvent, MuxRole, PriorityClass};
-use mousse_net_core::pairing::Ticket;
-use mousse_net_core::{ErrorCode, Millis, PROTOCOL_MINOR_VERSION};
+use mousse_net_core::pairing::{InvitationKind, InvitationStatus, Ticket};
+use mousse_net_core::{ErrorCode, Millis, PROTOCOL_MINOR_VERSION, PROTOCOL_VERSION};
 use mousse_net_io::certs::CertManager;
 use mousse_net_io::keystore::KeyStorage;
 use mousse_net_io::pipe::connect_tcp;
@@ -18,6 +18,7 @@ use mousse_net_io::{
     tls, Caller, Endpoint, JoinOutcome, ManualClock, NetError, PortChoice, TlsPolicy,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
 
 async fn wait_until(what: &str, cond: impl Fn() -> bool) {
     within(what, async {
@@ -127,6 +128,7 @@ async fn an_ungranted_identity_cannot_open_streams() {
     let mut mux = Mux::new(MuxRole::Caller, Millis(0));
     mux.send_control(
         ControlMessage::Hello {
+            major_version: PROTOCOL_VERSION,
             minor_version: PROTOCOL_MINOR_VERSION,
         }
         .encode(),
@@ -273,4 +275,78 @@ async fn a_paired_caller_finds_the_host_after_a_port_change() {
     host.stop().await;
     drop(endpoint);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Start a send-link join in the background. Returns the code channel, the
+/// asks the joiner makes, and the join result.
+fn start_link_join(
+    caller: Arc<Caller>,
+    host: &TestHost,
+    ticket: Ticket,
+) -> (
+    mpsc::UnboundedSender<String>,
+    mpsc::UnboundedReceiver<Option<u8>>,
+    tokio::task::JoinHandle<Result<(mousse_net_io::Connection, JoinOutcome), NetError>>,
+) {
+    let (type_tx, typed) = mpsc::unbounded_channel();
+    let (asks, asks_rx) = mpsc::unbounded_channel();
+    let route = host.route();
+    let join = tokio::spawn(async move {
+        let pipe = connect_tcp(&route).await?;
+        let mut codes = TypedCodes { asks, typed };
+        caller
+            .join_with_code(pipe, &ticket, "phone", &mut codes)
+            .await
+    });
+    (type_tx, asks_rx, join)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_link_pairs_with_the_right_code_and_three_wrong_codes_end_it() {
+    let mut host = TestHost::start(new_signer()).await;
+
+    // The right code pairs, and the connection is live at once.
+    let caller = Arc::new(new_caller(new_signer()));
+    let ticket = host.invite_kind(InvitationKind::SendLink);
+    let (type_code, mut asks, join) = start_link_join(caller.clone(), &host, ticket.clone());
+    let code = host.next_code().await;
+    assert_eq!(within("ask", asks.recv()).await, Some(None));
+    type_code.send(code).unwrap();
+    let (conn, outcome) = within("join", join).await.unwrap().unwrap();
+    assert!(matches!(outcome, JoinOutcome::Paired(_)), "{outcome:?}");
+    assert!(host.grant_of(&caller.identity()).is_some());
+    assert_echo(&mut open_echo(&conn).await, b"after the code").await;
+    assert_eq!(
+        host.host.invitation_status(&ticket.invitation),
+        Some(InvitationStatus::Consumed {
+            grant: host.grant_of(&caller.identity()).unwrap()
+        })
+    );
+
+    // Three wrong codes: the joiner is asked again after each of the first
+    // two, then the host ends the invitation and enrolls no one.
+    let stranger = Arc::new(new_caller(new_signer()));
+    let ticket = host.invite_kind(InvitationKind::SendLink);
+    let (type_code, mut asks, join) = start_link_join(stranger.clone(), &host, ticket.clone());
+    let mut retries = Vec::new();
+    for _ in 0..3 {
+        let shown = host.next_code().await;
+        retries.push(within("ask", asks.recv()).await.unwrap());
+        type_code.send(wrong_code(&shown)).unwrap();
+    }
+    assert_eq!(retries, vec![None, Some(2), Some(1)]);
+    let err = within("join", join).await.unwrap().unwrap_err();
+    assert!(closed_with(&err, ErrorCode::AttemptsExhausted), "{err}");
+    assert_eq!(host.invitation_ended().await, ErrorCode::AttemptsExhausted);
+    assert_eq!(
+        host.host.invitation_status(&ticket.invitation),
+        Some(InvitationStatus::Ended(ErrorCode::AttemptsExhausted))
+    );
+    assert_eq!(host.grant_of(&stranger.identity()), None);
+
+    // The ended invitation does not admit the device again.
+    let (_type_code, _asks, join) = start_link_join(stranger.clone(), &host, ticket);
+    let err = within("join", join).await.unwrap().unwrap_err();
+    assert!(closed_with(&err, ErrorCode::InvitationInvalid), "{err}");
+    host.stop().await;
 }

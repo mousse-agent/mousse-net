@@ -5,12 +5,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use mousse_net_core::pairing::Ticket;
+use mousse_net_core::pairing::{InvitationKind, Route, Ticket};
 use mousse_net_core::ErrorCode;
-use mousse_net_io::pipe::{connect_tcp, Route};
+use mousse_net_io::pipe::{connect_tcp, parse_route, route_uri};
 use mousse_net_io::store::{hex, short_id, PeerRecord, PeerStore};
 use mousse_net_io::{
-    Caller, CloseReason, Connection, Endpoint, JoinOutcome, NetError, SystemClock, TlsPolicy,
+    Caller, CloseReason, CodeEntry, Connection, Endpoint, JoinOutcome, NetError, SystemClock,
+    TlsPolicy,
 };
 use serde_json::json;
 
@@ -55,10 +56,46 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Routes typed on the command line: each must parse.
 fn parse_routes(list: &[String]) -> Result<Vec<Route>, String> {
     list.iter()
-        .map(|r| Route::parse(r).map_err(|e| format!("route {r}: {e}")))
+        .map(|r| parse_route(r).map_err(|e| e.to_string()))
         .collect()
+}
+
+/// Routes from a ticket or the peer store: hints this version cannot use
+/// (unknown or reserved schemes, mDNS names without a browser) are skipped.
+fn usable_routes(hints: &[String]) -> Vec<Route> {
+    hints
+        .iter()
+        .filter_map(|h| Route::parse(h).ok())
+        .filter(|r| matches!(r, Route::Tcp { .. }))
+        .collect()
+}
+
+/// Asks for the send-link code on the terminal.
+pub struct TypedCode;
+
+impl CodeEntry for TypedCode {
+    async fn code(&mut self, retry: Option<u8>) -> Option<String> {
+        match retry {
+            None => println!("Type the 6-digit code shown on the host:"),
+            Some(left) => println!(
+                "Wrong code. Type the new code shown on the host ({left} {} left):",
+                if left == 1 { "try" } else { "tries" }
+            ),
+        }
+        tokio::task::spawn_blocking(|| {
+            let mut line = String::new();
+            match std::io::stdin().read_line(&mut line) {
+                Ok(0) | Err(_) => None,
+                Ok(_) => Some(line.trim().to_owned()),
+            }
+        })
+        .await
+        .ok()
+        .flatten()
+    }
 }
 
 /// Pair with the host in `ticket`, trying `routes` (default: the ticket's).
@@ -69,25 +106,34 @@ pub async fn join(
     name: &str,
     routes: &[String],
 ) -> Result<(Connection, PeerRecord), String> {
-    let hints: Vec<String> = if routes.is_empty() {
-        ticket.routes.clone()
+    let candidates = if routes.is_empty() {
+        usable_routes(&ticket.routes)
     } else {
-        routes.to_vec()
+        parse_routes(routes)?
     };
-    if hints.is_empty() {
-        return Err("the ticket has no address; pass --route tcp://host:port".into());
+    if candidates.is_empty() {
+        return Err("the ticket has no usable address; pass --route tcp://host:port".into());
+    }
+    if ticket.kind == InvitationKind::SendLink {
+        println!("joining with a link; the code is shown on the host");
+    } else {
+        println!("joining; the host owner is asked to confirm");
     }
     let mut last = String::from("no route answered");
-    for hint in &hints {
-        let route = Route::parse(hint).map_err(|e| format!("route {hint}: {e}"))?;
-        let pipe = match connect_tcp(&route).await {
+    for route in &candidates {
+        let hint = route_uri(route);
+        let pipe = match connect_tcp(route).await {
             Ok(p) => p,
             Err(e) => {
                 last = format!("{hint}: {e}");
                 continue;
             }
         };
-        match side.caller.join(pipe, ticket, name).await {
+        match side
+            .caller
+            .join_with_code(pipe, ticket, name, &mut TypedCode)
+            .await
+        {
             Ok((conn, outcome)) => {
                 let existing = side.peers().load().ok().and_then(|ps| {
                     ps.into_iter()
@@ -105,7 +151,7 @@ pub async fn join(
                     identity: hex(ticket.host_identity.as_bytes()),
                     role,
                     routes: ticket.routes.clone(),
-                    last_route: Some(route.to_uri()),
+                    last_route: Some(hint.clone()),
                     paired_at: now_secs(),
                 };
                 side.peers()
@@ -144,6 +190,9 @@ fn describe_close(reason: &CloseReason) -> String {
             "the ticket is used, expired or unknown (INVITATION_INVALID)".into()
         }
         Some(ErrorCode::PairingDeclined) => "the host owner said no (PAIRING_DECLINED)".into(),
+        Some(ErrorCode::AttemptsExhausted) => {
+            "too many wrong codes; the invitation ended (ATTEMPTS_EXHAUSTED)".into()
+        }
         _ => format!("connection closed: {reason}"),
     }
 }
@@ -177,19 +226,18 @@ pub async fn dial(
     routes: &[String],
 ) -> Result<Connection, String> {
     let pin = peer.pin().map_err(|e| e.to_string())?;
-    let list = if routes.is_empty() {
-        peer.routes_to_try()
+    let candidates = if routes.is_empty() {
+        usable_routes(&peer.routes_to_try())
     } else {
-        routes.to_vec()
+        parse_routes(routes)?
     };
-    let candidates = parse_routes(&list)?;
     let (conn, used) = side
         .caller
         .dial_candidates(&candidates, pin)
         .await
         .map_err(|e| describe(&e))?;
     let mut record = peer.clone();
-    record.last_route = Some(used.to_uri());
+    record.last_route = Some(route_uri(&used));
     let _ = side.peers().upsert(record);
     Ok(conn)
 }

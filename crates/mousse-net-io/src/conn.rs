@@ -8,7 +8,8 @@
 //!   core's [`ConnectionGate`](mousse_net_core::authz::ConnectionGate), so an
 //!   ungranted peer can never open a stream.
 //! - `HELLO` is the first thing each side sends and must be the first control
-//!   message received.
+//!   message received; core's `negotiate_version` decides the minor version
+//!   or closes with `UNSUPPORTED_VERSION`.
 //! - The connection closes with `CERT_EXPIRED` after the effective deadline
 //!   of the two certificates.
 //! - A separate writer task owns the write half, so a slow peer never stops
@@ -20,13 +21,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mousse_net_core::authz::{Traffic, Verdict};
-use mousse_net_core::control::ControlMessage;
+use mousse_net_core::control::{negotiate_version, ControlMessage, VersionSupport};
 use mousse_net_core::identity::IdentityPublicKey;
 use mousse_net_core::mux::{
     decode_frame, Frame, Mux, MuxEvent, MuxRole, PriorityClass, StreamError, StreamId,
 };
-use mousse_net_core::pairing::PairedHost;
-use mousse_net_core::{ConnectionId, ErrorCode, UnixTime, PROTOCOL_MINOR_VERSION};
+use mousse_net_core::pairing::{PairedHost, PairingCode};
+use mousse_net_core::{ConnectionId, ErrorCode, UnixTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, WriteHalf};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
@@ -80,6 +81,14 @@ pub enum ConnStatus {
     Pending,
     /// Pairing messages only.
     JoinOnly,
+    /// Send link: the host admitted this device; type the code shown on the
+    /// host. `retry` is set after a wrong code.
+    CodeNeeded {
+        /// Code attempts left in this flow.
+        attempts_left: u8,
+        /// The previous code was wrong.
+        retry: bool,
+    },
     /// Normal channels.
     Live,
     /// Pairing finished on this connection; it is now live.
@@ -114,14 +123,19 @@ pub(crate) struct Outbox {
 pub(crate) trait Role: Send + 'static {
     /// The driver queued `HELLO`; queue whatever comes next.
     fn on_start(&mut self, out: &mut Outbox);
-    /// Decide what to do with inbound traffic.
-    fn check(&mut self, traffic: Traffic) -> Verdict;
+    /// Decide what to do with inbound traffic (`message` is the decoded
+    /// control message, if it is one).
+    fn check(&mut self, traffic: Traffic, message: Option<&ControlMessage>) -> Verdict;
     /// A control message (other than `HELLO`) passed the gate.
     fn on_control(&mut self, message: ControlMessage, out: &mut Outbox);
     /// Whether this side may open streams now.
     fn may_open(&self) -> bool;
     /// The connection ended.
     fn on_closed(&mut self, reason: &CloseReason);
+    /// The owner typed a pairing code (send link, joiner only).
+    fn on_code(&mut self, _code: PairingCode, out: &mut Outbox) {
+        out.close = Some(ErrorCode::ProtocolError);
+    }
 }
 
 pub(crate) enum Cmd {
@@ -141,6 +155,7 @@ pub(crate) enum Cmd {
     Control(ControlMessage),
     Close(ErrorCode),
     Status(ConnStatus),
+    Code(PairingCode),
 }
 
 enum StreamEvent {
@@ -325,6 +340,30 @@ impl Connection {
         }
     }
 
+    /// Wait until the status differs from `from`, and return it.
+    pub async fn next_status(&self, from: &ConnStatus) -> ConnStatus {
+        let mut rx = self.status.clone();
+        loop {
+            let current = rx.borrow_and_update().clone();
+            if &current != from {
+                return current;
+            }
+            if rx.changed().await.is_err() {
+                return match rx.borrow().clone() {
+                    closed @ ConnStatus::Closed(_) => closed,
+                    _ => ConnStatus::Closed(CloseReason::PipeClosed),
+                };
+            }
+        }
+    }
+
+    /// Send link: hand the code the owner typed to the pairing flow.
+    pub fn submit_code(&self, code: PairingCode) -> Result<(), NetError> {
+        self.cmd
+            .send(Cmd::Code(code))
+            .map_err(|_| NetError::Closed(CloseReason::PipeClosed))
+    }
+
     /// Wait for the connection to close.
     pub async fn closed(&self) -> CloseReason {
         let mut rx = self.status.clone();
@@ -470,7 +509,8 @@ impl Driver {
         let writer = tokio::spawn(writer_task(wr, wrx));
 
         let hello = ControlMessage::Hello {
-            minor_version: PROTOCOL_MINOR_VERSION,
+            major_version: VersionSupport::LOCAL.major,
+            minor_version: VersionSupport::LOCAL.minor,
         };
         let _ = self.mux.send_control(hello.encode());
         let mut out = Outbox::default();
@@ -631,6 +671,11 @@ impl Driver {
             Cmd::Status(status) => {
                 let _ = self.status.send(status);
             }
+            Cmd::Code(code) => {
+                let mut out = Outbox::default();
+                self.role.on_code(code, &mut out);
+                self.apply(out);
+            }
         }
     }
 
@@ -717,10 +762,15 @@ impl Driver {
     fn gate(&mut self, traffic: Traffic, message: Option<&ControlMessage>) -> Verdict {
         match (self.peer_hello, traffic) {
             (None, Traffic::Hello) => {
-                if let Some(ControlMessage::Hello { minor_version }) = message {
-                    // Every minor version of protocol 1 is accepted; the peer's
-                    // is kept for features that later minors add.
-                    self.peer_hello = Some(*minor_version);
+                if let Some(ControlMessage::Hello {
+                    major_version,
+                    minor_version,
+                }) = message
+                {
+                    match negotiate_version(VersionSupport::LOCAL, *major_version, *minor_version) {
+                        Ok(agreed) => self.peer_hello = Some(agreed),
+                        Err(code) => return Verdict::Close(code),
+                    }
                 }
             }
             (Some(_), Traffic::Hello) => return Verdict::Close(ErrorCode::ProtocolError),
@@ -728,7 +778,7 @@ impl Driver {
             (None, _) => return Verdict::Close(ErrorCode::ProtocolError),
             (Some(_), _) => {}
         }
-        self.role.check(traffic)
+        self.role.check(traffic, message)
     }
 
     fn on_event(&mut self, event: MuxEvent) {

@@ -4,7 +4,7 @@
 //! on top. TCP (LAN, tailnet, port forward) is the first implementation; SSH
 //! stdio and WebSocket pipes plug in the same way.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -20,72 +20,55 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> Pipe for T {}
 /// How long a TCP connect may take.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// A parsed route hint.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Route {
-    /// `tcp://host:port`.
-    Tcp {
-        /// Host name or address literal (IPv6 without brackets).
-        host: String,
-        /// Port.
-        port: u16,
-    },
+pub use mousse_net_core::pairing::{Route, RouteHost};
+
+/// Parse a route hint with core's grammar ([`Route::parse`]).
+pub fn parse_route(hint: &str) -> Result<Route, NetError> {
+    Route::parse(hint).map_err(|skip| NetError::Refused(format!("route {hint:?}: {skip}")))
 }
 
-impl Route {
-    /// Parse a route hint URI. Only `tcp://` is defined so far.
-    pub fn parse(uri: &str) -> Result<Self, NetError> {
-        let rest = uri
-            .strip_prefix("tcp://")
-            .ok_or_else(|| NetError::Refused(format!("unsupported route {uri:?}")))?;
-        let rest = rest.trim_end_matches('/');
-        let (host, port) = if let Some(inner) = rest.strip_prefix('[') {
-            let (host, tail) = inner
-                .split_once(']')
-                .ok_or_else(|| NetError::Refused(format!("bad route {uri:?}")))?;
-            let port = tail
-                .strip_prefix(':')
-                .ok_or_else(|| NetError::Refused(format!("route {uri:?} has no port")))?;
-            (host, port)
-        } else {
-            rest.rsplit_once(':')
-                .ok_or_else(|| NetError::Refused(format!("route {uri:?} has no port")))?
-        };
-        if host.is_empty() {
-            return Err(NetError::Refused(format!("route {uri:?} has no host")));
-        }
-        let port = port
-            .parse::<u16>()
-            .map_err(|_| NetError::Refused(format!("bad port in route {uri:?}")))?;
-        Ok(Route::Tcp {
-            host: host.to_owned(),
-            port,
-        })
-    }
-
-    /// The route for a socket address.
-    pub fn from_addr(addr: SocketAddr) -> Self {
-        Route::Tcp {
-            host: addr.ip().to_string(),
-            port: addr.port(),
-        }
-    }
-
-    /// The URI form, as written into tickets.
-    pub fn to_uri(&self) -> String {
-        match self {
-            Route::Tcp { host, port } if host.contains(':') => format!("tcp://[{host}]:{port}"),
-            Route::Tcp { host, port } => format!("tcp://{host}:{port}"),
-        }
+/// The `tcp://` route for a socket address.
+pub fn route_from_addr(addr: SocketAddr) -> Route {
+    Route::Tcp {
+        host: match addr.ip() {
+            IpAddr::V4(ip) => RouteHost::Ipv4(ip),
+            IpAddr::V6(ip) => RouteHost::Ipv6(ip),
+        },
+        port: addr.port(),
     }
 }
 
-/// Dial a TCP route.
+/// The hint form of a route, as written into tickets.
+pub fn route_uri(route: &Route) -> String {
+    match route {
+        Route::Tcp { host, port } => match host {
+            RouteHost::Ipv4(ip) => format!("tcp://{ip}:{port}"),
+            RouteHost::Ipv6(ip) => format!("tcp://[{ip}]:{port}"),
+            RouteHost::Dns(name) => format!("tcp://{name}:{port}"),
+        },
+        Route::Mdns { instance } => format!("mdns:{instance}"),
+    }
+}
+
+/// Dial a `tcp://` route. Other routes need discovery first.
 pub async fn connect_tcp(route: &Route) -> Result<TcpStream, NetError> {
-    let Route::Tcp { host, port } = route;
-    let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((host.as_str(), *port)))
-        .await
-        .map_err(|_| NetError::Timeout("TCP connect"))??;
+    let Route::Tcp { host, port } = route else {
+        return Err(NetError::Refused(format!(
+            "{} is not a TCP route",
+            route_uri(route)
+        )));
+    };
+    let target = match host {
+        RouteHost::Ipv4(ip) => IpAddr::V4(*ip).to_string(),
+        RouteHost::Ipv6(ip) => IpAddr::V6(*ip).to_string(),
+        RouteHost::Dns(name) => name.clone(),
+    };
+    let stream = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        TcpStream::connect((target.as_str(), *port)),
+    )
+    .await
+    .map_err(|_| NetError::Timeout("TCP connect"))??;
     stream.set_nodelay(true)?;
     Ok(stream)
 }
@@ -102,38 +85,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn routes_parse_and_round_trip() {
-        let r = Route::parse("tcp://192.168.1.20:7443").unwrap();
-        assert_eq!(
-            r,
-            Route::Tcp {
-                host: "192.168.1.20".into(),
-                port: 7443
-            }
-        );
-        assert_eq!(r.to_uri(), "tcp://192.168.1.20:7443");
-        let v6 = Route::parse("tcp://[fe80::1]:9").unwrap();
-        assert_eq!(v6.to_uri(), "tcp://[fe80::1]:9");
-        assert_eq!(
-            Route::parse("tcp://mac.local:1").unwrap(),
-            Route::Tcp {
-                host: "mac.local".into(),
-                port: 1
-            }
-        );
-    }
-
-    #[test]
-    fn bad_routes_are_refused() {
-        for bad in [
-            "ws://x:1",
-            "tcp://x",
-            "tcp://:1",
-            "tcp://x:99999",
-            "tcp://[::1]1",
-            "",
-        ] {
-            assert!(Route::parse(bad).is_err(), "{bad}");
+    fn written_hints_parse_back_to_the_same_route() {
+        for addr in ["192.168.1.20:7443", "[fe80::1]:9"] {
+            let route = route_from_addr(addr.parse().unwrap());
+            assert_eq!(parse_route(&route_uri(&route)).unwrap(), route);
         }
+        let named = parse_route("tcp://mac.local:1").unwrap();
+        assert_eq!(route_uri(&named), "tcp://mac.local:1");
+        assert!(parse_route("ws://x:1").is_err());
     }
 }

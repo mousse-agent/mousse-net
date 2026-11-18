@@ -3,15 +3,19 @@
 
 use std::path::PathBuf;
 
-use mousse_net_core::authz::{ConnectionGate, GateState, Traffic, Verdict};
+use mousse_net_core::authz::{
+    CallerGate, CallerGateState, CallerTraffic, ConnectionGate, GateState, Traffic, Verdict,
+};
 use mousse_net_core::cbor;
-use mousse_net_core::control::ControlMessage;
+use mousse_net_core::control::{
+    negotiate_version, AuthorizedState, ControlMessage, VersionSupport,
+};
 use mousse_net_core::grants::{GrantTable, NewGrant, OwnerRef, Role};
 use mousse_net_core::identity::{IdentityPublicKey, RawSignature, SoftwareKey};
 use mousse_net_core::mux::{decode_frame, Frame, PriorityClass, StreamId};
 use mousse_net_core::pairing::{
-    binding_transcript, join_proof_input, join_proof_mac, verify_join_proof, InvitationId,
-    InvitationKind, Ticket, TicketSecret,
+    attempt_sid, binding_transcript, join_proof_input, join_proof_mac, verify_join_proof,
+    AttemptId, InvitationId, InvitationKind, Route, RouteHost, Ticket, TicketSecret,
 };
 use mousse_net_core::session::{PeerSession, SessionEvent};
 use mousse_net_core::session_cert::{self, PendingCertificate, SessionKey, ValidityWindow};
@@ -223,7 +227,7 @@ fn authorization() {
                         identity: key(&ids[s(&g["identity"])]),
                         name: "device".into(),
                         role: Role::new(s(&g["role"])).expect("role"),
-                        authorizing_owner: OwnerRef::new("profile").expect("owner"),
+                        authorizing_owner: OwnerRef::from_bytes([0x51; 16]),
                         expires_at: g["expires_at"].as_u64().map(UnixTime),
                     },
                     UnixTime(now.secs() - 60),
@@ -263,6 +267,79 @@ fn authorization() {
                 other => panic!("op {other}"),
             }
         }
+    }
+}
+
+fn caller_traffic(name: &str) -> CallerTraffic {
+    match name {
+        "keepalive" => CallerTraffic::Keepalive,
+        "hello" => CallerTraffic::Hello,
+        "goaway" => CallerTraffic::GoAway,
+        "authorized_live" => CallerTraffic::Authorized(AuthorizedState::Live),
+        "authorized_join_only" => CallerTraffic::Authorized(AuthorizedState::JoinOnly),
+        "pairing" => CallerTraffic::Pairing,
+        "paired" => CallerTraffic::Paired,
+        "stream" => CallerTraffic::Stream,
+        "caller_only" => CallerTraffic::CallerOnly,
+        other => panic!("caller traffic {other}"),
+    }
+}
+
+fn caller_state_name(state: CallerGateState) -> String {
+    match state {
+        CallerGateState::AwaitingAuthorization => "awaiting_authorization".into(),
+        CallerGateState::JoinOnly => "join_only".into(),
+        CallerGateState::Live => "live".into(),
+        CallerGateState::Closed(code) => format!("closed:{}", code.name()),
+    }
+}
+
+#[test]
+fn caller_gate() {
+    let doc = load("authz.json");
+    for case in list(&doc["caller_cases"]) {
+        let name = s(&case["name"]);
+        let mut gate = CallerGate::new();
+        for step in list(&case["steps"]) {
+            match s(&step["op"]) {
+                "check" => {
+                    let got = verdict_name(gate.check(caller_traffic(s(&step["traffic"]))));
+                    assert_eq!(got, s(&step["verdict"]), "{name}: {}", s(&step["traffic"]));
+                }
+                "promote" => gate.promote(),
+                other => panic!("op {other}"),
+            }
+            assert_eq!(caller_state_name(gate.state()), s(&step["state"]), "{name}");
+        }
+    }
+}
+
+#[test]
+fn hello_negotiation() {
+    let doc = load("hello.json");
+    let this = &doc["this_build"];
+    assert_eq!(
+        VersionSupport::LOCAL,
+        VersionSupport {
+            major: u(&this["major"]),
+            minor: u(&this["minor"]),
+            oldest_minor: u(&this["oldest_minor"]),
+        }
+    );
+    assert_eq!(ControlMessage::hello().encode(), unhex(&doc["hello"]));
+    for case in list(&doc["cases"]) {
+        let local = &case["local"];
+        let local = VersionSupport {
+            major: u(&local["major"]),
+            minor: u(&local["minor"]),
+            oldest_minor: u(&local["oldest_minor"]),
+        };
+        let peer = &case["peer"];
+        let got = match negotiate_version(local, u(&peer["major"]), u(&peer["minor"])) {
+            Ok(minor) => J::from(minor),
+            Err(code) => J::from(format!("close:{}", code.name())),
+        };
+        assert_eq!(got, case["result"], "{}", s(&case["name"]));
     }
 }
 
@@ -314,6 +391,24 @@ fn tickets() {
         };
         assert_eq!(got, s(&case["result"]));
     }
+    for case in list(&doc["route_hints"]["cases"]) {
+        let hint = s(&case["hint"]);
+        let expected = &case["result"];
+        match Route::parse(hint) {
+            Ok(Route::Tcp { host, port }) => {
+                let tcp = &expected["tcp"];
+                assert_eq!(u(&tcp["port"]), u64::from(port), "{hint}");
+                let host_ok = match host {
+                    RouteHost::Ipv4(a) => tcp["host"]["ipv4"] == a.to_string(),
+                    RouteHost::Ipv6(a) => tcp["host"]["ipv6"] == a.to_string(),
+                    RouteHost::Dns(n) => tcp["host"]["dns"] == n,
+                };
+                assert!(host_ok, "{hint}");
+            }
+            Ok(Route::Mdns { instance }) => assert_eq!(expected["mdns"], instance, "{hint}"),
+            Err(skip) => assert_eq!(expected["skip"], skip.name(), "{hint}"),
+        }
+    }
 }
 
 #[test]
@@ -353,6 +448,17 @@ fn join_proof_and_binding_transcript() {
         &fixed(&b["pair_exporter"]),
     );
     assert_eq!(transcript.as_bytes(), unhex(&b["transcript"]));
+    let sid = &doc["sid"];
+    let attempt = AttemptId(fixed(&sid["attempt"]));
+    let exporter: [u8; 32] = fixed(&sid["pair_exporter"]);
+    assert_eq!(
+        cbor::decode(&unhex(&sid["input"])).map(|v| cbor::encode(&v)),
+        Ok(unhex(&sid["input"]))
+    );
+    assert_eq!(
+        attempt_sid(&attempt, &exporter).as_slice(),
+        unhex(&sid["sid"])
+    );
 }
 
 #[test]

@@ -27,24 +27,40 @@ The code exchange used by "Send link" pairing (CPace) is specified in
 - "Close the connection with code C" means: send `GOAWAY(C)` (section 9.4)
   if the mux is running, then close the pipe. Before the mux runs (during
   TLS) it means: abort the handshake.
+- An **endpoint** is one Mousse profile's helper on one device. Each endpoint
+  has its own identity key, grant and denial table, invitations, pins,
+  listener and relay registration. Two profiles on one computer are two
+  endpoints and share none of these. Where this document says "device" or
+  "host" for one of these, it means an endpoint.
 
 ## 2. Versions
 
 | Name | Value | Where |
 |---|---|---|
-| Major protocol version | `1` | Session certificate (record and extension), pairing ticket |
+| Major protocol version | `1` | Session certificate (record and extension), pairing ticket, `HELLO` |
 | Minor protocol version | `0` | `HELLO` |
 | TLS ALPN | `mousse/1` | TLS ClientHello and ServerHello |
 
 - A peer MUST reject a certificate or ticket whose major version it does not
   support (`unsupported_version`). A change of major version means devices
   pair again.
-- Each side sends its minor version in `HELLO`. Both use the **lower** of the
-  two. Implementations support the current and the previous minor version.
-  A peer that receives a minor version older than the oldest it supports
-  closes with `UNSUPPORTED_VERSION`.
 - The ALPN value carries the major version. A TLS peer MUST offer exactly
   `mousse/1` and MUST fail the handshake if it is not selected.
+
+**Minor version negotiation.** Each side speaks one major version and a
+range of minor versions, from its oldest to its newest. An implementation
+speaks its current minor version and the one before it (oldest = current −
+1, or 0). Each side sends `HELLO {1: major, 2: newest minor}` (section 11).
+When the peer's `HELLO` arrives, each side decides on its own:
+
+1. If the peer's major version is not its own, close with
+   `UNSUPPORTED_VERSION`.
+2. `agreed = min(own newest minor, peer minor)`.
+3. If `agreed` is below its own oldest minor, close with
+   `UNSUPPORTED_VERSION`.
+4. Otherwise the connection uses `agreed`.
+
+When both sides accept, they reach the same `agreed`. Vectors: `hello.json`.
 
 ## 3. Canonical CBOR
 
@@ -79,7 +95,7 @@ field fails its rule is rejected as a whole.
 
 ### 4.1 Identity key
 
-Each device has one long-lived **identity key**: ECDSA on NIST P-256
+Each endpoint has one long-lived **identity key**: ECDSA on NIST P-256
 (secp256r1) with SHA-256. Its public key is always written as a **SEC1
 uncompressed point**: 65 bytes, `0x04 ‖ X ‖ Y`. Compressed points, the
 point at infinity and points not on the curve are rejected.
@@ -144,8 +160,8 @@ The identity key signs this canonical CBOR map (the **session record**):
 The **identity signature** is a raw signature (4.2) by the identity key, with
 SHA-256, over the record bytes.
 
-There is no role in the record. A device's role on a host comes only from
-the host's grant (section 7).
+There is no role in the record. A device's role on a host endpoint comes only
+from that endpoint's grant (section 7).
 
 ### 5.2 Validity window
 
@@ -227,11 +243,15 @@ and Web PKI checks do not apply; the checks below replace them.
 Each side verifies the peer's certificate at its own wall time `now`, with an
 **expected identity** (pin):
 
-- **every connection to a known peer**: the stored pin for that peer, on
-  first connections, reconnects, bulk sessions and path switches alike;
-- **a joiner's first contact with a host**: the host identity from the
-  ticket;
+- **every connection to a known peer**: the pin this endpoint stored for
+  that peer endpoint, on first connections, reconnects, bulk sessions and
+  path switches alike;
+- **a joiner's first contact with a host**: the host endpoint's identity
+  from the ticket;
 - **a host accepting a connection**: no pin; step 2 decides (section 8).
+
+Pins belong to one endpoint. Another profile's endpoint on the same device
+has its own pins and never uses these.
 
 Checks run in this order; the first failure is the result. Vectors expect
 this exact order.
@@ -255,6 +275,15 @@ this exact order.
 The TLS stack separately verifies `CertificateVerify` with the session key,
 as usual. Together, these prove that the peer holds the session key now and
 that the identity key vouched for that session key and window.
+
+**Another endpoint on the address.** A LAN address (a route hint, a
+discovered address or a remembered one) is only a candidate. When the
+endpoint that answers on a candidate fails the pin (`pin_mismatch`), another
+endpoint holds that address: for example another profile's helper on the
+same computer, or another computer that took the address. The caller aborts
+that handshake before sending any data, tries the next candidate, shows no
+warning and keeps its pin unchanged. Vector: `session-cert.json` case
+`another_endpoint_on_lan_address`.
 
 ### 5.5 TLS exporters
 
@@ -284,7 +313,11 @@ includes both identity keys.
   after it, whatever it is doing.
 - **Renewal** starts at `min(not_after) − 1800`, but never before the later
   `not_before`. The side whose certificate runs out first issues a new one.
-  Renewal is a path switch.
+  Renewal is a path switch. While no new path has become current, renewal
+  is retried: 30 s after the first try, then waits of 60, 120 and 240 s,
+  then every 300 s, until the effective deadline. A retry is skipped while
+  a candidate path is still being brought up. Vectors:
+  `session-lifecycle.json`.
 - **Path switch:** open a new connection to the same peer, run step 1 with
   the **same pin**, reopen channels on it (the application resumes from its
   own cursors), then close the old connection with `PATH_REPLACED`. If the
@@ -294,33 +327,48 @@ includes both identity keys.
 
 ## 7. Grants
 
-Authorization lives on each host as a table of **grants**. This section fixes
-the semantics both ends rely on; the storage format is local.
+Authorization lives on each host endpoint as its own table of **grants** and
+**denials**. Two endpoints on one device never share a table. This section
+fixes the semantics both ends rely on; the storage format is local.
 
 A grant is `{identity, name, role, source, authorizing owner, adopted_into,
 granted_at, expires_at?}`:
 
-- `identity`: the device's 65-byte identity key.
-- `name`: 1 to 64 bytes of UTF-8.
+- `identity`: the peer endpoint's 65-byte identity key.
+- `name`: 1 to 128 bytes of UTF-8. The app uses `<computer> (<profile>)`.
 - `role`: 1 to 32 bytes of `[a-z0-9-]`. `owner` and `client` are defined
   now; the application gives them meaning.
 - `source`: `local` (until rosters exist).
-- `authorizing owner`: the local owner or profile that approved it (1 to 128
-  bytes).
+- `authorizing owner`: the **profile id** of the profile that approved it:
+  16 random bytes (128 bits), drawn once when the profile is created and
+  never changed. Never a display name. With one owner profile per endpoint,
+  this is the endpoint's own profile.
 - `adopted_into`: always empty in version 1.
 - `expires_at`: optional. At that second the grant is already expired.
 
 Rules:
 
-- At most one grant per identity. A new grant for the same identity replaces
-  the old one, and the old one's channels close.
+- At most one grant per identity on an endpoint. A new grant for the same
+  identity replaces the old one entirely (name, role and authorizing owner),
+  and the old one's channels close with `GRANT_REVOKED`.
 - Each authorized connection is **bound** to the grant that authorized it.
   Removing, expiring or denying that grant closes the bound connections at
   once with `GRANT_REVOKED`.
-- A **local denial** is host-wide and always wins: denying an identity removes
-  its grant, closes its connections, and blocks new grants until the denial
-  is lifted. Lifting a denial grants nothing.
-- Grant ids are local and never reused.
+- A **local denial** covers the whole endpoint and always wins: denying an
+  identity removes its grant, closes its connections, and blocks new grants
+  until the denial is lifted. Lifting a denial grants nothing. It has no
+  effect on other endpoints of the same device.
+- Grant ids are local and never reused, also across restarts: an endpoint
+  stores the next grant id with its grants, because the grant that last
+  used an id may already be gone.
+
+**Removal from another device (later phases).** Phase 0 removes grants only
+locally. When removal messages are added, an endpoint accepts one only from
+a signer that holds a live grant with role `owner` on that same endpoint,
+and only after checking the signature, that the message names this endpoint
+as its recipient, and that it is not a replay. A removal names the pairing it
+ends; a stale removal, for a pairing that a newer pairing of the same device
+has replaced, leaves the newer grant alone.
 
 ## 8. Connection start and step 2
 
@@ -354,6 +402,26 @@ connection's state:
 
 After a close, everything else is ignored. A valid identity with no grant can
 therefore never reach RPC or any other channel.
+
+### 8.2 What the caller accepts
+
+The caller checks what the host sends in the same way. It starts **awaiting
+authorization**; `AUTHORIZED` moves it to live or join-only. A join-only
+caller becomes live when it accepts `PAIRED` (10.4, 10.6), which for "Send
+link" is only after it verified the host's confirmation.
+
+| Traffic from the host | Awaiting `AUTHORIZED` | Join-only | Live |
+|---|---|---|---|
+| `PING`, `PONG`, `HELLO`, `GOAWAY` | allow | allow | allow |
+| `AUTHORIZED` | allow, then live or join-only | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` |
+| `CODE_EXCHANGE`, `CODE_ABORT` | close `PROTOCOL_ERROR` | allow | ignore |
+| `PAIRED` | close `PROTOCOL_ERROR` | allow | close `PROTOCOL_ERROR` |
+| Any stream frame, including a stream the host opens | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` | allow |
+| `JOIN_PROOF` (caller-only message) | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` |
+
+So a host can never open a stream on a caller that has not been told it is
+live. After a close, everything else is ignored. Vectors: `authz.json`
+`caller_cases`.
 
 ## 9. Mux
 
@@ -445,9 +513,11 @@ An unknown error code in `RESET` or `GOAWAY` is not a frame error; treat it as
 
 ## 10. Pairing
 
-Pairing turns an unknown device (the **joiner**) into a device with a grant on
-a host. The host creates an **invitation**; the joiner receives its
-**ticket**.
+Pairing turns an unknown endpoint (the **joiner**) into one with a grant on
+a host endpoint. The host endpoint creates an **invitation**; the joiner
+receives its **ticket**. Invitations belong to the endpoint that created
+them: the ticket names that endpoint's identity key, and other endpoints on
+the same device know nothing of it.
 
 ### 10.1 Invitation kinds
 
@@ -478,10 +548,14 @@ The ticket is a canonical CBOR map:
 - Decoders check the **version first** (key 1); an unsupported version is
   `unsupported_version` even if other fields are unknown. An unknown kind is
   `unknown_kind`. Other field errors are `field`; CBOR errors are `cbor`.
-- **Route hints** are URIs in the host's order of preference, for example
-  `tcp://192.168.1.20:7443`. Their schemes are defined with the transports.
+- **Route hints** are in the host's order of preference (10.2.1). The ticket
+  accepts any text of 1 to 255 bytes there; reading a hint happens later and
+  never makes the ticket invalid.
 - `expires_at` is creation time + **600 s**.
-- The **ticket hash** is `H(ticket CBOR bytes)`.
+- The **ticket hash** is `H(ticket CBOR bytes)`, over the canonical encoding.
+  Because decoders accept only canonical CBOR, the joiner can hash the bytes
+  it decoded from the link and the host the bytes it created; both are the
+  same.
 - **Link form:** the ticket bytes in base64url (RFC 4648 section 5) **without
   padding**, placed in the URL fragment after `#`. Decoders reject `=`, the
   standard alphabet's `+` and `/`, and any other character (`encoding`). The
@@ -493,9 +567,51 @@ Expiry:
   At `expires_at` the invitation ends and its join-only connections close
   with `INVITATION_INVALID`.
 - The joiner refuses to start while `now ≥ expires_at + 600` (its clock may
-  differ).
+  differ). A joiner that is only learning the outcome of an earlier attempt
+  (10.6) reconnects even after that.
+
+Invitations live only in the host endpoint's memory in version 1. When the
+host restarts, its open invitations end; their tickets then fail with
+`INVITATION_INVALID`, and the owner creates a new invitation. Grants made
+before the restart are stored and stay.
 
 The joiner pins the ticket's host identity for step 1 on first contact.
+
+#### 10.2.1 Route hints
+
+The **scheme** is the text before the first `:`, matched exactly
+(lowercase only). Each hint is either usable or **skipped** with a reason.
+A skipped hint is not an error: the joiner tries the next one.
+
+| Scheme | Form | Meaning |
+|---|---|---|
+| `tcp` | `tcp://<host>:<port>` | A direct TLS connection. |
+| `mdns` | `mdns:<instance>` | Browse for this service instance on the local network. |
+| `ssh`, `ws`, `wss`, `relay` | reserved | Kept for later transports. Skipped as `reserved`. |
+| anything else, or no `:` | | Skipped as `unknown_scheme`. |
+
+A `tcp` or `mdns` hint that breaks its grammar is skipped as `malformed`:
+
+- `<port>`: decimal 1 to 65535, ASCII digits only, no sign, no leading zero.
+  The port is the text after the last `:`.
+- `<host>` is read by its shape:
+  - in square brackets: an IPv6 address in an RFC 4291 section 2.2 text form
+    (an embedded IPv4 part follows the IPv4 rule below), with no zone id;
+  - only ASCII digits and dots: an IPv4 address, four decimal parts 0 to 255
+    with no leading zeros (`1.2.3` and `192.168.01.20` are malformed, not DNS
+    names);
+  - anything else: a DNS name. Labels of 1 to 63 ASCII letters, digits and
+    `-`, not starting or ending with `-`, joined by single dots; at most 253
+    bytes; no trailing dot; the last label is not all digits. The name is
+    compared lowercased.
+- Nothing else may appear: no user part, path, query or fragment.
+- `<instance>`: 1 to 63 bytes of UTF-8 with no control characters (Unicode
+  general category Cc).
+
+Whichever route reaches it, the host is checked against the ticket's pin. A
+pin mismatch on a LAN candidate means another endpoint holds that address
+(5.4): try the next candidate, with no warning and no re-pin. Vectors:
+`ticket.json` `route_hints`.
 
 ### 10.3 Join proof
 
@@ -522,13 +638,19 @@ The proof shows that the joiner holds the ticket, bound to this TLS session
 and to both identities, so it cannot be replayed on another connection or by
 another device.
 
+The joiner's **name** (`JOIN_PROOF` key 3) is not covered by the MAC. It is a
+claim the joiner makes about itself, shown to the host owner as sent and
+stored in the grant. The app sends `<computer> (<profile>)`, so the field
+allows 1 to 128 bytes.
+
 ### 10.4 In-person flow
 
 1. Join proof accepted; the host sends `AUTHORIZED {join_only}`.
 2. The host asks its owner: "Is the device next to you?", showing the
-   joiner's name.
+   joiner's name from `JOIN_PROOF`.
 3. On approval the host enrolls (10.8). On decline it closes with
    `PAIRING_DECLINED`; on cancel, `CANCELLED`.
+4. The joiner accepts `PAIRED` and becomes live (8.2).
 
 ### 10.5 Binding transcript
 
@@ -540,35 +662,103 @@ The code exchange is bound to this canonical CBOR map:
 | 2 | bytes: ticket hash (32) |
 | 3 | uint: kind (mode) |
 | 4 | uint: ticket version |
-| 5 | array `[[1, host identity key], [2, joiner identity key]]` |
+| 5 | array `[[1, joiner identity key], [2, host identity key]]` |
 | 6 | bytes: pair exporter (32, label `EXPORTER-mousse-pair-v1`) |
 
-The identities are ordered host first; the numbers are their roles in the
-exchange (1 = host = responder, 2 = joiner = initiator). The transcript bytes
-are the exchange's channel identifier and are bound into **both** key
-confirmations ([`cpace.md`](cpace.md)).
+The initiator comes first, as CPace requires; the numbers are the roles in
+the exchange (1 = initiator = joiner, 2 = responder = host). The transcript
+bytes are the exchange's channel identifier (`CI`) and are bound into **both**
+key confirmations ([`cpace.md`](cpace.md)). Each side builds them from its own
+values: the ticket it holds, the identity keys of this TLS session and its
+own exporter. Vectors: `join-proof.json` `binding`.
+
+#### Session id
+
+Each attempt has its own session id:
+
+```
+sid = H(CBOR {1: "mousse-pair-sid-v1",
+              2: attempt id (16 bytes),
+              3: pair exporter (32 bytes)})
+```
+
+`sid` is 32 bytes and public. A fresh attempt id gives a fresh `sid`; the same
+attempt id on another TLS session gives another `sid`, because the exporter
+differs. Vectors: `join-proof.json` `sid`.
+
+#### Code exchange
+
+"Send link" runs CPace profile 1 ([`cpace.md`](cpace.md)) once per attempt
+with these inputs:
+
+| CPace input | Value |
+|---|---|
+| `PRS` | the attempt's code (10.6): its 6 ASCII digits |
+| `CI` | the binding transcript bytes |
+| `sid` | the attempt's session id |
+| `ADa`, `ADb` | empty. Senders MUST send empty AD. A receiver refuses a share with non-empty AD as malformed, before any group work. |
+| Initiator (A) | the joiner |
+| Responder (B) | the host |
+
+The three CPace messages travel in `CODE_EXCHANGE {attempt, payload}`, one
+message per payload, in this order:
+
+1. joiner → host: `msg_a`;
+2. host → joiner: `msg_b` (the host's share and its confirmation `Tb`);
+3. joiner → host: `msg_c` (the joiner's confirmation `Ta`).
+
+The joiner sends `msg_c` only after `Tb` verified. The host enrolls (10.8)
+only after `Ta` verified, and its `PAIRED` is how the joiner learns that the
+host accepted `Ta`. Any CPace error (a malformed message, an invalid point,
+a wrong tag, a message out of order) fails the attempt: the side that saw it
+sends `CODE_ABORT {attempt, PAIRING_FAILED}` and gives no other detail. The
+CPace output `ISK` is not used by pairing in version 1.
 
 ### 10.6 Send-link flow and the code
 
 1. Join proof accepted; the host sends `AUTHORIZED {join_only}` and shows the
-   invitation's **code**: 6 ASCII digits, generated when the invitation is
-   created. Generation: draw a uniform 32-bit integer `x`; redraw while
-   `x ≥ 4 294 000 000`; the code is `x mod 1 000 000`, zero-padded to 6
-   digits.
+   invitation's current **code**: 6 ASCII digits. Generation: draw a uniform
+   32-bit integer `x`; redraw while `x ≥ 4 294 000 000`; the code is
+   `x mod 1 000 000`, zero-padded to 6 digits. The first code is drawn when
+   the invitation is created.
 2. The owner types the code into the joiner. It reaches the joiner
    independently of the link (from the host's screen or a separate call). The
    digits are never transmitted.
 3. The joiner starts an **attempt**: it picks a random 16-byte attempt id and
-   runs the code exchange as **initiator**, sending each exchange message in
-   `CODE_EXCHANGE {attempt, payload}`. The host runs it as **responder** and
-   answers in `CODE_EXCHANGE` with the same attempt id.
-4. An attempt **succeeds** only when both confirmations verify: the joiner
+   runs the code exchange (10.5) as **initiator**. The host runs it as
+   **responder** and answers with the same attempt id.
+4. **A fresh code for each attempt.** When the first message of a new attempt
+   arrives, the host debits it (10.7) and takes the code it is showing; that
+   is the attempt's code. If attempts are left, the host draws a new code and
+   shows it in place of the old one. A wrong guess therefore says nothing
+   about the next code, and after a failure the owner reads the new code off
+   the host's screen. When no attempts are left, no new code is drawn.
+5. An attempt **succeeds** only when both confirmations verify: the joiner
    verifies the host's, the host verifies the joiner's. Then the host
    enrolls (10.8). The joiner accepts `PAIRED` only after it has verified the
-   host's confirmation.
-5. Either side ends a failed attempt with `CODE_ABORT {attempt,
+   host's confirmation, and then becomes live (8.2).
+6. Either side ends a failed attempt with `CODE_ABORT {attempt,
    PAIRING_FAILED}`. The joiner shows the attempts it has left and the owner
-   may type the code again on the same connection.
+   may type the new code on the same connection.
+7. **Outcome after a lost connection.** Once the joiner has sent `msg_c`,
+   the host may have enrolled it. If the connection closes before `PAIRED`
+   arrives, the joiner does not count the attempt as failed yet. It
+   reconnects with the same ticket, even with no attempts left and even
+   after the ticket's joiner-side expiry, sends `HELLO` and `JOIN_PROOF` as
+   usual, and step 2 gives the outcome:
+   - `AUTHORIZED {live}`: the host enrolled it. Pairing succeeded ("already
+     paired"); the joiner keeps the ticket's host identity as its pin.
+   - `AUTHORIZED {join_only}`: not enrolled. With attempts left the owner
+     may type the current code; with none left the flow ends with
+     `ATTEMPTS_EXHAUSTED`.
+   - A close with `INVITATION_INVALID` or `ATTEMPTS_EXHAUSTED`: not
+     enrolled; the flow ends.
+
+Random draws, in order (vectors depend on it): the host draws the invitation
+id (16 bytes), the secret (16 bytes) and, for "Send link", the first code
+when it creates the invitation; for each new attempt, the next code (if
+attempts are left) and then its CPace scalar. The joiner draws, for each
+attempt, the attempt id (16 bytes) and then its CPace scalar.
 
 ### 10.7 Attempt limits
 
@@ -585,7 +775,13 @@ confirmations ([`cpace.md`](cpace.md)).
   attempts but cannot cancel the real host's invitation; each side's count is
   local.
 - **Attempt key.** The host keys attempts by **(TLS session, attempt id)**.
-  The same attempt id on another TLS session is a new, counted attempt.
+  An attempt id the host has already seen on another TLS session of the
+  invitation is a replay: its messages are bound to the old session's
+  exporter and can never succeed. The host answers it with `CODE_ABORT
+  {attempt, PAIRING_FAILED}` **before** any debit and without exchange work
+  or a new code, so replays cannot spend the invitation's attempts.
+  Vectors: `pairing-attempts.json`
+  `attempt_replayed_on_another_connection_is_refused`.
 - **Resends.** A sender may resend only a **byte-identical** message. When the
   host receives, for an existing attempt, a payload identical to the last one
   it received, it replies with the same bytes it sent before and does no new
@@ -599,15 +795,19 @@ routes:
 
 1. Mark the invitation consumed.
 2. Add the grant (identity, the name from `JOIN_PROOF`, the role and
-   authorizing owner fixed in the invitation).
+   authorizing owner fixed in the invitation). If the identity already holds
+   a grant on this endpoint (for example two invitations joined at the same
+   time), the new grant replaces it (section 7).
 3. Bind this connection to the new grant; it becomes live.
-4. Send `PAIRED {host name, role}`.
+4. Send `PAIRED {host name, role}`. The host name is the host endpoint's
+   display name, `<computer> (<profile>)` in the app.
 5. Close every other join-only connection of the invitation with
    `INVITATION_INVALID`.
 
 Cancelling or declining an invitation grants nothing. A joiner that already
 holds a live grant gets `AUTHORIZED {live}` at step 2 and pairing ends with
-"already paired".
+"already paired". That is also how a joiner whose `PAIRED` was lost learns
+that it was enrolled (10.6).
 
 ## 11. Control messages
 
@@ -618,12 +818,12 @@ extra keys and field rule failures close the connection with
 
 | Type | Name | Direction | Fields |
 |---|---|---|---|
-| 1 | `HELLO` | both, first | `1`: uint minor version |
+| 1 | `HELLO` | both, first | `1`: uint major version, `2`: uint newest minor version (section 2) |
 | 2 | `AUTHORIZED` | host → caller | `1`: uint state, `1` live or `2` join-only |
-| 3 | `JOIN_PROOF` | caller → host | `1`: bytes invitation id (16), `2`: bytes mac (32), `3`: text joiner name (1–64 bytes) |
+| 3 | `JOIN_PROOF` | caller → host | `1`: bytes invitation id (16), `2`: bytes mac (32), `3`: text joiner name (1–128 bytes, not covered by the MAC) |
 | 4 | `CODE_EXCHANGE` | both | `1`: bytes attempt id (16), `2`: bytes payload (1–1024) |
 | 5 | `CODE_ABORT` | both | `1`: bytes attempt id (16), `2`: uint error code (at most 65 535; unknown codes read as `INTERNAL_ERROR`) |
-| 6 | `PAIRED` | host → joiner | `1`: text host name (1–64 bytes), `2`: text role (section 7 rules) |
+| 6 | `PAIRED` | host → joiner | `1`: text host name (1–128 bytes), `2`: text role (section 7 rules) |
 
 ## 12. Error codes
 
@@ -654,4 +854,8 @@ Carried as uint16 in `RESET`, `GOAWAY` and `CODE_ABORT`. Values never change.
 
 [`vectors/`](vectors/README.md) holds the vectors for every rule above,
 including the rejection cases. A conforming implementation passes all of
-them.
+them. [`vectors/README.md`](vectors/README.md) maps each file to its
+sections. `pairing-e2e.json` replays whole pairings, in person and by "Send
+link", from fixed random draws: every message, frame and decision, byte for
+byte, including wrong codes, the joiner's own attempt limit, tampered tickets
+and a proof made on another TLS session.

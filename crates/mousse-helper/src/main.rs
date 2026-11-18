@@ -74,10 +74,15 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
     },
-    /// Make an in-person invitation on the running host, print the ticket
-    /// and a QR code, and answer "Is the device next to you?".
+    /// Make an invitation on the running host and print the ticket and a QR
+    /// code. In person (the default), answer "Is the device next to you?";
+    /// with --link, show the code to type on the joining device.
     Invite {
-        /// Answer yes without asking.
+        /// A send link: the joining device types a 6-digit code shown here,
+        /// a fresh one for each attempt.
+        #[arg(long)]
+        link: bool,
+        /// Answer yes without asking (in person).
         #[arg(long)]
         approve_next: bool,
         /// Print only the ticket line, no QR code.
@@ -270,8 +275,8 @@ fn ask_yes_no(question: &str) -> bool {
     matches!(line.trim(), "y" | "Y" | "yes" | "Yes")
 }
 
-async fn invite(dir: &Path, approve_next: bool, no_qr: bool) -> Result<(), String> {
-    let mut ch = ipc::request(dir, json!({"cmd": "invite"}))
+async fn invite(dir: &Path, link: bool, approve_next: bool, no_qr: bool) -> Result<(), String> {
+    let mut ch = ipc::request(dir, json!({"cmd": "invite", "link": link}))
         .await?
         .ok_or("no host is running for this endpoint (start `serve` first)")?;
     let first = ch
@@ -308,6 +313,13 @@ async fn invite(dir: &Path, approve_next: bool, no_qr: bool) -> Result<(), Strin
             return Err("the host closed the control channel".into());
         };
         match event.get("event").and_then(Value::as_str) {
+            Some("code") => {
+                println!(
+                    "CODE {} (type it on the joining device)",
+                    event["code"].as_str().unwrap_or("")
+                );
+                let _ = std::io::stdout().flush();
+            }
             Some("approval") => {
                 let question = format!(
                     "\"{}\" ({}) wants to pair. Is the device next to you?",
@@ -398,9 +410,10 @@ async fn run(cli: Cli) -> Result<i32, String> {
             serve::run(&dir, insecure, opts).await?;
         }
         Command::Invite {
+            link,
             approve_next,
             no_qr,
-        } => invite(&dir, approve_next, no_qr).await?,
+        } => invite(&dir, link, approve_next, no_qr).await?,
         Command::Join {
             ticket,
             name,
@@ -408,7 +421,6 @@ async fn run(cli: Cli) -> Result<i32, String> {
         } => {
             let ticket = peer::parse_ticket(&ticket)?;
             let side = peer::CallerSide::open(&dir, insecure)?;
-            println!("joining; the host owner is asked to confirm");
             let (_conn, record) =
                 peer::join(&side, &ticket, &name.unwrap_or_else(computer_name), &routes).await?;
             println!(

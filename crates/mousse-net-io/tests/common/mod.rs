@@ -11,14 +11,14 @@ use mousse_net_core::authz::JOIN_PROOF_WAIT_MS;
 use mousse_net_core::grants::{GrantId, OwnerRef};
 use mousse_net_core::identity::{IdentityPublicKey, SoftwareKey};
 use mousse_net_core::mux::PriorityClass;
-use mousse_net_core::pairing::Ticket;
+use mousse_net_core::pairing::{CpaceExchangeFactory, InvitationKind, Ticket};
 use mousse_net_core::ErrorCode;
-use mousse_net_io::pipe::{accept_tcp, connect_tcp, Route};
+use mousse_net_io::pipe::{accept_tcp, connect_tcp, route_from_addr, route_uri, Route};
 use mousse_net_io::rng::os_rng;
 use mousse_net_io::store::hex;
 use mousse_net_io::{
-    Caller, CloseReason, Connection, Endpoint, Host, HostConfig, HostEvent, ManualClock, MuxStream,
-    NetError, PortChoice, SharedSigner, TlsPolicy,
+    Caller, CloseReason, CodeEntry, Connection, Endpoint, Host, HostConfig, HostEvent, ManualClock,
+    MuxStream, NetError, PortChoice, SharedSigner, TlsPolicy,
 };
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -64,7 +64,7 @@ impl TestHost {
         let config = HostConfig {
             name: "test host".into(),
             state_dir: None,
-            owner: OwnerRef::new("profile-test").unwrap(),
+            owner: OwnerRef::from_bytes([0x5a; 16]),
             policy: TlsPolicy::default(),
             clock: clock.clone(),
         };
@@ -96,8 +96,7 @@ impl TestHost {
         clock: Arc<ManualClock>,
         listener: TcpListener,
     ) -> Self {
-        let (host, events) =
-            Host::new(signer, config, mousse_net_io::exchange::InPersonOnly).unwrap();
+        let (host, events) = Host::new(signer, config, CpaceExchangeFactory).unwrap();
         let addr = listener.local_addr().unwrap();
         let accepted = Arc::new(AtomicUsize::new(0));
         let rejected = Arc::new(Mutex::new(Vec::new()));
@@ -126,12 +125,20 @@ impl TestHost {
     }
 
     pub fn route(&self) -> Route {
-        Route::from_addr(self.addr)
+        route_from_addr(self.addr)
     }
 
-    /// A ticket, read back from its fragment like a joiner would.
+    /// An in-person ticket, read back from its fragment like a joiner would.
     pub fn invite(&self) -> Ticket {
-        let created = self.host.invite(vec![self.route().to_uri()]).unwrap();
+        self.invite_kind(InvitationKind::InPerson)
+    }
+
+    /// A ticket of `kind`.
+    pub fn invite_kind(&self, kind: InvitationKind) -> Ticket {
+        let created = self
+            .host
+            .invite(kind, vec![route_uri(&self.route())])
+            .unwrap();
         Ticket::from_fragment(&created.fragment).unwrap()
     }
 
@@ -143,6 +150,28 @@ impl TestHost {
                     self.host.approve(&req).unwrap();
                     return;
                 }
+                Some(_) => continue,
+                None => panic!("host events ended"),
+            }
+        }
+    }
+
+    /// Wait for the next code the host shows for a send link.
+    pub async fn next_code(&mut self) -> String {
+        loop {
+            match within("code shown", self.events.recv()).await {
+                Some(HostEvent::ShowCode { code, .. }) => return code.as_str().to_owned(),
+                Some(_) => continue,
+                None => panic!("host events ended"),
+            }
+        }
+    }
+
+    /// Wait for an invitation to end without pairing, and return why.
+    pub async fn invitation_ended(&mut self) -> ErrorCode {
+        loop {
+            match within("invitation end", self.events.recv()).await {
+                Some(HostEvent::InvitationEnded { reason, .. }) => return reason,
                 Some(_) => continue,
                 None => panic!("host events ended"),
             }
@@ -290,4 +319,25 @@ pub fn closed_with(e: &NetError, code: ErrorCode) -> bool {
 
 pub fn endpoint_signer(endpoint: &Endpoint) -> SharedSigner {
     Arc::new(endpoint.load_identity(true).unwrap())
+}
+
+/// Codes typed by the test: each ask is reported on `asks` (with the
+/// attempts left after a wrong code) and answered from `typed`.
+pub struct TypedCodes {
+    pub asks: mpsc::UnboundedSender<Option<u8>>,
+    pub typed: mpsc::UnboundedReceiver<String>,
+}
+
+impl CodeEntry for TypedCodes {
+    async fn code(&mut self, retry: Option<u8>) -> Option<String> {
+        let _ = self.asks.send(retry);
+        self.typed.recv().await
+    }
+}
+
+/// A six-digit code that differs from `code` in every digit.
+pub fn wrong_code(code: &str) -> String {
+    code.bytes()
+        .map(|d| char::from(b'0' + (d - b'0' + 1) % 10))
+        .collect()
 }

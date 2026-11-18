@@ -67,7 +67,8 @@ pub fn new_profile_id() -> String {
 /// The authorizing owner for grants made by `profile_id`. The one place
 /// that turns the stored profile id into the core's owner value.
 pub fn owner_for_profile(profile_id: &str) -> Result<OwnerRef, NetError> {
-    OwnerRef::new(profile_id).map_err(|e| NetError::Store(format!("profile id: {e:?}")))
+    crate::store::owner_from_hex(profile_id)
+        .ok_or_else(|| NetError::Store("a profile id is 32 hex digits".into()))
 }
 
 /// The exclusive locks of an open endpoint. Released on drop.
@@ -421,10 +422,12 @@ mod tests {
     #[test]
     fn the_profile_id_is_kept_opaque() {
         let dir = temp_dir("ep-prof");
-        let (ep, _) = Endpoint::create(&dir, Some("p-42"), KeyStorage::InsecureFile).unwrap();
-        assert_eq!(ep.owner().unwrap().as_str(), "p-42");
+        let profile = "0123456789abcdef0123456789abcdef";
+        assert!(Endpoint::create(&dir, Some("p-42"), KeyStorage::InsecureFile).is_err());
+        let (ep, _) = Endpoint::create(&dir, Some(profile), KeyStorage::InsecureFile).unwrap();
+        assert_eq!(hex(ep.owner().unwrap().as_bytes()), profile);
         drop(ep);
-        assert_eq!(Endpoint::open(&dir).unwrap().profile_id(), "p-42");
+        assert_eq!(Endpoint::open(&dir).unwrap().profile_id(), profile);
         fs::remove_dir_all(&dir).unwrap();
         assert_eq!(new_profile_id().len(), 32);
     }

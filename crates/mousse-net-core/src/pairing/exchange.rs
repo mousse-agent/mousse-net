@@ -1,16 +1,19 @@
 //! The code-exchange seam and the pairing code.
 //!
 //! The real exchange is CPace (spec `cpace.md`), implemented in
-//! [`crate::cpace`]. The pairing state machines only see these traits, so they
-//! can be tested and simulated without it.
+//! [`crate::cpace`] and adapted here as [`CpaceExchangeFactory`]. The pairing
+//! state machines only see the traits.
 
 use std::fmt;
 
+use curve25519_dalek::scalar::Scalar;
 use rand_core::CryptoRng;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
+use super::proof::SID_LEN;
 use super::BindingTranscript;
+use crate::cpace::{sample_scalar, share_has_empty_ad, CpaceError, Initiator, Inputs, Responder};
 
 /// A 6-digit pairing code: six ASCII digits `0`-`9`, uniformly random.
 /// The digits are the exchange password and are never transmitted.
@@ -79,7 +82,7 @@ impl fmt::Debug for PairingCode {
 pub enum ExchangeRole {
     /// The joiner: sends the first message.
     Initiator,
-    /// The host.
+    /// The host: checks both confirmations.
     Responder,
 }
 
@@ -97,7 +100,7 @@ pub struct ExchangeStep {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExchangeError {
     /// The peer's confirmation did not match: wrong code, or a different
-    /// binding transcript.
+    /// binding transcript or session id.
     ConfirmationFailed,
     /// The peer's message could not be parsed or is invalid (for example, an
     /// identity point).
@@ -120,18 +123,17 @@ impl std::error::Error for ExchangeError {}
 
 /// One run of a code exchange (one attempt), on one side.
 ///
-/// The expected flow, for an exchange with explicit key confirmation in both
-/// directions (CPace initiator/responder):
-/// 1. initiator `step(None)` → send message 1;
-/// 2. responder `step(Some(m1))` → send message 2 (its share and its
+/// The flow, for CPace with key confirmation in both directions:
+/// 1. initiator `step(None)` → send `msg_a`;
+/// 2. responder `step(Some(msg_a))` → send `msg_b` (its share and its
 ///    confirmation);
-/// 3. initiator `step(Some(m2))` → verifies the responder's confirmation,
-///    sends message 3 (its own confirmation), `peer_confirmed = true`;
-/// 4. responder `step(Some(m3))` → verifies, `send = None`,
+/// 3. initiator `step(Some(msg_b))` → verifies the responder's confirmation,
+///    sends `msg_c` (its own confirmation), `peer_confirmed = true`;
+/// 4. responder `step(Some(msg_c))` → verifies, `send = None`,
 ///    `peer_confirmed = true`.
 ///
-/// The pairing state machines do not assume the number of messages; they
-/// only rely on `peer_confirmed` and on every error ending the attempt.
+/// The pairing state machines rely only on `peer_confirmed` and on every
+/// error ending the attempt.
 pub trait CodeExchange {
     /// Feed the next peer message (`None` for the initiator's first call).
     fn step(&mut self, incoming: Option<&[u8]>) -> Result<ExchangeStep, ExchangeError>;
@@ -143,22 +145,140 @@ pub trait CodeExchangeFactory {
     /// The per-attempt exchange.
     type Exchange: CodeExchange;
 
-    /// Start an exchange for `role`, with the code as the password and the
-    /// binding transcript as the channel identifier / associated data.
+    /// Start an exchange for `role`: the code is the password, the binding
+    /// transcript the channel identifier (CI) and `sid` the attempt's session
+    /// id (see [`super::attempt_sid`]). All randomness the exchange needs is
+    /// drawn here, from `rng`.
     fn start<R: CryptoRng + ?Sized>(
         &self,
         role: ExchangeRole,
         code: &PairingCode,
         binding: &BindingTranscript,
+        sid: &[u8; SID_LEN],
         rng: &mut R,
     ) -> Self::Exchange;
 }
 
-/// A stand-in exchange for tests and the simulator. **Not secure**: anyone
-/// who sees its messages can test every code offline. It has the same
-/// message shape as CPace with confirmation (three messages) so state
-/// machines see realistic traffic.
-#[cfg(any(test, feature = "insecure-test-exchange"))]
+/// The real code exchange: CPace profile 1 (spec `cpace.md`), with empty
+/// associated data on both sides.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CpaceExchangeFactory;
+
+enum CpaceState {
+    /// Created; holds this side's secret scalar.
+    Fresh(Zeroizing<Scalar>),
+    /// Initiator, `msg_a` sent.
+    AwaitingResponse(Initiator),
+    /// Responder, `msg_b` sent.
+    AwaitingConfirmation(Responder),
+    /// Finished or failed.
+    Done,
+}
+
+/// One side of a CPace attempt.
+pub struct CpaceExchange {
+    role: ExchangeRole,
+    code: PairingCode,
+    ci: Vec<u8>,
+    sid: [u8; SID_LEN],
+    state: CpaceState,
+}
+
+impl fmt::Debug for CpaceExchange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "CpaceExchange({:?})", self.role)
+    }
+}
+
+impl CodeExchangeFactory for CpaceExchangeFactory {
+    type Exchange = CpaceExchange;
+
+    fn start<R: CryptoRng + ?Sized>(
+        &self,
+        role: ExchangeRole,
+        code: &PairingCode,
+        binding: &BindingTranscript,
+        sid: &[u8; SID_LEN],
+        rng: &mut R,
+    ) -> CpaceExchange {
+        // The scalar is drawn now, so all of an attempt's draws happen when it
+        // starts, in a fixed order.
+        CpaceExchange {
+            role,
+            code: code.clone(),
+            ci: binding.as_bytes().to_vec(),
+            sid: *sid,
+            state: CpaceState::Fresh(sample_scalar(rng)),
+        }
+    }
+}
+
+fn from_cpace(e: CpaceError) -> ExchangeError {
+    match e {
+        CpaceError::ConfirmationFailed => ExchangeError::ConfirmationFailed,
+        _ => ExchangeError::Malformed,
+    }
+}
+
+impl CodeExchange for CpaceExchange {
+    fn step(&mut self, incoming: Option<&[u8]>) -> Result<ExchangeStep, ExchangeError> {
+        let state = std::mem::replace(&mut self.state, CpaceState::Done);
+        let inputs = Inputs {
+            prs: self.code.as_bytes(),
+            ci: &self.ci,
+            sid: &self.sid,
+            ad: &[],
+        };
+        inputs.check().map_err(from_cpace)?;
+        // Version 1 sends empty AD both ways; a share with AD is refused
+        // before any group work.
+        let carries_share = matches!(
+            (self.role, &state),
+            (ExchangeRole::Responder, CpaceState::Fresh(_))
+                | (ExchangeRole::Initiator, CpaceState::AwaitingResponse(_))
+        );
+        if let (true, Some(share)) = (carries_share, incoming) {
+            if !share_has_empty_ad(share).map_err(from_cpace)? {
+                return Err(ExchangeError::Malformed);
+            }
+        }
+        let (next, send, peer_confirmed) = match (self.role, state, incoming) {
+            (ExchangeRole::Initiator, CpaceState::Fresh(ya), None) => {
+                let (initiator, msg_a) = Initiator::start_with_scalar(&inputs, ya);
+                (CpaceState::AwaitingResponse(initiator), Some(msg_a), false)
+            }
+            (ExchangeRole::Responder, CpaceState::Fresh(yb), Some(msg_a)) => {
+                let (responder, msg_b) =
+                    Responder::respond_with_scalar(&inputs, msg_a, yb).map_err(from_cpace)?;
+                (
+                    CpaceState::AwaitingConfirmation(responder),
+                    Some(msg_b),
+                    false,
+                )
+            }
+            (ExchangeRole::Initiator, CpaceState::AwaitingResponse(initiator), Some(msg_b)) => {
+                // Pairing does not use the session key; it is wiped on drop.
+                let (_confirmed, msg_c) = initiator.finish(msg_b).map_err(from_cpace)?;
+                (CpaceState::Done, Some(msg_c), true)
+            }
+            (ExchangeRole::Responder, CpaceState::AwaitingConfirmation(responder), Some(msg_c)) => {
+                responder.finish(msg_c).map_err(from_cpace)?;
+                (CpaceState::Done, None, true)
+            }
+            _ => return Err(ExchangeError::OutOfOrder),
+        };
+        self.state = next;
+        Ok(ExchangeStep {
+            send,
+            peer_confirmed,
+        })
+    }
+}
+
+/// A stand-in exchange for the simulator. **Not secure**: anyone who sees its
+/// messages can test every code offline. It has the same message shape as
+/// CPace with confirmation (three messages) and costs less to run.
+#[cfg(feature = "insecure-test-exchange")]
 pub mod insecure {
     use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
@@ -204,14 +324,17 @@ pub mod insecure {
             role: ExchangeRole,
             code: &PairingCode,
             binding: &BindingTranscript,
+            sid: &[u8; SID_LEN],
             rng: &mut R,
         ) -> InsecureTestExchange {
             let mut own_nonce = [0u8; 16];
             rng.fill_bytes(&mut own_nonce);
+            let mut bound = binding.as_bytes().to_vec();
+            bound.extend_from_slice(sid);
             InsecureTestExchange {
                 role,
                 code: code.clone(),
-                binding: binding.as_bytes().to_vec(),
+                binding: bound,
                 own_nonce,
                 peer_nonce: None,
                 stage: 0,
@@ -290,7 +413,6 @@ pub mod insecure {
 
 #[cfg(test)]
 mod tests {
-    use super::insecure::InsecureTestExchangeFactory;
     use super::*;
     use rand_chacha::ChaCha20Rng;
     use rand_core::SeedableRng;
@@ -312,11 +434,11 @@ mod tests {
         );
     }
 
-    fn binding() -> BindingTranscript {
+    fn binding(ticket_hash: u8) -> BindingTranscript {
         let key = crate::identity::SoftwareKey::generate(&mut ChaCha20Rng::from_seed([9; 32]))
             .public_key();
         crate::pairing::binding_transcript(
-            &[0; 32],
+            &[ticket_hash; 32],
             crate::pairing::InvitationKind::SendLink,
             1,
             &key,
@@ -325,26 +447,33 @@ mod tests {
         )
     }
 
-    fn run(
-        initiator_code: &str,
-        responder_code: &str,
-    ) -> (
+    type Outcome = (
         Result<ExchangeStep, ExchangeError>,
         Option<Result<ExchangeStep, ExchangeError>>,
-    ) {
+    );
+
+    /// One attempt. Returns the initiator's second step and the responder's
+    /// last step (when the initiator got that far).
+    fn run<F: CodeExchangeFactory>(
+        f: &F,
+        codes: (&str, &str),
+        bindings: (u8, u8),
+        sids: ([u8; SID_LEN], [u8; SID_LEN]),
+    ) -> Outcome {
         let mut rng = ChaCha20Rng::from_seed([2; 32]);
-        let f = InsecureTestExchangeFactory;
-        let b = binding();
+        let code = |c: &str| PairingCode::parse(c).unwrap();
         let mut i = f.start(
             ExchangeRole::Initiator,
-            &PairingCode::parse(initiator_code).unwrap(),
-            &b,
+            &code(codes.0),
+            &binding(bindings.0),
+            &sids.0,
             &mut rng,
         );
         let mut r = f.start(
             ExchangeRole::Responder,
-            &PairingCode::parse(responder_code).unwrap(),
-            &b,
+            &code(codes.1),
+            &binding(bindings.1),
+            &sids.1,
             &mut rng,
         );
         let m1 = i.step(None).unwrap().send.unwrap();
@@ -359,12 +488,89 @@ mod tests {
     }
 
     #[test]
-    fn stand_in_exchange_confirms_only_with_equal_codes() {
-        let (i, r) = run("123456", "123456");
+    fn cpace_confirms_only_with_equal_code_transcript_and_sid() {
+        let f = CpaceExchangeFactory;
+        let (i, r) = run(&f, ("123456", "123456"), (0, 0), ([1; 32], [1; 32]));
+        assert!(i.unwrap().peer_confirmed);
+        let r = r.unwrap().unwrap();
+        assert!(r.peer_confirmed);
+        assert_eq!(r.send, None);
+        for (codes, bindings, sids) in [
+            (("123456", "654321"), (0, 0), ([1; 32], [1; 32])),
+            (("123456", "123456"), (0, 1), ([1; 32], [1; 32])),
+            (("123456", "123456"), (0, 0), ([1; 32], [2; 32])),
+        ] {
+            let (i, r) = run(&f, codes, bindings, sids);
+            assert_eq!(i, Err(ExchangeError::ConfirmationFailed));
+            assert!(r.is_none());
+        }
+    }
+
+    #[test]
+    fn cpace_rejects_out_of_order_and_malformed_messages() {
+        let f = CpaceExchangeFactory;
+        let mut rng = ChaCha20Rng::from_seed([3; 32]);
+        let code = PairingCode::parse("123456").unwrap();
+        let b = binding(0);
+        let mut r = f.start(ExchangeRole::Responder, &code, &b, &[1; 32], &mut rng);
+        assert_eq!(r.step(None), Err(ExchangeError::OutOfOrder));
+        let mut r = f.start(ExchangeRole::Responder, &code, &b, &[1; 32], &mut rng);
+        assert_eq!(r.step(Some(&[0x20; 10])), Err(ExchangeError::Malformed));
+        // A failed step ends the exchange.
+        assert_eq!(r.step(Some(&[0x20; 10])), Err(ExchangeError::OutOfOrder));
+        let mut i = f.start(ExchangeRole::Initiator, &code, &b, &[1; 32], &mut rng);
+        assert_eq!(i.step(Some(b"x")), Err(ExchangeError::OutOfOrder));
+        // A forged confirmation from the initiator fails on the responder.
+        let mut i = f.start(ExchangeRole::Initiator, &code, &b, &[1; 32], &mut rng);
+        let mut r = f.start(ExchangeRole::Responder, &code, &b, &[1; 32], &mut rng);
+        let m1 = i.step(None).unwrap().send.unwrap();
+        r.step(Some(&m1)).unwrap();
+        assert_eq!(
+            r.step(Some(&[0; crate::cpace::TAG_LEN])),
+            Err(ExchangeError::ConfirmationFailed)
+        );
+    }
+
+    /// A peer running CPace with the same code, transcript and sid but
+    /// non-empty AD would confirm; version 1 refuses its share instead.
+    #[test]
+    fn cpace_shares_with_associated_data_are_refused() {
+        let f = CpaceExchangeFactory;
+        let mut rng = ChaCha20Rng::from_seed([4; 32]);
+        let code = PairingCode::parse("123456").unwrap();
+        let b = binding(0);
+        let sid = [1u8; 32];
+        let inputs = Inputs {
+            prs: code.as_bytes(),
+            ci: b.as_bytes(),
+            sid: &sid,
+            ad: b"x",
+        };
+        // msg_a with AD, to our responder.
+        let (_, msg_a) = Initiator::start(&inputs, &mut rng).unwrap();
+        let mut r = f.start(ExchangeRole::Responder, &code, &b, &sid, &mut rng);
+        assert_eq!(r.step(Some(&msg_a)), Err(ExchangeError::Malformed));
+        // msg_b with AD, to our initiator.
+        let mut i = f.start(ExchangeRole::Initiator, &code, &b, &sid, &mut rng);
+        let ours = i.step(None).unwrap().send.unwrap();
+        let (_, msg_b) = Responder::respond(&inputs, &ours, &mut rng).unwrap();
+        assert_eq!(i.step(Some(&msg_b)), Err(ExchangeError::Malformed));
+    }
+
+    #[cfg(feature = "insecure-test-exchange")]
+    #[test]
+    fn stand_in_exchange_confirms_only_with_equal_inputs() {
+        let f = insecure::InsecureTestExchangeFactory;
+        let (i, r) = run(&f, ("123456", "123456"), (0, 0), ([1; 32], [1; 32]));
         assert!(i.unwrap().peer_confirmed);
         assert!(r.unwrap().unwrap().peer_confirmed);
-        let (i, r) = run("123456", "654321");
-        assert_eq!(i, Err(ExchangeError::ConfirmationFailed));
-        assert!(r.is_none());
+        for (codes, sids) in [
+            (("123456", "654321"), ([1; 32], [1; 32])),
+            (("123456", "123456"), ([1; 32], [2; 32])),
+        ] {
+            let (i, r) = run(&f, codes, (0, 0), sids);
+            assert_eq!(i, Err(ExchangeError::ConfirmationFailed));
+            assert!(r.is_none());
+        }
     }
 }

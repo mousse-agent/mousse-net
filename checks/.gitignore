@@ -1,0 +1,4 @@
+# Local run records, logs and outputs: trusted only on the machine that ran them.
+/runs/
+# Device secret keys must never be committed.
+*.key

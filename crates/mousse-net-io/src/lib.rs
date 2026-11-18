@@ -25,7 +25,6 @@ pub mod conn;
 pub mod discovery;
 pub mod endpoint;
 mod error;
-pub mod exchange;
 pub mod host;
 pub mod keystore;
 pub mod pipe;
@@ -33,7 +32,7 @@ pub mod rng;
 pub mod store;
 pub mod tls;
 
-pub use caller::{Caller, JoinOutcome};
+pub use caller::{Caller, CodeEntry, JoinOutcome, NoCode};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use conn::{CloseReason, ConnStatus, Connection, MuxStream, StreamReader, StreamWriter};
 pub use endpoint::{Endpoint, PortChoice};
