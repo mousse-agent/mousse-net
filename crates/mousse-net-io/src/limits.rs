@@ -56,6 +56,12 @@ mousse_net_core::define_limits! {
         browse_wait_ms = "BROWSE_WAIT_MS": 1_500, [100, 30_000];
         /// How long browse results are reused before the next browse (Phase 1a §6; 0 browses every time).
         browse_cache_ms = "BROWSE_CACHE_MS": 60_000, [0, 3_600_000];
+        /// How often the network watcher lists the interfaces and reads the monotonic clock (Phase 1a §6 and §8).
+        iface_poll_ms = "IFACE_POLL_MS": 5_000, [100, 60_000];
+        /// How far the monotonic clock may run past one watcher poll before the gap counts as a sleep and wake (Phase 1a §8).
+        wake_jump_ms = "WAKE_JUMP_MS": 10_000, [1_000, 600_000];
+        /// After a wake or an interface change, how long each connection has to answer a PING before it is closed as dead (Phase 1a §8).
+        wake_ping_ms = "WAKE_PING_MS": 2_000, [100, 30_000];
     }
     agree(io) {
         if io.outcome_retry_max_ms < io.outcome_retry_first_ms {

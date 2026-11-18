@@ -238,6 +238,8 @@ pub(crate) enum Cmd {
     Close(ErrorCode),
     Status(ConnStatus),
     Code(PairingCode),
+    /// Answered when the peer's next `PONG` arrives.
+    Ping(oneshot::Sender<()>),
 }
 
 enum StreamEvent {
@@ -575,6 +577,16 @@ impl Connection {
         self.incoming.lock().await.recv().await
     }
 
+    /// Whether the peer answers a `PING` within `within`: false when it
+    /// does not, or the connection closed first.
+    pub async fn ping(&self, within: Duration) -> bool {
+        let (reply, rx) = oneshot::channel();
+        if self.cmd.send(Cmd::Ping(reply)).is_err() {
+            return false;
+        }
+        matches!(tokio::time::timeout(within, rx).await, Ok(Ok(())))
+    }
+
     /// Close with `code`.
     pub fn close(&self, code: ErrorCode) {
         let _ = self.cmd.send(Cmd::Close(code));
@@ -640,6 +652,7 @@ pub(crate) fn spawn<P: Pipe>(
         accept: accept_tx,
         streams: HashMap::new(),
         blocked: Vec::new(),
+        pings: Vec::new(),
         hello: HelloState::new(VersionSupport::LOCAL),
         reason: None,
         before_close: VecDeque::new(),
@@ -665,6 +678,8 @@ struct Driver {
     /// holds its place too, so it frees once both are done.
     permits: HashMap<u32, Arc<StreamPermit>>,
     blocked: Vec<(StreamId, oneshot::Sender<Result<(), NetError>>)>,
+    /// Who waits for the next `PONG`.
+    pings: Vec<oneshot::Sender<()>>,
     /// The peer's `HELLO`s so far.
     hello: HelloState,
     reason: Option<CloseReason>,
@@ -1005,6 +1020,13 @@ impl Driver {
                 self.role.on_code(code, &mut out);
                 self.apply(out);
             }
+            Cmd::Ping(reply) => {
+                // Closing: the reply drops, which answers false.
+                if !self.mux.is_closing() {
+                    self.mux.ping();
+                    self.pings.push(reply);
+                }
+            }
         }
     }
 
@@ -1215,7 +1237,11 @@ impl Driver {
                 self.role.on_control(message, &mut out);
                 self.apply(out);
             }
-            MuxEvent::Pong { .. } => {}
+            MuxEvent::Pong { .. } => {
+                for reply in self.pings.drain(..) {
+                    let _ = reply.send(());
+                }
+            }
             MuxEvent::GoAway { code } => {
                 self.reason.get_or_insert(CloseReason::Peer(code));
             }
@@ -1611,6 +1637,36 @@ mod tests {
                 "wall: {wall}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_ping_is_true_only_when_the_peer_answers_in_time() {
+        let (conn, mut peer, _valve, _clock) = connected(3_600).await;
+        let asked = conn.ping(Duration::from_secs(5));
+        let answer = async {
+            assert!(peer.read_until(|f| matches!(f, Frame::Ping { .. })).await);
+            // Reading the PING queued the PONG.
+            peer.flush().await;
+        };
+        let (answered, ()) = within("the ping", async { tokio::join!(asked, answer) }).await;
+        assert!(answered);
+
+        // The peer reads the next PING and never answers.
+        let asked = conn.ping(Duration::from_millis(200));
+        let ignore = async {
+            assert!(peer.read_until(|f| matches!(f, Frame::Ping { .. })).await);
+        };
+        let (answered, ()) = within("the ping", async { tokio::join!(asked, ignore) }).await;
+        assert!(!answered);
+
+        conn.close(ErrorCode::NoError);
+        assert!(
+            !within(
+                "a ping on a closed connection",
+                conn.ping(Duration::from_secs(5))
+            )
+            .await
+        );
     }
 
     #[tokio::test]

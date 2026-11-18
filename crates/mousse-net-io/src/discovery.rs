@@ -106,6 +106,7 @@ pub fn record(name: &str, port: u16) -> Result<ServiceInfo, NetError> {
 pub struct Advertiser {
     daemon: ServiceDaemon,
     name: Arc<Mutex<RotatingName>>,
+    port: u16,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -137,7 +138,12 @@ impl Advertiser {
                 }
             }
         });
-        Ok(Self { daemon, name, task })
+        Ok(Self {
+            daemon,
+            name,
+            port,
+            task,
+        })
     }
 
     /// The name advertised right now.
@@ -146,6 +152,18 @@ impl Advertiser {
             .lock()
             .map(|n| n.current().to_owned())
             .unwrap_or_default()
+    }
+
+    /// Announce the record again with this computer's addresses now, say
+    /// after a wake or an interface change. The daemon also notices new
+    /// addresses by itself, every few seconds.
+    pub fn refresh(&self) {
+        let Ok(name) = self.name.lock() else {
+            return;
+        };
+        if let Ok(info) = record(name.current(), self.port) {
+            let _ = self.daemon.register(info);
+        }
     }
 
     /// Stop advertising.

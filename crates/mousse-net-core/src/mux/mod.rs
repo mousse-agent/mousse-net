@@ -606,6 +606,22 @@ impl Mux {
         Some(Frame::Fin { stream })
     }
 
+    /// Ask the peer for a `PONG` now (to learn whether the path still
+    /// works, say after a wake). A `PING` already queued or unanswered
+    /// serves: its `PONG` is the answer, reported as [`MuxEvent::Pong`].
+    pub fn ping(&mut self) {
+        if self.closing.is_some()
+            || self.outstanding_ping.is_some()
+            || self.control.iter().any(|f| matches!(f, Frame::Ping { .. }))
+        {
+            return;
+        }
+        self.ping_counter += 1;
+        self.control.push_back(Frame::Ping {
+            opaque: self.ping_counter.to_be_bytes(),
+        });
+    }
+
     /// When [`Mux::on_timeout`] must next run.
     pub fn poll_timeout(&self) -> Option<Millis> {
         if self.closing.is_some() {
@@ -899,6 +915,29 @@ mod tests {
                 code: ErrorCode::IdleTimeout
             })
         );
+    }
+
+    #[test]
+    fn a_ping_asked_for_goes_out_once_and_its_pong_is_reported() {
+        let mut m = Mux::new(MuxRole::Caller, Millis(0));
+        m.ping();
+        m.ping();
+        let ping = m.poll_transmit(Millis(10)).unwrap();
+        let Frame::Ping { opaque } = decode_frame(&ping).unwrap().unwrap().0 else {
+            panic!("not a ping");
+        };
+        assert_eq!(m.poll_transmit(Millis(10)), None);
+        // Unanswered: asking again sends nothing more.
+        m.ping();
+        assert_eq!(m.poll_transmit(Millis(11)), None);
+        assert_eq!(
+            m.receive(&Frame::Pong { opaque }.encode(), Millis(30))
+                .unwrap(),
+            vec![MuxEvent::Pong { rtt_ms: 20 }]
+        );
+        // Answered: the next ask sends a new one.
+        m.ping();
+        assert!(m.poll_transmit(Millis(31)).is_some());
     }
 
     #[test]

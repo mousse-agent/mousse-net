@@ -16,6 +16,7 @@
 //!   locks, kept port and profile id.
 //! - [`keystore`] and [`store`]: the identity key and the local state files.
 //! - [`discovery`]: mDNS with a rotating random instance name.
+//! - [`watch`]: interface changes and wakes, for the caller to redial.
 //! - [`limits`]: every limit, its default and allowed range.
 // Only `private` (the Windows security calls) may use unsafe code.
 #![deny(unsafe_code)]
@@ -36,6 +37,7 @@ pub mod private;
 pub mod rng;
 pub mod store;
 pub mod tls;
+pub mod watch;
 
 pub use admission::StreamAdmission;
 pub use caller::{Caller, CodeEntry, JoinOutcome, NoCode, PathEvent, Step1Failures};
