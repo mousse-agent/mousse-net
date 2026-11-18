@@ -57,7 +57,7 @@ use mousse_net_core::identity::IdentityPublicKey;
 use mousse_net_core::mux::MuxRole;
 use mousse_net_core::pairing::{
     Arrival, CodeExchangeFactory, CpaceExchangeFactory, InvitationKind, JoinerAction, JoinerName,
-    JoinerPairing, JoinerState, PairedHost, PairingCode, Ticket,
+    JoinerPairing, JoinerRecord, JoinerState, PairedHost, PairingCode, Ticket,
 };
 use mousse_net_core::session::{PeerSession, SessionEvent};
 use mousse_net_core::session_cert::CertError;
@@ -632,6 +632,65 @@ where
         D: FnMut() -> Fut,
         Fut: Future<Output = Result<P, NetError>>,
     {
+        self.join_flow(
+            pipe,
+            ticket,
+            arrival,
+            name,
+            codes,
+            host_pinned,
+            false,
+            redial,
+        )
+        .await
+    }
+
+    /// [`Caller::join_with_redial`] for a join the app consented to and
+    /// recorded before it started (Phase 1a §5.1): the ticket's host is
+    /// trusted as pinned, and a join that may have lost its `PAIRED` can
+    /// learn the outcome. If the ticket is past its joiner-side expiry, the
+    /// flow is marked "outcome pending" (stored like any pending mark)
+    /// before it dials, so it reconnects with the same ticket as wire.md
+    /// 10.6 rule 7 says: `PAIRED` means this invitation enrolled the
+    /// device, `AUTHORIZED {live}` that it is already paired, and a host
+    /// with no grant for it ends the flow.
+    pub async fn join_pinned_with_redial<P, C, D, Fut>(
+        &self,
+        pipe: P,
+        ticket: &Ticket,
+        arrival: Arrival,
+        name: &str,
+        codes: &mut C,
+        redial: D,
+    ) -> Result<(Connection, JoinOutcome), NetError>
+    where
+        P: Pipe,
+        C: CodeEntry,
+        D: FnMut() -> Fut,
+        Fut: Future<Output = Result<P, NetError>>,
+    {
+        self.join_flow(pipe, ticket, arrival, name, codes, true, true, redial)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn join_flow<P, C, D, Fut>(
+        &self,
+        pipe: P,
+        ticket: &Ticket,
+        arrival: Arrival,
+        name: &str,
+        codes: &mut C,
+        host_pinned: bool,
+        resume: bool,
+        redial: D,
+    ) -> Result<(Connection, JoinOutcome), NetError>
+    where
+        P: Pipe,
+        C: CodeEntry,
+        D: FnMut() -> Fut,
+        Fut: Future<Output = Result<P, NetError>>,
+    {
         // A join of this ticket that ended paired and was never settled
         // gives way: its pending mark stays stored, and this join learns
         // the outcome again.
@@ -644,7 +703,10 @@ where
             lock_joiner(&unsettled).hold = None;
         }
         let hold = self.records.hold(&ticket.hash())?;
-        let stored = self.records.load(&ticket.hash())?;
+        let mut stored = self.records.load(&ticket.hash())?;
+        if resume {
+            stored = self.mark_outcome_pending_if_expired(ticket, stored)?;
+        }
         let mut pairing = JoinerPairing::with_limits(
             ticket.clone(),
             arrival,
@@ -689,6 +751,31 @@ where
             ))),
             (result, _) => result,
         }
+    }
+
+    /// A consented join of a ticket past its joiner-side expiry can only
+    /// be learning whether a lost `PAIRED` enrolled it: store that as a
+    /// pending outcome, so the flow may dial (wire.md 10.6 rule 7).
+    fn mark_outcome_pending_if_expired(
+        &self,
+        ticket: &Ticket,
+        stored: Option<JoinerRecord>,
+    ) -> Result<Option<JoinerRecord>, NetError> {
+        let core = self.limits.core();
+        let fresh = ticket
+            .check_fresh_for_joiner_with_skew(self.clock.now(), core.clock_skew_secs())
+            .is_ok();
+        if fresh || stored.is_some_and(|r| r.outcome_pending) {
+            return Ok(stored);
+        }
+        let attempts = u8::try_from(core.joiner_attempts_per_flow()).unwrap_or(u8::MAX);
+        let record = JoinerRecord {
+            ticket_hash: ticket.hash(),
+            attempts_left: stored.map_or(attempts, |r| r.attempts_left),
+            outcome_pending: true,
+        };
+        self.records.swap(stored.as_ref(), &record)?;
+        Ok(Some(record))
     }
 
     async fn join_redialling<P, C, D, Fut>(

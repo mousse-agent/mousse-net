@@ -32,7 +32,9 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use mousse_net_core::authz::{ConnectionGate, GateState, Traffic, Verdict};
 use mousse_net_core::control::{AuthorizedState, ControlMessage};
-use mousse_net_core::grants::{Denial, Grant, GrantEvent, GrantId, GrantTable, OwnerRef, Role};
+use mousse_net_core::grants::{
+    validate_name, Denial, Grant, GrantEvent, GrantId, GrantTable, NewGrant, OwnerRef, Role,
+};
 use mousse_net_core::identity::IdentityPublicKey;
 use mousse_net_core::mux::MuxRole;
 use mousse_net_core::pairing::{
@@ -742,6 +744,65 @@ where
         let lifted = inner.grants.undeny(identity);
         inner.persist()?;
         Ok(lifted)
+    }
+
+    /// Grant `identity` the owner role on this endpoint, named `name`, as
+    /// the joiner's half of pairing both ways (Phase 1a §5.1). `receipt` is
+    /// the invitation of the pairing this answers, kept as the grant's
+    /// enrollment receipt.
+    ///
+    /// Idempotent: if the identity already holds a live grant, that grant
+    /// is returned with `true` and nothing changes (its connections stay
+    /// up), apart from saving a table whose last save failed. An error
+    /// after the grant was added means it is in effect now but was not
+    /// saved: the host keeps retrying, and the caller may repeat the call.
+    pub fn add_grant(
+        &self,
+        identity: IdentityPublicKey,
+        name: String,
+        receipt: Option<InvitationId>,
+    ) -> Result<(Grant, bool), NetError> {
+        let now = self.shared.clock.now();
+        let mut inner = lock(&self.shared);
+        if let Some(grant) = inner.grants.live_grant(&identity, now).cloned() {
+            if inner.unsaved {
+                inner.persist()?;
+            }
+            return Ok((grant, true));
+        }
+        let new = NewGrant {
+            identity,
+            name,
+            role: Role::owner(),
+            authorizing_owner: self.shared.owner,
+            expires_at: None,
+            enrolled_by: receipt,
+        };
+        let (id, events) = inner
+            .grants
+            .add(new, now)
+            .map_err(|e| NetError::Refused(e.to_string()))?;
+        inner.apply_grant_events(events);
+        let grant = inner
+            .grants
+            .get(id)
+            .cloned()
+            .ok_or_else(|| NetError::Refused("the new grant is missing".into()))?;
+        inner.persist()?;
+        Ok((grant, false))
+    }
+
+    /// Save the grant table now. A failure is reported as
+    /// [`HostEvent::StoreFailed`] too.
+    pub fn save(&self) -> Result<(), NetError> {
+        lock(&self.shared).persist()
+    }
+
+    /// The name `PAIRED` sends from now on (1 to 128 bytes).
+    pub fn set_name(&self, name: &str) -> Result<(), NetError> {
+        validate_name(name).map_err(|e| NetError::Refused(e.to_string()))?;
+        lock(&self.shared).pairing.set_host_name(name.to_owned());
+        Ok(())
     }
 
     /// Whether the grant table has changes that are not saved yet.
