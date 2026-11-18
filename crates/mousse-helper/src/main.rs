@@ -15,9 +15,14 @@ compile_error!("a mousse_control build has a deliberate defect and is for tests 
 
 mod ipc;
 mod peer;
+
+/// This build: `<commit>[-dirty]+<profile>`, fixed at compile time (see
+/// `build.rs`; `MOUSSE_BUILD_ID` overrides it).
+pub const BUILD: &str = env!("MOUSSE_HELPER_BUILD");
 mod serve;
 mod term;
 
+use std::collections::VecDeque;
 use std::io::{BufRead, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -150,9 +155,11 @@ enum Command {
         /// The control this run exercises, recorded in the result.
         #[arg(long)]
         control: Option<String>,
-        /// The build id recorded in the result (default: from git).
+        /// The host's build, from the `ready` line its `serve` printed. Used
+        /// when the run never gets to ask the host (a control that fails
+        /// before pairing); otherwise the host's own answer must match it.
         #[arg(long)]
-        build: Option<String>,
+        host_build: Option<String>,
         /// Command to run on the host.
         #[arg(last = true)]
         command: Vec<String>,
@@ -308,8 +315,41 @@ async fn invite(dir: &Path, link: bool, approve_next: bool, no_qr: bool) -> Resu
     println!("routes: {}", routes.join(" "));
     println!("waiting for the device to join (the ticket is valid for 10 minutes)");
     let _ = std::io::stdout().flush();
+    // One question on screen at a time, in the order asked. Events keep
+    // arriving meanwhile: the invitation may pair or end while one is open.
+    let mut queued: VecDeque<(String, String)> = VecDeque::new();
+    let mut asking: Option<(String, tokio::task::JoinHandle<bool>)> = None;
     loop {
-        let Some(event) = ch.recv().await? else {
+        if asking.is_none() {
+            if let Some((request, question)) = queued.pop_front() {
+                if approve_next {
+                    println!("{question} [y/N] y (--approve-next)");
+                    ch.send(&json!({"answer": true, "request": request}))
+                        .await?;
+                    continue;
+                }
+                let ask = tokio::task::spawn_blocking(move || ask_yes_no(&question));
+                asking = Some((request, ask));
+            }
+        }
+        let answered = async {
+            match asking.as_mut() {
+                Some((_, ask)) => ask.await.unwrap_or(false),
+                None => std::future::pending().await,
+            }
+        };
+        let event = tokio::select! {
+            yes = answered => {
+                // The answer names its request: it never applies to
+                // another device or a newer request.
+                if let Some((request, _)) = asking.take() {
+                    ch.send(&json!({"answer": yes, "request": request})).await?;
+                }
+                continue;
+            }
+            event = ch.recv() => event?,
+        };
+        let Some(event) = event else {
             return Err("the host closed the control channel".into());
         };
         match event.get("event").and_then(Value::as_str) {
@@ -321,20 +361,20 @@ async fn invite(dir: &Path, link: bool, approve_next: bool, no_qr: bool) -> Resu
                 let _ = std::io::stdout().flush();
             }
             Some("approval") => {
+                let request = event["request"].as_str().unwrap_or("").to_owned();
                 let question = format!(
                     "\"{}\" ({}) wants to pair. Is the device next to you?",
                     event["name"].as_str().unwrap_or(""),
                     event["device"].as_str().unwrap_or("")
                 );
-                let yes = if approve_next {
-                    println!("{question} [y/N] y (--approve-next)");
-                    true
-                } else {
-                    tokio::task::spawn_blocking(move || ask_yes_no(&question))
-                        .await
-                        .unwrap_or(false)
-                };
-                ch.send(&json!({"answer": yes})).await?;
+                queued.push_back((request, question));
+            }
+            Some("stale") => {
+                println!(
+                    "that request is no longer waiting: {}",
+                    event["error"].as_str().unwrap_or("")
+                );
+                let _ = std::io::stdout().flush();
             }
             Some("enrolled") => {
                 println!(
@@ -463,7 +503,7 @@ async fn run(cli: Cli) -> Result<i32, String> {
             out,
             target,
             control,
-            build,
+            host_build,
             command,
         } => {
             let side = peer::CallerSide::open(&dir, insecure)?;
@@ -480,7 +520,7 @@ async fn run(cli: Cli) -> Result<i32, String> {
                 removal_timeout: Duration::from_secs(removal_timeout),
                 out,
                 control,
-                build,
+                host_build,
                 target,
             };
             return Ok(peer::slice_check(&side, opts).await);

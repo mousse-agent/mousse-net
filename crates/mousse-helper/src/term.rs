@@ -10,8 +10,10 @@
 //! - 4 EXIT, host to caller: the exit code (i32). The host finishes the
 //!   stream after it.
 //!
-//! The PTY closes when the stream or its connection goes away, for example
-//! when the host removes the caller's grant.
+//! The command is killed and the PTY closed when the stream or its
+//! connection goes away, for example when the host removes the caller's
+//! grant, even if the caller already finished sending and the command is
+//! silent.
 
 use std::io::{IsTerminal, Read, Write};
 use std::sync::{mpsc as std_mpsc, Arc, Mutex};
@@ -381,6 +383,14 @@ pub async fn serve(mut stream: MuxStream) {
                     return;
                 }
             },
+            // Access ended (grant removed or expired, connection closed):
+            // end the command now. Reading alone would miss this once the
+            // caller has finished its side of the stream.
+            () = wr.closing() => {
+                let _ = killer.kill();
+                close_master(&master);
+                return;
+            }
             () = async { match grace.as_mut() { Some(s) => s.await, None => std::future::pending().await } } => {
                 let code = exit_code.unwrap_or(-1);
                 let _ = wr.write(&Frame::Exit(code).encode()).await;
@@ -448,7 +458,12 @@ pub async fn run_client(conn: &Connection, argv: Vec<String>) -> Result<ClientEn
         let mut buf = vec![0u8; 4096];
         loop {
             match stdin.read(&mut buf).await {
-                Ok(0) | Err(_) => return,
+                // No more input: finish our side; the command keeps running.
+                Ok(0) => {
+                    stdin_wr.finish();
+                    return;
+                }
+                Err(_) => return,
                 Ok(n) => {
                     if stdin_wr
                         .write(&Frame::Data(buf[..n].to_vec()).encode())

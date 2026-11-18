@@ -583,3 +583,127 @@ fn send_link_right_code_pairs_and_three_wrong_codes_end_the_invitation() {
     stop(&host, server);
     cleanup(&[&host, &phone, &stranger]);
 }
+
+#[test]
+fn removing_the_grant_kills_a_silent_command_after_the_caller_finished_sending() {
+    let host = Endpoint::init("silent-host");
+    let peer = Endpoint::init("silent-peer");
+    let server = host.serve("hostS", &[]);
+    let (grant, _) = pair(&host, &peer, "laptop");
+
+    // A command that writes a mark, stays silent for a while, then writes
+    // another. The caller's stdin is empty, so it finishes its side of the
+    // stream at once.
+    let marks = temp_dir("silent-marks");
+    std::fs::create_dir_all(&marks).unwrap();
+    let (started, finished) = (marks.join("started"), marks.join("finished"));
+    let command: Vec<String> = if cfg!(windows) {
+        vec![
+            "cmd".into(),
+            "/c".into(),
+            format!(
+                "echo x>{} & ping -n 6 127.0.0.1 >nul & echo x>{}",
+                started.display(),
+                finished.display()
+            ),
+        ]
+    } else {
+        vec![
+            "sh".into(),
+            "-c".into(),
+            format!(
+                "touch '{}'; sleep 5; touch '{}'",
+                started.display(),
+                finished.display()
+            ),
+        ]
+    };
+    let mut args = vec!["term", "hostS", "--"];
+    args.extend(command.iter().map(String::as_str));
+    let mut term = peer.spawn(&args);
+    let start = Instant::now();
+    while !started.exists() {
+        assert!(
+            start.elapsed() < WAIT,
+            "the command never started\nstdout: {}\nstderr: {}",
+            term.out(),
+            term.err()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let removed = host.run(&["remove", &grant.to_string()]);
+    assert!(removed.ok(), "{}", removed.text());
+    assert_closed_by_removal(&mut term);
+    // The host killed the command: it never gets to its second mark.
+    std::thread::sleep(Duration::from_secs(8));
+    assert!(!finished.exists(), "the command kept running after removal");
+
+    stop(&host, server);
+    let _ = std::fs::remove_dir_all(&marks);
+    cleanup(&[&host, &peer]);
+}
+
+#[test]
+fn an_approval_answer_applies_only_to_the_request_it_names() {
+    let host = Endpoint::init("ask-host");
+    let first = Endpoint::init("ask-first");
+    let second = Endpoint::init("ask-second");
+    let server = host.serve("hostQ", &[]);
+
+    // Two devices join with the same in-person ticket. The owner is asked
+    // about the first; the second asks while that question is open.
+    let mut invite = host.spawn_with_stdin(&["invite", "--no-qr"]);
+    let ticket = invite.wait_for("TICKET ", WAIT)["TICKET ".len()..].to_owned();
+    let mut join_first = first.spawn(&["join", &ticket, "--name", "first"]);
+    invite.wait_for("\"first\"", WAIT);
+    let mut join_second = second.spawn(&["join", &ticket, "--name", "second"]);
+    server.proc.wait_for("approval requested for second", WAIT);
+
+    // "Yes" to the question about the first device pairs that device only.
+    invite.type_line("y\n");
+    invite.wait_for("paired: grant ", WAIT);
+    assert_eq!(
+        join_first.exit_within(WAIT),
+        Some(0),
+        "{}",
+        join_first.err()
+    );
+    assert_eq!(join_second.exit_within(WAIT), Some(2));
+    assert!(
+        join_second.err().contains("INVITATION_INVALID"),
+        "{}",
+        join_second.err()
+    );
+    let listed = host.run(&["grants"]);
+    assert!(listed.stdout.contains("first"), "{}", listed.text());
+    assert!(!listed.stdout.contains("second"), "{}", listed.text());
+
+    stop(&host, server);
+    cleanup(&[&host, &first, &second]);
+}
+
+#[test]
+fn the_state_folder_control_file_and_control_channel_are_owner_only() {
+    use mousse_net_io::private::is_owner_only;
+    let host = Endpoint::init("private-host");
+    let server = host.serve("hostP", &[]);
+    assert!(is_owner_only(&host.dir).unwrap(), "state folder");
+    let control = host.dir.join("control.json");
+    assert!(is_owner_only(&control).unwrap(), "control.json");
+    let addr = serde_json::from_slice::<serde_json::Value>(&std::fs::read(&control).unwrap())
+        .unwrap()["addr"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    if cfg!(windows) {
+        // A named pipe that allows the current user alone.
+        assert!(addr.starts_with(r"\\.\pipe\"), "{addr}");
+        assert!(is_owner_only(std::path::Path::new(&addr)).unwrap(), "pipe");
+    }
+    // The control channel still works for the owner.
+    let status = host.run(&["id"]);
+    assert!(status.stdout.contains("serving at"), "{}", status.text());
+    stop(&host, server);
+    cleanup(&[&host]);
+}

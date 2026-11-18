@@ -98,6 +98,51 @@ impl CodeEntry for TypedCode {
     }
 }
 
+/// A failed step: what happened, and one word for why (`pin_mismatch`,
+/// `grant_revoked`, ...), as test results record it.
+#[derive(Debug)]
+pub struct Failure {
+    pub text: String,
+    pub reason: String,
+}
+
+impl Failure {
+    fn new(text: impl Into<String>, reason: &str) -> Self {
+        Self {
+            text: text.into(),
+            reason: reason.into(),
+        }
+    }
+
+    fn of(e: &NetError) -> Self {
+        Self {
+            text: describe(e),
+            reason: reason_of(e),
+        }
+    }
+}
+
+impl From<Failure> for String {
+    fn from(f: Failure) -> Self {
+        f.text
+    }
+}
+
+/// One lowercase word for why a connection failed or closed.
+pub fn reason_of(e: &NetError) -> String {
+    match e {
+        NetError::PeerCertificate(mousse_net_core::session_cert::CertError::PinMismatch) => {
+            "pin_mismatch".into()
+        }
+        NetError::PeerCertificate(_) => "peer_certificate".into(),
+        NetError::Closed(reason) => match reason.code() {
+            Some(code) => code.name().to_lowercase(),
+            None => "connection_dropped".into(),
+        },
+        _ => "error".into(),
+    }
+}
+
 /// Pair with the host in `ticket`, trying `routes` (default: the ticket's).
 /// Stores the host's pin on success.
 pub async fn join(
@@ -105,33 +150,44 @@ pub async fn join(
     ticket: &Ticket,
     name: &str,
     routes: &[String],
-) -> Result<(Connection, PeerRecord), String> {
+) -> Result<(Connection, PeerRecord), Failure> {
     let candidates = if routes.is_empty() {
         usable_routes(&ticket.routes)
     } else {
-        parse_routes(routes)?
+        parse_routes(routes).map_err(|e| Failure::new(e, "bad_route"))?
     };
     if candidates.is_empty() {
-        return Err("the ticket has no usable address; pass --route tcp://host:port".into());
+        return Err(Failure::new(
+            "the ticket has no usable address; pass --route tcp://host:port",
+            "no_route",
+        ));
     }
+    // A send link may end "already paired" only for a host pinned before.
+    let pinned = side.peers().load().is_ok_and(|ps| {
+        ps.iter()
+            .any(|p| p.pin().ok() == Some(ticket.host_identity))
+    });
     if ticket.kind == InvitationKind::SendLink {
         println!("joining with a link; the code is shown on the host");
     } else {
         println!("joining; the host owner is asked to confirm");
     }
-    let mut last = String::from("no route answered");
+    let mut last = Failure::new("no route answered", "unreachable");
     for route in &candidates {
         let hint = route_uri(route);
         let pipe = match connect_tcp(route).await {
             Ok(p) => p,
             Err(e) => {
-                last = format!("{hint}: {e}");
+                last = Failure::new(format!("{hint}: {e}"), "unreachable");
                 continue;
             }
         };
+        // If the connection drops before PAIRED, the join reconnects here
+        // to learn whether the host enrolled this device.
+        let redial = || connect_tcp(route);
         match side
             .caller
-            .join_with_code(pipe, ticket, name, &mut TypedCode)
+            .join_with_redial(pipe, ticket, name, &mut TypedCode, pinned, redial)
             .await
         {
             Ok((conn, outcome)) => {
@@ -156,16 +212,21 @@ pub async fn join(
                 };
                 side.peers()
                     .upsert(record.clone())
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| Failure::new(e.to_string(), "store"))?;
+                side.caller
+                    .remember_routes(ticket.host_identity, vec![route.clone()]);
                 return Ok((conn, record));
             }
             // Another endpoint at this address: try the next one.
             Err(NetError::PeerCertificate(
                 mousse_net_core::session_cert::CertError::PinMismatch,
             )) => {
-                last = format!("{hint}: another device answered (pin mismatch)");
+                last = Failure::new(
+                    format!("{hint}: another device answered (pin mismatch)"),
+                    "pin_mismatch",
+                );
             }
-            Err(e) => return Err(describe(&e)),
+            Err(e) => return Err(Failure::of(&e)),
         }
     }
     Err(last)
@@ -294,13 +355,19 @@ pub struct SliceCheck {
     pub removal_timeout: Duration,
     pub out: Option<std::path::PathBuf>,
     pub control: Option<String>,
-    pub build: Option<String>,
+    /// The host's build as its `serve` printed it, for runs that never get
+    /// to ask the host (a control that fails before pairing).
+    pub host_build: Option<String>,
     pub target: String,
 }
 
 struct Steps {
     lines: Vec<String>,
     ok: bool,
+    /// Why the first failed step failed.
+    reason: Option<String>,
+    /// The host's build, as the host reported it.
+    host_build: Option<String>,
 }
 
 impl Steps {
@@ -309,10 +376,12 @@ impl Steps {
         self.lines.push(format!("PASS {line}"));
     }
 
-    fn fail(&mut self, line: String) {
+    fn fail(&mut self, line: String, reason: &str) {
+        let line = format!("{line} reason={reason}");
         println!("FAIL {line}");
         self.lines.push(format!("FAIL {line}"));
         self.ok = false;
+        self.reason.get_or_insert_with(|| reason.to_owned());
     }
 }
 
@@ -324,17 +393,38 @@ pub async fn slice_check(side: &CallerSide, opts: SliceCheck) -> i32 {
     let mut steps = Steps {
         lines: Vec::new(),
         ok: true,
+        reason: None,
+        host_build: None,
     };
     run_slice(side, &opts, &mut steps).await;
+    // The host's own report wins; the operator's copy fills in when the run
+    // never got that far, and must agree when both exist.
+    let host_build = match (steps.host_build.clone(), opts.host_build.clone()) {
+        (Some(reported), Some(given)) if reported != given => {
+            steps.fail(
+                format!("the host reports build {reported}, not {given}"),
+                "host_build_mismatch",
+            );
+            Some(reported)
+        }
+        (reported, given) => reported.or(given),
+    };
     let outcome = if steps.ok { "PASS" } else { "FAIL" };
     let mut result = json!({
         "check": "phase0.thin-slice-cross-machine",
         "target": opts.target,
         "outcome": outcome,
         "details": steps.lines.join("; "),
+        // `build` is the caller's, this binary's.
+        "build": crate::BUILD,
+        "caller_build": crate::BUILD,
     });
-    if let Some(build) = opts.build.clone().or_else(build_id) {
-        result["build"] = json!(build);
+    match host_build {
+        Some(b) => result["host_build"] = json!(b),
+        None => println!("NOTE the host's build is unknown (pass --host-build)"),
+    }
+    if let Some(reason) = &steps.reason {
+        result["reason"] = json!(reason);
     }
     if let Some(control) = &opts.control {
         result["control"] = json!(control);
@@ -361,11 +451,11 @@ pub async fn slice_check(side: &CallerSide, opts: SliceCheck) -> i32 {
 async fn run_slice(side: &CallerSide, opts: &SliceCheck, steps: &mut Steps) {
     let ticket = match parse_ticket(&opts.ticket) {
         Ok(t) => t,
-        Err(e) => return steps.fail(format!("ticket: {e}")),
+        Err(e) => return steps.fail(format!("ticket: {e}"), "bad_ticket"),
     };
     let (conn, peer) = match join(side, &ticket, &opts.name, &opts.routes).await {
         Ok(v) => v,
-        Err(e) => return steps.fail(format!("pair in person: {e}")),
+        Err(e) => return steps.fail(format!("pair in person: {}", e.text), &e.reason),
     };
     steps.pass(format!(
         "paired with {} ({}) via {} using {}",
@@ -374,6 +464,13 @@ async fn run_slice(side: &CallerSide, opts: &SliceCheck, steps: &mut Steps) {
         peer.last_route.clone().unwrap_or_default(),
         conn.kx_group()
     ));
+    match host_build(&conn).await {
+        Ok(build) => {
+            steps.pass(format!("the host runs build {build}"));
+            steps.host_build = Some(build);
+        }
+        Err(e) => return steps.fail(format!("ask the host for its build: {e}"), "host_build"),
+    }
 
     match capture(&conn, opts.command.clone()).await {
         Ok((0, output)) if !output.trim().is_empty() => {
@@ -388,12 +485,12 @@ async fn run_slice(side: &CallerSide, opts: &SliceCheck, steps: &mut Steps) {
             ));
         }
         Ok((code, output)) => {
-            return steps.fail(format!(
-                "terminal command exited {code}: {:?}",
-                output.trim()
-            ))
+            return steps.fail(
+                format!("terminal command exited {code}: {:?}", output.trim()),
+                "command_failed",
+            )
         }
-        Err(e) => return steps.fail(format!("terminal: {e}")),
+        Err(e) => return steps.fail(format!("terminal: {e}"), "terminal"),
     }
 
     // A live terminal that the removal must close.
@@ -405,7 +502,12 @@ async fn run_slice(side: &CallerSide, opts: &SliceCheck, steps: &mut Steps) {
         .await
     {
         Ok(s) => s,
-        Err(e) => return steps.fail(format!("open a second terminal: {}", describe(&e))),
+        Err(e) => {
+            return steps.fail(
+                format!("open a second terminal: {}", describe(&e)),
+                &reason_of(&e),
+            )
+        }
     };
     let (mut rd, wr) = stream.split();
     let open = term::Frame::Open {
@@ -414,7 +516,10 @@ async fn run_slice(side: &CallerSide, opts: &SliceCheck, steps: &mut Steps) {
         argv: Vec::new(),
     };
     if let Err(e) = wr.write(&open.encode()).await {
-        return steps.fail(format!("open a second terminal: {}", describe(&e)));
+        return steps.fail(
+            format!("open a second terminal: {}", describe(&e)),
+            &reason_of(&e),
+        );
     }
     println!(
         "WAITING remove this device on the host (grant for {:?}) within {} s",
@@ -435,20 +540,65 @@ async fn run_slice(side: &CallerSide, opts: &SliceCheck, steps: &mut Steps) {
             steps.pass("removal closed the live terminal with GRANT_REVOKED".into())
         }
         Ok(Some(e)) => {
-            return steps.fail(format!("the terminal ended another way: {}", describe(&e)))
+            return steps.fail(
+                format!("the terminal ended another way: {}", describe(&e)),
+                &reason_of(&e),
+            )
         }
-        Ok(None) => return steps.fail("the terminal ended before the removal".into()),
-        Err(_) => return steps.fail("no removal within the time limit".into()),
+        Ok(None) => {
+            return steps.fail(
+                "the terminal ended before the removal".into(),
+                "ended_early",
+            )
+        }
+        Err(_) => return steps.fail("no removal within the time limit".into(), "timeout"),
     }
     drop(conn);
 
     match dial(side, &peer, &opts.routes).await {
-        Ok(_) => steps.fail("a new connection was accepted after the removal".into()),
+        Ok(_) => steps.fail(
+            "a new connection was accepted after the removal".into(),
+            "still_authorized",
+        ),
         Err(e) if e.contains("NOT_AUTHORIZED") => {
             steps.pass(format!("a new connection was refused: {e}"))
         }
-        Err(e) => steps.fail(format!("a new connection failed another way: {e}")),
+        Err(e) => steps.fail(
+            format!("a new connection failed another way: {e}"),
+            "refused_otherwise",
+        ),
     }
+}
+
+/// Ask the host for its build over a `helper-info` stream.
+async fn host_build(conn: &Connection) -> Result<String, String> {
+    let stream = conn
+        .open_stream(
+            mousse_net_core::mux::PriorityClass::Interactive,
+            crate::serve::INFO_LABEL,
+        )
+        .await
+        .map_err(|e| describe(&e))?;
+    let (mut rd, _wr) = stream.split();
+    let read = async {
+        let mut bytes = Vec::new();
+        while let Some(chunk) = rd.read().await.map_err(|e| describe(&e))? {
+            bytes.extend(chunk);
+            if bytes.len() > 4096 {
+                return Err("the host's answer is too long".to_string());
+            }
+        }
+        Ok(bytes)
+    };
+    let bytes = tokio::time::timeout(Duration::from_secs(10), read)
+        .await
+        .map_err(|_| "no answer in 10 s".to_string())??;
+    let info: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| format!("bad answer: {e}"))?;
+    info.get("build")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| "the answer names no build".into())
 }
 
 /// Run `argv` in a terminal on `conn` and collect its output.
@@ -490,28 +640,4 @@ async fn capture(conn: &Connection, argv: Vec<String>) -> Result<(i32, String), 
         .await
         .map_err(|_| "the command did not finish in 30 s".to_string())??;
     Ok((code, String::from_utf8_lossy(&output).into_owned()))
-}
-
-/// `<commit>[-dirty]+<profile>` for the checkout in the current directory,
-/// if git is available.
-fn build_id() -> Option<String> {
-    let git = |args: &[&str]| {
-        std::process::Command::new("git")
-            .args(args)
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-    };
-    let commit = git(&["rev-parse", "HEAD"])?;
-    let dirty = !git(&["status", "--porcelain", "--untracked-files=no"])?.is_empty();
-    let profile = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    };
-    Some(format!(
-        "{commit}{}+{profile}",
-        if dirty { "-dirty" } else { "" }
-    ))
 }
