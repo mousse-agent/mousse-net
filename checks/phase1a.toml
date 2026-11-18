@@ -41,3 +41,18 @@ local = [
 control = [
   { name = "no-revoke-journal", breaks = "removal is not journaled, so a crash between change and save re-admits the peer", env = { RUSTFLAGS = '--cfg mousse_control="no-revoke-journal"' } },
 ]
+
+[[check]]
+id = "phase1a.discovery"
+title = "mDNS carries no name; a pin mismatch moves on; peer-supplied routes are private-range only"
+plan = "docs/phase1a-design.md §5.3, §6 and §10 (E5a)"
+targets = ["linux-x64", "macos-arm64"]
+min_tests = 8
+local = [
+  { target = "linux-x64", host = "linux-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_paths", "--no-fail-fast"] },
+  { target = "macos-arm64", host = "macos-aarch64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_paths", "--no-fail-fast"] },
+]
+control = [
+  { name = "stop-on-mismatch", breaks = "the caller gives up at the first candidate with another identity", env = { RUSTFLAGS = '--cfg mousse_control="stop-on-mismatch"' } },
+  { name = "public-routes", breaks = "pairback and peer.addresses.set accept public addresses", env = { RUSTFLAGS = '--cfg mousse_control="public-routes"' } },
+]

@@ -1226,3 +1226,54 @@ Not touched: `sync/session.ts`, `sync/supervisor.ts`, `transports/*`,
    This replaces item 8 of the E1 and E2 list.
 8. **Stored roles.** A join now stores the role's name (`owner`), not its
    debug form; readers accept both.
+
+**Decided while building E5a**
+
+1. **Private ranges (§5.3).** A peer-supplied or owner-supplied address
+   must be a `tcp://` route to an IP literal in RFC 1918, IPv4 link-local
+   or `fc00::/7` (an IPv4-mapped IPv6 address counts as its IPv4 address).
+   Names, including `.local`, are refused, since they can resolve
+   anywhere. `peer.add` routes (the pairback's) and `peer.addresses.set`
+   answer `bad_route` naming the first address that fails, and store
+   nothing; a ticket's other hints are skipped, and a ticket with none
+   left answers `no_route`. Debug builds also take loopback, so the tests
+   run on one computer without listening on the LAN; release builds never
+   do. The command line keeps its Phase 0 behaviour.
+2. **Candidates.** `peers.json` gains `addresses` (the owner's, set whole
+   by `peer.addresses.set`, listed by `peers.list`). The order is the last
+   working route, then `addresses`, then the hints (`routes`), each
+   filtered as in item 1. The browse runs only when none of those answers
+   as the host, and its addresses are tried after them; they are not
+   stored, except as the last working route once one works. A re-pair
+   keeps `addresses`.
+3. **Parallel dial.** Up to `DIAL_PARALLEL` candidates at once, launched
+   in order; each has `DIAL_TIMEOUT_MS` to connect and pass step 1. The
+   first to pass step 1 is the host and the other tries end. Session
+   state changes only for that one: step 1 runs before the path is begun,
+   so a losing or failing try never replaces a candidate path. Renewals
+   use the same dial.
+4. **Keep connected.** After the first `hello`, the helper keeps one
+   outbound path to every stored peer, as `conn.up {dir: "out"}`.
+   `dial {identity}` still opens a new path (the reply adds `already:
+   true` when another dial opened one while it waited; one dial per host
+   runs at a time). A host that cannot be reached is retried after
+   `KEEP_RETRY_FIRST_MS`, doubling to `KEEP_RETRY_MAX_MS`; after a path
+   drops, the first retry also waits `KEEP_RETRY_FIRST_MS`. Each failure
+   is an event `dial.failed {identity, why, reason, retry_ms}` (not in
+   §2.3; the §5.2 row states need it). A host that refuses this device
+   (`not_authorized`, `grant_revoked`) is not retried (`retry_ms: null`)
+   until `dial`, `peer.add`, `peer.addresses.set`, `net.resumed` or a
+   restart. Nothing is dialled while networking is paused.
+5. **Browse source.** `BrowseSource` in `discovery.rs`, with `MdnsBrowse`
+   and `CachedBrowse` (`BROWSE_WAIT_MS`, `BROWSE_CACHE_MS`, timed by the
+   monotonic clock; a failed browse is not kept). The helper browses with
+   mDNS only where it advertises (`--mdns` and not loopback). Debug builds
+   read `MOUSSE_HELPER_BROWSE_FILE` instead when it is set: one `ip:port`
+   (or `tcp://ip:port`) per line, read on every browse.
+6. **mDNS record.** The proof is the record the advertiser registers
+   (`discovery::record`): instance and host name both the random
+   `mousse-` name, TXT only `v=1`. No test on this PC opens multicast; a
+   live LAN mDNS test needs the Mac listening.
+7. **Controls.** `stop-on-mismatch` (net-io) and `public-routes` (helper)
+   for `phase1a.discovery`. `no-rediscovery` (helper: only the last
+   working route, no browse) is in place for `phase1a.reconnect`.

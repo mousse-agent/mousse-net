@@ -57,6 +57,10 @@ spec's value: it can only be tightened.
 | `MOUSSE_NET_MDNS_ROTATE_CHECK_MS` | 5000 | 100 to 30000 | How often the advertiser checks whether the name is due to change. |
 | `MOUSSE_NET_STREAMS_PER_CONNECTION` | 32 | 1 to 1024 | Open streams on one connection, both directions counted. A peer's open past it is reset with `REFUSED_STREAM`; an own open fails with `StreamLimit`. With the engine's 256 KiB initial credit per stream, this bounds what one connection can queue unread (wire.md 9.2). |
 | `MOUSSE_NET_STREAMS_PER_ENDPOINT` | 128 | 1 to 1024 | Open streams on all of an endpoint's connections together, host and caller sides alike; past it as above. |
+| `MOUSSE_NET_DIAL_PARALLEL` | 4 | 1 to 64 | Caller: candidate addresses for one host dialled at once (Phase 1a §6). |
+| `MOUSSE_NET_DIAL_TIMEOUT_MS` | 2000 | 100 to 60000 | Caller: time one candidate address has to connect and pass step 1 before it is given up (Phase 1a §6). |
+| `MOUSSE_NET_BROWSE_WAIT_MS` | 1500 | 100 to 30000 | How long an mDNS browse listens for answers (Phase 1a §6). |
+| `MOUSSE_NET_BROWSE_CACHE_MS` | 60000 | 0 to 3600000 | How long browse results are reused before the next browse; 0 browses every time (Phase 1a §6). |
 
 ## Helper
 
@@ -88,6 +92,8 @@ spec's value: it can only be tightened.
 | `MOUSSE_NET_APP_LOG_MAX_BYTES` | 1048576 | 4096 to 1073741824 | App mode: size at which `helper.log` in the state directory starts a new file. |
 | `MOUSSE_NET_APP_LOG_FILES` | 2 | 1 to 10 | App mode: log files kept (`helper.log`, `helper.log.1`, ...). |
 | `MOUSSE_NET_REMOVAL_RETRY_MS` | 1000 | 10 to 60000 | While networking is paused because a removal (`grant.remove`) could not be saved, how often the helper tries the save again (Phase 1a §5.4). |
+| `MOUSSE_NET_KEEP_RETRY_FIRST_MS` | 1000 | 10 to 60000 | App mode: wait before redialling a paired host that could not be reached; each next wait doubles (Phase 1a §6). |
+| `MOUSSE_NET_KEEP_RETRY_MAX_MS` | 60000 | 10 to 3600000 | App mode: longest wait between those redials; not below the first. |
 
 ## Fixed on purpose
 
