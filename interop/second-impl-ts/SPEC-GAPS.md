@@ -17,13 +17,10 @@
 | First renewal tick with a candidate pending | `wire.md` §6 and `session-lifecycle.json` (`candidate_at_first_renewal`). The first request at the renewal time follows the skipped-retry rule: it is skipped but counts, and the 30-second wait starts at that tick. |
 | Transport close on a failed flow | `wire.md` §10.6 rule 9 and the `pairing-e2e.json` and `pairing-attempts.json` conventions. When the joiner's flow fails with code C, it sends any message the same step produced, then one `GOAWAY(C)`, unless the host already closed the connection or it broke. The vectors do not list that `GOAWAY`; the `failed` output stands for it. A failed attempt sends only `CODE_ABORT` and keeps the connection. |
 | In-person name and profile label | `wire.md` §10.3. In-person proofs combine both fixture fields, for example `Phone (Work)`. Send-link proofs use only the computer name. |
+| Live-grant proof answer in the connect convention | `wire.md` §8 step 3. The `pairing-e2e.json` convention now says the proof gets `PAIRED` when the grant's receipt names this invitation, else a second `AUTHORIZED`. |
 | Proof timeout while learning a lost `PAIRED` | `wire.md` §10.6 rule 7. The flow ends with `NOT_AUTHORIZED` and leaves the pending mark stored. Reopening the ticket can resume recovery. |
 
 ## Open
-
-- The `pairing-e2e.json` connect convention describes the live-grant proof
-  answer as a second `AUTHORIZED`. The replay follows `wire.md` §8 step
-  3 and the fixture outputs, which also allow a receipt in `PAIRED`.
 
 The browser Worker certificate is pending in `session-cert.json` and
 has no certificate bytes.
