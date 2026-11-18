@@ -56,6 +56,11 @@ Hub. That was false.
    since login. There is no login item in 1a.
 10. **Keep connected.** Each helper keeps one outbound path to every paired
     host while both are online.
+11. **No hard-coded limits.** Every timeout, cap, window, size, count and
+    retry delay is a named default in one place, overridable by a
+    `MOUSSE_NET_*` environment variable read once at startup. Bad values are
+    reported at startup. Limits a security bound depends on are clamped to
+    the spec's safe range. Every variable is documented.
 
 ## 1. Helper lifecycle
 
