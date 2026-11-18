@@ -22,6 +22,14 @@ If the published RFC changes any computation below, Mousse will define a new pro
 | Setting | initiator-responder (A speaks first), `transcript_ir` | §4.3, §6.3, §7 |
 | Key confirmation | the construction in §10.4, with MAC = HMAC-SHA-512 and 64-byte tags | §10.4 |
 | Sid output (§10.6) | not used, because sid is always provided | §4.2 |
+| Ordered concatenation (`o_cat`, `transcript_oc`) | not used: the setting is initiator-responder | §6.3, Appendix A.3 |
+
+The draft also defines values this profile never computes: `o_cat`, the
+symmetric-setting transcript `transcript_oc` and the ISK built from it, and
+the CPace sid output. A Mousse implementation MUST NOT use them and need not
+implement them. Their draft vectors are copied into the vector file only so
+that it is a complete copy of the draft's values for this suite; they are
+informative.
 
 Constants:
 
@@ -80,12 +88,12 @@ For a 6-digit code, `len_zpad` = 128 − 1 − 7 − 18 = 102.
 
 ```
 Initiator A                                          Responder B
-ya = sample_scalar()
+ya = sample_scalar()                                 yb = sample_scalar()
 Ya = encode(ya * g)
 msg_a = lv_cat(Ya, ADa)          ---- msg_a ---->
                                                      parse msg_a (section 6)
                                                      K = scalar_mult_vfy(yb, Ya); abort if K == G.I
-                                                     yb = sample_scalar(); Yb = encode(yb * g)
+                                                     Yb = encode(yb * g)
                                                      body_b = lv_cat(Yb, ADb)
                                                      ISK = SHA-512(lv_cat(DSI_ISK, sid, K) || msg_a || body_b)
                                                      mac_key = SHA-512(b"CPaceMac" || sid || ISK)
@@ -104,6 +112,12 @@ msg_c = Ta                                           abort unless msg_c == HMAC(
 
 Notes:
 
+- **When B samples `yb`.** B samples `yb` when its exchange starts, before
+  it reads `msg_a`, so a malformed or invalid `msg_a` still uses up that
+  draw. In Mousse pairing the exchange starts when the first message of a
+  new attempt arrives, after the debit and the next code ([`wire.md`](wire.md)
+  10.6, "Random draws"). The order of draws is visible in byte-for-byte
+  replays, so a second implementation MUST keep it.
 - `scalar_mult_vfy(y, X)` (§8.3) returns `G.I` if `decode(X)` fails, and `encode(y * decode(X))` otherwise. ristretto255 has prime order and `y` is never zero, so `K == G.I` exactly when `X` fails to decode or is the identity. Both cases end with `InvalidPoint`.
 - `msg_a || body_b` is `transcript_ir(Ya, ADa, Yb, ADb)` from §6.3. Each share's bytes on the wire are the same bytes the transcript uses.
 - `mac_key` is plain concatenation with no length prefixes, exactly as §10.4 writes it. `ISK` always takes the last 64 bytes, so the input can be read only one way.
@@ -146,7 +160,7 @@ Any error ends the attempt, and the state is discarded. The pairing layer counts
 - `vectors/cpace-ristretto255-sha512-mousse.json`: Mousse's own vectors, because the draft has none for key confirmation or framing. It holds two full runs and 24 rejection cases. The first run uses the B.3 inputs, so its `ISK` equals the draft's `ISK_IR`. The second has a 200-byte `ADa`, which needs a two-byte length, and an empty `ADb`. Each run lists `mac_key`, `Ta`, `Tb`, `msg_a`, `msg_b` and `msg_c`. Each rejection names the receiving step, the message and the required error.
 - `vectors/cpace-mousse-vectors.py` builds the Mousse file from the draft file using only Python's `hashlib` and `hmac`. It doesn't depend on the Rust code: `python -I cpace-mousse-vectors.py cpace-ristretto255-sha512.json cpace-ristretto255-sha512-mousse.json`.
 
-An implementation passes when it reproduces every value in both files bit for bit and fails every rejection with the listed error.
+An implementation passes when it reproduces every value in both files bit for bit and fails every rejection with the listed error. The exceptions are the draft-only values of section 2 (`o_cat`, `transcript_oc`, the ISK built from it and the sid output): they are informative, and an implementation that does not compute them still passes.
 
 ## 8. Review notes
 
