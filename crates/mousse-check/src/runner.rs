@@ -139,7 +139,15 @@ pub fn judge_normal(judge: Judge, check: &Check, out: &RunOutput) -> Judged {
                     None,
                 );
             }
-            if c.failed_lines > 0 || c.failed > 0 || exit != 0 {
+            if c.failed == 0 && exit != 0 {
+                return fail(
+                    format!(
+                        "exit {exit} with no failed test (a test binary did not build or crashed?)"
+                    ),
+                    total,
+                );
+            }
+            if c.failed_lines > 0 || c.failed > 0 {
                 return fail(
                     format!("{} of {} tests failed (exit {exit})", c.failed, c.total()),
                     total,
