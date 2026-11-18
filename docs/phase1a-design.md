@@ -1277,3 +1277,43 @@ Not touched: `sync/session.ts`, `sync/supervisor.ts`, `transports/*`,
 7. **Controls.** `stop-on-mismatch` (net-io) and `public-routes` (helper)
    for `phase1a.discovery`. `no-rediscovery` (helper: only the last
    working route, no browse) is in place for `phase1a.reconnect`.
+
+**Decided while building E5b**
+
+1. **Renewals in app mode.** The helper takes the caller's renewals from
+   the start. A renewed path is announced as `conn.up {dir: "out"}`, then
+   `path.reopen {identity, from, conn}` (`from` is null when the old path
+   is already gone). `path.reopened {conn}` makes it current and closes
+   the old one with `PATH_REPLACED`; it answers `no_conn`, or
+   `not_renewed` for a path that is not a renewed one waiting (an inbound
+   path, or one already current). A failed try is `path.renew_failed
+   {identity, why, reason}`, and the caller tries again on the session's
+   schedule. While networking is paused, a renewed path is closed at once
+   and reported as `path.renew_failed {why: "paused"}`. `dial` reuses the
+   oldest outbound path, which stays current while a renewed one waits.
+2. **Watcher.** `watch.rs` in net-io polls every `IFACE_POLL_MS`: the
+   interface list (`if-addrs`, already in the tree through `mdns-sd`;
+   name, address and up or down, loopback left out) and the monotonic
+   clock. A clock that ran more than `WAKE_JUMP_MS` past one interval is
+   a wake. It runs in every `serve`, which then announces the mDNS record
+   again (`Advertiser::refresh`; `mdns-sd` also checks addresses itself
+   every 5 s).
+3. **The reaction** (app mode) is the same for both changes: drop the
+   browse cache, ping every connection, inbound and outbound, and close
+   any that does not answer within `WAKE_PING_MS` with `IDLE_TIMEOUT`,
+   then reset every host's backoff so the ones without a path are
+   dialled at once. §8 asks for the ping after a wake only; it runs after
+   an interface change too, since a lost interface leaves TCP paths
+   silently dead until the 45 s idle timeout. `Connection::ping` uses a
+   new core `Mux::ping`, which reuses a `PING` already queued or
+   unanswered. The app gets no event for the change itself; it sees
+   `conn.down` and `conn.up`.
+4. **Test hooks**, debug builds only: `MOUSSE_HELPER_INTERFACES_FILE`
+   (the interface list, one line each, read at every poll) and
+   `MOUSSE_HELPER_MANUAL_CLOCK=1` with the op `test.clock {advance_secs,
+   advance_mono_ms}`. The net-io watcher tests run a `ManualClock` on
+   paused tokio time; the helper tests (`tests/app_changes.rs`) move both
+   helpers' clocks. Row E5b names no check cell, so none was added and no
+   control build either; each helper test was checked to fail with the
+   close after a missed ping, the backoff reset, or the renewal
+   forwarding taken out.
