@@ -34,17 +34,39 @@ cargo test -p mousse-helper --test loopback --no-fail-fast
 - two devices join with one in-person ticket: "yes" to the question about
   the first pairs only the first, though the second asked meanwhile;
 - the state folder, `control.json` and (on Windows) the control pipe are
-  owner-only.
+  owner-only;
+- a `control.json` left by an older build does not stop `id`, `grants` and
+  `remove` from working offline;
+- `slice-check` runs end to end on loopback, and names chosen by the other
+  device (with newlines and terminal escapes) print escaped in `serve`'s
+  log, `invite`, `grants`, `peers` and the `slice-check` lines.
+
+The tests run a private copy of the helper and first check, with
+`mousse-helper --version` (`<version> build <id> control <cfg or none>`),
+that it is the build they were compiled with. Cargo writes every build of
+the helper to the same path whatever its flags, so a control build in the
+same target folder would otherwise swap the binary under a running suite
+(with `keep-removed-grant`, the removal tests then time out waiting for the
+terminal to close). Give each configuration its own `CARGO_TARGET_DIR`.
 
 ## Local state and the control channel
 
 The endpoint's state folder and every file the helper writes in it are
 owner-only: on Windows a protected DACL that allows the current user alone,
-on Unix `0700` folders and `0600` files. `serve` takes local commands
-(`invite`, `grants`, `remove`, `stop`) over a control channel: on Windows a
-named pipe that only the current user can open and that refuses remote
-clients, on Unix 127.0.0.1. `control.json` holds where it listens and a
-random token that every request must carry.
+on Unix `0700` folders and `0600` files. Opening the folder applies this
+again to everything already in it, so files from an older build, or ones
+that gained a wider access entry, are owner-only again. `serve` takes local
+commands (`invite`, `grants`, `remove`, `stop`) over a control channel: on
+Windows a named pipe that only the current user can open and that refuses
+remote clients, on Unix 127.0.0.1. `control.json` holds where it listens and
+a random token that every request must carry. A `control.json` that is not
+in the current layout (an older build wrote `port`) counts as no `serve`
+running, so the commands take their offline path.
+
+Names another device chose (its device name on the host, the host's name on
+the caller) are printed with control characters, newlines, bidirectional
+and invisible formatting characters and backslashes escaped, so a name
+cannot start a fake log line or drive the terminal.
 
 An in-person approval question names its request: the joining connection
 and the device shown. `invite` answers with that request id, so an answer
@@ -107,7 +129,9 @@ mousse-helper --state J:\...\pc-state --insecure-file-key slice-check --name pc 
 ```
 
 After pairing, `slice-check` asks the host for its build over a
-`helper-info` stream. `--host-build` (copied from the Mac's `ready` line)
+`helper-info` stream: it finishes its side of the stream at once, and the
+host answers once that `FIN` arrives (within 5 s, else it resets the
+stream), so the stream ends cleanly on both sides. `--host-build` (copied from the Mac's `ready` line)
 fills in when the run never gets that far, as in the control below; when
 both exist they must agree.
 
