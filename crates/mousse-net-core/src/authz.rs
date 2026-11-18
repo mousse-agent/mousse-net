@@ -1,4 +1,5 @@
-//! Step 2: what a connection may do, decided after TLS (step 1) on the host.
+//! Step 2: what a connection may do, decided after TLS (step 1) on the host
+//! endpoint, from that endpoint's grant table.
 //!
 //! A connection gets one of:
 //! - **live** — the peer identity has a live grant and no local denial. The
@@ -9,7 +10,12 @@
 //!
 //! A peer with no grant has [`JOIN_PROOF_WAIT_MS`] to send a `JOIN_PROOF`.
 //! Until then only `HELLO`, keepalive, `GOAWAY` and `JOIN_PROOF` are allowed.
+//!
+//! The caller has its own gate, [`CallerGate`]: it accepts nothing from the
+//! host on streams until the host has said `AUTHORIZED {live}` (or `PAIRED`
+//! has made a join-only connection live).
 
+use crate::control::{AuthorizedState, ControlMessage};
 use crate::grants::{GrantId, GrantTable, Role};
 use crate::identity::IdentityPublicKey;
 use crate::pairing::InvitationId;
@@ -69,6 +75,20 @@ pub enum Traffic {
     /// A control message the host never accepts from a caller
     /// (`AUTHORIZED`, `PAIRED`).
     HostOnly,
+}
+
+impl Traffic {
+    /// The class of a control message received by the host.
+    pub fn of(message: &ControlMessage) -> Traffic {
+        match message {
+            ControlMessage::Hello { .. } => Traffic::Hello,
+            ControlMessage::JoinProof { .. } => Traffic::JoinProof,
+            ControlMessage::CodeExchange { .. } | ControlMessage::CodeAbort { .. } => {
+                Traffic::Pairing
+            }
+            ControlMessage::Authorized { .. } | ControlMessage::Paired { .. } => Traffic::HostOnly,
+        }
+    }
 }
 
 /// What to do with inbound traffic.
@@ -219,6 +239,135 @@ impl ConnectionGate {
     }
 }
 
+/// Inbound traffic on the caller, from the host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallerTraffic {
+    /// `PING` or `PONG`.
+    Keepalive,
+    /// `HELLO`.
+    Hello,
+    /// `GOAWAY`.
+    GoAway,
+    /// `AUTHORIZED` with this state.
+    Authorized(AuthorizedState),
+    /// `CODE_EXCHANGE` or `CODE_ABORT`.
+    Pairing,
+    /// `PAIRED`.
+    Paired,
+    /// Any stream frame: `OPEN`, `DATA`, `CREDIT`, `FIN`, `RESET`.
+    Stream,
+    /// A control message the caller never accepts from a host
+    /// (`JOIN_PROOF`).
+    CallerOnly,
+}
+
+impl CallerTraffic {
+    /// The class of a control message received by the caller.
+    pub fn of(message: &ControlMessage) -> CallerTraffic {
+        match message {
+            ControlMessage::Hello { .. } => CallerTraffic::Hello,
+            ControlMessage::Authorized { state } => CallerTraffic::Authorized(*state),
+            ControlMessage::CodeExchange { .. } | ControlMessage::CodeAbort { .. } => {
+                CallerTraffic::Pairing
+            }
+            ControlMessage::Paired { .. } => CallerTraffic::Paired,
+            ControlMessage::JoinProof { .. } => CallerTraffic::CallerOnly,
+        }
+    }
+}
+
+/// The caller's view of a connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallerGateState {
+    /// Waiting for the host's `AUTHORIZED`.
+    AwaitingAuthorization,
+    /// The host said join-only: pairing messages only.
+    JoinOnly,
+    /// The host said live, or pairing finished: normal channels.
+    Live,
+    /// Closed with this code.
+    Closed(ErrorCode),
+}
+
+/// The caller-side gate for one connection. Until the host has authorized
+/// the connection as live, the caller opens no streams and accepts none:
+/// any stream frame from the host closes the connection.
+#[derive(Clone, Debug)]
+pub struct CallerGate {
+    state: CallerGateState,
+}
+
+impl Default for CallerGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CallerGate {
+    /// A new connection, after TLS.
+    pub fn new() -> Self {
+        Self {
+            state: CallerGateState::AwaitingAuthorization,
+        }
+    }
+
+    /// The current state.
+    pub fn state(&self) -> CallerGateState {
+        self.state
+    }
+
+    /// True once the caller may open streams.
+    pub fn is_live(&self) -> bool {
+        self.state == CallerGateState::Live
+    }
+
+    /// Check inbound traffic from the host. `AUTHORIZED` moves the gate on;
+    /// a `Close` verdict also closes the gate.
+    pub fn check(&mut self, traffic: CallerTraffic) -> Verdict {
+        use CallerGateState as S;
+        use CallerTraffic as T;
+        let verdict = match (self.state, traffic) {
+            (S::Closed(_), _) => Verdict::Ignore,
+            (_, T::Keepalive | T::Hello | T::GoAway) => Verdict::Allow,
+            (_, T::CallerOnly) => Verdict::Close(ErrorCode::ProtocolError),
+            (S::AwaitingAuthorization, T::Authorized(state)) => {
+                self.state = match state {
+                    AuthorizedState::Live => S::Live,
+                    AuthorizedState::JoinOnly => S::JoinOnly,
+                };
+                Verdict::Allow
+            }
+            (_, T::Authorized(_)) => Verdict::Close(ErrorCode::ProtocolError),
+            (S::JoinOnly, T::Pairing | T::Paired) => Verdict::Allow,
+            // A late pairing message after enrollment means nothing.
+            (S::Live, T::Pairing) => Verdict::Ignore,
+            (S::Live, T::Stream) => Verdict::Allow,
+            (S::AwaitingAuthorization, T::Pairing | T::Paired | T::Stream)
+            | (S::JoinOnly, T::Stream)
+            | (S::Live, T::Paired) => Verdict::Close(ErrorCode::ProtocolError),
+        };
+        if let Verdict::Close(code) = verdict {
+            self.state = S::Closed(code);
+        }
+        verdict
+    }
+
+    /// The joiner's pairing accepted `PAIRED`
+    /// ([`crate::pairing::JoinerAction::Paired`]): the connection is live.
+    pub fn promote(&mut self) {
+        if self.state == CallerGateState::JoinOnly {
+            self.state = CallerGateState::Live;
+        }
+    }
+
+    /// The connection closed, or must close, for another reason.
+    pub fn close(&mut self, code: ErrorCode) {
+        if !matches!(self.state, CallerGateState::Closed(_)) {
+            self.state = CallerGateState::Closed(code);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,7 +389,7 @@ mod tests {
                 identity: id(seed),
                 name: "phone".into(),
                 role: Role::owner(),
-                authorizing_owner: OwnerRef::new("p").unwrap(),
+                authorizing_owner: OwnerRef::from_bytes([0x51; 16]),
                 expires_at: None,
             },
             NOW,
@@ -290,6 +439,50 @@ mod tests {
         grants.deny(id(1), NOW);
         let gate = ConnectionGate::open(ConnectionId(1), id(1), &mut grants, NOW, Millis(0));
         assert_eq!(gate.state(), &GateState::Closed(ErrorCode::NotAuthorized));
+    }
+
+    #[test]
+    fn caller_refuses_host_streams_until_authorized_live() {
+        let mut gate = CallerGate::new();
+        assert_eq!(gate.check(CallerTraffic::Hello), Verdict::Allow);
+        assert_eq!(
+            gate.check(CallerTraffic::Stream),
+            Verdict::Close(ErrorCode::ProtocolError)
+        );
+        assert_eq!(gate.check(CallerTraffic::Stream), Verdict::Ignore);
+
+        let mut gate = CallerGate::new();
+        let live = CallerTraffic::Authorized(AuthorizedState::Live);
+        assert_eq!(gate.check(live), Verdict::Allow);
+        assert!(gate.is_live());
+        assert_eq!(gate.check(CallerTraffic::Stream), Verdict::Allow);
+        assert_eq!(gate.check(live), Verdict::Close(ErrorCode::ProtocolError));
+    }
+
+    #[test]
+    fn caller_join_only_allows_pairing_until_paired_is_accepted() {
+        let mut gate = CallerGate::new();
+        assert_eq!(
+            gate.check(CallerTraffic::Authorized(AuthorizedState::JoinOnly)),
+            Verdict::Allow
+        );
+        assert_eq!(gate.check(CallerTraffic::Pairing), Verdict::Allow);
+        assert_eq!(gate.check(CallerTraffic::Paired), Verdict::Allow);
+        assert!(!gate.is_live());
+        gate.promote();
+        assert_eq!(gate.check(CallerTraffic::Stream), Verdict::Allow);
+        assert_eq!(gate.check(CallerTraffic::Pairing), Verdict::Ignore);
+        assert_eq!(
+            gate.check(CallerTraffic::Paired),
+            Verdict::Close(ErrorCode::ProtocolError)
+        );
+
+        let mut gate = CallerGate::new();
+        gate.check(CallerTraffic::Authorized(AuthorizedState::JoinOnly));
+        assert_eq!(
+            gate.check(CallerTraffic::Stream),
+            Verdict::Close(ErrorCode::ProtocolError)
+        );
     }
 
     #[test]

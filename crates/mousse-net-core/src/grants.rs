@@ -1,18 +1,25 @@
-//! The host grant table: who may use this host, and which live channels each
-//! grant authorized.
+//! An endpoint's grant table: who may use this endpoint, and which live
+//! channels each grant authorized.
 //!
-//! - A grant is the only source of a device's role on this host.
+//! An **endpoint** is one Mousse profile's helper on one device, with its
+//! own identity key, grant and denial table, invitations and pins. A computer
+//! with two profiles is two endpoints with two tables; nothing here reaches
+//! across them.
+//!
+//! - A grant is the only source of a device's role on this endpoint.
 //! - Every live channel (an authorized connection) is bound to the grant that
 //!   authorized it. Removing or expiring a grant closes those channels at once.
-//! - A local denial is host-wide and always wins: it removes the identity's
-//!   grant, closes its channels, and blocks new grants until it is lifted
-//!   locally. Nothing else clears it.
+//! - A local denial covers the whole endpoint and always wins: it removes the
+//!   identity's grant, closes its channels, and blocks new grants until it is
+//!   lifted locally. Nothing else clears it.
 //!
 //! The table is plain state. The caller persists [`GrantTable::grants`] and
 //! [`GrantTable::denials`] and restores them with [`GrantTable::restore`].
 
 use std::collections::BTreeMap;
 use std::fmt;
+
+use rand_core::CryptoRng;
 
 use crate::identity::IdentityPublicKey;
 use crate::time::UnixTime;
@@ -22,7 +29,7 @@ use crate::{ConnectionId, ErrorCode};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GrantId(pub u64);
 
-/// A device's role on this host. The app gives roles their meaning; core
+/// A device's role on this endpoint. The app gives roles their meaning; core
 /// only stores and reports them.
 ///
 /// A role is 1 to 32 bytes of lowercase ASCII letters, digits and `-`.
@@ -60,24 +67,42 @@ impl Role {
     }
 }
 
-/// Who authorized a grant on this host: the owner or profile id the app uses
-/// (1 to 128 bytes of UTF-8). "Remove on all my hosts" (Phase 4) affects only
-/// grants whose authorizing owner matches.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct OwnerRef(String);
+/// The profile that authorized a grant: its random 128-bit profile id,
+/// drawn once when the profile is created. Never a display name. "Remove on
+/// all my hosts" (Phase 4) affects only grants whose authorizing owner
+/// matches.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct OwnerRef(pub [u8; OwnerRef::LEN]);
 
 impl OwnerRef {
-    /// Validate an owner reference.
-    pub fn new(id: &str) -> Result<Self, GrantError> {
-        if id.is_empty() || id.len() > 128 {
-            return Err(GrantError::InvalidOwner);
-        }
-        Ok(Self(id.to_owned()))
+    /// Length of a profile id, in bytes.
+    pub const LEN: usize = 16;
+
+    /// A fresh random profile id.
+    pub fn generate<R: CryptoRng + ?Sized>(rng: &mut R) -> Self {
+        let mut id = [0u8; Self::LEN];
+        rng.fill_bytes(&mut id);
+        Self(id)
     }
 
-    /// The owner id.
-    pub fn as_str(&self) -> &str {
+    /// Wrap a stored profile id.
+    pub fn from_bytes(id: [u8; Self::LEN]) -> Self {
+        Self(id)
+    }
+
+    /// The profile id.
+    pub fn as_bytes(&self) -> &[u8; Self::LEN] {
         &self.0
+    }
+}
+
+impl fmt::Debug for OwnerRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "OwnerRef(")?;
+        for b in &self.0 {
+            write!(f, "{b:02x}")?;
+        }
+        write!(f, ")")
     }
 }
 
@@ -85,7 +110,7 @@ impl OwnerRef {
 /// (Phase 6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GrantSource {
-    /// Approved on this host (pairing or a local action).
+    /// Approved on this endpoint (pairing or a local action).
     Local,
 }
 
@@ -102,19 +127,19 @@ pub struct Grant {
     pub id: GrantId,
     /// The device's identity key.
     pub identity: IdentityPublicKey,
-    /// Display name (1 to 64 bytes), as the device or owner gave it.
+    /// Display name (1 to 128 bytes), as the device or owner gave it.
     pub name: String,
-    /// The role on this host.
+    /// The role on this endpoint.
     pub role: Role,
     /// Where the grant came from.
     pub source: GrantSource,
-    /// The owner or profile that authorized it.
+    /// The profile that authorized it.
     pub authorizing_owner: OwnerRef,
     /// The roster this grant was adopted into. Always `None` before Phase 6.
     pub adopted_into: Option<RosterId>,
-    /// When it was granted (host clock).
+    /// When it was granted (this endpoint's clock).
     pub granted_at: UnixTime,
-    /// When it stops being valid, if ever (host clock). At this second the
+    /// When it stops being valid, if ever (this endpoint's clock). At this second the
     /// grant is already expired.
     pub expires_at: Option<UnixTime>,
 }
@@ -130,17 +155,17 @@ impl Grant {
 pub struct NewGrant {
     /// The device's identity key.
     pub identity: IdentityPublicKey,
-    /// Display name (1 to 64 bytes).
+    /// Display name (1 to 128 bytes).
     pub name: String,
-    /// The role on this host.
+    /// The role on this endpoint.
     pub role: Role,
-    /// The owner or profile that authorized it.
+    /// The profile that authorized it.
     pub authorizing_owner: OwnerRef,
     /// Optional expiry.
     pub expires_at: Option<UnixTime>,
 }
 
-/// A local denial: this identity may not hold a grant on this host.
+/// A local denial: this identity may not hold a grant on this endpoint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Denial {
     /// The denied identity.
@@ -175,9 +200,7 @@ pub enum GrantError {
     AlreadyBound,
     /// The role name is not valid.
     InvalidRole,
-    /// The owner reference is not valid.
-    InvalidOwner,
-    /// The name is empty or longer than 64 bytes.
+    /// The name is empty or longer than [`MAX_NAME_LEN`] bytes.
     InvalidName,
     /// Restored data has duplicate ids or identities.
     Inconsistent,
@@ -186,11 +209,10 @@ pub enum GrantError {
 impl fmt::Display for GrantError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            GrantError::Denied => "identity is denied on this host",
+            GrantError::Denied => "identity is denied on this endpoint",
             GrantError::UnknownGrant => "no such live grant",
             GrantError::AlreadyBound => "channel already bound to a grant",
             GrantError::InvalidRole => "invalid role name",
-            GrantError::InvalidOwner => "invalid owner reference",
             GrantError::InvalidName => "invalid device name",
             GrantError::Inconsistent => "inconsistent stored grants",
         })
@@ -199,16 +221,19 @@ impl fmt::Display for GrantError {
 
 impl std::error::Error for GrantError {}
 
-/// Validate a device display name: 1 to 64 bytes of UTF-8.
+/// Longest display name, in bytes. Room for "<computer> (<profile>)".
+pub const MAX_NAME_LEN: usize = 128;
+
+/// Validate a display name: 1 to [`MAX_NAME_LEN`] bytes of UTF-8.
 pub fn validate_name(name: &str) -> Result<(), GrantError> {
-    if name.is_empty() || name.len() > 64 {
+    if name.is_empty() || name.len() > MAX_NAME_LEN {
         Err(GrantError::InvalidName)
     } else {
         Ok(())
     }
 }
 
-/// The host's grant table.
+/// An endpoint's grant table.
 #[derive(Clone, Debug, Default)]
 pub struct GrantTable {
     grants: BTreeMap<GrantId, Grant>,
@@ -305,7 +330,7 @@ impl GrantTable {
         }
     }
 
-    /// Deny an identity host-wide: removes its grant, closes its channels and
+    /// Deny an identity on the whole endpoint: removes its grant, closes its channels and
     /// blocks future grants.
     pub fn deny(&mut self, identity: IdentityPublicKey, now: UnixTime) -> Vec<GrantEvent> {
         self.denials.entry(identity).or_insert(now);
@@ -417,7 +442,7 @@ mod tests {
             identity: id(seed),
             name: format!("device {seed}"),
             role: Role::owner(),
-            authorizing_owner: OwnerRef::new("profile-1").unwrap(),
+            authorizing_owner: OwnerRef::from_bytes([0x51; 16]),
             expires_at,
         }
     }

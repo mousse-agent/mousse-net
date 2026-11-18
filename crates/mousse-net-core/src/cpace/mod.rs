@@ -34,9 +34,8 @@ pub use primitives::{ISK_LEN, POINT_LEN, TAG_LEN};
 pub use wire::MAX_AD_LEN;
 
 use curve25519_dalek::scalar::Scalar;
-use primitives::{
-    calculate_generator, isk, mac_key, sample_scalar, scalar_mult, scalar_mult_vfy, tag,
-};
+pub(crate) use primitives::sample_scalar;
+use primitives::{calculate_generator, isk, mac_key, scalar_mult, scalar_mult_vfy, tag};
 
 /// The shortest session id Mousse accepts.
 pub const MIN_SID_LEN: usize = 16;
@@ -102,7 +101,7 @@ impl fmt::Debug for Inputs<'_> {
 }
 
 impl Inputs<'_> {
-    fn check(&self) -> Result<(), CpaceError> {
+    pub(crate) fn check(&self) -> Result<(), CpaceError> {
         if self.prs.is_empty() {
             return Err(CpaceError::EmptyPassword);
         }
@@ -181,7 +180,10 @@ impl Initiator {
         Ok(Self::start_with_scalar(inputs, sample_scalar(rng)))
     }
 
-    fn start_with_scalar(inputs: &Inputs<'_>, ya: Zeroizing<Scalar>) -> (Initiator, Vec<u8>) {
+    pub(crate) fn start_with_scalar(
+        inputs: &Inputs<'_>,
+        ya: Zeroizing<Scalar>,
+    ) -> (Initiator, Vec<u8>) {
         let g = calculate_generator(inputs.prs, inputs.ci, inputs.sid);
         let ya_enc = scalar_mult(&ya, &g);
         let msg_a = primitives::lv_cat(&[&ya_enc, inputs.ad]);
@@ -243,7 +245,7 @@ impl Responder {
         Self::respond_with_scalar(inputs, msg_a, sample_scalar(rng))
     }
 
-    fn respond_with_scalar(
+    pub(crate) fn respond_with_scalar(
         inputs: &Inputs<'_>,
         msg_a: &[u8],
         yb: Zeroizing<Scalar>,

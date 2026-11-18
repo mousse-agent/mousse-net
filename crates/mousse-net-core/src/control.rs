@@ -8,7 +8,7 @@ use std::fmt;
 use crate::cbor::{self, FieldError, Fields, Value};
 use crate::grants::{validate_name, Role};
 use crate::pairing::{AttemptId, InvitationId};
-use crate::ErrorCode;
+use crate::{ErrorCode, PROTOCOL_MINOR_VERSION, PROTOCOL_VERSION};
 
 /// Largest encoded control message, in bytes.
 pub const MAX_CONTROL_MESSAGE: usize = 16_384;
@@ -30,7 +30,9 @@ pub enum AuthorizedState {
 pub enum ControlMessage {
     /// Type 1, both directions, first message on every connection.
     Hello {
-        /// The sender's minor protocol version.
+        /// The sender's major protocol version.
+        major_version: u64,
+        /// The sender's minor protocol version (the newest it speaks).
         minor_version: u64,
     },
     /// Type 2, host to caller: the step 2 result.
@@ -45,7 +47,8 @@ pub enum ControlMessage {
         invitation: InvitationId,
         /// HMAC-SHA256 tag (spec "Join proof").
         mac: [u8; 32],
-        /// The joining device's display name (1 to 64 bytes).
+        /// The joining endpoint's display name (1 to 128 bytes), for example
+        /// "<computer> (<profile>)".
         name: String,
     },
     /// Type 4, both directions: one code-exchange message.
@@ -64,7 +67,7 @@ pub enum ControlMessage {
     },
     /// Type 6, host to joiner: enrollment done; the connection is now live.
     Paired {
-        /// The host's display name (1 to 64 bytes).
+        /// The host endpoint's display name (1 to 128 bytes).
         host_name: String,
         /// The role the new grant carries.
         role: Role,
@@ -74,7 +77,10 @@ pub enum ControlMessage {
 impl fmt::Debug for ControlMessage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ControlMessage::Hello { minor_version } => write!(f, "Hello({minor_version})"),
+            ControlMessage::Hello {
+                major_version,
+                minor_version,
+            } => write!(f, "Hello({major_version}.{minor_version})"),
             ControlMessage::Authorized { state } => write!(f, "Authorized({state:?})"),
             ControlMessage::JoinProof {
                 invitation, name, ..
@@ -141,8 +147,12 @@ impl ControlMessage {
     pub fn encode(&self) -> Vec<u8> {
         let mut entries = vec![(0, Value::Uint(self.type_number()))];
         match self {
-            ControlMessage::Hello { minor_version } => {
-                entries.push((1, Value::Uint(*minor_version)))
+            ControlMessage::Hello {
+                major_version,
+                minor_version,
+            } => {
+                entries.push((1, Value::Uint(*major_version)));
+                entries.push((2, Value::Uint(*minor_version)));
             }
             ControlMessage::Authorized { state } => entries.push((1, Value::Uint(*state as u64))),
             ControlMessage::JoinProof {
@@ -179,7 +189,8 @@ impl ControlMessage {
         let kind = f.uint(0)?;
         let message = match kind {
             1 => ControlMessage::Hello {
-                minor_version: f.uint(1)?,
+                major_version: f.uint(1)?,
+                minor_version: f.uint(2)?,
             },
             2 => ControlMessage::Authorized {
                 state: match f.uint(1)? {
@@ -227,13 +238,88 @@ impl ControlMessage {
     }
 }
 
+impl ControlMessage {
+    /// The `HELLO` this build sends.
+    pub fn hello() -> Self {
+        ControlMessage::Hello {
+            major_version: PROTOCOL_VERSION,
+            minor_version: PROTOCOL_MINOR_VERSION,
+        }
+    }
+}
+
+/// The protocol versions one side speaks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VersionSupport {
+    /// The major version (exactly one per build).
+    pub major: u64,
+    /// The newest minor version; sent in `HELLO`.
+    pub minor: u64,
+    /// The oldest minor version still spoken.
+    pub oldest_minor: u64,
+}
+
+impl VersionSupport {
+    /// What this build speaks: the current minor version and the one before.
+    pub const LOCAL: VersionSupport = VersionSupport {
+        major: PROTOCOL_VERSION,
+        minor: PROTOCOL_MINOR_VERSION,
+        oldest_minor: PROTOCOL_MINOR_VERSION.saturating_sub(1),
+    };
+}
+
+/// Decide the minor version for a connection from the peer's `HELLO`.
+///
+/// Both sides use the lower of the two minor versions. The connection closes
+/// with `UNSUPPORTED_VERSION` if the major versions differ or the lower minor
+/// version is older than the oldest one `local` speaks. Each side decides on
+/// its own; both reach the same minor version when both accept.
+pub fn negotiate_version(
+    local: VersionSupport,
+    peer_major: u64,
+    peer_minor: u64,
+) -> Result<u64, ErrorCode> {
+    if peer_major != local.major {
+        return Err(ErrorCode::UnsupportedVersion);
+    }
+    let agreed = local.minor.min(peer_minor);
+    if agreed < local.oldest_minor {
+        return Err(ErrorCode::UnsupportedVersion);
+    }
+    Ok(agreed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn version_negotiation_takes_the_lower_minor_and_refuses_too_old() {
+        let local = VersionSupport {
+            major: 1,
+            minor: 4,
+            oldest_minor: 3,
+        };
+        assert_eq!(negotiate_version(local, 1, 4), Ok(4));
+        assert_eq!(negotiate_version(local, 1, 9), Ok(4));
+        assert_eq!(negotiate_version(local, 1, 3), Ok(3));
+        assert_eq!(
+            negotiate_version(local, 1, 2),
+            Err(ErrorCode::UnsupportedVersion)
+        );
+        assert_eq!(
+            negotiate_version(local, 2, 4),
+            Err(ErrorCode::UnsupportedVersion)
+        );
+        assert_eq!(
+            negotiate_version(local, 0, 4),
+            Err(ErrorCode::UnsupportedVersion)
+        );
+    }
+
     fn all() -> Vec<ControlMessage> {
         vec![
-            ControlMessage::Hello { minor_version: 0 },
+            ControlMessage::hello(),
             ControlMessage::Authorized {
                 state: AuthorizedState::JoinOnly,
             },
@@ -273,7 +359,8 @@ mod tests {
         );
         let extra = cbor::encode(&Value::Map(vec![
             (0, Value::Uint(1)),
-            (1, Value::Uint(0)),
+            (1, Value::Uint(1)),
+            (2, Value::Uint(0)),
             (7, Value::Uint(0)),
         ]));
         assert_eq!(
