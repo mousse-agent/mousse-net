@@ -1,0 +1,7 @@
+# Devices whose signed results mousse-check trusts.
+#
+# Add one with:
+#   mousse-check device keygen --out <key file>        (on the device)
+#   mousse-check device add --name <name> --key <public key hex> --targets <cells>
+# and commit this file. `targets` limits which cells a device may report.
+# The secret key file stays on the device and is never committed.
