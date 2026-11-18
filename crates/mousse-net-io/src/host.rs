@@ -6,6 +6,10 @@
 //! Removing a grant closes every connection bound to it with
 //! `GRANT_REVOKED` before the call returns: their gates refuse further
 //! traffic at once and their drivers are told to send `GOAWAY`.
+//!
+//! The grant table is saved after every change. A change whose save fails
+//! still takes effect in memory (access ends at once) but the call reports
+//! the failure, and the host retries the save every second until it works.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -50,6 +54,10 @@ pub struct HostConfig {
     pub policy: TlsPolicy,
     /// Clock.
     pub clock: Arc<dyn Clock>,
+    /// The identity tickets and pairing name, when it differs from the
+    /// identity TLS presents. Only the `allow-break-env` control build (tests
+    /// only) may set it; [`Host::new`] refuses it otherwise.
+    pub ticket_identity: Option<IdentityPublicKey>,
 }
 
 impl HostConfig {
@@ -66,6 +74,7 @@ impl HostConfig {
             owner: endpoint.owner()?,
             policy: TlsPolicy::default(),
             clock,
+            ticket_identity: None,
         })
     }
 }
@@ -130,6 +139,8 @@ struct Inner<F: CodeExchangeFactory> {
     gates: HashMap<ConnectionId, ConnectionGate>,
     conns: HashMap<ConnectionId, mpsc::UnboundedSender<Cmd>>,
     store: Option<GrantStore>,
+    /// The last save failed; the ticker retries it.
+    unsaved: bool,
     approve_next: bool,
     events: mpsc::UnboundedSender<HostEvent>,
 }
@@ -177,10 +188,21 @@ where
         self.send(conn, Cmd::Close(code));
     }
 
-    fn persist(&self) {
-        if let Some(store) = &self.store {
-            if let Err(e) = store.save(&self.grants) {
+    /// Save the grant table. On failure the change stays in effect in
+    /// memory, the host reports [`HostEvent::StoreFailed`] and retries.
+    fn persist(&mut self) -> Result<(), NetError> {
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        match store.save(&self.grants) {
+            Ok(()) => {
+                self.unsaved = false;
+                Ok(())
+            }
+            Err(e) => {
+                self.unsaved = true;
                 let _ = self.events.send(HostEvent::StoreFailed(e.to_string()));
+                Err(e)
             }
         }
     }
@@ -272,7 +294,8 @@ where
             }
         }
         if persist {
-            self.persist();
+            // A failure is reported as an event and retried by the ticker.
+            let _ = self.persist();
         }
     }
 }
@@ -294,7 +317,15 @@ where
             Some(store) => store.load()?,
             None => GrantTable::new(),
         };
-        let identity = signer.public_key();
+        let identity = match config.ticket_identity {
+            None => signer.public_key(),
+            Some(other) if crate::CONTROL == Some("allow-break-env") => other,
+            Some(_) => {
+                return Err(NetError::Refused(
+                    "a separate ticket identity needs the allow-break-env control build".into(),
+                ))
+            }
+        };
         let (events, events_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
             inner: Mutex::new(Inner {
@@ -303,6 +334,7 @@ where
                 gates: HashMap::new(),
                 conns: HashMap::new(),
                 store,
+                unsaved: false,
                 approve_next: false,
                 events,
             }),
@@ -451,39 +483,50 @@ where
             .count()
     }
 
-    /// Remove a grant. Its connections close at once with `GRANT_REVOKED`.
-    /// Returns false if there was no such grant.
-    pub fn remove_grant(&self, grant: GrantId) -> bool {
+    /// Remove a grant. Its connections close at once with `GRANT_REVOKED`,
+    /// before the save. `Ok(false)` if there was no such grant. An error
+    /// means the removal is in effect now but was not saved: the host keeps
+    /// retrying, and if it stops before a retry works the grant is back on
+    /// the next start.
+    pub fn remove_grant(&self, grant: GrantId) -> Result<bool, NetError> {
         let mut inner = lock(&self.shared);
         if inner.grants.get(grant).is_none() {
-            return false;
+            return Ok(false);
         }
         if cfg!(mousse_control = "keep-removed-grant") {
             // The control build (tests only) reports success and changes
             // nothing.
-            return true;
+            return Ok(true);
         }
         let events = inner.grants.remove(grant);
         inner.apply_grant_events(events);
-        inner.persist();
-        true
+        inner.persist()?;
+        Ok(true)
     }
 
     /// Deny an identity host-wide: its grant goes, its connections close and
-    /// it cannot be granted again until the denial is lifted.
-    pub fn deny(&self, identity: IdentityPublicKey) {
+    /// it cannot be granted again until the denial is lifted. Access ends
+    /// before the save; an error means the denial was not saved (see
+    /// [`Host::remove_grant`]).
+    pub fn deny(&self, identity: IdentityPublicKey) -> Result<(), NetError> {
         let mut inner = lock(&self.shared);
         let events = inner.grants.deny(identity, self.shared.clock.now());
         inner.apply_grant_events(events);
-        inner.persist();
+        inner.persist()
     }
 
-    /// Lift a denial. Grants nothing.
-    pub fn undeny(&self, identity: &IdentityPublicKey) -> bool {
+    /// Lift a denial. Grants nothing. An error means the change was not
+    /// saved.
+    pub fn undeny(&self, identity: &IdentityPublicKey) -> Result<bool, NetError> {
         let mut inner = lock(&self.shared);
         let lifted = inner.grants.undeny(identity);
-        inner.persist();
-        lifted
+        inner.persist()?;
+        Ok(lifted)
+    }
+
+    /// Whether the grant table has changes that are not saved yet.
+    pub fn has_unsaved_changes(&self) -> bool {
+        lock(&self.shared).unsaved
     }
 
     /// Close every connection with `code`.
@@ -509,9 +552,9 @@ async fn ticker<F: CodeExchangeFactory>(shared: Weak<Shared<F>>) {
         let mono = shared.clock.mono();
         let mut inner = lock(&shared);
         let events = inner.grants.tick(now);
-        if !events.is_empty() {
+        if !events.is_empty() || inner.unsaved {
             inner.apply_grant_events(events);
-            inner.persist();
+            let _ = inner.persist();
         }
         let actions = inner.pairing.tick(now);
         inner.apply(actions, &*shared.clock);

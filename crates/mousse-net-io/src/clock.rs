@@ -61,6 +61,8 @@ pub struct ManualClock {
     origin: Instant,
     offset_secs: AtomicI64,
     mono_offset_ms: AtomicU64,
+    /// A stopped wall clock, or -1.
+    frozen: AtomicI64,
 }
 
 impl ManualClock {
@@ -70,6 +72,7 @@ impl ManualClock {
             origin: Instant::now(),
             offset_secs: AtomicI64::new(0),
             mono_offset_ms: AtomicU64::new(0),
+            frozen: AtomicI64::new(-1),
         }
     }
 
@@ -82,6 +85,18 @@ impl ManualClock {
     pub fn advance(&self, secs: i64) {
         self.offset_secs.fetch_add(secs, Ordering::SeqCst);
     }
+
+    /// Stop the wall clock at `at`, for checks at an exact second. Until
+    /// [`ManualClock::thaw`], `advance` has no effect.
+    pub fn freeze_at(&self, at: UnixTime) {
+        self.frozen
+            .store(i64::try_from(at.0).unwrap_or(i64::MAX), Ordering::SeqCst);
+    }
+
+    /// Let the wall clock run again.
+    pub fn thaw(&self) {
+        self.frozen.store(-1, Ordering::SeqCst);
+    }
 }
 
 impl Default for ManualClock {
@@ -92,6 +107,10 @@ impl Default for ManualClock {
 
 impl Clock for ManualClock {
     fn now(&self) -> UnixTime {
+        let frozen = self.frozen.load(Ordering::SeqCst);
+        if frozen >= 0 {
+            return UnixTime(frozen as u64);
+        }
         let base = system_secs() as i64;
         let shifted = base.saturating_add(self.offset_secs.load(Ordering::SeqCst));
         UnixTime(shifted.max(0) as u64)

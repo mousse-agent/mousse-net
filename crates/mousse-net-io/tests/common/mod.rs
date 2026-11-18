@@ -67,6 +67,7 @@ impl TestHost {
             owner: OwnerRef::from_bytes([0x5a; 16]),
             policy: TlsPolicy::default(),
             clock: clock.clone(),
+            ticket_identity: None,
         };
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         Self::run(signer, config, clock, listener)

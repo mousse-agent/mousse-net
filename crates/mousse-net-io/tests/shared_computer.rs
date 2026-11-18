@@ -135,7 +135,10 @@ async fn scenario(setup: Setup, a_dir: &Path, b_dir: &Path) -> Outcome {
     let grant = b
         .grant_of(&pb.identity())
         .ok_or("B has no grant for its peer")?;
-    check(b.host.remove_grant(grant), "B could not remove its peer")?;
+    check(
+        matches!(b.host.remove_grant(grant), Ok(true)),
+        "B could not remove its peer",
+    )?;
     check(
         close_code(&pb_conn).await == Some(ErrorCode::GrantRevoked),
         "B's channel did not close with GRANT_REVOKED",

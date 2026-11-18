@@ -124,7 +124,7 @@ impl IdentityStore {
                 self.dir.display()
             )));
         }
-        fs::create_dir_all(&self.dir)
+        crate::private::make_private_dir(&self.dir)
             .map_err(|e| NetError::Store(format!("{}: {e}", self.dir.display())))?;
         let key = SoftwareKey::generate(&mut os_rng());
         let secret = key.secret_bytes();

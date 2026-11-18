@@ -10,11 +10,23 @@
 //! - A [`PeerSession`] per pinned host tracks the current path. A new live
 //!   connection to the same host replaces the old one, which closes with
 //!   `PATH_REPLACED`.
+//! - Renewal: [`Caller::start_renewals`] runs each session's timer. When a
+//!   path nears its deadline the caller dials the host again (over the
+//!   routes it last used, with a fresh certificate if ours runs out),
+//!   retrying on the session's schedule. The new path stays a candidate
+//!   until the app reopened its channels on it and called
+//!   [`Caller::reopened`]; only then does it become current and the old one
+//!   close with `PATH_REPLACED`.
+//! - A join keeps one [`JoinerPairing`] across connections. If the
+//!   connection drops after this side confirmed the code and before
+//!   `PAIRED` arrived, the join reconnects with the same joiner to learn the
+//!   outcome before it reports anything.
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::time::Duration;
 
 use mousse_net_core::authz::{CallerGate, CallerTraffic, Traffic, Verdict};
 use mousse_net_core::control::{AuthorizedState, ControlMessage};
@@ -63,10 +75,37 @@ impl CodeEntry for NoCode {
     }
 }
 
+/// A path change the app must act on (see [`Caller::start_renewals`]).
+#[derive(Debug)]
+pub enum PathEvent {
+    /// A renewal brought up `conn` to the host pinned as `pin`: live and
+    /// authorized, but not current yet. Reopen the app's channels on it
+    /// from their cursors, then call [`Caller::reopened`]. Until then the
+    /// old path `from` stays current.
+    Reopen {
+        /// The host.
+        pin: IdentityPublicKey,
+        /// The path being replaced.
+        from: ConnectionId,
+        /// The new path.
+        conn: Connection,
+    },
+    /// A renewal try failed. The session asks again later (after 30 s,
+    /// doubling up to 5 min) until the old path's deadline.
+    RenewFailed {
+        /// The host.
+        pin: IdentityPublicKey,
+        /// Why.
+        error: NetError,
+    },
+}
+
 #[derive(Default)]
 struct Paths {
     sessions: HashMap<IdentityPublicKey, PeerSession>,
     conns: HashMap<ConnectionId, mpsc::UnboundedSender<Cmd>>,
+    /// Where each pinned host was last reached, best first.
+    routes: HashMap<IdentityPublicKey, Vec<Route>>,
 }
 
 impl Paths {
@@ -94,6 +133,24 @@ pub struct Caller<F: CodeExchangeFactory + Clone = CpaceExchangeFactory> {
 fn lock(paths: &Mutex<Paths>) -> MutexGuard<'_, Paths> {
     paths.lock().unwrap_or_else(|e| e.into_inner())
 }
+
+/// One join's pairing state, shared by every connection the join uses.
+type SharedJoiner<F> = Arc<Mutex<JoinerPairing<F>>>;
+
+fn lock_joiner<F: CodeExchangeFactory>(
+    joiner: &Mutex<JoinerPairing<F>>,
+) -> MutexGuard<'_, JoinerPairing<F>> {
+    joiner.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// How often a join reconnects to learn a pending outcome, and the waits
+/// before each try.
+const OUTCOME_RETRIES: [Duration; 4] = [
+    Duration::from_millis(200),
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+];
 
 impl Caller<CpaceExchangeFactory> {
     /// A caller that pairs in person or with a send link (CPace).
@@ -127,6 +184,61 @@ where
     /// This device's identity.
     pub fn identity(&self) -> IdentityPublicKey {
         self.certs.identity()
+    }
+
+    /// Where to reach the host pinned as `pin` when a path must be
+    /// renewed, best first. [`Caller::dial_candidates`] keeps this up to
+    /// date; call it after a join or a dial over a pipe of your own.
+    pub fn remember_routes(&self, pin: IdentityPublicKey, routes: Vec<Route>) {
+        lock(&self.paths).routes.insert(pin, routes);
+    }
+
+    /// The app reopened its channels on a renewed path: make it current.
+    /// The old path closes with `PATH_REPLACED`.
+    pub fn reopened(&self, conn: &Connection) -> Result<(), NetError> {
+        let mut paths = lock(&self.paths);
+        let session = paths
+            .sessions
+            .get_mut(conn.peer())
+            .ok_or_else(|| NetError::Refused("no session with this host".into()))?;
+        let events = session
+            .on_reopened(conn.id())
+            .map_err(|e| NetError::Refused(format!("not a renewed path: {e:?}")))?;
+        paths.run(events);
+        Ok(())
+    }
+
+    /// Bring up a new path to `pin` for a renewal: live, not yet current.
+    async fn renew(&self, pin: IdentityPublicKey) -> Result<Connection, NetError> {
+        let routes = lock(&self.paths)
+            .routes
+            .get(&pin)
+            .cloned()
+            .unwrap_or_default();
+        let mut last = NetError::Refused("no known route to this host".into());
+        for route in &routes {
+            let pipe = match connect_tcp(route).await {
+                Ok(pipe) => pipe,
+                Err(e) => {
+                    last = e;
+                    continue;
+                }
+            };
+            let conn = match self.connect(pipe, pin).await {
+                Ok(conn) => conn,
+                Err(NetError::PeerCertificate(CertError::PinMismatch)) => continue,
+                Err(e) => {
+                    last = e;
+                    continue;
+                }
+            };
+            return match conn.settled(false).await {
+                status if status.is_live() => Ok(conn),
+                ConnStatus::Closed(reason) => Err(NetError::Closed(reason)),
+                other => Err(NetError::Refused(format!("unexpected state {other:?}"))),
+            };
+        }
+        Err(last)
     }
 
     async fn handshake<P: Pipe>(
@@ -181,7 +293,7 @@ where
         stream: tokio_rustls::TlsStream<P>,
         handshake: Handshake,
         pin: IdentityPublicKey,
-        joiner: Option<(JoinerPairing<F>, ControlMessage)>,
+        joiner: Option<(SharedJoiner<F>, ControlMessage)>,
     ) -> Connection {
         let (cmd_tx, cmd_rx) = conn::channel();
         lock(&self.paths).conns.insert(conn, cmd_tx.clone());
@@ -279,7 +391,12 @@ where
                 }
             };
             match self.dial(pipe, pin).await {
-                Ok(conn) => return Ok((conn, route.clone())),
+                Ok(conn) => {
+                    let mut order = vec![route.clone()];
+                    order.extend(routes.iter().filter(|r| *r != route).cloned());
+                    self.remember_routes(pin, order);
+                    return Ok((conn, route.clone()));
+                }
                 Err(NetError::PeerCertificate(CertError::PinMismatch)) => continue,
                 Err(e @ NetError::Closed(_)) => return Err(e),
                 Err(e) => last = Some(e),
@@ -307,7 +424,8 @@ where
     /// Pair with the host in `ticket` over `pipe`. In person, wait for the
     /// host owner's approval. With a send link, ask `codes` for the code the
     /// host shows, and again after each wrong code until the attempts run
-    /// out.
+    /// out. Treats the host as never pinned and cannot reconnect; see
+    /// [`Caller::join_with_redial`].
     pub async fn join_with_code<P: Pipe, C: CodeEntry>(
         &self,
         pipe: P,
@@ -315,6 +433,39 @@ where
         name: &str,
         codes: &mut C,
     ) -> Result<(Connection, JoinOutcome), NetError> {
+        let no_redial = || {
+            std::future::ready(Err::<P, _>(NetError::Refused(
+                "no address to reconnect to".into(),
+            )))
+        };
+        self.join_with_redial(pipe, ticket, name, codes, false, no_redial)
+            .await
+    }
+
+    /// [`Caller::join_with_code`], plus:
+    /// - `host_pinned`: this device already holds a pin for the ticket's
+    ///   host (paired before). Only then may a "send link" join end as
+    ///   "already paired" without a code exchange.
+    /// - `redial`: opens a new pipe to the host. If the connection drops
+    ///   after this side confirmed the code and before `PAIRED` arrived,
+    ///   the join reconnects through it (a few times, with short waits) and
+    ///   keeps the same pairing state, so the host's answer settles the
+    ///   outcome: `AUTHORIZED {live}` means it enrolled this device.
+    pub async fn join_with_redial<P, C, D, Fut>(
+        &self,
+        pipe: P,
+        ticket: &Ticket,
+        name: &str,
+        codes: &mut C,
+        host_pinned: bool,
+        mut redial: D,
+    ) -> Result<(Connection, JoinOutcome), NetError>
+    where
+        P: Pipe,
+        C: CodeEntry,
+        D: FnMut() -> Fut,
+        Fut: Future<Output = Result<P, NetError>>,
+    {
         let mut joiner = JoinerPairing::new(
             ticket.clone(),
             self.identity(),
@@ -323,12 +474,50 @@ where
             self.clock.now(),
         )
         .map_err(|e| NetError::Ticket(e.to_string()))?;
+        joiner.set_host_pinned(host_pinned);
+        let joiner: SharedJoiner<F> = Arc::new(Mutex::new(joiner));
+        let mut result = self.join_once(pipe, ticket, &joiner, codes).await;
+        let mut retries = OUTCOME_RETRIES.iter();
+        while result.is_err() && lock_joiner(&joiner).outcome_pending() {
+            let Some(wait) = retries.next() else {
+                return Err(NetError::Refused(
+                    "the connection dropped while the host was enrolling this device, \
+                     and reconnecting did not tell whether it did"
+                        .into(),
+                ));
+            };
+            tokio::time::sleep(*wait).await;
+            result = match redial().await {
+                Ok(pipe) => self.join_once(pipe, ticket, &joiner, codes).await,
+                Err(e) => Err(e),
+            };
+        }
+        result
+    }
+
+    /// One connection of a join.
+    async fn join_once<P: Pipe, C: CodeEntry>(
+        &self,
+        pipe: P,
+        ticket: &Ticket,
+        joiner: &SharedJoiner<F>,
+        codes: &mut C,
+    ) -> Result<(Connection, JoinOutcome), NetError> {
         let pin = ticket.host_identity;
         let (conn, stream, handshake) = self.handshake(pipe, pin).await?;
-        let proof = joiner
-            .on_connected(handshake.exporters, self.clock.now())
-            .map_err(|e| NetError::Ticket(e.to_string()))?;
-        let connection = self.start(conn, stream, handshake, pin, Some((joiner, proof)));
+        let proof = lock_joiner(joiner).on_connected(handshake.exporters, self.clock.now());
+        let proof = match proof {
+            Ok(proof) => proof,
+            Err(e) => {
+                lock(&self.paths)
+                    .sessions
+                    .entry(pin)
+                    .or_insert_with(|| PeerSession::new(pin))
+                    .on_path_closed(conn);
+                return Err(NetError::Ticket(e.to_string()));
+            }
+        };
+        let connection = self.start(conn, stream, handshake, pin, Some((joiner.clone(), proof)));
         let mut status = connection.settled(true).await;
         loop {
             match status {
@@ -367,9 +556,68 @@ where
     }
 }
 
+impl<F> Caller<F>
+where
+    F: CodeExchangeFactory + Clone + Send + Sync + 'static,
+    F::Exchange: Send,
+{
+    /// Run every session's timer, once a second, for as long as the caller
+    /// and the returned receiver live: renew paths before their deadline
+    /// and close paths past it. Must be called inside a tokio runtime.
+    pub fn start_renewals(self: &Arc<Self>) -> mpsc::UnboundedReceiver<PathEvent> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(renewal_ticker(Arc::downgrade(self), tx));
+        rx
+    }
+}
+
+async fn renewal_ticker<F>(caller: Weak<Caller<F>>, tx: mpsc::UnboundedSender<PathEvent>)
+where
+    F: CodeExchangeFactory + Clone + Send + Sync + 'static,
+    F::Exchange: Send,
+{
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        interval.tick().await;
+        let Some(caller) = caller.upgrade() else {
+            return;
+        };
+        if tx.is_closed() {
+            return;
+        }
+        let now = caller.clock.now();
+        let due: Vec<(IdentityPublicKey, ConnectionId)> = {
+            let mut paths = lock(&caller.paths);
+            let mut due = Vec::new();
+            let mut other = Vec::new();
+            for (pin, session) in paths.sessions.iter_mut() {
+                for event in session.tick(now) {
+                    match event {
+                        SessionEvent::RenewDue { conn } => due.push((*pin, conn)),
+                        event => other.push(event),
+                    }
+                }
+            }
+            paths.run(other);
+            due
+        };
+        for (pin, from) in due {
+            let (caller, tx) = (caller.clone(), tx.clone());
+            tokio::spawn(async move {
+                let event = match caller.renew(pin).await {
+                    Ok(conn) => PathEvent::Reopen { pin, from, conn },
+                    Err(error) => PathEvent::RenewFailed { pin, error },
+                };
+                let _ = tx.send(event);
+            });
+        }
+    }
+}
+
 struct CallerRole<F: CodeExchangeFactory> {
     gate: CallerGate,
-    joiner: Option<JoinerPairing<F>>,
+    joiner: Option<SharedJoiner<F>>,
     proof: Option<ControlMessage>,
     paths: Arc<Mutex<Paths>>,
     conn: ConnectionId,
@@ -424,7 +672,7 @@ where
 
     fn on_control(&mut self, message: ControlMessage, out: &mut Outbox) {
         // The gate already let this through, and moved on `AUTHORIZED`.
-        let Some(joiner) = self.joiner.as_mut() else {
+        let Some(joiner) = self.joiner.clone() else {
             match message {
                 ControlMessage::Authorized {
                     state: AuthorizedState::Live,
@@ -437,6 +685,7 @@ where
             }
             return;
         };
+        let mut joiner = lock_joiner(&joiner);
         let actions = match message {
             ControlMessage::Authorized { state } => {
                 let actions = joiner.on_authorized(state);
@@ -458,12 +707,13 @@ where
             ControlMessage::CodeAbort { attempt, .. } => joiner.on_code_abort(attempt),
             _ => vec![JoinerAction::Failed(ErrorCode::ProtocolError)],
         };
+        drop(joiner);
         self.joiner_actions(actions, out);
     }
 
     fn on_code(&mut self, code: PairingCode, out: &mut Outbox) {
-        let actions = match self.joiner.as_mut() {
-            Some(joiner) => joiner
+        let actions = match &self.joiner {
+            Some(joiner) => lock_joiner(joiner)
                 .submit_code(&code, &mut os_rng())
                 .unwrap_or_else(|_| vec![JoinerAction::Failed(ErrorCode::ProtocolError)]),
             None => vec![JoinerAction::Failed(ErrorCode::ProtocolError)],
@@ -476,8 +726,8 @@ where
     }
 
     fn on_closed(&mut self, reason: &CloseReason) {
-        if let Some(joiner) = self.joiner.as_mut() {
-            let _ = joiner.on_closed(reason.code());
+        if let Some(joiner) = &self.joiner {
+            let _ = lock_joiner(joiner).on_closed(reason.code());
         }
         self.gate.close(reason.code().unwrap_or(ErrorCode::NoError));
         let mut paths = lock(&self.paths);

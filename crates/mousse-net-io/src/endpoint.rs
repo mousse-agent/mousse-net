@@ -163,7 +163,8 @@ impl Endpoint {
         profile_id: Option<&str>,
         storage: KeyStorage,
     ) -> Result<(Self, StoredIdentity), NetError> {
-        fs::create_dir_all(dir).map_err(|e| NetError::Store(format!("{}: {e}", dir.display())))?;
+        crate::private::make_private_dir(dir)
+            .map_err(|e| NetError::Store(format!("{}: {e}", dir.display())))?;
         let dir_lock = lock_file(&dir.join(DIR_LOCK_FILE), false)?;
         if Self::exists(dir) {
             return Err(NetError::Store(format!(
@@ -235,6 +236,9 @@ impl Endpoint {
                 dir.display()
             )));
         }
+        // Owner-only, also for a folder made before this was enforced.
+        crate::private::make_private_dir(dir)
+            .map_err(|e| NetError::Store(format!("{}: {e}", dir.display())))?;
         let dir_lock = lock_file(&dir.join(DIR_LOCK_FILE), shared)?;
         let path = dir.join(ENDPOINT_FILE);
         let bytes =

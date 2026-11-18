@@ -11,7 +11,13 @@
 //!   message received; core's `negotiate_version` decides the minor version
 //!   or closes with `UNSUPPORTED_VERSION`.
 //! - The connection closes with `CERT_EXPIRED` after the effective deadline
-//!   of the two certificates.
+//!   of the two certificates. The deadline is checked before every inbound
+//!   frame, every stream open or send, and every write, not only when the
+//!   timer fires: after it nothing but the closing `GOAWAY` goes out, and
+//!   queued stream data is dropped.
+//! - Each stream half can wait for its connection to start closing
+//!   ([`StreamWriter::closing`]), so a task serving a stream ends with the
+//!   connection even after the peer finished its side of the stream.
 //! - A separate writer task owns the write half, so a slow peer never stops
 //!   us reading.
 
@@ -24,7 +30,7 @@ use mousse_net_core::authz::{Traffic, Verdict};
 use mousse_net_core::control::{negotiate_version, ControlMessage, VersionSupport};
 use mousse_net_core::identity::IdentityPublicKey;
 use mousse_net_core::mux::{
-    decode_frame, Frame, Mux, MuxEvent, MuxRole, PriorityClass, StreamError, StreamId,
+    decode_frame, frame_type, Frame, Mux, MuxEvent, MuxRole, PriorityClass, StreamError, StreamId,
 };
 use mousse_net_core::pairing::{PairedHost, PairingCode};
 use mousse_net_core::{ConnectionId, ErrorCode, UnixTime};
@@ -171,6 +177,7 @@ pub struct StreamReader {
     rx: mpsc::UnboundedReceiver<StreamEvent>,
     cmd: mpsc::UnboundedSender<Cmd>,
     ended: Option<Result<(), NetError>>,
+    closing: watch::Receiver<bool>,
 }
 
 impl StreamReader {
@@ -202,6 +209,17 @@ impl StreamReader {
         self.ended = Some(result);
         out
     }
+
+    /// Wait until the connection starts closing (see
+    /// [`StreamWriter::closing`]).
+    pub async fn closing(&self) {
+        wait_closing(self.closing.clone()).await;
+    }
+}
+
+async fn wait_closing(mut rx: watch::Receiver<bool>) {
+    // An error means the driver is gone: closed as well.
+    let _ = rx.wait_for(|closing| *closing).await;
 }
 
 fn clone_err(e: &NetError) -> NetError {
@@ -217,6 +235,7 @@ fn clone_err(e: &NetError) -> NetError {
 pub struct StreamWriter {
     id: StreamId,
     cmd: mpsc::UnboundedSender<Cmd>,
+    closing: watch::Receiver<bool>,
 }
 
 impl StreamWriter {
@@ -246,6 +265,16 @@ impl StreamWriter {
     /// Abort the stream in both directions.
     pub fn reset(&self, code: ErrorCode) {
         let _ = self.cmd.send(Cmd::Reset(self.id, code));
+    }
+
+    /// Wait until the connection starts closing, for any reason: the grant
+    /// was removed or expired, a certificate ran out, either side sent
+    /// `GOAWAY`, or the pipe failed. Unlike reading, this keeps working
+    /// after the peer finished its side of the stream, so a task serving
+    /// the stream can stop its work (for example a running command) when
+    /// access ends.
+    pub async fn closing(&self) {
+        wait_closing(self.closing.clone()).await;
     }
 }
 
@@ -287,6 +316,7 @@ pub struct Connection {
     id: ConnectionId,
     peer: IdentityPublicKey,
     kx_group: String,
+    deadline: UnixTime,
     cmd: mpsc::UnboundedSender<Cmd>,
     status: watch::Receiver<ConnStatus>,
     incoming: tokio::sync::Mutex<mpsc::UnboundedReceiver<MuxStream>>,
@@ -312,6 +342,12 @@ impl Connection {
     /// The negotiated key exchange group.
     pub fn kx_group(&self) -> &str {
         &self.kx_group
+    }
+
+    /// The last second this connection may carry traffic: the earlier
+    /// effective deadline of the two certificates.
+    pub fn deadline(&self) -> UnixTime {
+        self.deadline
     }
 
     /// The current status.
@@ -393,9 +429,17 @@ impl Connection {
                 label: label.to_owned(),
                 reply,
             })
-            .map_err(|_| NetError::Closed(CloseReason::PipeClosed))?;
-        rx.await
-            .map_err(|_| NetError::Closed(CloseReason::PipeClosed))?
+            .map_err(|_| self.gone())?;
+        rx.await.map_err(|_| self.gone())?
+    }
+
+    /// The error for a request the driver can no longer take: the reason
+    /// the connection closed.
+    fn gone(&self) -> NetError {
+        NetError::Closed(match self.status.borrow().clone() {
+            ConnStatus::Closed(reason) => reason,
+            _ => CloseReason::PipeClosed,
+        })
     }
 
     /// The next stream the peer opened. `None` once the connection closed.
@@ -440,11 +484,13 @@ pub(crate) fn spawn<P: Pipe>(
     cmd_rx: mpsc::UnboundedReceiver<Cmd>,
 ) -> Connection {
     let (status_tx, status_rx) = watch::channel(ConnStatus::Pending);
+    let (closing_tx, _) = watch::channel(false);
     let (accept_tx, accept_rx) = mpsc::unbounded_channel();
     let connection = Connection {
         id: start.conn,
         peer: start.peer,
         kx_group: start.kx_group.clone(),
+        deadline: start.deadline,
         cmd: cmd_tx.clone(),
         status: status_rx,
         incoming: tokio::sync::Mutex::new(accept_rx),
@@ -456,6 +502,7 @@ pub(crate) fn spawn<P: Pipe>(
         role,
         cmd_tx,
         status: status_tx,
+        closing: closing_tx,
         accept: accept_tx,
         streams: HashMap::new(),
         blocked: Vec::new(),
@@ -473,6 +520,7 @@ struct Driver {
     role: Box<dyn Role>,
     cmd_tx: mpsc::UnboundedSender<Cmd>,
     status: watch::Sender<ConnStatus>,
+    closing: watch::Sender<bool>,
     accept: mpsc::UnboundedSender<MuxStream>,
     streams: HashMap<u32, mpsc::UnboundedSender<StreamEvent>>,
     blocked: Vec<(StreamId, oneshot::Sender<Result<(), NetError>>)>,
@@ -506,7 +554,7 @@ impl Driver {
     async fn run<P: Pipe>(mut self, tls: TlsStream<P>, mut cmd_rx: mpsc::UnboundedReceiver<Cmd>) {
         let (mut rd, wr) = tokio::io::split(tls);
         let (wtx, wrx) = mpsc::channel::<Vec<u8>>(16);
-        let writer = tokio::spawn(writer_task(wr, wrx));
+        let writer = tokio::spawn(writer_task(wr, wrx, self.clock.clone(), self.deadline));
 
         let hello = ControlMessage::Hello {
             major_version: VersionSupport::LOCAL.major,
@@ -521,6 +569,16 @@ impl Driver {
         let mut inbuf: Vec<u8> = Vec::new();
         let mut pending: Option<Vec<u8>> = None;
         loop {
+            if self.expired() {
+                self.close(ErrorCode::CertExpired);
+                // A frame taken before the deadline does not go out after it.
+                if pending.as_deref().is_some_and(|f| !is_goaway(f)) {
+                    pending = None;
+                }
+            }
+            if self.reason.is_some() || self.mux.is_closing() {
+                self.mark_closing();
+            }
             if pending.is_none() {
                 pending = self.mux.poll_transmit(self.clock.mono());
             }
@@ -568,6 +626,7 @@ impl Driver {
             }
         }
 
+        self.mark_closing();
         let reason = self.reason.clone().unwrap_or(CloseReason::PipeClosed);
         for (_, tx) in self.streams.drain() {
             let _ = tx.send(StreamEvent::ConnectionClosed(reason.clone()));
@@ -601,9 +660,35 @@ impl Driver {
         if let Err(e) = self.mux.on_timeout(self.clock.mono()) {
             self.reason.get_or_insert(CloseReason::Local(e.code));
         }
-        if self.clock.now() > self.deadline {
+        if self.expired() {
             self.close(ErrorCode::CertExpired);
         }
+    }
+
+    /// Past the effective deadline: the connection may run through that
+    /// second and no further.
+    fn expired(&self) -> bool {
+        self.clock.now() > self.deadline
+    }
+
+    fn mark_closing(&self) {
+        self.closing
+            .send_if_modified(|closing| !std::mem::replace(closing, true));
+    }
+
+    /// At or past the deadline: close, and return the error for a refused
+    /// open or send.
+    fn refuse_if_expired(&mut self) -> Option<NetError> {
+        if !self.expired() {
+            return None;
+        }
+        self.close(ErrorCode::CertExpired);
+        self.mark_closing();
+        Some(NetError::Closed(
+            self.reason
+                .clone()
+                .unwrap_or(CloseReason::Local(ErrorCode::CertExpired)),
+        ))
     }
 
     fn close(&mut self, code: ErrorCode) {
@@ -632,7 +717,9 @@ impl Driver {
                 label,
                 reply,
             } => {
-                let result = if self.mux.is_closing() {
+                let result = if let Some(e) = self.refuse_if_expired() {
+                    Err(e)
+                } else if self.mux.is_closing() {
                     Err(NetError::Closed(
                         self.reason.clone().unwrap_or(CloseReason::PipeClosed),
                     ))
@@ -650,12 +737,18 @@ impl Driver {
                 stream,
                 bytes,
                 reply,
-            } => match self.mux.send(stream, &bytes) {
-                Ok(()) => self.blocked.push((stream, reply)),
-                Err(e) => {
-                    let _ = reply.send(Err(stream_err(e)));
+            } => {
+                if let Some(e) = self.refuse_if_expired() {
+                    let _ = reply.send(Err(e));
+                    return;
                 }
-            },
+                match self.mux.send(stream, &bytes) {
+                    Ok(()) => self.blocked.push((stream, reply)),
+                    Err(e) => {
+                        let _ = reply.send(Err(stream_err(e)));
+                    }
+                }
+            }
             Cmd::Finish(stream) => {
                 let _ = self.mux.finish(stream);
             }
@@ -665,7 +758,9 @@ impl Driver {
             }
             Cmd::Release(stream, n) => self.mux.release(stream, n),
             Cmd::Control(message) => {
-                let _ = self.mux.send_control(message.encode());
+                if self.refuse_if_expired().is_none() {
+                    let _ = self.mux.send_control(message.encode());
+                }
             }
             Cmd::Close(code) => self.close(code),
             Cmd::Status(status) => {
@@ -711,10 +806,12 @@ impl Driver {
                 rx,
                 cmd: self.cmd_tx.clone(),
                 ended: None,
+                closing: self.closing.subscribe(),
             },
             writer: StreamWriter {
                 id,
                 cmd: self.cmd_tx.clone(),
+                closing: self.closing.subscribe(),
             },
             label,
             class,
@@ -724,6 +821,13 @@ impl Driver {
     fn process_inbound(&mut self, inbuf: &mut Vec<u8>) {
         loop {
             if self.mux.is_closing() {
+                inbuf.clear();
+                return;
+            }
+            // Nothing is accepted after the deadline, even if the timer has
+            // not fired yet.
+            if self.expired() {
+                self.close(ErrorCode::CertExpired);
                 inbuf.clear();
                 return;
             }
@@ -840,8 +944,22 @@ fn stream_err(e: StreamError) -> NetError {
     }
 }
 
-async fn writer_task<P: Pipe>(mut wr: WriteHalf<TlsStream<P>>, mut rx: mpsc::Receiver<Vec<u8>>) {
+fn is_goaway(frame: &[u8]) -> bool {
+    frame.get(4) == Some(&frame_type::GOAWAY)
+}
+
+/// Writes frames in order. Past the deadline it writes only `GOAWAY`: frames
+/// handed over just before the deadline are dropped.
+async fn writer_task<P: Pipe>(
+    mut wr: WriteHalf<TlsStream<P>>,
+    mut rx: mpsc::Receiver<Vec<u8>>,
+    clock: Arc<dyn Clock>,
+    deadline: UnixTime,
+) {
     while let Some(frame) = rx.recv().await {
+        if clock.now() > deadline && !is_goaway(&frame) {
+            continue;
+        }
         if wr.write_all(&frame).await.is_err() {
             return;
         }

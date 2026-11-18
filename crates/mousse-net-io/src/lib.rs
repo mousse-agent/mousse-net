@@ -16,7 +16,8 @@
 //!   locks, kept port and profile id.
 //! - [`keystore`] and [`store`]: the identity key and the local state files.
 //! - [`discovery`]: mDNS with a rotating random instance name.
-#![forbid(unsafe_code)]
+// Only `private` (the Windows security calls) may use unsafe code.
+#![deny(unsafe_code)]
 
 pub mod caller;
 pub mod certs;
@@ -28,11 +29,12 @@ mod error;
 pub mod host;
 pub mod keystore;
 pub mod pipe;
+pub mod private;
 pub mod rng;
 pub mod store;
 pub mod tls;
 
-pub use caller::{Caller, CodeEntry, JoinOutcome, NoCode};
+pub use caller::{Caller, CodeEntry, JoinOutcome, NoCode, PathEvent};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use conn::{CloseReason, ConnStatus, Connection, MuxStream, StreamReader, StreamWriter};
 pub use endpoint::{Endpoint, PortChoice};

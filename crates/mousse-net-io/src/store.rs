@@ -86,13 +86,12 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), NetError> {
             options.mode(0o600);
         }
         let mut file = options.open(&tmp)?;
+        // Owner-only before any byte is written, wherever the folder is.
+        crate::private::restrict_file(&tmp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
-        fs::rename(&tmp, path)?;
-        #[cfg(unix)]
-        fs::File::open(dir)?.sync_all()?;
-        Ok(())
+        crate::private::replace_durably(&tmp, path)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
