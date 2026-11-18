@@ -58,7 +58,7 @@ Each party gets the following. A party MUST reject its own inputs if they break 
 | `PRS` | The pairing code: the 6 digits shown by the host, as ASCII bytes `0x30`–`0x39`. No spaces or separators; leading zeros are kept. | Not empty (`EmptyPassword`). CPace accepts any bytes here; the pairing layer MUST pass exactly the 6 digits. |
 | `CI` | The binding transcript ([`wire.md`](wire.md) 10.5): ticket hash, mode, version, the identities with their roles (initiator first), and the peer session's TLS exporter. | Opaque. Never sent. Both sides MUST build identical bytes. Any length. |
 | `sid` | The attempt's session id ([`wire.md`](wire.md) 10.5, "Session id"): 32 bytes, a hash of the attempt id and the peer session's TLS exporter. | At least 16 bytes (`SidTooShort`). Public. Identical on both sides. MUST NOT be reused across attempts (§10.9). |
-| `ADa`, `ADb` | Each party's associated data. Sent in clear inside its message. Mousse pairing sends both empty and refuses a share that carries AD (`Malformed`). | At most 4096 bytes (`AdTooLong`). |
+| `ADa`, `ADb` | Each party's associated data. Sent in clear inside its message. Mousse pairing MUST send both empty and refuses a share that carries AD (`Malformed`). AD support exists only so the draft's test vectors and Mousse's own framing vectors run; pairing never uses it. | At most 4096 bytes (`AdTooLong`). |
 
 Requirements on the pairing layer (from §10.1.1 and §10.1.2):
 
@@ -148,7 +148,7 @@ A receiver MUST reject a message, with `Malformed`, if:
 - `msg_b` doesn't have exactly 64 bytes after its AD;
 - `msg_c` isn't exactly 64 bytes.
 
-These rules give each share exactly one encoding. That matters because only byte-identical messages may be resent.
+These rules give each share exactly one encoding, so the bytes a transcript hashes are the bytes on the wire.
 
 A receiver MUST reject an undecodable or identity point with `InvalidPoint`, and a wrong tag with `ConfirmationFailed`.
 

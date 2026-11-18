@@ -41,8 +41,23 @@ profiles under the same OS user (see "Other people on the same computer").
 - An identity signature is bound to one SPKI. Reusing it with another session
   key fails (`identity_signature_invalid`).
 - Certificates live at most 24 h, are checked against their signed window
-  with ±10 min skew, and live connections close at the effective deadline.
-  A stolen session key is useful only until its certificate expires.
+  with ±10 min skew, and live connections close at the effective deadline,
+  also when the wall clock is set back (a monotonic cap). A stolen session
+  key is useful only until its certificate expires.
+- **Signing access is worth more than a session key.** Whoever can make the
+  identity key sign, even briefly (malware running as the user, an unlocked
+  keystore), can sign session records for any future window, and those
+  certificates stay usable after that access ends: each lives 24 h, but
+  nothing limits how far ahead its window starts. Only removing or denying
+  the device's grant on each host stops them. Hardware keys raise the bar
+  for copying the key, not for using it while the attacker runs on the
+  device.
+- **A cloned identity is one device.** A virtual machine clone, or a device
+  restored from a backup that includes the identity key, holds the same key
+  as the original. Hosts cannot tell the copies apart: both pass step 1 and
+  both use the same grant. Removing or denying that grant removes both. A
+  copy that should be its own device needs a new identity key and a new
+  pairing.
 
 ### Using a host without a grant
 
@@ -75,12 +90,21 @@ profiles under the same OS user (see "Other people on the same computer").
 - Each code guess is a full online exchange; CPace gives an attacker no
   offline test.
 - The host allows 3 attempts per invitation across all routes, and the joiner
-  allows 3 per code-entry flow. Both debit before any exchange work, so
-  aborting or dropping the connection does not refund an attempt. A new TLS
-  session is a new attempt.
+  allows 3 per ticket, kept in a stored record so that reopening the link or
+  restarting the app does not reset them. Both debit before any exchange
+  work, so aborting or dropping the connection does not refund an attempt.
+  A new TLS session is a new attempt.
 - Each attempt uses a fresh code, so a failed guess says nothing about the
   next one.
-- Chance of one invitation falling to guessing: at most 3 in 1 000 000.
+- Two parties can guess. A ticket holder guesses at the real host: 3 guesses
+  per invitation. A fake host behind a swapped link guesses at the code the
+  user types into the joiner: 3 more guesses per link the user opens, since
+  the joiner's own count is per ticket. Chance that one invitation and its
+  link fall to guessing: at most 6 in 1 000 000.
+- When a code the user typed exactly as shown fails, the joiner says that
+  the link may have been swapped and asks for a new one by another way
+  ([`wire.md`](wire.md) 10.6 rule 6), so the user does not keep feeding a
+  fake host guesses with fresh links from the same channel.
 
 ### Fake host
 
@@ -91,6 +115,13 @@ profiles under the same OS user (see "Other people on the same computer").
   identities.
 - A fake host can use up the joiner's local attempts. It cannot spend the
   real host's attempts, because each side counts its own.
+- A swapped link cannot claim "in person" to skip the code: the joiner
+  accepts an in-person ticket only from the app's own scanner, reading the
+  host's screen ([`wire.md`](wire.md) 10.1).
+- A swapped link cannot make the joiner believe "already paired" unless the
+  joiner already pinned that host before ([`wire.md`](wire.md) 10.6 rule 8).
+- A fake host learns the joiner's identity key and computer name before the
+  code fails ([`privacy.md`](privacy.md)).
 
 ### Other people on the same computer
 
@@ -139,3 +170,7 @@ key, grants and denials, invitations, pins and listener.
 - CPace may be **DEFERRED** in Phase 0. Until it passes review, "Send link"
   is not enabled.
 - Software identity keys on desktops are protected by the OS keystore only.
+- Identity keys must sign without a user-presence prompt while the device is
+  unlocked ([`wire.md`](wire.md) 4.1), so that renewal works; a hardware key
+  therefore protects against copying, not against use by code running as
+  the user.
