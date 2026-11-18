@@ -14,7 +14,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use mousse_net_core::identity::{
-    IdentityPublicKey, IdentitySigner, RawSignature, SignerError, SoftwareKey,
+    IdentityPublicKey, IdentityRecord, IdentitySigner, RawSignature, SignerError, SoftwareKey,
 };
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
@@ -86,8 +86,8 @@ impl IdentitySigner for StoredIdentity {
         self.key.public_key()
     }
 
-    fn sign(&self, message: &[u8]) -> Result<RawSignature, SignerError> {
-        Ok(self.key.sign_raw(message))
+    fn sign(&self, record: &IdentityRecord) -> Result<RawSignature, SignerError> {
+        Ok(self.key.sign_raw(record.as_bytes()))
     }
 }
 
@@ -274,8 +274,19 @@ mod tests {
         let loaded = store.load(true).unwrap();
         assert_eq!(loaded.public_key(), created.public_key());
         assert_eq!(store.public_key().unwrap(), created.public_key());
-        let sig = loaded.sign(b"m").unwrap();
-        created.public_key().verify(b"m", &sig).unwrap();
+        let pending = mousse_net_core::session_cert::PendingCertificate::new(
+            mousse_net_core::session_cert::SessionKey::generate(&mut os_rng()),
+            mousse_net_core::session_cert::ValidityWindow::starting_at(
+                mousse_net_core::time::UnixTime(1_800_000_000),
+                3_600,
+            )
+            .unwrap(),
+        );
+        let sig = loaded.sign(pending.record()).unwrap();
+        created
+            .public_key()
+            .verify(pending.record().as_bytes(), &sig)
+            .unwrap();
         store.delete().unwrap();
         assert!(!store.exists());
         fs::remove_dir_all(&dir).unwrap();

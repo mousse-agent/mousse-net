@@ -10,7 +10,7 @@
 //!
 //! [`verify`] checks, in this order: structure, version, keys, raw signature
 //! form, window length, self-signature, identity signature over this SPKI,
-//! the validity window with ±10 min skew, and the expected pin.
+//! the expected pin, and the validity window with ±10 min skew.
 
 use std::fmt;
 
@@ -21,8 +21,8 @@ use zeroize::Zeroizing;
 use crate::asn1::{self, Reader};
 use crate::cbor::{self, Value};
 use crate::identity::{
-    IdentityPublicKey, IdentitySigner, KeyError, PublicKey, RawSignature, SignatureError,
-    SignerError, SoftwareKey, PUBLIC_KEY_LEN,
+    IdentityPublicKey, IdentityRecord, IdentitySigner, KeyError, PublicKey, RawSignature,
+    SignatureError, SignerError, SoftwareKey, PUBLIC_KEY_LEN,
 };
 use crate::time::{UnixTime, CLOCK_SKEW_SECS};
 use crate::PROTOCOL_VERSION;
@@ -268,7 +268,7 @@ impl SessionKey {
 pub struct PendingCertificate {
     key: SessionKey,
     window: ValidityWindow,
-    record: Vec<u8>,
+    record: IdentityRecord,
 }
 
 impl PendingCertificate {
@@ -283,12 +283,13 @@ impl PendingCertificate {
         Self {
             key,
             window,
-            record,
+            record: IdentityRecord::new(SESSION_DOMAIN, record),
         }
     }
 
-    /// The exact bytes the identity key must sign (ECDSA P-256, SHA-256).
-    pub fn record(&self) -> &[u8] {
+    /// The record the identity key must sign (ECDSA P-256, SHA-256 over
+    /// [`IdentityRecord::as_bytes`]).
+    pub fn record(&self) -> &IdentityRecord {
         &self.record
     }
 
@@ -300,7 +301,7 @@ impl PendingCertificate {
         signature: RawSignature,
     ) -> Result<SessionCertificate, CertError> {
         identity
-            .verify(&self.record, &signature)
+            .verify(self.record.as_bytes(), &signature)
             .map_err(|_| CertError::IdentitySignatureInvalid)?;
         let der = build_certificate(
             &self.key,
@@ -456,13 +457,16 @@ pub fn verify(
     #[cfg(mousse_control = "break-session-cert")]
     let _ = (&record, &identity_signature);
 
-    if !window.accepts(now) {
-        return Err(CertError::OutsideWindow);
-    }
+    // The pin comes before the window: a foreign endpoint on a candidate
+    // address must read as "not this peer, try the next address", never as
+    // a clock problem.
     if let Some(expected) = expected_identity {
         if *expected != identity {
             return Err(CertError::PinMismatch);
         }
+    }
+    if !window.accepts(now) {
+        return Err(CertError::OutsideWindow);
     }
     Ok(VerifiedSessionCert {
         identity,
@@ -892,6 +896,21 @@ mod tests {
         let c = cert(&identity(1), 2);
         assert_eq!(
             verify(c.der(), T0, Some(&identity(9).public_key())),
+            Err(CertError::PinMismatch)
+        );
+    }
+
+    #[test]
+    fn pin_is_checked_before_the_window() {
+        // A foreign endpoint whose certificate is also out of its window
+        // must still read as "not this peer".
+        let c = cert(&identity(1), 2);
+        assert_eq!(
+            verify(
+                c.der(),
+                T0.plus(10 * 86_400),
+                Some(&identity(9).public_key())
+            ),
             Err(CertError::PinMismatch)
         );
     }

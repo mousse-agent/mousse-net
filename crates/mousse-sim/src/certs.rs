@@ -20,12 +20,12 @@
 //! ## The verify cache
 //!
 //! Step 1 checks 1 to 8 are pure functions of the certificate bytes; only
-//! check 9 (window at `now`) and check 10 (pin) depend on the call. P-256 is
+//! check 9 (pin) and check 10 (window at `now`) depend on the call. P-256 is
 //! slow in debug builds, so by default the simulator runs core's full
 //! [`session_cert::verify`] once per certificate (at issue time, inside its
-//! window), keeps the result, and for each handshake applies check 9 with
-//! core's [`ValidityWindow::accepts`] and check 10 by comparing keys, in that
-//! order. `RunConfig::full_verify` turns the cache off; a test checks that
+//! window), keeps the result, and for each handshake applies check 9 by
+//! comparing keys and check 10 with core's [`ValidityWindow::accepts`], in
+//! that order. `RunConfig::full_verify` turns the cache off; a test checks that
 //! both paths agree.
 
 use std::cell::RefCell;
@@ -120,13 +120,13 @@ pub(crate) fn verify(
     let Some(cached) = VERIFIED.with(|v| v.borrow().get(der).cloned()) else {
         return session_cert::verify(der, now, pin);
     };
-    if !cached.window.accepts(now) {
-        return Err(CertError::OutsideWindow);
-    }
     if let Some(expected) = pin {
         if *expected != cached.identity {
             return Err(CertError::PinMismatch);
         }
+    }
+    if !cached.window.accepts(now) {
+        return Err(CertError::OutsideWindow);
     }
     Ok(cached)
 }

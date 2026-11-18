@@ -11,9 +11,15 @@
 //! A peer with no grant has [`JOIN_PROOF_WAIT_MS`] to send a `JOIN_PROOF`.
 //! Until then only `HELLO`, keepalive, `GOAWAY` and `JOIN_PROOF` are allowed.
 //!
+//! A granted peer may still send one `JOIN_PROOF`, before any stream: the
+//! host answers it, and a valid proof for an open invitation makes the
+//! connection join-only until enrollment replaces the grant.
+//!
 //! The caller has its own gate, [`CallerGate`]: it accepts nothing from the
 //! host on streams until the host has said `AUTHORIZED {live}` (or `PAIRED`
-//! has made a join-only connection live).
+//! has made a join-only connection live). A caller that sent a `JOIN_PROOF`
+//! takes a first `AUTHORIZED {live}` as step 2's notice and waits for the
+//! host's answer to the proof, which is the next `AUTHORIZED`.
 
 use crate::control::{AuthorizedState, ControlMessage};
 use crate::grants::{GrantId, GrantTable, Role};
@@ -130,6 +136,10 @@ pub struct ConnectionGate {
     conn: ConnectionId,
     peer: IdentityPublicKey,
     state: GateState,
+    /// A `JOIN_PROOF` was let through on this connection.
+    proof_seen: bool,
+    /// A stream frame was let through on this connection.
+    stream_seen: bool,
 }
 
 impl ConnectionGate {
@@ -152,7 +162,13 @@ impl ConnectionGate {
             },
             Step2::Close(code) => GateState::Closed(code),
         };
-        Self { conn, peer, state }
+        Self {
+            conn,
+            peer,
+            state,
+            proof_seen: false,
+            stream_seen: false,
+        }
     }
 
     /// The connection.
@@ -192,11 +208,22 @@ impl ConnectionGate {
             (GateState::JoinOnly { .. }, Pairing) => Verdict::Allow,
             (GateState::JoinOnly { .. }, JoinProof) => Verdict::Close(ErrorCode::ProtocolError),
             (GateState::JoinOnly { .. }, Stream) => Verdict::Close(ErrorCode::NotAuthorized),
-            // A device that is already granted may still send a proof or a
-            // late pairing message; they mean nothing on a live connection.
-            (GateState::Live { .. }, JoinProof | Pairing) => Verdict::Ignore,
+            // A granted device may send one proof, before any stream: the
+            // host answers it, and a valid one starts a pairing that
+            // replaces the grant (wire.md 8).
+            (GateState::Live { .. }, JoinProof) if !self.proof_seen && !self.stream_seen => {
+                Verdict::Allow
+            }
+            (GateState::Live { .. }, JoinProof) => Verdict::Close(ErrorCode::ProtocolError),
+            // A late pairing message means nothing on a live connection.
+            (GateState::Live { .. }, Pairing) => Verdict::Ignore,
             (GateState::Live { .. }, Stream) => Verdict::Allow,
         };
+        match (verdict, traffic) {
+            (Verdict::Allow, JoinProof) => self.proof_seen = true,
+            (Verdict::Allow, Stream) => self.stream_seen = true,
+            _ => {}
+        }
         if let Verdict::Close(code) = verdict {
             self.state = GateState::Closed(code);
         }
@@ -204,9 +231,13 @@ impl ConnectionGate {
     }
 
     /// The pairing state machine admitted this connection
-    /// ([`crate::pairing::HostAction::AdmittedJoinOnly`]).
+    /// ([`crate::pairing::HostAction::AdmittedJoinOnly`]), from awaiting a
+    /// proof or from live (a granted device pairing again).
     pub fn admit_join_only(&mut self, invitation: InvitationId) {
-        if matches!(self.state, GateState::AwaitingJoinProof { .. }) {
+        if matches!(
+            self.state,
+            GateState::AwaitingJoinProof { .. } | GateState::Live { .. }
+        ) {
             self.state = GateState::JoinOnly { invitation };
         }
     }
@@ -289,6 +320,10 @@ impl CallerTraffic {
 pub enum CallerGateState {
     /// Waiting for the host's `AUTHORIZED`.
     AwaitingAuthorization,
+    /// This side sent a `JOIN_PROOF` and the host said `AUTHORIZED {live}`
+    /// from step 2; the host's answer to the proof is the next
+    /// `AUTHORIZED`. Nothing else but keepalive, `HELLO` and `GOAWAY` yet.
+    AwaitingProofAnswer,
     /// The host said join-only: pairing messages only.
     JoinOnly,
     /// The host said live, or pairing finished: normal channels.
@@ -303,6 +338,8 @@ pub enum CallerGateState {
 #[derive(Clone, Debug)]
 pub struct CallerGate {
     state: CallerGateState,
+    /// This side sent a `JOIN_PROOF` on this connection.
+    proof_sent: bool,
 }
 
 impl Default for CallerGate {
@@ -316,6 +353,20 @@ impl CallerGate {
     pub fn new() -> Self {
         Self {
             state: CallerGateState::AwaitingAuthorization,
+            proof_sent: false,
+        }
+    }
+
+    /// This side sent a `JOIN_PROOF`. Call it when the proof is queued,
+    /// before reading anything else from the host. A host that already
+    /// grants this device says `AUTHORIZED {live}` first and then answers
+    /// the proof with a second `AUTHORIZED`, so the connection is not live
+    /// until that answer.
+    pub fn sent_join_proof(&mut self) {
+        self.proof_sent = true;
+        // A `live` that was read before the proof went out is the notice.
+        if self.state == CallerGateState::Live {
+            self.state = CallerGateState::AwaitingProofAnswer;
         }
     }
 
@@ -340,6 +391,14 @@ impl CallerGate {
             (_, T::CallerOnly) => Verdict::Close(ErrorCode::ProtocolError),
             (S::AwaitingAuthorization, T::Authorized(state)) => {
                 self.state = match state {
+                    AuthorizedState::Live if self.proof_sent => S::AwaitingProofAnswer,
+                    AuthorizedState::Live => S::Live,
+                    AuthorizedState::JoinOnly => S::JoinOnly,
+                };
+                Verdict::Allow
+            }
+            (S::AwaitingProofAnswer, T::Authorized(state)) => {
+                self.state = match state {
                     AuthorizedState::Live => S::Live,
                     AuthorizedState::JoinOnly => S::JoinOnly,
                 };
@@ -350,7 +409,10 @@ impl CallerGate {
             // A late pairing message after enrollment means nothing.
             (S::Live, T::Pairing) => Verdict::Ignore,
             (S::Live, T::Stream) => Verdict::Allow,
-            (S::AwaitingAuthorization, T::Pairing | T::Paired | T::Stream)
+            (
+                S::AwaitingAuthorization | S::AwaitingProofAnswer,
+                T::Pairing | T::Paired | T::Stream,
+            )
             | (S::JoinOnly, T::Stream)
             | (S::Live, T::Paired) => Verdict::Close(ErrorCode::ProtocolError),
         };
@@ -491,6 +553,70 @@ mod tests {
             gate.check(CallerTraffic::Stream),
             Verdict::Close(ErrorCode::ProtocolError)
         );
+    }
+
+    #[test]
+    fn a_granted_device_may_send_one_proof_before_any_stream() {
+        let mut grants = table_with(1);
+        let mut gate = ConnectionGate::open(ConnectionId(7), id(1), &mut grants, NOW, Millis(0));
+        assert_eq!(gate.check(Traffic::JoinProof), Verdict::Allow);
+        assert_eq!(
+            gate.check(Traffic::JoinProof),
+            Verdict::Close(ErrorCode::ProtocolError)
+        );
+
+        let mut gate = ConnectionGate::open(ConnectionId(8), id(1), &mut grants, NOW, Millis(0));
+        assert_eq!(gate.check(Traffic::Stream), Verdict::Allow);
+        assert_eq!(
+            gate.check(Traffic::JoinProof),
+            Verdict::Close(ErrorCode::ProtocolError)
+        );
+
+        // A valid proof for an open invitation: the live connection becomes
+        // pairing only until enrollment.
+        let mut gate = ConnectionGate::open(ConnectionId(9), id(1), &mut grants, NOW, Millis(0));
+        assert_eq!(gate.check(Traffic::JoinProof), Verdict::Allow);
+        gate.admit_join_only(InvitationId([0; 16]));
+        assert!(matches!(gate.state(), GateState::JoinOnly { .. }));
+        assert_eq!(
+            gate.check(Traffic::Stream),
+            Verdict::Close(ErrorCode::NotAuthorized)
+        );
+    }
+
+    #[test]
+    fn a_caller_that_sent_a_proof_waits_for_its_answer() {
+        let live = CallerTraffic::Authorized(AuthorizedState::Live);
+        let join_only = CallerTraffic::Authorized(AuthorizedState::JoinOnly);
+        // Step 2's live, then the answer.
+        for answer in [live, join_only] {
+            let mut gate = CallerGate::new();
+            gate.sent_join_proof();
+            assert_eq!(gate.check(live), Verdict::Allow);
+            assert_eq!(gate.state(), CallerGateState::AwaitingProofAnswer);
+            assert!(!gate.is_live());
+            assert_eq!(gate.check(answer), Verdict::Allow);
+            assert_eq!(gate.is_live(), answer == live);
+        }
+        // Read before the proof went out: still only the notice.
+        let mut gate = CallerGate::new();
+        assert_eq!(gate.check(live), Verdict::Allow);
+        gate.sent_join_proof();
+        assert_eq!(gate.state(), CallerGateState::AwaitingProofAnswer);
+        // The host opens nothing before the answer.
+        for traffic in [
+            CallerTraffic::Stream,
+            CallerTraffic::Pairing,
+            CallerTraffic::Paired,
+        ] {
+            let mut gate = CallerGate::new();
+            gate.sent_join_proof();
+            gate.check(live);
+            assert_eq!(
+                gate.check(traffic),
+                Verdict::Close(ErrorCode::ProtocolError)
+            );
+        }
     }
 
     #[test]

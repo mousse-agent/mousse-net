@@ -41,9 +41,6 @@ pub(crate) struct WorkRecord {
     /// Host: pairing instance (changes on restart). Joiner: state machine
     /// instance (one per `JoinerPairing` value).
     pub instance: u64,
-    /// Joiner only: the user-level code-entry flow. Reconnects stay in the
-    /// same flow; a device restart starts a new one.
-    pub flow: u64,
     /// Initiator (joiner) or responder (host).
     pub role: ExchangeRole,
     /// The binding transcript (it contains the ticket hash).
@@ -58,17 +55,15 @@ pub(crate) struct CountingFactory {
     inner: ExchangeImpl,
     dev: usize,
     instance: u64,
-    flow: u64,
     log: WorkLog,
 }
 
 impl CountingFactory {
-    pub(crate) fn new(dev: usize, instance: u64, flow: u64, log: WorkLog) -> Self {
+    pub(crate) fn new(dev: usize, instance: u64, log: WorkLog) -> Self {
         Self {
             inner: new_exchange_impl(),
             dev,
             instance,
-            flow,
             log,
         }
     }
@@ -88,7 +83,6 @@ impl CodeExchangeFactory for CountingFactory {
         self.log.borrow_mut().push(WorkRecord {
             dev: self.dev,
             instance: self.instance,
-            flow: self.flow,
             role,
             transcript: binding.as_bytes().to_vec(),
         });

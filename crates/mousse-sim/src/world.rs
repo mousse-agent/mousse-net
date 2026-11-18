@@ -520,10 +520,11 @@ impl World {
         let nb = cert.window().not_before().secs();
         let na = cert.window().not_after().secs();
         let n = now.secs();
-        let expected = if n + CLOCK_SKEW_SECS < nb || n > na + CLOCK_SKEW_SECS {
-            Err(CertError::OutsideWindow)
-        } else if pin.is_some_and(|p| p != *cert.identity()) {
+        // The pin comes before the window (wire.md 5.4, checks 9 and 10).
+        let expected = if pin.is_some_and(|p| p != *cert.identity()) {
             Err(CertError::PinMismatch)
+        } else if n + CLOCK_SKEW_SECS < nb || n > na + CLOCK_SKEW_SECS {
+            Err(CertError::OutsideWindow)
         } else {
             Ok(())
         };

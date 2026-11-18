@@ -58,8 +58,40 @@
       }
     ]
   },
+  "clock_rollback": {
+    "description": "A fresh replay of the same path. The wall clock is set back to just after authentication and stays there, while the monotonic clock keeps running. The path still closes when the monotonic time left at authentication runs out: at (deadline + 1 - authenticated_at) x 1000 ms. Replay: begin_path(1), on_authenticated(1, ...), on_reopened(1) as above, then tick at each `now` and `mono_ms`.",
+    "mono_deadline_ms": 43741000,
+    "ticks": [
+      {
+        "events": [],
+        "mono_ms": 43740000,
+        "now": 1790003661
+      },
+      {
+        "events": [],
+        "mono_ms": 43740999,
+        "now": 1790003661
+      },
+      {
+        "events": [
+          {
+            "code": "cert_expired",
+            "conn": 1,
+            "event": "close"
+          }
+        ],
+        "mono_ms": 43741000,
+        "now": 1790003661
+      },
+      {
+        "events": [],
+        "mono_ms": 43742000,
+        "now": 1790003662
+      }
+    ]
+  },
   "deadline": 1790047400,
-  "description": "A live path closes with cert_expired at the first second after the effective deadline (earlier not_after + 600). Renewal is due 1800 s before the earlier not_after; while no new path with a later renewal time is current it is asked for again after 30 s, then 60, 120, 240 and every 300 s, until the deadline. Replay: begin_path(1), on_authenticated(1, verify(peer_certificate, authenticated_at, pin), local window, authenticated_at), on_reopened(1), then tick at each `now`.",
+  "description": "A live path closes with cert_expired at the first second after the effective deadline (earlier not_after + 600). Renewal is due 1800 s before the earlier not_after; while no new path with a later renewal time is current it is asked for again after 30 s, then 60, 120, 240 and every 300 s, until the deadline. Replay: begin_path(1), on_authenticated(1, verify(peer_certificate, authenticated_at, pin), local window, authenticated_at, monotonic 0 ms), on_reopened(1), then tick at each `now`. Monotonic clock: a tick (or a later on_authenticated) without `mono_ms` reads (now - authenticated_at) x 1000 ms, as if no one touched the wall clock.",
   "local_window": {
     "not_after": 1790046800,
     "not_before": 1790003600

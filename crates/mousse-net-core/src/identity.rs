@@ -229,16 +229,64 @@ impl fmt::Display for SignerError {
 
 impl std::error::Error for SignerError {}
 
+/// Every domain string an identity key may sign under (spec `wire.md` 4.1).
+/// A new signed record needs a new, unique entry here.
+pub const IDENTITY_DOMAINS: [&str; 1] = [crate::session_cert::SESSION_DOMAIN];
+
+/// A record the identity key is allowed to sign: canonical CBOR, a map
+/// whose key 1 is one of [`IDENTITY_DOMAINS`].
+///
+/// Only this crate builds these (today: the session record of a
+/// [`crate::session_cert::PendingCertificate`]), so an identity key held
+/// behind [`IdentitySigner`] can never be asked to sign arbitrary bytes.
+#[derive(Clone, PartialEq, Eq)]
+pub struct IdentityRecord {
+    domain: &'static str,
+    bytes: Vec<u8>,
+}
+
+impl IdentityRecord {
+    /// Wrap a record built by this crate. `bytes` MUST be a canonical CBOR
+    /// map whose key 1 is `domain`.
+    pub(crate) fn new(domain: &'static str, bytes: Vec<u8>) -> Self {
+        debug_assert!(IDENTITY_DOMAINS.contains(&domain));
+        Self { domain, bytes }
+    }
+
+    /// The domain string at key 1.
+    pub fn domain(&self) -> &'static str {
+        self.domain
+    }
+
+    /// The exact bytes to sign (ECDSA P-256, SHA-256).
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl fmt::Debug for IdentityRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "IdentityRecord({}, {} bytes)",
+            self.domain,
+            self.bytes.len()
+        )
+    }
+}
+
 /// Something that holds an identity private key: a hardware key store, a
 /// WebCrypto key, or [`SoftwareIdentityKey`].
 ///
-/// `sign` is ECDSA P-256 with SHA-256 over `message`. Implementations that
-/// get DER from their platform convert it with [`RawSignature::from_der`].
+/// `sign` is ECDSA P-256 with SHA-256 over the record's bytes.
+/// Implementations that get DER from their platform convert it with
+/// [`RawSignature::from_der`]. The identity key signs nothing else: it takes
+/// only typed [`IdentityRecord`]s, never raw bytes.
 pub trait IdentitySigner {
     /// The identity public key.
     fn public_key(&self) -> IdentityPublicKey;
-    /// Sign `message` (the signer hashes it with SHA-256).
-    fn sign(&self, message: &[u8]) -> Result<RawSignature, SignerError>;
+    /// Sign `record` (the signer hashes its bytes with SHA-256).
+    fn sign(&self, record: &IdentityRecord) -> Result<RawSignature, SignerError>;
 }
 
 /// A software P-256 key. Used for identity keys where no hardware store
@@ -299,8 +347,8 @@ impl IdentitySigner for SoftwareKey {
         SoftwareKey::public_key(self)
     }
 
-    fn sign(&self, message: &[u8]) -> Result<RawSignature, SignerError> {
-        Ok(self.sign_raw(message))
+    fn sign(&self, record: &IdentityRecord) -> Result<RawSignature, SignerError> {
+        Ok(self.sign_raw(record.as_bytes()))
     }
 }
 
