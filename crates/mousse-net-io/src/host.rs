@@ -1154,6 +1154,7 @@ mod tests {
             limits: Limits::DEFAULT,
             clock: Arc::new(ManualClock::new()),
             ticket_identity: None,
+            streams: None,
         };
         let key = Arc::new(SoftwareKey::generate(&mut os_rng()));
         Host::new(key, config, CpaceExchangeFactory).unwrap()
