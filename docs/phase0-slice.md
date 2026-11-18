@@ -1,9 +1,14 @@
 # Phase 0 thin slice
 
-The thin slice pairs two machines in person, runs a terminal from one on the
-other, then removes the grant: the live terminal closes at once and the next
+The thin slice pairs two machines, runs a terminal from one on the other,
+then removes the grant: the live terminal closes at once and the next
 connection is refused. It runs on `mousse-net-io` and the `mousse-helper`
 binary.
+
+Pairing is in person by default: the host owner answers "Is the device next
+to you?". With a send link (`invite --link`) the host shows a 6-digit code,
+a fresh one for each attempt, and `join` asks for it; the code is checked
+with CPace, and three wrong codes end the invitation.
 
 ## On one machine
 
@@ -21,7 +26,15 @@ cargo test -p mousse-helper --test loopback --no-fail-fast
 - two endpoints on one computer stay separate: removing B's peer closes only
   B's channels, A's terminal stays open and A reconnects after a restart, and
   A's peer cannot reach B;
-- a second process for the same endpoint does not start.
+- a second process for the same endpoint does not start;
+- send link: the right code pairs; three wrong codes end the invitation, a
+  fresh code is shown for each attempt and the ended ticket is refused.
+
+The owner test kit runs the same suite and its controls:
+
+```
+mousse-check phase0 --only phase0.thin-slice-loopback
+```
 
 ### Must-fail controls
 
@@ -31,11 +44,11 @@ Each control is a compile-time cfg and only builds with debug assertions:
 RUSTFLAGS='--cfg mousse_control="skip-pin-check"' cargo test -p mousse-helper --test loopback --no-fail-fast
 ```
 
-| Control | Breaks | Tests that fail (of 4) |
+| Control | Breaks | Tests that fail (of 5) |
 |---|---|---|
-| `skip-pin-check` | the dialler accepts a host whose identity does not match the pin | rejections, two endpoints |
-| `keep-removed-grant` | removing a grant leaves it in force | pair and remove, two endpoints |
-| `shared-endpoint-state` | every endpoint on the machine uses one key and one grant table | rejections, two endpoints |
+| `skip-pin-check` | the dialler accepts a host whose identity does not match the pin | 2 |
+| `keep-removed-grant` | removing a grant leaves it in force | 2 |
+| `shared-endpoint-state` | every endpoint on the machine uses one key and one grant table | 3 |
 | `allow-break-env` | lets `serve` read `MOUSSE_HELPER_BREAK` (cross-machine control) | none on its own |
 
 Use a separate `CARGO_TARGET_DIR` for control builds.
@@ -70,7 +83,9 @@ mousse-helper --state ./mac-state --insecure-file-key remove 1
 
 ### Run on 2026-11-18
 
-Build `165425b+debug`, Windows 11 x64 dialling macOS 25.6 arm64.
+Build `165425b+debug`, Windows 11 x64 dialling macOS 25.6 arm64. The same
+run was repeated on the build with core's CPace, caller gate and HELLO
+negotiation; its result file goes to the owner test kit to be signed.
 
 PC:
 
