@@ -148,9 +148,90 @@ impl FlowRecords for BrokenRecords {
         Ok(None)
     }
 
-    fn save(&self, _: &JoinerRecord) -> Result<(), NetError> {
+    fn swap(&self, _: Option<&JoinerRecord>, _: &JoinerRecord) -> Result<(), NetError> {
         Err(NetError::Store("disk full".into()))
     }
+}
+
+/// Flow records on disk, in an app that is killed the moment the
+/// outcome-pending mark lands: that write is durable, and nothing after it
+/// happens.
+struct KilledAfterPendingMark(FlowRecordStore);
+
+impl FlowRecords for KilledAfterPendingMark {
+    fn load(&self, ticket_hash: &[u8; 32]) -> Result<Option<JoinerRecord>, NetError> {
+        self.0.load(ticket_hash)
+    }
+
+    fn swap(&self, expected: Option<&JoinerRecord>, record: &JoinerRecord) -> Result<(), NetError> {
+        self.0.swap(expected, record)?;
+        if record.outcome_pending && !expected.is_some_and(|e| e.outcome_pending) {
+            return Err(NetError::Store("the app was killed".into()));
+        }
+        Ok(())
+    }
+}
+
+/// The outcome-pending mark is stored before this side's confirmation goes
+/// out. If the app dies right after it lands, the confirmation never
+/// leaves and the host enrolls nothing; opening the link again with the
+/// stored record reconnects, learns that it is not enrolled, and pairs with
+/// the current code. The mark is cleared only once the pin is stored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_crash_between_the_pending_mark_and_the_confirmation_still_recovers() {
+    let dir = temp_dir("pending-crash");
+    let signer = new_signer();
+    let mut host = TestHost::start(new_signer()).await;
+    let ticket = host.invite_kind(InvitationKind::SendLink);
+    let store = FlowRecordStore::in_dir(&dir);
+    let mut shown = None;
+
+    let mut first = new_caller(signer.clone());
+    first.use_flow_records(Arc::new(KilledAfterPendingMark(FlowRecordStore::in_dir(
+        &dir,
+    ))));
+    let (asks, result) = link_join(&first, &mut host, &ticket, &mut shown, |shown| {
+        Some(shown.into())
+    })
+    .await;
+    assert_eq!(asks, vec![None]);
+    let err = result.map(|(_, outcome)| outcome).unwrap_err();
+    assert!(matches!(err, NetError::Store(_)), "{err:?}");
+    assert_eq!(
+        store.load(&ticket.hash()).unwrap(),
+        Some(JoinerRecord {
+            ticket_hash: ticket.hash(),
+            attempts_left: 2,
+            outcome_pending: true,
+        })
+    );
+    // The confirmation never went out.
+    assert!(host.host.grants().is_empty());
+    drop(first);
+    // The attempt drew the next code when it started.
+    shown = Some(host.next_code().await);
+
+    let second = caller_with_records(signer, &dir);
+    let (asks, result) = link_join(&second, &mut host, &ticket, &mut shown, |shown| {
+        Some(shown.into())
+    })
+    .await;
+    assert_eq!(asks, vec![None]);
+    let (_conn, outcome) = result.unwrap();
+    assert!(matches!(outcome, JoinOutcome::Paired(_)), "{outcome:?}");
+    assert!(!host.host.grants().is_empty());
+    assert!(store.load(&ticket.hash()).unwrap().unwrap().outcome_pending);
+    second.pin_stored(&ticket).unwrap();
+    assert_eq!(
+        store.load(&ticket.hash()).unwrap(),
+        Some(JoinerRecord {
+            ticket_hash: ticket.hash(),
+            attempts_left: 1,
+            outcome_pending: false,
+        })
+    );
+    host.stop().await;
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 /// The debit is saved before the attempt's first message goes out: when

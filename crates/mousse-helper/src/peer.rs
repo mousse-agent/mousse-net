@@ -252,6 +252,10 @@ pub async fn join(
                 side.peers()
                     .upsert(record.clone())
                     .map_err(|e| Failure::new(e.to_string(), "store"))?;
+                // The pin is stored: the join's outcome is no longer pending.
+                side.caller
+                    .pin_stored(ticket)
+                    .map_err(|e| Failure::new(e.to_string(), "store"))?;
                 side.caller
                     .remember_routes(ticket.host_identity, vec![route.clone()]);
                 return Ok((conn, record));

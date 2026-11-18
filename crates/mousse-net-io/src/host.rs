@@ -814,6 +814,7 @@ mod tests {
             role: Role::owner(),
             authorizing_owner: owner,
             expires_at: Some(expires_at),
+            enrolled_by: None,
         };
         lock(&host.shared).grants.add(grant, now).unwrap();
         let (a, b) = tokio::io::duplex(1 << 16);

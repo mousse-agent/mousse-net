@@ -28,14 +28,19 @@
 //! - The joiner believes an "in person" ticket only from the app's own
 //!   scanner: the app says how the ticket arrived ([`Arrival`]).
 //! - The joiner's flow record (code attempts left, outcome pending) is kept
-//!   in [`FlowRecords`] by ticket hash: loaded when a join starts, saved
-//!   after each debit before the attempt's first message goes out, and
-//!   whenever it changes or the flow ends. Reopening a link or restarting
-//!   the app therefore resets nothing.
+//!   in [`FlowRecords`] by ticket hash: loaded when a join starts and
+//!   written whenever the pairing state machine asks, as a compare-and-swap
+//!   that lands before anything that depends on it goes out (wire.md
+//!   10.7): the debit before the attempt's first message, the pending mark
+//!   before this side's confirmation. Reopening a link or restarting the
+//!   app therefore resets nothing, and a crash after the confirmation still
+//!   learns the outcome. The mark is cleared once the app has stored the
+//!   pin and called [`Caller::pin_stored`].
 //! - A caller that sent a `JOIN_PROOF` and has no answer 10 s later closes
-//!   the connection with `NOT_AUTHORIZED` (wire.md 8.2).
+//!   the connection with `NOT_AUTHORIZED` (wire.md 8.2), and the join ends
+//!   without reconnecting.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
@@ -47,8 +52,8 @@ use mousse_net_core::control::{AuthorizedState, ControlMessage};
 use mousse_net_core::identity::IdentityPublicKey;
 use mousse_net_core::mux::MuxRole;
 use mousse_net_core::pairing::{
-    Arrival, CodeExchangeFactory, CpaceExchangeFactory, InvitationKind, JoinerAction,
-    JoinerPairing, JoinerRecord, JoinerState, PairedHost, PairingCode, Ticket,
+    Arrival, CodeExchangeFactory, CpaceExchangeFactory, InvitationKind, JoinerAction, JoinerName,
+    JoinerPairing, JoinerState, PairedHost, PairingCode, Ticket,
 };
 use mousse_net_core::session::{PeerSession, SessionEvent};
 use mousse_net_core::session_cert::CertError;
@@ -150,6 +155,9 @@ pub struct Caller<F: CodeExchangeFactory + Clone = CpaceExchangeFactory> {
     paths: Arc<Mutex<Paths>>,
     next_conn: AtomicU64,
     records: Arc<dyn FlowRecords>,
+    /// Joins that ended paired with their outcome still marked pending,
+    /// by ticket hash, until the app says the pin is stored.
+    settling: Mutex<HashMap<[u8; 32], SharedJoiner<F>>>,
 }
 
 fn lock(paths: &Mutex<Paths>) -> MutexGuard<'_, Paths> {
@@ -160,38 +168,35 @@ fn lock(paths: &Mutex<Paths>) -> MutexGuard<'_, Paths> {
 struct Flow<F: CodeExchangeFactory> {
     pairing: JoinerPairing<F>,
     records: Arc<dyn FlowRecords>,
-    /// The record as last saved.
-    saved: Option<JoinerRecord>,
-    /// The flow ended and its record was saved since.
-    ended_saved: bool,
-    /// The last save that failed, reported if the join fails.
+    /// The last write that failed, reported if the join fails.
     save_failed: Option<String>,
 }
 
 impl<F: CodeExchangeFactory> Flow<F> {
-    /// Save the flow record if it changed since the last save, or once the
-    /// flow has ended. The one place a record is written, so a save the
-    /// pairing state machine asks for at another step moves here alone.
-    fn save(&mut self) -> Result<(), ()> {
-        let record = self.pairing.record();
-        let ended = matches!(
-            self.pairing.state(),
-            JoinerState::Paired | JoinerState::AlreadyPaired | JoinerState::Failed(_)
-        );
-        if self.saved == Some(record) && (!ended || self.ended_saved) {
-            return Ok(());
-        }
-        match self.records.save(&record) {
-            Ok(()) => {
-                self.saved = Some(record);
-                self.ended_saved = ended;
-                Ok(())
+    /// Carry out the record writes among `actions`, in order, each a
+    /// compare-and-swap (wire.md 10.7). The one place a record is written.
+    /// Returns the other actions; what a write held back comes out only
+    /// after it landed, and is dropped if it failed (the flow then ends).
+    fn run(&mut self, actions: Vec<JoinerAction>) -> Vec<JoinerAction> {
+        let mut queue: VecDeque<JoinerAction> = actions.into();
+        let mut out = Vec::new();
+        while let Some(action) = queue.pop_front() {
+            let JoinerAction::Persist { expected, record } = action else {
+                out.push(action);
+                continue;
+            };
+            let more = match self.records.swap(expected.as_ref(), &record) {
+                Ok(()) => self.pairing.on_persisted(),
+                Err(e) => {
+                    self.save_failed = Some(e.to_string());
+                    self.pairing.on_persist_failed()
+                }
+            };
+            for m in more.into_iter().rev() {
+                queue.push_front(m);
             }
-            Err(e) => {
-                self.save_failed = Some(e.to_string());
-                Err(())
-            }
         }
+        out
     }
 }
 
@@ -238,6 +243,7 @@ where
             paths: Arc::new(Mutex::new(Paths::default())),
             next_conn: AtomicU64::new(1),
             records: Arc::new(MemoryFlowRecords::default()),
+            settling: Mutex::new(HashMap::new()),
         }
     }
 
@@ -246,6 +252,31 @@ where
     /// endpoint state ([`crate::Endpoint::flow_records`]).
     pub fn use_flow_records(&mut self, records: Arc<dyn FlowRecords>) {
         self.records = records;
+    }
+
+    /// The app has durably stored the pin for the host of `ticket`, after a
+    /// join with it returned. Clears the join's outcome-pending mark, which
+    /// may go only once the result is stored (wire.md 10.7). Until this is
+    /// called the mark stays, so opening the ticket again asks the host
+    /// again; that is safe, only slower.
+    pub fn pin_stored(&self, ticket: &Ticket) -> Result<(), NetError> {
+        let flow = self
+            .settling
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&ticket.hash());
+        let Some(flow) = flow else {
+            return Ok(());
+        };
+        let mut flow = lock_joiner(&flow);
+        let actions = flow.pairing.on_pin_stored();
+        flow.run(actions);
+        match flow.save_failed.take() {
+            Some(e) => Err(NetError::Store(format!(
+                "the pairing record could not be saved: {e}"
+            ))),
+            None => Ok(()),
+        }
     }
 
     /// This device's identity.
@@ -545,8 +576,13 @@ where
     ///   after this side confirmed the code and before `PAIRED` arrived,
     ///   the join reconnects through it (a few times, with short waits) and
     ///   keeps the same pairing state, so the host's answer settles the
-    ///   outcome: `AUTHORIZED {live}` means the device has access now,
-    ///   reported as [`JoinOutcome::AlreadyPaired`].
+    ///   outcome: `PAIRED` means this invitation enrolled the device, and
+    ///   `AUTHORIZED {live}` means it has access that this invitation did
+    ///   not give (its role is not in effect), reported as
+    ///   [`JoinOutcome::AlreadyPaired`].
+    ///
+    /// After storing the pin for a successful join, call
+    /// [`Caller::pin_stored`].
     ///
     /// A refusal before dialing (an in-person ticket that did not come from
     /// the in-app scanner, this device's own ticket, an expired ticket, no
@@ -574,7 +610,12 @@ where
             ticket.clone(),
             arrival,
             self.identity(),
-            name.to_owned(),
+            // The app composes the name for the ticket's kind (wire.md
+            // 10.3), so it is passed through as is.
+            JoinerName {
+                computer: name.to_owned(),
+                profile: None,
+            },
             self.factory.clone(),
             stored.as_ref(),
             self.clock.now(),
@@ -584,15 +625,18 @@ where
         let joiner: SharedJoiner<F> = Arc::new(Mutex::new(Flow {
             pairing,
             records: self.records.clone(),
-            saved: stored,
-            ended_saved: false,
             save_failed: None,
         }));
         let result = self
             .join_redialling(pipe, ticket, &joiner, codes, redial)
             .await;
         let mut flow = lock_joiner(&joiner);
-        let _ = flow.save();
+        if result.is_ok() && flow.pairing.outcome_pending() {
+            self.settling
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(ticket.hash(), joiner.clone());
+        }
         match (result, flow.save_failed.take()) {
             (Err(_), Some(e)) => Err(NetError::Store(format!(
                 "the pairing record could not be saved: {e}"
@@ -652,11 +696,8 @@ where
         let (conn, stream, handshake) = self.handshake(pipe, pin).await?;
         let proof = {
             let mut flow = lock_joiner(joiner);
-            let proof = flow
-                .pairing
-                .on_connected(handshake.exporters, self.clock.now());
-            let _ = flow.save();
-            proof
+            flow.pairing
+                .on_connected(handshake.exporters, self.clock.now())
         };
         let proof = match proof {
             Ok(proof) => proof,
@@ -825,6 +866,8 @@ impl<F: CodeExchangeFactory> CallerRole<F> {
         for action in actions {
             match action {
                 JoinerAction::Send(message) => out.control.push(message),
+                // `Flow::run` carries out every write first.
+                JoinerAction::Persist { .. } => {}
                 JoinerAction::Paired(host) => {
                     self.gate.promote();
                     out.status = Some(ConnStatus::Paired(host));
@@ -864,6 +907,15 @@ where
 
     fn on_wake(&mut self, mono: Millis, out: &mut Outbox) {
         if self.awaiting_answer() && self.answer_due.is_some_and(|due| mono >= due) {
+            // The flow ends here, also while it learns a pending outcome:
+            // the join does not reconnect (wire.md 10.6 rule 7).
+            if let Some(joiner) = self.joiner.clone() {
+                let mut flow = lock_joiner(&joiner);
+                let actions = flow.pairing.on_proof_timeout();
+                let actions = flow.run(actions);
+                drop(flow);
+                self.joiner_actions(actions, out);
+            }
             self.gate.close(ErrorCode::NotAuthorized);
             out.close = Some(ErrorCode::NotAuthorized);
         }
@@ -917,8 +969,8 @@ where
             ControlMessage::CodeAbort { attempt, .. } => joiner.on_code_abort(attempt),
             _ => vec![JoinerAction::Failed(ErrorCode::ProtocolError)],
         };
-        // A failed save is reported when the join ends; the flow goes on.
-        let _ = flow.save();
+        // Writes land before what they hold; a failed one ends the flow.
+        let actions = flow.run(actions);
         drop(flow);
         self.joiner_actions(actions, out);
     }
@@ -930,10 +982,7 @@ where
                 match flow.pairing.submit_code(&code, &mut os_rng()) {
                     // The debit is saved before the attempt's first message
                     // goes out; without that save the message never does.
-                    Ok(actions) => match flow.save() {
-                        Ok(()) => actions,
-                        Err(()) => vec![JoinerAction::Failed(ErrorCode::InternalError)],
-                    },
+                    Ok(actions) => flow.run(actions),
                     Err(e) => vec![JoinerAction::Failed(
                         e.code().unwrap_or(ErrorCode::ProtocolError),
                     )],
@@ -951,8 +1000,8 @@ where
     fn on_closed(&mut self, reason: &CloseReason) {
         if let Some(joiner) = &self.joiner {
             let mut flow = lock_joiner(joiner);
-            let _ = flow.pairing.on_closed(reason.code());
-            let _ = flow.save();
+            let actions = flow.pairing.on_closed(reason.code());
+            flow.run(actions);
         }
         self.gate.close(reason.code().unwrap_or(ErrorCode::NoError));
         let mut paths = lock(&self.paths);

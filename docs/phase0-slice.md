@@ -27,9 +27,18 @@ with CPace, and three wrong codes end the invitation.
   owner-only state (`joins/<ticket hash>.cbor`), so closing the helper and
   opening the link again does not give three new tries. Each attempt is
   saved before its first message goes out; if the save fails, nothing is
-  sent.
+  sent. The record also marks the outcome pending before this side's
+  confirmation goes out and keeps the mark until the host's pin is stored,
+  so a helper killed mid-pairing learns the outcome when the link is
+  opened again. Two joins with one link take turns on the record; the
+  second to write ends with a store error instead of reusing an attempt.
+- After a lost `PAIRED`, the host answers the reconnected join with
+  `PAIRED` again when this invitation made its grant; a plain "live"
+  answer means the device already had access and the invitation's role is
+  not in effect.
 - After sending its join proof the joiner waits 10 s for the host's answer,
-  then closes with `NOT_AUTHORIZED`.
+  then closes with `NOT_AUTHORIZED` and the join ends, also while it is
+  learning a lost `PAIRED`; opening the link again asks again.
 - Any certificate failure on a candidate address means "try the next one".
   An error shows only when no address passed, the clock message (the
   certificate is outside its time window) first. Another device at an

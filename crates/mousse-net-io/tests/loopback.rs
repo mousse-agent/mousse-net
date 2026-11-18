@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use common::*;
 use mousse_net_core::control::ControlMessage;
+use mousse_net_core::grants::Role;
 use mousse_net_core::mux::{Mux, MuxEvent, MuxRole, PriorityClass};
 use mousse_net_core::pairing::{
     Arrival, BindingTranscript, CodeExchange, CodeExchangeFactory, CpaceExchangeFactory,
@@ -732,8 +733,12 @@ async fn a_lost_paired_is_settled_by_reconnecting_with_the_same_join() {
     type_tx.send(code).unwrap();
     let (conn, outcome) = within("join", join).await.unwrap().unwrap();
     // The first connection lost PAIRED; the same join reconnected once and
-    // learned from AUTHORIZED {live} that the host enrolled it.
-    assert_eq!(outcome, JoinOutcome::AlreadyPaired);
+    // the host, whose grant this invitation made, answered the proof with
+    // PAIRED again.
+    assert!(
+        matches!(&outcome, JoinOutcome::Paired(h) if h.role == Role::owner()),
+        "{outcome:?}"
+    );
     assert_eq!(redials.load(Ordering::SeqCst), 1);
     assert!(host.grant_of(&caller.identity()).is_some());
     assert_echo(&mut open_echo(&conn).await, b"after the lost PAIRED").await;
@@ -772,10 +777,13 @@ async fn a_granted_device_pairs_again_by_link_and_already_paired_needs_a_pin() {
     assert_ne!(new, old);
     open_echo(&conn).await;
     drop(conn);
+    // The app stores the pin, which clears the outcome-pending mark. The
+    // pin is then lost.
+    caller.pin_stored(&ticket).unwrap();
 
-    // The invitation is consumed now, so a proof opens nothing and the host
-    // answers live. Without a pin from before, a send link must not end
-    // "already paired" on the host's word alone.
+    // The invitation is consumed now, so a proof opens nothing; the host
+    // answers with PAIRED from the grant's receipt. Without a pin from
+    // before, a send link must not end paired on the host's word alone.
     let pipe = connect_tcp(&host.route()).await.unwrap();
     let err = within(
         "join",
@@ -785,7 +793,7 @@ async fn a_granted_device_pairs_again_by_link_and_already_paired_needs_a_pin() {
     .unwrap_err();
     assert!(closed_with(&err, ErrorCode::PairingFailed), "{err}");
 
-    // With its earlier pin, it is already paired.
+    // With its earlier pin, the host's answer is believed.
     let pipe = connect_tcp(&host.route()).await.unwrap();
     let no_redial = || async { Err::<tokio::net::TcpStream, _>(NetError::Refused("none".into())) };
     let (conn, outcome) = within(
@@ -802,7 +810,7 @@ async fn a_granted_device_pairs_again_by_link_and_already_paired_needs_a_pin() {
     )
     .await
     .unwrap();
-    assert_eq!(outcome, JoinOutcome::AlreadyPaired);
+    assert!(matches!(outcome, JoinOutcome::Paired(_)), "{outcome:?}");
     open_echo(&conn).await;
     host.stop().await;
 }

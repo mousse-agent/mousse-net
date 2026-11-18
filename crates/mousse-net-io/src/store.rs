@@ -6,14 +6,14 @@
 //! the new contents. On Unix the files are readable by the owner only.
 
 use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use mousse_net_core::grants::{Denial, Grant, GrantId, GrantSource, GrantTable, OwnerRef, Role};
 use mousse_net_core::identity::IdentityPublicKey;
-use mousse_net_core::pairing::JoinerRecord;
+use mousse_net_core::pairing::{InvitationId, JoinerRecord};
 use mousse_net_core::UnixTime;
 use serde::{Deserialize, Serialize};
 
@@ -125,6 +125,11 @@ struct GrantRecord {
     authorizing_owner: String,
     granted_at: u64,
     expires_at: Option<u64>,
+    /// The enrollment receipt: the hex id of the invitation whose pairing
+    /// made this grant (wire.md 7). Absent for a grant made another way,
+    /// and in files written before receipts were kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    enrolled_by: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -193,6 +198,15 @@ impl GrantStore {
                 adopted_into: None,
                 granted_at: UnixTime(g.granted_at),
                 expires_at: g.expires_at.map(UnixTime),
+                enrolled_by: match g.enrolled_by {
+                    Some(text) => Some(InvitationId(
+                        unhex(&text)
+                            .ok()
+                            .and_then(|b| b.try_into().ok())
+                            .ok_or_else(|| bad("enrollment receipt"))?,
+                    )),
+                    None => None,
+                },
             });
         }
         let mut denials = Vec::with_capacity(file.denials.len());
@@ -222,6 +236,7 @@ impl GrantStore {
                     authorizing_owner: hex(g.authorizing_owner.as_bytes()),
                     granted_at: g.granted_at.secs(),
                     expires_at: g.expires_at.map(|t| t.secs()),
+                    enrolled_by: g.enrolled_by.map(|i| hex(&i.0)),
                 })
                 .collect(),
             denials: table
@@ -330,8 +345,16 @@ pub trait FlowRecords: Send + Sync {
     /// The record kept for `ticket_hash`, if any. One that cannot be read
     /// is an error, never "none", which would reset the count.
     fn load(&self, ticket_hash: &[u8; 32]) -> Result<Option<JoinerRecord>, NetError>;
-    /// Keep `record` in place of the one for its ticket hash.
-    fn save(&self, record: &JoinerRecord) -> Result<(), NetError>;
+    /// Keep `record` in place of the one for its ticket hash, durably and
+    /// atomically, but only if the stored record is still `expected`
+    /// (`None`: no record yet). If it is not, write nothing and return an
+    /// error: another flow on the same ticket wrote first, and two flows
+    /// must never spend the same attempt.
+    fn swap(&self, expected: Option<&JoinerRecord>, record: &JoinerRecord) -> Result<(), NetError>;
+}
+
+fn changed_under_us() -> NetError {
+    NetError::Store("another pairing with the same link changed its record first".into())
 }
 
 /// Flow records kept in memory, for as long as the process runs.
@@ -344,8 +367,11 @@ impl FlowRecords for MemoryFlowRecords {
         Ok(map.get(ticket_hash).copied())
     }
 
-    fn save(&self, record: &JoinerRecord) -> Result<(), NetError> {
+    fn swap(&self, expected: Option<&JoinerRecord>, record: &JoinerRecord) -> Result<(), NetError> {
         let mut map = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if map.get(&record.ticket_hash) != expected {
+            return Err(changed_under_us());
+        }
         map.insert(record.ticket_hash, *record);
         Ok(())
     }
@@ -353,6 +379,9 @@ impl FlowRecords for MemoryFlowRecords {
 
 /// Flow records on disk: one canonical CBOR file per ticket hash in a
 /// `joins` folder that only the owner can read, each written atomically.
+/// A swap holds an exclusive lock on `joins/flows.lock` while it reads,
+/// compares and writes, so flows in this process and in other processes on
+/// the same endpoint state take turns.
 #[derive(Clone, Debug)]
 pub struct FlowRecordStore {
     dir: PathBuf,
@@ -389,11 +418,23 @@ impl FlowRecords for FlowRecordStore {
         Ok(Some(record))
     }
 
-    fn save(&self, record: &JoinerRecord) -> Result<(), NetError> {
+    fn swap(&self, expected: Option<&JoinerRecord>, record: &JoinerRecord) -> Result<(), NetError> {
         if !self.dir.exists() {
             crate::private::make_private_dir(&self.dir).map_err(|e| store_err(&self.dir, e))?;
         }
+        let lock_path = self.dir.join("flows.lock");
+        let lock = File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| store_err(&lock_path, e))?;
+        lock.lock().map_err(|e| store_err(&lock_path, e))?;
+        if self.load(&record.ticket_hash)?.as_ref() != expected {
+            return Err(changed_under_us());
+        }
         write_atomic(&self.path(&record.ticket_hash), &record.to_bytes())
+        // The lock goes with `lock`.
     }
 }
 
@@ -421,8 +462,17 @@ mod tests {
             outcome_pending: true,
         };
         assert_eq!(store.load(&[3; 32]).unwrap(), None);
-        store.save(&record).unwrap();
+        store.swap(None, &record).unwrap();
         assert_eq!(store.load(&[3; 32]).unwrap(), Some(record));
+        // A swap from a record that is no longer stored writes nothing.
+        let spent = JoinerRecord {
+            attempts_left: 0,
+            ..record
+        };
+        assert!(store.swap(None, &spent).is_err());
+        assert_eq!(store.load(&[3; 32]).unwrap(), Some(record));
+        store.swap(Some(&record), &spent).unwrap();
+        assert_eq!(store.load(&[3; 32]).unwrap(), Some(spent));
         assert!(crate::private::is_owner_only(&store.path(&[3; 32])).unwrap());
         assert!(crate::private::is_owner_only(&dir.join("joins")).unwrap());
 
@@ -459,6 +509,7 @@ mod tests {
                     role: Role::owner(),
                     authorizing_owner: OwnerRef::from_bytes([7; 16]),
                     expires_at: Some(UnixTime(9_999)),
+                    enrolled_by: Some(InvitationId([9; 16])),
                 },
                 UnixTime(100),
             )
@@ -471,6 +522,7 @@ mod tests {
         assert_eq!(g.name, "laptop");
         assert_eq!(g.expires_at, Some(UnixTime(9_999)));
         assert_eq!(g.authorizing_owner, OwnerRef::from_bytes([7; 16]));
+        assert_eq!(g.enrolled_by, Some(InvitationId([9; 16])));
         assert!(loaded.is_denied(&b));
         // No temporary files are left behind.
         let leftovers: Vec<_> = fs::read_dir(&dir)
@@ -492,6 +544,7 @@ mod tests {
             role: Role::owner(),
             authorizing_owner: OwnerRef::from_bytes([1; 16]),
             expires_at: None,
+            enrolled_by: None,
         };
         let mut table = GrantTable::new();
         let a = SoftwareKey::generate(&mut os_rng()).public_key();
