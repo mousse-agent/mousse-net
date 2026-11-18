@@ -3,17 +3,21 @@ import type { UInt } from './cbor.ts';
 import { errorNumber, hello, negotiate } from './wire.ts';
 import type { ErrorName, Frame, Version } from './wire.ts';
 
-export interface Grant { identity: string; expires_at: number | null; role: string }
+export interface Grant { identity: string; expires_at: number | null; role: string; enrolled_by?: string }
 type Verdict = 'allow' | 'ignore' | `close:${ErrorName}`;
 type GateState = 'await_join_proof' | 'awaiting_authorization' | 'awaiting_proof_answer' |
   'join_only' | 'live' | `closed:${ErrorName}`;
 export type Traffic = 'hello' | 'keepalive' | 'goaway' | 'stream' | 'paired' | 'pairing' |
   'join_proof' | 'authorized_live' | 'authorized_join_only' | 'host_only' | 'caller_only';
 
+function liveGrant(peer: string, grants: Iterable<Grant>, now: number) {
+  const grant = new Map(Array.from(grants, grant => [grant.identity, grant])).get(peer);
+  return grant && (grant.expires_at === null || grant.expires_at > now) ? grant : undefined;
+}
+
 export function step2(peer: string, grants: Iterable<Grant>, denied: Iterable<string>, now: number) {
   if (new Set(denied).has(peer)) return 'close:not_authorized';
-  const grant = new Map(Array.from(grants, grant => [grant.identity, grant])).get(peer);
-  return grant && (grant.expires_at === null || grant.expires_at > now) ? 'live' : 'await_join_proof';
+  return liveGrant(peer, grants, now) ? 'live' : 'await_join_proof';
 }
 
 export class Gate {
@@ -80,6 +84,11 @@ export class Gate {
     return this.state === 'live' && (side === 'caller' || this.callerOpened);
   }
 
+  hostStreamRole(host: string, localGrants: Iterable<Grant>, denied: Iterable<string>, now: number) {
+    if (this.side !== 'caller' || this.state !== 'live' || new Set(denied).has(host)) return undefined;
+    return liveGrant(host, localGrants, now)?.role;
+  }
+
   openedStream(side: 'host' | 'caller') {
     this.streamSeen = true;
     if (side === 'caller') this.callerOpened = true;
@@ -125,7 +134,13 @@ export class Gate {
         if (this.state !== 'live') return this.close('protocol_error');
         this.streamSeen = true;
         return 'allow';
-      case 'paired': return this.state === 'join_only' ? 'allow' : this.close('protocol_error');
+      case 'paired':
+        if (this.state === 'awaiting_proof_answer') {
+          this.proofSentAt = undefined;
+          this.state = 'live';
+          return 'allow';
+        }
+        return this.state === 'join_only' ? 'allow' : this.close('protocol_error');
       case 'pairing':
         if (this.state === 'join_only') return 'allow';
         return this.state === 'live' ? 'ignore' : this.close('protocol_error');

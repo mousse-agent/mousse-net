@@ -159,6 +159,10 @@ function outcome(expected, fn) {
     for (const step of item.steps) {
       if (step.op === 'promote') gate.promote();
       else if (step.op === 'sent_join_proof') gate.sentJoinProof(step.mono_ms ?? 0);
+      else if (step.op === 'host_stream') {
+        const localGrants = item.local_grants.map(grant => ({ ...grant, identity: v.identities[grant.identity] }));
+        assert.equal(gate.hostStreamRole(v.identities[step.host], localGrants, [], item.now) ?? 'none', step.result);
+      }
       else {
         assert.equal(step.op, 'check');
         assert.equal(gate.check(step.traffic), step.verdict);
@@ -437,7 +441,7 @@ test('lifecycle checks / losing PAIRED on the last attempt permits an expired-ti
   let draw = 0;
   const store = memoryFlowStore();
   const options = { arrival: 'link', store };
-  const local = { computerName: endpoint.name, identity: bytes(endpoint.identity) };
+  const local = { computerName: endpoint.computer, profileName: endpoint.profile, identity: bytes(endpoint.identity) };
   const draws = { bytes: length => Buffer.alloc(length, ++draw) };
   const joiner = new PairingJoiner(local, ticket, draws, time, options);
   const exporters = { join: Buffer.alloc(32, 1), pair: Buffer.alloc(32, 2) };
@@ -447,15 +451,15 @@ test('lifecycle checks / losing PAIRED on the last attempt permits an expired-ti
 
   const code = '012345';
   for (let i = 0; i < 2; i++) {
-    const [, { send }] = joiner.submit(code);
+    const [, , { send }] = joiner.submit(code);
     joiner.receive({ type: 'CODE_ABORT', attempt: send.attempt, code: wire.errorNumber('pairing_failed') });
   }
-  const [{ attempt: { ci, sid } }, { send: first }] = joiner.submit(code);
+  const [{ attempt: { ci, sid } }, , { send: first }] = joiner.submit(code);
   const ticketHash = hex(sha256(ticket));
   assert.deepEqual([...decode(store.load(ticketHash)).values()].slice(2), [0n, 0n]);
   const host = cpace.respond({ ci: bytes(ci), sid: bytes(sid), prs: Buffer.from(code), ad: Buffer.alloc(0) },
     first.payload, length => Buffer.alloc(length, 42));
-  const [{ send: last }] = joiner.receive({ type: 'CODE_EXCHANGE', attempt: first.attempt, payload: host.message });
+  const [, { send: last }] = joiner.receive({ type: 'CODE_EXCHANGE', attempt: first.attempt, payload: host.message });
   host.finish(last.payload).isk.fill(0);
   assert.deepEqual([...decode(store.load(ticketHash)).values()].slice(2), [0n, 1n]);
 
@@ -467,8 +471,11 @@ test('lifecycle checks / losing PAIRED on the last attempt permits an expired-ti
   restored.receive(wire.hello);
   const live = { type: 'AUTHORIZED', state: 'live' };
   assert.deepEqual(restored.receive(live), []);
-  assert.deepEqual(restored.receive(live), [{ already_paired: true }]);
-  assert.deepEqual(restored.snapshot(), { attempts_left: 0, live: true, state: 'already_paired' });
+  const [paired, persisted] = restored.receive({ type: 'PAIRED', name: 'Desk', role: 'owner' });
+  assert.deepEqual(paired, { paired: { host_identity: hex(restored.ticket.hostIdentity), host_name: 'Desk', role: 'owner' } });
+  assert.ok(store.hasPin(restored.ticket.hostIdentity));
+  assert.deepEqual(restored.snapshot(), { attempts_left: 0, live: true, outcome_pending: false,
+    state: 'paired', stored: persisted.persist.record });
   assert.throws(() => new PairingJoiner(local, ticket, draws, time, options), { message: 'attempts_exhausted' });
   const wrongRecord = encode(decode(store.load(ticketHash)).set(2n, Buffer.alloc(32)));
   const mismatchedStore = { ...store, load: () => wrongRecord };
@@ -480,7 +487,7 @@ test('pairing checks / a repeated host share fails the active attempt', () => {
   const { conventions, flows } = fixtures.get('pairing-e2e.json');
   const { time, joiner: endpoint } = conventions;
   const { ticket } = flows.find(flow => flow.name === 'send_link').steps.find(step => step.event === 'start');
-  const local = { computerName: endpoint.name, profileName: 'Private profile', identity: bytes(endpoint.identity) };
+  const local = { computerName: endpoint.computer, profileName: endpoint.profile, identity: bytes(endpoint.identity) };
   const joiner = new PairingJoiner(local, bytes(ticket), { bytes: length => Buffer.alloc(length, 3) }, time,
     { arrival: 'link', store: memoryFlowStore() });
   const exporters = { join: Buffer.alloc(32, 1), pair: Buffer.alloc(32, 2) };
@@ -489,16 +496,40 @@ test('pairing checks / a repeated host share fails the active attempt', () => {
   joiner.receive(wire.hello);
   joiner.receive({ type: 'AUTHORIZED', state: 'join_only' });
   const code = '012345';
-  const [{ attempt: { ci, sid } }, { send: first }] = joiner.submit(code);
+  const [{ attempt: { ci, sid } }, , { send: first }] = joiner.submit(code);
   const host = cpace.respond({ ci: bytes(ci), sid: bytes(sid), prs: Buffer.from(code), ad: Buffer.alloc(0) },
     first.payload, length => Buffer.alloc(length, 42));
   const share = { type: 'CODE_EXCHANGE', attempt: first.attempt, payload: host.message };
-  const [{ send: last }] = joiner.receive(share);
+  const [, { send: last }] = joiner.receive(share);
   host.finish(last.payload).isk.fill(0);
-  assert.deepEqual(joiner.receive(share), [
+  const [persist, ...effects] = joiner.receive(share);
+  assert.equal(decode(bytes(persist.persist.record)).get(4n), 0n);
+  assert.deepEqual(effects, [
     { conn: 1, send: { type: 'CODE_ABORT', attempt: first.attempt, code: wire.errorNumber('pairing_failed') } },
     { code_rejected: { attempts_left: 2 } },
   ]);
+});
+
+test('pairing checks / a stale flow cannot send an attempt', () => {
+  const { conventions, flows } = fixtures.get('pairing-e2e.json');
+  const { time, joiner: endpoint } = conventions;
+  const { ticket } = flows.find(flow => flow.name === 'send_link').steps.find(step => step.event === 'start');
+  const local = { computerName: endpoint.computer, identity: bytes(endpoint.identity) };
+  const store = memoryFlowStore();
+  const options = { arrival: 'link', store };
+  const draws = { bytes: length => Buffer.alloc(length, 3) };
+  const first = new PairingJoiner(local, bytes(ticket), draws, time, options);
+  const second = new PairingJoiner(local, bytes(ticket), draws, time, options);
+  const exporters = { join: Buffer.alloc(32, 1), pair: Buffer.alloc(32, 2) };
+  for (const [index, joiner] of [first, second].entries()) {
+    joiner.connect(index + 1, exporters, time);
+    joiner.receive(wire.hello);
+    joiner.receive({ type: 'AUTHORIZED', state: 'join_only' });
+  }
+  const [, { persist }, { send }] = first.submit('012345');
+  assert.equal(send.type, 'CODE_EXCHANGE');
+  assert.deepEqual(second.submit('012345'), [{ failed: 'internal_error' }, { conn: 2, close: 'internal_error' }]);
+  assert.equal(second.snapshot().stored, persist.record);
 });
 
 test('coverage / all JSON files registered', () => assert.deepEqual([...used].sort(), [...fixtures.keys()].sort()));

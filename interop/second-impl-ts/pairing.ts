@@ -2,7 +2,7 @@ import { equalBytes, sha256 } from './certificate.ts';
 import { byteString, decode, encode, fields, hex, record, requireThat, uint, utf8 } from './cbor.ts';
 import { initiate, respond } from './cpace.ts';
 import { Gate, step2, Streams } from './session.ts';
-import type { Traffic } from './session.ts';
+import type { Grant, Traffic } from './session.ts';
 import { attemptSession, bindingTranscript, checkJoinerExpiry, decodeTicket, encodeTicket, errorNumber, hello, joinProof } from './wire.ts';
 import type { Control, ErrorName, Ticket } from './wire.ts';
 
@@ -29,6 +29,7 @@ export type Effect =
   | { code_rejected: { attempts_left: number } }
   | { failed: ErrorName }
   | { attempt: { id: string; ci: string; sid: string } }
+  | { persist: { expected: string | null; record: string } }
   | { error: string }
   | { ignored: true };
 
@@ -103,20 +104,24 @@ interface HostConnection {
   name?: string;
 }
 
-interface Enrollment {
+interface Enrollment extends Grant {
   authorizing_owner: string;
   bound_connections: number[];
-  expires_at: number | null;
   granted_at: number;
-  identity: string;
   name: string;
-  role: string;
+}
+
+interface HostGrantStore {
+  get(identity: string): Enrollment | undefined;
+  values(): Iterable<Enrollment>;
+  // A persistent implementation commits the complete grant, including its receipt, in this call.
+  set(identity: string, enrollment: Enrollment): void;
 }
 
 export class PairingHost {
   readonly ticket: Ticket;
   readonly binary: Buffer;
-  readonly grants = new Map<string, Enrollment>();
+  readonly grants: HostGrantStore;
   readonly denials = new Set<string>();
   private readonly connections = new Map<number, HostConnection>();
   attemptsLeft = 3;
@@ -126,10 +131,12 @@ export class PairingHost {
   private readonly endpoint: Endpoint;
   private readonly policy: InvitationPolicy;
   private readonly random: RandomDraws;
-  constructor(endpoint: Endpoint, policy: InvitationPolicy, kind: 1 | 2, random: RandomDraws, now: number) {
+  constructor(endpoint: Endpoint, policy: InvitationPolicy, kind: 1 | 2, random: RandomDraws, now: number,
+    grants: HostGrantStore = new Map()) {
     this.endpoint = endpoint;
     this.policy = policy;
     this.random = random;
+    this.grants = grants;
     this.ticket = { version: 1, kind, hostIdentity: endpoint.identity,
       invitation: random.bytes(16, 'invitation_id'), secret: random.bytes(16, 'ticket_secret'),
       expiresAt: now + 600, routes: policy.routes };
@@ -215,11 +222,16 @@ export class PairingHost {
     const identity = hex(connection.peer);
     if (this.denials.has(identity)) return [close(conn, connection.gate, 'not_authorized')];
     requireThat(connection.name !== undefined, 'protocol_error');
+    const oldGrant = this.grants.get(identity);
+    try {
+      this.grants.set(identity, { authorizing_owner: this.policy.authorizingOwner, bound_connections: [conn],
+        enrolled_by: hex(this.ticket.invitation), expires_at: this.policy.grantExpiresAt, granted_at: now,
+        identity, name: connection.name, role: this.policy.role });
+    } catch {
+      return [close(conn, connection.gate, 'internal_error'), ...this.checkExhausted()];
+    }
     this.status = 'consumed';
     this.shownCode = null;
-    const oldGrant = this.grants.get(identity);
-    this.grants.set(identity, { authorizing_owner: this.policy.authorizingOwner, bound_connections: [conn],
-      expires_at: this.policy.grantExpiresAt, granted_at: now, identity, name: connection.name, role: this.policy.role });
     connection.gate.promote();
     const output: Effect[] = [{ enrolled: { conn } },
       send(conn, { type: 'PAIRED', name: this.endpoint.name, role: this.policy.role })];
@@ -256,8 +268,13 @@ export class PairingHost {
         if (this.status !== 'open' || now >= Number(this.ticket.expiresAt) ||
             !equalBytes(msg.invitation, this.ticket.invitation) ||
             !equalBytes(msg.mac, proof(this.ticket, connection.peer, connection.exporters.join))) {
-          return [gate.state === 'live' ? send(conn, { type: 'AUTHORIZED', state: 'live' }) :
-            close(conn, gate, 'invitation_invalid')];
+          if (gate.state !== 'live') return [close(conn, gate, 'invitation_invalid')];
+          const grant = this.grants.get(hex(connection.peer));
+          if (!grant || (grant.expires_at !== null && grant.expires_at <= now)) return [close(conn, gate, 'grant_revoked')];
+          if (grant.enrolled_by === hex(msg.invitation)) {
+            return [send(conn, { type: 'PAIRED', name: this.endpoint.name, role: grant.role })];
+          }
+          return [send(conn, { type: 'AUTHORIZED', state: 'live' })];
         }
         gate.admit();
         connection.name = msg.name;
@@ -327,6 +344,8 @@ export interface JoinerFlowStore {
   load(ticketHash: string): Uint8Array | undefined;
   // Atomically and durably replace the record only if its previous bytes match.
   save(ticketHash: string, record: Uint8Array, previous: Uint8Array | undefined): boolean;
+  // Return only once the pin is durable. Throw if it could not be stored.
+  savePin(hostIdentity: Uint8Array): void;
 }
 
 interface JoinerEndpoint {
@@ -393,6 +412,10 @@ export class PairingJoiner {
   get attemptsLeft() { return this.remaining; }
   get streams() { return this.connection?.streams; }
 
+  hostStreamRole(localGrants: Iterable<Grant>, denied: Iterable<string>, now: number) {
+    return this.connection?.gate.hostStreamRole(hex(this.ticket.hostIdentity), localGrants, denied, now);
+  }
+
   flowRecord(): Uint8Array {
     return this.encodeProgress(this.remaining, this.outcomePending);
   }
@@ -401,13 +424,20 @@ export class PairingJoiner {
     return encode(record([1, flowDomain], [2, this.ticketHash], [3, count], [4, Number(pending)]));
   }
 
-  private saveProgress(count: number, pending: boolean) {
-    if (count === this.remaining && pending === this.outcomePending) return;
+  private saveProgress(count: number, pending: boolean, effects: Effect[]): boolean {
+    if (count === this.remaining && pending === this.outcomePending) return true;
+    const previous = this.savedRecord;
     const next = this.encodeProgress(count, pending);
-    requireThat(this.store.save(hex(this.ticketHash), next, this.savedRecord), 'flow_record_changed');
+    try {
+      if (!this.store.save(hex(this.ticketHash), next, previous)) return false;
+    } catch {
+      return false;
+    }
     this.savedRecord = Uint8Array.from(next);
     this.remaining = count;
     this.outcomePending = pending;
+    effects.push({ persist: { expected: previous ? hex(previous) : null, record: hex(next) } });
+    return true;
   }
 
   connect(id: number, exporters: Exporters, now: number, mono = 0): Effect[] {
@@ -443,7 +473,8 @@ export class PairingJoiner {
     if (this.state !== 'awaiting_code') return [{ error: 'wrong_state' }];
     if (code.length !== 6 || !/^[0-9]{6}$/.test(code)) return [{ error: 'invalid_code' }];
     const conn = this.connection!;
-    this.saveProgress(this.attemptsLeft - 1, false);
+    const effects: Effect[] = [];
+    if (!this.saveProgress(this.attemptsLeft - 1, false, effects)) return this.fail('internal_error');
     const id = this.random.bytes(16, 'attempt_id');
     const inputs = cpaceInputs(this.ticket, this.binary, this.endpoint.identity, conn.exporters.pair, id, code);
     let initiator;
@@ -451,10 +482,17 @@ export class PairingJoiner {
     finally { inputs.prs.fill(0); }
     this.pending = { id, initiator };
     this.state = 'exchanging';
-    return [{ attempt: { id: hex(id), ci: hex(inputs.ci), sid: hex(inputs.sid) } }, exchange(conn.id, id, initiator.message)];
+    return [{ attempt: { id: hex(id), ci: hex(inputs.ci), sid: hex(inputs.sid) } }, ...effects,
+      exchange(conn.id, id, initiator.message)];
   }
 
   goaway(code: ErrorName): Effect[] {
+    if (this.state.startsWith('failed:')) return [];
+    if (code === 'invitation_invalid' || code === 'attempts_exhausted') {
+      const effects: Effect[] = [];
+      if (!this.saveProgress(this.attemptsLeft, false, effects)) return this.fail('internal_error', false);
+      return [...effects, ...this.fail(code, false)];
+    }
     if (this.state === 'awaiting_paired') {
       this.drop();
       return [];
@@ -464,7 +502,6 @@ export class PairingJoiner {
 
   private fail(code: ErrorName, notifyPeer = true): Effect[] {
     if (this.state.startsWith('failed:')) return [];
-    this.saveProgress(this.attemptsLeft, false);
     this.clearAttempt();
     this.state = `failed:${code}`;
     const effects: Effect[] = [{ failed: code }];
@@ -481,6 +518,7 @@ export class PairingJoiner {
     if (conn.gate.state === 'awaiting_authorization' && conn.gate.version === undefined && msg.type !== 'HELLO') {
       return [close(conn.id, conn.gate, 'protocol_error')];
     }
+    const proofAnswer = conn.gate.state === 'awaiting_proof_answer';
     const result = checked(conn.gate, conn.id, msg);
     if (result) {
       if (result.some(effect => 'close' in effect)) this.clearAttempt();
@@ -488,29 +526,28 @@ export class PairingJoiner {
     }
     switch (msg.type) {
       case 'HELLO': return receiveHello(conn.gate, conn.id, msg);
-      case 'AUTHORIZED':
+      case 'AUTHORIZED': {
         if (conn.gate.state === 'awaiting_proof_answer') return [];
-        if (msg.state === 'live' && this.ticket.kind === 2 && !this.hostPinned && !this.outcomePending) {
-          return this.fail('pairing_failed');
-        }
-        this.saveProgress(this.attemptsLeft, false);
         if (msg.state === 'live') {
-          this.state = 'already_paired';
-          return [{ already_paired: true }];
+          if (!this.trustsProofAnswer()) return this.fail('pairing_failed');
+          return this.completePairing({ already_paired: true });
         }
-        if (this.attemptsLeft === 0) return this.rejectCode();
+        const effects: Effect[] = [];
+        if (!this.saveProgress(this.attemptsLeft, false, effects)) return this.fail('internal_error');
+        if (this.attemptsLeft === 0) return [...effects, ...this.fail('attempts_exhausted')];
         this.state = this.ticket.kind === 1 ? 'awaiting_approval' : 'awaiting_code';
-        return [];
+        return effects;
+      }
       case 'PAIRED':
-        if (this.state !== 'awaiting_approval' && this.state !== 'awaiting_paired') {
+        if (proofAnswer) {
+          if (!this.trustsProofAnswer()) return this.fail('pairing_failed');
+        } else if (this.state !== 'awaiting_approval' && this.state !== 'awaiting_paired') {
           this.clearAttempt();
           return [close(conn.id, conn.gate, 'protocol_error')];
         }
-        this.saveProgress(this.attemptsLeft, false);
-        this.clearAttempt();
-        conn.gate.promote();
-        this.state = 'paired';
-        return [{ paired: { host_identity: hex(this.ticket.hostIdentity), host_name: msg.name, role: msg.role } }];
+        return this.completePairing({ paired: {
+          host_identity: hex(this.ticket.hostIdentity), host_name: msg.name, role: msg.role,
+        } });
       case 'CODE_ABORT':
         return this.pending && equalBytes(this.pending.id, msg.attempt) ?
           this.rejectCode() : [{ ignored: true }];
@@ -519,29 +556,55 @@ export class PairingJoiner {
     }
   }
 
-  private rejectCode(): Effect[] {
-    if (this.attemptsLeft === 0) return this.fail('attempts_exhausted');
-    this.saveProgress(this.attemptsLeft, false);
+  private trustsProofAnswer() {
+    return this.ticket.kind === 1 || this.hostPinned || this.outcomePending;
+  }
+
+  private completePairing(outcome: Extract<Effect, { paired: unknown } | { already_paired: true }>): Effect[] {
+    const effects: Effect[] = [outcome];
+    try {
+      this.store.savePin(this.ticket.hostIdentity);
+    } catch {
+      return this.fail('internal_error');
+    }
+    if (!this.saveProgress(this.attemptsLeft, false, effects)) return this.fail('internal_error');
+    this.clearAttempt();
+    const gate = this.connection!.gate;
+    if (gate.state === 'join_only') gate.promote();
+    this.state = 'paired' in outcome ? 'paired' : 'already_paired';
+    return effects;
+  }
+
+  private rejectCode(reply?: Effect): Effect[] {
+    const effects: Effect[] = [];
+    if (!this.saveProgress(this.attemptsLeft, false, effects)) return this.fail('internal_error');
+    if (reply) effects.push(reply);
+    if (this.attemptsLeft === 0) return [...effects, ...this.fail('attempts_exhausted')];
     this.clearAttempt();
     this.state = 'awaiting_code';
-    return [{ code_rejected: { attempts_left: this.attemptsLeft } }];
+    return [...effects, { code_rejected: { attempts_left: this.attemptsLeft } }];
   }
 
   private confirm(conn: number, msg: Extract<Control, { type: 'CODE_EXCHANGE' }>): Effect[] {
     const pending = this.pending;
     if (!pending || !equalBytes(pending.id, msg.attempt)) return [{ ignored: true }];
-    if (this.state !== 'exchanging') return [abort(conn, msg.attempt), ...this.rejectCode()];
+    if (this.state !== 'exchanging') return this.rejectCode(abort(conn, msg.attempt));
     let confirmation;
     try {
       confirmation = pending.initiator.finish(msg.payload);
     } catch {
-      return [abort(conn, msg.attempt), ...this.rejectCode()];
+      return this.rejectCode(abort(conn, msg.attempt));
     }
     confirmation.isk.fill(0);
-    this.saveProgress(this.attemptsLeft, true);
+    const effects: Effect[] = [];
+    if (!this.saveProgress(this.attemptsLeft, true, effects)) return this.fail('internal_error');
     this.state = 'awaiting_paired';
-    return [exchange(conn, msg.attempt, confirmation.message)];
+    return [...effects, exchange(conn, msg.attempt, confirmation.message)];
   }
 
-  snapshot() { return { attempts_left: this.attemptsLeft, live: this.connection?.gate.state === 'live', state: this.state }; }
+  snapshot() {
+    const stored = this.store.load(hex(this.ticketHash));
+    return { attempts_left: this.attemptsLeft, live: this.connection?.gate.state === 'live',
+      outcome_pending: this.outcomePending, state: this.state, stored: stored ? hex(stored) : null };
+  }
 }

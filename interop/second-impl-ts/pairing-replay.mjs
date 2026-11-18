@@ -5,16 +5,23 @@ import { PairingHost, PairingJoiner } from './pairing.ts';
 import { decodeControl, decodeFrame, decodeTicket, encodeControl, encodeFragment, encodeFrame, errorNumber,
   hello, joinProof, readError } from './wire.ts';
 
-export function memoryFlowStore() {
+export function memoryFlowStore(onPersist = () => {}, onPin = () => {}) {
   const records = new Map();
+  const pins = new Set();
   return {
     load(hash) { return records.get(hash); },
     save(hash, next, previous) {
       const current = records.get(hash);
       if (current === undefined ? previous !== undefined : !previous || !equalBytes(current, previous)) return false;
       records.set(hash, Uint8Array.from(next));
+      onPersist({ persist: { expected: previous ? hex(previous) : null, record: hex(next) } });
       return true;
     },
+    savePin(identity) {
+      pins.add(hex(identity));
+      onPin({ pin: hex(identity) });
+    },
+    hasPin(identity) { return pins.has(hex(identity)); },
   };
 }
 
@@ -59,19 +66,29 @@ function onWire(control) {
 export function replayEndToEnd(flow, input) {
   const { time: now, host: hostInput, joiner: joinerInput, invitation } = input;
   const hostEndpoint = { identity: publicKey(bytes(hostInput.identity_secret)), name: hostInput.name };
-  const joinerEndpoint = { identity: publicKey(bytes(joinerInput.identity_secret)), computerName: joinerInput.name };
+  const joinerEndpoint = { identity: publicKey(bytes(joinerInput.identity_secret)),
+    computerName: joinerInput.computer, profileName: joinerInput.profile };
   assert.equal(hex(hostEndpoint.identity), hostInput.identity);
   assert.equal(hex(joinerEndpoint.identity), joinerInput.identity);
   const policy = { authorizingOwner: invitation.authorizing_owner, grantExpiresAt: invitation.grant_expires_at,
     role: invitation.role, routes: invitation.routes };
   const hostDraws = new ScriptedDraws(flow.draws.host);
   const joinerDraws = new Map(Object.entries(flow.draws.joiners).map(([name, draws]) => [name, new ScriptedDraws(draws)]));
-  const stores = new Map([...joinerDraws.keys()].map(name => [name, memoryFlowStore()]));
+  const writes = [];
+  let crashAtPersist = false;
+  const stores = new Map([...joinerDraws.keys()].map(name => [name, memoryFlowStore(
+    write => {
+      writes.push(write);
+      if (crashAtPersist) throw new Error('simulated process exit after commit');
+    },
+    pin => writes.push(pin),
+  )]));
   const joiners = new Map();
   const routes = new Map();
   const parties = new Map();
   const frames = new Map();
   let host;
+  let hostNow = now;
 
   function queue(from, conn, frame) {
     const route = routes.get(conn);
@@ -114,6 +131,12 @@ export function replayEndToEnd(flow, input) {
     return decodeControl(message.payload);
   }
 
+  function breakConnection(party, conn) {
+    frames.delete(`${conn}/${party}`);
+    frames.delete(`${conn}/host`);
+    return routes.get(conn).real ? project(host.drop(conn), 'host') : [];
+  }
+
   function run(step) {
     const { party, event } = step;
     const joiner = joiners.get(party);
@@ -121,24 +144,30 @@ export function replayEndToEnd(flow, input) {
     switch (event) {
       case 'create': {
         assert.equal(step.kind, flow.kind);
-        host = new PairingHost(hostEndpoint, policy, step.kind, hostDraws, now);
+        host = new PairingHost(hostEndpoint, { ...policy, role: step.role ?? policy.role }, step.kind, hostDraws, hostNow);
         return [{ ticket: { binary: hex(host.binary), fragment: encodeFragment(host.binary),
           hash: hex(sha256(host.binary)), shown_code: host.shownCode } }];
       }
       case 'grant': {
         const identity = hex(joinerEndpoint.identity);
-        host.grants.set(identity, { identity, name: step.name, role: policy.role, authorizing_owner: policy.authorizingOwner,
-          expires_at: policy.grantExpiresAt, granted_at: now, bound_connections: [] });
+        host.grants.set(identity, { identity, name: step.name, role: step.role ?? policy.role,
+          authorizing_owner: policy.authorizingOwner, expires_at: policy.grantExpiresAt,
+          granted_at: hostNow, bound_connections: [] });
         return [];
       }
+      case 'tick':
+        assert.equal(party, 'host');
+        hostNow = step.at;
+        return project(host.tick(hostNow, (hostNow - now) * 1000), party);
       case 'start': {
         assert.ok(step.host_pinned === undefined || typeof step.host_pinned === 'boolean');
         assert.ok(step.identity === undefined || step.identity === 'host');
         assert.ok(step.arrival === 'in_app_scan' || step.arrival === 'link');
         const ticket = bytes(step.ticket);
-        const pinnedHost = step.host_pinned ? decodeTicket(ticket).hostIdentity : undefined;
+        const hostIdentity = decodeTicket(ticket).hostIdentity;
         const endpoint = step.identity === 'host' ? { ...joinerEndpoint, identity: hostEndpoint.identity } : joinerEndpoint;
         const store = stores.get(party);
+        const pinnedHost = step.host_pinned || store?.hasPin(hostIdentity) ? hostIdentity : undefined;
         if (step.record !== undefined) assert.equal(hex(store.load(hex(sha256(ticket)))), step.record);
         try {
           joiners.set(party, new PairingJoiner(endpoint, ticket, joinerDraws.get(party), now,
@@ -150,9 +179,9 @@ export function replayEndToEnd(flow, input) {
         return [];
       }
       case 'save': {
-        const record = joiner.flowRecord();
-        assert.deepEqual(Buffer.from(record), Buffer.from(stores.get(party).load(hex(decode(record).get(2n)))));
-        return [{ record: hex(record) }];
+        const hash = hex(decode(joiner.flowRecord()).get(2n));
+        const stored = stores.get(party).load(hash);
+        return [{ record: stored ? hex(stored) : null }];
       }
       case 'connect': {
         const real = step.host !== false;
@@ -161,23 +190,33 @@ export function replayEndToEnd(flow, input) {
         const exporters = parseExporters(step.exporters);
         const [hello, proof] = project(joiner.connect(conn, exporters, now), party);
         const peer = real ? project(
-          host.connect(conn, joinerEndpoint.identity, parseExporters(step.host_exporters ?? step.exporters), now), 'host') : [];
+          host.connect(conn, joinerEndpoint.identity, parseExporters(step.host_exporters ?? step.exporters),
+            hostNow, (hostNow - now) * 1000), 'host') : [];
         return [hello, ...peer, proof];
       }
       case 'receive': {
         const control = receive(party, conn, step.control);
-        if (party === 'host') return project(host.receive(conn, control, now), party);
-        return project(joiner.receive(control), party);
+        if (party === 'host') return project(host.receive(conn, control, hostNow), party);
+        crashAtPersist = step.crash_at_persist === true;
+        const effects = joiner.receive(control);
+        if (!crashAtPersist) return project(effects, party);
+        crashAtPersist = false;
+        assert.equal(writes.length, 1, 'crash must follow the first write');
+        assert.ok('persist' in writes[0], 'crash must follow a flow record commit');
+        assert.deepEqual(effects, [{ failed: 'internal_error' }, { conn, close: 'internal_error' }]);
+        joiners.delete(party);
+        return [...writes, { crashed: true }, ...breakConnection(party, conn)];
       }
       case 'drop':
         joiner.drop();
-        frames.delete(`${conn}/${party}`);
-        frames.delete(`${conn}/host`);
-        return routes.get(conn).real ? project(host.drop(conn), 'host') : [];
+        return breakConnection(party, conn);
+      case 'proof_timeout':
+        assert.deepEqual(joiner.tick(9999), []);
+        return project(joiner.tick(10000), party);
       case 'submit_code':
         return project(joiner.submit(step.code), party);
       case 'approve':
-        return project(host.approve(conn, now), party);
+        return project(host.approve(conn, hostNow), party);
       case 'goaway': {
         const frame = frames.get(`${conn}/${party}`)?.shift();
         assert.ok(frame);
@@ -192,6 +231,7 @@ export function replayEndToEnd(flow, input) {
   }
 
   for (const [index, step] of flow.steps.entries()) {
+    writes.length = 0;
     const effects = run(step);
     const label = `step ${index + 1} ${step.party}/${step.event}`;
     const failure = step.out.find(effect => 'failed' in effect);
@@ -202,6 +242,9 @@ export function replayEndToEnd(flow, input) {
       expected.push({ close: { code, conn, frame: hex(goawayFrame(code)), from: step.party } });
     }
     assert.deepEqual(effects, expected, label);
+    const paired = effects.find(effect => 'paired' in effect || 'already_paired' in effect);
+    const pin = paired ? [{ pin: hex(hostEndpoint.identity) }] : [];
+    assert.deepEqual(writes, [...pin, ...effects.filter(effect => 'persist' in effect)], `${label}: durable write order`);
     if (failure) {
       const message = onWire({ type: 'AUTHORIZED', state: 'live' });
       assert.deepEqual(joiners.get(step.party).receive(message), [{ ignored: true }], `${label}: gate after failure`);
@@ -210,10 +253,15 @@ export function replayEndToEnd(flow, input) {
   for (const pending of frames.values()) assert.equal(pending.length, 0, 'undelivered frame');
   hostDraws.done();
   for (const draws of joinerDraws.values()) draws.done();
+  const enrolled = flow.steps.some(step => step.out.some(effect => 'enrolled' in effect));
+  const grants = [...host.grants.values()].map(({ enrolled_by, ...grant }) => {
+    assert.equal(enrolled_by, enrolled ? hex(host.ticket.invitation) : undefined);
+    return grant;
+  });
   assert.deepEqual({
     host: host.snapshot(),
     joiners: Object.fromEntries([...joiners].map(([party, joiner]) => [party, joiner.snapshot()])),
-    grants: [...host.grants.values()],
+    grants,
   }, flow.end);
 }
 
@@ -296,7 +344,7 @@ export function replayAttemptSequence(sequence, input) {
       case 'connect': {
         let endpoint = joiners.get(label)?.endpoint;
         if (!endpoint) {
-          endpoint = { computerName: label, identity: publicKey(Buffer.alloc(32, 0x50 + joiners.size)) };
+          endpoint = { computerName: label, profileName: 'Work', identity: publicKey(Buffer.alloc(32, 0x50 + joiners.size)) };
           const arrival = host.ticket.kind === 1 ? 'in_app_scan' : 'link';
           const joiner = new PairingJoiner(endpoint, host.binary, draws.get(label), now,
             { arrival, store: memoryFlowStore() });

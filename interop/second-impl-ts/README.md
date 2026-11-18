@@ -13,8 +13,15 @@ The caller passes the ticket's arrival source and supplies one durable
 `JoinerFlowStore` per endpoint. All arrival sources share that store. The
 store atomically replaces a record only when its previous bytes match. The
 pairing flow saves each debit and its pending outcome before releasing the
-corresponding message. The app
-reports the vector's local `in_person_from_link` and `own_ticket` errors as
+corresponding message and saves the pin before clearing the pending mark.
+A persistent host grant store writes the entire grant and its enrollment
+receipt together. Before dispatching a privileged operation on a host-opened
+stream, the caller checks the role returned by `hostStreamRole` against the
+operation's required role using its own endpoint's grants.
+
+The installed app or a trusted web-client origin supplies the pairing code.
+A handoff page passes the ticket along without receiving a code. The app
+reports the local `in_person_from_link` and `own_ticket` errors as
 `PAIRING_FAILED` and presents the warning in wire.md §10.6 on code failure.
 
 Run these commands from this directory with Node 24.
@@ -26,7 +33,7 @@ npm test
 ```
 
 The tests print case counts by vector file and end with `PASS second-impl` or
-`FAIL second-impl`. They replay twelve pairing flows and
+`FAIL second-impl`. They replay fifteen pairing flows and
 twelve attempt sequences with the supplied random draws, and compare
 the resulting messages byte for byte. The suite also checks retry
 scheduling with a candidate path, clock rollback, reconnect after ticket
