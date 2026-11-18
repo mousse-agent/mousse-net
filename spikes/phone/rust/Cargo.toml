@@ -1,0 +1,27 @@
+[package]
+name = "mousse-phone-spike"
+description = "Phase 0 phone spikes: UniFFI lifecycle (start, stop, dial, cancel, events) and a loopback WebSocket byte path."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "mousse_phone_spike"
+# staticlib for the iOS XCFramework, cdylib for Android (JNA loads it), lib for host tests.
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[dependencies]
+uniffi = { version = "=0.32.2" }
+tokio = { version = "=1.54.1", features = ["rt-multi-thread", "net", "time", "sync", "io-util", "macros"] }
+tokio-util = { version = "=0.7.20" }
+tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"] }
+futures-util = { version = "=0.3.34", default-features = false, features = ["sink", "std"] }
+getrandom = { version = "=0.4.3" }
+thiserror = "2"
+serde_json = "1"
+
+[dev-dependencies]
+# A plain executor, like Swift's and Kotlin's: host tests never poll inside tokio.
+futures-executor = "=0.3.34"
