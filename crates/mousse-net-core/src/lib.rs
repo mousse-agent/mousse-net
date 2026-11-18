@@ -30,7 +30,8 @@
         mousse_control = "break-session-cert",
         mousse_control = "break-authz",
         mousse_control = "break-raw-signature",
-        mousse_control = "break-cpace"
+        mousse_control = "break-cpace-confirm",
+        mousse_control = "break-cpace-sid"
     ),
     not(debug_assertions)
 ))]

@@ -47,13 +47,13 @@ pub(crate) fn share_has_empty_ad(msg: &[u8]) -> Result<bool, CpaceError> {
 }
 
 /// Whether a constant-time tag compare matched.
-#[cfg(not(mousse_control = "break-cpace"))]
+#[cfg(not(mousse_control = "break-cpace-confirm"))]
 fn tags_match(equal: subtle::Choice) -> bool {
     bool::from(equal)
 }
 
 /// Must-fail control: the confirmation compare always passes.
-#[cfg(mousse_control = "break-cpace")]
+#[cfg(mousse_control = "break-cpace-confirm")]
 fn tags_match(_equal: subtle::Choice) -> bool {
     true
 }

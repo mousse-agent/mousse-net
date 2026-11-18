@@ -183,6 +183,23 @@ fn generator_matches_draft_b3_1() {
     assert_eq!(g.compress().to_bytes(), arr32(&d["g"]));
 }
 
+/// The session id is part of the generator: the same code and channel
+/// identifier with another session id give another generator, so a share
+/// made for one session is useless in another.
+#[test]
+fn session_id_changes_the_generator() {
+    let (prs, ci) = (b"Password".as_slice(), b"channel".as_slice());
+    let (sid_1, sid_2) = ([1u8; MIN_SID_LEN], [2u8; MIN_SID_LEN]);
+    assert_ne!(
+        generator_string(prs, ci, &sid_1)[..],
+        generator_string(prs, ci, &sid_2)[..]
+    );
+    assert_ne!(
+        calculate_generator(prs, ci, &sid_1),
+        calculate_generator(prs, ci, &sid_2)
+    );
+}
+
 #[test]
 fn shares_and_k_match_draft_b3_2_to_b3_4() {
     let d = &json(DRAFT)["cpace"];
