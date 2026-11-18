@@ -373,7 +373,10 @@ mod tests {
             state.on_hello(PROTOCOL_VERSION, PROTOCOL_MINOR_VERSION),
             HelloOutcome::Agreed(PROTOCOL_MINOR_VERSION)
         );
-        assert_eq!(state.on_hello(PROTOCOL_VERSION + 1, 0), HelloOutcome::Ignored);
+        assert_eq!(
+            state.on_hello(PROTOCOL_VERSION + 1, 0),
+            HelloOutcome::Ignored
+        );
         assert_eq!(state.agreed(), Some(PROTOCOL_MINOR_VERSION));
 
         let mut refused = HelloState::new(VersionSupport::LOCAL);

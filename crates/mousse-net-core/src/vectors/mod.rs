@@ -255,9 +255,15 @@ fn session_cert_vectors() -> J {
         &identity_signature.to_der(),
     )
     .expect("encodable");
-    let version_2_off_curve =
-        build_certificate(&s1, UnixTime(nb), UnixTime(na), 2, &off_curve, identity_signature.as_bytes())
-            .expect("encodable");
+    let version_2_off_curve = build_certificate(
+        &s1,
+        UnixTime(nb),
+        UnixTime(na),
+        2,
+        &off_curve,
+        identity_signature.as_bytes(),
+    )
+    .expect("encodable");
     let short_signature_empty_window = build_certificate(
         &s1,
         UnixTime(nb),
@@ -682,12 +688,15 @@ fn ticket_vectors() -> J {
 /// decodes to the same bytes in a lax decoder.
 fn dirty_fragment(fragment: &str) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    if fragment.len() % 4 == 0 {
+    if fragment.len().is_multiple_of(4) {
         return format!("{fragment}AB");
     }
     let mut bytes = fragment.as_bytes().to_vec();
     let last = bytes.len() - 1;
-    let index = ALPHABET.iter().position(|c| *c == bytes[last]).expect("alphabet");
+    let index = ALPHABET
+        .iter()
+        .position(|c| *c == bytes[last])
+        .expect("alphabet");
     bytes[last] = ALPHABET[index | 1];
     String::from_utf8(bytes).expect("ascii")
 }
@@ -857,15 +866,31 @@ fn cbor_vectors() -> J {
         ("9 nested arrays", "81818181818181818100", "too_deep"),
         ("indefinite text string", "7f6161ff", "non_canonical"),
         ("indefinite map", "bf0101ff", "non_canonical"),
-        ("additional info 31 on an unsigned integer", "1f", "non_canonical"),
+        (
+            "additional info 31 on an unsigned integer",
+            "1f",
+            "non_canonical",
+        ),
         ("break byte alone", "ff", "unsupported"),
         ("reserved additional info 28", "1c", "unsupported"),
         ("reserved additional info 30 on bytes", "5e", "unsupported"),
-        ("array count above the bytes left, before its items", "8220", "truncated"),
-        ("map count above half the bytes left", "a2010102", "truncated"),
+        (
+            "array count above the bytes left, before its items",
+            "8220",
+            "truncated",
+        ),
+        (
+            "map count above half the bytes left",
+            "a2010102",
+            "truncated",
+        ),
         ("negative integer as map key", "a12001", "non_integer_key"),
         ("indefinite head on a map key", "a11f01", "non_canonical"),
-        ("key order checked before the value", "a202000120", "unsorted_keys"),
+        (
+            "key order checked before the value",
+            "a202000120",
+            "unsorted_keys",
+        ),
         ("major type checked before the head", "3b00", "unsupported"),
     ];
     let valid: Vec<J> = valid
@@ -1570,7 +1595,8 @@ impl Replay {
     }
 
     fn sent(&mut self, from: &str, conn: u64, m: &ControlMessage) {
-        self.out.push(json!({ "send": { "from": from, "conn": conn, "control": hex(&m.encode()) } }));
+        self.out
+            .push(json!({ "send": { "from": from, "conn": conn, "control": hex(&m.encode()) } }));
     }
 
     /// Log the host's actions; return the messages it sent on `conn`.
@@ -1585,8 +1611,9 @@ impl Replay {
                     }
                 }
                 HostAction::Close { conn: c, code } => {
-                    self.out
-                        .push(json!({ "close": { "from": "host", "conn": c.0, "code": code.name() } }));
+                    self.out.push(
+                        json!({ "close": { "from": "host", "conn": c.0, "code": code.name() } }),
+                    );
                 }
                 HostAction::ShowCode { code, .. } => {
                     self.out.push(json!({ "show_code": code.as_str() }));
@@ -1930,7 +1957,11 @@ fn run_attempt_sequence(seq: &J, listed: Option<&J>) -> J {
     draws.insert("host".into(), J::Array(r.host_rng.log.clone()));
     assert!(r.host_rng.script.is_empty(), "{name}: unused host draws");
     for j in &r.joiners {
-        assert!(j.rng.script.is_empty(), "{name}: unused draws of {}", j.name);
+        assert!(
+            j.rng.script.is_empty(),
+            "{name}: unused draws of {}",
+            j.name
+        );
         draws.insert(j.name.clone(), J::Array(j.rng.log.clone()));
     }
     let mut out = seq.clone();
