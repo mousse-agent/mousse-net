@@ -555,8 +555,9 @@ display-stream fallback. Every subscribe, delivered batch, blob fetch and
      caller's local id.
    - If the stream also has a bound reader (`boundReader`, as on a phone's
      lists), that equals the local id too.
-   - Current policy allows the kind: terminal needs `terminal`, and work
-     needs `work`.
+   - Current policy allows the kind: a terminal needs `terminal`; every
+     kind, terminal included, needs the device not blocked and Work on
+     threads not off. (Settled in S0.)
 2. **Artifact.** A `node.artifact` stream whose
    `net_bridge_artifacts.caller` equals the local id, with a matching
    capability. `mousse.put` may write only into the caller's own input
@@ -1110,3 +1111,17 @@ Not touched: `sync/session.ts`, `sync/supervisor.ts`, `transports/*`,
 2. **Start-up sweep:** enough, because the `removing` and `removed` states
    fence authorization and removal commits before it reports success
    (§5.4).
+
+**Found in S0 (to fix in the named slice)**
+
+1. `RoutedClient.settle` rejects a durable artifact reply (a result over
+   63 KiB) as `bad_reply`, on v1 too. M3 fixes it and covers it through a
+   window call.
+2. If the clock moves back after a renewal, the owner refuses new streams
+   with `bad_delegation`, because the delegation now starts in the future.
+   M3 handles a clock that goes back, using the same skew allowance as the
+   engine.
+3. App-side limits live in `src/mms/netEngine/limits.ts` as
+   `MOUSSE_NET_ENGINE_*` variables. A bad value is logged and keeps its
+   default, so a typo never stops the daemon; the helper still refuses to
+   start on a bad `MOUSSE_NET_*` value.
