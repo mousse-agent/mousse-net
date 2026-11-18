@@ -18,9 +18,10 @@ rust-version = "1.96"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
-# Must-fail controls in mousse-net-core (spec/vectors/README.md). Each plants
-# one bug so the vector tests can be shown to fail. Debug builds only.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(mousse_control, values("break-session-cert", "break-authz", "break-raw-signature", "break-cpace"))'] }
+# Must-fail controls (spec/vectors/README.md, checks/phase0.toml). Each plants
+# one bug so the tests can be shown to fail. Debug builds only. The first four
+# are in mousse-net-core, the rest in mousse-net-io and mousse-helper.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(mousse_control, values("break-session-cert", "break-authz", "break-raw-signature", "break-cpace", "skip-pin-check", "keep-removed-grant", "shared-endpoint-state", "allow-break-env"))'] }
 
 [profile.release]
 lto = true
