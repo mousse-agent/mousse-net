@@ -118,8 +118,86 @@
       "result": "close:unsupported_version"
     }
   ],
-  "description": "HELLO version negotiation (spec wire.md, \"Versions\"). `local` is what the receiving side speaks (its newest and oldest minor version), `peer` is the HELLO it received. `result` is the minor version both sides use, or the close code. `this_build` is what mousse-net-core version 1.0 speaks; `hello` is its HELLO.",
+  "description": "HELLO version negotiation (spec wire.md, \"Versions\"). `local` is what the receiving side speaks (its newest and oldest minor version), `peer` is the HELLO it received. `result` is the minor version both sides use, or the close code. `this_build` is what mousse-net-core version 1.0 speaks; `hello` is its HELLO. `repeated`: several HELLOs arrive on one connection, as control-message bytes, in order. Only the first counts; each later one is `ignored`, whatever it holds. `agreed` is the connection's minor version at the end (null if the first HELLO closed it).",
   "hello": "a3000101010200",
+  "repeated": [
+    {
+      "agreed": 0,
+      "hellos": [
+        {
+          "control": "a3000101010200",
+          "result": 0
+        },
+        {
+          "control": "a3000101010200",
+          "result": "ignored"
+        }
+      ],
+      "local": {
+        "major": 1,
+        "minor": 0,
+        "oldest_minor": 0
+      },
+      "name": "second_hello_same"
+    },
+    {
+      "agreed": 3,
+      "hellos": [
+        {
+          "control": "a3000101010203",
+          "result": 3
+        },
+        {
+          "control": "a3000101010209",
+          "result": "ignored"
+        }
+      ],
+      "local": {
+        "major": 1,
+        "minor": 4,
+        "oldest_minor": 3
+      },
+      "name": "second_hello_other_minor"
+    },
+    {
+      "agreed": 0,
+      "hellos": [
+        {
+          "control": "a3000101010200",
+          "result": 0
+        },
+        {
+          "control": "a3000101020200",
+          "result": "ignored"
+        }
+      ],
+      "local": {
+        "major": 1,
+        "minor": 0,
+        "oldest_minor": 0
+      },
+      "name": "second_hello_other_major"
+    },
+    {
+      "agreed": null,
+      "hellos": [
+        {
+          "control": "a3000101020200",
+          "result": "close:unsupported_version"
+        },
+        {
+          "control": "a3000101010200",
+          "result": "ignored"
+        }
+      ],
+      "local": {
+        "major": 1,
+        "minor": 0,
+        "oldest_minor": 0
+      },
+      "name": "first_hello_refused"
+    }
+  ],
   "this_build": {
     "major": 1,
     "minor": 0,

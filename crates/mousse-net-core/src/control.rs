@@ -289,6 +289,54 @@ pub fn negotiate_version(
     Ok(agreed)
 }
 
+/// What one received `HELLO` did to a connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HelloOutcome {
+    /// The peer's first `HELLO`: the connection uses this minor version.
+    Agreed(u64),
+    /// A later `HELLO`: it has no effect, whatever it holds.
+    Ignored,
+    /// No common version: close the connection with this code.
+    Close(ErrorCode),
+}
+
+/// The version state of one connection. Only the peer's first `HELLO`
+/// counts (spec `wire.md`, "Versions"): it fixes the minor version or closes
+/// the connection. Later ones are ignored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HelloState {
+    local: VersionSupport,
+    decided: Option<Result<u64, ErrorCode>>,
+}
+
+impl HelloState {
+    /// A connection that has not received the peer's `HELLO` yet.
+    pub fn new(local: VersionSupport) -> Self {
+        Self {
+            local,
+            decided: None,
+        }
+    }
+
+    /// The agreed minor version, once the peer's first `HELLO` was accepted.
+    pub fn agreed(&self) -> Option<u64> {
+        self.decided.and_then(Result::ok)
+    }
+
+    /// A `HELLO` arrived from the peer.
+    pub fn on_hello(&mut self, peer_major: u64, peer_minor: u64) -> HelloOutcome {
+        if self.decided.is_some() {
+            return HelloOutcome::Ignored;
+        }
+        let result = negotiate_version(self.local, peer_major, peer_minor);
+        self.decided = Some(result);
+        match result {
+            Ok(minor) => HelloOutcome::Agreed(minor),
+            Err(code) => HelloOutcome::Close(code),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,6 +363,29 @@ mod tests {
             negotiate_version(local, 0, 4),
             Err(ErrorCode::UnsupportedVersion)
         );
+    }
+
+    #[test]
+    fn only_the_first_hello_counts() {
+        let mut state = HelloState::new(VersionSupport::LOCAL);
+        assert_eq!(state.agreed(), None);
+        assert_eq!(
+            state.on_hello(PROTOCOL_VERSION, PROTOCOL_MINOR_VERSION),
+            HelloOutcome::Agreed(PROTOCOL_MINOR_VERSION)
+        );
+        assert_eq!(state.on_hello(PROTOCOL_VERSION + 1, 0), HelloOutcome::Ignored);
+        assert_eq!(state.agreed(), Some(PROTOCOL_MINOR_VERSION));
+
+        let mut refused = HelloState::new(VersionSupport::LOCAL);
+        assert_eq!(
+            refused.on_hello(PROTOCOL_VERSION + 1, 0),
+            HelloOutcome::Close(ErrorCode::UnsupportedVersion)
+        );
+        assert_eq!(
+            refused.on_hello(PROTOCOL_VERSION, PROTOCOL_MINOR_VERSION),
+            HelloOutcome::Ignored
+        );
+        assert_eq!(refused.agreed(), None);
     }
 
     fn all() -> Vec<ControlMessage> {

@@ -60,7 +60,14 @@ When the peer's `HELLO` arrives, each side decides on its own:
    `UNSUPPORTED_VERSION`.
 4. Otherwise the connection uses `agreed`.
 
-When both sides accept, they reach the same `agreed`. Vectors: `hello.json`.
+When both sides accept, they reach the same `agreed`.
+
+**Only the first `HELLO` counts.** The peer's first `HELLO` on a connection
+fixes `agreed` or closes the connection. A later `HELLO` on the same
+connection has no effect, whatever its fields hold: it is ignored, not
+negotiated again and not an error. A side does not wait for the peer's
+`HELLO` before sending its own next messages (section 8). Vectors:
+`hello.json` `cases` and `repeated`.
 
 ## 3. Canonical CBOR
 

@@ -8,7 +8,7 @@ use mousse_net_core::authz::{
 };
 use mousse_net_core::cbor;
 use mousse_net_core::control::{
-    negotiate_version, AuthorizedState, ControlMessage, VersionSupport,
+    negotiate_version, AuthorizedState, ControlMessage, HelloOutcome, HelloState, VersionSupport,
 };
 use mousse_net_core::grants::{GrantTable, NewGrant, OwnerRef, Role};
 use mousse_net_core::identity::{IdentityPublicKey, RawSignature, SoftwareKey};
@@ -364,6 +364,31 @@ fn hello_negotiation() {
             Err(code) => J::from(format!("close:{}", code.name())),
         };
         assert_eq!(got, case["result"], "{}", s(&case["name"]));
+    }
+    for seq in list(&doc["repeated"]) {
+        let name = s(&seq["name"]);
+        let local = &seq["local"];
+        let mut state = HelloState::new(VersionSupport {
+            major: u(&local["major"]),
+            minor: u(&local["minor"]),
+            oldest_minor: u(&local["oldest_minor"]),
+        });
+        for hello in list(&seq["hellos"]) {
+            let Ok(ControlMessage::Hello {
+                major_version,
+                minor_version,
+            }) = ControlMessage::decode(&unhex(&hello["control"]))
+            else {
+                panic!("{name}: not a HELLO");
+            };
+            let got = match state.on_hello(major_version, minor_version) {
+                HelloOutcome::Agreed(minor) => J::from(minor),
+                HelloOutcome::Ignored => J::from("ignored"),
+                HelloOutcome::Close(code) => J::from(format!("close:{}", code.name())),
+            };
+            assert_eq!(got, hello["result"], "{name}");
+        }
+        assert_eq!(J::from(state.agreed()), seq["agreed"], "{name}");
     }
 }
 

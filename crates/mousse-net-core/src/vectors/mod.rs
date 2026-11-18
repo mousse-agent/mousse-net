@@ -15,7 +15,9 @@ use serde_json::{json, Value as J};
 use sha2::Sha256;
 
 use crate::cbor::{self, Value};
-use crate::control::{negotiate_version, AuthorizedState, ControlMessage, VersionSupport};
+use crate::control::{
+    negotiate_version, AuthorizedState, ControlMessage, HelloOutcome, HelloState, VersionSupport,
+};
 use crate::grants::{GrantTable, OwnerRef, Role};
 use crate::identity::{IdentityPublicKey, RawSignature, SoftwareKey};
 use crate::mux::{Frame, PriorityClass, StreamId};
@@ -1122,8 +1124,33 @@ fn hello_vectors() -> J {
     };
     let local = VersionSupport::LOCAL;
     let later = support(1, 4, 3);
+    // Several HELLOs on one connection: only the first counts.
+    let sequence = |name: &str, local: VersionSupport, peers: &[(u64, u64)]| {
+        let mut state = HelloState::new(local);
+        let hellos: Vec<J> = peers
+            .iter()
+            .map(|&(major_version, minor_version)| {
+                let message = ControlMessage::Hello {
+                    major_version,
+                    minor_version,
+                };
+                let result = match state.on_hello(major_version, minor_version) {
+                    HelloOutcome::Agreed(minor) => json!(minor),
+                    HelloOutcome::Ignored => json!("ignored"),
+                    HelloOutcome::Close(code) => json!(format!("close:{}", code.name())),
+                };
+                json!({ "control": hex(&message.encode()), "result": result })
+            })
+            .collect();
+        json!({
+            "name": name,
+            "local": { "major": local.major, "minor": local.minor, "oldest_minor": local.oldest_minor },
+            "hellos": hellos,
+            "agreed": state.agreed(),
+        })
+    };
     json!({
-        "description": "HELLO version negotiation (spec wire.md, \"Versions\"). `local` is what the receiving side speaks (its newest and oldest minor version), `peer` is the HELLO it received. `result` is the minor version both sides use, or the close code. `this_build` is what mousse-net-core version 1.0 speaks; `hello` is its HELLO.",
+        "description": "HELLO version negotiation (spec wire.md, \"Versions\"). `local` is what the receiving side speaks (its newest and oldest minor version), `peer` is the HELLO it received. `result` is the minor version both sides use, or the close code. `this_build` is what mousse-net-core version 1.0 speaks; `hello` is its HELLO. `repeated`: several HELLOs arrive on one connection, as control-message bytes, in order. Only the first counts; each later one is `ignored`, whatever it holds. `agreed` is the connection's minor version at the end (null if the first HELLO closed it).",
         "this_build": { "major": local.major, "minor": local.minor, "oldest_minor": local.oldest_minor },
         "hello": hex(&ControlMessage::hello().encode()),
         "cases": [
@@ -1136,6 +1163,12 @@ fn hello_vectors() -> J {
             case("minor_too_old", later, (1, 2)),
             case("minor_zero_too_old", later, (1, 0)),
             case("major_checked_before_minor", later, (2, 4)),
+        ],
+        "repeated": [
+            sequence("second_hello_same", local, &[(1, 0), (1, 0)]),
+            sequence("second_hello_other_minor", later, &[(1, 3), (1, 9)]),
+            sequence("second_hello_other_major", local, &[(1, 0), (2, 0)]),
+            sequence("first_hello_refused", local, &[(2, 0), (1, 0)]),
         ],
     })
 }
