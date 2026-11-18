@@ -5,8 +5,8 @@
 //! checks, [`Millis`] for timers) and randomness comes from a caller-supplied
 //! [`rand_core::CryptoRng`], so a seeded simulator can replay every run.
 //!
-//! The wire format is specified in `native/net/spec/wire.md`; the design is in
-//! `docs/net/engine/PLAN.md`.
+//! The wire format is specified in `spec/wire.md`; the design is in
+//! `docs/PLAN.md`.
 //!
 //! Modules, bottom-up:
 //! - [`cbor`]: the small canonical CBOR subset our records use.

@@ -1,6 +1,6 @@
 # Crypto provider choice for the session
 
-Phase 0 spike 1 (crypto matrix). Decides which rustls crypto provider each target uses before the session design freezes. Cells, commands and the result format are in [targets.md](targets.md). Code: `native/net/spikes/tls-matrix`. Results: `results/` (build `7fca58b75+release`).
+Phase 0 spike 1 (crypto matrix). Decides which rustls crypto provider each target uses before the session design freezes. Cells, commands and the result format are in [targets.md](targets.md). Code: `spikes/tls-matrix`. Results: `results/` (build `7fca58b75+release`).
 
 ## Recommendation
 

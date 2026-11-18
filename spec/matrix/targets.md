@@ -1,6 +1,6 @@
 # Crypto matrix: target groups
 
-Phase 0 spike 1. Each cell runs the `tls-matrix` spike (`native/net/spikes/tls-matrix`) and writes one JSON result per provider pair into `results/`. A cell passes only when every case passes on every transport the target has. The recommendation is in [crypto.md](crypto.md).
+Phase 0 spike 1. Each cell runs the `tls-matrix` spike (`spikes/tls-matrix`) and writes one JSON result per provider pair into `results/`. A cell passes only when every case passes on every transport the target has. The recommendation is in [crypto.md](crypto.md).
 
 ## What one run checks
 
@@ -62,22 +62,22 @@ Cross pairs that matter for the design:
 
 ## Commands
 
-All commands run from `native/net`. Set `CARGO_TARGET_DIR` to a build folder of your choice. Every native run takes `--out spec/matrix/results`; every run also has a must-fail control with `MOUSSE_MATRIX_BREAK=1` that must end in `FAIL phase0.crypto-matrix` and exit 1.
+All commands run from `spikes/tls-matrix` (the spike is its own Cargo workspace). Set `CARGO_TARGET_DIR` to a build folder of your choice. Every native run takes `--out ../../spec/matrix/results`; every run also has a must-fail control with `MOUSSE_MATRIX_BREAK=1` that must end in `FAIL phase0.crypto-matrix` and exit 1.
 
 ### Windows x64 (done on the PC)
 
-    cargo +stable-x86_64-pc-windows-msvc run --release -p tls-matrix -- --out spec/matrix/results
+    cargo +stable-x86_64-pc-windows-msvc run --release -p tls-matrix -- --out ../../spec/matrix/results
     cargo +stable-x86_64-pc-windows-msvc test -p tls-matrix
 
 The gnu toolchain needs a MinGW C compiler and `dlltool` (for `getrandom` 0.4). The PC has neither, so a portable llvm-mingw (`J:\ryspa\mousse\tools\llvm-mingw-20261104-ucrt-x86_64`) was used, with the toolchain's own linker:
 
-    LM=/j/ryspa/mousse/tools/llvm-mingw-20261104-ucrt-x86_64/bin
+    LM=<llvm-mingw folder>/bin
     SC=$(rustc +stable-x86_64-pc-windows-gnu --print sysroot)/lib/rustlib/x86_64-pc-windows-gnu/bin/self-contained
     PATH="$PATH:$LM" \
     CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER="$SC/x86_64-w64-mingw32-gcc.exe" \
     CC_x86_64_pc_windows_gnu="$LM/x86_64-w64-mingw32-clang.exe" \
     AR_x86_64_pc_windows_gnu="$LM/llvm-ar.exe" \
-    cargo +stable-x86_64-pc-windows-gnu run --release -p tls-matrix -- --out spec/matrix/results
+    cargo +stable-x86_64-pc-windows-gnu run --release -p tls-matrix -- --out ../../spec/matrix/results
 
 ### Linux x64 (done in WSL)
 
@@ -85,7 +85,7 @@ Rust was installed for one user into a private folder (no system packages); gcc 
 
     export RUSTUP_HOME=~/net-p0-crypto/rustup CARGO_HOME=~/net-p0-crypto/cargo
     sh rustup-init.sh -y --no-modify-path --profile minimal --default-toolchain 1.96.0
-    MOUSSE_BUILD_ID=<sha>+release cargo run --release -p tls-matrix -- --out spec/matrix/results
+    MOUSSE_BUILD_ID=<sha>+release cargo run --release -p tls-matrix -- --out ../../spec/matrix/results
 
 `MOUSSE_BUILD_ID` was set because git inside WSL can't read this Windows worktree.
 
@@ -102,15 +102,15 @@ ring needs clang with the wasm32 backend. A portable LLVM 23.1.6 (only `clang.ex
     cargo rustc -p tls-matrix --lib --release --target wasm32-unknown-unknown \
       --no-default-features --features ring,rustcrypto,pq-pure,wasm --crate-type cdylib
     wasm-bindgen --target nodejs --out-dir $CARGO_TARGET_DIR/wasm-pkg $CARGO_TARGET_DIR/wasm32-unknown-unknown/release/tls_matrix.wasm
-    node spikes/tls-matrix/scripts/matrix-results.mjs --pkg $CARGO_TARGET_DIR/wasm-pkg --build <sha>+release --out spec/matrix/results
+    node spikes/tls-matrix/scripts/matrix-results.mjs --pkg $CARGO_TARGET_DIR/wasm-pkg --build <sha>+release --out ../../spec/matrix/results
 
 Without clang, `--features rustcrypto,pq-pure,wasm` builds and passes; anything with `ring` fails in `ring`'s build script (`failed to find tool "clang"`).
 
 ### macOS arm64 and x64 (group 3)
 
-    cargo run --release -p tls-matrix -- --out spec/matrix/results
+    cargo run --release -p tls-matrix -- --out ../../spec/matrix/results
     rustup target add x86_64-apple-darwin
-    cargo run --release --target x86_64-apple-darwin -p tls-matrix -- --out spec/matrix/results   # runs under Rosetta 2
+    cargo run --release --target x86_64-apple-darwin -p tls-matrix -- --out ../../spec/matrix/results   # runs under Rosetta 2
     cargo test -p tls-matrix
     MOUSSE_MATRIX_BREAK=1 cargo run --release -p tls-matrix -- --same-only   # must print FAIL
 
@@ -118,14 +118,14 @@ Without clang, `--features rustcrypto,pq-pure,wasm` builds and passes; anything 
 
 On the Mac, in an arm64 Linux container (or any arm64 Linux host):
 
-    docker run --rm -v "$PWD/../..":/src -w /src/native/net -e MOUSSE_BUILD_ID=<sha>+release rust:1.96 \
-      cargo run --release -p tls-matrix -- --out spec/matrix/results
+    docker run --rm -v "$PWD/../..":/src -w /src/spikes/tls-matrix -e MOUSSE_BUILD_ID=<sha>+release rust:1.96 \
+      cargo run --release -p tls-matrix -- --out ../../spec/matrix/results
 
 ### Windows arm64 (group 2)
 
 On a Windows on Arm machine with the MSVC arm64 build tools (aws-lc-sys may also need clang-cl; to verify):
 
-    cargo +stable-aarch64-pc-windows-msvc run --release -p tls-matrix -- --out spec/matrix/results
+    cargo +stable-aarch64-pc-windows-msvc run --release -p tls-matrix -- --out ../../spec/matrix/results
 
 ### iOS 15+ (group 6), physical phone
 
@@ -135,7 +135,7 @@ On a Windows on Arm machine with the MSVC arm64 build tools (aws-lc-sys may also
     cargo install cargo-dinghy --locked
     export IPHONEOS_DEPLOYMENT_TARGET=15.0 MOUSSE_BUILD_ID=$(git rev-parse --short HEAD)+release
     cargo dinghy -d <phone> run --release -p tls-matrix -- --print-results \
-      | node spikes/tls-matrix/scripts/matrix-results.mjs --stdin --out spec/matrix/results
+      | node spikes/tls-matrix/scripts/matrix-results.mjs --stdin --out ../../spec/matrix/results
     cargo dinghy -d <phone> test --release -p tls-matrix
 
 `--print-results` prints one `MATRIX_RESULT` line per pair; the script writes the files. If dinghy can't pass `MOUSSE_MATRIX_BREAK`, the in-process control is `cargo dinghy -d <phone> test --release -p tls-matrix broken_mode_fails`. A simulator run (`aarch64-apple-ios-sim`) is supporting evidence only, not the cell.
@@ -148,7 +148,7 @@ On a Windows on Arm machine with the MSVC arm64 build tools (aws-lc-sys may also
     cargo ndk -t arm64-v8a --platform <min API from spike 4> build --release -p tls-matrix --bin tls-matrix
     adb push $CARGO_TARGET_DIR/aarch64-linux-android/release/tls-matrix /data/local/tmp/tls-matrix
     adb shell /data/local/tmp/tls-matrix --print-results \
-      | node spikes/tls-matrix/scripts/matrix-results.mjs --stdin --out spec/matrix/results
+      | node spikes/tls-matrix/scripts/matrix-results.mjs --stdin --out ../../spec/matrix/results
     adb shell MOUSSE_MATRIX_BREAK=1 /data/local/tmp/tls-matrix --same-only   # must print FAIL
 
 Repeat with `-t x86_64` and `x86_64-linux-android` on an x86_64 emulator.
@@ -163,7 +163,7 @@ Apple's clang has no wasm32 backend, so use LLVM's clang (Homebrew `llvm`, or th
     export MOUSSE_BUILD_ID=$(git rev-parse --short HEAD)+debug
     F="--no-default-features --features ring,rustcrypto,pq-pure,browser-worker --test wasm_worker"
     CHROMEDRIVER=$(which chromedriver) cargo test -p tls-matrix --target wasm32-unknown-unknown $F -- --nocapture \
-      | node spikes/tls-matrix/scripts/matrix-results.mjs --stdin --out spec/matrix/results
+      | node spikes/tls-matrix/scripts/matrix-results.mjs --stdin --out ../../spec/matrix/results
     GECKODRIVER=$(which geckodriver) cargo test ...same...
     SAFARIDRIVER=/usr/bin/safaridriver cargo test ...same...   # once: safaridriver --enable; Safari opens a window
 

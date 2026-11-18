@@ -4,7 +4,7 @@ The open specification of Mousse networking: how two Mousse devices prove who
 they are, decide what each may do, pair, and carry channels over one
 encrypted connection.
 
-The design and the phase plan are in `docs/net/engine/PLAN.md`. This folder is
+The design and the phase plan are in [`docs/PLAN.md`](../docs/PLAN.md). This folder is
 the part another implementation needs.
 
 | Document | What it covers |
@@ -23,6 +23,6 @@ change needs a version bump.
 
 ## Reference implementation
 
-`native/net/crates/mousse-net-core` implements `wire.md` with no I/O of its
+`crates/mousse-net-core` implements `wire.md` with no I/O of its
 own. Its tests check every vector file through the public API
 (`tests/vectors.rs`).
