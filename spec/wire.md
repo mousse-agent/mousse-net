@@ -815,6 +815,17 @@ CPace output `ISK` is not used by pairing in version 1.
      `ATTEMPTS_EXHAUSTED`.
    - A close with `INVITATION_INVALID` or `ATTEMPTS_EXHAUSTED`: not
      enrolled; the flow ends.
+8. **"Already paired" needs a reason to trust the host.** A link travels
+   over channels anyone may tamper with, so a swapped link can name another
+   key, and step 1 then passes against whoever holds it. A "Send link"
+   joiner therefore accepts `AUTHORIZED {live}` as "already paired" only
+   when it already held a pin for the ticket's host identity before this
+   flow started (an earlier pairing, not this ticket), or while it is
+   learning the outcome of its own lost `PAIRED` (7). Otherwise the flow
+   ends with `PAIRING_FAILED`, the joiner closes the connection, and
+   nothing is pinned. An in-person ticket is read off the host's own
+   screen, so this does not apply to it. Vectors: `pairing-e2e.json`
+   `send_link_live_needs_a_pin`.
 
 Random draws, in order (vectors depend on it): the host draws the invitation
 id (16 bytes), the secret (16 bytes) and, for "Send link", the first code
@@ -892,7 +903,8 @@ routes:
 Cancelling or declining an invitation grants nothing. A joiner that already
 holds a live grant gets `AUTHORIZED {live}` at step 2 and pairing ends with
 "already paired". That is also how a joiner whose `PAIRED` was lost learns
-that it was enrolled (10.6).
+that it was enrolled (10.6). A "Send link" joiner believes it only for a host
+it pinned before the flow, or for its own lost `PAIRED` (10.6, rule 8).
 
 ## 11. Control messages
 

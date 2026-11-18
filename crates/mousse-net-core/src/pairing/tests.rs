@@ -840,6 +840,43 @@ fn send_link_joiner_refuses_paired_without_host_confirmation() {
     );
 }
 
+/// A swapped send link names the far end's key, so step 1 passes against
+/// it. Its `AUTHORIZED {live}` must not end the flow "already paired" (and
+/// get that key pinned) unless this device pinned the host before.
+#[test]
+fn send_link_already_paired_needs_an_earlier_pin() {
+    let mut w = world();
+    let ticket = w.invite(InvitationKind::SendLink);
+
+    let mut fresh = w.joiner(&ticket, 2);
+    fresh.on_connected(exporters(10), NOW).unwrap();
+    assert_eq!(
+        fresh.on_authorized(AuthorizedState::Live),
+        vec![JoinerAction::Failed(ErrorCode::PairingFailed)]
+    );
+    assert_eq!(
+        fresh.state(),
+        JoinerState::Failed(ErrorCode::PairingFailed)
+    );
+
+    let mut known = w.joiner(&ticket, 2);
+    known.set_host_pinned(true);
+    known.on_connected(exporters(11), NOW).unwrap();
+    assert_eq!(
+        known.on_authorized(AuthorizedState::Live),
+        vec![JoinerAction::AlreadyPaired]
+    );
+
+    // In person, the ticket came from the owner's own screen: unchanged.
+    let in_person = w.invite(InvitationKind::InPerson);
+    let mut j = w.joiner(&in_person, 2);
+    j.on_connected(exporters(12), NOW).unwrap();
+    assert_eq!(
+        j.on_authorized(AuthorizedState::Live),
+        vec![JoinerAction::AlreadyPaired]
+    );
+}
+
 #[test]
 fn expired_invitations_close_their_joiners_and_refuse_new_ones() {
     let mut w = world();

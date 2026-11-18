@@ -1,7 +1,7 @@
 {
   "conventions": {
     "draws": "Each party takes its draws in order. A `bytes` draw fills a request of exactly that length; a `u32` draw answers a request for a 32-bit integer. Host: invitation id (16), ticket secret (16), for send link the code (u32, drawn again while at least 4294000000); then for each new attempt the next code (u32, only while attempts are left after the debit) and the CPace scalar yb (32). Joiner: for each attempt the attempt id (16) and the CPace scalar ya (32). A CPace scalar is the 32 bytes with the top four bits of the last byte cleared, read little-endian.",
-    "events": "host/create: create an invitation of `kind`. <joiner>/start: the joiner opens `ticket`. <joiner>/connect: a new TLS connection `conn`; both ends send HELLO, the host runs step 2 at once (a live grant: AUTHORIZED live; no grant: await the join proof, sending nothing) and the joiner sends JOIN_PROOF right after its HELLO without waiting; with `host: false` the far end is scripted. <joiner>/drop: the joiner's connection breaks with no GOAWAY either way. host/receive and <joiner>/receive: a CONTROL message arrives (checked by that end's gate first). <joiner>/goaway: the host's GOAWAY arrives. <joiner>/submit_code: the owner types `code`. host/approve: the host owner approves the device on `conn`.",
+    "events": "host/create: create an invitation of `kind`. <joiner>/start: the joiner opens `ticket`; `host_pinned`: it already held a pin for the ticket's host from an earlier pairing. <joiner>/connect: a new TLS connection `conn`; both ends send HELLO, the host runs step 2 at once (a live grant: AUTHORIZED live; no grant: await the join proof, sending nothing) and the joiner sends JOIN_PROOF right after its HELLO without waiting; with `host: false` the far end is scripted. <joiner>/drop: the joiner's connection breaks with no GOAWAY either way. host/receive and <joiner>/receive: a CONTROL message arrives (checked by that end's gate first). <joiner>/goaway: the host's GOAWAY arrives. <joiner>/submit_code: the owner types `code`. host/approve: the host owner approves the device on `conn`.",
     "exporters": "Stand-in TLS exporter values per connection. Unless `host_exporters` is given, both ends see the same session.",
     "host": {
       "identity": "040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794",
@@ -21,7 +21,7 @@
       "identity_secret": "2222222222222222222222222222222222222222222222222222222222222222",
       "name": "Phone"
     },
-    "outputs": "send: a control message with its CONTROL frame. close: GOAWAY with its frame. attempt: the CPace inputs of a new attempt (CI is the binding transcript; sid as in wire.md). version: the minor version agreed from a HELLO. Others name host or joiner events: show_code, ask_approval, admitted_join_only, enrolled, invitation_ended, paired, code_rejected, failed, error, ignored.",
+    "outputs": "send: a control message with its CONTROL frame. close: GOAWAY with its frame. attempt: the CPace inputs of a new attempt (CI is the binding transcript; sid as in wire.md). version: the minor version agreed from a HELLO. Others name host or joiner events: show_code, ask_approval, admitted_join_only, enrolled, invitation_ended, paired, code_rejected, failed (the joiner's gate closes with it), error, ignored.",
     "time": 1790000000
   },
   "description": "End-to-end pairing (spec wire.md, sections 8, 10 and 11, and cpace.md). Each flow lists scripted random draws per party, then events in order with every output. Replaying the events with the same draws must give the same outputs byte for byte.",
@@ -1923,6 +1923,181 @@
             }
           ],
           "party": "host"
+        }
+      ]
+    },
+    {
+      "description": "A send link can be swapped in transit for one that names another key; step 1 then passes against whoever holds that key, and it answers AUTHORIZED live at once. Joiner a has no pin for that key from before: it does not end already paired, fails with pairing_failed and pins nothing. Joiner b held a pin for the ticket's host before this flow (start with host_pinned): it ends already paired. A joiner learning the outcome of its own lost PAIRED is outcome_after_lost_paired.",
+      "draws": {
+        "host": [
+          {
+            "bytes": "7a833c4afd5dc592f9fee8cf0ea073e7",
+            "use": "invitation_id"
+          },
+          {
+            "bytes": "3b49b89ffb3b5866007e5ba24d151c33",
+            "use": "ticket_secret"
+          },
+          {
+            "u32": 112358,
+            "use": "code"
+          }
+        ],
+        "joiners": {
+          "a": [],
+          "b": []
+        }
+      },
+      "end": {
+        "grants": [],
+        "host": {
+          "attempts_left": 3,
+          "shown_code": "112358",
+          "status": "open"
+        },
+        "joiners": {
+          "a": {
+            "attempts_left": 3,
+            "live": false,
+            "state": "failed:pairing_failed"
+          },
+          "b": {
+            "attempts_left": 3,
+            "live": true,
+            "state": "already_paired"
+          }
+        }
+      },
+      "kind": 2,
+      "name": "send_link_live_needs_a_pin",
+      "steps": [
+        {
+          "event": "create",
+          "kind": 2,
+          "out": [
+            {
+              "ticket": {
+                "binary": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e579404507a833c4afd5dc592f9fee8cf0ea073e705503b49b89ffb3b5866007e5ba24d151c33061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433",
+                "fragment": "pwEBAgIDWEEEAhfmF_C2RDkoJ4-WmZ5pojpPLBUr321s32bluAKC1O0ZSn3ry5dxLS3aPKhaqHZaVvRfx1hZllLyiXxlMG5XlARQeoM8Sv1dxZL5_ujPDqBz5wVQO0m4n_s7WGYAfluiTRUcMwYaarE92AeBd3RjcDovLzE5Mi4xNjguMS4yMDo3NDQz",
+                "hash": "85231634dee754688ba2c00f18dd3819a877af22504cdff8b0268f558c954b6a",
+                "shown_code": "112358"
+              }
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "event": "start",
+          "out": [],
+          "party": "a",
+          "ticket": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e579404507a833c4afd5dc592f9fee8cf0ea073e705503b49b89ffb3b5866007e5ba24d151c33061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
+        },
+        {
+          "event": "start",
+          "host_pinned": true,
+          "out": [],
+          "party": "b",
+          "ticket": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e579404507a833c4afd5dc592f9fee8cf0ea073e705503b49b89ffb3b5866007e5ba24d151c33061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
+        },
+        {
+          "conn": 1,
+          "event": "connect",
+          "exporters": {
+            "join": "5c204b0031f56c01fd42d293174d38c0284f8ac18052af6b5614a7348b8d290a",
+            "pair": "02a96ed33f448dae293418eb942d2096a5ff13cb712b0768d87cc71e5e7f9b6c"
+          },
+          "host": false,
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000101010200",
+                "frame": "000000000700000007a3000101010200",
+                "from": "a",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a4000301507a833c4afd5dc592f9fee8cf0ea073e7025820ad21ddd334e3fc4206de008c7d93185fc503092d1ea769649297e1c5abc6454a036550686f6e65",
+                "frame": "00000000070000003fa4000301507a833c4afd5dc592f9fee8cf0ea073e7025820ad21ddd334e3fc4206de008c7d93185fc503092d1ea769649297e1c5abc6454a036550686f6e65",
+                "from": "a",
+                "type": "JOIN_PROOF"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "control": "a3000101010200",
+          "event": "receive",
+          "out": [
+            {
+              "version": 0
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "control": "a200020101",
+          "event": "receive",
+          "out": [
+            {
+              "failed": "pairing_failed"
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 2,
+          "event": "connect",
+          "exporters": {
+            "join": "defc0ad5e125834ee35276a971d55d1592469b6b06a0ee337530ed5398622bbc",
+            "pair": "bf6dd17cc29a9a249a45300f58b40273e0d10f3af1a95f8b0aedde975b2f2c2d"
+          },
+          "host": false,
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a3000101010200",
+                "frame": "000000000700000007a3000101010200",
+                "from": "b",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a4000301507a833c4afd5dc592f9fee8cf0ea073e7025820dd6c9b39b7e779202baa20d63646591048bfb54db1b9e8dd769450bae8521912036550686f6e65",
+                "frame": "00000000070000003fa4000301507a833c4afd5dc592f9fee8cf0ea073e7025820dd6c9b39b7e779202baa20d63646591048bfb54db1b9e8dd769450bae8521912036550686f6e65",
+                "from": "b",
+                "type": "JOIN_PROOF"
+              }
+            }
+          ],
+          "party": "b"
+        },
+        {
+          "control": "a3000101010200",
+          "event": "receive",
+          "out": [
+            {
+              "version": 0
+            }
+          ],
+          "party": "b"
+        },
+        {
+          "control": "a200020101",
+          "event": "receive",
+          "out": [
+            {
+              "already_paired": true
+            }
+          ],
+          "party": "b"
         }
       ]
     }

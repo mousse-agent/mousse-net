@@ -62,7 +62,10 @@ pub enum JoinerAction {
     Paired(PairedHost),
     /// The host already grants this device (step 2 said live). The device
     /// is paired: pin [`JoinerPairing::expected_host`]. This is also how a
-    /// joiner whose `PAIRED` was lost learns that it was enrolled.
+    /// joiner whose `PAIRED` was lost learns that it was enrolled. With a
+    /// "Send link" ticket it happens only for a host pinned before the flow
+    /// ([`JoinerPairing::set_host_pinned`]) or after this flow's own lost
+    /// `PAIRED`; otherwise the flow fails with `PAIRING_FAILED`.
     AlreadyPaired,
     /// The code was wrong (or the attempt failed); the owner may retype.
     CodeRejected {
@@ -121,6 +124,10 @@ pub struct JoinerPairing<F: CodeExchangeFactory> {
     /// `PAIRED`: the host may have enrolled it. The next connection learns
     /// the outcome, even with no attempts or ticket time left.
     outcome_pending: bool,
+    /// This device already held a pin for the ticket's host before the
+    /// flow started (it paired with that host earlier, not through this
+    /// ticket).
+    host_pinned: bool,
 }
 
 impl<F: CodeExchangeFactory> JoinerPairing<F> {
@@ -147,7 +154,17 @@ impl<F: CodeExchangeFactory> JoinerPairing<F> {
             attempt: None,
             exporters: None,
             outcome_pending: false,
+            host_pinned: false,
         })
+    }
+
+    /// Say whether this device already holds a pin for the ticket's host
+    /// from an earlier pairing. Only then may a "Send link" flow end
+    /// "already paired" on a first `AUTHORIZED {live}`: a link can be
+    /// swapped in transit, and a swapped link that names another host's
+    /// key must not be pinned without the code exchange.
+    pub fn set_host_pinned(&mut self, pinned: bool) {
+        self.host_pinned = pinned;
     }
 
     /// The host identity to pin for step 1 on every connection of this flow.
@@ -232,6 +249,16 @@ impl<F: CodeExchangeFactory> JoinerPairing<F> {
                 Vec::new()
             }
             AuthorizedState::Live => {
+                // A send link proves the host only through the code
+                // exchange. "Already paired" is believed only for a host
+                // this device pinned before, or as the outcome of this
+                // flow's own exchange (a lost `PAIRED`).
+                if self.ticket.kind == InvitationKind::SendLink
+                    && !self.host_pinned
+                    && !self.outcome_pending
+                {
+                    return self.fail(ErrorCode::PairingFailed);
+                }
                 // Also how a pending outcome resolves: the host enrolled us.
                 self.outcome_pending = false;
                 self.state = JoinerState::AlreadyPaired;
