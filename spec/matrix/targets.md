@@ -93,9 +93,9 @@ Rust was installed for one user into a private folder (no system packages); gcc 
 
 ring needs clang with the wasm32 backend. A portable LLVM 23.1.6 (only `clang.exe`, `llvm-ar.exe` and the clang headers, 144 MB) was unpacked to `J:\ryspa\mousse\tools\llvm-23.1.6`. wasm-bindgen 0.2.130 (prebuilt, checksum checked) is in `J:\ryspa\mousse\tools\wasm-bindgen-0.2.130`. Nothing was installed system-wide.
 
-    export CC_wasm32_unknown_unknown=J:/ryspa/mousse/tools/llvm-23.1.6/bin/clang.exe
-    export AR_wasm32_unknown_unknown=J:/ryspa/mousse/tools/llvm-23.1.6/bin/llvm-ar.exe
-    export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=J:/ryspa/mousse/tools/wasm-bindgen-0.2.130/wasm-bindgen-test-runner.exe
+    export CC_wasm32_unknown_unknown=<tools>/llvm-23.1.6/bin/clang.exe
+    export AR_wasm32_unknown_unknown=<tools>/llvm-23.1.6/bin/llvm-ar.exe
+    export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=<tools>/wasm-bindgen-0.2.130/wasm-bindgen-test-runner.exe
     cargo test -p tls-matrix --target wasm32-unknown-unknown --no-default-features --features ring,rustcrypto,pq-pure,wasm
 
     # result files
