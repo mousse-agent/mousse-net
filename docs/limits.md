@@ -87,6 +87,7 @@ spec's value: it can only be tightened.
 | `MOUSSE_NET_APP_CONTROL_QUEUE_BYTES` | 1048576 | 65536 to 67108864 | App mode: JSON and `CREDIT` queued for an app that is not reading; past it the channel ends and the helper exits. |
 | `MOUSSE_NET_APP_LOG_MAX_BYTES` | 1048576 | 4096 to 1073741824 | App mode: size at which `helper.log` in the state directory starts a new file. |
 | `MOUSSE_NET_APP_LOG_FILES` | 2 | 1 to 10 | App mode: log files kept (`helper.log`, `helper.log.1`, ...). |
+| `MOUSSE_NET_REMOVAL_RETRY_MS` | 1000 | 10 to 60000 | While networking is paused because a removal (`grant.remove`) could not be saved, how often the helper tries the save again (Phase 1a §5.4). |
 
 ## Fixed on purpose
 

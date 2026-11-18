@@ -1161,3 +1161,68 @@ Not touched: `sync/session.ts`, `sync/supervisor.ts`, `transports/*`,
    frames for tests and diagnostics.
 9. **Environment.** The helper ignores the app's own `MOUSSE_NET_ENGINE_*`
    names and `MOUSSE_NET_HELPER` when it checks for unknown limits.
+
+**Decided while building E3**
+
+1. **`join {ticket, pinned}`.** `pinned` means the app recorded its
+   consent first (§5.1): the ticket's host counts as pinned, and a join
+   past the ticket's joiner-side expiry stores "outcome pending" and
+   reconnects with the same ticket (`Caller::join_pinned_with_redial`).
+   `PAIRED` then means this invitation enrolled the device,
+   `AUTHORIZED {live}` that it is already paired, and a host with no grant
+   for it closes with `INVITATION_INVALID`. Only in-person tickets join
+   (send links are not in 1.0: `not_supported`), as an in-app scan. The
+   reply adds `conn`: the pairing connection stays up and is announced as
+   `conn.up {dir: "out", role}`. `join.progress {invitation, step:
+   "connecting", route}` comes once per address tried; `join.cancel
+   {invitation}` answers the join with `cancelled`.
+2. **Names.** `config.set {name}` and `hello {name}` set the name `PAIRED`
+   and joins send (`bad_name` if empty or over 128 bytes). Until then it
+   is `serve --name`.
+3. **Invitations.** `invite.create` makes in-person invitations only. `uri`
+   is the ticket's fragment, the text the QR holds (`join` also takes a
+   link ending in `#fragment`). `approval` is `{request, invitation,
+   identity, device, name}`; the request id names the connection and the
+   full fingerprint. An answer to a request that is gone is `no_request`,
+   a yes the host can no longer apply is `stale`. A question for an
+   invitation this channel did not make is declined. `invite.ended.reason`
+   is the error code's name.
+4. **`grant.add {identity, name, receipt}`** makes an owner grant and keeps
+   `receipt` as its enrollment receipt (`grants.list` shows it as
+   `receipt`). If the identity holds a live grant, that grant is returned
+   with `already: true` and nothing closes. A failed save is
+   `store_failed`; the grant is in effect, the host retries, and the app
+   may repeat the call.
+5. **Peers.** `peer.add {identity, name, routes, role?}` stores a peer;
+   `role` defaults to `owner`, since 1a grants are owner grants. Repeated,
+   it updates the name and role and adds routes. Routes must parse
+   (`bad_route`); the private-range rule (§5.3) and `peer.addresses.set`
+   come with E5a. `peer.forget` also closes this side's outbound
+   connections to the peer (`CANCELLED`). Outbound `conn.up` carries the
+   role stored for the peer: from `PAIRED`, or from `peer.add`. An
+   "already paired" join with no stored record has `role: null`.
+6. **Removal.** The journal is `revoke.journal` in the endpoint's state
+   folder, beside `grants.json`, rewritten whole and durably on each
+   entry. A grant that is already gone answers `{removed: false}`. A
+   journal write that fails answers `journal_failed`, "Couldn't remove;
+   try again", and changes nothing. A save that fails answers `{removed:
+   true, paused: true}` and pauses networking:
+   - every connection closes with `INTERNAL_ERROR` (the removed peer's
+     with `GRANT_REVOKED` first);
+   - inbound TCP connections are dropped as they are accepted. The
+     listener stays bound, so the kept port stays this endpoint's;
+   - `dial` and `join` answer `paused`;
+   - events `net.paused {reason}` and `net.resumed`; `hello` reports
+     `paused`.
+
+   Every `REMOVAL_RETRY_MS` (`MOUSSE_NET_REMOVAL_RETRY_MS`, 1 s) the
+   helper replays the journal, saves and clears it. At start the replay
+   runs before the accept loop; if it fails, the helper starts paused. The
+   command line's `remove` keeps its Phase 0 behaviour (not journaled);
+   the start-up replay and the pause apply in both modes.
+7. **Retired.** App mode binds no control listener and writes no
+   `control.json`; the app tests pair through `invite.create`, `join` and
+   `approval.answer`. `dial` uses the peer store and announces the role.
+   This replaces item 8 of the E1 and E2 list.
+8. **Stored roles.** A join now stores the role's name (`owner`), not its
+   debug form; readers accept both.

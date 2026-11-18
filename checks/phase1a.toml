@@ -27,3 +27,17 @@ control = [
   { name = "fin-overtakes", breaks = "FIN is sent as a control message ahead of the stream's queued DATA", env = { RUSTFLAGS = '--cfg mousse_control="fin-overtakes"' } },
   { name = "no-stream-cap", breaks = "the engine admits every peer stream at full initial credit", env = { RUSTFLAGS = '--cfg mousse_control="no-stream-cap"' } },
 ]
+
+[[check]]
+id = "phase1a.helper-removal"
+title = "A crash between the grant change and its save never re-admits the removed peer at helper admission"
+plan = "docs/phase1a-design.md §5.4 and §10 (E3)"
+targets = ["windows-x64", "linux-x64"]
+min_tests = 6
+local = [
+  { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_pairing", "--no-fail-fast"] },
+  { target = "linux-x64", host = "linux-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_pairing", "--no-fail-fast"] },
+]
+control = [
+  { name = "no-revoke-journal", breaks = "removal is not journaled, so a crash between change and save re-admits the peer", env = { RUSTFLAGS = '--cfg mousse_control="no-revoke-journal"' } },
+]
