@@ -1,0 +1,20 @@
+# Phase 0 spike 2: a browser Worker signs a session certificate.
+# Its own workspace, like spikes/phone and spikes/tls-matrix, so the engine
+# workspace is untouched.
+[workspace]
+resolver = "3"
+members = ["wasm", "runner"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+rust-version = "1.96"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
