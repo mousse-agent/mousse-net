@@ -1317,3 +1317,58 @@ Not touched: `sync/session.ts`, `sync/supervisor.ts`, `transports/*`,
    control build either; each helper test was checked to fail with the
    close after a missed ping, the backoff reset, or the renewal
    forwarding taken out.
+
+**Decided while building E6**
+
+1. **The pin.** `app/MOUSSE_REVISION` holds one full commit hash (40 or
+   64 hex digits); an abbreviated one is refused. It pins `8789ae66`, the
+   tip of the app's `net-engine-1a` branch when E6 landed. Without a
+   readable pin, every app cell is INCOMPLETE.
+2. **Digest.** `app = true` joins the configuration digest only when set,
+   so every check without it keeps its digest and its signed evidence
+   (checked against a committed Phase 0 result). `app` with `manual` is
+   refused: a manual step is attested with both builds instead.
+3. **The gate.** The kit runs an app check only if `MOUSSE_APP_DIR` is a
+   git checkout whose HEAD is the pin and whose `git status --porcelain`
+   is empty (ignored files such as `node_modules` are fine). Otherwise it
+   says why and runs nothing, so no record is written. A run record keeps
+   the run's `app_build=` line as `app_build`, and `run --sign-with` signs
+   it as `extra.app_build`. Records and results count only with the
+   pinned app build; a `-dirty` one never counts, `--allow-dirty` or not.
+   `sign` also keeps `app_build` and `host_app_build`, and notes when an
+   app result names another app build.
+4. **`run.mjs`.** The helper build it reports is `<source commit>[-dirty]
+   +debug`, named the way the kit names this checkout. The kit records
+   app runs with the profile `unknown`, since it cannot see what a script
+   builds; the app cells set no `profile`. The helper build reaches the
+   app as `MOUSSE_NET_ENGINE_HELPER_BUILD`, inside the app's own
+   namespace: the helper refuses to start with a `MOUSSE_NET_*` name it
+   does not know, so `MOUSSE_NET_HELPER_BUILD` would stop it. `run.mjs`
+   only warns when the app build is not the pin: the kit refuses the run,
+   and a device result is judged when it is evaluated.
+5. **Device runs.** `--control <name>` takes the control's environment
+   from the manifest through a new `mousse-check control-env`, which
+   prints it as JSON (controls that change the command are refused).
+   `--result` takes `host_build` and `host_app_build` from the app's
+   `host_build=` and `host_app_build=` lines. The app script has no
+   `--role` yet, so that is the contract for it.
+6. **Cells.** The three app checks the app script runs today
+   (`picker-v1-off`, `private-streams`, `once-or-unknown`) joined
+   `checks/phase1a.toml` as written in §9; the others join with their M
+   slices. On Windows, against a clean clone of the app at the pin, all
+   three passed and every control failed with its reason.
+7. **A lost GOAWAY.** `an_ungranted_identity_cannot_open_streams` failed
+   about once in 50 runs under load: the peer read
+   `ConnectionAborted` and no GOAWAY. That was a real bug. A
+   connection closed its socket as soon as the GOAWAY was written, with
+   the peer's later data unread. Closing with unread data resets the
+   connection, and on Windows the reset destroys what the peer has not
+   read yet, so a refused or removed device saw a network error instead
+   of the reason. The driver now reads and drops what the peer still
+   sends until it closes too, within `CLOSE_LINGER_MS`.
+   `a_refused_peer_that_keeps_sending_still_reads_why` fails every time
+   without that. The one-off hang of a loopback test binary in E5a did
+   not recur in about 500 suite runs under load. Its cause is unknown.
+   The unbounded awaits left in those tests (`dial`, `connect`, reads
+   and writes after a close) are now bounded, so a recurrence names its
+   step.
