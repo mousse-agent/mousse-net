@@ -20,8 +20,12 @@
 ))]
 compile_error!("a mousse_control build has a deliberate defect and is for tests only; build it without --release");
 
-// The same controls in a release-profile build, even with debug assertions
-// on. `build.rs` passes the profile in `MOUSSE_BUILD_PROFILE`.
+#[cfg(all(not(debug_assertions), feature = "test-in-person"))]
+compile_error!("test-in-person lets a typed ticket count as scanned from the host's screen; it is for test builds only, build it without --release");
+
+// The same controls (and `test-in-person`) in a release-profile build, even
+// with debug assertions on. `build.rs` passes the profile in
+// `MOUSSE_BUILD_PROFILE`.
 #[cfg(any(
     mousse_control = "skip-pin-check",
     mousse_control = "keep-removed-grant",
@@ -33,7 +37,8 @@ compile_error!("a mousse_control build has a deliberate defect and is for tests 
     mousse_control = "no-revoke-journal",
     mousse_control = "stop-on-mismatch",
     mousse_control = "public-routes",
-    mousse_control = "no-rediscovery"
+    mousse_control = "no-rediscovery",
+    feature = "test-in-person"
 ))]
 const _: () = {
     let profile = env!("MOUSSE_BUILD_PROFILE").as_bytes();
@@ -44,7 +49,10 @@ const _: () = {
         same = profile[i] == release[i];
         i += 1;
     }
-    assert!(!same, "a mousse_control build has a deliberate defect and is for tests only; build it without --release");
+    assert!(
+        !same,
+        "a mousse_control or test-in-person build is for tests only; build it without --release"
+    );
 };
 
 mod app;
@@ -147,11 +155,8 @@ enum Command {
     Join {
         /// The ticket (the fragment, or a link containing `#`).
         ticket: String,
-        /// The ticket was scanned from the host's screen. An in-person
-        /// ticket pairs only this way; without the flag a ticket counts as
-        /// sent (pasted or opened as a link).
-        #[arg(long)]
-        in_person: bool,
+        #[command(flatten)]
+        arrival: TicketArrival,
         /// The name the host sees in person (default: this computer's
         /// name). A send link sends the computer name only.
         #[arg(long)]
@@ -192,11 +197,8 @@ enum Command {
         /// The host's ticket.
         #[arg(long)]
         ticket: String,
-        /// The ticket was scanned from the host's screen. An in-person
-        /// ticket pairs only this way; without the flag a ticket counts as
-        /// sent (pasted or opened as a link).
-        #[arg(long)]
-        in_person: bool,
+        #[command(flatten)]
+        arrival: TicketArrival,
         /// The name the host sees in person. A send link sends the
         /// computer name only.
         #[arg(long)]
@@ -228,12 +230,26 @@ enum Command {
     },
 }
 
-/// How a ticket reached this device: `--in-person` for a scan of the
-/// host's screen, anything else counts as sent.
-fn arrival(in_person: bool) -> mousse_net_core::pairing::Arrival {
-    if in_person {
-        mousse_net_core::pairing::Arrival::InAppScan
-    } else {
+/// How a ticket reached this device. A ticket given on the command line
+/// counts as sent (pasted or opened as a link): only the app's own scanner
+/// can say it was scanned from the host's screen, so an in-person ticket
+/// does not pair here. Test builds (feature `test-in-person`, refused in
+/// release builds) take `--in-person` to stand in for the scanner.
+#[derive(clap::Args, Debug)]
+struct TicketArrival {
+    /// Test builds only: the ticket counts as scanned from the host's
+    /// screen, as the app's scanner would say.
+    #[cfg(feature = "test-in-person")]
+    #[arg(long)]
+    in_person: bool,
+}
+
+impl TicketArrival {
+    fn arrival(&self) -> mousse_net_core::pairing::Arrival {
+        #[cfg(feature = "test-in-person")]
+        if self.in_person {
+            return mousse_net_core::pairing::Arrival::InAppScan;
+        }
         mousse_net_core::pairing::Arrival::Link
     }
 }
@@ -570,20 +586,15 @@ async fn run(cli: Cli) -> Result<i32, String> {
         Command::Invite { link, no_qr } => invite(&dir, link, no_qr).await?,
         Command::Join {
             ticket,
-            in_person,
+            arrival,
             name,
             routes,
         } => {
             let ticket = peer::parse_ticket(&ticket)?;
             let side = peer::CallerSide::open(&dir, insecure)?;
             let name = peer::join_name(&ticket, name, computer_name());
-            let (_conn, record) =
-                peer::join(&side, &ticket, arrival(in_person), &name, &routes).await?;
-            println!(
-                "paired with {} ({})",
-                printable(&record.name),
-                short_id(&ticket.host_identity)
-            );
+            let joined = peer::join(&side, &ticket, arrival.arrival(), &name, &routes).await?;
+            println!("{}", peer::joined_line(&joined, &ticket.host_identity));
         }
         Command::Peers => peer::print_peers(&dir)?,
         Command::Grants => match ipc::call(&dir, json!({"cmd": "grants"})).await? {
@@ -613,7 +624,7 @@ async fn run(cli: Cli) -> Result<i32, String> {
         }
         Command::SliceCheck {
             ticket,
-            in_person,
+            arrival,
             name,
             routes,
             removal_timeout,
@@ -631,7 +642,7 @@ async fn run(cli: Cli) -> Result<i32, String> {
             };
             let opts = peer::SliceCheck {
                 ticket,
-                arrival: arrival(in_person),
+                arrival: arrival.arrival(),
                 name,
                 routes,
                 command,

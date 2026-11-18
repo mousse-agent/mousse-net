@@ -1,5 +1,8 @@
 //! Host and joiner pairing flows, driven message by message.
 
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen_test::wasm_bindgen_test as test;
+
 use rand_chacha::ChaCha20Rng;
 use rand_core::{CryptoRng, SeedableRng};
 

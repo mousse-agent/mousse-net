@@ -160,6 +160,9 @@ pub(crate) fn single(input: &[u8], tag: u8) -> Result<&[u8], DerError> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_arch = "wasm32")]
+    use wasm_bindgen_test::wasm_bindgen_test as test;
+
     use super::*;
 
     #[test]

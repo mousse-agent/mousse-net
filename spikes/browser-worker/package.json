@@ -1,0 +1,13 @@
+{
+  "name": "mousse-browser-worker-spike",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "build": "wasm-pack build wasm --target no-modules --release --out-dir ../web/pkg --no-typescript --no-pack && cargo build --release -p browser-worker-runner"
+  },
+  "devDependencies": {
+    "playwright": "1.65.1"
+  }
+}

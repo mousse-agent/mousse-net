@@ -9,11 +9,16 @@
 //! joiner's flow records) are read, changed and written under an OS file
 //! lock, which the OS releases when the process holding it dies.
 //!
-//! An enrollment is recorded as pending (`grants-pending.json`) before the
-//! grant table that holds it replaces the old one, and the record is
-//! cleared only once that table is saved. Loading the table drops every
-//! grant still recorded as pending, so an enrollment the host reported as
-//! failed is never honored after a restart, whatever step failed.
+//! An enrollment is saved in three steps. First `grants-pending.json`
+//! records it with the table in force before it, then the table holding it
+//! replaces `grants.json`, then the record is cleared. While a record is
+//! there, loading returns the table it holds, so a failure before the
+//! clear lands leaves the old table in force, also after a restart: the
+//! enrollment's grant is not honored and a grant it replaced comes back.
+//! A clear that landed but could not be made durable leaves the new table
+//! in force (that is what every reader sees); the host treats it as
+//! unsettled until a save works, and loading syncs the folder, so what a
+//! load returns stays in force.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -175,7 +180,7 @@ fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, NetError> {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct GrantRecord {
     id: u64,
     identity: String,
@@ -192,13 +197,13 @@ struct GrantRecord {
     enrolled_by: Option<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct DenialRecord {
     identity: String,
     denied_at: u64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct GrantFile {
     version: u32,
     /// Grant ids are never reused: the next id survives restarts even when
@@ -208,7 +213,7 @@ struct GrantFile {
     denials: Vec<DenialRecord>,
 }
 
-/// An enrollment saved in the grant table and not yet committed.
+/// An enrollment the host is saving.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PendingEnrollment {
     /// The new grant.
@@ -234,24 +239,82 @@ impl PendingRecord {
             invitation: hex(&e.invitation.0),
         }
     }
-
-    /// Whether `grant` is the one this enrollment made.
-    fn made(&self, grant: &Grant) -> bool {
-        self.grant == grant.id.0
-            && self.identity == hex(grant.identity.as_bytes())
-            && grant
-                .enrolled_by
-                .is_some_and(|i| self.invitation == hex(&i.0))
-    }
 }
 
-#[derive(Serialize, Deserialize, Default)]
+/// The pending record format.
+const PENDING_FILE_VERSION: u32 = 2;
+
+/// `grants-pending.json`: the enrollments being saved and the table in
+/// force without them.
+#[derive(Serialize, Deserialize)]
 struct PendingFile {
     version: u32,
     enrollments: Vec<PendingRecord>,
+    /// What a load returns while `enrollments` is not empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    in_force: Option<GrantFile>,
 }
 
-/// The host's grant table on disk, and the enrollments not yet committed.
+impl PendingFile {
+    fn cleared() -> Self {
+        Self {
+            version: PENDING_FILE_VERSION,
+            enrollments: Vec::new(),
+            in_force: None,
+        }
+    }
+}
+
+/// How a failed [`GrantStore::save_enrollment`] left things.
+#[derive(Debug)]
+pub enum EnrollmentSaveError {
+    /// The table from before the enrollments is in force, now and after a
+    /// restart: none of them is.
+    NotSaved(NetError),
+    /// The enrollments are in force (a load returns them), but the last
+    /// step could not be made durable; a save that works settles it.
+    Unsettled(NetError),
+}
+
+impl EnrollmentSaveError {
+    /// What failed.
+    pub fn error(&self) -> &NetError {
+        match self {
+            Self::NotSaved(e) | Self::Unsettled(e) => e,
+        }
+    }
+}
+
+fn file_of(table: &GrantTable) -> GrantFile {
+    GrantFile {
+        version: GRANT_FILE_VERSION,
+        next_grant_id: table.next_grant_id(),
+        grants: table
+            .grants()
+            .map(|g| GrantRecord {
+                id: g.id.0,
+                identity: hex(g.identity.as_bytes()),
+                name: g.name.clone(),
+                role: g.role.as_str().to_owned(),
+                source: "local".into(),
+                authorizing_owner: hex(g.authorizing_owner.as_bytes()),
+                granted_at: g.granted_at.secs(),
+                expires_at: g.expires_at.map(|t| t.secs()),
+                enrolled_by: g.enrolled_by.map(|i| hex(&i.0)),
+            })
+            .collect(),
+        denials: table
+            .denials()
+            .map(|d| DenialRecord {
+                identity: hex(d.identity.as_bytes()),
+                denied_at: d.denied_at.secs(),
+            })
+            .collect(),
+    }
+}
+
+/// The host's grant table on disk, with the record of the enrollments
+/// being saved.
 #[derive(Clone, Debug)]
 pub struct GrantStore {
     path: PathBuf,
@@ -272,108 +335,79 @@ impl GrantStore {
         &self.path
     }
 
-    /// Where the enrollments not yet committed are recorded.
+    /// Where the enrollments being saved are recorded.
     pub fn pending_path(&self) -> &Path {
         &self.pending
     }
 
-    fn load_pending(&self) -> Result<Vec<PendingRecord>, NetError> {
+    /// The pending record, if it names any enrollment.
+    fn load_pending(&self) -> Result<Option<PendingFile>, NetError> {
         let Some(bytes) = read_optional(&self.pending)? else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
         let file: PendingFile =
             serde_json::from_slice(&bytes).map_err(|e| store_err(&self.pending, e.into()))?;
-        Ok(file.enrollments)
-    }
-
-    fn write_pending(&self, enrollments: Vec<PendingRecord>) -> Result<(), NetError> {
-        let file = PendingFile {
-            version: 1,
-            enrollments,
-        };
-        let bytes =
-            serde_json::to_vec_pretty(&file).map_err(|e| store_err(&self.pending, e.into()))?;
-        write_atomic(&self.pending, &bytes)
-    }
-
-    /// Record `enrollments` as pending, durably, before the table that
-    /// holds them is saved. Until [`GrantStore::commit_enrollments`], a
-    /// load drops their grants. Earlier records stay.
-    pub fn begin_enrollments(&self, enrollments: &[PendingEnrollment]) -> Result<(), NetError> {
-        let mut records = self.load_pending()?;
-        for e in enrollments {
-            let record = PendingRecord::of(e);
-            if !records.contains(&record) {
-                records.push(record);
-            }
+        if file.enrollments.is_empty() {
+            return Ok(None);
         }
-        self.write_pending(records)
-    }
-
-    /// The table saved last holds exactly what the host has in force: no
-    /// enrollment is pending any more. Writes only if one was recorded.
-    pub fn commit_enrollments(&self) -> Result<(), NetError> {
-        if self.load_pending()?.is_empty() {
-            return Ok(());
-        }
-        self.write_pending(Vec::new())
-    }
-
-    /// Load the table; a missing file is an empty table.
-    pub fn load(&self) -> Result<GrantTable, NetError> {
-        let Some(bytes) = read_optional(&self.path)? else {
-            return Ok(GrantTable::new());
-        };
-        let file: GrantFile =
-            serde_json::from_slice(&bytes).map_err(|e| store_err(&self.path, e.into()))?;
-        if file.version != GRANT_FILE_VERSION {
+        if file.version != PENDING_FILE_VERSION || file.in_force.is_none() {
             return Err(NetError::Store(format!(
-                "{}: unsupported version {}",
-                self.path.display(),
-                file.version
+                "{}: pending enrollments without the table in force",
+                self.pending.display()
             )));
         }
-        let bad = |what: &str| NetError::Store(format!("{}: bad {what}", self.path.display()));
-        let mut grants = Vec::with_capacity(file.grants.len());
-        for g in file.grants {
-            if g.source != "local" {
-                return Err(bad("grant source"));
-            }
-            grants.push(Grant {
-                id: GrantId(g.id),
-                identity: identity_from_hex(&g.identity)?,
-                name: g.name,
-                role: Role::new(&g.role).map_err(|_| bad("role"))?,
-                source: GrantSource::Local,
-                authorizing_owner: owner_from_hex(&g.authorizing_owner)
-                    .ok_or_else(|| bad("owner"))?,
-                adopted_into: None,
-                granted_at: UnixTime(g.granted_at),
-                expires_at: g.expires_at.map(UnixTime),
-                enrolled_by: match g.enrolled_by {
-                    Some(text) => Some(InvitationId(
-                        unhex(&text)
-                            .ok()
-                            .and_then(|b| b.try_into().ok())
-                            .ok_or_else(|| bad("enrollment receipt"))?,
-                    )),
-                    None => None,
-                },
-            });
-        }
-        let mut denials = Vec::with_capacity(file.denials.len());
-        for d in file.denials {
-            denials.push(Denial {
-                identity: identity_from_hex(&d.identity)?,
-                denied_at: UnixTime(d.denied_at),
-            });
-        }
-        // An enrollment saved but never committed was reported as failed:
-        // its grant is not honored.
+        Ok(Some(file))
+    }
+
+    fn write_pending(&self, file: &PendingFile) -> Result<(), WriteFailure> {
+        let bytes = serde_json::to_vec_pretty(file).map_err(|e| WriteFailure {
+            error: store_err(&self.pending, e.into()),
+            in_place: false,
+        })?;
+        write_atomic_checked(&self.pending, &bytes)
+    }
+
+    fn write_table(&self, table: &GrantTable) -> Result<(), WriteFailure> {
+        let bytes = serde_json::to_vec_pretty(&file_of(table)).map_err(|e| WriteFailure {
+            error: store_err(&self.path, e.into()),
+            in_place: false,
+        })?;
+        write_atomic_checked(&self.path, &bytes)
+    }
+
+    /// Load the table in force: the one the pending record holds while it
+    /// names an enrollment, else `grants.json` (a missing file is an empty
+    /// table). The folder is synced first, so what this returns survives a
+    /// power loss.
+    pub fn load(&self) -> Result<GrantTable, NetError> {
+        let current = match read_optional(&self.path)? {
+            Some(bytes) => Some(
+                serde_json::from_slice::<GrantFile>(&bytes)
+                    .map_err(|e| store_err(&self.path, e.into()))?,
+            ),
+            None => None,
+        };
         let pending = self.load_pending()?;
-        grants.retain(|g| !pending.iter().any(|p| p.made(g)));
-        GrantTable::restore(grants, denials, file.next_grant_id)
-            .map_err(|e| NetError::Store(format!("{}: {e}", self.path.display())))
+        if current.is_some() || pending.is_some() {
+            if let Some(dir) = self.path.parent() {
+                crate::private::sync_dir(dir).map_err(|e| store_err(dir, e))?;
+            }
+        }
+        let (file, origin) = match pending.and_then(|p| p.in_force) {
+            Some(mut held) => {
+                // Ids are never given out twice, also not those of the
+                // table that did not stay in force.
+                if let Some(c) = &current {
+                    held.next_grant_id = held.next_grant_id.max(c.next_grant_id);
+                }
+                (held, &self.pending)
+            }
+            None => match current {
+                Some(c) => (c, &self.path),
+                None => return Ok(GrantTable::new()),
+            },
+        };
+        table_of(file, origin)
     }
 
     /// Save the table atomically.
@@ -382,39 +416,104 @@ impl GrantStore {
     }
 
     /// [`GrantStore::save`], telling whether a failure may have left the
-    /// new table in place (see [`WriteFailure`]).
+    /// new table in force (see [`WriteFailure`]). While a pending record
+    /// names an enrollment, it is made to hold `table` first, so a load
+    /// returns `table` from then on, and it is cleared after.
     pub fn save_checked(&self, table: &GrantTable) -> Result<(), WriteFailure> {
-        let file = GrantFile {
-            version: GRANT_FILE_VERSION,
-            next_grant_id: table.next_grant_id(),
-            grants: table
-                .grants()
-                .map(|g| GrantRecord {
-                    id: g.id.0,
-                    identity: hex(g.identity.as_bytes()),
-                    name: g.name.clone(),
-                    role: g.role.as_str().to_owned(),
-                    source: "local".into(),
-                    authorizing_owner: hex(g.authorizing_owner.as_bytes()),
-                    granted_at: g.granted_at.secs(),
-                    expires_at: g.expires_at.map(|t| t.secs()),
-                    enrolled_by: g.enrolled_by.map(|i| hex(&i.0)),
-                })
-                .collect(),
-            denials: table
-                .denials()
-                .map(|d| DenialRecord {
-                    identity: hex(d.identity.as_bytes()),
-                    denied_at: d.denied_at.secs(),
-                })
-                .collect(),
-        };
-        let bytes = serde_json::to_vec_pretty(&file).map_err(|e| WriteFailure {
-            error: store_err(&self.path, e.into()),
+        let pending = self.load_pending().map_err(|error| WriteFailure {
+            error,
             in_place: false,
         })?;
-        write_atomic_checked(&self.path, &bytes)
+        let Some(pending) = pending else {
+            return self.write_table(table);
+        };
+        self.write_pending(&PendingFile {
+            in_force: Some(file_of(table)),
+            ..pending
+        })?;
+        // `table` is in force from here, whatever fails.
+        self.write_table(table).map_err(|f| WriteFailure {
+            in_place: true,
+            ..f
+        })?;
+        // Cleared or not, the record now holds the table saved.
+        let _ = self.write_pending(&PendingFile::cleared());
+        Ok(())
     }
+
+    /// Save `table`, which holds `enrollments` made on `before`, the table
+    /// in force. The enrollments are in force only if this returns `Ok`,
+    /// or [`EnrollmentSaveError::Unsettled`].
+    pub fn save_enrollment(
+        &self,
+        before: &GrantTable,
+        table: &GrantTable,
+        enrollments: &[PendingEnrollment],
+    ) -> Result<(), EnrollmentSaveError> {
+        let not_saved = |f: WriteFailure| EnrollmentSaveError::NotSaved(f.error);
+        let mut in_force = file_of(before);
+        // The new ids are not given out again.
+        in_force.next_grant_id = in_force.next_grant_id.max(table.next_grant_id());
+        self.write_pending(&PendingFile {
+            version: PENDING_FILE_VERSION,
+            enrollments: enrollments.iter().map(PendingRecord::of).collect(),
+            in_force: Some(in_force),
+        })
+        .map_err(not_saved)?;
+        self.write_table(table).map_err(not_saved)?;
+        match self.write_pending(&PendingFile::cleared()) {
+            Ok(()) => Ok(()),
+            Err(f) if f.in_place => Err(EnrollmentSaveError::Unsettled(f.error)),
+            Err(f) => Err(not_saved(f)),
+        }
+    }
+}
+
+/// The table in `file`, read from `origin`.
+fn table_of(file: GrantFile, origin: &Path) -> Result<GrantTable, NetError> {
+    if file.version != GRANT_FILE_VERSION {
+        return Err(NetError::Store(format!(
+            "{}: unsupported version {}",
+            origin.display(),
+            file.version
+        )));
+    }
+    let bad = |what: &str| NetError::Store(format!("{}: bad {what}", origin.display()));
+    let mut grants = Vec::with_capacity(file.grants.len());
+    for g in file.grants {
+        if g.source != "local" {
+            return Err(bad("grant source"));
+        }
+        grants.push(Grant {
+            id: GrantId(g.id),
+            identity: identity_from_hex(&g.identity)?,
+            name: g.name,
+            role: Role::new(&g.role).map_err(|_| bad("role"))?,
+            source: GrantSource::Local,
+            authorizing_owner: owner_from_hex(&g.authorizing_owner).ok_or_else(|| bad("owner"))?,
+            adopted_into: None,
+            granted_at: UnixTime(g.granted_at),
+            expires_at: g.expires_at.map(UnixTime),
+            enrolled_by: match g.enrolled_by {
+                Some(text) => Some(InvitationId(
+                    unhex(&text)
+                        .ok()
+                        .and_then(|b| b.try_into().ok())
+                        .ok_or_else(|| bad("enrollment receipt"))?,
+                )),
+                None => None,
+            },
+        });
+    }
+    let mut denials = Vec::with_capacity(file.denials.len());
+    for d in file.denials {
+        denials.push(Denial {
+            identity: identity_from_hex(&d.identity)?,
+            denied_at: UnixTime(d.denied_at),
+        });
+    }
+    GrantTable::restore(grants, denials, file.next_grant_id)
+        .map_err(|e| NetError::Store(format!("{}: {e}", origin.display())))
 }
 
 /// A host this device paired with.
@@ -985,65 +1084,148 @@ mod tests {
     }
 
     /// The folder for flow records gets its parent synced on first use in
-    /// a process even when another process made it, and again after a
-    /// sync that failed.
+    /// a process even when another process made it, and again after every
+    /// sync that failed, until one works.
     #[test]
     fn the_flow_record_folder_is_synced_on_first_use_and_after_a_failed_sync() {
         let dir = temp_dir("joins-sync");
         let store = FlowRecordStore::in_dir(&dir);
         // Made by someone else, without a sync here.
         fs::create_dir_all(dir.join("joins")).unwrap();
-        crate::private::faults::fail_syncs(&dir, 1);
+        crate::private::faults::fail_syncs(&dir, 2);
         let record = JoinerRecord {
             ticket_hash: [9; 32],
             attempts_left: 3,
             outcome_pending: false,
         };
-        // The first use syncs, and the failed sync fails the write.
-        assert!(store.swap(None, &record).is_err());
-        assert_eq!(store.load(&[9; 32]).unwrap(), None);
-        // The next use syncs again, and the write lands.
+        // The first use syncs, and the failed sync fails the write; so does
+        // the next, which syncs again rather than skipping it.
+        for _ in 0..2 {
+            assert!(store.swap(None, &record).is_err());
+            assert_eq!(store.load(&[9; 32]).unwrap(), None);
+        }
+        // The sync works now, and the write lands.
         store.swap(None, &record).unwrap();
         assert_eq!(store.load(&[9; 32]).unwrap(), Some(record));
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A grant recorded as a pending enrollment is dropped on load until
-    /// the enrollment is committed.
+    fn new_grant(identity: IdentityPublicKey, name: &str, invitation: u8) -> NewGrant {
+        NewGrant {
+            identity,
+            name: name.into(),
+            role: Role::owner(),
+            authorizing_owner: OwnerRef::from_bytes([1; 16]),
+            expires_at: None,
+            enrolled_by: Some(InvitationId([invitation; 16])),
+        }
+    }
+
+    /// A saved table holding a grant for `identity`, and the table after
+    /// pairing that device again, which replaces its grant.
+    fn re_pair(
+        store: &GrantStore,
+        identity: IdentityPublicKey,
+    ) -> (GrantTable, GrantTable, GrantId, Vec<PendingEnrollment>) {
+        let mut before = GrantTable::new();
+        let (old, _) = before
+            .add(new_grant(identity, "old", 1), UnixTime(1))
+            .unwrap();
+        store.save(&before).unwrap();
+        let mut after = before.clone();
+        let (new, _) = after
+            .add(new_grant(identity, "new", 2), UnixTime(2))
+            .unwrap();
+        assert!(after.get(old).is_none());
+        let pending = vec![PendingEnrollment {
+            grant: new,
+            identity,
+            invitation: InvitationId([2; 16]),
+        }];
+        (before, after, old, pending)
+    }
+
+    fn names(table: &GrantTable) -> Vec<String> {
+        table.grants().map(|g| g.name.clone()).collect()
+    }
+
+    /// Pairing a device again replaces its grant. When saving that fails
+    /// at any step short of the clear landing (the record written or
+    /// landed without its sync, the table not written or landed without
+    /// its sync, the clear not written), the old grant is what a restart
+    /// loads, under its own id.
     #[test]
-    fn a_pending_enrollment_is_not_loaded_until_committed() {
-        let dir = temp_dir("pending");
+    fn a_failed_re_pair_leaves_the_old_grant_in_force() {
+        use crate::private::faults::{plan_replaces, Fault};
+        let cases: [(&[Fault], &[Fault]); 5] = [
+            (&[Fault::BeforeRename], &[]),
+            (&[Fault::AfterRename], &[]),
+            (&[Fault::None], &[Fault::BeforeRename]),
+            (&[Fault::None], &[Fault::AfterRename]),
+            (&[Fault::None, Fault::BeforeRename], &[]),
+        ];
+        for (pending_faults, table_faults) in cases {
+            let dir = temp_dir("re-pair");
+            let store = GrantStore::in_dir(&dir);
+            let identity = SoftwareKey::generate(&mut os_rng()).public_key();
+            let (before, after, old, pending) = re_pair(&store, identity);
+            plan_replaces(store.pending_path(), pending_faults);
+            plan_replaces(store.path(), table_faults);
+            let result = store.save_enrollment(&before, &after, &pending);
+            assert!(
+                matches!(result, Err(EnrollmentSaveError::NotSaved(_))),
+                "{pending_faults:?} {table_faults:?}: {result:?}"
+            );
+            let loaded = store.load().unwrap();
+            assert_eq!(
+                names(&loaded),
+                ["old"],
+                "{pending_faults:?} {table_faults:?}"
+            );
+            assert!(loaded.get(old).is_some());
+
+            // A later save is what a restart loads, the record still there
+            // or not: removing the old grant sticks.
+            let mut later = loaded;
+            later.remove(old);
+            store.save(&later).unwrap();
+            assert!(names(&store.load().unwrap()).is_empty());
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// The clear landed but its sync failed: every reader sees the new
+    /// table, so it is in force, and the save says it is unsettled. A save
+    /// that works later keeps it.
+    #[test]
+    fn an_enrollment_whose_clear_landed_unsynced_is_in_force_and_unsettled() {
+        use crate::private::faults::{plan_replaces, Fault};
+        let dir = temp_dir("unsettled");
         let store = GrantStore::in_dir(&dir);
-        let mut table = GrantTable::new();
         let identity = SoftwareKey::generate(&mut os_rng()).public_key();
-        let invitation = InvitationId([4; 16]);
-        let (grant, _) = table
-            .add(
-                NewGrant {
-                    identity,
-                    name: "phone".into(),
-                    role: Role::owner(),
-                    authorizing_owner: OwnerRef::from_bytes([1; 16]),
-                    expires_at: None,
-                    enrolled_by: Some(invitation),
-                },
-                UnixTime(1),
-            )
-            .unwrap();
-        store
-            .begin_enrollments(&[PendingEnrollment {
-                grant,
-                identity,
-                invitation,
-            }])
-            .unwrap();
-        store.save(&table).unwrap();
-        let loaded = store.load().unwrap();
-        assert!(loaded.grants().next().is_none());
-        // Its id is not given out again.
-        assert_eq!(loaded.next_grant_id(), table.next_grant_id());
-        store.commit_enrollments().unwrap();
-        assert_eq!(store.load().unwrap().grants().count(), 1);
+        let (before, after, _, pending) = re_pair(&store, identity);
+        plan_replaces(store.pending_path(), &[Fault::None, Fault::AfterRename]);
+        let result = store.save_enrollment(&before, &after, &pending);
+        assert!(
+            matches!(result, Err(EnrollmentSaveError::Unsettled(_))),
+            "{result:?}"
+        );
+        assert_eq!(names(&store.load().unwrap()), ["new"]);
+        store.save(&after).unwrap();
+        assert_eq!(names(&store.load().unwrap()), ["new"]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A saved enrollment is in force and the record is cleared.
+    #[test]
+    fn a_saved_enrollment_is_in_force() {
+        let dir = temp_dir("enrolled");
+        let store = GrantStore::in_dir(&dir);
+        let identity = SoftwareKey::generate(&mut os_rng()).public_key();
+        let (before, after, _, pending) = re_pair(&store, identity);
+        store.save_enrollment(&before, &after, &pending).unwrap();
+        assert_eq!(names(&store.load().unwrap()), ["new"]);
+        assert!(store.load_pending().unwrap().is_none());
         fs::remove_dir_all(&dir).unwrap();
     }
 

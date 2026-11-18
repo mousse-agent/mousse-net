@@ -1,0 +1,9 @@
+{
+  "format": "mousse-check-attestation-v1",
+  "check": "phase0.cpace-review",
+  "target": "cpace-binding",
+  "build": "ffcf57b7d75e283d1d25c5717e3ee0beabc56f0e+manual",
+  "by": "Reviewer 2",
+  "time": "2026-11-18T15:53:10Z",
+  "note": "Design review record: checks/reviews/phase0-design-review.md (three independent reviewers; sign-off at 533f154, last code items fixed in ffcf57b)"
+}

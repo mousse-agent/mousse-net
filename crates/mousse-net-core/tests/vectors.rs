@@ -1,7 +1,8 @@
 //! Checks the files in `spec/vectors/` through the public API only, the way
 //! a second implementation would use them.
 
-use std::path::PathBuf;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen_test::wasm_bindgen_test as test;
 
 use mousse_net_core::authz::{
     CallerGate, CallerGateState, CallerTraffic, ConnectionGate, GateState, Traffic, Verdict,
@@ -23,12 +24,44 @@ use mousse_net_core::{ConnectionId, ErrorCode, Millis, UnixTime};
 use serde_json::Value as J;
 
 fn load(name: &str) -> J {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let text = checked_in(name).unwrap_or_else(|| panic!("no vector file {name}"));
+    serde_json::from_str(&text).expect("valid JSON")
+}
+
+/// A checked-in vector file.
+#[cfg(not(target_arch = "wasm32"))]
+fn checked_in(name: &str) -> Option<String> {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../spec/vectors")
         .join(name);
-    let text =
-        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    serde_json::from_str(&text).expect("valid JSON")
+    std::fs::read_to_string(path).ok()
+}
+
+/// A checked-in vector file. wasm32 has no file system, so there the
+/// files are compiled in.
+#[cfg(target_arch = "wasm32")]
+fn checked_in(name: &str) -> Option<String> {
+    macro_rules! files {
+        ($($file:literal,)*) => {
+            match name {
+                $($file => Some(include_str!(concat!("../../../spec/vectors/", $file)).to_string()),)*
+                _ => None,
+            }
+        };
+    }
+    files!(
+        "authz.json",
+        "cbor.json",
+        "control.json",
+        "der-raw.json",
+        "hello.json",
+        "join-proof.json",
+        "mux.json",
+        "pairing-attempts.json",
+        "session-cert.json",
+        "session-lifecycle.json",
+        "ticket.json",
+    )
 }
 
 fn unhex(v: &J) -> Vec<u8> {
@@ -135,7 +168,38 @@ fn session_certificates() {
         };
         assert_eq!(got, s(&case["result"]), "case {}", s(&case["name"]));
     }
-    assert_eq!(s(&doc["pending"][0]["status"]), "pending");
+
+    // Certificates made in browser Workers with WebCrypto identity keys: the
+    // native verifier accepts them, and their parts check out.
+    let browser = list(&doc["browser_worker"]);
+    assert!(!browser.is_empty());
+    for item in browser {
+        let name = s(&item["name"]);
+        let identity = key(&item["identity_public"]);
+        let (nb, na) = (
+            UnixTime(u(&item["not_before"])),
+            UnixTime(u(&item["not_after"])),
+        );
+        let verified =
+            session_cert::verify(&unhex(&item["certificate"]), nb.plus(60), Some(&identity))
+                .unwrap_or_else(|e| panic!("{name}: {}", e.code()));
+        assert_eq!(verified.spki_der, unhex(&item["spki"]), "{name}");
+        assert_eq!(
+            verified.window,
+            ValidityWindow::new(nb, na).expect("window")
+        );
+        let record = session_cert::session_record(&verified.spki_der, nb, na, verified.version);
+        assert_eq!(record, unhex(&item["record"]), "{name}");
+        let sig = RawSignature::from_slice(&unhex(&item["identity_signature"])).expect("raw");
+        identity.verify(&record, &sig).expect("identity signature");
+        assert!(
+            cases
+                .iter()
+                .any(|c| s(&c["name"]) == name && s(&c["result"]) == "ok"),
+            "{name} has an ok case"
+        );
+    }
+    assert!(doc.get("pending").is_none());
 }
 
 #[test]

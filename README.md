@@ -42,6 +42,14 @@ cargo test --workspace
 cargo check -p mousse-net-core --target wasm32-unknown-unknown
 ```
 
+The core's tests also run on wasm32 under Node, with `wasm-bindgen-test-runner`
+0.2.130 (from `wasm-bindgen-cli`, the same version as wasm-bindgen) on `PATH`:
+
+```sh
+CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
+  cargo test -p mousse-net-core --target wasm32-unknown-unknown
+```
+
 Run the Phase 0 checks and their must-fail controls:
 
 ```sh

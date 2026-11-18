@@ -74,7 +74,17 @@ function outcome(expected, fn) {
       assert.deepEqual(lanCandidate(item.result), { action: 'try_next', send: false, warn: false, repin: false });
     }
   });
-  for (const item of v.pending) console.log(`PENDING session-cert.json / ${item.name}`);
+  assert.ok(v.browser_worker.length > 0);
+  for (const item of v.browser_worker) add(`${item.name}: parts`, () => {
+    const checked = verifyCertificate(bytes(item.certificate), item.not_before + 60, bytes(item.identity_public));
+    assert.deepEqual(checked.window, { not_before: item.not_before, not_after: item.not_after });
+    assert.ok(verify(bytes(item.identity_signature), bytes(item.record), bytes(item.identity_public)));
+    const record = decode(bytes(item.record));
+    matches(record.get(2n), item.spki);
+    assert.equal(BigInt(record.get(3n)), BigInt(item.not_before));
+    assert.equal(BigInt(record.get(4n)), BigInt(item.not_after));
+    assert.ok(v.cases.some(c => c.name === item.name && c.result === 'ok'));
+  });
 }
 
 {

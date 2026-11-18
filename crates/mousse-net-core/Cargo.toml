@@ -24,6 +24,11 @@ rand_chacha = "=0.10.0"
 serde_json = "=1.0.154"
 ecdsa = { version = "=0.17.0", features = ["der"] }
 
+# Runs the tests on wasm32-unknown-unknown (under Node) with
+# wasm-bindgen-test-runner 0.2.130 as the cargo runner.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "=0.3.80"
+
 [features]
 # A stand-in code exchange for tests and the simulator. Not secure.
 insecure-test-exchange = []

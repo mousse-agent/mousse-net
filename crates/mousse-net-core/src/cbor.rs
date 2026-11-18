@@ -418,6 +418,9 @@ impl Fields {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_arch = "wasm32")]
+    use wasm_bindgen_test::wasm_bindgen_test as test;
+
     use super::*;
 
     fn round_trip(value: Value) {

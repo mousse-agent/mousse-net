@@ -438,8 +438,11 @@ includes both identity keys.
   the two: the wall clock passing the effective deadline, or the monotonic
   clock reaching `mono_deadline`. Setting the wall clock back therefore never
   keeps a connection open past its certificates, and renewal still runs on
-  the wall clock. A device that sleeps or suspends checks both again when it
-  resumes. Vectors: `session-lifecycle.json` `clock_rollback`.
+  the wall clock. The monotonic clock must keep counting while the device
+  sleeps or suspends (on Linux `CLOCK_BOOTTIME`, not `CLOCK_MONOTONIC`),
+  else a suspend followed by setting the wall clock back would stretch the
+  cap; the device checks both again when it resumes. Vectors:
+  `session-lifecycle.json` `clock_rollback`.
 
 ## 7. Grants
 

@@ -1341,6 +1341,34 @@ mod tests {
             .unwrap_or_else(|_| panic!("timed out: {what}"))
     }
 
+    /// A sleep moves the wall clock and the monotonic clock (which counts
+    /// sleep, see `clock.rs`) together. A sleep past the cap ends the
+    /// session whether the wall clock is set back before the sleep or
+    /// after it.
+    #[test]
+    fn a_suspend_and_a_wall_clock_set_back_cannot_extend_the_cap() {
+        const CAP: u64 = 3_600;
+        for set_back_first in [false, true] {
+            let clock = ManualClock::new();
+            clock.freeze_mono();
+            let deadline = Deadline::new(UnixTime(clock.now().secs() + CAP), &clock);
+            assert!(!deadline.passed(&clock));
+            let back = || clock.advance(-(CAP as i64) - 600);
+            if set_back_first {
+                back();
+            }
+            // Asleep past the cap.
+            clock.advance(CAP as i64 + 60);
+            clock.advance_mono((CAP + 60) * 1_000);
+            if !set_back_first {
+                back();
+            }
+            // The wall clock alone would not end it.
+            assert!(clock.now() <= deadline.wall);
+            assert!(deadline.passed(&clock), "set back first: {set_back_first}");
+        }
+    }
+
     /// Holds back everything our side writes while closed.
     #[derive(Clone, Default)]
     struct Valve(Arc<Mutex<(bool, Option<Waker>)>>);
