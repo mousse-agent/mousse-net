@@ -3,7 +3,7 @@ import { hex, requireThat, utf8 } from './cbor.ts';
 import { initiate, respond } from './cpace.ts';
 import { Gate, step2 } from './session.ts';
 import type { Traffic } from './session.ts';
-import { attemptSession, bindingTranscript, checkJoinerExpiry, decodeTicket, encodeTicket, errorNumber, hello, joinProof, negotiate } from './wire.ts';
+import { attemptSession, bindingTranscript, checkJoinerExpiry, decodeTicket, encodeTicket, errorNumber, hello, joinProof } from './wire.ts';
 import type { Control, ErrorName, Ticket } from './wire.ts';
 
 export interface RandomDraws {
@@ -56,6 +56,13 @@ function checked(gate: Gate, conn: number, msg: Control): Effect[] | undefined {
   return [{ conn, close: verdict.slice(6) as ErrorName }];
 }
 
+function receiveHello(gate: Gate, conn: number, message: Extract<Control, { type: 'HELLO' }>): Effect[] {
+  const result = gate.receiveHello(message);
+  if (result === 'ignored') return [{ ignored: true }];
+  if (result === 'close:unsupported_version') return [{ conn, close: 'unsupported_version' }];
+  return [{ version: Number(result) }];
+}
+
 function drawCode(random: RandomDraws, purpose: string): string {
   let value;
   do {
@@ -99,7 +106,6 @@ interface HostConnection {
   exporters: Exporters;
   attempts: Map<string, Attempt>;
   name?: string;
-  version?: number;
 }
 
 interface Enrollment {
@@ -234,7 +240,7 @@ export class PairingHost {
     const connection = this.connections.get(conn);
     if (!connection) return [{ ignored: true }];
     const { gate } = connection;
-    if (!gate.state.startsWith('closed:') && connection.version === undefined && msg.type !== 'HELLO') {
+    if (!gate.state.startsWith('closed:') && gate.version === undefined && msg.type !== 'HELLO') {
       return [close(conn, gate, 'protocol_error')];
     }
     const rejected = checked(gate, conn, msg);
@@ -246,12 +252,7 @@ export class PairingHost {
       return rejected;
     }
     switch (msg.type) {
-      case 'HELLO': {
-        if (connection.version !== undefined) return [{ ignored: true }];
-        try { connection.version = Number(negotiate(hello, msg)); }
-        catch { return [close(conn, gate, 'unsupported_version')]; }
-        return [{ version: connection.version }];
-      }
+      case 'HELLO': return receiveHello(gate, conn, msg);
       case 'JOIN_PROOF': {
         if (this.status !== 'open' || now >= Number(this.ticket.expiresAt) ||
             !equalBytes(msg.invitation, this.ticket.invitation) ||
@@ -330,7 +331,7 @@ export class PairingJoiner {
   readonly ticket: Ticket;
   attemptsLeft = 3;
   state: JoinerState = 'connecting';
-  private connection?: { id: number; exporters: Exporters; gate: Gate; version?: number };
+  private connection?: { id: number; exporters: Exporters; gate: Gate };
   private pending?: { id: Uint8Array; initiator: ReturnType<typeof initiate> };
   private lastReply?: Uint8Array;
   private learningOutcome = false;
@@ -405,7 +406,7 @@ export class PairingJoiner {
 
   receive(msg: Control): Effect[] {
     const conn = this.connection!;
-    if (conn.gate.state === 'awaiting_authorization' && conn.version === undefined && msg.type !== 'HELLO') {
+    if (conn.gate.state === 'awaiting_authorization' && conn.gate.version === undefined && msg.type !== 'HELLO') {
       return [close(conn.id, conn.gate, 'protocol_error')];
     }
     const result = checked(conn.gate, conn.id, msg);
@@ -414,12 +415,7 @@ export class PairingJoiner {
       return result;
     }
     switch (msg.type) {
-      case 'HELLO': {
-        if (conn.version !== undefined) return [{ ignored: true }];
-        try { conn.version = Number(negotiate(hello, msg)); }
-        catch { return [close(conn.id, conn.gate, 'unsupported_version')]; }
-        return [{ version: conn.version }];
-      }
+      case 'HELLO': return receiveHello(conn.gate, conn.id, msg);
       case 'AUTHORIZED':
         if (msg.state === 'live' && this.ticket.kind === 2 && !this.hostPinned && !this.learningOutcome) {
           return this.fail('pairing_failed');

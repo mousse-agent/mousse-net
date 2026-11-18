@@ -24,8 +24,9 @@ export type Control =
   | { type: 'CODE_ABORT'; attempt: Uint8Array; code: number }
   | { type: 'PAIRED'; name: string; role: string };
 
+export type Version = { major: UInt; minor: UInt };
 export const hello = { type: 'HELLO', major: 1, minor: 0 } as const;
-export function negotiate(local: { major: UInt; minor: UInt }, peer: { major: UInt; minor: UInt }): UInt {
+export function negotiate(local: Version, peer: Version): UInt {
   const agreed = BigInt(local.minor) < BigInt(peer.minor) ? local.minor : peer.minor;
   requireThat(BigInt(local.major) === BigInt(peer.major) && BigInt(agreed) >= BigInt(local.minor) - 1n,
     'unsupported_version');

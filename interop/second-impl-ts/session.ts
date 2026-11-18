@@ -1,6 +1,7 @@
 import { requireThat } from './cbor.ts';
-import { errorNumber } from './wire.ts';
-import type { ErrorName, Frame } from './wire.ts';
+import type { UInt } from './cbor.ts';
+import { errorNumber, hello, negotiate } from './wire.ts';
+import type { ErrorName, Frame, Version } from './wire.ts';
 
 export interface Grant { identity: string; expires_at: number | null; role: string }
 type Verdict = 'allow' | 'ignore' | `close:${ErrorName}`;
@@ -18,6 +19,7 @@ export class Gate {
   state: GateState;
   readonly side: 'host' | 'caller';
   private readonly start: number;
+  private agreed?: UInt;
   constructor(side: 'host' | 'caller', initial?: ReturnType<typeof step2>, start = 0) {
     this.side = side;
     this.start = start;
@@ -28,6 +30,19 @@ export class Gate {
   close(code: ErrorName): Verdict {
     this.state = `closed:${code}`;
     return `close:${code}`;
+  }
+
+  get version() { return this.agreed; }
+
+  receiveHello(peer: Version, local: Version = hello): UInt | 'ignored' | 'close:unsupported_version' {
+    if (this.agreed !== undefined || this.state.startsWith('closed:')) return 'ignored';
+    try {
+      this.agreed = negotiate(local, peer);
+      return this.agreed;
+    } catch {
+      this.close('unsupported_version');
+      return 'close:unsupported_version';
+    }
   }
 
   admit() {

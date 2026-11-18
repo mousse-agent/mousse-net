@@ -166,6 +166,20 @@ function outcome(expected, fn) {
     if (typeof item.result === 'number') assert.equal(wire.negotiate(item.local, item.peer), item.result);
     else outcome(item.result.slice(6), () => wire.negotiate(item.local, item.peer));
   });
+  for (const item of v.repeated) add(item.name, () => {
+    assert.equal(Math.max(0, item.local.minor - 1), item.local.oldest_minor);
+    for (const side of ['host', 'caller']) {
+      const gate = new Gate(side);
+      for (const step of item.hellos) {
+        const message = wire.decodeControl(bytes(step.control));
+        assert.equal(message.type, 'HELLO');
+        const result = gate.receiveHello(message, item.local);
+        assert.equal(typeof result === 'bigint' ? Number(result) : result, step.result, side);
+      }
+      assert.equal(gate.version === undefined ? null : Number(gate.version), item.agreed, side);
+      if (item.agreed === null) assert.equal(gate.state, 'closed:unsupported_version', side);
+    }
+  });
 }
 
 {
