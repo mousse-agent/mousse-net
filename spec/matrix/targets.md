@@ -169,6 +169,8 @@ Apple's clang has no wasm32 backend, so use LLVM's clang (Homebrew `llvm`, or th
 
 The target label in the files is `wasm32-unknown-unknown@worker-<chromium|firefox|safari>`, taken from the Worker's user agent.
 
+Without a WebDriver, `spikes/browser-worker` runs the same pairs in a dedicated Worker of a headless browser (Playwright for Chromium and Firefox, `safaridriver` for Safari) and writes the same result files and `MATRIX_RESULT` log: `node scripts/run.mjs --matrix --browser <chromium|firefox|safari> --out <dir>`, and `--control break-pin` for the control. Its README has the build commands.
+
 ### Mobile browsers (group 9)
 
 Serve the Worker test page and open it on the phone:

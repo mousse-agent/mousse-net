@@ -22,9 +22,9 @@ function deleteDb(name) {
   });
 }
 
-function runWorker(message) {
+function runWorker(message, script = 'worker.js') {
   return new Promise((resolve) => {
-    const worker = new Worker('worker.js');
+    const worker = new Worker(script);
     const finish = (result) => {
       worker.terminate();
       resolve(result);
@@ -41,6 +41,13 @@ function runWorker(message) {
   try {
     const config = await (await fetch(`config?run=${run}`)).json();
     page.breakMode = config.breakMode;
+    if (config.mode === 'matrix') {
+      // Crypto matrix: one Worker runs every provider pair.
+      const result = await runWorker({ breakPin: config.breakPin, build: config.build }, 'matrix-worker.js');
+      const verdict = await post(`matrix?run=${run}`, result);
+      log(`matrix: ${verdict.verdict}`);
+      return;
+    }
     page.clearedDb = await deleteDb('mousse-browser-spike');
     log(`cleared stored key: ${page.clearedDb}`);
     // Firefox asks the user before persisting; headless, nobody answers.
@@ -56,7 +63,8 @@ function runWorker(message) {
   } catch (e) {
     page.errors.push(String((e && e.stack) || e));
     log(`error: ${e}`);
+  } finally {
+    await post(`done?run=${run}`, page).catch(() => {});
+    log('done');
   }
-  await post(`done?run=${run}`, page).catch(() => {});
-  log('done');
 })();

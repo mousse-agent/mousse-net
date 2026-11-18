@@ -19,8 +19,6 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const CHECK = 'phase0.browser-worker-cert';
-const CONTROLS = { 'tampered-cert': 'tampered-cert', 'fresh-key-after-restart': 'fresh-key' };
 const here = dirname(fileURLToPath(import.meta.url));
 const spike = resolve(here, '..');
 
@@ -29,18 +27,27 @@ const opt = (name) => {
   const i = args.indexOf(name);
   return i >= 0 ? args[i + 1] : undefined;
 };
+// --matrix runs the crypto matrix (phase0.crypto-matrix) in the Worker
+// instead of the certificate check; its control is break-pin.
+const matrix = args.includes('--matrix');
+const CHECK = matrix ? 'phase0.crypto-matrix' : 'phase0.browser-worker-cert';
+const CONTROLS = matrix ? { 'break-pin': ['MOUSSE_MATRIX_BREAK', '1'] } : {
+  'tampered-cert': ['MOUSSE_BROWSER_SPIKE_BREAK', 'tampered-cert'],
+  'fresh-key-after-restart': ['MOUSSE_BROWSER_SPIKE_BREAK', 'fresh-key'],
+};
 const browserName = opt('--browser');
 const control = opt('--control');
 const outDir = opt('--out');
 if (!['chromium', 'firefox', 'safari'].includes(browserName) || !outDir || (control && !CONTROLS[control])) {
-  console.error('usage: node scripts/run.mjs --browser chromium|firefox|safari [--channel msedge] [--control tampered-cert|fresh-key-after-restart] --out <dir>');
+  console.error('usage: node scripts/run.mjs --browser chromium|firefox|safari [--channel msedge] [--matrix] [--control <name>] --out <dir>');
   process.exit(2);
 }
 
 function gitBuild() {
   const git = (...a) => execFileSync('git', a, { cwd: spike, encoding: 'utf8' }).trim();
   const sha = git('rev-parse', '--short=9', 'HEAD');
-  const dirty = git('status', '--porcelain', '--', '.', '../../crates/mousse-net-core') !== '';
+  const paths = ['.', matrix ? '../tls-matrix' : '../../crates/mousse-net-core'];
+  const dirty = git('status', '--porcelain', '--', ...paths) !== '';
   return `${sha}${dirty ? '-dirty' : ''}+release`;
 }
 
@@ -50,7 +57,8 @@ const exe = process.platform === 'win32' ? 'browser-worker-runner.exe' : 'browse
 const runnerPath = opt('--runner') ?? join(process.env.CARGO_TARGET_DIR ?? join(spike, 'target'), 'release', exe);
 const base = `${CHECK}__${target.replace(/[^A-Za-z0-9.-]+/g, '-')}${control ? `__${control}` : ''}`;
 mkdirSync(outDir, { recursive: true });
-const resultFile = resolve(outDir, `${base}.json`);
+// The certificate check writes one file; the matrix one file per pair.
+const resultPath = resolve(outDir, matrix ? base : `${base}.json`);
 const logLines = [];
 const log = (line) => {
   logLines.push(line);
@@ -59,11 +67,13 @@ const log = (line) => {
 
 const env = { ...process.env };
 delete env.MOUSSE_BROWSER_SPIKE_BREAK;
-if (control) env.MOUSSE_BROWSER_SPIKE_BREAK = CONTROLS[control];
+delete env.MOUSSE_MATRIX_BREAK;
+if (control) env[CONTROLS[control][0]] = CONTROLS[control][1];
 log(`run ${CHECK} target=${target} control=${control ?? 'none'} build=${build}`);
 
 const runner = spawn(runnerPath, ['--web', join(spike, 'web'), '--target', target, '--build', build,
-  '--out', resultFile, '--platform', opt('--platform') ?? `${process.platform}-${process.arch}`, '--timeout', '90'],
+  '--out', resultPath, '--platform', opt('--platform') ?? `${process.platform}-${process.arch}`, '--timeout', '300',
+  ...(matrix ? ['--mode', 'matrix'] : [])],
 { env, stdio: ['ignore', 'pipe', 'pipe'] });
 const runnerExit = new Promise((resolveExit) => runner.on('exit', (code) => resolveExit(code)));
 const url = await new Promise((resolveUrl, reject) => {

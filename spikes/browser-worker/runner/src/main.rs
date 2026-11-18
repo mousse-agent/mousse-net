@@ -24,6 +24,14 @@
 //! Prints `READY <url>` once listening and `RESULT PASS` or
 //! `RESULT FAIL reason=<word>` at the end. Exit 0 on PASS, 1 on FAIL, 2 when
 //! the run did not finish.
+//!
+//! With `--mode matrix` the page runs the crypto matrix instead
+//! (`spikes/tls-matrix` built for wasm32, every provider pair in one
+//! dedicated Worker). `--out` is then a folder: one result file per pair, as
+//! `spikes/tls-matrix/scripts/matrix-results.mjs` writes them. The runner
+//! prints a `MATRIX_RESULT` line per pair and `PASS phase0.crypto-matrix` or
+//! `FAIL phase0.crypto-matrix`. `MOUSSE_MATRIX_BREAK=1` is the must-fail
+//! control: the client pins the wrong server key, so every pair must fail.
 #![forbid(unsafe_code)]
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -40,19 +48,32 @@ use mousse_net_core::time::UnixTime;
 use serde_json::{Value, json};
 
 const CHECK: &str = "phase0.browser-worker-cert";
+const MATRIX_CHECK: &str = "phase0.crypto-matrix";
 const MAX_BODY: usize = 1 << 20;
 
+const JS: &str = "text/javascript; charset=utf-8";
+
 /// Files the page may load, and their types. Nothing else is served.
-const FILES: [(&str, &str); 5] = [
-    ("index.html", "text/html; charset=utf-8"),
-    ("page.js", "text/javascript; charset=utf-8"),
-    ("worker.js", "text/javascript; charset=utf-8"),
-    (
-        "pkg/mousse_browser_worker.js",
-        "text/javascript; charset=utf-8",
-    ),
+const PAGE_FILES: [(&str, &str); 2] = [("index.html", "text/html; charset=utf-8"), ("page.js", JS)];
+const CERT_FILES: [(&str, &str); 3] = [
+    ("worker.js", JS),
+    ("pkg/mousse_browser_worker.js", JS),
     ("pkg/mousse_browser_worker_bg.wasm", "application/wasm"),
 ];
+const MATRIX_FILES: [(&str, &str); 3] = [
+    ("matrix-worker.js", JS),
+    ("matrix-pkg/tls_matrix.js", JS),
+    ("matrix-pkg/tls_matrix_bg.wasm", "application/wasm"),
+];
+
+fn served(name: &str) -> Option<&'static str> {
+    PAGE_FILES
+        .iter()
+        .chain(&CERT_FILES)
+        .chain(&MATRIX_FILES)
+        .find(|(f, _)| *f == name)
+        .map(|(_, kind)| *kind)
+}
 
 struct Options {
     web: PathBuf,
@@ -61,6 +82,7 @@ struct Options {
     out: PathBuf,
     platform: String,
     timeout: Duration,
+    matrix: bool,
 }
 
 fn options() -> Result<Options, String> {
@@ -84,6 +106,11 @@ fn options() -> Result<Options, String> {
                 .transpose()?
                 .unwrap_or(120),
         ),
+        matrix: match get("--mode").as_deref() {
+            None | Some("cert") => false,
+            Some("matrix") => true,
+            Some(other) => return Err(format!("unknown --mode {other:?}")),
+        },
     })
 }
 
@@ -122,6 +149,8 @@ struct State {
     /// Step 1's identity key: the pin for step 2.
     pin: Option<PublicKey>,
     page: Option<Value>,
+    /// The matrix Worker's report (`--mode matrix`).
+    matrix: Option<Value>,
 }
 
 /// Check one Worker's result. Returns the step record with `verdict`.
@@ -270,6 +299,9 @@ struct Server {
     host: String,
     run: String,
     break_mode: Option<&'static str>,
+    matrix: bool,
+    break_pin: bool,
+    build: String,
     state: Mutex<State>,
     done: Mutex<Option<Sender<()>>>,
 }
@@ -292,7 +324,12 @@ impl Server {
             .any(|kv| kv == format!("run={}", self.run));
         match (req.method.as_str(), name) {
             ("GET", "config") if run_ok => {
-                let body = json!({ "breakMode": self.break_mode });
+                let body = json!({
+                    "mode": if self.matrix { "matrix" } else { "cert" },
+                    "breakMode": self.break_mode,
+                    "breakPin": self.break_pin,
+                    "build": self.build,
+                });
                 respond(
                     &stream,
                     "200 OK",
@@ -317,6 +354,19 @@ impl Server {
                     reply.to_string().as_bytes(),
                 );
             }
+            ("POST", "matrix") if run_ok && self.matrix => {
+                let report: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+                let pairs = report["entries"].as_array().map_or(0, Vec::len);
+                println!("matrix: {pairs} pairs in {} ms", report["ms"]);
+                self.state.lock().unwrap_or_else(|e| e.into_inner()).matrix = Some(report);
+                let reply = json!({ "verdict": format!("{pairs} pairs") });
+                respond(
+                    &stream,
+                    "200 OK",
+                    "application/json",
+                    reply.to_string().as_bytes(),
+                );
+            }
             ("POST", "done") if run_ok => {
                 let page: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
                 self.state.lock().unwrap_or_else(|e| e.into_inner()).page = Some(page);
@@ -326,8 +376,8 @@ impl Server {
                 }
             }
             ("GET", "favicon.ico") => respond(&stream, "204 No Content", "text/plain", b""),
-            ("GET", file) => match FILES.iter().find(|(f, _)| *f == file) {
-                Some((f, kind)) => match std::fs::read(self.web.join(f)) {
+            ("GET", file) => match served(file) {
+                Some(kind) => match std::fs::read(self.web.join(file)) {
                     Ok(bytes) => respond(&stream, "200 OK", kind, &bytes),
                     Err(_) => respond(&stream, "404 Not Found", "text/plain", b"missing"),
                 },
@@ -379,7 +429,12 @@ fn outcome(state: &State, finished: bool) -> (bool, Option<String>, Vec<String>)
 
 fn run() -> Result<ExitCode, String> {
     let opts = options()?;
-    for (file, _) in FILES {
+    let needed: &[(&str, &str)] = if opts.matrix {
+        &MATRIX_FILES
+    } else {
+        &CERT_FILES
+    };
+    for (file, _) in PAGE_FILES.iter().chain(needed) {
         if !Path::new(&opts.web).join(file).is_file() {
             return Err(format!(
                 "{} is missing; build the wasm package first (README)",
@@ -387,7 +442,8 @@ fn run() -> Result<ExitCode, String> {
             ));
         }
     }
-    let control = break_mode()?;
+    let control = if opts.matrix { None } else { break_mode()? };
+    let break_pin = opts.matrix && std::env::var("MOUSSE_MATRIX_BREAK").as_deref() == Ok("1");
     let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
         .map_err(|e| format!("bind 127.0.0.1: {e}"))?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
@@ -405,6 +461,9 @@ fn run() -> Result<ExitCode, String> {
         host: format!("127.0.0.1:{port}"),
         run: run.clone(),
         break_mode: control.map(|(mode, _)| mode),
+        matrix: opts.matrix,
+        break_pin,
+        build: opts.build.clone(),
         state: Mutex::new(State::default()),
         done: Mutex::new(Some(tx)),
     });
@@ -422,6 +481,9 @@ fn run() -> Result<ExitCode, String> {
 
     let finished = rx.recv_timeout(opts.timeout).is_ok();
     let state = server.state.lock().unwrap_or_else(|e| e.into_inner());
+    if opts.matrix {
+        return finish_matrix(&opts, &state, finished);
+    }
     let (pass, reason, failures) = outcome(&state, finished);
     let verdicts: Vec<String> = state
         .steps
@@ -461,6 +523,85 @@ fn run() -> Result<ExitCode, String> {
         None => println!("RESULT PASS"),
         Some(r) => println!("RESULT FAIL reason={r}"),
     }
+    Ok(if !finished {
+        ExitCode::from(2)
+    } else if pass {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    })
+}
+
+/// A result file name from the page (`<target>__<client>__<server>.json`):
+/// nothing that could leave the output folder.
+fn safe_file_name(name: &str) -> bool {
+    name.ends_with(".json")
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._@+-".contains(&b))
+}
+
+/// Write the matrix result files and print the verdict.
+fn finish_matrix(opts: &Options, state: &State, finished: bool) -> Result<ExitCode, String> {
+    let mut problems: Vec<String> = Vec::new();
+    if !finished {
+        problems.push("the page did not finish".into());
+    }
+    if let Some(page) = &state.page {
+        for e in page["errors"].as_array().into_iter().flatten() {
+            problems.push(format!("page error: {}", e.as_str().unwrap_or("?")));
+        }
+    }
+    let report = state.matrix.clone().unwrap_or(Value::Null);
+    if report["ok"] != Value::Bool(true) {
+        problems.push(format!("matrix Worker: {}", report["error"]));
+    }
+    let entries = report["entries"].as_array().cloned().unwrap_or_default();
+    if entries.is_empty() {
+        problems.push("no provider pair reported".into());
+    }
+    std::fs::create_dir_all(&opts.out).map_err(|e| format!("{}: {e}", opts.out.display()))?;
+    let mut all_pass = true;
+    for entry in &entries {
+        let file = entry["file"].as_str().unwrap_or("");
+        let result = &entry["result"];
+        if !safe_file_name(file) {
+            problems.push(format!("refused result file name {file:?}"));
+            continue;
+        }
+        if result["target"].as_str() != Some(opts.target.as_str()) {
+            problems.push(format!(
+                "{file}: target {} is not {}",
+                result["target"], opts.target
+            ));
+        }
+        if result["check"].as_str() != Some(MATRIX_CHECK) {
+            problems.push(format!("{file}: check {}", result["check"]));
+        }
+        let outcome = result["outcome"].as_str().unwrap_or("?");
+        all_pass &= outcome == "PASS";
+        println!(
+            "MATRIX_RESULT {}",
+            json!({ "file": file, "result": result })
+        );
+        println!(
+            "{outcome:<4} {:<28} kx={:<16} suite={}",
+            result["provider"].as_str().unwrap_or("?"),
+            result["kx_group"].as_str().unwrap_or("-"),
+            result["suite"].as_str().unwrap_or("-"),
+        );
+        let text = serde_json::to_string_pretty(result).map_err(|e| e.to_string())? + "\n";
+        std::fs::write(opts.out.join(file), text).map_err(|e| format!("{file}: {e}"))?;
+    }
+    for p in &problems {
+        println!("problem: {p}");
+    }
+    if let Some(page) = &state.page {
+        println!("user agent: {}", page["userAgent"].as_str().unwrap_or("?"));
+    }
+    let pass = all_pass && problems.is_empty();
+    println!("{} {MATRIX_CHECK}", if pass { "PASS" } else { "FAIL" });
     Ok(if !finished {
         ExitCode::from(2)
     } else if pass {

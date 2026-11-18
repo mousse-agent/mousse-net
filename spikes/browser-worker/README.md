@@ -58,5 +58,25 @@ Safari needs "Allow Remote Automation" (Safari's Develop menu) and
 the outcome is the expected one (PASS, or FAIL for a control) and 3 when
 Safari refuses automation.
 
+## Crypto matrix cells
+
+The same harness runs the crypto matrix's browser cells
+(`phase0.crypto-matrix`, `wasm32-unknown-unknown@worker-<browser>`): one
+dedicated Worker runs every provider pair of `spikes/tls-matrix` with the
+Worker's clock and `crypto.getRandomValues`, and the runner writes one result
+file per pair plus a log of `MATRIX_RESULT` lines. The control `break-pin`
+(`MOUSSE_MATRIX_BREAK=1`) must make every pair fail. ring needs LLVM's clang
+for wasm32 (spec/matrix/targets.md).
+
+```
+export CC_wasm32_unknown_unknown=<llvm>/bin/clang AR_wasm32_unknown_unknown=<llvm>/bin/llvm-ar
+cargo rustc --manifest-path ../tls-matrix/Cargo.toml -p tls-matrix --lib --release \
+  --target wasm32-unknown-unknown --no-default-features --features ring,rustcrypto,pq-pure,wasm --crate-type cdylib
+wasm-bindgen --target no-modules --no-typescript --out-dir web/matrix-pkg \
+  $CARGO_TARGET_DIR/wasm32-unknown-unknown/release/tls_matrix.wasm
+node scripts/run.mjs --matrix --browser firefox --out <dir>
+node scripts/run.mjs --matrix --browser firefox --control break-pin --out <dir>
+```
+
 `navigator.storage.persist()` is asked for and its answer recorded. Firefox
 asks the user, so headless it gets no answer; the run waits 2 s and goes on.
