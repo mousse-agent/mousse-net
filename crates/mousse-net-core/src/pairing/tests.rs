@@ -854,10 +854,7 @@ fn send_link_already_paired_needs_an_earlier_pin() {
         fresh.on_authorized(AuthorizedState::Live),
         vec![JoinerAction::Failed(ErrorCode::PairingFailed)]
     );
-    assert_eq!(
-        fresh.state(),
-        JoinerState::Failed(ErrorCode::PairingFailed)
-    );
+    assert_eq!(fresh.state(), JoinerState::Failed(ErrorCode::PairingFailed));
 
     let mut known = w.joiner(&ticket, 2);
     known.set_host_pinned(true);
