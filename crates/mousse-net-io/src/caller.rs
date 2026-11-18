@@ -59,7 +59,9 @@ use crate::SharedSigner;
 pub enum JoinOutcome {
     /// The host enrolled this device. Store the pin.
     Paired(PairedHost),
-    /// The host already had a live grant for this device.
+    /// The host grants this device access now. That says nothing about
+    /// which invitation the grant came from: it may be this one (its
+    /// `PAIRED` was lost), another one, or an earlier pairing.
     AlreadyPaired,
 }
 
@@ -466,7 +468,8 @@ where
     ///   after this side confirmed the code and before `PAIRED` arrived,
     ///   the join reconnects through it (a few times, with short waits) and
     ///   keeps the same pairing state, so the host's answer settles the
-    ///   outcome: `AUTHORIZED {live}` means it enrolled this device.
+    ///   outcome: `AUTHORIZED {live}` means the device has access now,
+    ///   reported as [`JoinOutcome::AlreadyPaired`].
     pub async fn join_with_redial<P, C, D, Fut>(
         &self,
         pipe: P,

@@ -413,6 +413,69 @@ async fn a_removal_that_cannot_be_saved_reports_it_and_still_ends_access_at_once
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_enrollment_that_cannot_be_saved_fails_the_pairing() {
+    let dir = temp_dir("unsaved-enroll");
+    let (mut endpoint, key) = Endpoint::create(&dir, None, KeyStorage::InsecureFile).unwrap();
+    let store = GrantStore::in_dir(&endpoint.grants_dir());
+    let mut host = TestHost::start_endpoint(&mut endpoint, Arc::new(key), "desk").await;
+    // A folder where grants.json goes: no save can replace it.
+    std::fs::create_dir_all(store.path()).unwrap();
+
+    // In person, approved by the owner.
+    let caller = new_caller(new_signer());
+    let ticket = host.invite();
+    let pipe = connect_tcp(&host.route()).await.unwrap();
+    let (joined, ()) = tokio::join!(
+        within("join", caller.join(pipe, &ticket, "laptop")),
+        host.approve_next_request()
+    );
+    let err = joined.map(|(_, outcome)| outcome).unwrap_err();
+    assert!(closed_with(&err, ErrorCode::InternalError), "{err:?}");
+    assert_eq!(host.invitation_ended().await, ErrorCode::InternalError);
+    assert!(host.host.grants().is_empty());
+
+    // A send link, settled by the code exchange. The close after its
+    // confirmation looks like a lost PAIRED to the joiner, so it reconnects
+    // to ask, and the host has no grant for it.
+    let phone = new_caller(new_signer());
+    let ticket = host.invite_kind(InvitationKind::SendLink);
+    let (type_tx, typed) = mpsc::unbounded_channel();
+    let (asks_tx, mut asks) = mpsc::unbounded_channel();
+    let mut codes = TypedCodes {
+        asks: asks_tx,
+        typed,
+    };
+    let route = host.route();
+    let pipe = connect_tcp(&route).await.unwrap();
+    let join = phone.join_with_redial(pipe, &ticket, "phone", &mut codes, false, || {
+        connect_tcp(&route)
+    });
+    let typing = async {
+        let code = host.next_code().await;
+        assert_eq!(within("ask", asks.recv()).await, Some(None));
+        type_tx.send(code).unwrap();
+    };
+    let (joined, ()) = tokio::join!(within("join", join), typing);
+    let err = joined.map(|(_, outcome)| outcome).unwrap_err();
+    assert!(closed_with(&err, ErrorCode::InvitationInvalid), "{err:?}");
+    assert_eq!(host.invitation_ended().await, ErrorCode::InternalError);
+    assert!(host.host.grants().is_empty());
+
+    // Nothing was saved, and nothing waits to be.
+    std::fs::remove_dir(store.path()).unwrap();
+    within("the retried save", async {
+        while host.host.has_unsaved_changes() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert_eq!(store.load().unwrap().grants().count(), 0);
+    host.stop().await;
+    drop(endpoint);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_paired_caller_reconnects_after_a_host_restart_on_the_kept_port() {
     let dir = temp_dir("restart");
     let (mut endpoint, key) = Endpoint::create(&dir, None, KeyStorage::InsecureFile).unwrap();

@@ -76,6 +76,10 @@ A removal or denial ends access at once. If saving the grant table fails,
 `remove` reports it; the host retries the save every second, and if it
 stops before a retry works the grant is back after a restart.
 
+A new grant is saved before the joiner is told it is paired. If that save
+fails, the pairing fails with `INTERNAL_ERROR` and the host keeps no grant,
+so no device holds a pin for a host that would forget it on restart.
+
 The owner test kit runs the same suite and its controls:
 
 ```

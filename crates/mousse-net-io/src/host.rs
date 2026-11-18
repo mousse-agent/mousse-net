@@ -10,6 +10,10 @@
 //! The grant table is saved after every change. A change whose save fails
 //! still takes effect in memory (access ends at once) but the call reports
 //! the failure, and the host retries the save every second until it works.
+//! Enrollment is the exception: a new grant is saved before the
+//! connection is promoted or `PAIRED` is sent, and if that save fails the
+//! grant is dropped and the pairing fails with `INTERNAL_ERROR`, so a
+//! device is never told it is paired under a grant a restart would lose.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -265,6 +269,56 @@ where
         }
     }
 
+    /// Save an enrollment before anything acts on it. `actions` came from a
+    /// pairing call that ran on the grant table as it was in `before`. When
+    /// they enroll a device, the new grant is saved first, so the gate is
+    /// promoted and `PAIRED` sent only for a grant that survives a restart.
+    /// If the save fails the table goes back to `before` and the pairing
+    /// fails: the enrolling connection closes with `INTERNAL_ERROR`, no
+    /// `PAIRED` is sent and the invitation ends.
+    fn commit_enrollment(
+        &mut self,
+        before: GrantTable,
+        actions: Vec<HostAction>,
+    ) -> Vec<HostAction> {
+        let enrolling: Vec<ConnectionId> = actions
+            .iter()
+            .filter_map(|a| match a {
+                HostAction::Enrolled { conn, .. } => Some(*conn),
+                _ => None,
+            })
+            .collect();
+        if enrolling.is_empty() || self.persist().is_ok() {
+            return actions;
+        }
+        self.grants = before;
+        actions
+            .into_iter()
+            .flat_map(|action| match action {
+                HostAction::Enrolled {
+                    invitation, conn, ..
+                } => vec![
+                    HostAction::Close {
+                        conn,
+                        code: ErrorCode::InternalError,
+                    },
+                    HostAction::InvitationEnded {
+                        invitation,
+                        reason: ErrorCode::InternalError,
+                    },
+                ],
+                // The grant table is back as it was: nothing it reported
+                // happened.
+                HostAction::Grant(_) => Vec::new(),
+                HostAction::Send {
+                    conn,
+                    message: ControlMessage::Paired { .. },
+                } if enrolling.contains(&conn) => Vec::new(),
+                other => vec![other],
+            })
+            .collect()
+    }
+
     fn apply(&mut self, actions: Vec<HostAction>, clock: &dyn Clock) {
         let mut queue: VecDeque<HostAction> = actions.into();
         let mut persist = false;
@@ -286,10 +340,12 @@ where
                 } => {
                     if self.approve_next {
                         self.approve_next = false;
+                        let before = self.grants.clone();
                         if let Ok(more) =
                             self.pairing
                                 .approve(&invitation, conn, &mut self.grants, clock.now())
                         {
+                            let more = self.commit_enrollment(before, more);
                             queue.extend(more);
                         }
                     } else {
@@ -312,11 +368,11 @@ where
                     grant,
                     identity,
                 } => {
+                    // Already saved by `commit_enrollment`.
                     if let Some(gate) = self.gates.get_mut(&conn) {
                         gate.promote(grant);
                     }
                     self.send(conn, Cmd::Status(ConnStatus::Live));
-                    persist = true;
                     let _ = self.events.send(HostEvent::Enrolled {
                         invitation,
                         grant,
@@ -474,6 +530,7 @@ where
     pub fn approve(&self, request: &ApprovalRequest) -> Result<(), NetError> {
         let mut inner = lock(&self.shared);
         let inner = &mut *inner;
+        let before = inner.grants.clone();
         let actions = inner
             .pairing
             .approve(
@@ -483,6 +540,7 @@ where
                 self.shared.clock.now(),
             )
             .map_err(|e| NetError::Refused(e.to_string()))?;
+        let actions = inner.commit_enrollment(before, actions);
         inner.apply(actions, &*self.shared.clock);
         Ok(())
     }
@@ -660,6 +718,7 @@ where
         let clock = &*shared.clock;
         let mut guard = lock(&shared);
         let inner = &mut *guard;
+        let before = inner.grants.clone();
         let actions = match message {
             ControlMessage::JoinProof {
                 invitation,
@@ -690,6 +749,7 @@ where
             // the gate.
             _ => Vec::new(),
         };
+        let actions = inner.commit_enrollment(before, actions);
         inner.apply(actions, clock);
     }
 
