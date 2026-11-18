@@ -684,6 +684,13 @@ where
                 break;
             }
             let Some(wait) = retries.next() else {
+                // A step 1 failure stays one, so the caller can try another
+                // address of the host.
+                if let Err(e) = result {
+                    if e.is_step1() {
+                        return Err(e);
+                    }
+                }
                 return Err(NetError::Refused(
                     "the connection dropped while the host was enrolling this device, \
                      and reconnecting did not tell whether it did"

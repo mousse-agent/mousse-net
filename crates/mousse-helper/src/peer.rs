@@ -157,6 +157,9 @@ pub fn reason_of(e: &NetError) -> String {
             None => "pairing_refused".into(),
         },
         NetError::Store(_) => "store".into(),
+        NetError::Tls(_) => "tls".into(),
+        NetError::Timeout(_) => "timeout".into(),
+        NetError::Io(_) => "unreachable".into(),
         _ => "error".into(),
     }
 }
@@ -274,10 +277,15 @@ pub async fn join(
                     "pin_mismatch",
                 );
             }
-            // Any other step 1 failure: the next address may pass.
+            // Any other certificate failure: the next address may pass.
             Err(NetError::PeerCertificate(e)) => {
                 step1.note(e);
                 last = Failure::of(&NetError::PeerCertificate(e));
+            }
+            // A step 1 failure of another kind (TLS, timeout, no answer):
+            // the next address may pass too.
+            Err(e) if e.is_step1() => {
+                last = Failure::new(format!("{hint}: {}", describe(&e)), &reason_of(&e));
             }
             Err(e) => return Err(Failure::of(&e)),
         }
