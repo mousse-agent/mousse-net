@@ -50,20 +50,17 @@ placeholder = "core tests need a wasm32 test runner (wasm-bindgen-test or a node
 [[check.control]]
 name = "break-session-cert"
 breaks = "the session certificate verifier skips the identity signature check"
-args = ["--features", "control-break-session-cert"]
-missing = "mousse-net-core has no control-break-session-cert feature yet"
+env = { RUSTFLAGS = '--cfg mousse_control="break-session-cert"' }
 
 [[check.control]]
 name = "break-authz"
 breaks = "the step 2 gate lets RPC through on a connection with no live grant"
-args = ["--features", "control-break-authz"]
-missing = "mousse-net-core has no control-break-authz feature yet"
+env = { RUSTFLAGS = '--cfg mousse_control="break-authz"' }
 
 [[check.control]]
 name = "break-raw-signature"
 breaks = "raw signature parsing accepts a DER signature where raw r||s is required"
-args = ["--features", "control-break-raw-signature"]
-missing = "mousse-net-core has no control-break-raw-signature feature yet"
+env = { RUSTFLAGS = '--cfg mousse_control="break-raw-signature"' }
 
 [[check]]
 id = "phase0.cpace-vectors"
@@ -98,8 +95,7 @@ placeholder = "core tests need a wasm32 test runner before they can run on wasm3
 [[check.control]]
 name = "break-cpace"
 breaks = "CPace leaves the session id out of the generator, so the draft vectors no longer match"
-args = ["--features", "control-break-cpace"]
-missing = "mousse-net-core has no control-break-cpace feature yet"
+env = { RUSTFLAGS = '--cfg mousse_control="break-cpace"' }
 
 [[check]]
 id = "phase0.cpace-review"
