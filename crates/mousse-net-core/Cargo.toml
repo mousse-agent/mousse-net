@@ -10,3 +10,14 @@ description = "Mousse networking state machines: identity, pairing, grants, sess
 workspace = true
 
 [dependencies]
+# CPace (src/cpace)
+curve25519-dalek = { version = "=5.0.0", default-features = false, features = ["alloc", "precomputed-tables", "zeroize"] }
+sha2 = { version = "=0.11.1", default-features = false }
+hmac = { version = "=0.13.0", default-features = false }
+subtle = { version = "=2.6.1", default-features = false }
+zeroize = { version = "=1.9.2", default-features = false, features = ["alloc"] }
+rand_core = { version = "=0.10.1", default-features = false }
+
+[dev-dependencies]
+# CPace test vectors (src/cpace/tests.rs)
+serde_json = "=1.0.154"
