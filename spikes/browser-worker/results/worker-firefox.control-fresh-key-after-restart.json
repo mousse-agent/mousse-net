@@ -1,0 +1,102 @@
+{
+  "build": "479c879+release",
+  "check": "phase0.browser-worker-cert",
+  "control": "fresh-key-after-restart",
+  "details": "firefox 157.0: failed key-loaded-after-restart, second-certificate-same-identity, key-survives-browser-restart",
+  "extra": {
+    "break": "fresh-key",
+    "browser": "firefox",
+    "browser_version": "157.0",
+    "checks": [
+      {
+        "detail": "extractable=false, pkcs8 export refused=true",
+        "name": "identity-key-non-extractable",
+        "ok": true
+      },
+      {
+        "detail": "WebCrypto ECDSA signature is 64 bytes (raw r||s is 64)",
+        "name": "webcrypto-signature-raw",
+        "ok": true
+      },
+      {
+        "detail": "PendingCertificate::finish with a DER signature: signature is not 64-byte raw r||s",
+        "name": "finish-refuses-der",
+        "ok": true
+      },
+      {
+        "detail": "verify(first certificate, pin = Worker identity) = ok",
+        "name": "first-certificate-accepted",
+        "ok": true
+      },
+      {
+        "detail": "one bit flipped in the identity signature: self_signature_invalid",
+        "name": "negative-tampered",
+        "ok": true
+      },
+      {
+        "detail": "identity signature over another session key's record: identity_signature_invalid",
+        "name": "negative-other-spki",
+        "ok": true
+      },
+      {
+        "detail": "identity signature in DER, certificate self-signed again: identity_signature_not_raw",
+        "name": "negative-der-identity-signature",
+        "ok": true
+      },
+      {
+        "detail": "pin = another identity: pin_mismatch",
+        "name": "negative-wrong-pin",
+        "ok": true
+      },
+      {
+        "detail": "loaded from IndexedDB = false",
+        "name": "key-loaded-after-restart",
+        "ok": false
+      },
+      {
+        "detail": "verify(second certificate, same pin) = pin_mismatch",
+        "name": "second-certificate-same-identity",
+        "ok": false
+      },
+      {
+        "detail": "the second certificate is a new certificate",
+        "name": "second-certificate-new-session-key",
+        "ok": true
+      },
+      {
+        "detail": "loaded from IndexedDB = false; verify(certificate, same pin) = pin_mismatch",
+        "name": "key-survives-browser-restart",
+        "ok": false
+      },
+      {
+        "detail": "loaded from IndexedDB = false (Clear-Site-Data: \"storage\" response header (fetched))",
+        "name": "key-lost-after-clear",
+        "ok": true
+      },
+      {
+        "detail": "verify(certificate after clear, old pin) = pin_mismatch; the app re-pairs",
+        "name": "old-pin-refuses-new-identity",
+        "ok": true
+      },
+      {
+        "detail": "verify(certificate after clear, its own new identity) = ok",
+        "name": "new-identity-certificate-valid",
+        "ok": true
+      }
+    ],
+    "clear_method": "Clear-Site-Data: \"storage\" response header (fetched)",
+    "identity_key": "0409b41da54f3d6f88fc6c152c34b48c828ce0c9a2f8d7e2ce3e313678f557181d560d067945795e31b9691e4dfa4e59d0a0fa84dd7843bcf2d33a7a6ab90c7a02",
+    "persist": {
+      "persist": "no-answer-in-5s",
+      "persisted_after": false,
+      "persisted_before": false
+    },
+    "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:157.0) Gecko/20100101 Firefox/157.0",
+    "verified_at": 1795027584,
+    "verifier_break": "none"
+  },
+  "outcome": "FAIL",
+  "platform": "macos-aarch64, Playwright firefox 157.0 (headless)",
+  "target": "wasm32-unknown-unknown@worker-firefox",
+  "time": "2026-11-18T18:46:24Z"
+}

@@ -103,9 +103,22 @@ version, `persist()` answers, every check line, the identity key). Sign them
 on the Mac with its device key:
 
 ```sh
-mousse-check sign --device-key ~/.mousse/device.key results/worker-chromium.json
-mousse-check sign --device-key ~/.mousse/device.key results/worker-chromium.control-tampered-cert.json
+mousse-check sign --device-key ~/.mousse/device.key results/worker-{chromium,webkit,firefox}*.json
 ```
+
+(`worker-cert-vector.json` is a test vector, not a result; leave it out.)
+
+The build in these files is the commit that holds the spike's code. Because
+`results/` sits outside `checks/`, committing the results moves the build
+`mousse-check` computes; re-run on the commit you evaluate, or move the
+output under `checks/` if this spike is kept.
+
+Recorded on a Mac mini (Apple silicon), Playwright 1.64.1: Chromium 156,
+WebKit 27.2, Firefox 157. All three: normal run PASS, all four controls FAIL.
+`persist()` answered `false` in headless Chromium and WebKit; headless Firefox
+never answered (it would show a permission prompt), recorded as
+`no-answer-in-5s`. `persisted()` was `false` everywhere, so the key relies on
+best-effort storage; it still survived a Worker restart and a browser restart.
 
 Targets are the cells in `checks/phase0.toml`:
 `wasm32-unknown-unknown@worker-chromium`, `...@worker-firefox`, and

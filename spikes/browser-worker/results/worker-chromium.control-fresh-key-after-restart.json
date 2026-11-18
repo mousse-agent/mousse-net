@@ -1,0 +1,102 @@
+{
+  "build": "479c879+release",
+  "check": "phase0.browser-worker-cert",
+  "control": "fresh-key-after-restart",
+  "details": "chromium 156.0.8078.4: failed key-loaded-after-restart, second-certificate-same-identity, key-survives-browser-restart",
+  "extra": {
+    "break": "fresh-key",
+    "browser": "chromium",
+    "browser_version": "156.0.8078.4",
+    "checks": [
+      {
+        "detail": "extractable=false, pkcs8 export refused=true",
+        "name": "identity-key-non-extractable",
+        "ok": true
+      },
+      {
+        "detail": "WebCrypto ECDSA signature is 64 bytes (raw r||s is 64)",
+        "name": "webcrypto-signature-raw",
+        "ok": true
+      },
+      {
+        "detail": "PendingCertificate::finish with a DER signature: signature is not 64-byte raw r||s",
+        "name": "finish-refuses-der",
+        "ok": true
+      },
+      {
+        "detail": "verify(first certificate, pin = Worker identity) = ok",
+        "name": "first-certificate-accepted",
+        "ok": true
+      },
+      {
+        "detail": "one bit flipped in the identity signature: self_signature_invalid",
+        "name": "negative-tampered",
+        "ok": true
+      },
+      {
+        "detail": "identity signature over another session key's record: identity_signature_invalid",
+        "name": "negative-other-spki",
+        "ok": true
+      },
+      {
+        "detail": "identity signature in DER, certificate self-signed again: identity_signature_not_raw",
+        "name": "negative-der-identity-signature",
+        "ok": true
+      },
+      {
+        "detail": "pin = another identity: pin_mismatch",
+        "name": "negative-wrong-pin",
+        "ok": true
+      },
+      {
+        "detail": "loaded from IndexedDB = false",
+        "name": "key-loaded-after-restart",
+        "ok": false
+      },
+      {
+        "detail": "verify(second certificate, same pin) = pin_mismatch",
+        "name": "second-certificate-same-identity",
+        "ok": false
+      },
+      {
+        "detail": "the second certificate is a new certificate",
+        "name": "second-certificate-new-session-key",
+        "ok": true
+      },
+      {
+        "detail": "loaded from IndexedDB = false; verify(certificate, same pin) = pin_mismatch",
+        "name": "key-survives-browser-restart",
+        "ok": false
+      },
+      {
+        "detail": "loaded from IndexedDB = false (Clear-Site-Data: \"storage\" response header (fetched))",
+        "name": "key-lost-after-clear",
+        "ok": true
+      },
+      {
+        "detail": "verify(certificate after clear, old pin) = pin_mismatch; the app re-pairs",
+        "name": "old-pin-refuses-new-identity",
+        "ok": true
+      },
+      {
+        "detail": "verify(certificate after clear, its own new identity) = ok",
+        "name": "new-identity-certificate-valid",
+        "ok": true
+      }
+    ],
+    "clear_method": "Clear-Site-Data: \"storage\" response header (fetched)",
+    "identity_key": "046b160375bc6b329db3a2b440a1fab9a428341d3f1e4469d5cbf6d45dbf2f0bc66761343c69e79a9d28a2319c9390b63aeffb4d2fcbc15c62d3838ec38fc8ccae",
+    "persist": {
+      "persist": false,
+      "persisted_after": false,
+      "persisted_before": false
+    },
+    "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/156.0.8078.4 Safari/537.36",
+    "verified_at": 1795027556,
+    "verifier_break": "none"
+  },
+  "outcome": "FAIL",
+  "platform": "macos-aarch64, Playwright chromium 156.0.8078.4 (headless)",
+  "target": "wasm32-unknown-unknown@worker-chromium",
+  "time": "2026-11-18T18:45:56Z"
+}

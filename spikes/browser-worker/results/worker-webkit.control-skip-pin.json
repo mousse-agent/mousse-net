@@ -1,0 +1,102 @@
+{
+  "build": "479c879+release",
+  "check": "phase0.browser-worker-cert",
+  "control": "skip-pin",
+  "details": "webkit 27.2: failed negative-wrong-pin, old-pin-refuses-new-identity",
+  "extra": {
+    "break": "skip-pin",
+    "browser": "webkit",
+    "browser_version": "27.2",
+    "checks": [
+      {
+        "detail": "extractable=false, pkcs8 export refused=true",
+        "name": "identity-key-non-extractable",
+        "ok": true
+      },
+      {
+        "detail": "WebCrypto ECDSA signature is 64 bytes (raw r||s is 64)",
+        "name": "webcrypto-signature-raw",
+        "ok": true
+      },
+      {
+        "detail": "PendingCertificate::finish with a DER signature: signature is not 64-byte raw r||s",
+        "name": "finish-refuses-der",
+        "ok": true
+      },
+      {
+        "detail": "verify(first certificate, pin = Worker identity) = ok",
+        "name": "first-certificate-accepted",
+        "ok": true
+      },
+      {
+        "detail": "one bit flipped in the identity signature: self_signature_invalid",
+        "name": "negative-tampered",
+        "ok": true
+      },
+      {
+        "detail": "identity signature over another session key's record: identity_signature_invalid",
+        "name": "negative-other-spki",
+        "ok": true
+      },
+      {
+        "detail": "identity signature in DER, certificate self-signed again: identity_signature_not_raw",
+        "name": "negative-der-identity-signature",
+        "ok": true
+      },
+      {
+        "detail": "pin = another identity: ok",
+        "name": "negative-wrong-pin",
+        "ok": false
+      },
+      {
+        "detail": "loaded from IndexedDB = true",
+        "name": "key-loaded-after-restart",
+        "ok": true
+      },
+      {
+        "detail": "verify(second certificate, same pin) = ok",
+        "name": "second-certificate-same-identity",
+        "ok": true
+      },
+      {
+        "detail": "the second certificate is a new certificate",
+        "name": "second-certificate-new-session-key",
+        "ok": true
+      },
+      {
+        "detail": "loaded from IndexedDB = true; verify(certificate, same pin) = ok",
+        "name": "key-survives-browser-restart",
+        "ok": true
+      },
+      {
+        "detail": "loaded from IndexedDB = false (Clear-Site-Data: \"storage\" response header (fetched))",
+        "name": "key-lost-after-clear",
+        "ok": true
+      },
+      {
+        "detail": "verify(certificate after clear, old pin) = ok; the app re-pairs",
+        "name": "old-pin-refuses-new-identity",
+        "ok": false
+      },
+      {
+        "detail": "verify(certificate after clear, its own new identity) = ok",
+        "name": "new-identity-certificate-valid",
+        "ok": true
+      }
+    ],
+    "clear_method": "Clear-Site-Data: \"storage\" response header (fetched)",
+    "identity_key": "04d7994531424a70ee60bba74af060b248be47cc970ce1884850fbcd779adfd1a66c686defb7ccff2474f12f6899ba62531b5a53d8c45d00166074f0d9db07f964",
+    "persist": {
+      "persist": false,
+      "persisted_after": false,
+      "persisted_before": false
+    },
+    "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/27.2 Safari/605.1.15",
+    "verified_at": 1795027562,
+    "verifier_break": "skip-pin"
+  },
+  "outcome": "FAIL",
+  "platform": "macos-aarch64, Playwright webkit 27.2 (headless)",
+  "target": "wasm32-unknown-unknown@worker-safari",
+  "time": "2026-11-18T18:46:02Z"
+}
