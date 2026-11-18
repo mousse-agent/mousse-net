@@ -76,15 +76,37 @@ pub fn short_id(identity: &IdentityPublicKey) -> String {
 
 /// Write `bytes` to `path` atomically (temp file, flush, rename).
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), NetError> {
+    write_atomic_checked(path, bytes).map_err(|f| f.error)
+}
+
+/// A failed [`write_atomic_checked`].
+#[derive(Debug)]
+pub struct WriteFailure {
+    /// What failed.
+    pub error: NetError,
+    /// The rename was made and only making it durable failed: the new
+    /// content is at the path now and may or may not survive a power loss.
+    /// Otherwise the file is as it was.
+    pub in_place: bool,
+}
+
+/// [`write_atomic`], telling a failure that left the file as it was from
+/// one after the rename, whose outcome is not known.
+pub fn write_atomic_checked(path: &Path, bytes: &[u8]) -> Result<(), WriteFailure> {
+    let failed = |error| WriteFailure {
+        error,
+        in_place: false,
+    };
     let dir = path
         .parent()
-        .ok_or_else(|| NetError::Store(format!("{} has no parent", path.display())))?;
-    fs::create_dir_all(dir).map_err(|e| store_err(dir, e))?;
+        .ok_or_else(|| failed(NetError::Store(format!("{} has no parent", path.display()))))?;
+    fs::create_dir_all(dir).map_err(|e| failed(store_err(dir, e)))?;
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
-        .ok_or_else(|| NetError::Store(format!("bad file name {}", path.display())))?;
+        .ok_or_else(|| failed(NetError::Store(format!("bad file name {}", path.display()))))?;
     let tmp = dir.join(format!(".{name}.tmp-{}", hex(&random_bytes::<6>())));
+    let mut renaming = false;
     let result = (|| -> std::io::Result<()> {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
@@ -99,12 +121,23 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), NetError> {
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
+        renaming = true;
         crate::private::replace_durably(&tmp, path)
     })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // The temporary file is gone only if the rename was made.
+            let in_place = renaming && !tmp.exists();
+            if !in_place {
+                let _ = fs::remove_file(&tmp);
+            }
+            Err(WriteFailure {
+                error: store_err(path, e),
+                in_place,
+            })
+        }
     }
-    result.map_err(|e| store_err(path, e))
 }
 
 fn store_err(path: &Path, e: std::io::Error) -> NetError {
@@ -243,6 +276,12 @@ impl GrantStore {
 
     /// Save the table atomically.
     pub fn save(&self, table: &GrantTable) -> Result<(), NetError> {
+        self.save_checked(table).map_err(|f| f.error)
+    }
+
+    /// [`GrantStore::save`], telling whether a failure may have left the
+    /// new table in place (see [`WriteFailure`]).
+    pub fn save_checked(&self, table: &GrantTable) -> Result<(), WriteFailure> {
         let file = GrantFile {
             version: GRANT_FILE_VERSION,
             next_grant_id: table.next_grant_id(),
@@ -268,9 +307,11 @@ impl GrantStore {
                 })
                 .collect(),
         };
-        let bytes =
-            serde_json::to_vec_pretty(&file).map_err(|e| store_err(&self.path, e.into()))?;
-        write_atomic(&self.path, &bytes)
+        let bytes = serde_json::to_vec_pretty(&file).map_err(|e| WriteFailure {
+            error: store_err(&self.path, e.into()),
+            in_place: false,
+        })?;
+        write_atomic_checked(&self.path, &bytes)
     }
 }
 
@@ -503,7 +544,10 @@ impl FlowRecordStore {
 
     fn make_dir(&self) -> Result<(), NetError> {
         if !self.dir.exists() {
-            crate::private::make_private_dir(&self.dir).map_err(|e| store_err(&self.dir, e))?;
+            // Durably: a debit saved in a new folder must survive a power
+            // loss with it.
+            crate::private::make_private_dir_durably(&self.dir)
+                .map_err(|e| store_err(&self.dir, e))?;
         }
         Ok(())
     }

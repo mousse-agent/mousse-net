@@ -25,6 +25,20 @@ pub fn make_private_dir(dir: &Path) -> io::Result<()> {
     restrict_contents(dir)
 }
 
+/// [`make_private_dir`] for a folder that may be new, made durable: when
+/// it did not exist, its parent is synced (Unix), so a file saved in it
+/// and reported saved does not vanish with the folder on a power loss.
+pub fn make_private_dir_durably(dir: &Path) -> io::Result<()> {
+    let existed = dir.is_dir();
+    make_private_dir(dir)?;
+    if !existed {
+        if let Some(parent) = dir.parent() {
+            imp::sync_dir(parent)?;
+        }
+    }
+    Ok(())
+}
+
 fn restrict_contents(dir: &Path) -> io::Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
@@ -65,8 +79,46 @@ pub fn is_owner_only(path: &Path) -> io::Result<bool> {
 
 /// Rename `from` over `to`. On Windows the rename is written through to
 /// disk before it returns; on Unix the folder is synced after it.
+///
+/// A failure after the rename (the folder sync) leaves `from` gone and the
+/// new content at `to`, not known to be durable: callers tell the two
+/// cases apart by whether `from` still exists.
 pub fn replace_durably(from: &Path, to: &Path) -> io::Result<()> {
-    imp::replace_durably(from, to)
+    imp::replace_durably(from, to)?;
+    #[cfg(test)]
+    if faults::take(to) {
+        return Err(io::Error::other("injected: the folder sync failed"));
+    }
+    Ok(())
+}
+
+/// Test faults: make the next durable replaces of a path fail after the
+/// rename, as a failed folder sync does.
+#[cfg(test)]
+pub(crate) mod faults {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static AFTER_RENAME: Mutex<Option<HashMap<PathBuf, u32>>> = Mutex::new(None);
+
+    /// The next `count` replaces of `path` fail after their rename.
+    pub fn fail_after_rename(path: &Path, count: u32) {
+        let mut map = AFTER_RENAME.lock().unwrap_or_else(|e| e.into_inner());
+        map.get_or_insert_with(HashMap::new)
+            .insert(path.to_path_buf(), count);
+    }
+
+    pub(super) fn take(path: &Path) -> bool {
+        let mut map = AFTER_RENAME.lock().unwrap_or_else(|e| e.into_inner());
+        match map.as_mut().and_then(|m| m.get_mut(path)) {
+            Some(n) if *n > 0 => {
+                *n -= 1;
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 fn restrict(path: &Path, dir: bool) -> io::Result<()> {
@@ -100,9 +152,13 @@ mod imp {
     pub fn replace_durably(from: &Path, to: &Path) -> io::Result<()> {
         fs::rename(from, to)?;
         if let Some(dir) = to.parent() {
-            fs::File::open(dir)?.sync_all()?;
+            sync_dir(dir)?;
         }
         Ok(())
+    }
+
+    pub fn sync_dir(dir: &Path) -> io::Result<()> {
+        fs::File::open(dir)?.sync_all()
     }
 }
 
@@ -373,6 +429,13 @@ mod imp {
         if ok == 0 {
             return Err(io::Error::last_os_error());
         }
+        Ok(())
+    }
+
+    /// Nothing to do: NTFS logs folder changes in order, and the
+    /// write-through rename of a file saved in the folder flushes the log
+    /// up to it, the folder's creation included.
+    pub fn sync_dir(_dir: &Path) -> io::Result<()> {
         Ok(())
     }
 
