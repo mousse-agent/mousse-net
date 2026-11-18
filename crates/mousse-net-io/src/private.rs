@@ -13,10 +13,42 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-/// Create `dir` (and its parents) and make it owner-only.
+/// Create `dir` (and its parents) and make it owner-only, together with
+/// everything already in it: a folder made before this was enforced may
+/// hold files with their own entries for other users, which the folder's
+/// inheritable entry does not remove. Links are left alone, not followed.
 pub fn make_private_dir(dir: &Path) -> io::Result<()> {
     fs::create_dir_all(dir)?;
-    restrict(dir, true)
+    restrict(dir, true)?;
+    restrict_contents(dir)
+}
+
+fn restrict_contents(dir: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        // Another process may replace or remove a file meanwhile (a save's
+        // temporary file): what is gone needs nothing.
+        let kind = match entry.file_type() {
+            Ok(kind) => kind,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        let result = if kind.is_symlink() {
+            Ok(())
+        } else if kind.is_dir() {
+            restrict(&path, true).and_then(|()| restrict_contents(&path))
+        } else {
+            restrict(&path, false)
+        };
+        match result {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            other => {
+                other.map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", path.display())))?
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Make an existing file owner-only.
@@ -86,7 +118,7 @@ mod imp {
     use windows_sys::Win32::Security::{
         GetSecurityDescriptorDacl, GetTokenInformation, TokenUser, ACL, DACL_SECURITY_INFORMATION,
         PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
-        TOKEN_QUERY, TOKEN_USER,
+        TOKEN_QUERY, TOKEN_USER, UNPROTECTED_DACL_SECURITY_INFORMATION,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
@@ -201,14 +233,46 @@ mod imp {
 
     pub fn restrict(path: &Path, dir: bool) -> io::Result<()> {
         let sd = Descriptor::owner_only("FA", dir)?;
+        set_dacl(path, &sd, true)
+    }
+
+    /// Give `path` an arbitrary DACL, for tests that seed a file the way
+    /// an older version or another tool left it.
+    #[cfg(test)]
+    pub(super) fn set_sddl(path: &Path, sddl: &str) -> io::Result<()> {
+        let sddl = sddl.replace("{me}", &user_sid()?);
+        let text = wide(sddl.as_ref());
+        let mut sd: PSECURITY_DESCRIPTOR = null_mut();
+        // SAFETY: valid NUL-terminated input and out pointer.
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                text.as_ptr(),
+                SDDL_REVISION_1,
+                &mut sd,
+                null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let sd = Descriptor(sd);
+        set_dacl(path, &sd, sddl.starts_with("D:P"))
+    }
+
+    fn set_dacl(path: &Path, sd: &Descriptor, protected: bool) -> io::Result<()> {
         let dacl = sd.dacl()?;
+        let info = if protected {
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION
+        } else {
+            DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION
+        };
         let name = wide(path.as_os_str());
         // SAFETY: valid name and DACL; owner, group and SACL are not set.
         let rc = unsafe {
             SetNamedSecurityInfoW(
                 name.as_ptr(),
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                info,
                 null_mut(),
                 null_mut(),
                 dacl,
@@ -357,6 +421,54 @@ mod tests {
         write_atomic(&outside, b"{}").unwrap();
         assert!(is_owner_only(&outside).unwrap());
         fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Give `path` access for other users, as a version that did not
+    /// restrict files (or another tool) may have left it.
+    fn open_to_others(path: &Path, protected: bool) {
+        #[cfg(windows)]
+        imp::set_sddl(
+            path,
+            if protected {
+                "D:P(A;;FA;;;{me})(A;;FR;;;WD)"
+            } else {
+                "D:(A;;FR;;;WD)"
+            },
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = protected;
+            let mode = if path.is_dir() { 0o755 } else { 0o644 };
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        }
+    }
+
+    #[test]
+    fn opening_an_older_state_folder_makes_what_is_already_in_it_owner_only() {
+        let dir = temp("upgrade");
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        let top = dir.join("grants.json");
+        let nested = dir.join("sub").join("identity.json");
+        fs::write(&top, b"{}").unwrap();
+        fs::write(&nested, b"{}").unwrap();
+        // An explicit grant to everyone on a file, and a whole subfolder
+        // whose own protected DACL lets everyone read.
+        open_to_others(&top, false);
+        open_to_others(&nested, false);
+        open_to_others(&dir.join("sub"), true);
+        // Restricting the folder alone leaves the file's own entries.
+        restrict(&dir, true).unwrap();
+        assert!(is_owner_only(&dir).unwrap());
+        assert!(!is_owner_only(&top).unwrap());
+        assert!(!is_owner_only(&dir.join("sub")).unwrap());
+
+        make_private_dir(&dir).unwrap();
+        for path in [&dir, &top, &dir.join("sub"), &nested] {
+            assert!(is_owner_only(path).unwrap(), "{}", path.display());
+        }
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[cfg(windows)]
