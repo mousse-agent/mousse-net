@@ -234,7 +234,7 @@ fn session_lifecycle_vectors() -> J {
     let deadline = local_na + SKEW;
     let renew_at = local_na - crate::session::RENEW_LEAD_SECS;
     json!({
-        "description": "A live path closes with cert_expired at the first second after the effective deadline (earlier not_after + 600). Renewal is due 1800 s before the earlier not_after; while no new path is current it is asked for again after 30 s, then 60, 120, 240 and every 300 s, until the deadline. Replay: begin_path(1), on_authenticated(1, verify(peer_certificate, authenticated_at, pin), local window, authenticated_at), on_reopened(1), then tick at each `now`.",
+        "description": "A live path closes with cert_expired at the first second after the effective deadline (earlier not_after + 600). Renewal is due 1800 s before the earlier not_after; while no new path with a later renewal time is current it is asked for again after 30 s, then 60, 120, 240 and every 300 s, until the deadline. Replay: begin_path(1), on_authenticated(1, verify(peer_certificate, authenticated_at, pin), local window, authenticated_at), on_reopened(1), then tick at each `now`.",
         "peer_certificate": hex(&peer),
         "pin": hex(a.public_key().as_bytes()),
         "local_window": { "not_before": local_nb, "not_after": local_na },
@@ -258,6 +258,18 @@ fn session_lifecycle_vectors() -> J {
             { "now": deadline + 1, "events": [{ "event": "close", "conn": 1, "code": "cert_expired" }] },
             { "now": deadline + 2, "events": [] },
         ],
+        "switch_without_renewal": {
+            "description": "A fresh replay of the same path. After the first renew_due, a new path (conn 2) comes up at `switch_at` and becomes current, but the peer has not renewed: it carries the same peer certificate and the same local window, so its renewal time is no later. The pending retries keep their schedule and waits. Replay: as above up to the tick at renew_at, then begin_path(2), on_authenticated(2, same certificate, same local window, switch_at), on_reopened(2), then tick at each `now`.",
+            "switch_at": renew_at + 5,
+            "ticks": [
+                { "now": renew_at + 6, "events": [] },
+                { "now": renew_at + 29, "events": [] },
+                { "now": renew_at + 30, "events": [{ "event": "renew_due", "conn": 2 }] },
+                { "now": renew_at + 89, "events": [] },
+                { "now": renew_at + 90, "events": [{ "event": "renew_due", "conn": 2 }] },
+                { "now": renew_at + 210, "events": [{ "event": "renew_due", "conn": 2 }] },
+            ],
+        },
         "new_connection_after_deadline": {
             "description": "A new connection with the same peer certificate after its own not_after + 600 fails step 1.",
             "now": T + DAY + SKEW + 1,

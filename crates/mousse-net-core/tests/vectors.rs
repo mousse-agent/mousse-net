@@ -159,7 +159,39 @@ fn live_path_closes_at_certificate_expiry() {
     let path = *session.current().expect("current");
     assert_eq!(path.renew_at, UnixTime(u(&doc["renew_at"])));
     assert_eq!(path.deadline, UnixTime(u(&doc["deadline"])));
-    for tick in list(&doc["ticks"]) {
+    check_ticks(&mut session, &doc["ticks"]);
+
+    // The same path again; after the first request a new path with the
+    // same certificates becomes current. The retries keep their schedule.
+    let switch = &doc["switch_without_renewal"];
+    let mut session = PeerSession::new(pin);
+    session.begin_path(conn);
+    session
+        .on_authenticated(conn, &peer, local, at)
+        .expect("authenticated");
+    session.on_reopened(conn).expect("reopened");
+    assert_eq!(session.tick(path.renew_at).len(), 1);
+    let switch_at = UnixTime(u(&switch["switch_at"]));
+    let second = ConnectionId(2);
+    session.begin_path(second);
+    session
+        .on_authenticated(second, &peer, local, switch_at)
+        .expect("authenticated");
+    session.on_reopened(second).expect("reopened");
+    check_ticks(&mut session, &switch["ticks"]);
+
+    let late = &doc["new_connection_after_deadline"];
+    let err = session_cert::verify(
+        &unhex(&doc["peer_certificate"]),
+        UnixTime(u(&late["now"])),
+        Some(&pin),
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), s(&late["result"]));
+}
+
+fn check_ticks(session: &mut PeerSession, ticks: &J) {
+    for tick in list(ticks) {
         let events: Vec<String> = session
             .tick(UnixTime(u(&tick["now"])))
             .into_iter()
@@ -181,14 +213,6 @@ fn live_path_closes_at_certificate_expiry() {
             .collect();
         assert_eq!(events, expected, "tick at {}", u(&tick["now"]));
     }
-    let late = &doc["new_connection_after_deadline"];
-    let err = session_cert::verify(
-        &unhex(&doc["peer_certificate"]),
-        UnixTime(u(&late["now"])),
-        Some(&pin),
-    )
-    .unwrap_err();
-    assert_eq!(err.code(), s(&late["result"]));
 }
 
 fn traffic(name: &str) -> Traffic {

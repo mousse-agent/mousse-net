@@ -1,7 +1,7 @@
 {
   "authenticated_at": 1790003660,
   "deadline": 1790047400,
-  "description": "A live path closes with cert_expired at the first second after the effective deadline (earlier not_after + 600). Renewal is due 1800 s before the earlier not_after; while no new path is current it is asked for again after 30 s, then 60, 120, 240 and every 300 s, until the deadline. Replay: begin_path(1), on_authenticated(1, verify(peer_certificate, authenticated_at, pin), local window, authenticated_at), on_reopened(1), then tick at each `now`.",
+  "description": "A live path closes with cert_expired at the first second after the effective deadline (earlier not_after + 600). Renewal is due 1800 s before the earlier not_after; while no new path with a later renewal time is current it is asked for again after 30 s, then 60, 120, 240 and every 300 s, until the deadline. Replay: begin_path(1), on_authenticated(1, verify(peer_certificate, authenticated_at, pin), local window, authenticated_at), on_reopened(1), then tick at each `now`.",
   "local_window": {
     "not_after": 1790046800,
     "not_before": 1790003600
@@ -14,6 +14,51 @@
   "peer_certificate": "308201db30820180a003020102021053ee3e6de5002858588900a83873c44e300a06082a8648ce3d04030230193117301506035504030c0e6d6f757373652d73657373696f6e301e170d3236303932313134313332305a170d3236303932323134313332305a30193117301506035504030c0e6d6f757373652d73657373696f6e3059301306072a8648ce3d020106082a8648ce3d0301070342000451a7580833898ea1b183cbd7350a4099078c6ef1c1e18e970cd7683035f25e7d0110522712b0b5a7cff081685486984a94e6831edac46e7360fa9d834a7a81a1a381a93081a63081a3061369e595e3c0fbf68a84f595c9dabef4e2f7be0504818b3081880201010441040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794044033485159812468a8d32632015af28b5e6322f9a71fce47800a5e53f7f381b2fbe3add3a140870b861e5e1fbc475b0a116a74a8abdedeff1ead7825c8f571317d300a06082a8648ce3d040302034900304602210093bcae8b94a1792876c71dec0329d1c6fb53c1e2e3d1784bf7c5adb2e5b7ad4a022100ec841c8c66075659b394c822be95f03b18942bd1191a49ca47d291f8d79ccbe9",
   "pin": "040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794",
   "renew_at": 1790045000,
+  "switch_without_renewal": {
+    "description": "A fresh replay of the same path. After the first renew_due, a new path (conn 2) comes up at `switch_at` and becomes current, but the peer has not renewed: it carries the same peer certificate and the same local window, so its renewal time is no later. The pending retries keep their schedule and waits. Replay: as above up to the tick at renew_at, then begin_path(2), on_authenticated(2, same certificate, same local window, switch_at), on_reopened(2), then tick at each `now`.",
+    "switch_at": 1790045005,
+    "ticks": [
+      {
+        "events": [],
+        "now": 1790045006
+      },
+      {
+        "events": [],
+        "now": 1790045029
+      },
+      {
+        "events": [
+          {
+            "conn": 2,
+            "event": "renew_due"
+          }
+        ],
+        "now": 1790045030
+      },
+      {
+        "events": [],
+        "now": 1790045089
+      },
+      {
+        "events": [
+          {
+            "conn": 2,
+            "event": "renew_due"
+          }
+        ],
+        "now": 1790045090
+      },
+      {
+        "events": [
+          {
+            "conn": 2,
+            "event": "renew_due"
+          }
+        ],
+        "now": 1790045210
+      }
+    ]
+  },
   "ticks": [
     {
       "events": [],

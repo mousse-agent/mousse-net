@@ -313,10 +313,13 @@ includes both identity keys.
   after it, whatever it is doing.
 - **Renewal** starts at `min(not_after) − 1800`, but never before the later
   `not_before`. The side whose certificate runs out first issues a new one.
-  Renewal is a path switch. While no new path has become current, renewal
-  is retried: 30 s after the first try, then waits of 60, 120 and 240 s,
-  then every 300 s, until the effective deadline. A retry is skipped while
-  a candidate path is still being brought up. Vectors:
+  Renewal is a path switch. While no new path with a later renewal time has
+  become current, renewal is retried: 30 s after the first try, then waits
+  of 60, 120 and 240 s, then every 300 s, until the effective deadline. A
+  new path whose renewal time is no later than the old one's (the peer has
+  not renewed yet, for example because its clock is behind) becomes current
+  as usual but keeps the pending retries and their waits. A retry is
+  skipped while a candidate path is still being brought up. Vectors:
   `session-lifecycle.json`.
 - **Path switch:** open a new connection to the same peer, run step 1 with
   the **same pin**, reopen channels on it (the application resumes from its

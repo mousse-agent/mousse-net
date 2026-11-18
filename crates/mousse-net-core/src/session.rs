@@ -11,7 +11,8 @@
 //! - **Renewal.** [`RENEW_LEAD_SECS`] before the earlier `not_after`, the
 //!   session asks for a new path (a fresh handshake, with a fresh certificate
 //!   if ours is the one running out). Renewal is just a path switch. If no
-//!   new path is current by the next retry time, it asks again: after
+//!   new path with a later renewal time is current by the next retry time,
+//!   it asks again: after
 //!   [`RENEW_RETRY_FIRST_SECS`], doubling up to [`RENEW_RETRY_MAX_SECS`],
 //!   until the path's deadline.
 //! - **Path switch.** Authenticate the new path (step 1 with the same pin),
@@ -137,7 +138,8 @@ pub enum PathError {
 pub struct PeerSession {
     pin: IdentityPublicKey,
     current: Option<PathInfo>,
-    /// Set once renewal is due; cleared when a new path becomes current.
+    /// Set once renewal is due; cleared when a new path with a later
+    /// renewal time becomes current.
     renewal: Option<Renewal>,
     candidate: Option<Candidate>,
 }
@@ -235,13 +237,20 @@ impl PeerSession {
         };
         self.candidate = None;
         let mut events = Vec::new();
-        if let Some(old) = self.current.replace(info) {
+        let old = self.current.replace(info);
+        if let Some(old) = old {
             events.push(SessionEvent::Close {
                 conn: old.conn,
                 code: ErrorCode::PathReplaced,
             });
         }
-        self.renewal = None;
+        // Renewal ends only when the new path renews later than the old one.
+        // A new path that still carries a certificate as old as before (the
+        // peer has not renewed yet) keeps the pending renewal and its
+        // growing backoff, so it is not replaced again every first retry.
+        if old.is_none_or(|old| info.renew_at > old.renew_at) {
+            self.renewal = None;
+        }
         events.push(SessionEvent::Switched { conn });
         Ok(events)
     }
@@ -437,6 +446,44 @@ mod tests {
         s.on_reopened(ConnectionId(2)).unwrap();
         assert_eq!(s.tick(renew_at.plus(30)), vec![]);
         assert_eq!(s.tick(renew_at.plus(3_600)), vec![]);
+    }
+
+    /// The peer has not renewed yet (for example its clock is behind ours):
+    /// the new path carries the same old certificate. Switching to it must
+    /// not restart renewal at the first retry; the backoff keeps growing.
+    #[test]
+    fn a_new_path_with_the_same_old_certificate_keeps_the_renewal_backoff() {
+        let peer = peer_cert(1, 3_600);
+        let mut s = PeerSession::new(peer.identity);
+        s.begin_path(ConnectionId(1));
+        s.on_authenticated(ConnectionId(1), &peer, local(86_400), T0)
+            .unwrap();
+        s.on_reopened(ConnectionId(1)).unwrap();
+        let renew_at = T0.plus(3_600 - RENEW_LEAD_SECS);
+        let mut t = renew_at;
+        let mut conn = 1;
+        let mut waits = Vec::new();
+        assert_eq!(s.tick(t).len(), 1);
+        for _ in 0..5 {
+            // Each request brings up a new path with the peer's old
+            // certificate, which becomes current right away.
+            conn += 1;
+            s.begin_path(ConnectionId(conn));
+            s.on_authenticated(ConnectionId(conn), &peer, local(86_400), t)
+                .unwrap();
+            s.on_reopened(ConnectionId(conn)).unwrap();
+            assert_eq!(s.tick(t.plus(1)), vec![], "asked again at once");
+            let next = s.next_deadline().unwrap();
+            waits.push(next.secs() - t.secs());
+            t = next;
+            assert_eq!(
+                s.tick(t),
+                vec![SessionEvent::RenewDue {
+                    conn: ConnectionId(conn)
+                }]
+            );
+        }
+        assert_eq!(waits, vec![30, 60, 120, 240, 300]);
     }
 
     #[test]
