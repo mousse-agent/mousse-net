@@ -178,7 +178,15 @@ impl ConnectionGate {
             (_, Keepalive | Hello | GoAway) => Verdict::Allow,
             (_, HostOnly) => Verdict::Close(ErrorCode::ProtocolError),
             (GateState::AwaitingJoinProof { .. }, JoinProof) => Verdict::Allow,
+            #[cfg(not(mousse_control = "break-authz"))]
             (GateState::AwaitingJoinProof { .. }, Pairing | Stream) => {
+                Verdict::Close(ErrorCode::NotAuthorized)
+            }
+            // Must-fail control: a connection with no grant may open streams.
+            #[cfg(mousse_control = "break-authz")]
+            (GateState::AwaitingJoinProof { .. }, Stream) => Verdict::Allow,
+            #[cfg(mousse_control = "break-authz")]
+            (GateState::AwaitingJoinProof { .. }, Pairing) => {
                 Verdict::Close(ErrorCode::NotAuthorized)
             }
             (GateState::JoinOnly { .. }, Pairing) => Verdict::Allow,

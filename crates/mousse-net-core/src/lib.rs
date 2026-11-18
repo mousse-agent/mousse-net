@@ -20,6 +20,20 @@
 //! - [`session`]: certificate-driven session lifetime and path switching.
 #![forbid(unsafe_code)]
 
+// Must-fail controls (spec/vectors/README.md, "Must-fail controls") plant a
+// bug so the vector tests can be shown to fail. They are for debug test runs
+// only and never compile into a release build.
+#[cfg(all(
+    any(
+        mousse_control = "break-session-cert",
+        mousse_control = "break-authz",
+        mousse_control = "break-raw-signature",
+        mousse_control = "break-cpace"
+    ),
+    not(debug_assertions)
+))]
+compile_error!("mousse_control plants a bug for tests; it is not allowed in release builds");
+
 mod asn1;
 mod base64url;
 

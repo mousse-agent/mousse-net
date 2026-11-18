@@ -39,6 +39,26 @@ conforming implementation passes every case, including every rejection.
 Code-exchange (CPace) vectors live in `cpace*.json` files, documented in
 [`../cpace.md`](../cpace.md).
 
+## Must-fail controls
+
+To show that these tests can fail, `mousse-net-core` can be built with one
+planted bug, chosen by a compile-time cfg:
+
+```
+RUSTFLAGS='--cfg mousse_control="break-authz"' cargo test -p mousse-net-core
+```
+
+| Control | Planted bug | Fails |
+|---|---|---|
+| `break-session-cert` | Step 1 skips the identity-signature check. | `session_certificates` (`delegation_over_wrong_tls_key`) |
+| `break-authz` | A connection with no grant may open streams. | `authorization` (`valid_identity_without_grant_attempting_rpc`) |
+| `break-raw-signature` | DER is quietly converted where a raw signature is required. | `der_to_raw`, `session_certificates` (`identity_signature_der`) |
+| `break-cpace` | The CPace confirmation compare always passes. | `pairing_e2e_vectors`, `pairing_attempt_sequences_hold`, the CPace rejection vectors |
+
+Each control runs the same tests as a normal build; at least one must fail.
+The cfg names are declared in the workspace lints. A release build with any
+control set does not compile.
+
 ## Pending
 
 - **Browser Worker certificate:** a session certificate issued in a browser

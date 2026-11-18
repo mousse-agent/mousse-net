@@ -40,6 +40,18 @@ use primitives::{calculate_generator, isk, mac_key, scalar_mult, scalar_mult_vfy
 /// The shortest session id Mousse accepts.
 pub const MIN_SID_LEN: usize = 16;
 
+/// Whether a constant-time tag compare matched.
+#[cfg(not(mousse_control = "break-cpace"))]
+fn tags_match(equal: subtle::Choice) -> bool {
+    bool::from(equal)
+}
+
+/// Must-fail control: the confirmation compare always passes.
+#[cfg(mousse_control = "break-cpace")]
+fn tags_match(_equal: subtle::Choice) -> bool {
+    true
+}
+
 /// Why a CPace step failed. A failed step consumes its state; the attempt is
 /// over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,7 +221,7 @@ impl Initiator {
         let isk = isk(&self.sid, &k, &[&self.msg_a, share.body]);
         let mac_key = mac_key(&self.sid, &isk);
         let expected_tb = tag(&mac_key, share.body);
-        if !bool::from(expected_tb[..].ct_eq(share.rest)) {
+        if !tags_match(expected_tb[..].ct_eq(share.rest)) {
             return Err(CpaceError::ConfirmationFailed);
         }
         let ta = tag(&mac_key, &self.msg_a);
@@ -285,7 +297,7 @@ impl Responder {
             expected_ta,
             peer_ad,
         } = self;
-        if !bool::from(expected_ta[..].ct_eq(msg_c)) {
+        if !tags_match(expected_ta[..].ct_eq(msg_c)) {
             return Err(CpaceError::ConfirmationFailed);
         }
         Ok(Confirmed {

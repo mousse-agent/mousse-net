@@ -448,9 +448,13 @@ pub fn verify(
     let spki = spki_from_point(&parts.session_point);
     let record = session_record(&spki, parts.not_before, parts.not_after, parts.version);
     let identity_signature = identity_signature.ok_or(CertError::IdentitySignatureInvalid)?;
+    // Must-fail control: skip the identity-signature check.
+    #[cfg(not(mousse_control = "break-session-cert"))]
     identity
         .verify(&record, &identity_signature)
         .map_err(|_| CertError::IdentitySignatureInvalid)?;
+    #[cfg(mousse_control = "break-session-cert")]
+    let _ = (&record, &identity_signature);
 
     if !window.accepts(now) {
         return Err(CertError::OutsideWindow);
