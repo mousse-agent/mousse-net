@@ -7,9 +7,13 @@
 //!   streams before the host said `AUTHORIZED {live}` (or `PAIRED`).
 //! - A "send link" ticket pairs with the 6-digit code the host shows, over
 //!   CPace; the owner types it through a [`CodeEntry`].
-//! - A [`PeerSession`] per pinned host tracks the current path. A new live
-//!   connection to the same host replaces the old one, which closes with
-//!   `PATH_REPLACED`.
+//! - A [`PeerSession`] per pinned host tracks the current path. Every
+//!   switch from one live path to another follows one rule: the new path
+//!   stays a candidate until the app reopened its channels on it and called
+//!   [`Caller::reopened`]; then it becomes current and the old one closes
+//!   with `PATH_REPLACED`. Only a host's first path (none current, also
+//!   after the last one closed) is current at once. A dial or join while a
+//!   path is current is such a switch.
 //! - Renewal: [`Caller::start_renewals`] runs each session's timer. When a
 //!   path nears its deadline the caller dials the host again (over the
 //!   routes it last used, with a fresh certificate if ours runs out),
@@ -34,7 +38,7 @@ use mousse_net_core::identity::IdentityPublicKey;
 use mousse_net_core::mux::MuxRole;
 use mousse_net_core::pairing::{
     CodeExchangeFactory, CpaceExchangeFactory, InvitationKind, JoinerAction, JoinerPairing,
-    PairedHost, PairingCode, Ticket,
+    JoinerState, PairedHost, PairingCode, Ticket,
 };
 use mousse_net_core::session::{PeerSession, SessionEvent};
 use mousse_net_core::session_cert::CertError;
@@ -329,9 +333,15 @@ where
         )
     }
 
-    fn promote(&self, conn: &Connection) {
+    /// Make a host's first path current at once. With a path current
+    /// already, `conn` stays the candidate, as a renewed path does: the app
+    /// moves its channels and calls [`Caller::reopened`].
+    fn promote_first(&self, conn: &Connection) {
         let mut paths = lock(&self.paths);
         if let Some(session) = paths.sessions.get_mut(conn.peer()) {
+            if session.current().is_some() {
+                return;
+            }
             if let Ok(events) = session.on_reopened(conn.id()) {
                 paths.run(events);
             }
@@ -352,6 +362,12 @@ where
     /// Connect to a paired host and wait until it authorizes the connection.
     /// A host without a live grant for us closes it (`NOT_AUTHORIZED`,
     /// after its join-proof wait).
+    ///
+    /// The first path to the host is current at once. If one is current
+    /// already, the new connection is live but only a candidate: the old
+    /// path stays current until the app reopened its channels on the new
+    /// one and called [`Caller::reopened`]. A later dial before that
+    /// replaces the candidate.
     pub async fn dial<P: Pipe>(
         &self,
         pipe: P,
@@ -360,7 +376,7 @@ where
         let conn = self.connect(pipe, pin).await?;
         match conn.settled(false).await {
             status if status.is_live() => {
-                self.promote(&conn);
+                self.promote_first(&conn);
                 Ok(conn)
             }
             ConnStatus::Closed(reason) => Err(NetError::Closed(reason)),
@@ -478,7 +494,13 @@ where
         let joiner: SharedJoiner<F> = Arc::new(Mutex::new(joiner));
         let mut result = self.join_once(pipe, ticket, &joiner, codes).await;
         let mut retries = OUTCOME_RETRIES.iter();
+        // Reconnect only while the outcome is unknown. A refusal the host
+        // gave (or the joiner reached) on a reconnect is the answer: the
+        // flow has failed, and that refusal is what the join reports.
         while result.is_err() && lock_joiner(&joiner).outcome_pending() {
+            if matches!(lock_joiner(&joiner).state(), JoinerState::Failed(_)) {
+                break;
+            }
             let Some(wait) = retries.next() else {
                 return Err(NetError::Refused(
                     "the connection dropped while the host was enrolling this device, \
@@ -540,11 +562,11 @@ where
                     }
                 }
                 ConnStatus::Paired(host) => {
-                    self.promote(&connection);
+                    self.promote_first(&connection);
                     return Ok((connection, JoinOutcome::Paired(host)));
                 }
                 ConnStatus::AlreadyPaired | ConnStatus::Live => {
-                    self.promote(&connection);
+                    self.promote_first(&connection);
                     return Ok((connection, JoinOutcome::AlreadyPaired));
                 }
                 ConnStatus::Closed(reason) => return Err(NetError::Closed(reason)),
@@ -609,7 +631,12 @@ where
                     Ok(conn) => PathEvent::Reopen { pin, from, conn },
                     Err(error) => PathEvent::RenewFailed { pin, error },
                 };
-                let _ = tx.send(event);
+                // Nobody takes paths any more: close the new one rather than
+                // leave it a candidate no one will reopen.
+                if let Err(mpsc::error::SendError(PathEvent::Reopen { conn, .. })) = tx.send(event)
+                {
+                    conn.close(ErrorCode::NoError);
+                }
             });
         }
     }

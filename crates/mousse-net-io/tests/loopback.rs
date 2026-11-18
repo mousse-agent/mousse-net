@@ -19,7 +19,7 @@ use mousse_net_core::{
 };
 use mousse_net_io::certs::CertManager;
 use mousse_net_io::keystore::KeyStorage;
-use mousse_net_io::pipe::connect_tcp;
+use mousse_net_io::pipe::{connect_tcp, route_from_addr};
 use mousse_net_io::store::GrantStore;
 use mousse_net_io::{
     tls, Caller, Clock, Endpoint, JoinOutcome, ManualClock, NetError, NoCode, PathEvent,
@@ -320,6 +320,55 @@ async fn a_path_is_renewed_before_its_deadline_and_replaced_only_after_reopening
     caller.reopened(&new).unwrap();
     assert_eq!(close_code(&old).await, Some(ErrorCode::PathReplaced));
     assert_echo(&mut new_stream, b"on the new path").await;
+    host.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_renewed_path_is_closed_when_nobody_takes_paths_any_more() {
+    let mut host = TestHost::start(new_signer()).await;
+    let clock = Arc::new(ManualClock::new());
+    let caller = Arc::new(new_caller_with_clock(new_signer(), clock.clone()));
+    let path_events = caller.start_renewals();
+    let old = pair(&caller, &mut host, "laptop").await;
+    let mut old_stream = open_echo(&old).await;
+    let grant = host.grant_of(&caller.identity()).unwrap();
+
+    // The renewal dials through a relay that holds the connection until
+    // told to go on.
+    let relay = tokio::net::TcpListener::bind((LOOPBACK, 0)).await.unwrap();
+    let relay_route = route_from_addr(relay.local_addr().unwrap());
+    caller.remember_routes(host.identity(), vec![relay_route]);
+    let (dialing_tx, dialing) = tokio::sync::oneshot::channel();
+    let (go_tx, go) = tokio::sync::oneshot::channel::<()>();
+    let target = host.addr;
+    let relayed = tokio::spawn(async move {
+        let (mut inbound, _) = relay.accept().await.unwrap();
+        let _ = dialing_tx.send(());
+        let _ = go.await;
+        let mut outbound = tokio::net::TcpStream::connect(target).await.unwrap();
+        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+    });
+
+    let renew_at = old.deadline().0 - CLOCK_SKEW_SECS - RENEW_LEAD_SECS;
+    let skip = renew_at as i64 - clock.now().0 as i64;
+    clock.advance(skip);
+    host.clock.advance(skip);
+    within("the renewal dial", dialing).await.unwrap();
+    // The app stops taking paths while that dial is under way.
+    drop(path_events);
+    let before = host.accepted.load(Ordering::SeqCst);
+    go_tx.send(()).unwrap();
+
+    // The new path comes up, finds no one to take it, and is closed; the
+    // current path is untouched.
+    wait_until("the new path reached the host", || {
+        host.accepted.load(Ordering::SeqCst) > before
+    })
+    .await;
+    within("the new path to close", relayed).await.unwrap();
+    assert!(old.status().is_live());
+    assert_echo(&mut old_stream, b"still current").await;
+    assert_eq!(host.host.connections_for(grant), 1);
     host.stop().await;
 }
 
@@ -672,5 +721,106 @@ async fn send_link_pairs_with_the_right_code_and_three_wrong_codes_end_it() {
     let (_type_code, _asks, join) = start_link_join(stranger.clone(), &host, ticket);
     let err = within("join", join).await.unwrap().unwrap_err();
     assert!(closed_with(&err, ErrorCode::InvitationInvalid), "{err}");
+    host.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refusal_after_a_lost_paired_is_reported_as_the_answer() {
+    let mut host = TestHost::start(new_signer()).await;
+    let flag = Arc::new(AtomicU8::new(0));
+    let caller = Arc::new(Caller::with_factory(
+        new_signer(),
+        Arc::new(ManualClock::new()),
+        TlsPolicy::default(),
+        FlagConfirm(flag.clone()),
+    ));
+    let ticket = host.invite_kind(InvitationKind::SendLink);
+    let (type_tx, typed) = mpsc::unbounded_channel();
+    let (asks, mut asks_rx) = mpsc::unbounded_channel();
+    let route = host.route();
+    let redials = Arc::new(AtomicUsize::new(0));
+    let join = {
+        let (caller, ticket, route, redials) = (
+            caller.clone(),
+            ticket.clone(),
+            route.clone(),
+            redials.clone(),
+        );
+        let (on_host, me) = (host.host.clone(), caller.identity());
+        tokio::spawn(async move {
+            let first = LosePaired {
+                tcp: connect_tcp(&route).await?,
+                flag: Some(flag),
+            };
+            let mut codes = TypedCodes { asks, typed };
+            let redial = || {
+                // The host enrolled the device, but its owner denies it
+                // before the reconnect: the host refuses it outright.
+                if redials.fetch_add(1, Ordering::SeqCst) == 0 {
+                    on_host.deny(me).unwrap();
+                }
+                let route = route.clone();
+                async move {
+                    Ok(LosePaired {
+                        tcp: connect_tcp(&route).await?,
+                        flag: None,
+                    })
+                }
+            };
+            caller
+                .join_with_redial(first, &ticket, "phone", &mut codes, false, redial)
+                .await
+        })
+    };
+    let code = host.next_code().await;
+    assert_eq!(within("ask", asks_rx.recv()).await, Some(None));
+    type_tx.send(code).unwrap();
+    let err = within("join", join).await.unwrap().unwrap_err();
+    // The refusal is the answer: no more reconnects, and not reported as
+    // "could not tell".
+    assert!(closed_with(&err, ErrorCode::NotAuthorized), "{err}");
+    assert_eq!(redials.load(Ordering::SeqCst), 1);
+    host.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dial_while_a_path_is_current_switches_only_after_reopening() {
+    let mut host = TestHost::start(new_signer()).await;
+    let caller = new_caller(new_signer());
+    let (route, pin) = (host.route(), host.identity());
+    let first = pair(&caller, &mut host, "laptop").await;
+    let mut first_stream = open_echo(&first).await;
+    // The first path is current at once: it is not waiting to be reopened.
+    assert!(caller.reopened(&first).is_err());
+
+    // An ordinary dial while `first` is current: live, but only a candidate.
+    let second = dial(&caller, &route, pin).await.unwrap();
+    open_echo(&second).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(first.status().is_live());
+    assert_echo(&mut first_stream, b"still current").await;
+
+    // Another dial replaces the candidate, not the current path.
+    let third = dial(&caller, &route, pin).await.unwrap();
+    assert_eq!(close_code(&second).await, Some(ErrorCode::PathReplaced));
+    assert!(first.status().is_live());
+    assert_echo(&mut first_stream, b"still current").await;
+
+    // Once the app reopened its channels on it, it becomes current and the
+    // old path closes.
+    let mut third_stream = open_echo(&third).await;
+    caller.reopened(&third).unwrap();
+    assert_eq!(close_code(&first).await, Some(ErrorCode::PathReplaced));
+    assert_echo(&mut third_stream, b"now current").await;
+
+    // With no path current, the next dial is current at once again.
+    third.close(ErrorCode::NoError);
+    within("closed", third.closed()).await;
+    let fourth = dial(&caller, &route, pin).await.unwrap();
+    assert!(caller.reopened(&fourth).is_err());
+    let fifth = dial(&caller, &route, pin).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(fourth.status().is_live());
+    assert!(fifth.status().is_live());
     host.stop().await;
 }
