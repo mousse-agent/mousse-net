@@ -347,19 +347,21 @@ id = "phase0.second-implementation"
 title = "An independent second implementation passes every vector, including the rejection vectors"
 plan = "Phase 0 exit: second implementation"
 targets = ["windows-x64"]
-judge = "cargo-test"
-min_tests = 20
-placeholder = "the second implementation does not exist yet; set its path here when it does"
+judge = "marker"
+pass_marker = "PASS second-impl"
+fail_marker = "FAIL second-impl"
 
+# Needs `npm ci` once in interop/second-impl-ts.
 [[check.local]]
 target = "windows-x64"
 host = "windows-x86_64"
-command = ["cargo", "test", "--manifest-path", "spikes/second-impl/Cargo.toml", "--no-fail-fast"]
+cwd = "interop/second-impl-ts"
+command = ["node", "--disable-warning=ExperimentalWarning", "test.mjs"]
 
 [[check.control]]
 name = "break-verifier"
 breaks = "the second implementation's certificate verifier skips the identity signature check"
-args = ["--features", "control-break-verifier"]
+env = { MOUSSE_SECOND_BREAK = "verifier" }
 
 # ---------------------------------------------------------------------------
 # Spike 2: browser Worker signs a session certificate.
