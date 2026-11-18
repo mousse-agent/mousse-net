@@ -18,6 +18,16 @@ picker, with v1 networking off, on a fresh profile that has no `net.db`.
 
 The review history is in this file's git log.
 
+**Amendment after S0.** The frozen text said the picker's views avoid the
+Hub. That was false.
+
+- The routed thread, terminal, list and Git-progress views all attach
+  through `BridgeHub.attach` (`attachedThreads.ts:300`, `:742`;
+  `attachedTerminals.ts:173`; `mergedLists.ts:450`).
+- The Hub therefore gets its engine branch in S0 and M4, which is Risk 1's
+  remedy moved forward (§4.3).
+- `bridge.hub.*` local methods still answer `not_supported` for engine ids.
+
 ## Decisions
 
 1. **The helper is a child process of the daemon.** There is one per
@@ -502,10 +512,23 @@ Spaces gates stay v1-only.
   `net.assertFeature('netBridge')`.
 - `BridgeProfileService.ts:135` and `:447` read the directory instead of
   `net.request('bridge.nodes')`.
-- **The Hub stays v1-only in 1a.** It follows display streams, which
-  engine sessions do not serve (§4.4). For an engine id, `bridge.hub.*`
-  answers `not_supported`. S0 confirms that the picker's thread and
-  terminal views use only the routed path.
+- **The Hub's engine branch.** The routed views attach through
+  `BridgeHub.attach` (see the amendment). For engine-bound streams the Hub
+  changes in four places:
+  - **Session:** it gets its session from `directory.client(node)`, not
+    `net.session(node)` (`BridgeProfileService.ts:525`).
+  - **Attach:** it checks authority against the stream's
+    `net_engine_streams` binding, not the v1 node (`hub/service.ts:970`).
+    It writes that binding in the same transaction as its own descriptor
+    write.
+  - **Records:** `verifyRecord`, replay and snapshot install
+    (`:1203-1215`, `:1243`, `:1097`) use the engine `verify` callback
+    (§3.4) instead of v1 author checks.
+  - **Session calls:** the Hub's `subscribe`, `onClosed`, `onEphemeral` and
+    `state` (`:1012`, `:1043`, `:1049`) come from `BridgeClient`.
+
+  `bridge.hub.*` local methods still answer `not_supported` for engine
+  ids.
 - In the renderer, `computers.ts:105-112` also lists computers when
   `netEngine.status` is on.
 
@@ -553,7 +576,7 @@ New `src/mms/bridge/peers.ts`:
     interface PeerDirectory {
       nodes(): NodesView                       // bridge.nodes rows: v1 (if on) + engine
       computers(): ComputerRef[]; name(node); has(node)
-      client(node): BridgeClient               // the SyncSession subset RoutedClient uses: rpc, rpcResult, rpcCancel, subscribe, getBlob, append, putBlob
+      client(node): BridgeClient               // the SyncSession subset RoutedClient and the Hub use: rpc, rpcResult, rpcCancel, subscribe, getBlob, append, putBlob, state, onClosed, onEphemeral
       verifyStream(stream): void
       publish / publishDelta / discardDeltas / failStream / isSubscribed
     }
@@ -573,7 +596,7 @@ and `onSessionClosed` (`BridgeProfileService.ts:752-777`).
 - When a client becomes handoff-ready, the engine service calls
   `router.nodeOnline(id)` and `lists.nodeOnline(id)`.
 - When its last client closes, it calls `lists.nodeOffline(id)`.
-- `hub.reconnect` stays v1-only.
+- It calls `hub.reconnect(id)` before those, as v1's `onSessionOpened` does.
 
 ### 4.6 Cases
 
@@ -996,7 +1019,7 @@ M = Mousse.
 
 | # | Repo | What | Proved by |
 |---|---|---|---|
-| S0 | M | **Spike** over in-memory engine streams, on a profile with no `net.db`, through the production caller path (`ThreadRouter` → `RoutedClient` → `directory.client`) and the real `rt.rpc`. Includes `EngineCaller`, `checkNodePolicy`, `renewSelf`, runtime build and activation, the `bridgeOn` gates and `bridge.policy` routing. | `tests/netEngine/spike.test.ts` (see the list below); go/no-go for §3–§4 |
+| S0 | M | **Spike** over in-memory engine streams, on a profile with no `net.db`, through the production caller path (`ThreadRouter` → `RoutedClient` → `directory.client`) and the real `rt.rpc`. Includes `EngineCaller`, `checkNodePolicy`, `renewSelf`, runtime build and activation, the `bridgeOn` gates, `bridge.policy` routing and the Hub's engine branch. | `tests/netEngine/spike.test.ts` (see the list below); go/no-go for §3–§4 |
 | E1 | E | `serve --app` on stdio: framing with stream handles and in-order FIN, hello, the helper's own log, exit on EOF | `tests/app_channel.rs`: equal wire ids on two connections; a stalled final write |
 | E2 | E | pumps, app credit, engine receive admission (stream caps), read-ahead, priority | `phase1a.app-channel` |
 | E3 | E | invite, approval, `join {pinned}`, idempotent `grant.add`, the revoke journal with pause and replay, peers | `phase1a.helper-removal`; Phase 0 `loopback.rs` |
@@ -1006,7 +1029,7 @@ M = Mousse.
 | M1 | M | build and package the helper; macOS local-network and keychain spike | the packaged app runs the helper on Windows and macOS |
 | M2 | M | spawn, restart, shutdown, pumps; `startNetworkedProfiles` | fake and real helper tests; packaged Windows and macOS parent hard kill |
 | M3 | M | engine session over the helper; `authorizeEngine` and allowlist; engine-only `result.get` waiting; §4.4 delivery checks; staging branch | `phase1a.once-or-unknown`, `phase1a.private-streams` |
-| M4 | M | peer directory, the §4.3 and §4.5 call sites, session hooks, stream binding, roster-release fix | v1 Bridge tests unchanged; `phase1a.picker-v1-off` |
+| M4 | M | peer directory, the §4.3 and §4.5 call sites, the Hub's engine branch, session hooks, stream binding, roster-release fix | v1 Bridge tests unchanged; `phase1a.picker-v1-off` |
 | M5a | M | peer table, selection, `teardown(localId)`, pairing journals and recovery, removal with tombstones, Start over hook | `phase1a.pair-both-ways`, `phase1a.removal`, `phase1a.reconnect` |
 | M5b | M | path switch | `phase1a.path-switch` |
 | M6 | M | local methods, push, picker source | allow-list test |
@@ -1022,7 +1045,9 @@ M = Mousse.
 - live records and a snapshot;
 - +8 and +40 days, and a terminal held open through a renewal;
 - a v1 non-keeper profile: refused with v1 off, working with v1 on;
-- that the picker views need no Hub;
+- the Hub's engine branch: a thread, a terminal, lists and Git progress,
+  each attached through `BridgeHub.attach` with replay and snapshot
+  install;
 - a list of every node-id, reader and stream field in routed params and
   results, including `artifact.caller`.
 
@@ -1044,7 +1069,10 @@ M = Mousse.
   - `routed/ThreadRouter.ts` (client from the directory),
     `routed/RoutedClient.ts` (remaining budget), `remote/botReach.ts`,
     `routed/deviceName.ts` and `routed/stager.ts`.
-  - `hub/service.ts`: `not_supported` for engine ids.
+  - `hub/service.ts`: the engine branch (session from the directory,
+    binding-based authority and descriptor write, engine `verify` for
+    records, replay and snapshots); local `bridge.hub.*` methods answer
+    `not_supported` for engine ids.
   - `artifacts.ts`: the staging branch.
   - `remote/ThreadStreamAdapter.ts`: per-delivery checks.
 - **Handlers:** those that read `caller.delegation`, as the compiler lists
@@ -1061,8 +1089,8 @@ Not touched: `sync/session.ts`, `sync/supervisor.ts`, `transports/*`,
 
 **Risks**
 
-1. **The Hub is v1-only in 1a** (§4.3). If S0 finds a picker view that
-   needs it, M4 adds the Hub's engine branch before M5.
+1. **The Hub's engine branch touches the Hub's core** (§4.3). S0 proves it
+   for the four routed views. M4 lands it with the v1 Hub tests unchanged.
 2. **The host author is still v1's local key** (§3.5). Phase 2 replaces it
    when v1 identity goes.
 3. **Inbound reachability on both desktops.** The Windows Firewall and
