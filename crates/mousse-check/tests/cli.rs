@@ -279,6 +279,54 @@ fn signed_device_results_complete_the_phase_and_tampering_breaks_it() {
 }
 
 #[test]
+fn hand_made_run_records_and_old_configurations_do_not_count() {
+    let r = repo("records", false);
+    let d = &r.dir;
+    let o = run(d, &["phase9"]);
+    let out = text(&o);
+    assert!(row(&out, "phase9.ok").contains("PASS"), "{out}");
+
+    // Copy this machine's records into records for the device-only cell.
+    let runs = d.join("checks/runs");
+    for part in ["normal", "break"] {
+        let t =
+            std::fs::read_to_string(runs.join(format!("phase9.ok__here__{part}.json"))).unwrap();
+        let forged = t
+            .replace("\"phase9.ok\"", "\"phase9.device\"")
+            .replace("\"here\"", "\"phone\"");
+        std::fs::write(
+            runs.join(format!("phase9.device__phone__{part}.json")),
+            forged,
+        )
+        .unwrap();
+    }
+    let o = run(d, &["report", "phase9"]);
+    let out = text(&o);
+    assert!(row(&out, "phase9.device").contains("INCOMPLETE"), "{out}");
+
+    // A committed change to the check's configuration: the old runs no
+    // longer count until the check runs again.
+    let path = d.join("checks/phase9.toml");
+    let m = std::fs::read_to_string(&path).unwrap().replacen(
+        "judge = \"marker\"\n",
+        "judge = \"marker\"\ntimeout_secs = 600\nmin_tests = 2\n",
+        1,
+    );
+    std::fs::write(&path, m).unwrap();
+    git(d, &["commit", "-q", "-am", "change the check"]);
+    let o = run(d, &["report", "phase9", "--full"]);
+    let out = text(&o);
+    let ok = row(&out, "phase9.ok");
+    assert!(
+        ok.contains("INCOMPLETE") && ok.contains("configuration"),
+        "{out}"
+    );
+    let o = run(d, &["phase9", "--only", "phase9.ok"]);
+    let out = text(&o);
+    assert!(row(&out, "phase9.ok").contains("PASS"), "{out}");
+}
+
+#[test]
 fn attestations_on_automated_checks_do_not_pass() {
     let r = repo("attest", false);
     let o = run(

@@ -419,7 +419,8 @@ impl Mux {
                 class,
                 label,
             } => {
-                if !self.is_peer_id(stream.0) || stream.0 <= self.highest_peer_id {
+                // Peer ids are opened in order with no gaps.
+                if Some(stream.0) != self.next_peer_id() {
                     return Err(self.fail(ErrorCode::ProtocolError));
                 }
                 self.highest_peer_id = stream.0;
@@ -478,6 +479,9 @@ impl Mux {
                     if done {
                         self.streams.remove(&stream.0);
                     }
+                    // No credit goes out after the peer's FIN, even if it
+                    // was queued before the FIN arrived.
+                    self.drop_queued_credit(stream);
                 }
             }
             Frame::Reset { stream, code } => {
@@ -509,8 +513,25 @@ impl Mux {
         Ok(())
     }
 
+    fn drop_queued_credit(&mut self, stream: StreamId) {
+        self.control
+            .retain(|f| !matches!(f, Frame::Credit { stream: s, .. } if *s == stream));
+    }
+
+    /// The only id the peer's next `OPEN` may carry (`None` once its ids
+    /// are used up).
+    fn next_peer_id(&self) -> Option<u32> {
+        match (self.highest_peer_id, self.role) {
+            (0, MuxRole::Caller) => Some(2),
+            (0, MuxRole::Host) => Some(1),
+            (highest, _) => highest.checked_add(2),
+        }
+    }
+
     /// A frame for a stream that was never opened is a protocol error. A
     /// frame for a stream that existed and is gone is a harmless race.
+    /// Both sides open ids in order, so every id up to the highest one
+    /// opened was opened.
     fn check_known(&mut self, stream: StreamId) -> Result<(), MuxError> {
         let id = stream.0;
         let ever_opened = if self.is_peer_id(id) {
@@ -733,41 +754,41 @@ mod tests {
         assert_eq!(h.queued(s), None);
     }
 
+    fn open(id: u32) -> Vec<u8> {
+        Frame::Open {
+            stream: StreamId(id),
+            class: PriorityClass::Bulk,
+            label: "x".into(),
+        }
+        .encode()
+    }
+
+    const PROTOCOL: Result<Vec<MuxEvent>, MuxError> = Err(MuxError {
+        code: ErrorCode::ProtocolError,
+    });
+
     #[test]
     fn opening_with_the_wrong_parity_or_reusing_an_id_is_rejected() {
         let (_, mut h) = pair();
-        let even = Frame::Open {
-            stream: StreamId(2),
-            class: PriorityClass::Bulk,
-            label: "x".into(),
-        }
-        .encode();
-        assert_eq!(
-            h.receive(&even, Millis(0)),
-            Err(MuxError {
-                code: ErrorCode::ProtocolError
-            })
-        );
+        assert_eq!(h.receive(&open(2), Millis(0)), PROTOCOL);
         let (_, mut h) = pair();
-        let five = Frame::Open {
-            stream: StreamId(5),
-            class: PriorityClass::Bulk,
-            label: "x".into(),
-        }
-        .encode();
-        let three = Frame::Open {
-            stream: StreamId(3),
-            class: PriorityClass::Bulk,
-            label: "x".into(),
-        }
-        .encode();
-        h.receive(&five, Millis(0)).unwrap();
-        assert_eq!(
-            h.receive(&three, Millis(0)),
-            Err(MuxError {
-                code: ErrorCode::ProtocolError
-            })
-        );
+        assert_eq!(h.receive(&open(1), Millis(0)).unwrap().len(), 1);
+        assert_eq!(h.receive(&open(1), Millis(0)), PROTOCOL);
+    }
+
+    /// Ids are opened in order, so a skipped id can never be mistaken for
+    /// one that was opened and is gone.
+    #[test]
+    fn opening_ids_out_of_order_is_rejected() {
+        let (_, mut h) = pair();
+        assert_eq!(h.receive(&open(3), Millis(0)), PROTOCOL);
+        let (_, mut h) = pair();
+        h.receive(&open(1), Millis(0)).unwrap();
+        assert_eq!(h.receive(&open(5), Millis(0)), PROTOCOL);
+        let (mut c, _) = pair();
+        c.receive(&open(2), Millis(0)).unwrap();
+        c.receive(&open(4), Millis(0)).unwrap();
+        assert_eq!(c.receive(&open(8), Millis(0)), PROTOCOL);
     }
 
     #[test]
@@ -784,6 +805,24 @@ mod tests {
                 code: ErrorCode::ProtocolError
             })
         );
+    }
+
+    /// Credit released before the peer's FIN arrives but not yet sent is
+    /// dropped: no credit goes out after the peer's FIN.
+    #[test]
+    fn queued_credit_is_dropped_when_the_peer_finishes() {
+        let (mut c, mut h) = pair();
+        let s = c.open_stream(PriorityClass::Bulk, "file").unwrap();
+        c.send(s, &[7; 70_000]).unwrap();
+        pump(&mut c, &mut h, Millis(0));
+        h.release(s, 70_000);
+        c.finish(s).unwrap();
+        let events = pump(&mut c, &mut h, Millis(0));
+        assert_eq!(events, vec![MuxEvent::Finished { stream: s }]);
+        while let Some(bytes) = h.poll_transmit(Millis(0)) {
+            let (frame, _) = decode_frame(&bytes).unwrap().unwrap();
+            assert!(!matches!(frame, Frame::Credit { .. }), "{frame:?}");
+        }
     }
 
     #[test]

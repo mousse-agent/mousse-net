@@ -93,9 +93,14 @@ command = ["cargo", "test", "-p", "mousse-net-core", "--no-fail-fast", "--lib", 
 placeholder = "core tests need a wasm32 test runner before they can run on wasm32"
 
 [[check.control]]
-name = "break-cpace"
-breaks = "CPace leaves the session id out of the generator, so the draft vectors no longer match"
-env = { RUSTFLAGS = '--cfg mousse_control="break-cpace"' }
+name = "break-cpace-confirm"
+breaks = "the CPace confirmation compare always passes, so a wrong code, channel identifier, session id or tampered message is accepted"
+env = { RUSTFLAGS = '--cfg mousse_control="break-cpace-confirm"' }
+
+[[check.control]]
+name = "break-cpace-sid"
+breaks = "CPace leaves the session id out of the generator, so the draft vectors no longer match and two sessions with the same code share a generator"
+env = { RUSTFLAGS = '--cfg mousse_control="break-cpace-sid"' }
 
 [[check]]
 id = "phase0.cpace-review"
@@ -335,12 +340,14 @@ id = "phase0.thin-slice-cross-machine"
 title = "Thin slice across machines: the PC dials the Mac over the LAN"
 plan = "Phase 0 \"Slice\" (two desktops)"
 targets = ["pc-to-mac-lan"]
+cross_machine = true
 device_steps = "the Mac runs `mousse-helper serve --listen-ip 0.0.0.0` and `invite`; the PC runs `mousse-helper slice-check --ticket <ticket> --route tcp://<mac>:<port> --out <file> -- uname -a` (pair, terminal, removal closes it, reconnect refused) and the result file is signed. Control: the Mac serves a build with --cfg mousse_control=\"allow-break-env\" and MOUSSE_HELPER_BREAK=wrong-identity; the PC runs slice-check with --control wrong-identity and must print RESULT FAIL"
 
 [[check.control]]
 name = "wrong-identity"
 breaks = "the Mac listener presents a different identity than the pinned one; the PC must refuse, so the run prints FAIL"
 env = { MOUSSE_HELPER_BREAK = "wrong-identity" }
+expect_reason = "pin_mismatch"
 
 # ---------------------------------------------------------------------------
 # Second implementation of the handshake (plus CPace confirmation unless

@@ -4,6 +4,12 @@
 use super::*;
 use crate::evidence::ATTEST_FORMAT;
 
+/// This machine in the tests.
+const HOST: &str = "windows-x86_64";
+/// Stands for "the right value" in records and results; `Case::report`
+/// fills it in from the manifest.
+const AUTO: &str = "auto";
+
 const HEAD: &str = "1111111111111111111111111111111111111111";
 const OLD: &str = "2222222222222222222222222222222222222222";
 /// A commit on top of HEAD that only adds evidence: same source commit.
@@ -105,6 +111,10 @@ fn rec(part: &str, verdict: RunVerdict, total: Option<u64>) -> RunRecord {
         summary: format!("{verdict:?}"),
         tests_total: total,
         log: String::new(),
+        host: AUTO.into(),
+        runner: AUTO.into(),
+        config: AUTO.into(),
+        reason: None,
     }
 }
 
@@ -127,6 +137,7 @@ fn result(
         details: String::new(),
         time: "2026-11-18T00:00:00Z".into(),
         device: "dev".into(),
+        config: Some(AUTO.into()),
         extra: serde_json::Value::Null,
     }
 }
@@ -169,15 +180,60 @@ impl Case {
         }
     }
 
+    /// Records and results with `AUTO` fields filled in: what the kit would
+    /// write for the current manifest on `HOST`.
+    fn filled(&self) -> (Vec<RunRecord>, Evidence) {
+        let m = &self.manifest;
+        let digest = |check: &str, target: &str, control: Option<&str>| {
+            let c = m.check(check).expect("check in manifest");
+            m.config_digest(c, target, control.and_then(|n| c.control_named(n)))
+        };
+        let records = self
+            .records
+            .iter()
+            .cloned()
+            .map(|mut r| {
+                if r.host == AUTO {
+                    r.host = HOST.into();
+                }
+                if r.runner == AUTO {
+                    let c = m.check(&r.check).expect("check in manifest");
+                    r.runner = c
+                        .local_on(&r.target, &r.host)
+                        .map(runner_id)
+                        .unwrap_or_else(|| "local:forged".into());
+                }
+                if r.config == AUTO {
+                    let control = (r.part != "normal").then_some(r.part.as_str());
+                    r.config = digest(&r.check, &r.target, control);
+                }
+                r
+            })
+            .collect();
+        let mut evidence = Evidence {
+            results: self.evidence.results.clone(),
+            attestations: self.evidence.attestations.clone(),
+            rejected: self.evidence.rejected.clone(),
+        };
+        for r in &mut evidence.results {
+            if r.config.as_deref() == Some(AUTO) {
+                r.config = Some(digest(&r.check, &r.target, r.control.as_deref()));
+            }
+        }
+        (records, evidence)
+    }
+
     fn report(&self) -> Report {
         let legacy = BTreeMap::new();
+        let (records, evidence) = self.filled();
         evaluate(&Inputs {
             manifest: &self.manifest,
+            host: HOST,
             build: &self.build,
             commits: &FakeGit,
             allow_dirty: self.allow_dirty,
-            records: &self.records,
-            evidence: &self.evidence,
+            records: &records,
+            evidence: &evidence,
             rejected_paths: &self.rejected,
             legacy: &legacy,
         })
@@ -513,4 +569,241 @@ fn placeholders_are_incomplete() {
     let c = case.cell("phase9.local");
     assert_eq!(c.status, Status::Incomplete);
     assert!(c.details.contains("not wired yet"));
+}
+
+// --- Which evidence counts: runner, configuration, reason, host build ---
+
+/// A record that claims a cell from this machine.
+fn rec_for(check: &str, target: &str, part: &str, verdict: RunVerdict) -> RunRecord {
+    RunRecord {
+        check: check.into(),
+        target: target.into(),
+        ..rec(part, verdict, None)
+    }
+}
+
+#[test]
+fn local_records_never_fill_a_device_only_cell() {
+    let mut case = Case::new(DEVICE_CHECK);
+    // Hand-written records in checks/runs/ for a cell no local entry runs.
+    case.records
+        .push(rec_for("phase9.phone", "ios", "normal", RunVerdict::Pass));
+    case.records.push(rec_for(
+        "phase9.phone",
+        "ios",
+        "break-path",
+        RunVerdict::FailedAsRequired,
+    ));
+    let c = case.cell("phase9.phone");
+    assert_eq!(c.status, Status::Incomplete, "{}", c.details);
+    assert!(c.details.contains("no signed result"), "{}", c.details);
+    assert!(!case.report().verdict.passed);
+}
+
+#[test]
+fn local_records_count_only_from_the_configured_runner_on_its_host() {
+    // Recorded on another kind of machine.
+    let mut case = Case::new("");
+    for r in &mut case.records {
+        r.host = "macos-aarch64".into();
+    }
+    assert_eq!(case.cell("phase9.local").status, Status::Incomplete);
+    // Recorded by a runner that is not the [[check.local]] entry.
+    let mut case = Case::new("");
+    for r in &mut case.records {
+        r.runner = "local:pc@windows-x86_64:0000000000000000".into();
+    }
+    assert_eq!(case.cell("phase9.local").status, Status::Incomplete);
+    // This machine is not the cell's runner: its records do not count even
+    // if they name the right runner.
+    let mut case = Case::new("");
+    case.manifest.checks[0].local[0].host = "linux-x86_64".into();
+    for r in &mut case.records {
+        r.host = "linux-x86_64".into();
+    }
+    let c = case.cell("phase9.local");
+    assert_eq!(c.status, Status::Incomplete, "{}", c.details);
+    assert!(c.details.contains("on linux-x86_64"), "{}", c.details);
+}
+
+#[test]
+fn a_local_run_with_another_profile_does_not_count() {
+    let mut case = Case::new("");
+    for r in &mut case.records {
+        r.build = format!("{HEAD}+debug");
+    }
+    let c = case.cell("phase9.local");
+    assert_eq!(c.status, Status::Incomplete);
+    assert!(c.details.contains("profile"), "{}", c.details);
+}
+
+#[test]
+fn a_changed_check_configuration_makes_local_runs_incomplete() {
+    let changes: [fn(&mut Check); 5] = [
+        |c| c.local[0].command.push("--release".into()),
+        |c| {
+            c.local[0].env.insert("X".into(), "1".into());
+        },
+        |c| c.min_tests = 50,
+        |c| c.control[0].args = vec!["--features".into(), "control-other".into()],
+        |c| c.pass_marker = Some("OK".into()),
+    ];
+    for (i, change) in changes.into_iter().enumerate() {
+        let mut case = Case::new("");
+        // Records written under the old configuration...
+        let (records, _) = case.filled();
+        case.records = records;
+        // ...then a committed manifest change.
+        change(&mut case.manifest.checks[0]);
+        let c = case.cell("phase9.local");
+        assert_eq!(c.status, Status::Incomplete, "change {i}: {}", c.details);
+        assert!(c.details.contains("configuration"), "{}", c.details);
+    }
+}
+
+#[test]
+fn a_changed_check_configuration_makes_device_results_incomplete() {
+    let mut case = Case::new(DEVICE_CHECK);
+    case.evidence.results = vec![
+        result("phase9.phone", "ios", None, None, "PASS", &release(HEAD)),
+        result(
+            "phase9.phone",
+            "ios",
+            None,
+            Some("break-path"),
+            "FAIL",
+            &release(HEAD),
+        ),
+    ];
+    assert_eq!(case.cell("phase9.phone").status, Status::Pass);
+    let (_, evidence) = case.filled();
+    case.evidence = evidence;
+    case.manifest.checks[1].control[0]
+        .env
+        .insert("MOUSSE_BREAK".into(), "2".into());
+    let c = case.cell("phase9.phone");
+    assert_eq!(c.status, Status::Incomplete, "{}", c.details);
+    assert!(c.details.contains("configuration"), "{}", c.details);
+    // A result with no digest at all does not count either.
+    let mut case = Case::new(DEVICE_CHECK);
+    case.evidence.results = vec![
+        ResultPayload {
+            config: None,
+            ..result("phase9.phone", "ios", None, None, "PASS", &release(HEAD))
+        },
+        result(
+            "phase9.phone",
+            "ios",
+            None,
+            Some("break-path"),
+            "FAIL",
+            &release(HEAD),
+        ),
+    ];
+    assert_eq!(case.cell("phase9.phone").status, Status::Incomplete);
+}
+
+const PIN_CHECK: &str = r#"
+[[check]]
+id = "phase9.slice"
+title = "cross machine"
+plan = "item 5"
+targets = ["pc-to-mac"]
+cross_machine = true
+[[check.control]]
+name = "wrong-identity"
+breaks = "the host presents another identity"
+env = { MOUSSE_HELPER_BREAK = "wrong-identity" }
+expect_reason = "pin_mismatch"
+"#;
+
+fn slice(control: Option<&str>, outcome: &str, extra: serde_json::Value) -> ResultPayload {
+    ResultPayload {
+        extra,
+        ..result(
+            "phase9.slice",
+            "pc-to-mac",
+            None,
+            control,
+            outcome,
+            &release(HEAD),
+        )
+    }
+}
+
+#[test]
+fn a_control_must_fail_for_the_reason_it_names() {
+    let host = release(HEAD);
+    let ok_normal = slice(None, "PASS", serde_json::json!({ "host_build": host }));
+    let control = |extra: serde_json::Value| {
+        let mut r = slice(Some("wrong-identity"), "FAIL", extra);
+        r.details = "FAIL pair in person: connection closed".into();
+        r
+    };
+    let mut case = Case::new(PIN_CHECK);
+    case.evidence.results = vec![
+        ok_normal.clone(),
+        control(serde_json::json!({ "host_build": host, "reason": "pin_mismatch" })),
+    ];
+    let c = case.cell("phase9.slice");
+    assert_eq!(c.status, Status::Pass, "{}", c.details);
+
+    for extra in [
+        serde_json::json!({ "host_build": host, "reason": "timeout" }),
+        serde_json::json!({ "host_build": host }),
+    ] {
+        case.evidence.results = vec![ok_normal.clone(), control(extra)];
+        let c = case.cell("phase9.slice");
+        assert_eq!(c.status, Status::Fail, "{}", c.details);
+        assert!(c.details.contains("reason=pin_mismatch"), "{}", c.details);
+    }
+
+    // The reason may also be on the FAIL line in the details.
+    let mut r = control(serde_json::json!({ "host_build": host }));
+    r.details = "FAIL phase0.thin-slice-cross-machine reason=pin_mismatch".into();
+    case.evidence.results = vec![ok_normal, r];
+    assert_eq!(case.cell("phase9.slice").status, Status::Pass);
+}
+
+#[test]
+fn a_local_control_with_the_wrong_reason_fails_the_check() {
+    let with_reason = MANIFEST.replace(
+        "args = [\"--features\", \"control-break\"]",
+        "args = [\"--features\", \"control-break\"]\nexpect_reason = \"pin_mismatch\"",
+    );
+    let mut case = Case::new("");
+    case.manifest = Manifest::parse(&with_reason).unwrap();
+    case.records[1].reason = Some("pin_mismatch".into());
+    assert_eq!(case.cell("phase9.local").status, Status::Pass);
+    case.records[1].reason = Some("timeout".into());
+    assert_eq!(case.cell("phase9.local").status, Status::Fail);
+    case.records[1].reason = None;
+    case.records[1].verdict = RunVerdict::WrongReason;
+    let c = case.cell("phase9.local");
+    assert_eq!(c.status, Status::Fail);
+    assert!(c.details.contains("wrong reason"), "{}", c.details);
+}
+
+#[test]
+fn a_cross_machine_cell_needs_the_host_build_under_test_too() {
+    let reason = serde_json::json!({ "host_build": release(HEAD), "reason": "pin_mismatch" });
+    let control = slice(Some("wrong-identity"), "FAIL", reason);
+    let normal = |extra: serde_json::Value| slice(None, "PASS", extra);
+    let mut case = Case::new(PIN_CHECK);
+    for extra in [
+        serde_json::json!({ "host_build": release(OLD) }),
+        serde_json::json!({ "host_build": format!("{HEAD}-dirty+release") }),
+        serde_json::json!({}),
+        serde_json::json!({ "host_build": release(HEAD), "caller_build": release(OLD) }),
+    ] {
+        case.evidence.results = vec![normal(extra.clone()), control.clone()];
+        let c = case.cell("phase9.slice");
+        assert_eq!(c.status, Status::Incomplete, "{extra}: {}", c.details);
+    }
+    case.evidence.results = vec![
+        normal(serde_json::json!({ "host_build": "333333333+release" })),
+        control,
+    ];
+    let c = case.cell("phase9.slice");
+    assert_eq!(c.status, Status::Pass, "{}", c.details);
 }

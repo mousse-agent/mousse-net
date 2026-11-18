@@ -12,7 +12,7 @@ use mousse_net_core::control::{
 };
 use mousse_net_core::grants::{GrantTable, NewGrant, OwnerRef, Role};
 use mousse_net_core::identity::{IdentityPublicKey, RawSignature, SoftwareKey};
-use mousse_net_core::mux::{decode_frame, Frame, PriorityClass, StreamId};
+use mousse_net_core::mux::{decode_frame, Frame, Mux, MuxEvent, MuxRole, PriorityClass, StreamId};
 use mousse_net_core::pairing::{
     attempt_sid, binding_transcript, join_proof_input, join_proof_mac, verify_join_proof,
     AttemptId, InvitationId, InvitationKind, Route, RouteHost, Ticket, TicketSecret,
@@ -179,6 +179,25 @@ fn live_path_closes_at_certificate_expiry() {
         .expect("authenticated");
     session.on_reopened(second).expect("reopened");
     check_ticks(&mut session, &switch["ticks"]);
+
+    // A retry skipped while a candidate comes up still counts.
+    let skipped = &doc["retry_while_candidate"];
+    let mut session = PeerSession::new(pin);
+    session.begin_path(conn);
+    session
+        .on_authenticated(conn, &peer, local, at)
+        .expect("authenticated");
+    session.on_reopened(conn).expect("reopened");
+    assert_eq!(session.tick(path.renew_at).len(), 1);
+    for step in list(&skipped["steps"]) {
+        let id = || ConnectionId(u(&step["conn"]));
+        match s(&step["op"]) {
+            "tick" => check_ticks(&mut session, &J::Array(vec![step.clone()])),
+            "begin_path" => assert!(session.begin_path(id()).is_empty()),
+            "path_closed" => session.on_path_closed(id()),
+            other => panic!("op {other}"),
+        }
+    }
 
     let late = &doc["new_connection_after_deadline"];
     let err = session_cert::verify(
@@ -545,6 +564,60 @@ fn der_to_raw() {
             Err(e) => e.code(),
         };
         assert_eq!(got, s(&case["result"]), "{}", s(&case["name"]));
+    }
+}
+
+#[test]
+fn mux_stream_rules() {
+    let doc = load("mux.json");
+    for case in list(&doc["streams"]["cases"]) {
+        let name = s(&case["name"]);
+        let role = match s(&case["role"]) {
+            "host" => MuxRole::Host,
+            "caller" => MuxRole::Caller,
+            other => panic!("role {other}"),
+        };
+        let mut mux = Mux::new(role, Millis(0));
+        for step in list(&case["steps"]) {
+            let bytes = unhex(&step["hex"]);
+            assert_eq!(
+                frame_from_json(&step["frame"]).encode(),
+                bytes,
+                "{name}: frame"
+            );
+            let got = match mux.receive(&bytes, Millis(0)) {
+                Ok(events) => J::Array(
+                    events
+                        .into_iter()
+                        .map(|e| {
+                            J::String(match e {
+                                MuxEvent::StreamOpened { stream, .. } => {
+                                    format!("opened:{}", stream.0)
+                                }
+                                MuxEvent::Data { stream, bytes } => {
+                                    format!("data:{}:{}", stream.0, bytes.len())
+                                }
+                                MuxEvent::Finished { stream } => format!("finished:{}", stream.0),
+                                MuxEvent::Reset { stream, code } => {
+                                    format!("reset:{}:{}", stream.0, code.name())
+                                }
+                                other => panic!("{name}: {other:?}"),
+                            })
+                        })
+                        .collect(),
+                ),
+                Err(e) => {
+                    let goaway = mux.poll_transmit(Millis(0)).expect("goaway");
+                    assert_eq!(
+                        decode_frame(&goaway),
+                        Ok(Some((Frame::GoAway { code: e.code }, goaway.len()))),
+                        "{name}: goaway"
+                    );
+                    J::String(format!("close:{}", e.code.name()))
+                }
+            };
+            assert_eq!(got, step["result"], "{name}");
+        }
     }
 }
 

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { bytes, hex, utf8 } from './cbor.ts';
+import { bytes, hex } from './cbor.ts';
 import { publicKey, sha256 } from './certificate.ts';
 import { PairingHost, PairingJoiner } from './pairing.ts';
 import { decodeControl, decodeFrame, encodeControl, encodeFragment, encodeFrame, errorNumber,
@@ -10,7 +10,8 @@ class ScriptedDraws {
   constructor(draws) { this.draws = draws; }
   take(purpose) {
     const draw = this.draws[this.#offset++];
-    assert.equal(draw?.use, purpose, 'random draw order');
+    assert.ok(draw, `unexpected random draw for ${purpose}`);
+    if (draw.use !== undefined) assert.equal(draw.use, purpose, 'random draw order');
     return draw;
   }
   bytes(length, purpose) {
@@ -26,15 +27,6 @@ class ScriptedDraws {
     return draw.u32;
   }
   done() { assert.equal(this.#offset, this.draws.length, 'unused random draws'); }
-}
-
-function deterministicDraws(seed) {
-  let counter = 0;
-  let code = 111111;
-  return {
-    bytes: (length, use) => sha256(utf8(`${seed}/${++counter}/${use}`)).subarray(0, length),
-    u32: () => code++,
-  };
 }
 
 const parseExporters = ({ join, pair }) => ({ join: bytes(join), pair: bytes(pair) });
@@ -64,7 +56,6 @@ export function replayEndToEnd(flow, input) {
   const routes = new Map();
   const parties = new Map();
   const frames = new Map();
-  const connectOutputs = new Map();
   let host;
 
   function queue(from, conn, frame) {
@@ -125,25 +116,21 @@ export function replayEndToEnd(flow, input) {
         routes.set(conn, { party, real });
         parties.set(party, conn);
         const exporters = parseExporters(step.exporters);
-        const start = project(joiner.connect(conn, exporters, now), party);
+        const [hello, proof] = project(joiner.connect(conn, exporters, now), party);
         const peer = real ? project(
-          host.connect(conn, joinerEndpoint.identity, parseExporters(step.host_exporters ?? step.exporters)), 'host') : [];
-        const outgoing = [...start, ...peer];
-        connectOutputs.set(conn, outgoing);
-        return outgoing;
+          host.connect(conn, joinerEndpoint.identity, parseExporters(step.host_exporters ?? step.exporters), now), 'host') : [];
+        return [hello, ...peer, proof];
       }
       case 'receive': {
         const control = receive(party, conn, step.control);
         if (party === 'host') return project(host.receive(conn, control, now), party);
-        const effects = joiner.receive(control);
-        const immediate = [];
-        for (const effect of effects) {
-          // The fixture groups the proof with connect, before its HELLO delivery rows.
-          if (effect.send?.type === 'JOIN_PROOF') connectOutputs.get(conn).push(...project([effect], party));
-          else immediate.push(effect);
-        }
-        return project(immediate, party);
+        return project(joiner.receive(control), party);
       }
+      case 'drop':
+        joiner.drop();
+        frames.delete(`${conn}/${party}`);
+        frames.delete(`${conn}/host`);
+        return routes.get(conn).real ? project(host.drop(conn), 'host') : [];
       case 'submit_code':
         return project(joiner.submit(step.code), party);
       case 'approve':
@@ -161,14 +148,9 @@ export function replayEndToEnd(flow, input) {
     }
   }
 
-  const deferred = [];
   for (const [index, step] of flow.steps.entries()) {
-    const actual = run(step);
-    const label = `step ${index + 1} ${step.party}/${step.event}`;
-    if (step.event === 'connect') deferred.push(() => assert.deepEqual(actual, step.out, label));
-    else assert.deepEqual(actual, step.out, label);
+    assert.deepEqual(run(step), step.out, `step ${index + 1} ${step.party}/${step.event}`);
   }
-  for (const check of deferred) check();
   for (const pending of frames.values()) assert.equal(pending.length, 0, 'undelivered frame');
   hostDraws.done();
   for (const draws of joinerDraws.values()) draws.done();
@@ -179,12 +161,14 @@ export function replayEndToEnd(flow, input) {
   }, flow.end);
 }
 
-export function replayAttemptSequence(sequence) {
-  const now = 1790000000;
-  const hostEndpoint = { name: 'Desk', identity: publicKey(Buffer.alloc(32, 0x11)) };
-  const host = new PairingHost(hostEndpoint, { authorizingOwner: '51'.repeat(16),
-    grantExpiresAt: null, routes: [], role: 'owner' }, sequence.kind === 'in_person' ? 1 : 2,
-  deterministicDraws('host'), now);
+export function replayAttemptSequence(sequence, input) {
+  const { time: now, host: hostInput, invitation } = input;
+  const hostEndpoint = { name: hostInput.name, identity: publicKey(bytes(hostInput.identity_secret)) };
+  const draws = new Map(Object.entries(sequence.draws).map(([name, script]) => [name, new ScriptedDraws(script)]));
+  const host = new PairingHost(hostEndpoint, { authorizingOwner: invitation.authorizing_owner,
+    grantExpiresAt: invitation.grant_expires_at, routes: invitation.routes, role: invitation.role },
+  sequence.kind === 'in_person' ? 1 : 2, draws.get('host'), now);
+  assert.equal(hex(host.binary), sequence.ticket);
   const joiners = new Map();
   const connections = new Map();
   const firstMessages = new Map();
@@ -192,71 +176,121 @@ export function replayAttemptSequence(sequence) {
 
   function apply(step) {
     const { conn, joiner: label, op } = step;
-    let joiner = joiners.get(label);
-    const effects = [];
-    let sameReply;
-    if (op === 'connect') {
-      const endpoint = { name: label, identity: publicKey(Buffer.alloc(32, 0x22 + joiners.size)) };
-      joiner ??= new PairingJoiner(endpoint, host.binary, deterministicDraws(label), now);
-      joiners.set(label, joiner);
-      connections.set(conn, joiner);
-      const exporters = { join: sha256(utf8(`join/${conn}`)), pair: sha256(utf8(`pair/${conn}`)) };
-      const [{ send: callerHello }] = joiner.connect(conn, exporters, now);
-      const [{ send: hostHello }] = host.connect(conn, endpoint.identity, exporters);
-      assert.deepEqual(host.receive(conn, onWire(callerHello), now), [{ version: 0 }]);
-      const [version, { send: proof }] = joiner.receive(onWire(hostHello));
-      assert.deepEqual(version, { version: 0 });
-      effects.push(...host.receive(conn, onWire(proof), now));
-    } else if (op === 'submit' || op === 'submit_first') {
-      const current = host.shownCode;
-      const code = step.code === 'right' ? current ?? '000000' : step.code === 'stale' ? lastCode : '000000';
-      const submitted = joiner.submit(code);
-      const first = submitted.find(effect => effect.send);
-      if (!first) return { result: submitted[0]?.error };
-      lastCode = current;
-      const replies = host.receive(conn, onWire(first.send), now);
-      firstMessages.set(label, { first: first.send, reply: replies.find(effect => effect.send)?.send });
-      if (op === 'submit_first') return { new_code: replies.some(effect => 'show_code' in effect) };
-      effects.push(...replies);
-    } else if (op === 'redeliver') {
-      const { first, reply } = firstMessages.get(label);
-      const outputs = host.receive(conn, onWire(first), now);
-      sameReply = outputs.some(effect => effect.send &&
-        hex(encodeControl(effect.send)) === hex(encodeControl(reply)));
-      return { same_reply: sameReply, new_code: outputs.some(effect => 'show_code' in effect) };
-    } else if (op === 'drop') {
-      connections.get(conn).drop();
-      effects.push(...host.drop(conn));
-    } else if (op === 'approve') {
-      effects.push(...host.approve(conn, now));
-    } else {
-      assert.fail(`unknown operation ${op}`);
+    const out = [];
+    const closed = [];
+    let result;
+    let reply;
+    const recordSend = (from, id, message) => {
+      out.push({ send: { conn: id, from, control: hex(encodeControl(message)) } });
+    };
+
+    function toHost(from, id, message, deliver = true) {
+      recordSend(from, id, message);
+      const effects = host.receive(id, onWire(message), now);
+      fromHost(effects, deliver);
+      return effects.flatMap(effect => effect.send ? [hex(encodeControl(effect.send))] : []);
     }
 
-    const closed = [];
-    let newCode = false;
-    let result;
-    for (const effect of effects) {
-      if (effect.send) {
-        const replies = connections.get(effect.conn).receive(onWire(effect.send));
-        for (const reply of replies) {
-          if (reply.send) effects.push(...host.receive(effect.conn, onWire(reply.send), now));
+    function fromHost(effects, deliver = true) {
+      for (const effect of effects) {
+        if (effect.send) {
+          const { conn: id, send } = effect;
+          recordSend('host', id, send);
+          if (deliver) {
+            const { label, joiner } = connections.get(id);
+            for (const response of joiner.receive(onWire(send))) {
+              if (response.send) toHost(label, id, response.send);
+            }
+          }
         }
+        if (effect.close) {
+          closed.push([effect.conn, effect.close]);
+          out.push({ close: { conn: effect.conn, code: effect.close, from: 'host' } });
+          connections.get(effect.conn)?.joiner.goaway(effect.close);
+        }
+        if (effect.show_code) out.push({ show_code: effect.show_code });
+        if (effect.error) result = effect.error;
+        if (effect.enrolled) result = 'ok';
       }
-      if (effect.close) {
-        closed.push([effect.conn, effect.close]);
-        connections.get(effect.conn)?.goaway(effect.close);
-      }
-      if (effect.show_code) newCode = true;
-      if (effect.error) result = effect.error;
-      if (effect.enrolled) result = 'ok';
     }
-    return { closed, result, new_code: newCode };
+
+    switch (op) {
+      case 'connect': {
+        let endpoint = joiners.get(label)?.endpoint;
+        if (!endpoint) {
+          endpoint = { name: label, identity: publicKey(Buffer.alloc(32, 0x50 + joiners.size)) };
+          const joiner = new PairingJoiner(endpoint, host.binary, draws.get(label), now);
+          joiners.set(label, { endpoint, joiner });
+        }
+        const { joiner } = joiners.get(label);
+        connections.set(conn, { label, joiner });
+        const exporters = { join: Buffer.alloc(32, conn), pair: Buffer.alloc(32, conn + 100) };
+        const [{ send: callerHello }, { send: proof }] = joiner.connect(conn, exporters, now);
+        const [{ send: hostHello }, ...hostEffects] = host.connect(conn, endpoint.identity, exporters, now);
+        // The attempt fixture starts its message log at JOIN_PROOF.
+        assert.deepEqual(host.receive(conn, onWire(callerHello), now), [{ version: 0 }]);
+        assert.deepEqual(joiner.receive(onWire(hostHello)), [{ version: 0 }]);
+        fromHost(hostEffects);
+        toHost(label, conn, proof);
+        break;
+      }
+      case 'submit':
+      case 'submit_first': {
+        const current = host.shownCode;
+        const wrong = current === '000000' ? '000001' : '000000';
+        const code = step.code === 'right' ? current ?? '000000' : step.code === 'stale' ? lastCode : wrong;
+        const submitted = joiners.get(label).joiner.submit(code);
+        const first = submitted.find(effect => effect.send)?.send;
+        if (first) {
+          lastCode = current;
+          const response = toHost(label, conn, first, op === 'submit');
+          firstMessages.set(label, { first, response });
+        } else {
+          result = submitted[0]?.error;
+        }
+        break;
+      }
+      case 'redeliver':
+      case 'inject': {
+        const previous = firstMessages.get(label);
+        let message;
+        if (op === 'redeliver') {
+          message = previous.first;
+        } else {
+          const attempt = step.attempt === 'current' ? previous.first.attempt : bytes(step.attempt);
+          if (step.message === 'code_exchange') {
+            message = { type: 'CODE_EXCHANGE', attempt, payload: bytes(step.payload) };
+          } else {
+            assert.equal(step.message, 'code_abort');
+            message = { type: 'CODE_ABORT', attempt, code: errorNumber('pairing_failed') };
+          }
+        }
+        const response = toHost(label, conn, message, false);
+        const abort = encodeControl({ type: 'CODE_ABORT', attempt: message.attempt, code: errorNumber('pairing_failed') });
+        if (!response.length) reply = 'none';
+        else if (op === 'redeliver' && response.length === previous.response.length &&
+          response.every((payload, index) => payload === previous.response[index])) reply = 'first_reply';
+        else if (response.length === 1 && response[0] === hex(abort)) reply = 'code_abort';
+        break;
+      }
+      case 'drop':
+        connections.get(conn).joiner.drop();
+        connections.delete(conn);
+        fromHost(host.drop(conn));
+        break;
+      case 'approve':
+        fromHost(host.approve(conn, now));
+        break;
+      default:
+        assert.fail(`unknown operation ${op}`);
+    }
+
+    return { out, closed, result, reply, new_code: out.some(effect => 'show_code' in effect) };
   }
 
   for (const [index, step] of sequence.steps.entries()) {
     const actual = apply(step);
-    const joiner = joiners.get(step.joiner ?? 'a');
+    const joiner = joiners.get(step.joiner ?? 'a')?.joiner;
     Object.assign(actual, {
       host_attempts_left: host.attemptsLeft,
       host_status: host.status,
@@ -264,8 +298,9 @@ export function replayAttemptSequence(sequence) {
       joiner_state: joiner?.state,
     });
     for (const [key, expected] of Object.entries(step)) {
-      if (['op', 'conn', 'joiner', 'code'].includes(key)) continue;
+      if (['op', 'conn', 'joiner', 'code', 'attempt', 'message', 'payload'].includes(key)) continue;
       assert.deepEqual(actual[key], expected, `step ${index + 1} ${step.op} ${key}`);
     }
   }
+  for (const script of draws.values()) script.done();
 }
