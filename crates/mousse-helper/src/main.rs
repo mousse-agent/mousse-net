@@ -34,6 +34,7 @@ const _: () = {
 };
 
 mod ipc;
+mod limits;
 mod peer;
 
 /// This build: `<commit>[-dirty]+<profile>`, fixed at compile time (see
@@ -180,9 +181,10 @@ enum Command {
         /// Address to use instead of the ticket's.
         #[arg(long = "route")]
         routes: Vec<String>,
-        /// Seconds to wait for the removal.
-        #[arg(long, default_value_t = 300)]
-        removal_timeout: u64,
+        /// Seconds to wait for the removal (default:
+        /// MOUSSE_NET_REMOVAL_WAIT_SECS, 300).
+        #[arg(long)]
+        removal_timeout: Option<u64>,
         /// Where to write the result JSON.
         #[arg(long)]
         out: Option<PathBuf>,
@@ -216,7 +218,8 @@ fn arrival(in_person: bool) -> mousse_net_core::pairing::Arrival {
 fn computer_name() -> String {
     let name = gethostname::gethostname().to_string_lossy().into_owned();
     let mut out: String = name.chars().filter(|c| !c.is_control()).collect();
-    while out.len() > 64 {
+    let max = usize::try_from(limits::helper().computer_name_max_bytes).unwrap_or(usize::MAX);
+    while out.len() > max {
         out.pop();
     }
     if out.is_empty() {
@@ -264,11 +267,12 @@ fn storage(insecure: bool) -> KeyStorage {
 }
 
 /// Open the endpoint in `dir` (`shared` for caller commands). A process
-/// that just exited may hold its
-/// lock for a moment (Windows releases it asynchronously), so a held lock
-/// is retried for up to two seconds before giving up.
+/// that just exited may hold its lock for a moment (Windows releases it
+/// asynchronously), so a held lock is retried for up to
+/// `ENDPOINT_LOCK_WAIT_MS` before giving up.
 pub fn open_endpoint(dir: &Path, shared: bool) -> Result<Endpoint, String> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let limits = limits::helper();
+    let deadline = std::time::Instant::now() + limits::ms(limits.endpoint_lock_wait_ms);
     loop {
         let opened = if shared {
             Endpoint::open_shared(dir)
@@ -278,7 +282,7 @@ pub fn open_endpoint(dir: &Path, shared: bool) -> Result<Endpoint, String> {
         match opened {
             Ok(endpoint) => return Ok(endpoint),
             Err(mousse_net_io::NetError::Refused(_)) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(limits::ms(limits.endpoint_lock_retry_ms));
             }
             Err(e) => return Err(e.to_string()),
         }
@@ -389,7 +393,13 @@ async fn invite(dir: &Path, link: bool, no_qr: bool) -> Result<(), String> {
         })
         .unwrap_or_default();
     println!("routes: {}", routes.join(" "));
-    println!("waiting for the device to join (the ticket is valid for 10 minutes)");
+    let valid = peer::parse_ticket(&ticket)
+        .map(|t| t.expires_at.secs().saturating_sub(peer::now_secs()))
+        .unwrap_or(0);
+    println!(
+        "waiting for the device to join (the ticket is valid for {})",
+        validity(valid)
+    );
     let _ = std::io::stdout().flush();
     // One question on screen at a time, in the order asked. Events keep
     // arriving meanwhile: the invitation may pair or end while one is open.
@@ -466,6 +476,21 @@ async fn invite(dir: &Path, link: bool, no_qr: bool) -> Result<(), String> {
                 }
             }
         }
+    }
+}
+
+/// How long a ticket stays valid, for people: whole minutes from a minute
+/// up, else seconds.
+fn validity(secs: u64) -> String {
+    if secs < 60 {
+        return format!("{secs} s");
+    }
+    let minutes = (secs + 30) / 60;
+    let unit = if minutes == 1 { "minute" } else { "minutes" };
+    if secs.is_multiple_of(60) {
+        format!("{minutes} {unit}")
+    } else {
+        format!("about {minutes} {unit}")
     }
 }
 
@@ -585,7 +610,9 @@ async fn run(cli: Cli) -> Result<i32, String> {
                 name,
                 routes,
                 command,
-                removal_timeout: Duration::from_secs(removal_timeout),
+                removal_timeout: Duration::from_secs(
+                    removal_timeout.unwrap_or(limits::helper().removal_wait_secs),
+                ),
                 out,
                 control,
                 host_build,
@@ -599,6 +626,11 @@ async fn run(cli: Cli) -> Result<i32, String> {
 
 fn main() {
     let cli = Cli::parse();
+    // Limits come from MOUSSE_NET_* once, before anything runs.
+    if let Err(e) = limits::init_from_env() {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -623,7 +655,16 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::printable;
+    use super::{printable, validity};
+
+    #[test]
+    fn the_ticket_validity_reads_in_minutes() {
+        assert_eq!(validity(600), "10 minutes");
+        assert_eq!(validity(599), "about 10 minutes");
+        assert_eq!(validity(60), "1 minute");
+        assert_eq!(validity(100), "about 2 minutes");
+        assert_eq!(validity(20), "20 s");
+    }
 
     #[test]
     fn a_peer_name_prints_on_one_line_without_terminal_controls() {

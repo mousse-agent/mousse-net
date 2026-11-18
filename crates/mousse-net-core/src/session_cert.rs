@@ -24,13 +24,16 @@ use crate::identity::{
     IdentityPublicKey, IdentityRecord, IdentitySigner, KeyError, PublicKey, RawSignature,
     SignatureError, SignerError, SoftwareKey, PUBLIC_KEY_LEN,
 };
-use crate::time::{UnixTime, CLOCK_SKEW_SECS};
+use crate::limits::Limits;
+use crate::time::UnixTime;
 use crate::PROTOCOL_VERSION;
 
 /// Domain string, the first field of the signed record.
 pub const SESSION_DOMAIN: &str = "mousse-session-v1";
 
 /// Longest allowed window, `not_after - not_before`, in seconds (24 h).
+/// Every verifier enforces it, so it is a protocol constant; an issuer may
+/// use a shorter lifetime.
 pub const MAX_LIFETIME_SECS: u64 = 86_400;
 
 /// The Mousse session-binding extension OID, under the UUID arc `2.25`
@@ -161,15 +164,27 @@ impl ValidityWindow {
         self.not_after
     }
 
-    /// Whether `now` is inside `[not_before - 10 min, not_after + 10 min]`.
+    /// Whether `now` is inside `[not_before - 10 min, not_after + 10 min]`
+    /// (the default skew).
     pub fn accepts(&self, now: UnixTime) -> bool {
-        now >= self.not_before.minus(CLOCK_SKEW_SECS) && now <= self.effective_deadline()
+        self.accepts_with_skew(now, Limits::DEFAULT.clock_skew_secs)
+    }
+
+    /// Whether `now` is inside `[not_before - skew, not_after + skew]`.
+    pub fn accepts_with_skew(&self, now: UnixTime, skew_secs: u64) -> bool {
+        now >= self.not_before.minus(skew_secs) && now <= self.deadline_with_skew(skew_secs)
     }
 
     /// The last second a session on this certificate may stay open:
-    /// `not_after + 10 min`.
+    /// `not_after + 10 min` (the default skew).
     pub fn effective_deadline(&self) -> UnixTime {
-        self.not_after.plus(CLOCK_SKEW_SECS)
+        self.deadline_with_skew(Limits::DEFAULT.clock_skew_secs)
+    }
+
+    /// The last second a session on this certificate may stay open:
+    /// `not_after + skew`.
+    pub fn deadline_with_skew(&self, skew_secs: u64) -> UnixTime {
+        self.not_after.plus(skew_secs)
     }
 }
 
@@ -417,11 +432,23 @@ impl VerifiedSessionCert {
 /// `expected_identity` is the pin for this peer: the stored pin on every
 /// reconnect, bulk session and path switch, or the ticket's host identity on
 /// first contact. Pass `None` only where step 2 will decide (a host accepting
-/// an incoming connection).
+/// an incoming connection). Allows the default clock skew; see
+/// [`verify_with_skew`].
 pub fn verify(
     der: &[u8],
     now: UnixTime,
     expected_identity: Option<&IdentityPublicKey>,
+) -> Result<VerifiedSessionCert, CertError> {
+    verify_with_skew(der, now, expected_identity, Limits::DEFAULT.clock_skew_secs)
+}
+
+/// [`verify`] allowing `skew_secs` of clock difference
+/// ([`Limits::clock_skew_secs`]).
+pub fn verify_with_skew(
+    der: &[u8],
+    now: UnixTime,
+    expected_identity: Option<&IdentityPublicKey>,
+    skew_secs: u64,
 ) -> Result<VerifiedSessionCert, CertError> {
     let parts = parse(der)?;
 
@@ -465,7 +492,7 @@ pub fn verify(
             return Err(CertError::PinMismatch);
         }
     }
-    if !window.accepts(now) {
+    if !window.accepts_with_skew(now, skew_secs) {
         return Err(CertError::OutsideWindow);
     }
     Ok(VerifiedSessionCert {

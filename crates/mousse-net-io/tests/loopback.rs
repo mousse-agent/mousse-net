@@ -15,16 +15,15 @@ use mousse_net_core::pairing::{
     ExchangeError, ExchangeRole, ExchangeStep, InvitationKind, InvitationStatus, JoinerError,
     PairingCode, Ticket, SID_LEN,
 };
-use mousse_net_core::session::RENEW_LEAD_SECS;
 use mousse_net_core::{
-    ErrorCode, Millis, UnixTime, CLOCK_SKEW_SECS, PROTOCOL_MINOR_VERSION, PROTOCOL_VERSION,
+    ErrorCode, Limits as CoreLimits, Millis, UnixTime, PROTOCOL_MINOR_VERSION, PROTOCOL_VERSION,
 };
 use mousse_net_io::certs::CertManager;
 use mousse_net_io::keystore::KeyStorage;
 use mousse_net_io::pipe::{connect_tcp, route_from_addr};
 use mousse_net_io::store::GrantStore;
 use mousse_net_io::{
-    tls, Caller, Clock, Endpoint, JoinOutcome, ManualClock, NetError, NoCode, PathEvent,
+    tls, Caller, Clock, Endpoint, JoinOutcome, Limits, ManualClock, NetError, NoCode, PathEvent,
     PortChoice, TlsPolicy,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -314,7 +313,9 @@ async fn a_path_is_renewed_before_its_deadline_and_replaced_only_after_reopening
 
     // Both devices reach the renewal time: the earlier not_after minus the
     // renewal lead (the deadline adds the clock skew to not_after).
-    let renew_at = old.deadline().0 - CLOCK_SKEW_SECS - RENEW_LEAD_SECS;
+    let renew_at = old.deadline().0
+        - CoreLimits::DEFAULT.clock_skew_secs
+        - CoreLimits::DEFAULT.renew_lead_secs;
     let skip = renew_at as i64 - clock.now().0 as i64;
     clock.advance(skip);
     host.clock.advance(skip);
@@ -368,7 +369,9 @@ async fn a_renewed_path_is_closed_when_nobody_takes_paths_any_more() {
         let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
     });
 
-    let renew_at = old.deadline().0 - CLOCK_SKEW_SECS - RENEW_LEAD_SECS;
+    let renew_at = old.deadline().0
+        - CoreLimits::DEFAULT.clock_skew_secs
+        - CoreLimits::DEFAULT.renew_lead_secs;
     let skip = renew_at as i64 - clock.now().0 as i64;
     clock.advance(skip);
     host.clock.advance(skip);
@@ -684,7 +687,7 @@ async fn a_lost_paired_is_settled_by_reconnecting_with_the_same_join() {
     let caller = Arc::new(Caller::with_factory(
         new_signer(),
         Arc::new(ManualClock::new()),
-        TlsPolicy::default(),
+        Limits::DEFAULT,
         FlagConfirm(flag.clone()),
     ));
     let ticket = host.invite_kind(InvitationKind::SendLink);
@@ -882,7 +885,7 @@ async fn a_refusal_after_a_lost_paired_is_reported_as_the_answer() {
     let caller = Arc::new(Caller::with_factory(
         new_signer(),
         Arc::new(ManualClock::new()),
-        TlsPolicy::default(),
+        Limits::DEFAULT,
         FlagConfirm(flag.clone()),
     ));
     let ticket = host.invite_kind(InvitationKind::SendLink);

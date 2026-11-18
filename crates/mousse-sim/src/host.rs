@@ -15,8 +15,9 @@ use mousse_net_core::pairing::{
     binding_transcript, CodeExchangeFactory, CreatedInvitation, ExchangeRole, HostAction,
     HostPairing, InvitationId, InvitationKind, InvitationParams, PairingCode, SID_LEN,
 };
-use mousse_net_core::session::{PeerSession, SessionEvent, RENEW_LEAD_SECS};
+use mousse_net_core::session::{PeerSession, SessionEvent};
 use mousse_net_core::session_cert::SessionCertificate;
+use mousse_net_core::Limits;
 use mousse_net_core::{ConnectionId, ErrorCode};
 
 use crate::certs;
@@ -99,7 +100,7 @@ impl HostDev {
             identity,
             cert,
             cert_lifetime: lifetime,
-            renew_lead: RENEW_LEAD_SECS,
+            renew_lead: Limits::DEFAULT.renew_lead_secs,
             grants: GrantTable::new(),
             pairing,
             instance: 1,

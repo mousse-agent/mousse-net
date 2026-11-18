@@ -14,18 +14,14 @@ use super::exchange::{CodeExchange, CodeExchangeFactory, ExchangeRole, PairingCo
 use super::proof::{
     attempt_sid, binding_transcript, verify_join_proof, SessionExporters, EXPORTER_LEN,
 };
-use super::ticket::{
-    Ticket, TicketSecret, MAX_ROUTES, MAX_ROUTE_LEN, TICKET_LIFETIME_SECS, TICKET_VERSION,
-};
+use super::ticket::{Ticket, TicketSecret, MAX_ROUTES, MAX_ROUTE_LEN, TICKET_VERSION};
 use super::{AttemptId, InvitationId, InvitationKind};
 use crate::control::{AuthorizedState, ControlMessage};
 use crate::grants::{GrantError, GrantEvent, GrantId, GrantTable, NewGrant, OwnerRef, Role};
 use crate::identity::IdentityPublicKey;
+use crate::limits::Limits;
 use crate::time::UnixTime;
 use crate::{ConnectionId, ErrorCode};
-
-/// Code attempts the host allows per invitation, across all routes.
-pub const HOST_ATTEMPTS_PER_INVITATION: u8 = 3;
 
 /// What the host owner chose when creating an invitation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -204,21 +200,39 @@ pub struct HostPairing<F: CodeExchangeFactory> {
     factory: F,
     invitations: BTreeMap<InvitationId, Invitation<F::Exchange>>,
     by_conn: BTreeMap<ConnectionId, InvitationId>,
+    ticket_lifetime_secs: u64,
+    attempts_per_invitation: u8,
 }
 
 impl<F: CodeExchangeFactory> HostPairing<F> {
-    /// A host with no invitations.
+    /// A host with no invitations. Uses the default limits; see
+    /// [`HostPairing::with_limits`].
     pub fn new(host_identity: IdentityPublicKey, host_name: String, factory: F) -> Self {
+        Self::with_limits(host_identity, host_name, factory, &Limits::DEFAULT)
+    }
+
+    /// [`HostPairing::new`] with other limits (ticket lifetime, code
+    /// attempts per invitation).
+    pub fn with_limits(
+        host_identity: IdentityPublicKey,
+        host_name: String,
+        factory: F,
+        limits: &Limits,
+    ) -> Self {
         Self {
             host_identity,
             host_name,
             factory,
             invitations: BTreeMap::new(),
             by_conn: BTreeMap::new(),
+            ticket_lifetime_secs: limits.ticket_lifetime_secs,
+            attempts_per_invitation: u8::try_from(limits.host_attempts_per_invitation)
+                .unwrap_or(u8::MAX),
         }
     }
 
-    /// Create an invitation that expires 10 minutes from `now`.
+    /// Create an invitation that expires [`Limits::ticket_lifetime_secs`]
+    /// from `now`.
     pub fn create<R: CryptoRng + ?Sized>(
         &mut self,
         params: InvitationParams,
@@ -247,7 +261,7 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
             host_identity: self.host_identity,
             invitation,
             secret,
-            expires_at: now.plus(TICKET_LIFETIME_SECS),
+            expires_at: now.plus(self.ticket_lifetime_secs),
             routes: params.routes.clone(),
         };
         let created = CreatedInvitation {
@@ -262,7 +276,7 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
                 params,
                 code,
                 status: InvitationStatus::Open,
-                attempts_left: HOST_ATTEMPTS_PER_INVITATION,
+                attempts_left: self.attempts_per_invitation,
                 joiners: BTreeMap::new(),
                 attempts: BTreeMap::new(),
             },

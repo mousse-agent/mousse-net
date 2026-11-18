@@ -17,27 +17,17 @@ pub use frame::{
     MAX_CONTROL_PAYLOAD, MAX_LABEL_LEN, MAX_OPEN_PAYLOAD, MAX_PAYLOAD,
 };
 
+use crate::limits::Limits;
 use crate::time::Millis;
 use crate::ErrorCode;
 
-/// Send a `PING` after this long without sending anything (15 s).
-pub const KEEPALIVE_MS: u64 = 15_000;
-
-/// Close after this long without receiving anything (45 s).
-pub const IDLE_TIMEOUT_MS: u64 = 45_000;
-
 /// Each direction of each stream starts with this much credit (256 KiB).
+/// Both sides assume it, so it is a protocol constant, not a limit.
 pub const INITIAL_CREDIT: u32 = 262_144;
 
-/// A stream's available send credit may never exceed this (1 GiB).
+/// A stream's available send credit may never exceed this (1 GiB). The peer
+/// enforces it too, so it is a protocol constant, not a limit.
 pub const MAX_CREDIT: u64 = 1 << 30;
-
-/// Most streams a peer may have open at once; more are refused.
-pub const MAX_PEER_STREAMS: usize = 1_024;
-
-/// Largest `DATA` payload this sender produces. Keeps interactive latency
-/// low behind bulk: an interactive frame waits for at most one such chunk.
-pub const SEND_CHUNK: usize = 16_384;
 
 /// Which end of the connection this is. Decides stream id parity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -223,11 +213,23 @@ pub struct Mux {
     cursor: [u32; 2],
     closing: Option<ErrorCode>,
     goaway_sent: bool,
+    keepalive_ms: u64,
+    idle_timeout_ms: u64,
+    max_peer_streams: usize,
+    send_chunk: usize,
+    credit_return: u64,
 }
 
 impl Mux {
-    /// A new mux; `now` starts both timers.
+    /// A new mux; `now` starts both timers. Uses the default limits; see
+    /// [`Mux::with_limits`].
     pub fn new(role: MuxRole, now: Millis) -> Self {
+        Self::with_limits(role, now, &Limits::DEFAULT)
+    }
+
+    /// [`Mux::new`] with other limits (keepalive, idle timeout, peer
+    /// streams, send chunk and credit return).
+    pub fn with_limits(role: MuxRole, now: Millis, limits: &Limits) -> Self {
         Self {
             role,
             next_local_id: match role {
@@ -245,6 +247,11 @@ impl Mux {
             cursor: [0, 0],
             closing: None,
             goaway_sent: false,
+            keepalive_ms: limits.keepalive_ms,
+            idle_timeout_ms: limits.idle_timeout_ms,
+            max_peer_streams: usize::try_from(limits.max_peer_streams).unwrap_or(usize::MAX),
+            send_chunk: usize::try_from(limits.send_chunk_bytes).unwrap_or(usize::MAX),
+            credit_return: limits.credit_return_bytes,
         }
     }
 
@@ -329,8 +336,8 @@ impl Mux {
     }
 
     /// The app consumed `n` received bytes on `stream`; return them to the
-    /// peer as credit. Credit is batched: a `CREDIT` frame goes out once a
-    /// quarter of the initial window is released.
+    /// peer as credit. Credit is batched: a `CREDIT` frame goes out once
+    /// [`Limits::credit_return_bytes`] are released.
     pub fn release(&mut self, stream: StreamId, n: u64) {
         let Some(s) = self.streams.get_mut(&stream.0) else {
             return;
@@ -338,7 +345,7 @@ impl Mux {
         let n = n.min(s.recv_unreleased);
         s.recv_unreleased -= n;
         s.recv_to_credit += n;
-        if s.recv_to_credit >= u64::from(INITIAL_CREDIT / 4) && !s.peer_fin {
+        if s.recv_to_credit >= self.credit_return && !s.peer_fin {
             let increment = s.recv_to_credit.min(u64::from(u32::MAX)) as u32;
             s.recv_to_credit -= u64::from(increment);
             s.recv_window += u64::from(increment);
@@ -425,7 +432,7 @@ impl Mux {
                 }
                 self.highest_peer_id = stream.0;
                 let open_by_peer = self.streams.values().filter(|s| s.peer_initiated).count();
-                if open_by_peer >= MAX_PEER_STREAMS {
+                if open_by_peer >= self.max_peer_streams {
                     self.control.push_back(Frame::Reset {
                         stream,
                         code: ErrorCode::RefusedStream,
@@ -581,7 +588,7 @@ impl Mux {
         let s = self.streams.get_mut(&pick)?;
         let stream = StreamId(pick);
         if !s.out.is_empty() {
-            let n = s.out.len().min(SEND_CHUNK).min(s.send_credit as usize);
+            let n = s.out.len().min(self.send_chunk).min(s.send_credit as usize);
             let payload: Vec<u8> = s.out.drain(..n).collect();
             s.send_credit -= n as u64;
             return Some(Frame::Data { stream, payload });
@@ -600,21 +607,21 @@ impl Mux {
         }
         Some(
             self.last_sent
-                .plus(KEEPALIVE_MS)
-                .min(self.last_received.plus(IDLE_TIMEOUT_MS)),
+                .plus(self.keepalive_ms)
+                .min(self.last_received.plus(self.idle_timeout_ms)),
         )
     }
 
-    /// Run timers: close after 45 s of silence from the peer; queue a `PING`
-    /// after 15 s without sending.
+    /// Run timers: close after the idle timeout without hearing from the
+    /// peer; queue a `PING` after the keepalive time without sending.
     pub fn on_timeout(&mut self, now: Millis) -> Result<(), MuxError> {
         if self.closing.is_some() {
             return Ok(());
         }
-        if now.since(self.last_received) >= IDLE_TIMEOUT_MS {
+        if now.since(self.last_received) >= self.idle_timeout_ms {
             return Err(self.fail(ErrorCode::IdleTimeout));
         }
-        if now.since(self.last_sent) >= KEEPALIVE_MS
+        if now.since(self.last_sent) >= self.keepalive_ms
             && !self.control.iter().any(|f| matches!(f, Frame::Ping { .. }))
         {
             self.ping_counter += 1;
@@ -629,6 +636,8 @@ impl Mux {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SEND_CHUNK: usize = Limits::DEFAULT.send_chunk_bytes as usize;
 
     fn pump(from: &mut Mux, to: &mut Mux, now: Millis) -> Vec<MuxEvent> {
         let mut events = Vec::new();
@@ -826,13 +835,32 @@ mod tests {
     }
 
     #[test]
+    fn tightened_keepalive_and_idle_limits_are_used() {
+        let mut limits = Limits::DEFAULT;
+        limits.set("KEEPALIVE_MS", 5_000).unwrap();
+        limits.set("IDLE_TIMEOUT_MS", 30_000).unwrap();
+        let mut m = Mux::with_limits(MuxRole::Caller, Millis(0), &limits);
+        assert_eq!(m.poll_timeout(), Some(Millis(5_000)));
+        m.on_timeout(Millis(5_000)).unwrap();
+        assert!(m.poll_transmit(Millis(5_000)).is_some());
+        assert_eq!(m.poll_timeout(), Some(Millis(10_000)));
+        assert!(m.on_timeout(Millis(30_000)).is_err());
+    }
+
+    #[test]
     fn keepalive_after_15s_and_idle_close_after_45s() {
         let mut m = Mux::new(MuxRole::Caller, Millis(0));
-        assert_eq!(m.poll_timeout(), Some(Millis(KEEPALIVE_MS)));
-        m.on_timeout(Millis(KEEPALIVE_MS - 1)).unwrap();
-        assert_eq!(m.poll_transmit(Millis(KEEPALIVE_MS - 1)), None);
-        m.on_timeout(Millis(KEEPALIVE_MS)).unwrap();
-        let ping = m.poll_transmit(Millis(KEEPALIVE_MS)).unwrap();
+        assert_eq!(m.poll_timeout(), Some(Millis(Limits::DEFAULT.keepalive_ms)));
+        m.on_timeout(Millis(Limits::DEFAULT.keepalive_ms - 1))
+            .unwrap();
+        assert_eq!(
+            m.poll_transmit(Millis(Limits::DEFAULT.keepalive_ms - 1)),
+            None
+        );
+        m.on_timeout(Millis(Limits::DEFAULT.keepalive_ms)).unwrap();
+        let ping = m
+            .poll_transmit(Millis(Limits::DEFAULT.keepalive_ms))
+            .unwrap();
         assert!(matches!(
             decode_frame(&ping).unwrap().unwrap().0,
             Frame::Ping { .. }
@@ -843,14 +871,17 @@ mod tests {
         }
         .encode();
         assert_eq!(
-            m.receive(&pong, Millis(KEEPALIVE_MS + 40)).unwrap(),
+            m.receive(&pong, Millis(Limits::DEFAULT.keepalive_ms + 40))
+                .unwrap(),
             vec![MuxEvent::Pong { rtt_ms: 40 }]
         );
         // Nothing more from the peer: idle close 45 s after the last receive.
-        let last = KEEPALIVE_MS + 40;
-        assert!(m.on_timeout(Millis(last + IDLE_TIMEOUT_MS - 1)).is_ok());
+        let last = Limits::DEFAULT.keepalive_ms + 40;
+        assert!(m
+            .on_timeout(Millis(last + Limits::DEFAULT.idle_timeout_ms - 1))
+            .is_ok());
         assert_eq!(
-            m.on_timeout(Millis(last + IDLE_TIMEOUT_MS)),
+            m.on_timeout(Millis(last + Limits::DEFAULT.idle_timeout_ms)),
             Err(MuxError {
                 code: ErrorCode::IdleTimeout
             })

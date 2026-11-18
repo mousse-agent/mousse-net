@@ -37,20 +37,35 @@ use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 
 use crate::clock::Clock;
 use crate::error::NetError;
+use crate::limits::{ms, Limits};
 use crate::pipe::Pipe;
 
 /// The only `CertificateVerify` scheme peers use.
 pub const SCHEME: SignatureScheme = SignatureScheme::ECDSA_NISTP256_SHA256;
 
-/// How long a TLS handshake may take.
-pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// The TLS policy. Wire.md 5.4 makes every part of it a requirement, so
-/// there is nothing to choose; the type stays so callers name it in one
-/// place.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// The TLS policy. Wire.md 5.4 makes the protocol choices requirements, so
+/// the only settings are two limits: the clock skew the verifiers allow and
+/// how long a handshake may take.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TlsPolicy {
-    _fixed: (),
+    skew_secs: u64,
+    handshake_timeout: Duration,
+}
+
+impl TlsPolicy {
+    /// The policy for `limits`.
+    pub fn from_limits(limits: &Limits) -> Self {
+        Self {
+            skew_secs: limits.core.clock_skew_secs,
+            handshake_timeout: ms(limits.io.handshake_timeout_ms),
+        }
+    }
+}
+
+impl Default for TlsPolicy {
+    fn default() -> Self {
+        Self::from_limits(&Limits::DEFAULT)
+    }
 }
 
 /// The groups a native endpoint offers, in order.
@@ -156,6 +171,7 @@ fn cert_error(e: CertError) -> Error {
 /// Check a `CertificateVerify` signature with the session key of `cert`.
 fn verify_cert_verify(
     clock: &dyn Clock,
+    skew_secs: u64,
     message: &[u8],
     cert: &CertificateDer<'_>,
     dss: &DigitallySignedStruct,
@@ -165,7 +181,8 @@ fn verify_cert_verify(
             rustls::PeerMisbehaved::SignedHandshakeWithUnadvertisedSigScheme,
         ));
     }
-    let verified = session_cert::verify(cert.as_ref(), clock.now(), None).map_err(cert_error)?;
+    let verified = session_cert::verify_with_skew(cert.as_ref(), clock.now(), None, skew_secs)
+        .map_err(cert_error)?;
     verified
         .verify_tls_signature(message, dss.signature())
         .map_err(|_| Error::InvalidCertificate(CertificateError::BadSignature))?;
@@ -187,6 +204,7 @@ fn checked_pin(pin: &IdentityPublicKey) -> Option<&IdentityPublicKey> {
 struct PinnedHostVerifier {
     pin: IdentityPublicKey,
     clock: Arc<dyn Clock>,
+    skew_secs: u64,
 }
 
 impl ServerCertVerifier for PinnedHostVerifier {
@@ -201,10 +219,11 @@ impl ServerCertVerifier for PinnedHostVerifier {
         if !intermediates.is_empty() {
             return Err(cert_error(CertError::Malformed));
         }
-        session_cert::verify(
+        session_cert::verify_with_skew(
             end_entity.as_ref(),
             self.clock.now(),
             checked_pin(&self.pin),
+            self.skew_secs,
         )
         .map_err(cert_error)?;
         Ok(ServerCertVerified::assertion())
@@ -225,7 +244,7 @@ impl ServerCertVerifier for PinnedHostVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, Error> {
-        verify_cert_verify(&*self.clock, message, cert, dss)
+        verify_cert_verify(&*self.clock, self.skew_secs, message, cert, dss)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -237,6 +256,7 @@ impl ServerCertVerifier for PinnedHostVerifier {
 #[derive(Debug)]
 struct AnyDeviceVerifier {
     clock: Arc<dyn Clock>,
+    skew_secs: u64,
 }
 
 impl ClientCertVerifier for AnyDeviceVerifier {
@@ -261,7 +281,8 @@ impl ClientCertVerifier for AnyDeviceVerifier {
         if !intermediates.is_empty() {
             return Err(cert_error(CertError::Malformed));
         }
-        session_cert::verify(end_entity.as_ref(), self.clock.now(), None).map_err(cert_error)?;
+        session_cert::verify_with_skew(end_entity.as_ref(), self.clock.now(), None, self.skew_secs)
+            .map_err(cert_error)?;
         Ok(ClientCertVerified::assertion())
     }
 
@@ -280,7 +301,7 @@ impl ClientCertVerifier for AnyDeviceVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, Error> {
-        verify_cert_verify(&*self.clock, message, cert, dss)
+        verify_cert_verify(&*self.clock, self.skew_secs, message, cert, dss)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -293,8 +314,9 @@ pub fn client_config(
     own: &SessionCertificate,
     pin: IdentityPublicKey,
     clock: Arc<dyn Clock>,
+    policy: TlsPolicy,
 ) -> Result<Arc<ClientConfig>, NetError> {
-    client_config_on(provider(), own, pin, clock)
+    client_config_on(provider(), own, pin, clock, policy)
 }
 
 fn client_config_on(
@@ -302,13 +324,18 @@ fn client_config_on(
     own: &SessionCertificate,
     pin: IdentityPublicKey,
     clock: Arc<dyn Clock>,
+    policy: TlsPolicy,
 ) -> Result<Arc<ClientConfig>, NetError> {
     let mut config =
         ClientConfig::builder_with_details(provider, Arc::new(ClockTime(clock.clone())))
             .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(|e| NetError::Tls(e.to_string()))?
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(PinnedHostVerifier { pin, clock }))
+            .with_custom_certificate_verifier(Arc::new(PinnedHostVerifier {
+                pin,
+                clock,
+                skew_secs: policy.skew_secs,
+            }))
             .with_client_cert_resolver(Arc::new(OwnCert(certified_key(own))));
     config.alpn_protocols = vec![ALPN.to_vec()];
     config.resumption = Resumption::disabled();
@@ -321,12 +348,16 @@ fn client_config_on(
 pub fn server_config(
     own: &SessionCertificate,
     clock: Arc<dyn Clock>,
+    policy: TlsPolicy,
 ) -> Result<Arc<ServerConfig>, NetError> {
     let mut config =
         ServerConfig::builder_with_details(provider(), Arc::new(ClockTime(clock.clone())))
             .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(|e| NetError::Tls(e.to_string()))?
-            .with_client_cert_verifier(Arc::new(AnyDeviceVerifier { clock }))
+            .with_client_cert_verifier(Arc::new(AnyDeviceVerifier {
+                clock,
+                skew_secs: policy.skew_secs,
+            }))
             .with_cert_resolver(Arc::new(OwnCert(certified_key(own))));
     config.alpn_protocols = vec![ALPN.to_vec()];
     config.session_storage = Arc::new(NoServerSessionStorage {});
@@ -385,7 +416,6 @@ fn finish(
         .negotiated_key_exchange_group()
         .map(|g| g.name())
         .ok_or_else(|| NetError::Tls("no key exchange group".into()))?;
-    let _ = policy;
     if group != NamedGroup::X25519MLKEM768 {
         return Err(NetError::Tls(format!(
             "key exchange {group:?} is not the hybrid group"
@@ -395,8 +425,13 @@ fn finish(
         .peer_certificates()
         .and_then(|c| c.first())
         .ok_or_else(|| NetError::Tls("peer sent no certificate".into()))?;
-    let peer = session_cert::verify(der.as_ref(), clock.now(), pin.and_then(checked_pin))
-        .map_err(NetError::PeerCertificate)?;
+    let peer = session_cert::verify_with_skew(
+        der.as_ref(),
+        clock.now(),
+        pin.and_then(checked_pin),
+        policy.skew_secs,
+    )
+    .map_err(NetError::PeerCertificate)?;
     Ok(Handshake {
         peer,
         local_window,
@@ -413,10 +448,10 @@ pub async fn connect<P: Pipe>(
     clock: Arc<dyn Clock>,
     policy: TlsPolicy,
 ) -> Result<(TlsStream<P>, Handshake), NetError> {
-    let config = client_config(own, pin, clock.clone())?;
+    let config = client_config(own, pin, clock.clone(), policy)?;
     let name = ServerName::try_from("mousse-session").map_err(|e| NetError::Tls(e.to_string()))?;
     let stream = tokio::time::timeout(
-        HANDSHAKE_TIMEOUT,
+        policy.handshake_timeout,
         TlsConnector::from(config).connect(name, pipe),
     )
     .await
@@ -437,11 +472,14 @@ pub async fn accept<P: Pipe>(
     clock: Arc<dyn Clock>,
     policy: TlsPolicy,
 ) -> Result<(TlsStream<P>, Handshake), NetError> {
-    let config = server_config(own, clock.clone())?;
-    let stream = tokio::time::timeout(HANDSHAKE_TIMEOUT, TlsAcceptor::from(config).accept(pipe))
-        .await
-        .map_err(|_| NetError::Timeout("TLS handshake"))?
-        .map_err(map_handshake_error)?;
+    let config = server_config(own, clock.clone(), policy)?;
+    let stream = tokio::time::timeout(
+        policy.handshake_timeout,
+        TlsAcceptor::from(config).accept(pipe),
+    )
+    .await
+    .map_err(|_| NetError::Timeout("TLS handshake"))?
+    .map_err(map_handshake_error)?;
     let conn = stream.get_ref().1;
     let exporters =
         exporters(|label| conn.export_keying_material([0u8; 32], label.as_bytes(), None))?;
@@ -484,6 +522,7 @@ mod tests {
             &caller,
             *host.identity(),
             clock.clone(),
+            TlsPolicy::default(),
         )
         .unwrap();
         let (a, b) = tokio::io::duplex(1 << 16);

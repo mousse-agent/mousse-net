@@ -11,6 +11,10 @@ seen. With a send link (`invite --link`) the host shows a 6-digit code, a
 fresh one for each attempt, and `join` asks for it; the code is checked
 with CPace, and three wrong codes end the invitation.
 
+The times, attempt caps and sizes below are defaults; [limits.md](limits.md)
+lists each one, its `MOUSSE_NET_<NAME>` variable and the range it may be
+set to.
+
 ## Joining
 
 - How the ticket arrived matters. An in-person ticket pairs only when it

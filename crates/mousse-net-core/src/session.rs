@@ -6,17 +6,18 @@
 //! brought up to replace it.
 //!
 //! - **Deadline.** A path's effective deadline is the earlier of the two
-//!   certificates' `not_after`, plus the 10 min skew. The path may run through
+//!   certificates' `not_after`, plus the clock skew. The path may run through
 //!   that second and closes with `CERT_EXPIRED` at the first second after it.
 //!   The time left at authentication is also a monotonic budget: the path
 //!   closes when either clock runs out, so setting the wall clock back
 //!   cannot keep it open past its deadline.
-//! - **Renewal.** [`RENEW_LEAD_SECS`] before the earlier `not_after`, the
+//! - **Renewal.** [`Limits::renew_lead_secs`] before the earlier `not_after`, the
 //!   session asks for a new path (a fresh handshake, with a fresh certificate
 //!   if ours is the one running out). Renewal is just a path switch. If no
 //!   new path with a later renewal time is current by the next retry time,
 //!   it asks again: after
-//!   [`RENEW_RETRY_FIRST_SECS`], doubling up to [`RENEW_RETRY_MAX_SECS`],
+//!   [`Limits::renew_retry_first_secs`], doubling up to
+//!   [`Limits::renew_retry_max_secs`],
 //!   until the path's deadline.
 //! - **Path switch.** Authenticate the new path (step 1 with the same pin),
 //!   reopen channels on it from the app's cursors, then close the old path
@@ -26,20 +27,10 @@
 //! moves bytes.
 
 use crate::identity::IdentityPublicKey;
+use crate::limits::Limits;
 use crate::session_cert::{ValidityWindow, VerifiedSessionCert};
 use crate::time::{Millis, UnixTime};
 use crate::{ConnectionId, ErrorCode};
-
-/// Start renewal this long before the earlier certificate's `not_after`
-/// (30 minutes).
-pub const RENEW_LEAD_SECS: u64 = 1_800;
-
-/// First wait before asking again for a renewal that has not happened
-/// (30 seconds).
-pub const RENEW_RETRY_FIRST_SECS: u64 = 30;
-
-/// Longest wait between renewal requests (5 minutes).
-pub const RENEW_RETRY_MAX_SECS: u64 = 300;
 
 /// Pending renewal of the current path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,12 +62,16 @@ impl PathInfo {
         peer: ValidityWindow,
         now: UnixTime,
         mono: Millis,
+        limits: &SessionLimits,
     ) -> Self {
         let not_after = local.not_after().min(peer.not_after());
         let not_before = local.not_before().max(peer.not_before());
         // Never schedule renewal before the window starts.
-        let renew_at = not_after.minus(RENEW_LEAD_SECS).max(not_before);
-        let deadline = local.effective_deadline().min(peer.effective_deadline());
+        let renew_at = not_after.minus(limits.renew_lead_secs).max(not_before);
+        let skew = limits.clock_skew_secs;
+        let deadline = local
+            .deadline_with_skew(skew)
+            .min(peer.deadline_with_skew(skew));
         // Seconds left at authentication, counting the deadline second.
         let left = deadline.secs().saturating_add(1).saturating_sub(now.secs());
         Self {
@@ -162,16 +157,39 @@ pub struct PeerSession {
     /// renewal time becomes current.
     renewal: Option<Renewal>,
     candidate: Option<Candidate>,
+    limits: SessionLimits,
+}
+
+/// The limits a [`PeerSession`] uses, taken from [`Limits`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SessionLimits {
+    renew_lead_secs: u64,
+    renew_retry_first_secs: u64,
+    renew_retry_max_secs: u64,
+    clock_skew_secs: u64,
 }
 
 impl PeerSession {
-    /// A session for `pin` with no path yet.
+    /// A session for `pin` with no path yet. Uses the default limits; see
+    /// [`PeerSession::with_limits`].
     pub fn new(pin: IdentityPublicKey) -> Self {
+        Self::with_limits(pin, &Limits::DEFAULT)
+    }
+
+    /// [`PeerSession::new`] with other limits (renewal lead and retries,
+    /// clock skew).
+    pub fn with_limits(pin: IdentityPublicKey, limits: &Limits) -> Self {
         Self {
             pin,
             current: None,
             renewal: None,
             candidate: None,
+            limits: SessionLimits {
+                renew_lead_secs: limits.renew_lead_secs,
+                renew_retry_first_secs: limits.renew_retry_first_secs,
+                renew_retry_max_secs: limits.renew_retry_max_secs,
+                clock_skew_secs: limits.clock_skew_secs,
+            },
         }
     }
 
@@ -230,7 +248,7 @@ impl PeerSession {
             self.candidate = None;
             return Err(PathError::PinMismatch);
         }
-        let info = PathInfo::new(conn, local, peer.window, now, mono);
+        let info = PathInfo::new(conn, local, peer.window, now, mono, &self.limits);
         if now > info.deadline {
             self.candidate = None;
             return Err(PathError::Expired);
@@ -333,7 +351,7 @@ impl PeerSession {
             } else if now >= path.renew_at {
                 let renewal = self.renewal.get_or_insert(Renewal {
                     next_at: path.renew_at,
-                    backoff: RENEW_RETRY_FIRST_SECS,
+                    backoff: self.limits.renew_retry_first_secs,
                 });
                 if now >= renewal.next_at {
                     // Ask again later unless a new path becomes current. The
@@ -341,7 +359,7 @@ impl PeerSession {
                     // up is left alone, but the skipped retry still counts.
                     let in_progress = self.candidate.is_some();
                     renewal.next_at = now.plus(renewal.backoff);
-                    renewal.backoff = (renewal.backoff * 2).min(RENEW_RETRY_MAX_SECS);
+                    renewal.backoff = (renewal.backoff * 2).min(self.limits.renew_retry_max_secs);
                     if !in_progress {
                         events.push(SessionEvent::RenewDue { conn: path.conn });
                     }
@@ -357,7 +375,8 @@ mod tests {
     use super::*;
     use crate::identity::SoftwareKey;
     use crate::session_cert::{issue, verify};
-    use crate::CLOCK_SKEW_SECS;
+    const CLOCK_SKEW_SECS: u64 = Limits::DEFAULT.clock_skew_secs;
+    const RENEW_LEAD_SECS: u64 = Limits::DEFAULT.renew_lead_secs;
     use rand_chacha::ChaCha20Rng;
     use rand_core::SeedableRng;
 

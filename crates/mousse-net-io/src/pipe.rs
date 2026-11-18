@@ -11,14 +11,12 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::error::NetError;
+use crate::limits::{ms, Limits};
 
 /// A reliable byte stream.
 pub trait Pipe: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
 
 impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> Pipe for T {}
-
-/// How long a TCP connect may take.
-pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub use mousse_net_core::pairing::{Route, RouteHost};
 
@@ -50,8 +48,15 @@ pub fn route_uri(route: &Route) -> String {
     }
 }
 
-/// Dial a `tcp://` route. Other routes need discovery first.
+/// Dial a `tcp://` route within the default connect timeout. Other routes
+/// need discovery first.
 pub async fn connect_tcp(route: &Route) -> Result<TcpStream, NetError> {
+    connect_tcp_within(route, ms(Limits::DEFAULT.io.connect_timeout_ms)).await
+}
+
+/// Dial a `tcp://` route, giving up after `timeout`
+/// ([`IoLimits::connect_timeout_ms`](crate::limits::IoLimits::connect_timeout_ms)).
+pub async fn connect_tcp_within(route: &Route, timeout: Duration) -> Result<TcpStream, NetError> {
     let Route::Tcp { host, port } = route else {
         return Err(NetError::Refused(format!(
             "{} is not a TCP route",
@@ -63,12 +68,9 @@ pub async fn connect_tcp(route: &Route) -> Result<TcpStream, NetError> {
         RouteHost::Ipv6(ip) => IpAddr::V6(*ip).to_string(),
         RouteHost::Dns(name) => name.clone(),
     };
-    let stream = tokio::time::timeout(
-        CONNECT_TIMEOUT,
-        TcpStream::connect((target.as_str(), *port)),
-    )
-    .await
-    .map_err(|_| NetError::Timeout("TCP connect"))??;
+    let stream = tokio::time::timeout(timeout, TcpStream::connect((target.as_str(), *port)))
+        .await
+        .map_err(|_| NetError::Timeout("TCP connect"))??;
     stream.set_nodelay(true)?;
     Ok(stream)
 }

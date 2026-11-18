@@ -8,11 +8,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use mousse_net_core::pairing::{Arrival, InvitationKind, Route, Ticket, CODE_FAILED_MESSAGE};
 use mousse_net_core::session_cert::CertError;
 use mousse_net_core::ErrorCode;
-use mousse_net_io::pipe::{connect_tcp, parse_route, route_uri};
+use mousse_net_io::pipe::{connect_tcp_within, parse_route, route_uri};
 use mousse_net_io::store::{hex, short_id, PeerRecord, PeerStore};
 use mousse_net_io::{
     Caller, CloseReason, CodeEntry, Connection, Endpoint, JoinOutcome, NetError, Step1Failures,
-    SystemClock, TlsPolicy,
+    SystemClock,
 };
 use serde_json::json;
 
@@ -36,7 +36,7 @@ impl CallerSide {
         let mut caller = Caller::new(
             Arc::new(key),
             Arc::new(SystemClock::new()),
-            TlsPolicy::default(),
+            crate::limits::get().net,
         );
         caller.use_flow_records(Arc::new(endpoint.flow_records()));
         Ok(Self { endpoint, caller })
@@ -53,7 +53,13 @@ pub fn parse_ticket(text: &str) -> Result<Ticket, String> {
     Ticket::from_fragment(fragment).map_err(|e| format!("bad ticket: {e:?}"))
 }
 
-fn now_secs() -> u64 {
+/// How long a TCP connect may take (`CONNECT_TIMEOUT_MS`).
+fn connect_timeout() -> Duration {
+    crate::limits::ms(crate::limits::get().net.io.connect_timeout_ms)
+}
+
+/// Wall-clock now, in Unix seconds.
+pub fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -214,7 +220,7 @@ pub async fn join(
     let mut step1 = Step1Failures::default();
     for route in &candidates {
         let hint = route_uri(route);
-        let pipe = match connect_tcp(route).await {
+        let pipe = match connect_tcp_within(route, connect_timeout()).await {
             Ok(p) => p,
             Err(e) => {
                 last = Failure::new(format!("{hint}: {e}"), "unreachable");
@@ -223,7 +229,7 @@ pub async fn join(
         };
         // If the connection drops before PAIRED, the join reconnects here
         // to learn whether the host enrolled this device.
-        let redial = || connect_tcp(route);
+        let redial = || connect_tcp_within(route, connect_timeout());
         match side
             .caller
             .join_with_redial(pipe, ticket, arrival, name, &mut TypedCode, pinned, redial)
@@ -650,19 +656,22 @@ async fn host_build(conn: &Connection) -> Result<String, String> {
     // The request is the stream itself: nothing more is sent, so the
     // request side ends here and the host sees a clean FIN.
     wr.finish();
+    let limits = crate::limits::helper();
+    let max = usize::try_from(limits.info_answer_max_bytes).unwrap_or(usize::MAX);
     let read = async {
         let mut bytes = Vec::new();
         while let Some(chunk) = rd.read().await.map_err(|e| describe(&e))? {
             bytes.extend(chunk);
-            if bytes.len() > 4096 {
+            if bytes.len() > max {
                 return Err("the host's answer is too long".to_string());
             }
         }
         Ok(bytes)
     };
-    let bytes = tokio::time::timeout(Duration::from_secs(10), read)
+    let wait = crate::limits::ms(limits.info_answer_wait_ms);
+    let bytes = tokio::time::timeout(wait, read)
         .await
-        .map_err(|_| "no answer in 10 s".to_string())??;
+        .map_err(|_| format!("no answer in {}", crate::limits::describe(wait)))??;
     let info: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|e| format!("bad answer: {e}"))?;
     info.get("build")
@@ -706,8 +715,12 @@ async fn capture(conn: &Connection, argv: Vec<String>) -> Result<(i32, String), 
             }
         }
     };
-    let code = tokio::time::timeout(Duration::from_secs(30), read)
-        .await
-        .map_err(|_| "the command did not finish in 30 s".to_string())??;
+    let wait = crate::limits::ms(crate::limits::helper().capture_wait_ms);
+    let code = tokio::time::timeout(wait, read).await.map_err(|_| {
+        format!(
+            "the command did not finish in {}",
+            crate::limits::describe(wait)
+        )
+    })??;
     Ok((code, String::from_utf8_lossy(&output).into_owned()))
 }

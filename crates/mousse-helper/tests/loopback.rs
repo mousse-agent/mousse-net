@@ -953,3 +953,39 @@ fn the_slice_check_runs_on_loopback_and_peer_names_print_escaped() {
     cleanup(&[&host, &peer]);
     let _ = std::fs::remove_file(&out);
 }
+
+/// A bad `MOUSSE_NET_*` value stops the helper before it does anything,
+/// with a message naming the variable and its allowed range.
+#[test]
+fn a_bad_limit_variable_stops_startup() {
+    let dir = temp_dir("limits");
+    for (name, value, says) in [
+        (
+            "MOUSSE_NET_KEEPALIVE_MS",
+            "soon",
+            "MOUSSE_NET_KEEPALIVE_MS=\"soon\" is not a whole number; allowed range is 1000 to 15000",
+        ),
+        (
+            "MOUSSE_NET_CLOCK_SKEW_SECS",
+            "601",
+            "MOUSSE_NET_CLOCK_SKEW_SECS=601 is out of range; allowed range is 0 to 600",
+        ),
+        (
+            "MOUSSE_NET_KEEPALIVE",
+            "1000",
+            "MOUSSE_NET_KEEPALIVE is not a known limit",
+        ),
+    ] {
+        let out = Command::new(bin())
+            .arg("--state")
+            .arg(&dir)
+            .arg("id")
+            .env(name, value)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{name}={value}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(says), "{name}={value}: {stderr}");
+        assert!(!dir.exists(), "{name}={value} created state");
+    }
+}

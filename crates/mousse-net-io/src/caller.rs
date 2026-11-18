@@ -44,7 +44,6 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
-use std::time::Duration;
 
 use mousse_net_core::authz::CallerGateState;
 use mousse_net_core::authz::{CallerGate, CallerTraffic, Traffic, Verdict};
@@ -64,15 +63,12 @@ use crate::certs::CertManager;
 use crate::clock::Clock;
 use crate::conn::{self, CloseReason, Cmd, ConnStatus, Connection, Outbox, Role as ConnRole};
 use crate::error::NetError;
-use crate::pipe::{connect_tcp, route_uri, Pipe, Route};
+use crate::limits::{ms, Limits};
+use crate::pipe::{connect_tcp_within, route_uri, Pipe, Route};
 use crate::rng::os_rng;
 use crate::store::{FlowRecords, MemoryFlowRecords};
 use crate::tls::{self, Handshake, TlsPolicy};
 use crate::SharedSigner;
-
-/// How long a caller waits for the answer to its `JOIN_PROOF` before it
-/// closes the connection with `NOT_AUTHORIZED` (wire.md 8.2).
-pub const PROOF_ANSWER_WAIT_MS: u64 = 10_000;
 
 /// How pairing ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -151,6 +147,7 @@ pub struct Caller<F: CodeExchangeFactory + Clone = CpaceExchangeFactory> {
     certs: Arc<CertManager>,
     clock: Arc<dyn Clock>,
     policy: TlsPolicy,
+    limits: Limits,
     factory: F,
     paths: Arc<Mutex<Paths>>,
     next_conn: AtomicU64,
@@ -207,19 +204,11 @@ fn lock_joiner<F: CodeExchangeFactory>(joiner: &Mutex<Flow<F>>) -> MutexGuard<'_
     joiner.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// How often a join reconnects to learn a pending outcome, and the waits
-/// before each try.
-const OUTCOME_RETRIES: [Duration; 4] = [
-    Duration::from_millis(200),
-    Duration::from_millis(500),
-    Duration::from_secs(1),
-    Duration::from_secs(2),
-];
-
 impl Caller<CpaceExchangeFactory> {
     /// A caller that pairs in person or with a send link (CPace).
-    pub fn new(signer: SharedSigner, clock: Arc<dyn Clock>, policy: TlsPolicy) -> Self {
-        Self::with_factory(signer, clock, policy, CpaceExchangeFactory)
+    /// `limits` should pass [`Limits::validate`].
+    pub fn new(signer: SharedSigner, clock: Arc<dyn Clock>, limits: Limits) -> Self {
+        Self::with_factory(signer, clock, limits, CpaceExchangeFactory)
     }
 }
 
@@ -232,13 +221,14 @@ where
     pub fn with_factory(
         signer: SharedSigner,
         clock: Arc<dyn Clock>,
-        policy: TlsPolicy,
+        limits: Limits,
         factory: F,
     ) -> Self {
         Self {
-            certs: Arc::new(CertManager::new(signer, clock.clone())),
+            certs: Arc::new(CertManager::with_limits(signer, clock.clone(), &limits)),
             clock,
-            policy,
+            policy: TlsPolicy::from_limits(&limits),
+            limits,
             factory,
             paths: Arc::new(Mutex::new(Paths::default())),
             next_conn: AtomicU64::new(1),
@@ -315,7 +305,8 @@ where
             .unwrap_or_default();
         let mut last = NetError::Refused("no known route to this host".into());
         for route in &routes {
-            let pipe = match connect_tcp(route).await {
+            let pipe = match connect_tcp_within(route, ms(self.limits.io.connect_timeout_ms)).await
+            {
                 Ok(pipe) => pipe,
                 Err(e) => {
                     last = e;
@@ -351,7 +342,7 @@ where
             let events = paths
                 .sessions
                 .entry(pin)
-                .or_insert_with(|| PeerSession::new(pin))
+                .or_insert_with(|| PeerSession::with_limits(pin, &self.limits.core))
                 .begin_path(conn);
             paths.run(events);
         }
@@ -360,7 +351,7 @@ where
         let session = paths
             .sessions
             .entry(pin)
-            .or_insert_with(|| PeerSession::new(pin));
+            .or_insert_with(|| PeerSession::with_limits(pin, &self.limits.core));
         match result {
             Ok((stream, handshake)) => {
                 match session.on_authenticated(
@@ -396,10 +387,11 @@ where
     ) -> Connection {
         let (cmd_tx, cmd_rx) = conn::channel();
         lock(&self.paths).conns.insert(conn, cmd_tx.clone());
+        let skew = self.limits.core.clock_skew_secs;
         let deadline = handshake
             .local_window
-            .effective_deadline()
-            .min(handshake.peer.window.effective_deadline());
+            .deadline_with_skew(skew)
+            .min(handshake.peer.window.deadline_with_skew(skew));
         let (joiner, proof) = match joiner {
             Some((j, p)) => (Some(j), Some(p)),
             None => (None, None),
@@ -409,6 +401,7 @@ where
             joiner,
             proof,
             answer_due: None,
+            answer_wait_ms: self.limits.io.proof_answer_wait_ms,
             clock: self.clock.clone(),
             paths: self.paths.clone(),
             conn,
@@ -423,6 +416,7 @@ where
                 kx_group: handshake.kx_group,
                 deadline,
                 clock: self.clock.clone(),
+                limits: self.limits,
             },
             Box::new(role),
             cmd_tx,
@@ -501,7 +495,8 @@ where
         let mut last = None;
         let mut step1 = Step1Failures::default();
         for route in routes {
-            let pipe = match connect_tcp(route).await {
+            let pipe = match connect_tcp_within(route, ms(self.limits.io.connect_timeout_ms)).await
+            {
                 Ok(pipe) => pipe,
                 Err(e) => {
                     last = Some(e);
@@ -606,7 +601,7 @@ where
         Fut: Future<Output = Result<P, NetError>>,
     {
         let stored = self.records.load(&ticket.hash())?;
-        let mut pairing = JoinerPairing::new(
+        let mut pairing = JoinerPairing::with_limits(
             ticket.clone(),
             arrival,
             self.identity(),
@@ -619,6 +614,7 @@ where
             self.factory.clone(),
             stored.as_ref(),
             self.clock.now(),
+            &self.limits.core,
         )
         .map_err(NetError::Join)?;
         pairing.set_host_pinned(host_pinned);
@@ -660,7 +656,7 @@ where
         Fut: Future<Output = Result<P, NetError>>,
     {
         let mut result = self.join_once(pipe, ticket, joiner, codes).await;
-        let mut retries = OUTCOME_RETRIES.iter();
+        let mut retries = self.limits.outcome_retry_waits().into_iter();
         // Reconnect only while the outcome is unknown. A refusal the host
         // gave (or the joiner reached) on a reconnect is the answer: the
         // flow has failed, and that refusal is what the join reports.
@@ -675,7 +671,7 @@ where
                         .into(),
                 ));
             };
-            tokio::time::sleep(*wait).await;
+            tokio::time::sleep(wait).await;
             result = match redial().await {
                 Ok(pipe) => self.join_once(pipe, ticket, joiner, codes).await,
                 Err(e) => Err(e),
@@ -705,7 +701,7 @@ where
                 lock(&self.paths)
                     .sessions
                     .entry(pin)
-                    .or_insert_with(|| PeerSession::new(pin))
+                    .or_insert_with(|| PeerSession::with_limits(pin, &self.limits.core))
                     .on_path_closed(conn);
                 return Err(NetError::Join(e));
             }
@@ -769,7 +765,13 @@ where
     F: CodeExchangeFactory + Clone + Send + Sync + 'static,
     F::Exchange: Send,
 {
-    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    let Some(recheck) = caller
+        .upgrade()
+        .map(|caller| ms(caller.limits.io.clock_recheck_ms))
+    else {
+        return;
+    };
+    let mut interval = tokio::time::interval(recheck);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         interval.tick().await;
@@ -846,6 +848,9 @@ struct CallerRole<F: CodeExchangeFactory> {
     proof: Option<ControlMessage>,
     /// When the answer to our `JOIN_PROOF` is due, once it is sent.
     answer_due: Option<Millis>,
+    /// How long the answer may take
+    /// ([`IoLimits::proof_answer_wait_ms`](crate::limits::IoLimits::proof_answer_wait_ms)).
+    answer_wait_ms: u64,
     clock: Arc<dyn Clock>,
     paths: Arc<Mutex<Paths>>,
     conn: ConnectionId,
@@ -897,7 +902,7 @@ where
         if let Some(proof) = self.proof.take() {
             out.control.push(proof);
             self.gate.sent_join_proof();
-            self.answer_due = Some(self.clock.mono().plus(PROOF_ANSWER_WAIT_MS));
+            self.answer_due = Some(self.clock.mono().plus(self.answer_wait_ms));
         }
     }
 

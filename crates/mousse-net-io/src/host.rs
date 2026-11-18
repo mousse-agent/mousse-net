@@ -19,7 +19,6 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
-use std::time::Duration;
 
 use mousse_net_core::authz::{ConnectionGate, GateState, Traffic, Verdict};
 use mousse_net_core::control::{AuthorizedState, ControlMessage};
@@ -39,6 +38,7 @@ use crate::clock::Clock;
 use crate::conn::{self, CloseReason, Cmd, ConnStatus, Connection, Outbox, Role as ConnRole};
 use crate::endpoint::Endpoint;
 use crate::error::NetError;
+use crate::limits::{ms, Limits};
 use crate::pipe::Pipe;
 use crate::rng::os_rng;
 use crate::store::GrantStore;
@@ -54,8 +54,9 @@ pub struct HostConfig {
     pub state_dir: Option<PathBuf>,
     /// The local owner or profile that authorizes grants made here.
     pub owner: OwnerRef,
-    /// TLS policy.
-    pub policy: TlsPolicy,
+    /// Limits ([`Limits::DEFAULT`] unless the app overrides some).
+    /// [`Host::new`] refuses values outside their allowed ranges.
+    pub limits: Limits,
     /// Clock.
     pub clock: Arc<dyn Clock>,
     /// The identity tickets and pairing name, when it differs from the
@@ -76,7 +77,7 @@ impl HostConfig {
             name,
             state_dir: Some(endpoint.grants_dir()),
             owner: endpoint.owner()?,
-            policy: TlsPolicy::default(),
+            limits: Limits::DEFAULT,
             clock,
             ticket_identity: None,
         })
@@ -153,6 +154,7 @@ struct Shared<F: CodeExchangeFactory> {
     certs: CertManager,
     clock: Arc<dyn Clock>,
     policy: TlsPolicy,
+    limits: Limits,
     owner: OwnerRef,
     next_conn: AtomicU64,
     /// Tests stop the ticker to show what holds without it.
@@ -396,6 +398,10 @@ where
         config: HostConfig,
         factory: F,
     ) -> Result<(Self, mpsc::UnboundedReceiver<HostEvent>), NetError> {
+        config
+            .limits
+            .validate()
+            .map_err(|e| NetError::Refused(e.to_string()))?;
         let store = config.state_dir.as_deref().map(GrantStore::in_dir);
         let grants = match &store {
             Some(store) => store.load()?,
@@ -414,16 +420,22 @@ where
         let shared = Arc::new(Shared {
             inner: Mutex::new(Inner {
                 grants,
-                pairing: HostPairing::new(identity, config.name.clone(), factory),
+                pairing: HostPairing::with_limits(
+                    identity,
+                    config.name.clone(),
+                    factory,
+                    &config.limits.core,
+                ),
                 gates: HashMap::new(),
                 conns: HashMap::new(),
                 store,
                 unsaved: false,
                 events,
             }),
-            certs: CertManager::new(signer, config.clock.clone()),
+            certs: CertManager::with_limits(signer, config.clock.clone(), &config.limits),
             clock: config.clock,
-            policy: config.policy,
+            policy: TlsPolicy::from_limits(&config.limits),
+            limits: config.limits,
             owner: config.owner,
             next_conn: AtomicU64::new(1),
             #[cfg(test)]
@@ -450,20 +462,22 @@ where
         {
             let mut inner = lock(&self.shared);
             let inner = &mut *inner;
-            let gate = ConnectionGate::open(
+            let gate = ConnectionGate::open_with_limits(
                 conn,
                 peer,
                 &mut inner.grants,
                 self.shared.clock.now(),
                 self.shared.clock.mono(),
+                &self.shared.limits.core,
             );
             inner.gates.insert(conn, gate);
             inner.conns.insert(conn, cmd_tx.clone());
         }
+        let skew = self.shared.limits.core.clock_skew_secs;
         let deadline = handshake
             .local_window
-            .effective_deadline()
-            .min(handshake.peer.window.effective_deadline());
+            .deadline_with_skew(skew)
+            .min(handshake.peer.window.deadline_with_skew(skew));
         let role = HostRole {
             shared: self.shared.clone(),
             conn,
@@ -480,6 +494,7 @@ where
                 kx_group: handshake.kx_group,
                 deadline,
                 clock: self.shared.clock.clone(),
+                limits: self.shared.limits,
             },
             Box::new(role),
             cmd_tx,
@@ -622,9 +637,16 @@ where
     }
 }
 
-/// Grant expiry, invitation expiry and the join-proof wait, once a second.
+/// Grant expiry, invitation expiry and the join-proof wait, every
+/// [`IoLimits::clock_recheck_ms`](crate::limits::IoLimits::clock_recheck_ms).
 async fn ticker<F: CodeExchangeFactory>(shared: Weak<Shared<F>>) {
-    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    let Some(recheck) = shared
+        .upgrade()
+        .map(|shared| ms(shared.limits.io.clock_recheck_ms))
+    else {
+        return;
+    };
+    let mut interval = tokio::time::interval(recheck);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         interval.tick().await;
@@ -773,7 +795,7 @@ mod tests {
     use crate::clock::ManualClock;
 
     async fn within<T>(what: &str, fut: impl std::future::Future<Output = T>) -> T {
-        tokio::time::timeout(Duration::from_secs(5), fut)
+        tokio::time::timeout(std::time::Duration::from_secs(5), fut)
             .await
             .unwrap_or_else(|_| panic!("timed out: {what}"))
     }
@@ -795,7 +817,7 @@ mod tests {
             name: "desk".into(),
             state_dir: None,
             owner,
-            policy: TlsPolicy::default(),
+            limits: Limits::DEFAULT,
             clock: clock.clone(),
             ticket_identity: None,
         };
@@ -804,7 +826,7 @@ mod tests {
         let caller = Caller::new(
             Arc::new(SoftwareKey::generate(&mut os_rng())),
             Arc::new(ManualClock::new()),
-            TlsPolicy::default(),
+            Limits::DEFAULT,
         );
         let now = clock.now();
         let expires_at = UnixTime(now.0 + 60);

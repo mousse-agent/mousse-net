@@ -220,7 +220,8 @@ async fn connect(dir: &Path, addr: &str) -> Result<Option<Channel>, String> {
         let _ = dir;
         use tokio::net::windows::named_pipe::ClientOptions;
         const ERROR_PIPE_BUSY: i32 = 231;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let limits = crate::limits::helper();
+        let deadline = std::time::Instant::now() + crate::limits::ms(limits.pipe_busy_wait_ms);
         loop {
             match ClientOptions::new().open(addr) {
                 Ok(client) => return Ok(Some(Channel::new(client))),
@@ -228,7 +229,7 @@ async fn connect(dir: &Path, addr: &str) -> Result<Option<Channel>, String> {
                     if e.raw_os_error() == Some(ERROR_PIPE_BUSY)
                         && std::time::Instant::now() < deadline =>
                 {
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    tokio::time::sleep(crate::limits::ms(limits.pipe_busy_retry_ms)).await;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                 Err(e) => return Err(format!("control channel: {e}")),

@@ -14,8 +14,9 @@ use mousse_net_core::pairing::{
     Arrival, CodeExchangeFactory, ExchangeRole, InvitationKind, JoinerAction, JoinerName,
     JoinerPairing, JoinerRecord, JoinerState, PairedHost, PairingCode, Ticket,
 };
-use mousse_net_core::session::{PeerSession, SessionEvent, RENEW_LEAD_SECS};
+use mousse_net_core::session::{PeerSession, SessionEvent};
 use mousse_net_core::session_cert::SessionCertificate;
+use mousse_net_core::Limits;
 use mousse_net_core::{ConnectionId, ErrorCode};
 
 use crate::certs;
@@ -32,7 +33,7 @@ pub(crate) enum Mode {
     /// Not started yet.
     Idle,
     Joining(Box<JoinerPairing<CountingFactory>>),
-    Paired(PeerSession),
+    Paired(Box<PeerSession>),
     Intruder,
     Done,
 }
@@ -134,7 +135,7 @@ impl CallerDev {
             identity: certs::identity_key(key_label).public_key(),
             cert: certs::certificate(key_label, certs::grid(sim.wall(id)), lifetime),
             cert_lifetime: lifetime,
-            renew_lead: RENEW_LEAD_SECS,
+            renew_lead: Limits::DEFAULT.renew_lead_secs,
             mode: Mode::Idle,
             expected_host: None,
             host_dev: 0,
@@ -245,7 +246,7 @@ impl CallerDev {
             self.id,
             format_args!("starts, paired with {}", sim.who(&pin)),
         );
-        self.mode = Mode::Paired(PeerSession::new(pin));
+        self.mode = Mode::Paired(Box::new(PeerSession::new(pin)));
         self.dial(sim);
     }
 
@@ -757,7 +758,7 @@ impl CallerDev {
             cc.authorized = Some(AuthorizedState::Live);
             Self::open_terminal(cc);
         }
-        self.mode = Mode::Paired(session);
+        self.mode = Mode::Paired(Box::new(session));
         self.active = None;
     }
 

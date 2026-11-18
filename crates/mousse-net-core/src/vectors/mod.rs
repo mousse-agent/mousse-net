@@ -359,7 +359,7 @@ fn session_lifecycle_vectors() -> J {
     let local_nb = T + 3_600;
     let local_na = T + 3_600 + 43_200;
     let deadline = local_na + SKEW;
-    let renew_at = local_na - crate::session::RENEW_LEAD_SECS;
+    let renew_at = local_na - crate::Limits::DEFAULT.renew_lead_secs;
     json!({
         "description": "A live path closes with cert_expired at the first second after the effective deadline (earlier not_after + 600). Renewal is due 1800 s before the earlier not_after; while no new path with a later renewal time is current it is asked for again after 30 s, then 60, 120, 240 and every 300 s, until the deadline. Replay: begin_path(1), on_authenticated(1, verify(peer_certificate, authenticated_at, pin), local window, authenticated_at, monotonic 0 ms), on_reopened(1), then tick at each `now`. Monotonic clock: a tick (or a later on_authenticated) without `mono_ms` reads (now - authenticated_at) x 1000 ms, as if no one touched the wall clock.",
         "peer_certificate": hex(&peer),

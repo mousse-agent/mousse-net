@@ -27,29 +27,14 @@ use crate::cbor::{self, Fields, Value};
 use crate::control::{AuthorizedState, ControlMessage};
 use crate::grants::{validate_name, Role};
 use crate::identity::IdentityPublicKey;
+use crate::limits::Limits;
 use crate::time::UnixTime;
 use crate::ErrorCode;
 
-/// Code attempts the joiner allows per ticket, by default (wire.md 10.7).
-/// Also the most a stored [`JoinerRecord`] may hold.
+/// The most code attempts a stored [`JoinerRecord`] may hold (wire.md
+/// 10.7). A record format bound, so not a setting:
+/// [`Limits::joiner_attempts_per_flow`] can only be lower.
 pub const JOINER_ATTEMPTS_PER_FLOW: u8 = 3;
-
-/// The joiner's limits. [`Default`] gives the protocol's.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct JoinerLimits {
-    /// Code attempts per ticket, across every time it is opened. A stored
-    /// record holds at most [`JOINER_ATTEMPTS_PER_FLOW`], so a larger value
-    /// is cut to that.
-    pub attempts_per_flow: u8,
-}
-
-impl Default for JoinerLimits {
-    fn default() -> Self {
-        Self {
-            attempts_per_flow: JOINER_ATTEMPTS_PER_FLOW,
-        }
-    }
-}
 
 /// What the joiner shows when a code attempt fails. The joiner cannot tell
 /// a mistyped code from a swapped link, so it names both.
@@ -305,6 +290,8 @@ pub struct JoinerPairing<F: CodeExchangeFactory> {
     state: JoinerState,
     /// Attempts a flow with nothing stored starts with.
     attempts_per_flow: u8,
+    /// Clock skew allowed on the ticket's expiry.
+    skew_secs: u64,
     attempts_left: u8,
     attempt: Option<JoinerAttempt<F::Exchange>>,
     exporters: Option<SessionExporters>,
@@ -337,7 +324,7 @@ impl<F: CodeExchangeFactory> JoinerPairing<F> {
     /// the [`JoinerRecord`] kept for this ticket hash by an earlier start,
     /// if any: the flow then goes on with its attempt count and pending
     /// outcome. Every refusal here happens before dialing. Uses the default
-    /// [`JoinerLimits`]; see [`JoinerPairing::with_limits`].
+    /// limits; see [`JoinerPairing::with_limits`].
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         ticket: Ticket,
@@ -356,11 +343,12 @@ impl<F: CodeExchangeFactory> JoinerPairing<F> {
             factory,
             stored,
             now,
-            JoinerLimits::default(),
+            &Limits::DEFAULT,
         )
     }
 
-    /// [`JoinerPairing::new`] with other limits.
+    /// [`JoinerPairing::new`] with other limits (code attempts per flow,
+    /// clock skew). Attempts above the record's bound are cut to it.
     #[allow(clippy::too_many_arguments)]
     pub fn with_limits(
         ticket: Ticket,
@@ -370,9 +358,12 @@ impl<F: CodeExchangeFactory> JoinerPairing<F> {
         factory: F,
         stored: Option<&JoinerRecord>,
         now: UnixTime,
-        limits: JoinerLimits,
+        limits: &Limits,
     ) -> Result<Self, JoinerError> {
-        let attempts_per_flow = limits.attempts_per_flow.min(JOINER_ATTEMPTS_PER_FLOW);
+        let attempts_per_flow = u8::try_from(limits.joiner_attempts_per_flow)
+            .unwrap_or(u8::MAX)
+            .min(JOINER_ATTEMPTS_PER_FLOW);
+        let skew_secs = limits.clock_skew_secs;
         if ticket.host_identity == joiner {
             return Err(JoinerError::OwnTicket);
         }
@@ -402,7 +393,7 @@ impl<F: CodeExchangeFactory> JoinerPairing<F> {
         // ticket: a grant outlives its invitation.
         if !outcome_pending {
             ticket
-                .check_fresh_for_joiner(now)
+                .check_fresh_for_joiner_with_skew(now, skew_secs)
                 .map_err(|_| JoinerError::Expired)?;
             if ticket.kind == InvitationKind::SendLink && attempts_left == 0 {
                 return Err(JoinerError::AttemptsExhausted);
@@ -416,6 +407,7 @@ impl<F: CodeExchangeFactory> JoinerPairing<F> {
             factory,
             state: JoinerState::Connecting,
             attempts_per_flow,
+            skew_secs,
             attempts_left,
             attempt: None,
             exporters: None,
@@ -544,7 +536,12 @@ impl<F: CodeExchangeFactory> JoinerPairing<F> {
         }
         // A pending outcome is learned from step 2, which needs no fresh
         // ticket: a grant outlives its invitation.
-        if !self.outcome_pending && self.ticket.check_fresh_for_joiner(now).is_err() {
+        if !self.outcome_pending
+            && self
+                .ticket
+                .check_fresh_for_joiner_with_skew(now, self.skew_secs)
+                .is_err()
+        {
             self.state = JoinerState::Failed(ErrorCode::InvitationInvalid);
             return Err(JoinerError::Expired);
         }

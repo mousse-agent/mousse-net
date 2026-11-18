@@ -53,22 +53,39 @@ use tokio_rustls::TlsStream;
 
 use crate::clock::Clock;
 use crate::error::NetError;
+use crate::limits::{ms, Limits};
 use crate::pipe::Pipe;
 
-/// Queued bytes per stream above which [`StreamWriter::write`] waits.
-pub const WRITE_HIGH_WATER: usize = 256 * 1024;
+/// The driver's limits, from [`Limits`], as the types it uses.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DriverLimits {
+    /// Queued bytes per stream above which [`StreamWriter::write`] waits.
+    write_high_water: usize,
+    /// How long a closing connection may take to send its last frame and
+    /// shut the pipe down before it is dropped.
+    close_linger: Duration,
+    /// How often a write still pending checks the deadline.
+    deadline_poll: Duration,
+    /// The longest the driver sleeps without reading both clocks again.
+    /// Timers do not run while a device sleeps, so this is what notices, on
+    /// resume, a deadline that passed meanwhile.
+    recheck: Duration,
+    /// Bytes read from the pipe at a time.
+    read_buffer: usize,
+}
 
-/// How long a closing connection may take to send its last frame and shut
-/// the pipe down before it is dropped.
-const CLOSE_LINGER: Duration = Duration::from_secs(2);
-
-/// How often a write still pending checks the deadline.
-const DEADLINE_POLL: Duration = Duration::from_millis(50);
-
-/// The longest the driver sleeps without reading both clocks again. Timers
-/// do not run while a device sleeps, so this is what notices, on resume,
-/// a deadline that passed meanwhile.
-const RECHECK: Duration = Duration::from_secs(1);
+impl DriverLimits {
+    fn new(limits: &Limits) -> Self {
+        let io = &limits.io;
+        Self {
+            write_high_water: usize::try_from(io.write_high_water_bytes).unwrap_or(usize::MAX),
+            close_linger: ms(io.close_linger_ms),
+            deadline_poll: ms(io.deadline_poll_ms),
+            recheck: ms(io.clock_recheck_ms),
+            read_buffer: usize::try_from(io.read_buffer_bytes).unwrap_or(usize::MAX),
+        }
+    }
+}
 
 /// The end of a connection: the effective deadline on the wall clock, and
 /// the same span on the monotonic clock from when the connection started
@@ -297,8 +314,9 @@ pub struct StreamWriter {
 }
 
 impl StreamWriter {
-    /// Queue bytes. Waits while more than [`WRITE_HIGH_WATER`] bytes are
-    /// queued on this stream.
+    /// Queue bytes. Waits while more than
+    /// [`IoLimits::write_high_water_bytes`](crate::limits::IoLimits::write_high_water_bytes)
+    /// are queued on this stream.
     pub async fn write(&self, bytes: &[u8]) -> Result<(), NetError> {
         if bytes.is_empty() {
             return Ok(());
@@ -526,6 +544,7 @@ pub(crate) struct Start<P: Pipe> {
     pub kx_group: String,
     pub deadline: UnixTime,
     pub clock: Arc<dyn Clock>,
+    pub limits: Limits,
 }
 
 /// A command sender for a driver that is about to start. The host registers
@@ -554,7 +573,8 @@ pub(crate) fn spawn<P: Pipe>(
         incoming: tokio::sync::Mutex::new(accept_rx),
     };
     let driver = Driver {
-        mux: Mux::new(start.side, start.clock.mono()),
+        mux: Mux::with_limits(start.side, start.clock.mono(), &start.limits.core),
+        limits: DriverLimits::new(&start.limits),
         deadline: Deadline::new(start.deadline, &*start.clock),
         clock: start.clock,
         role,
@@ -574,6 +594,7 @@ pub(crate) fn spawn<P: Pipe>(
 
 struct Driver {
     mux: Mux,
+    limits: DriverLimits,
     clock: Arc<dyn Clock>,
     deadline: Deadline,
     role: Box<dyn Role>,
@@ -620,7 +641,13 @@ impl Driver {
         // TLS (where a credit could go stale after a FIN, or data outlive
         // the deadline).
         let (ask_tx, mut ask_rx) = mpsc::channel::<oneshot::Sender<Vec<u8>>>(1);
-        let mut writer = tokio::spawn(writer_task(wr, ask_tx, self.clock.clone(), self.deadline));
+        let mut writer = tokio::spawn(writer_task(
+            wr,
+            ask_tx,
+            self.clock.clone(),
+            self.deadline,
+            self.limits,
+        ));
         let mut slot: Option<oneshot::Sender<Vec<u8>>> = None;
 
         let hello = ControlMessage::Hello {
@@ -632,7 +659,7 @@ impl Driver {
         self.role.on_start(&mut out);
         self.apply(out);
 
-        let mut buf = vec![0u8; 32 * 1024];
+        let mut buf = vec![0u8; self.limits.read_buffer];
         let mut inbuf: Vec<u8> = Vec::new();
         // Once closing, the writer has this long to take the GOAWAY.
         let mut give_up: Option<Instant> = None;
@@ -645,7 +672,7 @@ impl Driver {
                 self.mark_closing();
             }
             if self.mux.is_closing() && give_up.is_none() {
-                give_up = Some(Instant::now() + CLOSE_LINGER);
+                give_up = Some(Instant::now() + self.limits.close_linger);
             }
             if slot.is_some() {
                 if let Some(frame) = self.next_frame() {
@@ -716,7 +743,7 @@ impl Driver {
         // stopped, so the pipe does not stay open.
         drop(slot);
         drop(ask_rx);
-        if tokio::time::timeout(CLOSE_LINGER, &mut writer)
+        if tokio::time::timeout(self.limits.close_linger, &mut writer)
             .await
             .is_err()
         {
@@ -735,7 +762,8 @@ impl Driver {
     fn next_wake(&self) -> Instant {
         let now = Instant::now();
         let mono = self.clock.mono();
-        let mut wake = now + Duration::from_secs(3600);
+        // Never later than the recheck.
+        let mut wake = now + self.limits.recheck;
         if let Some(t) = self.mux.poll_timeout() {
             wake = wake.min(now + Duration::from_millis(t.since(mono)));
         }
@@ -751,7 +779,6 @@ impl Driver {
             .saturating_sub(wall.secs());
         wake.min(now + Duration::from_secs(until_deadline))
             .min(now + Duration::from_millis(self.deadline.mono.since(mono)))
-            .min(now + RECHECK)
     }
 
     fn on_timer(&mut self) {
@@ -911,7 +938,9 @@ impl Driver {
                 continue;
             }
             match self.mux.queued(stream) {
-                Some(queued) if queued > WRITE_HIGH_WATER => still.push((stream, reply)),
+                Some(queued) if queued > self.limits.write_high_water => {
+                    still.push((stream, reply))
+                }
                 // Below the mark, or the stream already completed.
                 _ => {
                     let _ = reply.send(Ok(()));
@@ -1089,6 +1118,7 @@ async fn writer_task<P: Pipe>(
     ask: mpsc::Sender<oneshot::Sender<Vec<u8>>>,
     clock: Arc<dyn Clock>,
     deadline: Deadline,
+    limits: DriverLimits,
 ) {
     loop {
         let (tx, rx) = oneshot::channel();
@@ -1107,13 +1137,16 @@ async fn writer_task<P: Pipe>(
             wr.flush().await
         };
         let sent = if goaway {
-            matches!(tokio::time::timeout(CLOSE_LINGER, send).await, Ok(Ok(())))
+            matches!(
+                tokio::time::timeout(limits.close_linger, send).await,
+                Ok(Ok(()))
+            )
         } else {
             // The deadline is checked first on every poll, so the pipe can
             // take more of the frame only while the deadline has not passed.
             tokio::select! {
                 biased;
-                () = past(&*clock, deadline) => return,
+                () = past(&*clock, deadline, limits.deadline_poll) => return,
                 result = send => result.is_ok(),
             }
         };
@@ -1124,7 +1157,7 @@ async fn writer_task<P: Pipe>(
             break;
         }
     }
-    let _ = tokio::time::timeout(CLOSE_LINGER, wr.shutdown()).await;
+    let _ = tokio::time::timeout(limits.close_linger, wr.shutdown()).await;
 }
 
 async fn sleep_until_some(at: Option<Instant>) {
@@ -1136,9 +1169,13 @@ async fn sleep_until_some(at: Option<Instant>) {
 
 /// Ready once `clock` is past `deadline`. The clock is read on every poll
 /// (also when whatever it races against wakes the task) and at least every
-/// [`DEADLINE_POLL`].
-fn past(clock: &dyn Clock, deadline: Deadline) -> impl std::future::Future<Output = ()> + '_ {
-    let mut tick = tokio::time::interval(DEADLINE_POLL);
+/// `poll`.
+fn past(
+    clock: &dyn Clock,
+    deadline: Deadline,
+    poll: Duration,
+) -> impl std::future::Future<Output = ()> + '_ {
+    let mut tick = tokio::time::interval(poll);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     std::future::poll_fn(move |cx| {
         if deadline.passed(clock) {
@@ -1349,6 +1386,7 @@ mod tests {
                 kx_group: handshake.kx_group,
                 deadline: UnixTime(clock.now().0 + deadline_in),
                 clock: clock.clone(),
+                limits: Limits::DEFAULT,
             },
             Box::new(OpenRole),
             cmd_tx,

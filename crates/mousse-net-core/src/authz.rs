@@ -8,7 +8,8 @@
 //!   Pairing messages only, no streams, no RPC;
 //! - **closed** — anything else.
 //!
-//! A peer with no grant has [`JOIN_PROOF_WAIT_MS`] to send a `JOIN_PROOF`.
+//! A peer with no grant has [`Limits::join_proof_wait_ms`] to send a
+//! `JOIN_PROOF`.
 //! Until then only `HELLO`, keepalive, `GOAWAY` and `JOIN_PROOF` are allowed.
 //!
 //! A granted peer may still send one `JOIN_PROOF`, before any stream: the
@@ -32,13 +33,10 @@
 use crate::control::{AuthorizedState, ControlMessage};
 use crate::grants::{GrantId, GrantTable, Role};
 use crate::identity::IdentityPublicKey;
+use crate::limits::Limits;
 use crate::pairing::InvitationId;
 use crate::time::{Millis, UnixTime};
 use crate::{ConnectionId, ErrorCode};
-
-/// How long a connection without a grant may wait before sending its join
-/// proof, in milliseconds.
-pub const JOIN_PROOF_WAIT_MS: u64 = 10_000;
 
 /// The step 2 decision at connection time.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -152,7 +150,8 @@ pub struct ConnectionGate {
 
 impl ConnectionGate {
     /// Run step 2 for a new connection whose certificate passed step 1. A
-    /// live result binds the connection to its grant in `grants`.
+    /// live result binds the connection to its grant in `grants`. Uses the
+    /// default limits; see [`ConnectionGate::open_with_limits`].
     pub fn open(
         conn: ConnectionId,
         peer: IdentityPublicKey,
@@ -160,13 +159,25 @@ impl ConnectionGate {
         now: UnixTime,
         mono: Millis,
     ) -> Self {
+        Self::open_with_limits(conn, peer, grants, now, mono, &Limits::DEFAULT)
+    }
+
+    /// [`ConnectionGate::open`] with other limits.
+    pub fn open_with_limits(
+        conn: ConnectionId,
+        peer: IdentityPublicKey,
+        grants: &mut GrantTable,
+        now: UnixTime,
+        mono: Millis,
+        limits: &Limits,
+    ) -> Self {
         let state = match decide(grants, &peer, now) {
             Step2::Live { grant, .. } => match grants.bind(conn, grant, now) {
                 Ok(()) => GateState::Live { grant },
                 Err(_) => GateState::Closed(ErrorCode::NotAuthorized),
             },
             Step2::AwaitJoinProof => GateState::AwaitingJoinProof {
-                deadline: mono.plus(JOIN_PROOF_WAIT_MS),
+                deadline: mono.plus(limits.join_proof_wait_ms),
             },
             Step2::Close(code) => GateState::Closed(code),
         };
@@ -690,10 +701,36 @@ mod tests {
     fn join_proof_wait_times_out() {
         let mut grants = GrantTable::new();
         let mut gate = ConnectionGate::open(ConnectionId(1), id(2), &mut grants, NOW, Millis(100));
-        assert_eq!(gate.poll_timeout(), Some(Millis(100 + JOIN_PROOF_WAIT_MS)));
-        assert_eq!(gate.on_timeout(Millis(100 + JOIN_PROOF_WAIT_MS - 1)), None);
         assert_eq!(
-            gate.on_timeout(Millis(100 + JOIN_PROOF_WAIT_MS)),
+            gate.poll_timeout(),
+            Some(Millis(100 + Limits::DEFAULT.join_proof_wait_ms))
+        );
+        assert_eq!(
+            gate.on_timeout(Millis(100 + Limits::DEFAULT.join_proof_wait_ms - 1)),
+            None
+        );
+        assert_eq!(
+            gate.on_timeout(Millis(100 + Limits::DEFAULT.join_proof_wait_ms)),
+            Some(ErrorCode::NotAuthorized)
+        );
+    }
+
+    #[test]
+    fn a_tightened_join_proof_wait_is_used() {
+        let mut limits = Limits::DEFAULT;
+        limits.set("JOIN_PROOF_WAIT_MS", 2_000).unwrap();
+        let mut grants = GrantTable::new();
+        let mut gate = ConnectionGate::open_with_limits(
+            ConnectionId(1),
+            id(2),
+            &mut grants,
+            NOW,
+            Millis(100),
+            &limits,
+        );
+        assert_eq!(gate.poll_timeout(), Some(Millis(2_100)));
+        assert_eq!(
+            gate.on_timeout(Millis(2_100)),
             Some(ErrorCode::NotAuthorized)
         );
     }

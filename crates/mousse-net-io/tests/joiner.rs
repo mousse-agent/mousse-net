@@ -11,11 +11,10 @@ use common::*;
 use mousse_net_core::pairing::{Arrival, InvitationKind, JoinerError, JoinerRecord, Ticket};
 use mousse_net_core::session_cert::CertError;
 use mousse_net_core::ErrorCode;
-use mousse_net_io::caller::PROOF_ANSWER_WAIT_MS;
 use mousse_net_io::certs::CertManager;
 use mousse_net_io::pipe::{connect_tcp, parse_route};
 use mousse_net_io::store::{FlowRecordStore, FlowRecords};
-use mousse_net_io::{tls, Caller, JoinOutcome, ManualClock, NetError, NoCode, TlsPolicy};
+use mousse_net_io::{tls, Caller, JoinOutcome, Limits, ManualClock, NetError, NoCode, TlsPolicy};
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 
@@ -301,7 +300,7 @@ async fn a_proof_with_no_answer_closes_after_ten_seconds() {
             .is_err(),
         "gave up before the wait was over"
     );
-    clock.advance_mono(PROOF_ANSWER_WAIT_MS);
+    clock.advance_mono(Limits::DEFAULT.io.proof_answer_wait_ms);
     let err = within("give up", join).await.unwrap_err();
     assert!(closed_with(&err, ErrorCode::NotAuthorized), "{err:?}");
     silent.abort();

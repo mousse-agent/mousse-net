@@ -18,6 +18,7 @@
 //! - [`pairing`]: tickets, join proofs, host and joiner pairing state machines.
 //! - [`mux`]: frame codec, per-stream credit, priority scheduler, keepalive.
 //! - [`session`]: certificate-driven session lifetime and path switching.
+//! - [`limits`]: every tunable limit, its default and allowed range.
 #![forbid(unsafe_code)]
 
 // Must-fail controls (spec/vectors/README.md, "Must-fail controls") plant a
@@ -71,6 +72,7 @@ pub mod control;
 pub mod cpace;
 pub mod grants;
 pub mod identity;
+pub mod limits;
 pub mod mux;
 pub mod pairing;
 pub mod session;
@@ -81,7 +83,8 @@ pub mod time;
 mod vectors;
 
 pub use codes::ErrorCode;
-pub use time::{Millis, UnixTime, CLOCK_SKEW_SECS};
+pub use limits::Limits;
+pub use time::{Millis, UnixTime};
 
 /// Major protocol version. It is signed into every session certificate and
 /// carried in every pairing ticket. A new major version means re-pairing.

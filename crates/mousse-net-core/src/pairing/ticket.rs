@@ -16,14 +16,12 @@ use super::{InvitationId, InvitationKind};
 use crate::base64url;
 use crate::cbor::{self, FieldError, Fields, Value};
 use crate::identity::IdentityPublicKey;
-use crate::time::{UnixTime, CLOCK_SKEW_SECS};
+use crate::limits::Limits;
+use crate::time::UnixTime;
 use crate::PROTOCOL_VERSION;
 
 /// Ticket format version. Equal to the major protocol version.
 pub const TICKET_VERSION: u64 = PROTOCOL_VERSION;
-
-/// How long an invitation stays open, in seconds (10 minutes).
-pub const TICKET_LIFETIME_SECS: u64 = 600;
 
 /// Most route hints a ticket may carry.
 pub const MAX_ROUTES: usize = 8;
@@ -217,10 +215,19 @@ impl Ticket {
         Sha256::digest(self.encode()).into()
     }
 
-    /// Joiner-side freshness: valid while `now < expires_at + 10 min`. The
-    /// host checks its own record without skew.
+    /// Joiner-side freshness: valid while `now < expires_at + 10 min` (the
+    /// default skew). The host checks its own record without skew.
     pub fn check_fresh_for_joiner(&self, now: UnixTime) -> Result<(), TicketError> {
-        if now < self.expires_at.plus(CLOCK_SKEW_SECS) {
+        self.check_fresh_for_joiner_with_skew(now, Limits::DEFAULT.clock_skew_secs)
+    }
+
+    /// Joiner-side freshness: valid while `now < expires_at + skew`.
+    pub fn check_fresh_for_joiner_with_skew(
+        &self,
+        now: UnixTime,
+        skew_secs: u64,
+    ) -> Result<(), TicketError> {
+        if now < self.expires_at.plus(skew_secs) {
             Ok(())
         } else {
             Err(TicketError::Expired)
