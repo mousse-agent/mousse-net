@@ -51,6 +51,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 use tokio_rustls::TlsStream;
 
+use crate::admission::{ConnStreams, StreamAdmission, StreamPermit};
 use crate::clock::Clock;
 use crate::error::NetError;
 use crate::limits::{ms, Limits};
@@ -246,13 +247,46 @@ enum StreamEvent {
     ConnectionClosed(CloseReason),
 }
 
-/// The receiving half of a stream.
+/// The driver's end of one stream's receive side. A peer reset is also
+/// posted on `reset`, so a reader that is holding back still learns of it
+/// ([`StreamReader::reset_by_peer`]).
+struct StreamTx {
+    events: mpsc::UnboundedSender<StreamEvent>,
+    reset: watch::Sender<Option<ErrorCode>>,
+}
+
+impl StreamTx {
+    fn send(&self, event: StreamEvent) -> Result<(), ()> {
+        if let StreamEvent::Reset(code) = &event {
+            self.reset.send_replace(Some(*code));
+        }
+        self.events.send(event).map_err(|_| ())
+    }
+}
+
+/// The receiving half of a stream. It holds the stream's place (see
+/// [`crate::admission`]) until it is dropped.
 pub struct StreamReader {
     id: StreamId,
     rx: mpsc::UnboundedReceiver<StreamEvent>,
     cmd: mpsc::UnboundedSender<Cmd>,
     ended: Option<Result<(), NetError>>,
     closing: watch::Receiver<bool>,
+    admission: Arc<StreamAdmission>,
+    _permit: Arc<StreamPermit>,
+    reset: watch::Receiver<Option<ErrorCode>>,
+}
+
+impl Drop for StreamReader {
+    fn drop(&mut self) {
+        // Bytes nobody will read leave the queue gauge.
+        self.rx.close();
+        while let Ok(event) = self.rx.try_recv() {
+            if let StreamEvent::Data(bytes) = event {
+                self.admission.sub_queued(bytes.len() as u64);
+            }
+        }
+    }
 }
 
 impl StreamReader {
@@ -269,6 +303,7 @@ impl StreamReader {
         let event = self.rx.recv().await;
         let result = match event {
             Some(StreamEvent::Data(bytes)) => {
+                self.admission.sub_queued(bytes.len() as u64);
                 let _ = self.cmd.send(Cmd::Release(self.id, bytes.len() as u64));
                 return Ok(Some(bytes));
             }
@@ -289,6 +324,23 @@ impl StreamReader {
     /// [`StreamWriter::closing`]).
     pub async fn closing(&self) {
         wait_closing(self.closing.clone()).await;
+    }
+
+    /// Wait until the peer resets the stream, and return its code. Unlike
+    /// [`StreamReader::read`], this does not take bytes off the queue, so
+    /// a reader that holds back (for example for want of credit further
+    /// on) still learns of a reset at once. Never returns for a stream that
+    /// ends any other way.
+    pub async fn reset_by_peer(&self) -> ErrorCode {
+        let mut rx = self.reset.clone();
+        let code = match rx.wait_for(Option::is_some).await {
+            Ok(code) => *code,
+            Err(_) => None,
+        };
+        match code {
+            Some(code) => code,
+            None => std::future::pending().await,
+        }
     }
 }
 
@@ -545,6 +597,8 @@ pub(crate) struct Start<P: Pipe> {
     pub deadline: UnixTime,
     pub clock: Arc<dyn Clock>,
     pub limits: Limits,
+    /// The endpoint's stream places, shared by all its connections.
+    pub streams: Arc<StreamAdmission>,
 }
 
 /// A command sender for a driver that is about to start. The host registers
@@ -575,6 +629,8 @@ pub(crate) fn spawn<P: Pipe>(
     let driver = Driver {
         mux: Mux::with_limits(start.side, start.clock.mono(), start.limits.core()),
         limits: DriverLimits::new(&start.limits),
+        admit: start.streams.connection(),
+        permits: HashMap::new(),
         deadline: Deadline::new(start.deadline, &*start.clock),
         clock: start.clock,
         role,
@@ -602,7 +658,12 @@ struct Driver {
     status: watch::Sender<ConnStatus>,
     closing: watch::Sender<bool>,
     accept: mpsc::UnboundedSender<MuxStream>,
-    streams: HashMap<u32, mpsc::UnboundedSender<StreamEvent>>,
+    streams: HashMap<u32, StreamTx>,
+    /// This connection's stream places.
+    admit: ConnStreams,
+    /// The places of the streams the mux still has. A stream's reader
+    /// holds its place too, so it frees once both are done.
+    permits: HashMap<u32, Arc<StreamPermit>>,
     blocked: Vec<(StreamId, oneshot::Sender<Result<(), NetError>>)>,
     /// The peer's `HELLO`s so far.
     hello: HelloState,
@@ -682,6 +743,7 @@ impl Driver {
                 }
             }
             self.release_blocked();
+            self.sweep_permits();
             if self.before_close.is_empty() && self.mux.is_closed() {
                 break;
             }
@@ -876,11 +938,13 @@ impl Driver {
                     ))
                 } else if !self.role.may_open() {
                     Err(NetError::Refused("the connection is not authorized".into()))
-                } else {
+                } else if let Some(permit) = self.admit.try_admit() {
                     self.mux
                         .open_stream(class, &label)
-                        .map(|id| self.new_stream(id, class, label))
+                        .map(|id| self.new_stream(id, class, label, permit))
                         .map_err(stream_err)
+                } else {
+                    Err(NetError::StreamLimit)
                 };
                 let _ = reply.send(result);
             }
@@ -925,6 +989,28 @@ impl Driver {
         }
     }
 
+    /// A place for a stream the peer opened, if the caps allow one.
+    fn admit_peer_stream(&self) -> Option<Arc<StreamPermit>> {
+        #[cfg(mousse_control = "no-stream-cap")]
+        {
+            Some(self.admit.admit_anyway())
+        }
+        #[cfg(not(mousse_control = "no-stream-cap"))]
+        {
+            self.admit.try_admit()
+        }
+    }
+
+    /// Let go of the places of streams the mux is done with. Their readers
+    /// may still hold them.
+    fn sweep_permits(&mut self) {
+        if self.permits.is_empty() {
+            return;
+        }
+        let mux = &self.mux;
+        self.permits.retain(|id, _| mux.has_stream(StreamId(*id)));
+    }
+
     fn release_blocked(&mut self) {
         if self.blocked.is_empty() {
             return;
@@ -950,9 +1036,17 @@ impl Driver {
         self.blocked = still;
     }
 
-    fn new_stream(&mut self, id: StreamId, class: PriorityClass, label: String) -> MuxStream {
+    fn new_stream(
+        &mut self,
+        id: StreamId,
+        class: PriorityClass,
+        label: String,
+        permit: Arc<StreamPermit>,
+    ) -> MuxStream {
         let (tx, rx) = mpsc::unbounded_channel();
-        self.streams.insert(id.0, tx);
+        let (reset, reset_rx) = watch::channel(None);
+        self.streams.insert(id.0, StreamTx { events: tx, reset });
+        self.permits.insert(id.0, permit.clone());
         MuxStream {
             reader: StreamReader {
                 id,
@@ -960,6 +1054,9 @@ impl Driver {
                 cmd: self.cmd_tx.clone(),
                 ended: None,
                 closing: self.closing.subscribe(),
+                admission: self.admit.admission().clone(),
+                _permit: permit,
+                reset: reset_rx,
             },
             writer: StreamWriter {
                 id,
@@ -1048,17 +1145,31 @@ impl Driver {
                 class,
                 label,
             } => {
-                let s = self.new_stream(stream, class, label);
+                // Admission: a stream past either cap is refused before
+                // anything is queued for it (Phase 1a §2.2).
+                let Some(permit) = self.admit_peer_stream() else {
+                    self.admit.refused();
+                    let _ = self.mux.reset(stream, ErrorCode::RefusedStream);
+                    return;
+                };
+                let s = self.new_stream(stream, class, label, permit);
                 if self.accept.send(s).is_err() {
                     self.streams.remove(&stream.0);
                     let _ = self.mux.reset(stream, ErrorCode::RefusedStream);
                 }
             }
             MuxEvent::Data { stream, bytes } => {
+                let n = bytes.len() as u64;
+                let admission = self.admit.admission();
+                // Counted before the reader can take it.
+                admission.add_queued(n);
                 let delivered = self
                     .streams
                     .get(&stream.0)
                     .is_some_and(|tx| tx.send(StreamEvent::Data(bytes)).is_ok());
+                if !delivered {
+                    admission.sub_queued(n);
+                }
                 if !delivered && self.streams.remove(&stream.0).is_some() {
                     let _ = self.mux.reset(stream, ErrorCode::Cancelled);
                 }
@@ -1387,6 +1498,7 @@ mod tests {
                 deadline: UnixTime(clock.now().0 + deadline_in),
                 clock: clock.clone(),
                 limits: Limits::DEFAULT,
+                streams: StreamAdmission::new(&Limits::DEFAULT),
             },
             Box::new(OpenRole),
             cmd_tx,

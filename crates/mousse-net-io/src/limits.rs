@@ -44,6 +44,10 @@ mousse_net_core::define_limits! {
         mdns_rotate_ms = "MDNS_ROTATE_MS": 900_000, [60_000, 900_000];
         /// How often the advertiser checks whether the name is due to change.
         mdns_rotate_check_ms = "MDNS_ROTATE_CHECK_MS": 5_000, [100, 30_000];
+        /// Streams one connection may have open, both directions counted; a peer's open beyond it is refused with REFUSED_STREAM. Each holds up to 256 KiB of received data before it is read (wire.md 9.2; at most the spec's 1 024).
+        streams_per_connection = "STREAMS_PER_CONNECTION": 32, [1, 1_024];
+        /// Streams all connections of one endpoint (one helper) may have open together, both directions counted; a peer's open beyond it is refused with REFUSED_STREAM.
+        streams_per_endpoint = "STREAMS_PER_ENDPOINT": 128, [1, 1_024];
     }
     agree(io) {
         if io.outcome_retry_max_ms < io.outcome_retry_first_ms {
@@ -148,6 +152,10 @@ mod tests {
         // wire.md 6: a connection closes in the first second after its
         // deadline, so the clocks are read at least once a second.
         assert_eq!(d.clock_recheck_ms(), 1_000);
+        // Phase 1a §2.2: 32 streams a connection and 128 an endpoint keep
+        // initial credit at 8 MiB a connection and 32 MiB an endpoint.
+        assert_eq!(d.streams_per_connection(), 32);
+        assert_eq!(d.streams_per_endpoint(), 128);
         assert_eq!(Limits::DEFAULT.with_overrides(&[]), Ok(Limits::DEFAULT));
         assert_eq!(Limits::default(), Limits::DEFAULT);
     }

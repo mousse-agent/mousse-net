@@ -64,6 +64,7 @@ use mousse_net_core::session_cert::CertError;
 use mousse_net_core::{ConnectionId, ErrorCode, Millis};
 use tokio::sync::mpsc;
 
+use crate::admission::StreamAdmission;
 use crate::certs::CertManager;
 use crate::clock::Clock;
 use crate::conn::{self, CloseReason, Cmd, ConnStatus, Connection, Outbox, Role as ConnRole};
@@ -157,6 +158,7 @@ pub struct Caller<F: CodeExchangeFactory + Clone = CpaceExchangeFactory> {
     paths: Arc<Mutex<Paths>>,
     next_conn: AtomicU64,
     records: Arc<dyn FlowRecords>,
+    streams: Arc<StreamAdmission>,
     /// Joins that ended paired with their outcome still marked pending,
     /// by ticket hash, until the app says the pin is stored. Each still
     /// holds its ticket.
@@ -243,6 +245,7 @@ where
             paths: Arc::new(Mutex::new(Paths::default())),
             next_conn: AtomicU64::new(1),
             records: Arc::new(MemoryFlowRecords::default()),
+            streams: StreamAdmission::new(&limits),
             settling: Mutex::new(HashMap::new()),
         }
     }
@@ -252,6 +255,18 @@ where
     /// endpoint state ([`crate::Endpoint::flow_records`]).
     pub fn use_flow_records(&mut self, records: Arc<dyn FlowRecords>) {
         self.records = records;
+    }
+
+    /// Share the stream places of `streams` (by default the caller has its
+    /// own, from its limits). A host and a caller of the same endpoint
+    /// share one, so its caps count every connection of the endpoint.
+    pub fn use_stream_admission(&mut self, streams: Arc<StreamAdmission>) {
+        self.streams = streams;
+    }
+
+    /// The stream places this caller's connections use.
+    pub fn stream_admission(&self) -> Arc<StreamAdmission> {
+        self.streams.clone()
     }
 
     /// The app has durably stored the pin for the host of `ticket`, after a
@@ -427,6 +442,7 @@ where
                 deadline,
                 clock: self.clock.clone(),
                 limits: self.limits,
+                streams: self.streams.clone(),
             },
             Box::new(role),
             cmd_tx,

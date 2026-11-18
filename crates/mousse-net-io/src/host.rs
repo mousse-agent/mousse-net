@@ -33,6 +33,7 @@ use mousse_net_core::pairing::{
 use mousse_net_core::{ConnectionId, ErrorCode, UnixTime};
 use tokio::sync::mpsc;
 
+use crate::admission::StreamAdmission;
 use crate::certs::CertManager;
 use crate::clock::Clock;
 use crate::conn::{self, CloseReason, Cmd, ConnStatus, Connection, Outbox, Role as ConnRole};
@@ -63,6 +64,9 @@ pub struct HostConfig {
     /// identity TLS presents. Only the `allow-break-env` control build (tests
     /// only) may set it; [`Host::new`] refuses it otherwise.
     pub ticket_identity: Option<IdentityPublicKey>,
+    /// The endpoint's stream places, when a caller of the same endpoint
+    /// shares them. `None` gives the host its own, from `limits`.
+    pub streams: Option<Arc<StreamAdmission>>,
 }
 
 impl HostConfig {
@@ -80,6 +84,7 @@ impl HostConfig {
             limits: Limits::DEFAULT,
             clock,
             ticket_identity: None,
+            streams: None,
         })
     }
 }
@@ -157,6 +162,7 @@ struct Shared<F: CodeExchangeFactory> {
     limits: Limits,
     owner: OwnerRef,
     next_conn: AtomicU64,
+    streams: Arc<StreamAdmission>,
     /// Tests stop the ticker to show what holds without it.
     #[cfg(test)]
     ticker_paused: std::sync::atomic::AtomicBool,
@@ -431,6 +437,9 @@ where
             certs: CertManager::with_limits(signer, config.clock.clone(), &config.limits),
             clock: config.clock,
             policy: TlsPolicy::from_limits(&config.limits),
+            streams: config
+                .streams
+                .unwrap_or_else(|| StreamAdmission::new(&config.limits)),
             limits: config.limits,
             owner: config.owner,
             next_conn: AtomicU64::new(1),
@@ -491,6 +500,7 @@ where
                 deadline,
                 clock: self.shared.clock.clone(),
                 limits: self.shared.limits,
+                streams: self.shared.streams.clone(),
             },
             Box::new(role),
             cmd_tx,
@@ -555,6 +565,21 @@ where
         let mut inner = lock(&self.shared);
         let actions = inner.pairing.cancel(invitation);
         inner.apply(actions);
+    }
+
+    /// This host's stream places (shared with a caller of the same
+    /// endpoint when [`HostConfig::streams`] named one).
+    pub fn stream_admission(&self) -> Arc<StreamAdmission> {
+        self.shared.streams.clone()
+    }
+
+    /// The grant `conn` is live under, if it is live.
+    pub fn grant_of(&self, conn: ConnectionId) -> Option<Grant> {
+        let inner = lock(&self.shared);
+        match inner.gates.get(&conn).map(|g| g.state()) {
+            Some(GateState::Live { grant }) => inner.grants.get(*grant).cloned(),
+            _ => None,
+        }
     }
 
     /// All grants.
@@ -816,6 +841,7 @@ mod tests {
             limits: Limits::DEFAULT,
             clock: clock.clone(),
             ticket_identity: None,
+            streams: None,
         };
         let key = Arc::new(SoftwareKey::generate(&mut os_rng()));
         let (host, _events) = Host::new(key, config, CpaceExchangeFactory).unwrap();

@@ -32,6 +32,9 @@ pub enum NetError {
     StreamReset(mousse_net_core::ErrorCode),
     /// A local call was refused (unknown stream, wrong state).
     Refused(String),
+    /// No place for another stream: the connection or the endpoint has as
+    /// many open as its limit allows. Open it once one ends.
+    StreamLimit,
 }
 
 impl fmt::Display for NetError {
@@ -51,6 +54,7 @@ impl fmt::Display for NetError {
             NetError::Store(e) => write!(f, "local state: {e}"),
             NetError::StreamReset(c) => write!(f, "stream reset ({})", c.name()),
             NetError::Refused(e) => write!(f, "refused: {e}"),
+            NetError::StreamLimit => f.write_str("too many open streams"),
         }
     }
 }

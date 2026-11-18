@@ -358,6 +358,12 @@ impl Mux {
         self.streams.get(&stream.0).map(|s| s.send_credit)
     }
 
+    /// Whether `stream` is still open here: not reset, and not yet finished
+    /// in both directions.
+    pub fn has_stream(&self, stream: StreamId) -> bool {
+        self.streams.contains_key(&stream.0)
+    }
+
     /// Bytes queued and not yet sent on `stream`.
     pub fn queued(&self, stream: StreamId) -> Option<usize> {
         self.streams.get(&stream.0).map(|s| s.out.len())

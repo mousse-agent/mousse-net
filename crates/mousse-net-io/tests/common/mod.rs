@@ -67,6 +67,7 @@ impl TestHost {
             limits: Limits::DEFAULT,
             clock: clock.clone(),
             ticket_identity: None,
+            streams: None,
         };
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         Self::run(signer, config, clock, listener)

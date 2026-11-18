@@ -20,6 +20,7 @@
 // Only `private` (the Windows security calls) may use unsafe code.
 #![deny(unsafe_code)]
 
+pub mod admission;
 pub mod caller;
 pub mod certs;
 pub mod clock;
@@ -36,6 +37,7 @@ pub mod rng;
 pub mod store;
 pub mod tls;
 
+pub use admission::StreamAdmission;
 pub use caller::{Caller, CodeEntry, JoinOutcome, NoCode, PathEvent, Step1Failures};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use conn::{CloseReason, ConnStatus, Connection, MuxStream, StreamReader, StreamWriter};
@@ -58,7 +60,8 @@ pub type SharedSigner = Arc<dyn IdentitySigner + Send + Sync>;
         mousse_control = "skip-pin-check",
         mousse_control = "keep-removed-grant",
         mousse_control = "shared-endpoint-state",
-        mousse_control = "allow-break-env"
+        mousse_control = "allow-break-env",
+        mousse_control = "no-stream-cap"
     )
 ))]
 compile_error!("a mousse_control build has a deliberate defect and is for tests only; build it without --release");
@@ -69,7 +72,8 @@ compile_error!("a mousse_control build has a deliberate defect and is for tests 
     mousse_control = "skip-pin-check",
     mousse_control = "keep-removed-grant",
     mousse_control = "shared-endpoint-state",
-    mousse_control = "allow-break-env"
+    mousse_control = "allow-break-env",
+    mousse_control = "no-stream-cap"
 ))]
 const _: () = {
     let profile = env!("MOUSSE_BUILD_PROFILE").as_bytes();
@@ -94,6 +98,8 @@ pub const CONTROL: Option<&str> = if cfg!(mousse_control = "skip-pin-check") {
     Some("shared-endpoint-state")
 } else if cfg!(mousse_control = "allow-break-env") {
     Some("allow-break-env")
+} else if cfg!(mousse_control = "no-stream-cap") {
+    Some("no-stream-cap")
 } else {
     None
 };

@@ -653,6 +653,12 @@ An unknown error code in `RESET` or `GOAWAY` is not a frame error; treat it as
   race).
 - A side may keep at most **1 024** streams opened by its peer. A further
   `OPEN` is answered with `RESET REFUSED_STREAM`; the connection stays up.
+- A side may keep fewer, counting its own streams too (the reference
+  implementation keeps 32 per connection and 128 per endpoint, to bound
+  the initial credit it has granted). It answers an `OPEN` past its own
+  limit the same way: `RESET REFUSED_STREAM`, connection up. A sender that
+  gets `REFUSED_STREAM` may open the stream again once one of its streams
+  on that connection has ended.
 
 ### 9.3 Flow control
 
