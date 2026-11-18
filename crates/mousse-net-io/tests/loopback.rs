@@ -10,8 +10,9 @@ use common::*;
 use mousse_net_core::control::ControlMessage;
 use mousse_net_core::mux::{Mux, MuxEvent, MuxRole, PriorityClass};
 use mousse_net_core::pairing::{
-    BindingTranscript, CodeExchange, CodeExchangeFactory, CpaceExchangeFactory, ExchangeError,
-    ExchangeRole, ExchangeStep, InvitationKind, InvitationStatus, PairingCode, Ticket, SID_LEN,
+    Arrival, BindingTranscript, CodeExchange, CodeExchangeFactory, CpaceExchangeFactory,
+    ExchangeError, ExchangeRole, ExchangeStep, InvitationKind, InvitationStatus, JoinerError,
+    PairingCode, Ticket, SID_LEN,
 };
 use mousse_net_core::session::RENEW_LEAD_SECS;
 use mousse_net_core::{
@@ -43,7 +44,11 @@ async fn join_with(
     ticket: &Ticket,
 ) -> Result<(mousse_net_io::Connection, JoinOutcome), NetError> {
     let pipe = connect_tcp(&host.route()).await?;
-    within("join", caller.join(pipe, ticket, "laptop")).await
+    within(
+        "join",
+        caller.join(pipe, ticket, Arrival::InAppScan, "laptop"),
+    )
+    .await
 }
 
 /// Connect with `pin` and let the host's join-proof wait run out. The
@@ -193,7 +198,10 @@ async fn a_ticket_replayed_after_use_is_refused() {
     let first = new_caller(new_signer());
     let pipe = connect_tcp(&host.route()).await.unwrap();
     let (joined, ()) = tokio::join!(
-        within("join", first.join(pipe, &ticket, "laptop")),
+        within(
+            "join",
+            first.join(pipe, &ticket, Arrival::InAppScan, "laptop")
+        ),
         host.approve_next_request()
     );
     assert!(matches!(joined.unwrap().1, JoinOutcome::Paired(_)));
@@ -220,8 +228,18 @@ async fn an_expired_ticket_is_refused_by_the_host_and_by_the_joiner() {
     late_clock.advance(901);
     let late = new_caller_with_clock(new_signer(), late_clock);
     let pipe = connect_tcp(&host.route()).await.unwrap();
-    let err = late.join(pipe, &ticket, "laptop").await.unwrap_err();
-    assert!(matches!(err, NetError::Ticket(_)), "{err:?}");
+    let err = late
+        .join(pipe, &ticket, Arrival::InAppScan, "laptop")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, NetError::Join(JoinerError::Expired)),
+        "{err:?}"
+    );
+    assert_eq!(
+        JoinerError::Expired.code(),
+        Some(ErrorCode::InvitationInvalid)
+    );
 
     // The host's clock is past the expiry: it refuses the join proof.
     host.clock.advance(601);
@@ -426,7 +444,10 @@ async fn an_enrollment_that_cannot_be_saved_fails_the_pairing() {
     let ticket = host.invite();
     let pipe = connect_tcp(&host.route()).await.unwrap();
     let (joined, ()) = tokio::join!(
-        within("join", caller.join(pipe, &ticket, "laptop")),
+        within(
+            "join",
+            caller.join(pipe, &ticket, Arrival::InAppScan, "laptop")
+        ),
         host.approve_next_request()
     );
     let err = joined.map(|(_, outcome)| outcome).unwrap_err();
@@ -447,9 +468,15 @@ async fn an_enrollment_that_cannot_be_saved_fails_the_pairing() {
     };
     let route = host.route();
     let pipe = connect_tcp(&route).await.unwrap();
-    let join = phone.join_with_redial(pipe, &ticket, "phone", &mut codes, false, || {
-        connect_tcp(&route)
-    });
+    let join = phone.join_with_redial(
+        pipe,
+        &ticket,
+        Arrival::Link,
+        "phone",
+        &mut codes,
+        false,
+        || connect_tcp(&route),
+    );
     let typing = async {
         let code = host.next_code().await;
         assert_eq!(within("ask", asks.recv()).await, Some(None));
@@ -547,7 +574,7 @@ fn start_link_join(
         let pipe = connect_tcp(&route).await?;
         let mut codes = TypedCodes { asks, typed };
         caller
-            .join_with_code(pipe, &ticket, "phone", &mut codes)
+            .join_with_code(pipe, &ticket, Arrival::Link, "phone", &mut codes)
             .await
     });
     (type_tx, asks_rx, join)
@@ -688,7 +715,15 @@ async fn a_lost_paired_is_settled_by_reconnecting_with_the_same_join() {
                 }
             };
             caller
-                .join_with_redial(first, &ticket, "phone", &mut codes, false, redial)
+                .join_with_redial(
+                    first,
+                    &ticket,
+                    Arrival::Link,
+                    "phone",
+                    &mut codes,
+                    false,
+                    redial,
+                )
                 .await
         })
     };
@@ -724,7 +759,7 @@ async fn a_granted_device_pairs_again_by_link_and_already_paired_needs_a_pin() {
             let pipe = connect_tcp(&route).await?;
             let mut codes = TypedCodes { asks, typed };
             caller
-                .join_with_code(pipe, &ticket, "laptop", &mut codes)
+                .join_with_code(pipe, &ticket, Arrival::Link, "laptop", &mut codes)
                 .await
         })
     };
@@ -744,7 +779,7 @@ async fn a_granted_device_pairs_again_by_link_and_already_paired_needs_a_pin() {
     let pipe = connect_tcp(&host.route()).await.unwrap();
     let err = within(
         "join",
-        caller.join_with_code(pipe, &ticket, "laptop", &mut NoCode),
+        caller.join_with_code(pipe, &ticket, Arrival::Link, "laptop", &mut NoCode),
     )
     .await
     .unwrap_err();
@@ -755,7 +790,15 @@ async fn a_granted_device_pairs_again_by_link_and_already_paired_needs_a_pin() {
     let no_redial = || async { Err::<tokio::net::TcpStream, _>(NetError::Refused("none".into())) };
     let (conn, outcome) = within(
         "join",
-        caller.join_with_redial(pipe, &ticket, "laptop", &mut NoCode, true, no_redial),
+        caller.join_with_redial(
+            pipe,
+            &ticket,
+            Arrival::Link,
+            "laptop",
+            &mut NoCode,
+            true,
+            no_redial,
+        ),
     )
     .await
     .unwrap();
@@ -807,8 +850,18 @@ async fn send_link_pairs_with_the_right_code_and_three_wrong_codes_end_it() {
     );
     assert_eq!(host.grant_of(&stranger.identity()), None);
 
-    // The ended invitation does not admit the device again.
-    let (_type_code, _asks, join) = start_link_join(stranger.clone(), &host, ticket);
+    // Opening the link again resets nothing: the joiner kept its count and
+    // refuses before dialling.
+    let (_type_code, _asks, join) = start_link_join(stranger.clone(), &host, ticket.clone());
+    let err = within("join", join).await.unwrap().unwrap_err();
+    assert!(
+        matches!(err, NetError::Join(JoinerError::AttemptsExhausted)),
+        "{err}"
+    );
+
+    // The ended invitation does not admit another device either.
+    let other = Arc::new(new_caller(new_signer()));
+    let (_type_code, _asks, join) = start_link_join(other, &host, ticket);
     let err = within("join", join).await.unwrap().unwrap_err();
     assert!(closed_with(&err, ErrorCode::InvitationInvalid), "{err}");
     host.stop().await;
@@ -858,7 +911,15 @@ async fn a_refusal_after_a_lost_paired_is_reported_as_the_answer() {
                 }
             };
             caller
-                .join_with_redial(first, &ticket, "phone", &mut codes, false, redial)
+                .join_with_redial(
+                    first,
+                    &ticket,
+                    Arrival::Link,
+                    "phone",
+                    &mut codes,
+                    false,
+                    redial,
+                )
                 .await
         })
     };

@@ -11,7 +11,7 @@ use mousse_net_core::authz::JOIN_PROOF_WAIT_MS;
 use mousse_net_core::grants::{GrantId, OwnerRef};
 use mousse_net_core::identity::{IdentityPublicKey, SoftwareKey};
 use mousse_net_core::mux::PriorityClass;
-use mousse_net_core::pairing::{CpaceExchangeFactory, InvitationKind, Ticket};
+use mousse_net_core::pairing::{Arrival, CpaceExchangeFactory, InvitationKind, Ticket};
 use mousse_net_core::ErrorCode;
 use mousse_net_io::pipe::{accept_tcp, connect_tcp, route_from_addr, route_uri, Route};
 use mousse_net_io::rng::os_rng;
@@ -255,7 +255,7 @@ pub fn new_caller_with_clock(signer: SharedSigner, clock: Arc<ManualClock>) -> C
 pub async fn pair(caller: &Caller, host: &mut TestHost, name: &str) -> Connection {
     let ticket = host.invite();
     let pipe = connect_tcp(&host.route()).await.unwrap();
-    let join = caller.join(pipe, &ticket, name);
+    let join = caller.join(pipe, &ticket, Arrival::InAppScan, name);
     let approve = host.approve_next_request();
     let (result, ()) = tokio::join!(within("join", join), approve);
     let (conn, outcome) = result.unwrap();

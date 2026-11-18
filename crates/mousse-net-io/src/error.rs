@@ -1,5 +1,6 @@
 use std::fmt;
 
+use mousse_net_core::pairing::JoinerError;
 use mousse_net_core::session_cert::CertError;
 
 use crate::conn::CloseReason;
@@ -18,8 +19,11 @@ pub enum NetError {
     Closed(CloseReason),
     /// A step took too long.
     Timeout(&'static str),
-    /// The pairing ticket cannot be used (expired, wrong kind, bad form).
+    /// The pairing ticket cannot be used (bad form).
     Ticket(String),
+    /// The pairing flow refused to start or go on. `JoinerError::code` is
+    /// the error code to report, when it has one.
+    Join(JoinerError),
     /// Our identity signer failed.
     Signer(String),
     /// A local state file or the keystore failed.
@@ -39,6 +43,10 @@ impl fmt::Display for NetError {
             NetError::Closed(reason) => write!(f, "connection closed: {reason}"),
             NetError::Timeout(what) => write!(f, "timed out: {what}"),
             NetError::Ticket(e) => write!(f, "pairing ticket: {e}"),
+            NetError::Join(e) => match e.code() {
+                Some(code) => write!(f, "pairing: {e} ({})", code.name()),
+                None => write!(f, "pairing: {e}"),
+            },
             NetError::Signer(e) => write!(f, "identity signer: {e}"),
             NetError::Store(e) => write!(f, "local state: {e}"),
             NetError::StreamReset(c) => write!(f, "stream reset ({})", c.name()),
