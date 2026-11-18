@@ -1,0 +1,128 @@
+{
+  "cases": [
+    {
+      "local": {
+        "major": 1,
+        "minor": 0,
+        "oldest_minor": 0
+      },
+      "name": "same_version",
+      "peer": {
+        "major": 1,
+        "minor": 0
+      },
+      "result": 0
+    },
+    {
+      "local": {
+        "major": 1,
+        "minor": 0,
+        "oldest_minor": 0
+      },
+      "name": "peer_newer_minor",
+      "peer": {
+        "major": 1,
+        "minor": 7
+      },
+      "result": 0
+    },
+    {
+      "local": {
+        "major": 1,
+        "minor": 0,
+        "oldest_minor": 0
+      },
+      "name": "peer_major_2",
+      "peer": {
+        "major": 2,
+        "minor": 0
+      },
+      "result": "close:unsupported_version"
+    },
+    {
+      "local": {
+        "major": 1,
+        "minor": 0,
+        "oldest_minor": 0
+      },
+      "name": "peer_major_0",
+      "peer": {
+        "major": 0,
+        "minor": 0
+      },
+      "result": "close:unsupported_version"
+    },
+    {
+      "local": {
+        "major": 1,
+        "minor": 4,
+        "oldest_minor": 3
+      },
+      "name": "lower_minor_taken",
+      "peer": {
+        "major": 1,
+        "minor": 9
+      },
+      "result": 4
+    },
+    {
+      "local": {
+        "major": 1,
+        "minor": 4,
+        "oldest_minor": 3
+      },
+      "name": "previous_minor_supported",
+      "peer": {
+        "major": 1,
+        "minor": 3
+      },
+      "result": 3
+    },
+    {
+      "local": {
+        "major": 1,
+        "minor": 4,
+        "oldest_minor": 3
+      },
+      "name": "minor_too_old",
+      "peer": {
+        "major": 1,
+        "minor": 2
+      },
+      "result": "close:unsupported_version"
+    },
+    {
+      "local": {
+        "major": 1,
+        "minor": 4,
+        "oldest_minor": 3
+      },
+      "name": "minor_zero_too_old",
+      "peer": {
+        "major": 1,
+        "minor": 0
+      },
+      "result": "close:unsupported_version"
+    },
+    {
+      "local": {
+        "major": 1,
+        "minor": 4,
+        "oldest_minor": 3
+      },
+      "name": "major_checked_before_minor",
+      "peer": {
+        "major": 2,
+        "minor": 4
+      },
+      "result": "close:unsupported_version"
+    }
+  ],
+  "description": "HELLO version negotiation (spec wire.md, \"Versions\"). `local` is what the receiving side speaks (its newest and oldest minor version), `peer` is the HELLO it received. `result` is the minor version both sides use, or the close code. `this_build` is what mousse-net-core version 1.0 speaks; `hello` is its HELLO.",
+  "hello": "a3000101010200",
+  "this_build": {
+    "major": 1,
+    "minor": 0,
+    "oldest_minor": 0
+  }
+}

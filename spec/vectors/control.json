@@ -6,8 +6,16 @@
       "name": "unknown_type"
     },
     {
-      "hex": "a3000101000200",
+      "hex": "a40001010102000300",
       "name": "extra_key"
+    },
+    {
+      "hex": "a200010101",
+      "name": "hello_without_minor"
+    },
+    {
+      "hex": "a300010161310200",
+      "name": "hello_major_as_text"
     },
     {
       "hex": "a10100",
@@ -40,7 +48,11 @@
   ],
   "valid": [
     {
-      "hex": "a200010100",
+      "hex": "a3000101010200",
+      "type": 1
+    },
+    {
+      "hex": "a3000101010219012c",
       "type": 1
     },
     {

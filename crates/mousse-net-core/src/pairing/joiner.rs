@@ -7,7 +7,7 @@ use std::fmt;
 use rand_core::CryptoRng;
 
 use super::exchange::{CodeExchange, CodeExchangeFactory, ExchangeRole, PairingCode};
-use super::proof::{binding_transcript, join_proof_mac, SessionExporters};
+use super::proof::{attempt_sid, binding_transcript, join_proof_mac, SessionExporters};
 use super::ticket::Ticket;
 use super::{AttemptId, InvitationKind};
 use crate::control::{AuthorizedState, ControlMessage};
@@ -245,9 +245,10 @@ impl<F: CodeExchangeFactory> JoinerPairing<F> {
             &self.joiner,
             &exporters.pair,
         );
+        let sid = attempt_sid(&attempt, &exporters.pair);
         let mut exchange = self
             .factory
-            .start(ExchangeRole::Initiator, code, &binding, rng);
+            .start(ExchangeRole::Initiator, code, &binding, &sid, rng);
         match exchange.step(None) {
             Ok(step) => {
                 let Some(payload) = step.send else {

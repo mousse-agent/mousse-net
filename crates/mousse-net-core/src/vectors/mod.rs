@@ -15,16 +15,16 @@ use serde_json::{json, Value as J};
 use sha2::Sha256;
 
 use crate::cbor::{self, Value};
-use crate::control::{AuthorizedState, ControlMessage};
+use crate::control::{negotiate_version, AuthorizedState, ControlMessage, VersionSupport};
 use crate::grants::{GrantTable, OwnerRef, Role};
 use crate::identity::{IdentityPublicKey, RawSignature, SoftwareKey};
 use crate::mux::{Frame, PriorityClass, StreamId};
-use crate::pairing::insecure::InsecureTestExchangeFactory;
+use crate::pairing::CpaceExchangeFactory;
 use crate::pairing::{
-    binding_transcript, join_proof_input, join_proof_mac, AttemptId, HostAction, HostPairing,
-    HostPairingError, InvitationId, InvitationKind, InvitationParams, InvitationStatus,
-    JoinerAction, JoinerPairing, JoinerState, PairingCode, SessionExporters, Ticket, TicketSecret,
-    JOIN_PROOF_KEY_INFO, TICKET_VERSION,
+    attempt_sid, binding_transcript, join_proof_input, join_proof_mac, AttemptId, HostAction,
+    HostPairing, HostPairingError, InvitationId, InvitationKind, InvitationParams,
+    InvitationStatus, JoinerAction, JoinerPairing, JoinerState, PairingCode, Route, RouteHost,
+    SessionExporters, Ticket, TicketSecret, JOIN_PROOF_KEY_INFO, SID_DOMAIN, TICKET_VERSION,
 };
 use crate::session_cert::{
     self, build_certificate, PendingCertificate, SessionKey, ValidityWindow,
@@ -164,6 +164,7 @@ fn session_cert_vectors() -> J {
     .expect("encodable");
     let mut trailing = der.clone();
     trailing.push(0);
+    let other_endpoint = honest_cert(&b, &s2, nb, na, PROTOCOL_VERSION);
 
     let cases = vec![
         cert_case("valid", "Valid certificate, pinned identity matches.", &der, T + 60, Some(&pin_a), "ok"),
@@ -174,6 +175,7 @@ fn session_cert_vectors() -> J {
         cert_case("expired", "now = not_after + 601: expired.", &der, na + SKEW + 1, Some(&pin_a), "outside_window"),
         cert_case("expired_long_ago", "An expired certificate, a day later.", &der, na + DAY, Some(&pin_a), "outside_window"),
         cert_case("pin_mismatch_on_reconnect", "Valid certificate from identity A where identity B is pinned.", &der, T + 60, Some(&pin_b), "pin_mismatch"),
+        cert_case("another_endpoint_on_lan_address", "Dialling a LAN candidate for endpoint A, a valid certificate from endpoint B answers (for example another profile's helper, or another computer that took the address). Rejected before any data is sent; the caller tries the next candidate, with no warning and no change to the pin.", &other_endpoint, T + 60, Some(&pin_a), "pin_mismatch"),
         cert_case("delegation_over_wrong_tls_key", "Identity A's signature covers session key 1, but the certificate carries session key 2.", &wrong_key, T + 60, Some(&pin_a), "identity_signature_invalid"),
         cert_case("identity_signature_der", "The identity signature is DER, where 64-byte raw r||s is required.", &der_signature, T + 60, Some(&pin_a), "identity_signature_not_raw"),
         cert_case("window_too_long", "not_after - not_before = 86401 s.", &honest_cert(&a, &s1, nb, nb + DAY + 1, PROTOCOL_VERSION), T + 60, Some(&pin_a), "window_invalid"),
@@ -264,7 +266,7 @@ fn authz_vectors() -> J {
     let b = hex(identity(&IDENTITY_B).public_key().as_bytes());
     let now = T + 60;
     json!({
-        "description": "Step 2 on the host after step 1 passed. `grants` and `denied` set up the table (grants added in order, then denials), the gate opens at wall time `now` and monotonic time 0 ms, then `steps` run in order. Verdicts: allow, ignore, close:<code>.",
+        "description": "Step 2 on the host after step 1 passed (`cases`), and the caller's gate (`caller_cases`). Host cases: `grants` and `denied` set up the table (grants added in order, then denials), the gate opens at wall time `now` and monotonic time 0 ms, then `steps` run in order. Caller cases: the gate starts awaiting AUTHORIZED; `promote` means the joiner accepted PAIRED; `state` is the gate state after the step. Verdicts: allow, ignore, close:<code>.",
         "identities": { "a": a, "b": b },
         "cases": [
             {
@@ -350,6 +352,67 @@ fn authz_vectors() -> J {
                 "grants": [{ "identity": "a", "role": "owner", "expires_at": null }], "denied": ["a"], "peer": "a", "now": now,
                 "step2": "close:not_authorized",
                 "steps": [{ "op": "check", "traffic": "stream", "verdict": "ignore" }],
+            },
+        ],
+        "caller_cases": [
+            {
+                "name": "host_stream_before_authorized",
+                "description": "The host opens a stream before AUTHORIZED: the caller closes.",
+                "steps": [
+                    { "op": "check", "traffic": "hello", "verdict": "allow", "state": "awaiting_authorization" },
+                    { "op": "check", "traffic": "keepalive", "verdict": "allow", "state": "awaiting_authorization" },
+                    { "op": "check", "traffic": "stream", "verdict": "close:protocol_error", "state": "closed:protocol_error" },
+                    { "op": "check", "traffic": "authorized_live", "verdict": "ignore", "state": "closed:protocol_error" },
+                ],
+            },
+            {
+                "name": "authorized_live",
+                "steps": [
+                    { "op": "check", "traffic": "authorized_live", "verdict": "allow", "state": "live" },
+                    { "op": "check", "traffic": "stream", "verdict": "allow", "state": "live" },
+                    { "op": "check", "traffic": "pairing", "verdict": "ignore", "state": "live" },
+                    { "op": "check", "traffic": "authorized_live", "verdict": "close:protocol_error", "state": "closed:protocol_error" },
+                ],
+            },
+            {
+                "name": "pairing_before_authorized",
+                "steps": [{ "op": "check", "traffic": "pairing", "verdict": "close:protocol_error", "state": "closed:protocol_error" }],
+            },
+            {
+                "name": "paired_before_authorized",
+                "steps": [{ "op": "check", "traffic": "paired", "verdict": "close:protocol_error", "state": "closed:protocol_error" }],
+            },
+            {
+                "name": "join_only_then_paired",
+                "steps": [
+                    { "op": "check", "traffic": "authorized_join_only", "verdict": "allow", "state": "join_only" },
+                    { "op": "check", "traffic": "pairing", "verdict": "allow", "state": "join_only" },
+                    { "op": "check", "traffic": "paired", "verdict": "allow", "state": "join_only" },
+                    { "op": "promote", "state": "live" },
+                    { "op": "check", "traffic": "stream", "verdict": "allow", "state": "live" },
+                    { "op": "check", "traffic": "paired", "verdict": "close:protocol_error", "state": "closed:protocol_error" },
+                ],
+            },
+            {
+                "name": "join_only_host_stream",
+                "steps": [
+                    { "op": "check", "traffic": "authorized_join_only", "verdict": "allow", "state": "join_only" },
+                    { "op": "check", "traffic": "stream", "verdict": "close:protocol_error", "state": "closed:protocol_error" },
+                ],
+            },
+            {
+                "name": "join_only_second_authorized",
+                "steps": [
+                    { "op": "check", "traffic": "authorized_join_only", "verdict": "allow", "state": "join_only" },
+                    { "op": "check", "traffic": "authorized_live", "verdict": "close:protocol_error", "state": "closed:protocol_error" },
+                ],
+            },
+            {
+                "name": "join_proof_from_host",
+                "steps": [
+                    { "op": "check", "traffic": "authorized_live", "verdict": "allow", "state": "live" },
+                    { "op": "check", "traffic": "caller_only", "verdict": "close:protocol_error", "state": "closed:protocol_error" },
+                ],
             },
         ],
     })
@@ -461,6 +524,7 @@ fn ticket_vectors() -> J {
             { "name": "fragment_with_hash", "fragment": format!("#{fragment}"), "result": "encoding" },
             { "name": "fragment_standard_alphabet", "fragment": fragment.replace('-', "+").replace('_', "/") + "+", "result": "encoding" },
         ],
+        "route_hints": route_hint_vectors(),
         "joiner_freshness": {
             "description": "The joiner accepts the ticket while now < expires_at + 600.",
             "expires_at": T + 600,
@@ -469,6 +533,68 @@ fn ticket_vectors() -> J {
                 { "now": T + 600 + SKEW, "result": "expired" },
             ],
         },
+    })
+}
+
+fn route_hint_vectors() -> J {
+    let hints = [
+        "tcp://192.168.1.20:7443",
+        "tcp://[fd00::20]:7443",
+        "tcp://[::ffff:192.168.1.20]:1",
+        "tcp://Desk-1.example.org:65535",
+        "mdns:Desk",
+        "mdns:Bureau d’Anaïs",
+        "tcp://192.168.1.20",
+        "tcp://192.168.1.20:0",
+        "tcp://192.168.1.20:65536",
+        "tcp://192.168.1.20:07443",
+        "tcp://192.168.01.20:7443",
+        "tcp://192.168.1.256:7443",
+        "tcp://1.2.3:7443",
+        "tcp://fd00::20:7443",
+        "tcp://[fe80::1%25eth0]:7443",
+        "tcp://[::ffff:192.168.01.20]:7443",
+        "tcp://-desk.local:7443",
+        "tcp://desk..local:7443",
+        "tcp://desk.local.:7443",
+        "tcp://desk_1.local:7443",
+        "tcp://desk.123:7443",
+        "tcp://user@desk.local:7443",
+        "tcp://desk.local:7443/",
+        "tcp:desk.local:7443",
+        "mdns:",
+        "mdns:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "mdns:a\tb",
+        "ssh://desk.local",
+        "ws://desk.local/x",
+        "wss://desk.local/x",
+        "relay:abc",
+        "quic://desk.local:7443",
+        "TCP://desk.local:7443",
+        "desk.local:7443",
+        "desk",
+    ];
+    let cases: Vec<J> = hints
+        .iter()
+        .map(|hint| {
+            let result = match Route::parse(hint) {
+                Ok(Route::Tcp { host, port }) => {
+                    let host = match host {
+                        RouteHost::Ipv4(a) => json!({ "ipv4": a.to_string() }),
+                        RouteHost::Ipv6(a) => json!({ "ipv6": a.to_string() }),
+                        RouteHost::Dns(name) => json!({ "dns": name }),
+                    };
+                    json!({ "tcp": { "host": host, "port": port } })
+                }
+                Ok(Route::Mdns { instance }) => json!({ "mdns": instance }),
+                Err(skip) => json!({ "skip": skip.name() }),
+            };
+            json!({ "hint": hint, "result": result })
+        })
+        .collect();
+    json!({
+        "description": "Route hints (spec wire.md, \"Route hints\"). Each hint reads as a tcp route (host as ipv4, ipv6 in its shortest text form, or a lowercased dns name, and a port), an mdns instance, or is skipped with a reason: reserved, unknown_scheme or malformed.",
+        "cases": cases,
     })
 }
 
@@ -485,8 +611,14 @@ fn proof_vectors() -> J {
     let mac = join_proof_mac(&t.secret, &t.invitation, &host, &joiner, &join_exporter);
     let transcript =
         binding_transcript(&t.hash(), t.kind, t.version, &host, &joiner, &pair_exporter);
+    let attempt = AttemptId([0xa7; 16]);
+    let sid_input = cbor::encode(&Value::Map(vec![
+        (1, Value::Text(SID_DOMAIN.to_owned())),
+        (2, Value::Bytes(attempt.0.to_vec())),
+        (3, Value::Bytes(pair_exporter.to_vec())),
+    ]));
     json!({
-        "description": "Join proof and binding transcript (spec wire.md, \"Join proof\" and \"Binding transcript\"). Exporter values are fixed stand-ins for the TLS exporters.",
+        "description": "Join proof, binding transcript and attempt session id (spec wire.md, \"Join proof\", \"Binding transcript\" and \"Session id\"). Exporter values are fixed stand-ins for the TLS exporters.",
         "ticket_binary": hex(&t.encode()),
         "ticket_hash": hex(&t.hash()),
         "host_identity": hex(host.as_bytes()),
@@ -504,6 +636,12 @@ fn proof_vectors() -> J {
             "ticket_version": t.version,
             "pair_exporter": hex(&pair_exporter),
             "transcript": hex(transcript.as_bytes()),
+        },
+        "sid": {
+            "attempt": hex(&attempt.0),
+            "pair_exporter": hex(&pair_exporter),
+            "input": hex(&sid_input),
+            "sid": hex(&attempt_sid(&attempt, &pair_exporter)),
         },
     })
 }
@@ -667,7 +805,7 @@ fn header(stream: u32, kind: u8, len: u32) -> String {
 }
 
 fn mux_vectors() -> J {
-    let hello = ControlMessage::Hello { minor_version: 0 }.encode();
+    let hello = ControlMessage::hello().encode();
     let frames = [
         Frame::Data {
             stream: StreamId(1),
@@ -762,7 +900,11 @@ fn mux_vectors() -> J {
 
 fn control_vectors() -> J {
     let messages = [
-        ControlMessage::Hello { minor_version: 0 },
+        ControlMessage::hello(),
+        ControlMessage::Hello {
+            major_version: 1,
+            minor_version: 300,
+        },
         ControlMessage::Authorized {
             state: AuthorizedState::Live,
         },
@@ -801,7 +943,9 @@ fn control_vectors() -> J {
         "valid": valid,
         "invalid": [
             { "name": "unknown_type", "hex": enc(vec![(0, Value::Uint(99))]) },
-            { "name": "extra_key", "hex": enc(vec![(0, Value::Uint(1)), (1, Value::Uint(0)), (2, Value::Uint(0))]) },
+            { "name": "extra_key", "hex": enc(vec![(0, Value::Uint(1)), (1, Value::Uint(1)), (2, Value::Uint(0)), (3, Value::Uint(0))]) },
+            { "name": "hello_without_minor", "hex": enc(vec![(0, Value::Uint(1)), (1, Value::Uint(1))]) },
+            { "name": "hello_major_as_text", "hex": enc(vec![(0, Value::Uint(1)), (1, Value::Text("1".into())), (2, Value::Uint(0))]) },
             { "name": "missing_type", "hex": enc(vec![(1, Value::Uint(0))]) },
             { "name": "authorized_state_3", "hex": enc(vec![(0, Value::Uint(2)), (1, Value::Uint(3))]) },
             { "name": "join_proof_mac_31_bytes", "hex": enc(vec![
@@ -823,22 +967,60 @@ fn control_vectors() -> J {
     })
 }
 
+fn hello_vectors() -> J {
+    let support = |major: u64, minor: u64, oldest_minor: u64| VersionSupport {
+        major,
+        minor,
+        oldest_minor,
+    };
+    let case = |name: &str, local: VersionSupport, peer: (u64, u64)| {
+        let result = match negotiate_version(local, peer.0, peer.1) {
+            Ok(minor) => json!(minor),
+            Err(code) => json!(format!("close:{}", code.name())),
+        };
+        json!({
+            "name": name,
+            "local": { "major": local.major, "minor": local.minor, "oldest_minor": local.oldest_minor },
+            "peer": { "major": peer.0, "minor": peer.1 },
+            "result": result,
+        })
+    };
+    let local = VersionSupport::LOCAL;
+    let later = support(1, 4, 3);
+    json!({
+        "description": "HELLO version negotiation (spec wire.md, \"Versions\"). `local` is what the receiving side speaks (its newest and oldest minor version), `peer` is the HELLO it received. `result` is the minor version both sides use, or the close code. `this_build` is what mousse-net-core version 1.0 speaks; `hello` is its HELLO.",
+        "this_build": { "major": local.major, "minor": local.minor, "oldest_minor": local.oldest_minor },
+        "hello": hex(&ControlMessage::hello().encode()),
+        "cases": [
+            case("same_version", local, (1, 0)),
+            case("peer_newer_minor", local, (1, 7)),
+            case("peer_major_2", local, (2, 0)),
+            case("peer_major_0", local, (0, 0)),
+            case("lower_minor_taken", later, (1, 9)),
+            case("previous_minor_supported", later, (1, 3)),
+            case("minor_too_old", later, (1, 2)),
+            case("minor_zero_too_old", later, (1, 0)),
+            case("major_checked_before_minor", later, (2, 4)),
+        ],
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Pairing attempt limits (behavioural sequences)
 // ---------------------------------------------------------------------------
 
 fn pairing_attempt_vectors() -> J {
     json!({
-        "description": "Attempt-limit sequences for the send-link flow (spec wire.md, \"Attempt limits\"), plus one-enrollment for in person. Each step runs one operation and then the listed expectations hold. Ops: connect (joiner proves the ticket on conn), submit (joiner enters the right or a wrong code; messages flow until both sides stop), submit_first (only the joiner's first message reaches the host), redeliver (that first message reaches the host again on conn), drop (conn closes mid-attempt), approve (host owner taps for conn). `closed` lists connections the host closed during the step.",
+        "description": "Attempt-limit sequences for the send-link flow (spec wire.md, \"Send-link flow and the code\" and \"Attempt limits\"), plus one-enrollment for in person. Each step runs one operation and then the listed expectations hold. Ops: connect (joiner proves the ticket on conn), submit (joiner enters a code; messages flow until both sides stop), submit_first (only the joiner's first message reaches the host), redeliver (that first message reaches the host again on conn), drop (conn closes mid-attempt), approve (host owner taps for conn). Codes: right (the code the host shows now), wrong (any other code), stale (the code the host showed when the previous attempt started). `new_code` says whether the host showed a fresh code during the step. `closed` lists connections the host closed during the step.",
         "sequences": [
             {
                 "name": "three_wrong_codes",
                 "kind": "send_link",
                 "steps": [
                     { "op": "connect", "joiner": "a", "conn": 1, "host_attempts_left": 3, "joiner_attempts_left": 3, "joiner_state": "awaiting_code" },
-                    { "op": "submit", "joiner": "a", "conn": 1, "code": "wrong", "host_attempts_left": 2, "joiner_attempts_left": 2, "joiner_state": "awaiting_code", "host_status": "open" },
-                    { "op": "submit", "joiner": "a", "conn": 1, "code": "wrong", "host_attempts_left": 1, "joiner_attempts_left": 1, "joiner_state": "awaiting_code", "host_status": "open" },
-                    { "op": "submit", "joiner": "a", "conn": 1, "code": "wrong", "host_attempts_left": 0, "joiner_attempts_left": 0, "joiner_state": "failed:attempts_exhausted", "host_status": "ended:attempts_exhausted", "closed": [[1, "attempts_exhausted"]] },
+                    { "op": "submit", "joiner": "a", "conn": 1, "code": "wrong", "host_attempts_left": 2, "joiner_attempts_left": 2, "joiner_state": "awaiting_code", "host_status": "open", "new_code": true },
+                    { "op": "submit", "joiner": "a", "conn": 1, "code": "wrong", "host_attempts_left": 1, "joiner_attempts_left": 1, "joiner_state": "awaiting_code", "host_status": "open", "new_code": true },
+                    { "op": "submit", "joiner": "a", "conn": 1, "code": "wrong", "host_attempts_left": 0, "joiner_attempts_left": 0, "joiner_state": "failed:attempts_exhausted", "host_status": "ended:attempts_exhausted", "closed": [[1, "attempts_exhausted"]], "new_code": false },
                     { "op": "submit", "joiner": "a", "conn": 1, "code": "right", "result": "wrong_state" },
                 ],
             },
@@ -852,13 +1034,23 @@ fn pairing_attempt_vectors() -> J {
                 ],
             },
             {
+                "name": "stale_code_is_refused",
+                "kind": "send_link",
+                "steps": [
+                    { "op": "connect", "joiner": "a", "conn": 1 },
+                    { "op": "submit", "joiner": "a", "conn": 1, "code": "wrong", "host_attempts_left": 2, "new_code": true },
+                    { "op": "submit", "joiner": "a", "conn": 1, "code": "stale", "host_attempts_left": 1, "joiner_attempts_left": 1, "joiner_state": "awaiting_code", "host_status": "open", "new_code": true },
+                    { "op": "submit", "joiner": "a", "conn": 1, "code": "right", "host_attempts_left": 0, "joiner_state": "paired", "host_status": "consumed", "new_code": false },
+                ],
+            },
+            {
                 "name": "resend_is_not_a_new_attempt",
                 "kind": "send_link",
                 "steps": [
                     { "op": "connect", "joiner": "a", "conn": 1 },
                     { "op": "submit_first", "joiner": "a", "conn": 1, "code": "right", "host_attempts_left": 2, "joiner_attempts_left": 2 },
-                    { "op": "redeliver", "joiner": "a", "conn": 1, "same_reply": true, "host_attempts_left": 2 },
-                    { "op": "redeliver", "joiner": "a", "conn": 1, "same_reply": true, "host_attempts_left": 2 },
+                    { "op": "redeliver", "joiner": "a", "conn": 1, "same_reply": true, "host_attempts_left": 2, "new_code": false },
+                    { "op": "redeliver", "joiner": "a", "conn": 1, "same_reply": true, "host_attempts_left": 2, "new_code": false },
                 ],
             },
             {
@@ -932,12 +1124,25 @@ fn host_status_name(s: InvitationStatus) -> String {
 struct Replay {
     rng: ChaCha20Rng,
     joiner_rng: ChaCha20Rng,
-    host: HostPairing<InsecureTestExchangeFactory>,
+    host: HostPairing<CpaceExchangeFactory>,
     grants: GrantTable,
     ticket: Ticket,
-    joiners: Vec<(String, u8, JoinerPairing<InsecureTestExchangeFactory>)>,
+    joiners: Vec<(String, u8, JoinerPairing<CpaceExchangeFactory>)>,
     first: Vec<(String, ControlMessage)>,
-    last_reply: Option<Vec<HostAction>>,
+    last_reply: Option<Vec<ControlMessage>>,
+    shown_at_last_submit: Option<PairingCode>,
+    new_code: bool,
+}
+
+/// The messages the host sent, without display actions.
+fn sent(actions: &[HostAction]) -> Vec<ControlMessage> {
+    actions
+        .iter()
+        .filter_map(|a| match a {
+            HostAction::Send { message, .. } => Some(message.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 impl Replay {
@@ -946,12 +1151,12 @@ impl Replay {
         let mut host = HostPairing::new(
             identity(&IDENTITY_A).public_key(),
             "Desk".into(),
-            InsecureTestExchangeFactory,
+            CpaceExchangeFactory,
         );
         let params = InvitationParams {
             kind,
             role: Role::owner(),
-            authorizing_owner: OwnerRef::new("profile").expect("ref"),
+            authorizing_owner: OwnerRef::from_bytes([0x51; 16]),
             routes: vec![ROUTE.into()],
             grant_expires_at: None,
         };
@@ -968,10 +1173,12 @@ impl Replay {
             joiners: Vec::new(),
             first: Vec::new(),
             last_reply: None,
+            shown_at_last_submit: None,
+            new_code: false,
         }
     }
 
-    fn joiner(&mut self, name: &str) -> &mut JoinerPairing<InsecureTestExchangeFactory> {
+    fn joiner(&mut self, name: &str) -> &mut JoinerPairing<CpaceExchangeFactory> {
         if !self.joiners.iter().any(|(n, _, _)| n == name) {
             let seed = 0x50 + self.joiners.len() as u8;
             let key = identity(&[seed; 32]).public_key();
@@ -979,7 +1186,7 @@ impl Replay {
                 self.ticket.clone(),
                 key,
                 name.into(),
-                InsecureTestExchangeFactory,
+                CpaceExchangeFactory,
                 UnixTime(T),
             )
             .expect("joiner");
@@ -1065,25 +1272,27 @@ impl Replay {
                 host_log.extend(actions);
             }
             "submit" | "submit_first" => {
-                let code = if step["code"] == "right" {
-                    self.host
-                        .code(&self.ticket.invitation)
-                        .expect("code")
+                let shown = self.host.code(&self.ticket.invitation).cloned();
+                let fallback = PairingCode::parse("000000").expect("code");
+                let code = match step["code"].as_str() {
+                    Some("right") => shown.clone().unwrap_or(fallback),
+                    Some("stale") => self
+                        .shown_at_last_submit
                         .clone()
-                } else {
-                    let right = self
-                        .host
-                        .code(&self.ticket.invitation)
-                        .expect("code")
-                        .as_str()
-                        .to_owned();
-                    let wrong = if right == "000000" {
-                        "000001"
-                    } else {
-                        "000000"
-                    };
-                    PairingCode::parse(wrong).expect("code")
+                        .expect("a previous attempt"),
+                    _ => {
+                        let other = PairingCode::parse("000001").expect("code");
+                        if shown.as_ref() == Some(&fallback) {
+                            other
+                        } else {
+                            fallback
+                        }
+                    }
                 };
+                if step["code"] == "stale" {
+                    assert_ne!(shown.as_ref(), Some(&code), "stale code still shown");
+                }
+                self.shown_at_last_submit = shown;
                 let mut rng = self.joiner_rng.clone();
                 let result = self.joiner(&who).submit_code(&code, &mut rng);
                 self.joiner_rng = rng;
@@ -1117,7 +1326,7 @@ impl Replay {
                     let mut to_joiner = Vec::new();
                     for m in std::mem::take(&mut to_host) {
                         let actions = self.deliver_to_host(conn, m);
-                        self.last_reply = Some(actions.clone());
+                        self.last_reply = Some(sent(&actions));
                         for a in &actions {
                             if let HostAction::Send { conn: c, message } = a {
                                 if c.0 == conn {
@@ -1171,9 +1380,9 @@ impl Replay {
                 let before = self.last_reply.clone();
                 let actions = self.deliver_to_host(conn, m);
                 if step["same_reply"] == true {
-                    assert_eq!(Some(&actions), before.as_ref(), "resend reply differs");
+                    assert_eq!(Some(sent(&actions)), before, "resend reply differs");
                 }
-                self.last_reply = Some(actions.clone());
+                self.last_reply = Some(sent(&actions));
                 host_log.extend(actions);
             }
             "drop" => {
@@ -1198,6 +1407,9 @@ impl Replay {
             }
             other => panic!("unknown op {other}"),
         }
+        self.new_code = host_log
+            .iter()
+            .any(|a| matches!(a, HostAction::ShowCode { .. }));
         host_log
             .iter()
             .filter_map(|a| match a {
@@ -1239,6 +1451,9 @@ fn pairing_attempt_sequences_hold() {
                 if let Some(s) = step["joiner_state"].as_str() {
                     assert_eq!(joiner_state_name(r.joiner(who).state()), s, "{ctx}");
                 }
+            }
+            if let Some(b) = step["new_code"].as_bool() {
+                assert_eq!(r.new_code, b, "{ctx}");
             }
             if let Some(s) = step["host_status"].as_str() {
                 assert_eq!(
@@ -1284,6 +1499,7 @@ fn all_vectors() -> Vec<(&'static str, J)> {
         ("der-raw.json", der_raw_vectors()),
         ("mux.json", mux_vectors()),
         ("control.json", control_vectors()),
+        ("hello.json", hello_vectors()),
         ("pairing-attempts.json", pairing_attempt_vectors()),
     ]
 }

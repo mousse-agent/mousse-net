@@ -51,7 +51,9 @@ Status: approved design, 2026-11-18. Code: this repository. Wire spec: [`spec/`]
 ## Core designs
 
 ### 1. Identity, session certificates and the authorization boundary
-- **Identity key:** one ECDSA P-256 key per device, in the Secure Enclave or StrongBox/TEE where available, otherwise a keystore-wrapped software key. The spec lists which platforms use hardware. Browsers use a non-extractable WebCrypto key.
+- **Endpoint:** a Mousse profile's helper on one device. An endpoint has its own identity key, keystore entry, state directory, exclusive lock, grant and denial table, invitations, peer pins, listener and relay registration. A computer with several profiles is several endpoints, so two people sharing one computer can each put it in their own set of devices, and neither one's pairing, denial or removal touches the other's. In this plan, "device" and "host" mean endpoint.
+- **Identity key:** one ECDSA P-256 key per endpoint, in the Secure Enclave or StrongBox/TEE where available, otherwise a keystore-wrapped software key. The spec lists which platforms use hardware. Browsers use a non-extractable WebCrypto key.
+- **Shared computers:** separate OS accounts give real separation: keys sit in each user's own keystore, and terminals and files run as that user. Two profiles under the same OS account have separate grants and removal, but not privacy: any process running as that account can read both profiles' files and keys, and provider credentials are already shared between profiles. The app says so where a second profile is set up, and the threat model states it. One profile used by two people is one set of devices: either can remove the other's devices.
 - **Session certificate:** a self-signed certificate on a fresh session key. An extension carries the identity public key (SEC1 uncompressed) and an identity signature in **fixed-width raw r‖s (64 bytes)**. The Secure Enclave and Android produce DER, which is converted. The signature covers the canonical CBOR record:
 
   `{domain "mousse-session-v1", session SPKI (DER), not_before, not_after ≤ 24 h, protocol version}`
@@ -71,10 +73,10 @@ Status: approved design, 2026-11-18. Code: this repository. Wire spec: [`spec/`]
 - **Browser key loss:** request `navigator.storage.persist()` and recommend installing on Safari. A lost key means re-pairing the browser.
 
 ### 2. Trust: local grants, and "remove on all my hosts"
-- **Local host grants (Phase 1 onward):** each host keeps `{identity, name, role, source, authorizing owner/profile, adopted_into, granted_at}`. The source is `local` until Phase 6. Each live channel is bound to the grant that authorized it. A device can hold grants on hosts of different owners, which covers Teams. The app enforces Teams rules on every RPC.
+- **Local host grants (Phase 1 onward):** each endpoint keeps its own table of `{identity, name, role, source, authorizing owner/profile, adopted_into, granted_at}`. The authorizing owner is a random 128-bit profile id, never a display name. The source is `local` until Phase 6. Each live channel is bound to the grant that authorized it. A device can hold grants on hosts of different owners, which covers Teams. The app enforces Teams rules on every RPC.
 - **Remove everywhere (Phase 4):** an admin device sends a signed removal to each of its owner's hosts over sessions, or through the encrypted directory mailbox. It shows "delivered" or "pending" for each host.
-  - A **local denial is host-wide** and always wins.
-  - A removal affects only grants whose stored authorizing owner matches.
+  - A **local denial covers the whole endpoint** and always wins. It never reaches another profile's endpoint on the same computer.
+  - A removal affects only grants whose stored authorizing owner matches. The endpoint accepts it only from a signer that holds a live owner-role grant on that same endpoint, after checking the signature, the recipient and replay. A stale removal leaves a newer pairing of the same device alone.
 - **Shared roster (Phase 6, after the paid launch).** It is its own phase:
   - **One writer per roster:** records `{roster id, writer epoch, parent hash, sequence, change}`, signed by the writer and kept durably. The genesis record is pinned. A writer transfer starts a new epoch. Losing the writer means a reset and re-pairing.
   - **Grant source:** every grant records its source, `local` or `roster R`.
@@ -109,6 +111,7 @@ Status: approved design, 2026-11-18. Code: this repository. Wire spec: [`spec/`]
   - Retries are keyed by attempt ID plus TLS session. Only byte-identical messages may be resent; a new session is a new, counted attempt.
   - Each side's 3-attempt cap is local state. A fake host can use up the joiner's attempts, but it can't cancel the real host's invitation.
 - **Where codes are typed:** only in the installed app or a trusted, bookmarked or installed web-client origin. A handoff page reached from a link never receives a code.
+- **Profile first:** an invitation is made by, and grants into, the selected profile's endpoint; the ticket pins that endpoint. Joining never refuses because the computer already belongs to another profile's set of devices. The approval prompt names the joiner as "<computer> (<profile>)".
 - **Accept:** the host allows one enrollment per invitation across routes, with atomic consumption. Cancelling grants nothing.
 - **If CPace fails its review,** ship in-person pairing only and hold back shared links and browser pairing. There is no fallback where the owner merely compares codes. Phases 0 and 1a can pass with CPace deferred, as long as the matrix marks it **DEFERRED**. "Send link" (Phase 1b) and browser pairing (Phase 5) are gated on CPace passing.
 
@@ -127,6 +130,7 @@ Status: approved design, 2026-11-18. Code: this repository. Wire spec: [`spec/`]
   - **Browsers use normal Web PKI checks** against an origin listed in the host-signed manifest. A valid public certificate at an origin that isn't listed is refused.
   - The privacy doc states that whoever terminates a browser's WSS connection sees relay metadata. Peer TLS inside is still pinned, so they can't see content.
 - **State directory:** identity key, ACME files, the self-host allow-list and an exclusive lock. No user data, no payload and no IP logs.
+- **Per endpoint:** each endpoint has its own registration key, handle, manifest and allow-set, and each person's account pays for their own. The relay can see that two handles share an IP; the privacy doc says so.
 - **Registration:** the target registers handle `H = hash(relay id ‖ registration key)`. It proves it holds that key against a fresh relay challenge on the live connection, so the handle can't be claimed by anyone else. Then it pushes its live **allow-set**:
 
   `{allowed caller keys, open invitation ids with expiry}`
@@ -142,7 +146,7 @@ Status: approved design, 2026-11-18. Code: this repository. Wire spec: [`spec/`]
   - Rotation is tested through the old route, which carries the new manifest.
   - A lost relay key means a new manifest. Callers who were offline through the entire overlap re-pair.
 - **Linkability:** registration handles rotate with an overlap. The privacy doc admits that IP, timing and Plus issuance can still allow correlation.
-- **Self-hosted relay (Phase 3):** `mousse-relay init` writes a list of authorized targets, so operators decide who may register. There are no leases; local limits apply (connections per IP, bandwidth ceiling, bounded queues, idle timeouts).
+- **Self-hosted relay (Phase 3):** `mousse-relay init` writes a list of authorized target endpoints, so operators decide who may register. There are no leases; local limits apply (connections per IP, bandwidth ceiling, bounded queues, idle timeouts).
 - **Hosted relay (Phase 4):** admission is the same, plus leases.
 - **Launch:** one home relay per host. Manifests already hold lists.
 
@@ -192,7 +196,7 @@ Status: approved design, 2026-11-18. Code: this repository. Wire spec: [`spec/`]
 - **Two-region drills** run when region two exists.
 
 ### 8. App integration
-- **Desktop:** the helper per profile, restarted on a crash.
+- **Desktop:** one helper per profile with networking on, all running for the whole OS session (switching the open profile in the app doesn't stop the others), restarted on a crash. A profile is reachable only while its OS user is logged in, because the keystore unlocks at login; hosting with nobody logged in waits for the headless daemon. Each helper binds its own port (picked at start and kept; a fixed port per profile for port forwarding) and advertises it.
 - **CLI:** through user-restricted IPC, or headless.
 - **Phone:**
   - Capacitor → Swift/Kotlin → UniFFI.
@@ -232,19 +236,20 @@ Each phase ships something usable on its own. Phases 0–3 are the minimum produ
   - the session, mux and authorization boundary;
   - terminal and core RPC;
   - cursors and operation IDs;
-  - discovery (a rotating random mDNS instance, with a manual address fallback).
+  - discovery (one rotating random mDNS instance per endpoint, with no owner or profile name in it, with a manual address fallback). A pin mismatch on a LAN candidate means "another endpoint": try the next candidate, with no warning and no re-pin.
 - **Exit:**
   - pairing with the internet unplugged;
   - reconnecting after a restart and after an address change;
   - removal is refused at once and closes channels.
 - **Owner checks:**
   - Router cable unplugged: scan, tap, connected in under 10 s.
+  - Shared computer: two profiles on one desktop each pair, in both directions, with their own second desktop. One removes the shared desktop: its channels close, and the other profile stays connected, keeps a live terminal open and reconnects after a restart. Neither profile can dial the other's peers. Must-fail control: a build that shares one key or one grant table between profiles.
   - The kit drops an acknowledgement and kills the helper. The effect happens once, or shows "outcome unknown", and the kit checks the side effect itself.
 
 ### Phase 1b: User routes, CLI and "Send link"
 - **Scope:**
   - `tcp` to a tailnet or port forward;
-  - `ssh-stdio`;
+  - `ssh-stdio` (adding a computer over SSH picks the OS account and profile there: an existing profile of that account, or a new one; it never refuses because another profile is paired);
   - `ws` through a user tunnel;
   - the CLI and remaining RPC;
   - "Send link" with CPace (only if it passed its review).
@@ -290,7 +295,7 @@ Each phase ships something usable on its own. Phases 0–3 are the minimum produ
   - Works with UDP blocked.
   - A wrong relay key and a wrong peer identity both fail before any data.
   - A reboot keeps the identity, and calls are refused until the target re-registers.
-  - A second process using the same identity won't start.
+  - A second process using the same endpoint identity won't start; a second profile's endpoint on the same machine does.
   - An unlisted caller gets the same response as an offline host.
   - **Remove one phone: it fails, while a second phone on cellular only still connects.** This holds across a relay reboot and a relay rotation.
   - Registering a handle with someone else's key fails.
@@ -325,6 +330,7 @@ Each phase ships something usable on its own. Phases 0–3 are the minimum produ
   - Use up a tiny allowance mid-copy and keep typing: the relay adds under 150 ms at the 95th percentile compared with the same idle path. Then switch to LAN and finish with no prompt and no relay charge.
   - Stop Plus: LAN, user routes and the self-hosted relay still work.
   - No relay shows an account name.
+  - Shared computer: "remove on all my hosts" from A's phone leaves B's endpoint on the shared computer untouched.
 
 ### Phase 5: Browser client
 - **Scope:**

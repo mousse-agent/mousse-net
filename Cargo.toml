@@ -18,6 +18,9 @@ rust-version = "1.96"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
+# Must-fail controls in mousse-net-core (spec/vectors/README.md). Each plants
+# one bug so the vector tests can be shown to fail. Debug builds only.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(mousse_control, values("break-session-cert", "break-authz", "break-raw-signature", "break-cpace"))'] }
 
 [profile.release]
 lto = true
