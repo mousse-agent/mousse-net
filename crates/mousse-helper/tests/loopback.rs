@@ -479,3 +479,107 @@ fn a_second_process_for_the_same_endpoint_does_not_start() {
     stop(&a, server);
     cleanup(&[&a, &b]);
 }
+
+/// Wait until `proc` has printed `count` lines containing `needle`; return
+/// them.
+fn lines_with(proc: &Proc, needle: &str, count: usize) -> Vec<String> {
+    let start = Instant::now();
+    loop {
+        let lines: Vec<String> = proc
+            .out()
+            .lines()
+            .filter(|l| l.contains(needle))
+            .map(|l| l.trim().to_owned())
+            .collect();
+        if lines.len() >= count {
+            return lines;
+        }
+        if start.elapsed() > WAIT {
+            panic!(
+                "fewer than {count} {needle:?} lines\nstdout: {}\nstderr: {}",
+                proc.out(),
+                proc.err()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// The newest code an `invite --link` shows.
+fn shown_code(invite: &Proc, count: usize) -> String {
+    let lines = lines_with(invite, "CODE ", count);
+    let last = &lines[count - 1];
+    last.split_whitespace().nth(1).unwrap_or("").to_owned()
+}
+
+/// A six-digit code that differs from `code` in every digit.
+fn wrong_code(code: &str) -> String {
+    code.bytes()
+        .map(|d| char::from(b'0' + (d - b'0' + 1) % 10))
+        .collect()
+}
+
+#[test]
+fn send_link_right_code_pairs_and_three_wrong_codes_end_the_invitation() {
+    let host = Endpoint::init("link-host");
+    let phone = Endpoint::init("link-phone");
+    let stranger = Endpoint::init("link-stranger");
+    let server = host.serve("hostL", &[]);
+
+    // The code shown on the host pairs.
+    let invite = host.spawn(&["invite", "--link", "--no-qr"]);
+    let ticket = invite.wait_for("TICKET ", WAIT)["TICKET ".len()..].to_owned();
+    let mut join = phone.spawn_with_stdin(&["join", &ticket, "--name", "phone"]);
+    let code = shown_code(&invite, 1);
+    assert_eq!(code.len(), 6, "{code:?}");
+    lines_with(&join, "shown on the host", 1);
+    join.type_line(&format!("{code}\n"));
+    let joined = join.finish(WAIT);
+    assert!(joined.ok(), "join: {}", joined.text());
+    invite.wait_for("paired: grant ", WAIT);
+    let done = run_command(&phone, "hostL", &[], "link");
+    assert!(done.stdout.contains("hello-link"), "{}", done.text());
+
+    // Three wrong codes: a fresh code is shown for each attempt, and after
+    // the third the invitation ends and nothing is granted.
+    let mut invite = host.spawn(&["invite", "--link", "--no-qr"]);
+    let ticket = invite.wait_for("TICKET ", WAIT)["TICKET ".len()..].to_owned();
+    let mut join = stranger.spawn_with_stdin(&["join", &ticket, "--name", "stranger"]);
+    let mut shown = Vec::new();
+    for attempt in 1..=3 {
+        lines_with(&join, "shown on the host", attempt);
+        let code = shown_code(&invite, attempt);
+        join.type_line(&format!("{}\n", wrong_code(&code)));
+        shown.push(code);
+    }
+    shown.dedup();
+    assert_eq!(shown.len(), 3, "each attempt shows a fresh code: {shown:?}");
+    let refused = join.finish(WAIT);
+    assert!(!refused.ok(), "{}", refused.text());
+    assert!(
+        refused.stderr.contains("ATTEMPTS_EXHAUSTED"),
+        "{}",
+        refused.text()
+    );
+    assert!(invite.exit_within(WAIT).is_some(), "invite still waiting");
+    assert!(
+        invite.err().contains("AttemptsExhausted"),
+        "{}",
+        invite.err()
+    );
+    let listed = host.run(&["grants"]);
+    assert!(listed.stdout.contains("phone"), "{}", listed.text());
+    assert!(!listed.stdout.contains("stranger"), "{}", listed.text());
+
+    // The ended ticket does not work again.
+    let again = stranger.run(&["join", &ticket, "--name", "stranger"]);
+    assert!(!again.ok(), "{}", again.text());
+    assert!(
+        again.stderr.contains("INVITATION_INVALID"),
+        "{}",
+        again.text()
+    );
+
+    stop(&host, server);
+    cleanup(&[&host, &phone, &stranger]);
+}

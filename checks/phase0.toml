@@ -299,17 +299,16 @@ breaks = "the two endpoints on the computer share one grant table"
 args = ["--bug", "shared-grant-table"]
 
 # ---------------------------------------------------------------------------
-# Thin slice: two desktop processes pair in person, open a terminal channel,
-# then remove the grant.
+# Thin slice: two desktop processes pair (in person or by send link), open a
+# terminal channel, then remove the grant.
 
 [[check]]
 id = "phase0.thin-slice-loopback"
-title = "Thin slice on one machine: pair in person, terminal channel, remove the grant"
-plan = "Phase 0 \"Slice\""
+title = "Thin slice on one machine: pair in person and by send link, terminal channel, remove the grant, two endpoints on one computer"
+plan = "Phase 0 \"Slice\"; docs/PLAN.md §1 \"Endpoint\""
 targets = ["windows-x64"]
 judge = "cargo-test"
-min_tests = 3
-placeholder = "mousse-helper and mousse-net-io are not merged yet (branch p0-io)"
+min_tests = 5
 
 [[check.local]]
 target = "windows-x64"
@@ -318,20 +317,25 @@ command = ["cargo", "test", "-p", "mousse-helper", "--test", "loopback", "--no-f
 
 [[check.control]]
 name = "skip-pin-check"
-breaks = "the helper accepts a peer whose identity does not match its stored pin"
-args = ["--features", "control-skip-pin-check"]
+breaks = "the dialler accepts a host whose identity does not match its stored pin"
+env = { RUSTFLAGS = '--cfg mousse_control="skip-pin-check"' }
 
 [[check.control]]
 name = "keep-removed-grant"
-breaks = "removing a grant leaves the channels it authorized open"
-args = ["--features", "control-keep-removed-grant"]
+breaks = "removing a grant reports success and leaves the grant and its channels in force"
+env = { RUSTFLAGS = '--cfg mousse_control="keep-removed-grant"' }
+
+[[check.control]]
+name = "shared-endpoint-state"
+breaks = "every endpoint on the computer uses one identity key and one grant table"
+env = { RUSTFLAGS = '--cfg mousse_control="shared-endpoint-state"' }
 
 [[check]]
 id = "phase0.thin-slice-cross-machine"
 title = "Thin slice across machines: the PC dials the Mac over the LAN"
 plan = "Phase 0 \"Slice\" (two desktops)"
-targets = ["pc-dials-mac"]
-device_steps = "the Mac runs the helper listener, the PC runs the dialer (pair, terminal, remove); the side that judges signs the result. Control: the Mac listener presents a different identity and the PC must refuse"
+targets = ["pc-to-mac-lan"]
+device_steps = "the Mac runs `mousse-helper serve --listen-ip 0.0.0.0` and `invite`; the PC runs `mousse-helper slice-check --ticket <ticket> --route tcp://<mac>:<port> --out <file> -- uname -a` (pair, terminal, removal closes it, reconnect refused) and the result file is signed. Control: the Mac serves a build with --cfg mousse_control=\"allow-break-env\" and MOUSSE_HELPER_BREAK=wrong-identity; the PC runs slice-check with --control wrong-identity and must print RESULT FAIL"
 
 [[check.control]]
 name = "wrong-identity"
