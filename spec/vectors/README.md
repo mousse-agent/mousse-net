@@ -56,8 +56,10 @@ RUSTFLAGS='--cfg mousse_control="break-authz"' cargo test -p mousse-net-core
 | `break-cpace` | The CPace confirmation compare always passes. | `pairing_e2e_vectors`, `pairing_attempt_sequences_hold`, the CPace rejection vectors |
 
 Each control runs the same tests as a normal build; at least one must fail.
-The cfg names are declared in the workspace lints. A release build with any
-control set does not compile.
+The cfg names are declared in the workspace lints. A build with any control
+set fails when debug assertions are off, and the build scripts of
+`mousse-net-core`, `mousse-net-io` and `mousse-helper` refuse the release
+profile (and any profile that inherits it) even with debug assertions on.
 
 ## Pending
 

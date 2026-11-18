@@ -22,7 +22,9 @@
 
 // Must-fail controls (spec/vectors/README.md, "Must-fail controls") plant a
 // bug so the vector tests can be shown to fail. They are for debug test runs
-// only and never compile into a release build.
+// only and never compile into a release build: this stops builds without
+// debug assertions, and build.rs stops the release profile (and profiles
+// that inherit it) even when debug assertions are on.
 #[cfg(all(
     any(
         mousse_control = "break-session-cert",
