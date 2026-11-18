@@ -27,7 +27,7 @@ use mousse_net_core::pairing::{
     InvitationId, InvitationKind, InvitationParams, InvitationStatus, PairingCode,
     SessionExporters,
 };
-use mousse_net_core::{ConnectionId, ErrorCode};
+use mousse_net_core::{ConnectionId, ErrorCode, UnixTime};
 use tokio::sync::mpsc;
 
 use crate::certs::CertManager;
@@ -152,6 +152,9 @@ struct Shared<F: CodeExchangeFactory> {
     policy: TlsPolicy,
     owner: OwnerRef,
     next_conn: AtomicU64,
+    /// Tests stop the ticker to show what holds without it.
+    #[cfg(test)]
+    ticker_paused: std::sync::atomic::AtomicBool,
 }
 
 /// A host. Cheap to clone; all clones share state.
@@ -205,6 +208,44 @@ where
                 Err(e)
             }
         }
+    }
+
+    /// Remove the grants past their expiry, close their connections and
+    /// save.
+    fn expire_grants(&mut self, now: UnixTime) {
+        let before = self.grants.grants().count();
+        let events = self.grants.tick(now);
+        let changed = self.grants.grants().count() != before;
+        self.apply_grant_events(events);
+        if changed || self.unsaved {
+            // A failure is reported as an event and retried by the ticker.
+            let _ = self.persist();
+        }
+    }
+
+    /// Whether `conn` is live under a grant that is still live at `now`.
+    /// A grant found past its expiry is removed here and its connections
+    /// closed with `GRANT_REVOKED`, without waiting for the ticker.
+    fn live_now(&mut self, conn: ConnectionId, now: UnixTime) -> bool {
+        let Some(GateState::Live { grant }) = self.gates.get(&conn).map(|g| g.state().clone())
+        else {
+            return false;
+        };
+        let live = self
+            .grants
+            .get(grant)
+            .is_some_and(|g| g.expires_at.is_none_or(|at| now < at));
+        if !live {
+            self.expire_grants(now);
+            // Gone some other way: the connection must not stay live.
+            if matches!(
+                self.gates.get(&conn).map(|g| g.state()),
+                Some(GateState::Live { .. })
+            ) {
+                self.close_conn(conn, ErrorCode::GrantRevoked);
+            }
+        }
+        live
     }
 
     fn apply_grant_events(&mut self, events: Vec<GrantEvent>) {
@@ -343,6 +384,8 @@ where
             policy: config.policy,
             owner: config.owner,
             next_conn: AtomicU64::new(1),
+            #[cfg(test)]
+            ticker_paused: std::sync::atomic::AtomicBool::new(false),
         });
         tokio::spawn(ticker(Arc::downgrade(&shared)));
         Ok((Self { shared }, events_rx))
@@ -548,14 +591,14 @@ async fn ticker<F: CodeExchangeFactory>(shared: Weak<Shared<F>>) {
         let Some(shared) = shared.upgrade() else {
             return;
         };
+        #[cfg(test)]
+        if shared.ticker_paused.load(Ordering::SeqCst) {
+            continue;
+        }
         let now = shared.clock.now();
         let mono = shared.clock.mono();
         let mut inner = lock(&shared);
-        let events = inner.grants.tick(now);
-        if !events.is_empty() || inner.unsaved {
-            inner.apply_grant_events(events);
-            let _ = inner.persist();
-        }
+        inner.expire_grants(now);
         let actions = inner.pairing.tick(now);
         inner.apply(actions, &*shared.clock);
         let overdue: Vec<(ConnectionId, ErrorCode)> = inner
@@ -597,7 +640,15 @@ where
     }
 
     fn check(&mut self, traffic: Traffic, _message: Option<&ControlMessage>) -> Verdict {
+        let now = self.shared.clock.now();
         let mut inner = lock(&self.shared);
+        // Stream traffic needs the bound grant to be live now, not only when
+        // the ticker last looked.
+        if matches!(traffic, Traffic::Stream) && !inner.live_now(self.conn, now) {
+            if let Some(GateState::Closed(code)) = inner.gates.get(&self.conn).map(|g| g.state()) {
+                return Verdict::Close(*code);
+            }
+        }
         match inner.gates.get_mut(&self.conn) {
             Some(gate) => gate.check(traffic),
             None => Verdict::Close(ErrorCode::InternalError),
@@ -643,11 +694,8 @@ where
     }
 
     fn may_open(&self) -> bool {
-        let inner = lock(&self.shared);
-        matches!(
-            inner.gates.get(&self.conn).map(|g| g.state()),
-            Some(GateState::Live { .. })
-        )
+        let now = self.shared.clock.now();
+        lock(&self.shared).live_now(self.conn, now)
     }
 
     fn on_closed(&mut self, _reason: &CloseReason) {
@@ -658,5 +706,133 @@ where
         inner.grants.unbind(self.conn);
         let actions = inner.pairing.on_connection_closed(self.conn);
         inner.apply(actions, &*shared.clock);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use mousse_net_core::grants::NewGrant;
+    use mousse_net_core::identity::SoftwareKey;
+    use mousse_net_core::mux::PriorityClass;
+    use mousse_net_core::pairing::CpaceExchangeFactory;
+
+    use super::*;
+    use crate::caller::Caller;
+    use crate::clock::ManualClock;
+
+    async fn within<T>(what: &str, fut: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(5), fut)
+            .await
+            .unwrap_or_else(|_| panic!("timed out: {what}"))
+    }
+
+    struct Live {
+        host: Host,
+        clock: Arc<ManualClock>,
+        expires_at: UnixTime,
+        hosted: Connection,
+        dialled: Connection,
+    }
+
+    /// A caller with a grant that expires in a minute, connected to the
+    /// host over an in-memory pipe.
+    async fn live() -> Live {
+        let clock = Arc::new(ManualClock::new());
+        let owner = OwnerRef([1; OwnerRef::LEN]);
+        let config = HostConfig {
+            name: "desk".into(),
+            state_dir: None,
+            owner,
+            policy: TlsPolicy::default(),
+            clock: clock.clone(),
+            ticket_identity: None,
+        };
+        let key = Arc::new(SoftwareKey::generate(&mut os_rng()));
+        let (host, _events) = Host::new(key, config, CpaceExchangeFactory).unwrap();
+        let caller = Caller::new(
+            Arc::new(SoftwareKey::generate(&mut os_rng())),
+            Arc::new(ManualClock::new()),
+            TlsPolicy::default(),
+        );
+        let now = clock.now();
+        let expires_at = UnixTime(now.0 + 60);
+        let grant = NewGrant {
+            identity: caller.identity(),
+            name: "laptop".into(),
+            role: Role::owner(),
+            authorizing_owner: owner,
+            expires_at: Some(expires_at),
+        };
+        lock(&host.shared).grants.add(grant, now).unwrap();
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let (hosted, dialled) = tokio::join!(host.accept(a), caller.dial(b, host.identity()));
+        Live {
+            host,
+            clock,
+            expires_at,
+            hosted: hosted.unwrap(),
+            dialled: dialled.unwrap(),
+        }
+    }
+
+    impl Live {
+        /// The grant's expiry second arrives while the ticker is stopped.
+        fn expire_without_the_ticker(&self) {
+            self.host.shared.ticker_paused.store(true, Ordering::SeqCst);
+            self.clock.freeze_at(self.expires_at);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stream_after_the_grant_expired_is_refused_without_the_ticker() {
+        let live = live().await;
+        let before = live
+            .dialled
+            .open_stream(PriorityClass::Interactive, "terminal")
+            .await
+            .unwrap();
+        before.writer.write(b"in time").await.unwrap();
+        assert!(within("the first stream", live.hosted.accept_stream())
+            .await
+            .is_some());
+
+        live.expire_without_the_ticker();
+        let after = live
+            .dialled
+            .open_stream(PriorityClass::Interactive, "terminal")
+            .await
+            .unwrap();
+        let _ = after.writer.write(b"too late").await;
+        assert!(
+            within("no second stream", live.hosted.accept_stream())
+                .await
+                .is_none(),
+            "a stream was admitted under an expired grant"
+        );
+        assert_eq!(
+            within("closed", live.hosted.closed()).await,
+            CloseReason::Local(ErrorCode::GrantRevoked)
+        );
+        assert_eq!(
+            within("closed", live.dialled.closed()).await,
+            CloseReason::Peer(ErrorCode::GrantRevoked)
+        );
+        assert!(live.host.grants().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_host_opens_no_stream_under_an_expired_grant() {
+        let live = live().await;
+        live.expire_without_the_ticker();
+        assert!(live
+            .hosted
+            .open_stream(PriorityClass::Interactive, "terminal")
+            .await
+            .is_err());
+        assert_eq!(
+            within("closed", live.dialled.closed()).await,
+            CloseReason::Peer(ErrorCode::GrantRevoked)
+        );
+        assert!(live.host.grants().is_empty());
     }
 }
