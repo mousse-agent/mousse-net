@@ -1,0 +1,1053 @@
+//! `serve --app`: the channel to the Mousse app on stdin and stdout
+//! (Phase 1a §1 and §2).
+//!
+//! - **Framing** ([`frame`]): JSON, DATA and CREDIT frames. A malformed
+//!   frame closes the channel and the helper exits.
+//! - **Handles.** Every stream gets a handle that is unique for the life of
+//!   this process and never reused, bound to one connection and one wire
+//!   stream. Wire stream ids restart on every connection, so two
+//!   connections can use the same one at once; handles never collide.
+//!   Connection numbers are never reused either, so a reconnect is a new
+//!   number (its generation). DATA, CREDIT and `stream.reset` name only
+//!   handles; a frame for an unknown or ended handle is dropped and counted.
+//! - **Pumps.** Reading stdin never waits on writing stdout or on the
+//!   engine: each stream has its own pump each way.
+//! - **Writer order** ([`out`]): control (JSON, then CREDIT), then
+//!   interactive DATA, then bulk DATA, streams taking turns in a class. FIN
+//!   is a flag on a DATA frame in the stream's own queue.
+//! - **Credit, app to engine** ([`budget`]): the helper grants the app
+//!   credit from one budget, at most `APP_STREAM_CREDIT_BYTES` a stream,
+//!   with `APP_CREDIT_INTERACTIVE_RESERVE_BYTES` kept for interactive
+//!   streams. It returns once the engine has taken the bytes. Data beyond
+//!   credit is malformed.
+//! - **Credit, engine to app (read-ahead).** Reading an engine stream
+//!   returns wire credit to the peer at once, so the helper reads a stream
+//!   only while the app's credit covers what it has buffered plus
+//!   `APP_READ_AHEAD_BYTES`. When the app stalls, the remote writer stalls.
+//! - **Exit.** On stdin EOF the helper sends `GOAWAY NO_ERROR` on every
+//!   connection and exits.
+//!
+//! Requests are `{"id", "op", ...}`; replies `{"re", ...}` or
+//! `{"re", "error", "reason"}`; events `{"ev", ...}`.
+
+mod budget;
+mod frame;
+mod out;
+
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use mousse_net_core::identity::IdentityPublicKey;
+use mousse_net_core::mux::PriorityClass;
+use mousse_net_core::ErrorCode;
+use mousse_net_io::store::{hex, short_id, PeerStore};
+use mousse_net_io::{
+    Caller, CloseReason, Connection, Host, MuxStream, NetError, StreamAdmission, StreamReader,
+    StreamWriter,
+};
+use serde_json::{json, Map, Value};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{mpsc, watch, Notify};
+
+use self::budget::Budget;
+use self::frame::Frame;
+use self::out::{Meta, Out};
+use crate::applog;
+use crate::limits::HelperLimits;
+
+/// The protocol this helper speaks: 1.0.
+const PROTO: (u64, u64) = (1, 0);
+
+/// The stream labels an inbound connection passes on to the app (§3.2).
+pub const LABELS: [&str; 5] = [
+    "mousse.hello",
+    "mousse.rpc",
+    "mousse.sub",
+    "mousse.blob",
+    "mousse.put",
+];
+
+/// What the app learns in the `hello` reply.
+pub struct AppInfo {
+    pub identity: IdentityPublicKey,
+    pub profile: String,
+    pub port: u16,
+    pub routes: Vec<String>,
+    pub state_dir: PathBuf,
+}
+
+/// Why the channel ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum End {
+    /// stdin closed: the app exited or crashed.
+    Eof,
+    /// The app asked for `shutdown`.
+    Shutdown,
+    /// A malformed frame, or data beyond credit.
+    Malformed(String),
+    /// The app stopped reading: its control queue passed its limit.
+    Stuck,
+}
+
+impl End {
+    /// The error `serve` exits with, if any.
+    pub fn error(&self) -> Option<String> {
+        match self {
+            End::Eof | End::Shutdown => None,
+            End::Malformed(why) => Some(format!("app channel: {why}")),
+            End::Stuck => Some(
+                "app channel: the app stopped reading (APP_CONTROL_QUEUE_BYTES reached)".into(),
+            ),
+        }
+    }
+}
+
+/// One app channel.
+#[derive(Clone)]
+pub struct App {
+    shared: Arc<Shared>,
+}
+
+struct Shared {
+    core: Mutex<Core>,
+    wake_writer: Notify,
+    ended: watch::Sender<Option<End>>,
+    caller: Arc<Caller>,
+    host: Host,
+    admission: Arc<StreamAdmission>,
+    info: AppInfo,
+    limits: HelperLimits,
+}
+
+/// One chunk from the app for the engine.
+struct Chunk {
+    bytes: Vec<u8>,
+    fin: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rx {
+    Open,
+    /// FIN is queued for the app.
+    FinQueued,
+    /// FIN was written.
+    Done,
+}
+
+struct ConnEntry {
+    conn: Arc<Connection>,
+    identity: IdentityPublicKey,
+}
+
+struct StreamEntry {
+    conn: u64,
+    class: PriorityClass,
+    writer: StreamWriter,
+    /// The app accepted it (always, for a stream it opened).
+    accepted: bool,
+    // Engine to app.
+    rx: Rx,
+    /// Credit the app granted and the helper has not used.
+    rx_credit: u64,
+    /// Read from the engine, queued for the app.
+    rx_buffered: u64,
+    wake: Arc<Notify>,
+    // App to engine.
+    tx: Option<mpsc::UnboundedSender<Chunk>>,
+    /// Credit granted to the app that it has not used.
+    tx_credit: u64,
+    /// Credit granted and not yet taken by the engine (held from the
+    /// budget).
+    tx_window: u64,
+    tx_done: bool,
+}
+
+struct Core {
+    hello: bool,
+    out: Out,
+    budget: Budget,
+    conns: HashMap<u64, ConnEntry>,
+    streams: BTreeMap<u32, StreamEntry>,
+    next_conn: u64,
+    next_handle: u32,
+    /// The last stream granted credit, per class (streams take turns).
+    turn: [u32; 2],
+    dropped: u64,
+    buffered: u64,
+    peak_buffered: u64,
+    /// Shutdown: end once everything queued is written.
+    ending: Option<End>,
+}
+
+fn lock(core: &Mutex<Core>) -> MutexGuard<'_, Core> {
+    core.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn class_name(class: PriorityClass) -> &'static str {
+    match class {
+        PriorityClass::Interactive => "interactive",
+        PriorityClass::Bulk => "bulk",
+    }
+}
+
+fn close_word(reason: &CloseReason) -> String {
+    match reason {
+        CloseReason::Local(code) | CloseReason::Peer(code) => code.name().into(),
+        CloseReason::PipeClosed => "connection_dropped".into(),
+        CloseReason::Io(_) => "io_error".into(),
+    }
+}
+
+fn error_code(name: &str) -> ErrorCode {
+    ErrorCode::ALL
+        .iter()
+        .copied()
+        .find(|c| c.name() == name)
+        .unwrap_or(ErrorCode::Cancelled)
+}
+
+fn error(id: &Value, error: &str, reason: impl Into<String>) -> Value {
+    json!({"re": id, "error": error, "reason": reason.into()})
+}
+
+impl App {
+    /// Start the channel on stdin and stdout.
+    pub fn start(host: Host, caller: Arc<Caller>, info: AppInfo) -> Self {
+        let limits = *crate::limits::helper();
+        let (ended, _) = watch::channel(None);
+        let shared = Arc::new(Shared {
+            core: Mutex::new(Core {
+                hello: false,
+                out: Out::default(),
+                budget: Budget::new(
+                    limits.app_credit_budget_bytes(),
+                    limits.app_credit_interactive_reserve_bytes(),
+                ),
+                conns: HashMap::new(),
+                streams: BTreeMap::new(),
+                next_conn: 1,
+                next_handle: 1,
+                turn: [0, 0],
+                dropped: 0,
+                buffered: 0,
+                peak_buffered: 0,
+                ending: None,
+            }),
+            wake_writer: Notify::new(),
+            ended,
+            admission: host.stream_admission(),
+            caller,
+            host,
+            info,
+            limits,
+        });
+        tokio::spawn(read_stdin(shared.clone()));
+        tokio::spawn(write_stdout(shared.clone()));
+        Self { shared }
+    }
+
+    /// Wait until the channel ends.
+    pub async fn ended(&self) -> End {
+        let mut rx = self.shared.ended.subscribe();
+        let end = match rx.wait_for(Option::is_some).await {
+            Ok(end) => end.clone(),
+            Err(_) => None,
+        };
+        end.unwrap_or(End::Eof)
+    }
+
+    /// An inbound connection: announced once it is live.
+    pub async fn inbound(&self, conn: Connection) {
+        let peer = short_id(conn.peer());
+        if !conn.settled(true).await.is_live() {
+            applog::line(format!("refused {peer}: not live"));
+            return;
+        }
+        let grant = self.shared.host.grant_of(conn.id());
+        let mut fields = json!({"dir": "in"});
+        if let Some(g) = &grant {
+            fields["grant"] = json!(g.id.0);
+            fields["role"] = json!(g.role.as_str());
+        }
+        applog::line(format!("connected {peer} (in)"));
+        self.shared.add_conn(conn, true, fields);
+    }
+
+    /// Close every connection the channel opened (the host closes its own).
+    pub fn close_all(&self) {
+        let core = lock(&self.shared.core);
+        for entry in core.conns.values() {
+            entry.conn.close(ErrorCode::NoError);
+        }
+    }
+}
+
+impl Shared {
+    fn end(&self, end: End) {
+        self.ended.send_if_modified(|v| {
+            if v.is_none() {
+                *v = Some(end);
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    /// Wake the writer, and end the channel if the app stopped reading.
+    fn queued(&self, core: &Core) {
+        self.wake_writer.notify_one();
+        if core.out.control_bytes() as u64 > self.limits.app_control_queue_bytes() {
+            self.end(End::Stuck);
+        }
+    }
+
+    fn reply(&self, core: &mut Core, value: Value) {
+        core.out.json(&value);
+        self.queued(core);
+    }
+
+    fn add_conn(self: &Arc<Self>, conn: Connection, inbound: bool, mut fields: Value) -> u64 {
+        let conn = Arc::new(conn);
+        let identity = *conn.peer();
+        let no = {
+            let mut core = lock(&self.core);
+            let no = core.next_conn;
+            core.next_conn += 1;
+            core.conns.insert(
+                no,
+                ConnEntry {
+                    conn: conn.clone(),
+                    identity,
+                },
+            );
+            fields["ev"] = json!("conn.up");
+            fields["conn"] = json!(no);
+            fields["identity"] = json!(hex(identity.as_bytes()));
+            fields["deadline"] = json!(conn.deadline().secs());
+            core.out.conn_event(no, &fields);
+            self.queued(&core);
+            no
+        };
+        tokio::spawn(conn_task(self.clone(), no, conn, inbound));
+        no
+    }
+
+    /// The connection ended: its streams end with it (`conn.down` says so).
+    fn conn_down(&self, no: u64, reason: &CloseReason) {
+        let mut core = lock(&self.core);
+        let Some(entry) = core.conns.remove(&no) else {
+            return;
+        };
+        let handles: Vec<u32> = core
+            .streams
+            .iter()
+            .filter(|(_, s)| s.conn == no)
+            .map(|(h, _)| *h)
+            .collect();
+        for h in handles {
+            drop_stream(&mut core, h);
+        }
+        core.regrant(&self.limits);
+        let event = json!({
+            "ev": "conn.down",
+            "conn": no,
+            "identity": hex(entry.identity.as_bytes()),
+            "reason": close_word(reason),
+        });
+        core.out.conn_event(no, &event);
+        self.queued(&core);
+        applog::line(format!("closed {}: {reason}", short_id(&entry.identity)));
+    }
+
+    /// A new stream on connection `no`. Returns its handle, or `None` if
+    /// the connection is gone (the stream is reset).
+    fn add_stream(
+        self: &Arc<Self>,
+        core: &mut Core,
+        no: u64,
+        stream: MuxStream,
+        accepted: bool,
+    ) -> Option<u32> {
+        if !core.conns.contains_key(&no) || core.next_handle == u32::MAX {
+            stream.writer.reset(ErrorCode::RefusedStream);
+            return None;
+        }
+        let handle = core.next_handle;
+        core.next_handle += 1;
+        let class = stream.class();
+        let (reader, writer) = stream.split();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let wake = Arc::new(Notify::new());
+        core.streams.insert(
+            handle,
+            StreamEntry {
+                conn: no,
+                class,
+                writer: writer.clone(),
+                accepted,
+                rx: Rx::Open,
+                rx_credit: 0,
+                rx_buffered: 0,
+                wake: wake.clone(),
+                tx: Some(tx),
+                tx_credit: 0,
+                tx_window: 0,
+                tx_done: false,
+            },
+        );
+        tokio::spawn(rx_pump(self.clone(), handle, reader, wake));
+        tokio::spawn(tx_pump(self.clone(), handle, writer, rx));
+        Some(handle)
+    }
+
+    fn on_frame(self: &Arc<Self>, frame: Frame) -> Result<(), End> {
+        match frame {
+            Frame::Json(map) => {
+                self.on_request(map);
+                Ok(())
+            }
+            Frame::Data { handle, fin, bytes } => self.app_data(handle, fin, bytes),
+            Frame::Credit { handle, bytes } => {
+                let mut core = lock(&self.core);
+                match core.streams.get_mut(&handle) {
+                    Some(s) if s.rx != Rx::Done => {
+                        s.rx_credit = s.rx_credit.saturating_add(u64::from(bytes));
+                        s.wake.notify_one();
+                    }
+                    _ => core.dropped += 1,
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Bytes (and maybe FIN) from the app for the engine.
+    fn app_data(&self, handle: u32, fin: bool, bytes: Vec<u8>) -> Result<(), End> {
+        let mut core = lock(&self.core);
+        let core = &mut *core;
+        let Some(s) = core.streams.get_mut(&handle) else {
+            core.dropped += 1;
+            return Ok(());
+        };
+        let Some(tx) = s.tx.as_ref() else {
+            core.dropped += 1;
+            return Ok(());
+        };
+        let n = bytes.len() as u64;
+        if n > s.tx_credit {
+            return Err(End::Malformed(format!(
+                "{n} bytes on handle {handle} with {} bytes of credit",
+                s.tx_credit
+            )));
+        }
+        s.tx_credit -= n;
+        if !fin {
+            if n > 0 {
+                let _ = tx.send(Chunk { bytes, fin: false });
+            }
+            return Ok(());
+        }
+        #[cfg(mousse_control = "fin-overtakes")]
+        {
+            s.writer.finish();
+            let _ = tx.send(Chunk { bytes, fin: false });
+        }
+        #[cfg(not(mousse_control = "fin-overtakes"))]
+        let _ = tx.send(Chunk { bytes, fin: true });
+        // Nothing more comes this way: unused credit goes back.
+        s.tx = None;
+        let unused = s.tx_credit;
+        s.tx_credit = 0;
+        s.tx_window -= unused;
+        let class = s.class;
+        core.out.take_credit(handle);
+        core.budget.give_back(class, unused);
+        core.regrant(&self.limits);
+        self.wake_writer.notify_one();
+        Ok(())
+    }
+
+    fn on_request(self: &Arc<Self>, map: Map<String, Value>) {
+        let id = map.get("id").cloned().unwrap_or(Value::Null);
+        let op = map.get("op").and_then(Value::as_str).unwrap_or("");
+        let mut core = lock(&self.core);
+        if op != "hello" && !core.hello {
+            self.reply(&mut core, error(&id, "no_hello", "send hello first"));
+            return;
+        }
+        match op {
+            "hello" => {
+                let reply = self.hello(&id, &map);
+                if reply.get("error").is_none() {
+                    core.hello = true;
+                }
+                self.reply(&mut core, reply);
+            }
+            "shutdown" => {
+                self.reply(&mut core, json!({"re": id}));
+                core.ending = Some(End::Shutdown);
+                self.wake_writer.notify_one();
+            }
+            "stats" => {
+                let a = &self.admission;
+                let reply = json!({
+                    "re": id,
+                    "open_streams": a.open_streams(),
+                    "queued_bytes": a.queued_bytes(),
+                    "peak_queued_bytes": a.peak_queued_bytes(),
+                    "refused_streams": a.refused_streams(),
+                    "handles": core.streams.len(),
+                    "conns": core.conns.len(),
+                    "app_buffered_bytes": core.buffered,
+                    "peak_app_buffered_bytes": core.peak_buffered,
+                    "app_credit_out_bytes": core.budget.used(),
+                    "dropped_frames": core.dropped,
+                });
+                self.reply(&mut core, reply);
+            }
+            "stream.accept" => {
+                let handle = map.get("handle").and_then(Value::as_u64);
+                let found = handle
+                    .and_then(|h| u32::try_from(h).ok())
+                    .and_then(|h| core.streams.get_mut(&h));
+                match found {
+                    Some(s) => {
+                        s.accepted = true;
+                        s.wake.notify_one();
+                        core.regrant(&self.limits);
+                        self.reply(&mut core, json!({"re": id}));
+                    }
+                    None => {
+                        core.dropped += 1;
+                        self.reply(&mut core, error(&id, "no_stream", "no such stream"));
+                    }
+                }
+            }
+            "stream.reset" => {
+                let handle = map
+                    .get("handle")
+                    .and_then(Value::as_u64)
+                    .and_then(|h| u32::try_from(h).ok());
+                let code = error_code(map.get("code").and_then(Value::as_str).unwrap_or(""));
+                match handle.and_then(|h| core.streams.get(&h).map(|s| (h, s.writer.clone()))) {
+                    Some((h, writer)) => {
+                        writer.reset(code);
+                        drop_stream(&mut core, h);
+                        core.regrant(&self.limits);
+                        self.reply(&mut core, json!({"re": id}));
+                    }
+                    None => {
+                        core.dropped += 1;
+                        self.reply(&mut core, error(&id, "no_stream", "no such stream"));
+                    }
+                }
+            }
+            "stream.open" => {
+                let conn = map.get("conn").and_then(Value::as_u64);
+                let label = map.get("label").and_then(Value::as_str).map(str::to_owned);
+                let class = match map.get("class").and_then(Value::as_str) {
+                    Some("interactive") => Some(PriorityClass::Interactive),
+                    Some("bulk") => Some(PriorityClass::Bulk),
+                    _ => None,
+                };
+                let entry = conn.and_then(|c| core.conns.get(&c).map(|e| (c, e.conn.clone())));
+                match (entry, label, class) {
+                    (Some((no, conn)), Some(label), Some(class)) => {
+                        drop(core);
+                        tokio::spawn(open_stream(self.clone(), id, no, conn, label, class));
+                    }
+                    (None, _, _) => {
+                        self.reply(&mut core, error(&id, "no_conn", "no such connection"))
+                    }
+                    _ => self.reply(
+                        &mut core,
+                        error(
+                            &id,
+                            "bad_request",
+                            "stream.open needs conn, label and class",
+                        ),
+                    ),
+                }
+            }
+            "dial" => {
+                let identity = map
+                    .get("identity")
+                    .and_then(Value::as_str)
+                    .map(str::to_lowercase);
+                match identity {
+                    Some(identity) => {
+                        drop(core);
+                        tokio::spawn(dial(self.clone(), id, identity));
+                    }
+                    None => self.reply(&mut core, error(&id, "bad_request", "dial needs identity")),
+                }
+            }
+            other => {
+                let reason = format!("unknown op {other:?}");
+                self.reply(&mut core, error(&id, "unknown_op", reason));
+            }
+        }
+    }
+
+    fn hello(&self, id: &Value, map: &Map<String, Value>) -> Value {
+        let proto: Vec<u64> = map
+            .get("proto")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_u64).collect())
+            .unwrap_or_default();
+        let (Some(&major), Some(&minor)) = (proto.first(), proto.get(1)) else {
+            return error(id, "bad_request", "hello needs proto [major, minor]");
+        };
+        if major != PROTO.0 {
+            return error(
+                id,
+                "unsupported_proto",
+                format!("this helper speaks {}.{}", PROTO.0, PROTO.1),
+            );
+        }
+        if let Some(profile) = map.get("profile").and_then(Value::as_str) {
+            if profile != self.info.profile {
+                return error(
+                    id,
+                    "wrong_profile",
+                    "this endpoint belongs to another profile",
+                );
+            }
+        }
+        json!({
+            "re": id,
+            "proto": [PROTO.0, minor.min(PROTO.1)],
+            "build": crate::BUILD,
+            "identity": hex(self.info.identity.as_bytes()),
+            "device": short_id(&self.info.identity),
+            "port": self.info.port,
+            "routes": self.info.routes,
+        })
+    }
+
+    fn has(&self, handle: u32) -> bool {
+        lock(&self.core).streams.contains_key(&handle)
+    }
+
+    /// Whether the engine side of `handle` may be read now.
+    fn may_read(&self, handle: u32) -> Option<bool> {
+        let core = lock(&self.core);
+        let s = core.streams.get(&handle)?;
+        if s.rx != Rx::Open {
+            return None;
+        }
+        if cfg!(mousse_control = "read-without-credit") {
+            return Some(s.accepted);
+        }
+        Some(s.accepted && s.rx_credit >= s.rx_buffered + self.limits.app_read_ahead_bytes())
+    }
+
+    fn rx_data(&self, handle: u32, bytes: &[u8]) {
+        let mut core = lock(&self.core);
+        let core = &mut *core;
+        let Some(s) = core.streams.get_mut(&handle) else {
+            return;
+        };
+        if s.rx != Rx::Open {
+            return;
+        }
+        let n = bytes.len() as u64;
+        s.rx_buffered += n;
+        let class = s.class;
+        core.buffered += n;
+        core.peak_buffered = core.peak_buffered.max(core.buffered);
+        for chunk in bytes.chunks(frame::MAX_DATA) {
+            core.out.data(handle, class, false, chunk);
+        }
+        self.wake_writer.notify_one();
+    }
+
+    fn rx_fin(&self, handle: u32) {
+        let mut core = lock(&self.core);
+        let core = &mut *core;
+        let Some(s) = core.streams.get_mut(&handle) else {
+            return;
+        };
+        s.rx = Rx::FinQueued;
+        let class = s.class;
+        #[cfg(mousse_control = "fin-overtakes")]
+        {
+            let _ = class;
+            core.out.fin_as_control(handle);
+        }
+        #[cfg(not(mousse_control = "fin-overtakes"))]
+        core.out.data(handle, class, true, &[]);
+        self.queued(core);
+    }
+
+    /// The peer reset the stream: tell the app, drop what is queued.
+    fn rx_reset(&self, handle: u32, code: ErrorCode) {
+        let mut core = lock(&self.core);
+        if !core.streams.contains_key(&handle) {
+            return;
+        }
+        drop_stream(&mut core, handle);
+        core.regrant(&self.limits);
+        let event = json!({"ev": "stream.reset", "handle": handle, "code": code.name()});
+        core.out.json(&event);
+        self.queued(&core);
+    }
+
+    /// The engine took `n` bytes from the app: the credit goes back.
+    fn tx_took(&self, handle: u32, n: u64) {
+        let mut core = lock(&self.core);
+        let core = &mut *core;
+        let Some(s) = core.streams.get_mut(&handle) else {
+            return;
+        };
+        let n = n.min(s.tx_window);
+        s.tx_window -= n;
+        let class = s.class;
+        core.budget.give_back(class, n);
+        core.regrant(&self.limits);
+        self.wake_writer.notify_one();
+    }
+
+    /// The app-to-engine pump ended (after FIN, or because the stream or
+    /// connection ended).
+    fn tx_ended(&self, handle: u32) {
+        let mut core = lock(&self.core);
+        let core = &mut *core;
+        let Some(s) = core.streams.get_mut(&handle) else {
+            return;
+        };
+        s.tx_done = true;
+        s.tx = None;
+        s.wake.notify_one();
+        let left = s.tx_window;
+        s.tx_window = 0;
+        s.tx_credit = 0;
+        let class = s.class;
+        core.out.take_credit(handle);
+        core.budget.give_back(class, left);
+        core.maybe_remove(handle);
+        core.regrant(&self.limits);
+        self.wake_writer.notify_one();
+    }
+
+    fn after_write(&self, meta: Meta) {
+        let Meta::Data { handle, len, fin } = meta else {
+            return;
+        };
+        let mut core = lock(&self.core);
+        let core = &mut *core;
+        core.buffered = core.buffered.saturating_sub(len);
+        let Some(s) = core.streams.get_mut(&handle) else {
+            return;
+        };
+        s.rx_credit = s.rx_credit.saturating_sub(len);
+        s.rx_buffered = s.rx_buffered.saturating_sub(len);
+        s.wake.notify_one();
+        if fin {
+            s.rx = Rx::Done;
+            s.wake.notify_one();
+            core.maybe_remove(handle);
+        }
+    }
+}
+
+/// End a stream here: queued frames go, held credit returns, its pumps
+/// stop.
+fn drop_stream(core: &mut Core, handle: u32) {
+    let Some(s) = core.streams.remove(&handle) else {
+        return;
+    };
+    core.out.discard(handle);
+    core.buffered = core.buffered.saturating_sub(s.rx_buffered);
+    core.budget.give_back(s.class, s.tx_window);
+    s.wake.notify_one();
+}
+
+impl Core {
+    fn maybe_remove(&mut self, handle: u32) {
+        if let Some(s) = self.streams.get(&handle) {
+            if s.rx == Rx::Done && s.tx_done {
+                self.streams.remove(&handle);
+            }
+        }
+    }
+
+    /// Grant credit to streams that can take more, interactive first,
+    /// streams taking turns within a class.
+    fn regrant(&mut self, limits: &HelperLimits) {
+        let max = limits.app_stream_credit_bytes();
+        for (slot, class) in [PriorityClass::Interactive, PriorityClass::Bulk]
+            .into_iter()
+            .enumerate()
+        {
+            let wanting: Vec<u32> = self
+                .streams
+                .iter()
+                .filter(|(_, s)| {
+                    s.class == class && s.accepted && s.tx.is_some() && s.tx_window < max
+                })
+                .map(|(h, _)| *h)
+                .collect();
+            let start = wanting
+                .iter()
+                .position(|h| *h > self.turn[slot])
+                .unwrap_or(0);
+            for &handle in wanting[start..].iter().chain(&wanting[..start]) {
+                let Some(s) = self.streams.get_mut(&handle) else {
+                    continue;
+                };
+                let got = self.budget.take(class, max - s.tx_window);
+                if got == 0 {
+                    break;
+                }
+                s.tx_window += got;
+                s.tx_credit += got;
+                self.out.credit(handle, got);
+                self.turn[slot] = handle;
+            }
+        }
+    }
+}
+
+async fn read_stdin(shared: Arc<Shared>) {
+    let mut stdin = tokio::io::stdin();
+    let size = usize::try_from(crate::limits::get().net.io().read_buffer_bytes()).unwrap_or(32_768);
+    let mut buf = vec![0u8; size];
+    let mut inbuf: Vec<u8> = Vec::new();
+    loop {
+        let n = match stdin.read(&mut buf).await {
+            Ok(0) | Err(_) => {
+                shared.end(End::Eof);
+                return;
+            }
+            Ok(n) => n,
+        };
+        inbuf.extend_from_slice(&buf[..n]);
+        let mut at = 0;
+        loop {
+            match frame::decode(&inbuf[at..]) {
+                Ok(Some((frame, used))) => {
+                    at += used;
+                    if let Err(end) = shared.on_frame(frame) {
+                        shared.end(end);
+                        return;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    shared.end(End::Malformed(e.to_string()));
+                    return;
+                }
+            }
+        }
+        inbuf.drain(..at);
+    }
+}
+
+async fn write_stdout(shared: Arc<Shared>) {
+    let mut stdout = tokio::io::stdout();
+    loop {
+        let next = {
+            let mut core = lock(&shared.core);
+            match core.out.next() {
+                Some(next) => Some(next),
+                None => {
+                    if let Some(end) = core.ending.take() {
+                        drop(core);
+                        shared.end(end);
+                        return;
+                    }
+                    None
+                }
+            }
+        };
+        let Some((bytes, meta)) = next else {
+            shared.wake_writer.notified().await;
+            continue;
+        };
+        // One frame at a time, flushed: an interactive frame waits behind
+        // at most the frame being written and the pipe's buffer.
+        if stdout.write_all(&bytes).await.is_err() || stdout.flush().await.is_err() {
+            shared.end(End::Eof);
+            return;
+        }
+        shared.after_write(meta);
+    }
+}
+
+/// Watch one connection: hand its peer's streams to the app (or refuse
+/// them), and report its end.
+async fn conn_task(shared: Arc<Shared>, no: u64, conn: Arc<Connection>, inbound: bool) {
+    let accept = async {
+        while let Some(stream) = conn.accept_stream().await {
+            if !inbound {
+                // Not in 1.0: the host opens no streams to its caller.
+                stream.writer.reset(ErrorCode::RefusedStream);
+            } else if LABELS.contains(&stream.label()) {
+                let label = stream.label().to_owned();
+                let class = stream.class();
+                let mut core = lock(&shared.core);
+                if let Some(handle) = shared.add_stream(&mut core, no, stream, false) {
+                    let event = json!({
+                        "ev": "stream.incoming",
+                        "conn": no,
+                        "handle": handle,
+                        "label": label,
+                        "class": class_name(class),
+                    });
+                    core.out.json(&event);
+                    shared.queued(&core);
+                }
+            } else if stream.label() == crate::serve::INFO_LABEL {
+                tokio::spawn(crate::serve::send_info(stream));
+            } else {
+                stream.writer.reset(ErrorCode::RefusedStream);
+            }
+        }
+        std::future::pending::<()>().await;
+    };
+    let reason = tokio::select! {
+        () = accept => CloseReason::PipeClosed,
+        reason = conn.closed() => reason,
+    };
+    shared.conn_down(no, &reason);
+}
+
+async fn open_stream(
+    shared: Arc<Shared>,
+    id: Value,
+    no: u64,
+    conn: Arc<Connection>,
+    label: String,
+    class: PriorityClass,
+) {
+    let opened = conn.open_stream(class, &label).await;
+    let mut core = lock(&shared.core);
+    let reply = match opened {
+        Ok(stream) => match shared.add_stream(&mut core, no, stream, true) {
+            Some(handle) => json!({"re": id, "handle": handle}),
+            None => error(&id, "no_conn", "the connection closed"),
+        },
+        Err(NetError::StreamLimit) => error(
+            &id,
+            "stream_limit",
+            "too many open streams; open it once one ends",
+        ),
+        Err(e @ NetError::Closed(_)) => error(&id, "no_conn", e.to_string()),
+        Err(e) => error(&id, "refused", e.to_string()),
+    };
+    // The reply goes before the stream's first credit.
+    core.out.json(&reply);
+    core.regrant(&shared.limits);
+    shared.queued(&core);
+}
+
+async fn dial(shared: Arc<Shared>, id: Value, identity: String) {
+    let store = PeerStore::in_dir(&shared.info.state_dir);
+    let peer = store.load().ok().and_then(|peers| {
+        peers.into_iter().find(|p| {
+            p.pin()
+                .map(|pin| hex(pin.as_bytes()) == identity)
+                .unwrap_or(false)
+        })
+    });
+    let reply = match peer {
+        None => error(&id, "no_peer", "not paired with that identity"),
+        Some(record) => {
+            let routes = crate::peer::usable_routes(&record.routes_to_try());
+            match record.pin() {
+                Err(e) => error(&id, "no_peer", e.to_string()),
+                Ok(pin) => match shared.caller.dial_candidates(&routes, pin).await {
+                    Ok((conn, used)) => {
+                        let mut kept = record.clone();
+                        kept.last_route = Some(mousse_net_io::pipe::route_uri(&used));
+                        let _ = store.upsert(kept);
+                        applog::line(format!("connected {} (out)", short_id(&pin)));
+                        let no = shared.add_conn(conn, false, json!({"dir": "out"}));
+                        json!({"re": id, "conn": no})
+                    }
+                    Err(e) => json!({
+                        "re": id,
+                        "error": "unreachable",
+                        "reason": crate::peer::describe(&e),
+                        "why": crate::peer::reason_of(&e),
+                    }),
+                },
+            }
+        }
+    };
+    let mut core = lock(&shared.core);
+    shared.reply(&mut core, reply);
+}
+
+/// Engine to app: read only while the app's credit covers what is
+/// buffered plus the read-ahead.
+async fn rx_pump(shared: Arc<Shared>, handle: u32, mut reader: StreamReader, wake: Arc<Notify>) {
+    loop {
+        loop {
+            match shared.may_read(handle) {
+                None => return,
+                Some(true) => break,
+                Some(false) => {}
+            }
+            tokio::select! {
+                () = wake.notified() => {}
+                code = reader.reset_by_peer() => {
+                    shared.rx_reset(handle, code);
+                    return;
+                }
+            }
+        }
+        match reader.read().await {
+            Ok(Some(bytes)) => shared.rx_data(handle, &bytes),
+            Ok(None) => {
+                shared.rx_fin(handle);
+                break;
+            }
+            Err(NetError::StreamReset(code)) => {
+                shared.rx_reset(handle, code);
+                return;
+            }
+            // The connection closed: `conn.down` covers its streams.
+            Err(_) => return,
+        }
+    }
+    // Past FIN the peer may still reset the stream (its other half may be
+    // open). Hold the reader only while the stream lives here: its place
+    // in the stream caps is kept until the reader goes.
+    while shared.has(handle) {
+        tokio::select! {
+            () = wake.notified() => {}
+            code = reader.reset_by_peer() => {
+                shared.rx_reset(handle, code);
+                return;
+            }
+        }
+    }
+}
+
+/// App to engine, in order; FIN after the last byte.
+async fn tx_pump(
+    shared: Arc<Shared>,
+    handle: u32,
+    writer: StreamWriter,
+    mut rx: mpsc::UnboundedReceiver<Chunk>,
+) {
+    while let Some(chunk) = rx.recv().await {
+        if !chunk.bytes.is_empty() {
+            let n = chunk.bytes.len() as u64;
+            if writer.write(&chunk.bytes).await.is_err() {
+                break;
+            }
+            shared.tx_took(handle, n);
+        }
+        if chunk.fin {
+            writer.finish();
+            break;
+        }
+    }
+    shared.tx_ended(handle);
+}

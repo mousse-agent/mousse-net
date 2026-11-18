@@ -1125,3 +1125,39 @@ Not touched: `sync/session.ts`, `sync/supervisor.ts`, `transports/*`,
    `MOUSSE_NET_ENGINE_*` variables. A bad value is logged and keeps its
    default, so a typo never stops the daemon; the helper still refuses to
    start on a bad `MOUSSE_NET_*` value.
+
+**Decided while building E1 and E2**
+
+1. **Framing details.** The length counts the type byte and the body.
+   DATA flag bits other than FIN, a CREDIT of 0 bytes, and DATA beyond the
+   app's credit are malformed: the helper exits nonzero. Requests name
+   their method in `op`; only a request with `id` gets a reply.
+2. **Generation.** Connection numbers are per spawn and never reused, so a
+   reconnect is a new number; that number is the handle's generation.
+   `conn.down` ends every handle on that connection (no per-stream event).
+3. **Hello.** A `profile` that is not this endpoint's is `wrong_profile`;
+   another major is `unsupported_proto`; any other request first is
+   `no_hello`. `name` waits for `config.set` (E3).
+4. **Stream caps live in `mousse-net-io`** (`STREAMS_PER_CONNECTION`,
+   `STREAMS_PER_ENDPOINT`), shared by the host and the app's outbound
+   caller. A place is held until the mux is done with the stream and its
+   reader is gone. A peer's open past a cap gets `RESET REFUSED_STREAM`,
+   now named in `spec/wire.md` §9.2; the app's own open past it gets
+   `stream_limit`. `StreamReader::reset_by_peer` tells a pump held back by
+   read-ahead that the peer reset the stream.
+5. **Read-ahead needs 64 KiB of credit.** With credit below
+   `APP_READ_AHEAD_BYTES` plus what is queued, nothing moves, FIN
+   included: the app keeps at least 64 KiB granted on a stream it reads.
+6. **A stalled app.** Control past `APP_CONTROL_QUEUE_BYTES` ends the
+   channel, and the helper exits (the daemon restarts it).
+7. **Exit.** On EOF or `shutdown` the helper sends `GOAWAY NO_ERROR` on
+   every connection, waits `STOP_LINGER_MS` and exits 0.
+8. **Until E3.** App mode keeps the control listener, so `invite` and
+   `join` on the command line pair endpoints for the tests. Inbound
+   connections are announced once live (the joining connection too) with
+   `grant` and `role`; outbound ones have no `role` until E3. A minimal
+   `dial {identity}` uses the stored peer's routes. A `stats` request
+   reports the engine queue, stream places, app buffering and dropped
+   frames for tests and diagnostics.
+9. **Environment.** The helper ignores the app's own `MOUSSE_NET_ENGINE_*`
+   names and `MOUSSE_NET_HELPER` when it checks for unknown limits.

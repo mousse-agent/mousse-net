@@ -11,6 +11,12 @@ use mousse_net_core::limits::{LimitError, LimitSpec};
 /// The prefix of every limit variable.
 pub const ENV_PREFIX: &str = "MOUSSE_NET_";
 
+/// After [`ENV_PREFIX`]: the Mousse app's own limits and controls.
+const APP_PREFIX: &str = "ENGINE_";
+
+/// After [`ENV_PREFIX`]: the Mousse app's helper path in unpackaged builds.
+const APP_HELPER_PATH: &str = "HELPER";
+
 mousse_net_core::define_limits! {
     /// The helper's own limits.
     pub struct HelperLimits {
@@ -50,6 +56,37 @@ mousse_net_core::define_limits! {
         endpoint_lock_retry_ms = "ENDPOINT_LOCK_RETRY_MS": 100, [1, 1_000];
         /// Longest default device name taken from the computer name (names are at most 64 bytes in PAIRED).
         computer_name_max_bytes = "COMPUTER_NAME_MAX_BYTES": 64, [1, 64];
+        /// App channel: credit the helper grants the app, all streams together, for data going to the engine (Phase 1a §2.2).
+        app_credit_budget_bytes = "APP_CREDIT_BUDGET_BYTES": 8_388_608, [262_144, 1_073_741_824];
+        /// App channel: part of that budget only interactive streams may use.
+        app_credit_interactive_reserve_bytes = "APP_CREDIT_INTERACTIVE_RESERVE_BYTES": 1_048_576, [0, 1_073_741_824];
+        /// App channel: most credit one stream holds at a time, in each direction the helper grants it.
+        app_stream_credit_bytes = "APP_STREAM_CREDIT_BYTES": 262_144, [65_536, 16_777_216];
+        /// App channel: a stream is read from the engine only while the app's credit covers what is buffered plus this much (at least one engine chunk, 64 KiB).
+        app_read_ahead_bytes = "APP_READ_AHEAD_BYTES": 65_536, [65_536, 16_777_216];
+        /// App channel: queued JSON and CREDIT frames to the app above which the app counts as stuck and the channel closes.
+        app_control_queue_bytes = "APP_CONTROL_QUEUE_BYTES": 1_048_576, [65_536, 67_108_864];
+        /// App mode: size at which helper.log is rotated.
+        app_log_max_bytes = "APP_LOG_MAX_BYTES": 1_048_576, [4_096, 1_073_741_824];
+        /// App mode: log files kept, helper.log included.
+        app_log_files = "APP_LOG_FILES": 2, [1, 10];
+    }
+    agree(h) {
+        if h.app_credit_interactive_reserve_bytes >= h.app_credit_budget_bytes {
+            return Err(LimitError::Conflict(format!(
+                "APP_CREDIT_INTERACTIVE_RESERVE_BYTES ({}) must be below APP_CREDIT_BUDGET_BYTES ({})",
+                h.app_credit_interactive_reserve_bytes, h.app_credit_budget_bytes
+            )));
+        }
+        if h.app_stream_credit_bytes > h.app_credit_budget_bytes - h.app_credit_interactive_reserve_bytes {
+            return Err(LimitError::Conflict(format!(
+                "APP_STREAM_CREDIT_BYTES ({}) is more than a bulk stream can get: \
+                 APP_CREDIT_BUDGET_BYTES ({}) less APP_CREDIT_INTERACTIVE_RESERVE_BYTES ({})",
+                h.app_stream_credit_bytes,
+                h.app_credit_budget_bytes,
+                h.app_credit_interactive_reserve_bytes
+            )));
+        }
     }
 }
 
@@ -117,13 +154,19 @@ impl Limits {
         })
     }
 
-    /// Unknown `MOUSSE_NET_*` names among `names`, most likely typos.
+    /// Unknown `MOUSSE_NET_*` names among `names`, most likely typos. The
+    /// Mousse app's own variables (`MOUSSE_NET_ENGINE_*`, and
+    /// `MOUSSE_NET_HELPER`, the helper's path) are not the helper's and are
+    /// not reported: the app's environment reaches the helper it spawns.
     pub fn unknown_names(names: impl Iterator<Item = OsString>) -> Vec<String> {
         names
             .filter_map(|n| n.into_string().ok())
             .filter(|n| {
-                n.strip_prefix(ENV_PREFIX)
-                    .is_some_and(|rest| !Self::specs().any(|s| s.name == rest))
+                n.strip_prefix(ENV_PREFIX).is_some_and(|rest| {
+                    !rest.starts_with(APP_PREFIX)
+                        && rest != APP_HELPER_PATH
+                        && !Self::specs().any(|s| s.name == rest)
+                })
             })
             .collect()
     }
@@ -262,6 +305,36 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(err.contains("RENEW_LEAD_SECS"), "{err}");
+        let err = Limits::from_vars(vars(&[(
+            "MOUSSE_NET_APP_CREDIT_INTERACTIVE_RESERVE_BYTES",
+            "8388608",
+        )]))
+        .unwrap_err();
+        assert!(
+            err.contains("APP_CREDIT_INTERACTIVE_RESERVE_BYTES"),
+            "{err}"
+        );
+        let err = Limits::from_vars(vars(&[
+            ("MOUSSE_NET_APP_CREDIT_BUDGET_BYTES", "524288"),
+            ("MOUSSE_NET_APP_CREDIT_INTERACTIVE_RESERVE_BYTES", "393216"),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("APP_STREAM_CREDIT_BYTES"), "{err}");
+    }
+
+    #[test]
+    fn the_app_channel_defaults_are_the_design_values() {
+        // Phase 1a §2.2: an 8 MiB budget, 256 KiB a stream, 1 MiB kept for
+        // interactive streams and for control, 64 KiB of read-ahead.
+        let h = HelperLimits::DEFAULT;
+        assert_eq!(h.app_credit_budget_bytes, 8 << 20);
+        assert_eq!(h.app_credit_interactive_reserve_bytes, 1 << 20);
+        assert_eq!(h.app_stream_credit_bytes, 256 << 10);
+        assert_eq!(h.app_read_ahead_bytes, 64 << 10);
+        assert_eq!(h.app_control_queue_bytes, 1 << 20);
+        // §1: helper.log rotates at 1 MB, two files.
+        assert_eq!(h.app_log_max_bytes, 1 << 20);
+        assert_eq!(h.app_log_files, 2);
     }
 
     #[test]
@@ -271,6 +344,10 @@ mod tests {
             "MOUSSE_NET_KEEPALIVE",
             "MOUSSE_HELPER_STATE",
             "PATH",
+            // The app's own, which reach the helper it spawns.
+            "MOUSSE_NET_ENGINE_MAX_MESSAGE_BYTES",
+            "MOUSSE_NET_ENGINE_CONTROL",
+            "MOUSSE_NET_HELPER",
         ]
         .map(OsString::from);
         assert_eq!(

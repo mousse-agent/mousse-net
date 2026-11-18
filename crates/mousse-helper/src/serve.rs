@@ -20,7 +20,8 @@ use mousse_net_io::pipe::{accept_tcp, route_from_addr, route_uri};
 use mousse_net_io::rng::{os_rng, random_bytes};
 use mousse_net_io::store::{hex, short_id};
 use mousse_net_io::{
-    ApprovalRequest, Clock, Host, HostConfig, HostEvent, PortChoice, SharedSigner, SystemClock,
+    ApprovalRequest, Caller, Clock, Host, HostConfig, HostEvent, PortChoice, SharedSigner,
+    SystemClock,
 };
 use serde_json::{json, Value};
 use tokio::net::TcpStream;
@@ -35,6 +36,8 @@ pub struct ServeOptions {
     pub listen_ip: IpAddr,
     pub port: Option<u16>,
     pub mdns: bool,
+    /// `--app`: the app channel on stdin and stdout.
+    pub app: bool,
 }
 
 /// A deliberate defect for the cross-machine must-fail control, read from
@@ -86,10 +89,7 @@ pub fn route_hints(ip: IpAddr, port: u16) -> Vec<String> {
 }
 
 fn print_line(line: impl AsRef<str>) {
-    use std::io::Write;
-    let mut out = std::io::stdout();
-    let _ = writeln!(out, "{}", line.as_ref());
-    let _ = out.flush();
+    crate::applog::line(line);
 }
 
 /// Run until stopped (Ctrl-C or the `stop` control request).
@@ -99,6 +99,10 @@ pub async fn run(
     opts: ServeOptions,
 ) -> Result<(), String> {
     let mut endpoint = crate::open_endpoint(state_dir, false)?;
+    if opts.app {
+        // stdout carries only app-channel frames from here on.
+        crate::applog::to_file(state_dir)?;
+    }
     let key = endpoint
         .load_identity(insecure_file_key)
         .map_err(|e| e.to_string())?;
@@ -118,7 +122,7 @@ pub async fn run(
         _ => Arc::new(key),
     };
     let (host, mut events) =
-        Host::new(signer, config, CpaceExchangeFactory).map_err(|e| e.to_string())?;
+        Host::new(signer.clone(), config, CpaceExchangeFactory).map_err(|e| e.to_string())?;
     let choice = match opts.port {
         None => PortChoice::Kept,
         Some(0) => PortChoice::Auto,
@@ -164,14 +168,50 @@ pub async fn run(
         }
     ));
 
+    let app = if opts.app {
+        // Outbound connections for the app: the same key, flow records and
+        // stream places as the host.
+        let mut caller = Caller::new(signer.clone(), clock.clone(), crate::limits::get().net);
+        caller.use_flow_records(Arc::new(endpoint.flow_records()));
+        caller.use_stream_admission(host.stream_admission());
+        let info = crate::app::AppInfo {
+            identity: real_identity,
+            profile: endpoint.profile_id().to_owned(),
+            port,
+            routes: routes.clone(),
+            state_dir: endpoint.dir().to_path_buf(),
+        };
+        Some(crate::app::App::start(host.clone(), Arc::new(caller), info))
+    } else {
+        None
+    };
+    let app_end = async {
+        match &app {
+            Some(app) => app.ended().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(app_end);
+    let mut ended = None;
+
     loop {
         tokio::select! {
             accepted = accept_tcp(&listener) => match accepted {
-                Ok((pipe, addr)) => {
-                    tokio::spawn(handle_connection(host.clone(), pipe, addr));
-                }
+                Ok((pipe, addr)) => match &app {
+                    Some(app) => {
+                        tokio::spawn(app_connection(host.clone(), app.clone(), pipe, addr));
+                    }
+                    None => {
+                        tokio::spawn(handle_connection(host.clone(), pipe, addr));
+                    }
+                },
                 Err(e) => print_line(format!("accept failed: {e}")),
             },
+            end = &mut app_end => {
+                print_line(format!("app channel ended: {end:?}"));
+                ended = Some(end);
+                break;
+            }
             ctl = control.accept() => match ctl {
                 Ok(ch) => {
                     tokio::spawn(control_session(state.clone(), ch));
@@ -183,6 +223,9 @@ pub async fn run(
             _ = tokio::signal::ctrl_c() => break,
         }
     }
+    if let Some(app) = &app {
+        app.close_all();
+    }
     host.close_all(ErrorCode::NoError);
     tokio::time::sleep(crate::limits::ms(crate::limits::helper().stop_linger_ms())).await;
     ipc::remove_control_file(state_dir);
@@ -191,7 +234,18 @@ pub async fn run(
     }
     drop(endpoint);
     print_line("stopped");
-    Ok(())
+    match ended.and_then(|end| end.error()) {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// App mode: an inbound connection goes to the app once it is live.
+async fn app_connection(host: Host, app: crate::app::App, pipe: TcpStream, addr: SocketAddr) {
+    match host.accept(pipe).await {
+        Ok(conn) => app.inbound(conn).await,
+        Err(e) => print_line(format!("refused {addr}: {e}")),
+    }
 }
 
 async fn handle_connection(host: Host, pipe: TcpStream, addr: SocketAddr) {
@@ -227,7 +281,7 @@ pub const INFO_LABEL: &str = "helper-info";
 /// halves then end cleanly and the stream does not stay half open. A
 /// requester that sends data or does not finish in time gets the stream
 /// reset instead.
-async fn send_info(stream: mousse_net_io::MuxStream) {
+pub(crate) async fn send_info(stream: mousse_net_io::MuxStream) {
     let (mut reader, writer) = stream.split();
     // `INFO_REQUEST_WAIT_MS` to finish the (empty) request.
     let wait = crate::limits::ms(crate::limits::helper().info_request_wait_ms());

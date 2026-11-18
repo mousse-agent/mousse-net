@@ -1,0 +1,240 @@
+//! E1: `serve --app` on stdin and stdout. Framing, stream handles under
+//! equal wire stream ids, FIN in order after a stalled final write, hello,
+//! the helper's own log, and exit on EOF.
+
+mod common;
+
+use std::time::{Duration, Instant};
+
+use common::*;
+use serde_json::json;
+
+#[test]
+fn hello_comes_first_and_the_helpers_own_lines_go_to_its_log() {
+    let end = Endpoint::init("hello");
+    let mut a = end.app("hostA", &[]);
+    assert_eq!(a.request("stats", json!({}))["error"], "no_hello");
+    assert_eq!(
+        a.request("hello", json!({"proto": [2, 0]}))["error"],
+        "unsupported_proto"
+    );
+    assert_eq!(
+        a.request("hello", json!({"proto": [1, 0], "profile": "another"}))["error"],
+        "wrong_profile"
+    );
+    // The lower minor wins.
+    let hello = a.call("hello", json!({"proto": [1, 7], "name": "x"}));
+    assert_eq!(hello["proto"], json!([1, 0]));
+    let identity = hello["identity"].as_str().unwrap();
+    assert!(
+        !identity.is_empty() && identity.chars().all(|c| c.is_ascii_hexdigit()),
+        "{hello}"
+    );
+    let port = hello["port"].as_u64().unwrap();
+    assert!(port > 0);
+    let route = format!("tcp://127.0.0.1:{port}");
+    assert_eq!(hello["routes"], json!([route]), "{hello}");
+    assert!(!hello["build"].as_str().unwrap().is_empty());
+    assert_eq!(a.request("nope", json!({}))["error"], "unknown_op");
+
+    // stdout carried frames only (the reader checks every one); the
+    // helper's own lines are in its log.
+    let log = end.log();
+    assert!(
+        log.contains("ready ") && log.contains(&format!("port {port}")),
+        "{log}"
+    );
+
+    a.call("shutdown", json!({}));
+    assert_eq!(a.exit_within(WAIT), Some(0), "{}", a.err());
+    assert!(a.st().closed);
+    assert!(end.log().contains("stopped"));
+    a.assert_clean();
+}
+
+#[test]
+fn stdin_closing_ends_every_connection_cleanly_and_the_helper_exits() {
+    let mut p = pair_up("eof", &[], &[]);
+    let h = p.b.open(p.b_conn, "mousse.rpc", "interactive");
+    p.a.incoming(p.a_conn, 0);
+    assert!(h > 0);
+
+    let started = Instant::now();
+    p.b.close_stdin();
+    assert_eq!(p.b.exit_within(WAIT), Some(0), "{}", p.b.err());
+    let down = p.a.event("conn.down", |m| m["conn"] == p.a_conn);
+    assert_eq!(down["reason"], "no_error", "{down}");
+    assert_eq!(down["identity"], p.b.identity.as_str());
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(p.b_end.log().contains("app channel ended: Eof"));
+    p.a.assert_clean();
+}
+
+#[test]
+fn equal_wire_stream_ids_on_two_connections_get_their_own_handles() {
+    let mut p = pair_up("ids", &[], &[]);
+    let (_c_end, mut c, a_to_c, c_conn) = another_peer(&p.a_end, &mut p.a, "idsc", &[]);
+    assert_ne!(a_to_c, p.a_conn);
+
+    // The first stream each caller opens: wire stream ids restart on every
+    // connection, so both carry the same one.
+    let hb = p.b.open(p.b_conn, "mousse.rpc", "interactive");
+    let hc = c.open(c_conn, "mousse.rpc", "interactive");
+    let from_b = p.a.incoming(p.a_conn, 0);
+    let from_c = p.a.incoming(a_to_c, 0);
+    assert_ne!(from_b, from_c);
+
+    for h in [from_b, from_c] {
+        p.a.accept(h);
+        p.a.credit(h, 1 << 20);
+    }
+    p.b.credit(hb, 1 << 20);
+    c.credit(hc, 1 << 20);
+    p.b.send(hb, b"from b", true);
+    c.send(hc, b"from c, longer", true);
+    assert_eq!(p.a.until_fin(from_b, WAIT), b"from b");
+    assert_eq!(p.a.until_fin(from_c, WAIT), b"from c, longer");
+
+    p.a.send(from_b, b"to b", true);
+    p.a.send(from_c, b"to c", true);
+    assert_eq!(p.b.until_fin(hb, WAIT), b"to b");
+    assert_eq!(c.until_fin(hc, WAIT), b"to c");
+
+    // Done both ways: the handles are gone and are never reused.
+    let next = p.b.open(p.b_conn, "mousse.rpc", "interactive");
+    assert!(next > hb);
+    let again = p.a.incoming(p.a_conn, 1);
+    assert!(again > from_b.max(from_c), "{again}");
+    let start = Instant::now();
+    loop {
+        let stats = p.a.stats();
+        if stats["handles"] == 1 {
+            break;
+        }
+        assert!(start.elapsed() < WAIT, "finished handles stayed: {stats}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    for app in [&p.a, &p.b, &c] {
+        app.assert_clean();
+    }
+}
+
+#[test]
+fn fin_follows_every_byte_of_a_stalled_final_write() {
+    let mut p = pair_up("fin", &[], &[]);
+    let body = pattern(2 << 20, 7);
+    let hb = p.b.open(p.b_conn, "mousse.blob", "bulk");
+    let ha = p.a.incoming(p.a_conn, 0);
+    p.a.accept(ha);
+
+    // B's final write: all of it with FIN. A grants no credit, so it
+    // stalls with FIN queued behind its bytes.
+    p.b.send(hb, &body, true);
+    let sent = p.b.settle(Duration::from_millis(500), |b| b.sent(hb));
+    assert!(sent < body.len() as u64, "B's write never stalled: {sent}");
+    assert!(!p.b.st().tx[&hb].fin_sent);
+    assert_eq!(p.a.received(ha), (0, false));
+
+    // A stops reading and then grants it all: its helper queues every byte
+    // and the FIN while its writer is stalled.
+    p.a.pause();
+    p.a.credit(ha, 4 << 20);
+    p.b.wait("B's FIN to go", WAIT, |st| {
+        st.tx[&hb].fin_sent.then_some(())
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    p.a.resume();
+
+    let got = p.a.until_fin(ha, WAIT);
+    assert_eq!(got.len(), body.len());
+    assert!(got == body, "the bytes differ");
+    p.a.assert_clean();
+    p.b.assert_clean();
+}
+
+#[test]
+fn a_malformed_frame_ends_the_channel_and_the_helper_exits() {
+    let end = Endpoint::init("bad");
+    let cases: [(Vec<u8>, &str); 3] = [
+        (frame(0x09, b""), "unknown frame type"),
+        (vec![0, 0, 0, 0], "frame length 0"),
+        (
+            data_frame(1, false, b"x")
+                .into_iter()
+                .enumerate()
+                .map(|(i, b)| if i == 9 { 0x02 } else { b })
+                .collect(),
+            "malformed DATA",
+        ),
+    ];
+    for (bytes, why) in cases {
+        let mut a = end.app("hostA", &[]);
+        a.hello();
+        a.raw(&bytes);
+        assert_eq!(a.exit_within(WAIT), Some(2), "{why}: {}", a.err());
+        assert!(
+            a.err().contains("app channel") && a.err().contains(why),
+            "{}",
+            a.err()
+        );
+    }
+}
+
+#[test]
+fn frames_for_unknown_handles_are_dropped_and_data_beyond_credit_ends_the_channel() {
+    let mut p = pair_up("drop", &[], &[]);
+    p.b.raw(&data_frame(999, false, b"lost"));
+    p.b.raw(&credit_frame(999, 10));
+    assert_eq!(
+        p.b.request("stream.reset", json!({"handle": 999, "code": "cancelled"}))["error"],
+        "no_stream"
+    );
+    let stats = p.b.stats();
+    assert_eq!(stats["dropped_frames"], 3, "{stats}");
+
+    // Credit returns as the engine takes bytes, but the engine takes at
+    // most its wire window and write queue (512 KiB) beyond the 256 KiB
+    // granted: 2 MiB is beyond credit whatever came back meanwhile.
+    let h = p.b.open(p.b_conn, "mousse.blob", "bulk");
+    p.b.wait("credit on the new stream", WAIT, |st| {
+        st.tx.get(&h).filter(|t| t.credit > 0).map(|_| ())
+    });
+    let mut over = 0;
+    while over < 2 << 20 {
+        p.b.raw(&data_frame(h, false, &[0; MAX_DATA]));
+        over += MAX_DATA as u64;
+    }
+    assert_eq!(p.b.exit_within(WAIT), Some(2));
+    assert!(p.b.err().contains("credit"), "{}", p.b.err());
+    p.a.event("conn.down", |m| m["conn"] == p.a_conn);
+}
+
+#[test]
+fn inbound_passes_only_app_labels_and_outbound_refuses_host_opened_streams() {
+    let mut p = pair_up("labels", &[], &[]);
+    let term = p.b.open(p.b_conn, "terminal", "interactive");
+    let reset = p.b.event("stream.reset", |m| m["handle"] == term);
+    assert_eq!(reset["code"], "refused_stream");
+
+    // The host's app opens a stream on its inbound connection: not in
+    // 1.0, so the caller's helper refuses it.
+    let from_host = p.a.open(p.a_conn, "mousse.rpc", "interactive");
+    let reset = p.a.event("stream.reset", |m| m["handle"] == from_host);
+    assert_eq!(reset["code"], "refused_stream");
+
+    // An app reset reaches the peer's app with its code.
+    let h = p.b.open(p.b_conn, "mousse.sub", "interactive");
+    let ha = p.a.incoming(p.a_conn, 0);
+    p.a.call("stream.reset", json!({"handle": ha, "code": "cancelled"}));
+    let reset = p.b.event("stream.reset", |m| m["handle"] == h);
+    assert_eq!(reset["code"], "cancelled");
+
+    assert_eq!(p.a.events("stream.incoming").len(), 1);
+    assert!(p.b.events("stream.incoming").is_empty());
+    p.a.assert_clean();
+    p.b.assert_clean();
+}

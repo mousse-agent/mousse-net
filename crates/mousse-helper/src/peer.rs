@@ -75,7 +75,7 @@ fn parse_routes(list: &[String]) -> Result<Vec<Route>, String> {
 
 /// Routes from a ticket or the peer store: hints this version cannot use
 /// (unknown or reserved schemes, mDNS names without a browser) are skipped.
-fn usable_routes(hints: &[String]) -> Vec<Route> {
+pub(crate) fn usable_routes(hints: &[String]) -> Vec<Route> {
     hints
         .iter()
         .filter_map(|h| Route::parse(h).ok())

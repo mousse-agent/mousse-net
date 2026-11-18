@@ -8,7 +8,10 @@
         mousse_control = "skip-pin-check",
         mousse_control = "keep-removed-grant",
         mousse_control = "shared-endpoint-state",
-        mousse_control = "allow-break-env"
+        mousse_control = "allow-break-env",
+        mousse_control = "read-without-credit",
+        mousse_control = "fifo-writer",
+        mousse_control = "fin-overtakes"
     )
 ))]
 compile_error!("a mousse_control build has a deliberate defect and is for tests only; build it without --release");
@@ -19,7 +22,10 @@ compile_error!("a mousse_control build has a deliberate defect and is for tests 
     mousse_control = "skip-pin-check",
     mousse_control = "keep-removed-grant",
     mousse_control = "shared-endpoint-state",
-    mousse_control = "allow-break-env"
+    mousse_control = "allow-break-env",
+    mousse_control = "read-without-credit",
+    mousse_control = "fifo-writer",
+    mousse_control = "fin-overtakes"
 ))]
 const _: () = {
     let profile = env!("MOUSSE_BUILD_PROFILE").as_bytes();
@@ -33,6 +39,8 @@ const _: () = {
     assert!(!same, "a mousse_control build has a deliberate defect and is for tests only; build it without --release");
 };
 
+mod app;
+mod applog;
 mod ipc;
 mod limits;
 mod peer;
@@ -106,6 +114,12 @@ enum Command {
         /// The name paired devices see (default: this computer's name).
         #[arg(long)]
         name: Option<String>,
+        /// Talk to the Mousse app on stdin and stdout (framed; see
+        /// docs/phase1a-design.md §2). The helper's own lines go to
+        /// `helper.log` in the state directory, and it exits when stdin
+        /// closes.
+        #[arg(long)]
+        app: bool,
     },
     /// Make an invitation on the running host and print the ticket and a QR
     /// code. In person (the default), answer "Is the device next to you?";
@@ -533,12 +547,14 @@ async fn run(cli: Cli) -> Result<i32, String> {
             port,
             no_mdns,
             name,
+            app,
         } => {
             let opts = serve::ServeOptions {
                 name: name.unwrap_or_else(computer_name),
                 listen_ip,
                 port,
                 mdns: !no_mdns,
+                app,
             };
             serve::run(&dir, insecure, opts).await?;
         }
