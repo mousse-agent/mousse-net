@@ -31,11 +31,13 @@
 //! `{"re", "error", "reason"}`; events `{"ev", ...}`.
 
 mod budget;
+mod changes;
 mod frame;
 mod out;
 mod pairing;
 mod paths;
 
+pub use changes::{clock, interface_source};
 pub use paths::browse_source;
 
 use std::collections::BTreeMap;
@@ -86,6 +88,10 @@ pub struct AppInfo {
     pub state_dir: PathBuf,
     /// Where to look for paired hosts that moved (Phase 1a §6).
     pub browse: Option<Arc<mousse_net_io::discovery::CachedBrowse>>,
+    /// Debug builds with `MOUSSE_HELPER_MANUAL_CLOCK=1`: the clock
+    /// `test.clock` moves.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
+    pub manual_clock: Option<Arc<mousse_net_io::ManualClock>>,
 }
 
 /// Why the channel ended.
@@ -264,6 +270,7 @@ impl App {
         tokio::spawn(write_stdout(shared.clone()));
         tokio::spawn(pairing::watch_pause(shared.clone()));
         tokio::spawn(paths::keep_connected(shared.clone()));
+        tokio::spawn(changes::forward_renewals(shared.clone()));
         Self { shared }
     }
 
@@ -296,6 +303,12 @@ impl App {
         }
         applog::line(format!("connected {peer} (in)"));
         self.shared.add_conn(conn, true, fields);
+    }
+
+    /// The network changed (an interface, or a wake): check every
+    /// connection and redial what is down.
+    pub fn net_change(&self, change: mousse_net_io::watch::NetChange) {
+        tokio::spawn(changes::on_change(self.shared.clone(), change));
     }
 
     /// An event from the host: pairing, grants, the grant store.
@@ -613,6 +626,15 @@ impl Shared {
                         ),
                     ),
                 }
+            }
+            "path.reopened" => {
+                let reply = changes::reopened(self, &core, &id, &map);
+                self.reply(&mut core, reply);
+            }
+            #[cfg(debug_assertions)]
+            "test.clock" => {
+                let reply = changes::test_clock(self, &id, &map);
+                self.reply(&mut core, reply);
             }
             op if pairing::OPS.contains(&op) => {
                 drop(core);

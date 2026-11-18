@@ -26,56 +26,6 @@ fn some_identity() -> String {
     mousse_net_io::store::hex(IdentitySigner::public_key(&key).as_bytes())
 }
 
-/// The route a helper listens at (its `hello` reply).
-fn route_of(app: &mut App) -> String {
-    let reply = app.call("hello", json!({"proto": [1, 0]}));
-    reply["routes"][0].as_str().unwrap().to_owned()
-}
-
-/// `a` grants `b`, and `b` stores `a` as a peer at `routes`: paired both
-/// ways without the ceremony.
-fn trust(a: &mut App, b: &mut App, routes: &[&str]) {
-    let (identity, name) = (b.identity.clone(), b.name.clone());
-    a.call("grant.add", json!({"identity": identity, "name": name}));
-    let (identity, name) = (a.identity.clone(), a.name.clone());
-    b.call(
-        "peer.add",
-        json!({"identity": identity, "name": name, "routes": routes}),
-    );
-}
-
-/// `app`'s stored record of the peer `identity`.
-fn peer_of(app: &mut App, identity: &str) -> Value {
-    let list = app.call("peers.list", json!({}));
-    list["peers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|p| p["identity"] == identity)
-        .cloned()
-        .unwrap_or(Value::Null)
-}
-
-/// The outbound `conn.up` events for `identity` so far.
-fn outbound_ups(app: &App, identity: &str) -> usize {
-    app.events("conn.up")
-        .iter()
-        .filter(|m| m["dir"] == "out" && m["identity"] == identity)
-        .count()
-}
-
-/// Wait for an outbound `conn.up` for `identity` past the first `seen`.
-fn wait_outbound(app: &App, identity: &str, seen: usize) {
-    app.wait("an outbound conn.up", WAIT, |st| {
-        let n = st
-            .messages
-            .iter()
-            .filter(|m| m["ev"] == "conn.up" && m["dir"] == "out" && m["identity"] == identity)
-            .count();
-        (n > seen).then_some(())
-    });
-}
-
 /// A loopback address that accepts TCP and then says nothing: a candidate
 /// that never passes step 1. Counts the connections it took.
 struct Silent {

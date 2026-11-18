@@ -20,8 +20,7 @@ use mousse_net_io::pipe::{accept_tcp, route_from_addr, route_uri};
 use mousse_net_io::rng::{os_rng, random_bytes};
 use mousse_net_io::store::{hex, short_id};
 use mousse_net_io::{
-    ApprovalRequest, Caller, Clock, Host, HostConfig, HostEvent, PortChoice, SharedSigner,
-    SystemClock,
+    ApprovalRequest, Caller, Host, HostConfig, HostEvent, PortChoice, SharedSigner,
 };
 use serde_json::{json, Value};
 use tokio::net::TcpStream;
@@ -107,7 +106,7 @@ pub async fn run(
         .load_identity(insecure_file_key)
         .map_err(|e| e.to_string())?;
     let real_identity = endpoint.identity();
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+    let (clock, manual_clock) = crate::app::clock();
     let mut config = HostConfig::for_endpoint(&endpoint, opts.name.clone(), clock.clone())
         .map_err(|e| e.to_string())?;
     config.limits = crate::limits::get().net;
@@ -179,6 +178,14 @@ pub async fn run(
         }
     ));
 
+    // Interface changes and wakes: announce the mDNS record again, and in
+    // app mode check every connection and redial (Phase 1a §8).
+    let mut net_changes = mousse_net_io::watch::watch(
+        clock.clone(),
+        crate::app::interface_source(),
+        crate::limits::get().net.io(),
+    );
+
     let app = if opts.app {
         // Outbound connections for the app: the same key, flow records and
         // stream places as the host.
@@ -203,6 +210,7 @@ pub async fn run(
                     ))
                 },
             ),
+            manual_clock,
         };
         Some(crate::app::App::start(
             host.clone(),
@@ -251,6 +259,14 @@ pub async fn run(
                 }
                 Err(e) => print_line(format!("control channel: {e}")),
             },
+            Some(change) = net_changes.recv() => {
+                if let Some(advertiser) = &advertiser {
+                    advertiser.refresh();
+                }
+                if let Some(app) = &app {
+                    app.net_change(change);
+                }
+            }
             Some(event) = events.recv() => match &app {
                 Some(app) => app.host_event(event),
                 None => on_event(&state, event),

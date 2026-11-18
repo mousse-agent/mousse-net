@@ -213,13 +213,24 @@ impl Keep {
 }
 
 /// The outbound connections to `pin`, by number.
+/// The outbound connections to `pin`, oldest first: while a renewed path
+/// waits for `path.reopened`, the older one is still current.
 fn outbound(shared: &Shared, pin: &IdentityPublicKey) -> Vec<u64> {
-    super::lock(&shared.core)
+    let mut out: Vec<u64> = super::lock(&shared.core)
         .conns
         .iter()
         .filter(|(_, e)| !e.inbound && e.identity == *pin)
         .map(|(no, _)| *no)
-        .collect()
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+/// The role the stored record of `pin` names, as `conn.up` shows it.
+pub(super) fn stored_role(shared: &Shared, pin: &IdentityPublicKey) -> Value {
+    find_peer(shared, pin)
+        .map(|record| json!(super::pairing::role_text(&record.role)))
+        .unwrap_or(Value::Null)
 }
 
 fn find_peer(shared: &Shared, pin: &IdentityPublicKey) -> Result<PeerRecord, DialError> {

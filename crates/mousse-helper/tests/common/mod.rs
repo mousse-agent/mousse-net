@@ -128,6 +128,22 @@ impl Endpoint {
         port: u16,
         browse: Option<&Path>,
     ) -> App {
+        let browse: Vec<(&str, &Path)> = browse
+            .map(|file| ("MOUSSE_HELPER_BROWSE_FILE", file))
+            .into_iter()
+            .collect();
+        self.app_raw(name, env, port, &browse)
+    }
+
+    /// [`Endpoint::app_with`], with other variables set as given (the
+    /// debug-build test hooks).
+    pub fn app_raw(
+        &self,
+        name: &str,
+        env: &[(&str, &str)],
+        port: u16,
+        raw: &[(&str, &Path)],
+    ) -> App {
         let port = port.to_string();
         let mut cmd = self.command(&[
             "serve",
@@ -142,8 +158,8 @@ impl Endpoint {
         for (k, v) in env {
             cmd.env(format!("MOUSSE_NET_{k}"), v);
         }
-        if let Some(file) = browse {
-            cmd.env("MOUSSE_HELPER_BROWSE_FILE", file);
+        for (k, v) in raw {
+            cmd.env(k, v);
         }
         App::spawn(cmd, self.dir.clone(), name)
     }
@@ -835,4 +851,54 @@ pub fn pattern(n: usize, seed: u8) -> Vec<u8> {
     (0..n)
         .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed) ^ ((i >> 8) as u8))
         .collect()
+}
+
+/// The route a helper listens at (its `hello` reply).
+pub fn route_of(app: &mut App) -> String {
+    let reply = app.call("hello", json!({"proto": [1, 0]}));
+    reply["routes"][0].as_str().unwrap().to_owned()
+}
+
+/// `a` grants `b`, and `b` stores `a` as a peer at `routes`: paired both
+/// ways without the ceremony.
+pub fn trust(a: &mut App, b: &mut App, routes: &[&str]) {
+    let (identity, name) = (b.identity.clone(), b.name.clone());
+    a.call("grant.add", json!({"identity": identity, "name": name}));
+    let (identity, name) = (a.identity.clone(), a.name.clone());
+    b.call(
+        "peer.add",
+        json!({"identity": identity, "name": name, "routes": routes}),
+    );
+}
+
+/// `app`'s stored record of the peer `identity`.
+pub fn peer_of(app: &mut App, identity: &str) -> Value {
+    let list = app.call("peers.list", json!({}));
+    list["peers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["identity"] == identity)
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+/// The outbound `conn.up` events for `identity` so far.
+pub fn outbound_ups(app: &App, identity: &str) -> usize {
+    app.events("conn.up")
+        .iter()
+        .filter(|m| m["dir"] == "out" && m["identity"] == identity)
+        .count()
+}
+
+/// Wait for an outbound `conn.up` for `identity` past the first `seen`.
+pub fn wait_outbound(app: &App, identity: &str, seen: usize) {
+    app.wait("an outbound conn.up", WAIT, |st| {
+        let n = st
+            .messages
+            .iter()
+            .filter(|m| m["ev"] == "conn.up" && m["dir"] == "out" && m["identity"] == identity)
+            .count();
+        (n > seen).then_some(())
+    });
 }
