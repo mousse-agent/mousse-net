@@ -154,6 +154,11 @@ impl RawSignature {
     /// Accept exactly 64 bytes. Anything else, including a DER signature,
     /// is [`SignatureError::NotRaw`].
     pub fn from_slice(bytes: &[u8]) -> Result<Self, SignatureError> {
+        // Must-fail control: quietly convert DER where raw is required.
+        #[cfg(mousse_control = "break-raw-signature")]
+        if bytes.len() != RAW_SIGNATURE_LEN {
+            return Self::from_der(bytes);
+        }
         let raw: [u8; RAW_SIGNATURE_LEN] = bytes.try_into().map_err(|_| SignatureError::NotRaw)?;
         Signature::from_slice(&raw).map_err(|_| SignatureError::OutOfRange)?;
         Ok(Self(raw))

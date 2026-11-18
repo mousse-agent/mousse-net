@@ -1,4 +1,177 @@
 {
+  "caller_cases": [
+    {
+      "description": "The host opens a stream before AUTHORIZED: the caller closes.",
+      "name": "host_stream_before_authorized",
+      "steps": [
+        {
+          "op": "check",
+          "state": "awaiting_authorization",
+          "traffic": "hello",
+          "verdict": "allow"
+        },
+        {
+          "op": "check",
+          "state": "awaiting_authorization",
+          "traffic": "keepalive",
+          "verdict": "allow"
+        },
+        {
+          "op": "check",
+          "state": "closed:protocol_error",
+          "traffic": "stream",
+          "verdict": "close:protocol_error"
+        },
+        {
+          "op": "check",
+          "state": "closed:protocol_error",
+          "traffic": "authorized_live",
+          "verdict": "ignore"
+        }
+      ]
+    },
+    {
+      "name": "authorized_live",
+      "steps": [
+        {
+          "op": "check",
+          "state": "live",
+          "traffic": "authorized_live",
+          "verdict": "allow"
+        },
+        {
+          "op": "check",
+          "state": "live",
+          "traffic": "stream",
+          "verdict": "allow"
+        },
+        {
+          "op": "check",
+          "state": "live",
+          "traffic": "pairing",
+          "verdict": "ignore"
+        },
+        {
+          "op": "check",
+          "state": "closed:protocol_error",
+          "traffic": "authorized_live",
+          "verdict": "close:protocol_error"
+        }
+      ]
+    },
+    {
+      "name": "pairing_before_authorized",
+      "steps": [
+        {
+          "op": "check",
+          "state": "closed:protocol_error",
+          "traffic": "pairing",
+          "verdict": "close:protocol_error"
+        }
+      ]
+    },
+    {
+      "name": "paired_before_authorized",
+      "steps": [
+        {
+          "op": "check",
+          "state": "closed:protocol_error",
+          "traffic": "paired",
+          "verdict": "close:protocol_error"
+        }
+      ]
+    },
+    {
+      "name": "join_only_then_paired",
+      "steps": [
+        {
+          "op": "check",
+          "state": "join_only",
+          "traffic": "authorized_join_only",
+          "verdict": "allow"
+        },
+        {
+          "op": "check",
+          "state": "join_only",
+          "traffic": "pairing",
+          "verdict": "allow"
+        },
+        {
+          "op": "check",
+          "state": "join_only",
+          "traffic": "paired",
+          "verdict": "allow"
+        },
+        {
+          "op": "promote",
+          "state": "live"
+        },
+        {
+          "op": "check",
+          "state": "live",
+          "traffic": "stream",
+          "verdict": "allow"
+        },
+        {
+          "op": "check",
+          "state": "closed:protocol_error",
+          "traffic": "paired",
+          "verdict": "close:protocol_error"
+        }
+      ]
+    },
+    {
+      "name": "join_only_host_stream",
+      "steps": [
+        {
+          "op": "check",
+          "state": "join_only",
+          "traffic": "authorized_join_only",
+          "verdict": "allow"
+        },
+        {
+          "op": "check",
+          "state": "closed:protocol_error",
+          "traffic": "stream",
+          "verdict": "close:protocol_error"
+        }
+      ]
+    },
+    {
+      "name": "join_only_second_authorized",
+      "steps": [
+        {
+          "op": "check",
+          "state": "join_only",
+          "traffic": "authorized_join_only",
+          "verdict": "allow"
+        },
+        {
+          "op": "check",
+          "state": "closed:protocol_error",
+          "traffic": "authorized_live",
+          "verdict": "close:protocol_error"
+        }
+      ]
+    },
+    {
+      "name": "join_proof_from_host",
+      "steps": [
+        {
+          "op": "check",
+          "state": "live",
+          "traffic": "authorized_live",
+          "verdict": "allow"
+        },
+        {
+          "op": "check",
+          "state": "closed:protocol_error",
+          "traffic": "caller_only",
+          "verdict": "close:protocol_error"
+        }
+      ]
+    }
+  ],
   "cases": [
     {
       "denied": [],
@@ -237,7 +410,7 @@
       ]
     }
   ],
-  "description": "Step 2 on the host after step 1 passed. `grants` and `denied` set up the table (grants added in order, then denials), the gate opens at wall time `now` and monotonic time 0 ms, then `steps` run in order. Verdicts: allow, ignore, close:<code>.",
+  "description": "Step 2 on the host after step 1 passed (`cases`), and the caller's gate (`caller_cases`). Host cases: `grants` and `denied` set up the table (grants added in order, then denials), the gate opens at wall time `now` and monotonic time 0 ms, then `steps` run in order. Caller cases: the gate starts awaiting AUTHORIZED; `promote` means the joiner accepted PAIRED; `state` is the gate state after the step. Verdicts: allow, ignore, close:<code>.",
   "identities": {
     "a": "040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794",
     "b": "04d65a93977caa3d1b081852ff57a79e465f1660577304baead505dd3a48589cf350185e895372df6221ea3a137557e473fddb6755f05bd507c3c533fce9c91285"

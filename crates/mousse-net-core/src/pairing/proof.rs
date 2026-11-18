@@ -11,10 +11,10 @@
 
 use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use super::{InvitationId, InvitationKind, TicketSecret};
+use super::{AttemptId, InvitationId, InvitationKind, TicketSecret};
 use crate::cbor::{self, Value};
 use crate::identity::IdentityPublicKey;
 
@@ -142,17 +142,17 @@ impl std::fmt::Debug for BindingTranscript {
     }
 }
 
-/// Role numbers inside the binding transcript.
-const ROLE_HOST: u64 = 1;
-const ROLE_JOINER: u64 = 2;
+/// Role numbers inside the binding transcript: the exchange roles.
+const ROLE_INITIATOR: u64 = 1;
+const ROLE_RESPONDER: u64 = 2;
 
-/// Build the binding transcript:
+/// Build the binding transcript, the code exchange's channel identifier (CI):
 /// `{1: "mousse-pair-v1", 2: ticket hash, 3: kind (mode), 4: ticket version,
-///   5: [[1, host identity], [2, joiner identity]], 6: pair exporter}`.
+///   5: [[1, joiner identity], [2, host identity]], 6: pair exporter}`.
 ///
-/// The identity list is always host first, then joiner; the role numbers make
-/// the order explicit. The host is the exchange responder, the joiner the
-/// initiator.
+/// The joiner is the exchange initiator (role 1) and comes first; the host is
+/// the responder (role 2). Each identity sits next to its role number, and
+/// canonical CBOR gives every transcript exactly one encoding.
 pub fn binding_transcript(
     ticket_hash: &[u8; 32],
     kind: InvitationKind,
@@ -170,17 +170,37 @@ pub fn binding_transcript(
             5,
             Value::Array(vec![
                 Value::Array(vec![
-                    Value::Uint(ROLE_HOST),
-                    Value::Bytes(host.as_bytes().to_vec()),
+                    Value::Uint(ROLE_INITIATOR),
+                    Value::Bytes(joiner.as_bytes().to_vec()),
                 ]),
                 Value::Array(vec![
-                    Value::Uint(ROLE_JOINER),
-                    Value::Bytes(joiner.as_bytes().to_vec()),
+                    Value::Uint(ROLE_RESPONDER),
+                    Value::Bytes(host.as_bytes().to_vec()),
                 ]),
             ]),
         ),
         (6, Value::Bytes(pair_exporter.to_vec())),
     ])))
+}
+
+/// Length of a code-exchange session id.
+pub const SID_LEN: usize = 32;
+
+/// Domain string of the session-id input.
+pub const SID_DOMAIN: &str = "mousse-pair-sid-v1";
+
+/// The code exchange's session id for one attempt:
+/// `SHA-256(CBOR {1: "mousse-pair-sid-v1", 2: attempt id, 3: pair exporter})`.
+///
+/// The attempt id is fresh for every attempt and the exporter for every TLS
+/// session, so a session id is never reused across attempts.
+pub fn attempt_sid(attempt: &AttemptId, pair_exporter: &[u8; EXPORTER_LEN]) -> [u8; SID_LEN] {
+    let input = cbor::encode(&Value::Map(vec![
+        (1, Value::Text(SID_DOMAIN.to_owned())),
+        (2, Value::Bytes(attempt.0.to_vec())),
+        (3, Value::Bytes(pair_exporter.to_vec())),
+    ]));
+    Sha256::digest(input).into()
 }
 
 #[cfg(test)]

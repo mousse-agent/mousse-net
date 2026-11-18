@@ -101,6 +101,241 @@
       "result": "encoding"
     }
   ],
+  "route_hints": {
+    "cases": [
+      {
+        "hint": "tcp://192.168.1.20:7443",
+        "result": {
+          "tcp": {
+            "host": {
+              "ipv4": "192.168.1.20"
+            },
+            "port": 7443
+          }
+        }
+      },
+      {
+        "hint": "tcp://[fd00::20]:7443",
+        "result": {
+          "tcp": {
+            "host": {
+              "ipv6": "fd00::20"
+            },
+            "port": 7443
+          }
+        }
+      },
+      {
+        "hint": "tcp://[::ffff:192.168.1.20]:1",
+        "result": {
+          "tcp": {
+            "host": {
+              "ipv6": "::ffff:192.168.1.20"
+            },
+            "port": 1
+          }
+        }
+      },
+      {
+        "hint": "tcp://Desk-1.example.org:65535",
+        "result": {
+          "tcp": {
+            "host": {
+              "dns": "desk-1.example.org"
+            },
+            "port": 65535
+          }
+        }
+      },
+      {
+        "hint": "mdns:Desk",
+        "result": {
+          "mdns": "Desk"
+        }
+      },
+      {
+        "hint": "mdns:Bureau d’Anaïs",
+        "result": {
+          "mdns": "Bureau d’Anaïs"
+        }
+      },
+      {
+        "hint": "tcp://192.168.1.20",
+        "result": {
+          "skip": "malformed"
+        }
+      },
+      {
+        "hint": "tcp://192.168.1.20:0",
+        "result": {
+          "skip": "malformed"
+        }
+      },
+      {
+        "hint": "tcp://192.168.1.20:65536",
+        "result": {
+          "skip": "malformed"
+        }
+      },
+      {
+        "hint": "tcp://192.168.1.20:07443",
+        "result": {
+          "skip": "malformed"
+        }
+      },
+      {
+        "hint": "tcp://192.168.01.20:7443",
+        "result": {
+          "skip": "malformed"
+        }
+      },
+      {
+        "hint": "tcp://192.168.1.256:7443",
+        "result": {
+          "skip": "malformed"
+        }
+      },
+      {
+        "hint": "tcp://1.2.3:7443",
+        "result": {
+          "skip": "malformed"
+        }
+      },
+      {
+        "hint": "tcp://fd00::20:7443",
+        "result": {
+          "skip": "malformed"
+        }
+      },
+      {
+        "hint": "tcp://[fe80::1%25eth0]:7443",
+        "result": {
+          "skip": "malformed"
+        }
+      },
+      {
+        "hint": "tcp://[::ffff:192.168.01.20]:7443",
+        "result": {
+          "skip": "malformed"
+        }
+      },
+      {
+        "hint": "tcp://-desk.local:7443",
+        "result": {
+          "skip": "malformed"
+        }
+      },
+      {
+        "hint": "tcp://desk..local:7443",
+        "result": {
+          "skip": "malformed"
+        }
+      },
+      {
+        "hint": "tcp://desk.local.:7443",
+        "result": {
+          "skip": "malformed"
+        }
+      },
+      {
+        "hint": "tcp://desk_1.local:7443",
+        "result": {
+          "skip": "malformed"
+        }
+      },
+      {
+        "hint": "tcp://desk.123:7443",
+        "result": {
+          "skip": "malformed"
+        }
+      },
+      {
+        "hint": "tcp://user@desk.local:7443",
+        "result": {
+          "skip": "malformed"
+        }
+      },
+      {
+        "hint": "tcp://desk.local:7443/",
+        "result": {
+          "skip": "malformed"
+        }
+      },
+      {
+        "hint": "tcp:desk.local:7443",
+        "result": {
+          "skip": "malformed"
+        }
+      },
+      {
+        "hint": "mdns:",
+        "result": {
+          "skip": "malformed"
+        }
+      },
+      {
+        "hint": "mdns:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "result": {
+          "skip": "malformed"
+        }
+      },
+      {
+        "hint": "mdns:a\tb",
+        "result": {
+          "skip": "malformed"
+        }
+      },
+      {
+        "hint": "ssh://desk.local",
+        "result": {
+          "skip": "reserved"
+        }
+      },
+      {
+        "hint": "ws://desk.local/x",
+        "result": {
+          "skip": "reserved"
+        }
+      },
+      {
+        "hint": "wss://desk.local/x",
+        "result": {
+          "skip": "reserved"
+        }
+      },
+      {
+        "hint": "relay:abc",
+        "result": {
+          "skip": "reserved"
+        }
+      },
+      {
+        "hint": "quic://desk.local:7443",
+        "result": {
+          "skip": "unknown_scheme"
+        }
+      },
+      {
+        "hint": "TCP://desk.local:7443",
+        "result": {
+          "skip": "unknown_scheme"
+        }
+      },
+      {
+        "hint": "desk.local:7443",
+        "result": {
+          "skip": "unknown_scheme"
+        }
+      },
+      {
+        "hint": "desk",
+        "result": {
+          "skip": "unknown_scheme"
+        }
+      }
+    ],
+    "description": "Route hints (spec wire.md, \"Route hints\"). Each hint reads as a tcp route (host as ipv4, ipv6 in its shortest text form, or a lowercased dns name, and a port), an mdns instance, or is skipped with a reason: reserved, unknown_scheme or malformed."
+  },
   "valid": {
     "binary": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450000102030405060708090a0b0c0d0e0f0550101112131415161718191a1b1c1d1e1f061a6ab13dd80782777463703a2f2f3139322e3136382e312e32303a37343433757463703a2f2f5b666430303a3a32305d3a37343433",
     "expires_at": 1790000600,

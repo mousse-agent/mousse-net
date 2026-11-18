@@ -8,22 +8,25 @@
 //!   a code exchange (a PAKE over the 6-digit code shown on the host). Both
 //!   confirmations are needed before the host enrolls the device.
 //!
-//! The code exchange itself sits behind [`CodeExchange`]; this module owns
-//! the binding transcript it must use, attempt limits, resends and atomic
-//! one-enrollment consumption.
+//! The code exchange itself sits behind [`CodeExchange`]; the real one is
+//! CPace ([`CpaceExchangeFactory`]), with the joiner as initiator and the host
+//! as responder. This module owns the binding transcript and session id it
+//! must use, attempt limits, resends and atomic one-enrollment consumption.
 
 mod exchange;
 mod host;
 mod joiner;
 mod proof;
+mod route;
 mod ticket;
 
 use std::fmt;
 
-#[cfg(any(test, feature = "insecure-test-exchange"))]
+#[cfg(feature = "insecure-test-exchange")]
 pub use exchange::insecure;
 pub use exchange::{
-    CodeExchange, CodeExchangeFactory, ExchangeError, ExchangeRole, ExchangeStep, PairingCode,
+    CodeExchange, CodeExchangeFactory, CpaceExchange, CpaceExchangeFactory, ExchangeError,
+    ExchangeRole, ExchangeStep, PairingCode,
 };
 pub use host::{
     CreatedInvitation, HostAction, HostPairing, HostPairingError, InvitationParams,
@@ -33,9 +36,12 @@ pub use joiner::{
     JoinerAction, JoinerError, JoinerPairing, JoinerState, PairedHost, JOINER_ATTEMPTS_PER_FLOW,
 };
 pub use proof::{
-    binding_transcript, join_proof_input, join_proof_mac, verify_join_proof, BindingTranscript,
-    SessionExporters, EXPORTER_LEN, JOIN_EXPORTER_LABEL, JOIN_PROOF_DOMAIN, JOIN_PROOF_KEY_INFO,
-    PAIR_EXPORTER_LABEL, PAIR_TRANSCRIPT_DOMAIN,
+    attempt_sid, binding_transcript, join_proof_input, join_proof_mac, verify_join_proof,
+    BindingTranscript, SessionExporters, EXPORTER_LEN, JOIN_EXPORTER_LABEL, JOIN_PROOF_DOMAIN,
+    JOIN_PROOF_KEY_INFO, PAIR_EXPORTER_LABEL, PAIR_TRANSCRIPT_DOMAIN, SID_DOMAIN, SID_LEN,
+};
+pub use route::{
+    Route, RouteHost, RouteSkip, MAX_DNS_NAME_LEN, MAX_MDNS_INSTANCE_LEN, RESERVED_SCHEMES,
 };
 pub use ticket::{
     Ticket, TicketError, TicketSecret, MAX_ROUTES, MAX_ROUTE_LEN, TICKET_LIFETIME_SECS,

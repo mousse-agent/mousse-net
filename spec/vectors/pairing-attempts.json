@@ -1,5 +1,5 @@
 {
-  "description": "Attempt-limit sequences for the send-link flow (spec wire.md, \"Attempt limits\"), plus one-enrollment for in person. Each step runs one operation and then the listed expectations hold. Ops: connect (joiner proves the ticket on conn), submit (joiner enters the right or a wrong code; messages flow until both sides stop), submit_first (only the joiner's first message reaches the host), redeliver (that first message reaches the host again on conn), drop (conn closes mid-attempt), approve (host owner taps for conn). `closed` lists connections the host closed during the step.",
+  "description": "Attempt-limit sequences for the send-link flow (spec wire.md, \"Send-link flow and the code\" and \"Attempt limits\"), plus one-enrollment for in person. Each step runs one operation and then the listed expectations hold. Ops: connect (joiner proves the ticket on conn), submit (joiner enters a code; messages flow until both sides stop), submit_first (only the joiner's first message reaches the host), redeliver (that first message reaches the host again on conn), drop (conn closes mid-attempt), approve (host owner taps for conn). Codes: right (the code the host shows now), wrong (any other code), stale (the code the host showed when the previous attempt started). `new_code` says whether the host showed a fresh code during the step. `closed` lists connections the host closed during the step.",
   "sequences": [
     {
       "kind": "send_link",
@@ -21,6 +21,7 @@
           "joiner": "a",
           "joiner_attempts_left": 2,
           "joiner_state": "awaiting_code",
+          "new_code": true,
           "op": "submit"
         },
         {
@@ -31,6 +32,7 @@
           "joiner": "a",
           "joiner_attempts_left": 1,
           "joiner_state": "awaiting_code",
+          "new_code": true,
           "op": "submit"
         },
         {
@@ -47,6 +49,7 @@
           "joiner": "a",
           "joiner_attempts_left": 0,
           "joiner_state": "failed:attempts_exhausted",
+          "new_code": false,
           "op": "submit"
         },
         {
@@ -89,6 +92,46 @@
     },
     {
       "kind": "send_link",
+      "name": "stale_code_is_refused",
+      "steps": [
+        {
+          "conn": 1,
+          "joiner": "a",
+          "op": "connect"
+        },
+        {
+          "code": "wrong",
+          "conn": 1,
+          "host_attempts_left": 2,
+          "joiner": "a",
+          "new_code": true,
+          "op": "submit"
+        },
+        {
+          "code": "stale",
+          "conn": 1,
+          "host_attempts_left": 1,
+          "host_status": "open",
+          "joiner": "a",
+          "joiner_attempts_left": 1,
+          "joiner_state": "awaiting_code",
+          "new_code": true,
+          "op": "submit"
+        },
+        {
+          "code": "right",
+          "conn": 1,
+          "host_attempts_left": 0,
+          "host_status": "consumed",
+          "joiner": "a",
+          "joiner_state": "paired",
+          "new_code": false,
+          "op": "submit"
+        }
+      ]
+    },
+    {
+      "kind": "send_link",
       "name": "resend_is_not_a_new_attempt",
       "steps": [
         {
@@ -108,6 +151,7 @@
           "conn": 1,
           "host_attempts_left": 2,
           "joiner": "a",
+          "new_code": false,
           "op": "redeliver",
           "same_reply": true
         },
@@ -115,6 +159,7 @@
           "conn": 1,
           "host_attempts_left": 2,
           "joiner": "a",
+          "new_code": false,
           "op": "redeliver",
           "same_reply": true
         }
