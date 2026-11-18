@@ -17,7 +17,7 @@ added = "2026-11-18T15:03:32Z"
 name = "mac-mini"
 key = "04d63225e01c2fd84d8a4588702b08561c26da25295387d39876ea36c7f2deee75ec54bd53c9d5b09712f13f737f0ece0038931c8226886a42d77430c7c4e486ee"
 platform = "Mac mini, Apple silicon, macOS"
-targets = ["macos-arm64", "aarch64-apple-darwin", "x86_64-apple-darwin"]
+targets = ["macos-arm64", "aarch64-apple-darwin", "x86_64-apple-darwin", "aarch64-linux-android"]
 added = "2026-11-18T15:03:32Z"
 
 [[device]]
