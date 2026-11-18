@@ -124,6 +124,13 @@ async function openSafari() {
     try {
       if ((await call('GET', '/status')).status === 200) break;
     } catch { /* not up yet */ }
+    if (driver.exitCode !== null) {
+      // Without "Allow Remote Automation" its service is refused by
+      // webinspectord and safaridriver exits at once, silently.
+      const message = `safaridriver exited with ${driver.exitCode} before listening`;
+      log(message);
+      return { needsOwner: message };
+    }
     if (i > 50) {
       await stopDriver();
       throw new Error('safaridriver did not start');
