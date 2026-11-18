@@ -21,10 +21,12 @@ grant. Relays, Plus, phones and browsers come later and extend this document.
 | **Ticket holder** | Someone who saw or was sent a ticket (QR photo, forwarded link) but is not the intended device. |
 | **Fake host** | A device that pretends to be a host, for example by forwarding a link or answering on a route. |
 | **Former device** | A device whose grant was removed or denied, still holding its keys. |
+| **Other person on this computer** | A different OS user on the same computer: can reach the same loopback and LAN ports, run their own Mousse profile, and take a port the helper is not holding. |
 
 Out of scope for Phase 0: a compromised host or joiner OS, malware with the
-user's privileges, physical extraction from hardware keystores, and denial of
-service by an attacker who can block the network.
+user's privileges, physical extraction from hardware keystores, denial of
+service by an attacker who can block the network, and isolation between
+profiles under the same OS user (see "Other people on the same computer").
 
 ## Threats and defences
 
@@ -76,6 +78,8 @@ service by an attacker who can block the network.
   allows 3 per code-entry flow. Both debit before any exchange work, so
   aborting or dropping the connection does not refund an attempt. A new TLS
   session is a new attempt.
+- Each attempt uses a fresh code, so a failed guess says nothing about the
+  next one.
 - Chance of one invitation falling to guessing: at most 3 in 1 000 000.
 
 ### Fake host
@@ -87,6 +91,22 @@ service by an attacker who can block the network.
   identities.
 - A fake host can use up the joiner's local attempts. It cannot spend the
   real host's attempts, because each side counts its own.
+
+### Other people on the same computer
+
+Each Mousse profile on a computer is its own **endpoint**: its own identity
+key, grants and denials, invitations, pins and listener.
+
+- **A different OS user is in scope.** An endpoint's state directory (keys,
+  grants, pins, invitations) and its local IPC are readable and writable only
+  by its own OS user. Another user who takes the endpoint's port cannot
+  present its identity, so connecting devices fail the pin (`pin_mismatch`),
+  send nothing, and try their next address.
+- **Profiles under the same OS user are not isolated from each other.** They
+  share that user's files and processes, so one can read the other's state.
+  This is out of scope, and the app says so where profiles are set up.
+- A pin mismatch on a LAN address is expected when two endpoints share a
+  computer, so it causes no warning and no re-pin.
 
 ### Removed or denied devices
 
