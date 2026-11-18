@@ -4,6 +4,10 @@
 //!   "Must-fail controls"). The `compile_error!` in the crate only sees
 //!   `debug_assertions`, which a release profile can turn on; this sees the
 //!   profile itself. Profiles that inherit from `release` report `release`.
+//!   It stops a build early when the control is in the global `RUSTFLAGS`,
+//!   and always passes the profile to the crate as `MOUSSE_BUILD_PROFILE`;
+//!   the crate refuses `release` at compile time itself, which also catches
+//!   flags given to it alone (`cargo rustc -- --cfg ...`).
 //! - Fixes this build's id, `<commit>[-dirty]+<profile>`, in
 //!   `MOUSSE_HELPER_BUILD`, so a result names the build that ran, not the
 //!   checkout it happens to run in. `MOUSSE_BUILD_ID` overrides it (the test
@@ -23,6 +27,7 @@ fn main() {
         .unwrap_or_default()
         .contains("mousse_control");
     let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".into());
+    println!("cargo:rustc-env=MOUSSE_BUILD_PROFILE={profile}");
     if profile == "release" && (from_cfg.is_some() || from_flags) {
         eprintln!(
             "error: mousse_control ({}) plants a bug for tests; it is not allowed in release builds",

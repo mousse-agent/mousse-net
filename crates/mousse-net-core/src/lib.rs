@@ -23,8 +23,8 @@
 // Must-fail controls (spec/vectors/README.md, "Must-fail controls") plant a
 // bug so the vector tests can be shown to fail. They are for debug test runs
 // only and never compile into a release build: this stops builds without
-// debug assertions, and build.rs stops the release profile (and profiles
-// that inherit it) even when debug assertions are on.
+// debug assertions, and the check below stops the release profile (and
+// profiles that inherit it) even when debug assertions are on.
 #[cfg(all(
     any(
         mousse_control = "break-session-cert",
@@ -36,6 +36,30 @@
     not(debug_assertions)
 ))]
 compile_error!("mousse_control plants a bug for tests; it is not allowed in release builds");
+
+// The same controls in a release-profile build, even with debug assertions
+// on. `build.rs` passes the profile in `MOUSSE_BUILD_PROFILE`.
+#[cfg(any(
+    mousse_control = "break-session-cert",
+    mousse_control = "break-authz",
+    mousse_control = "break-raw-signature",
+    mousse_control = "break-cpace-confirm",
+    mousse_control = "break-cpace-sid"
+))]
+const _: () = {
+    let profile = env!("MOUSSE_BUILD_PROFILE").as_bytes();
+    let release = b"release";
+    let mut same = profile.len() == release.len();
+    let mut i = 0;
+    while same && i < profile.len() {
+        same = profile[i] == release[i];
+        i += 1;
+    }
+    assert!(
+        !same,
+        "mousse_control plants a bug for tests; it is not allowed in release builds"
+    );
+};
 
 mod asn1;
 mod base64url;
