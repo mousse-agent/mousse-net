@@ -311,6 +311,7 @@ fn authorization() {
                         role: Role::new(s(&g["role"])).expect("role"),
                         authorizing_owner: OwnerRef::from_bytes([0x51; 16]),
                         expires_at: g["expires_at"].as_u64().map(UnixTime),
+                        enrolled_by: None,
                     },
                     UnixTime(now.secs() - 60),
                 )
@@ -380,8 +381,27 @@ fn caller_state_name(state: CallerGateState) -> String {
 #[test]
 fn caller_gate() {
     let doc = load("authz.json");
+    let ids = &doc["identities"];
     for case in list(&doc["caller_cases"]) {
         let name = s(&case["name"]);
+        let now = UnixTime(case["now"].as_u64().unwrap_or(0));
+        // The caller endpoint's own grants, for streams the host opens.
+        let mut local = GrantTable::new();
+        for g in case["local_grants"].as_array().into_iter().flatten() {
+            local
+                .add(
+                    NewGrant {
+                        identity: key(&ids[s(&g["identity"])]),
+                        name: "device".into(),
+                        role: Role::new(s(&g["role"])).expect("role"),
+                        authorizing_owner: OwnerRef::from_bytes([0x51; 16]),
+                        expires_at: g["expires_at"].as_u64().map(UnixTime),
+                        enrolled_by: None,
+                    },
+                    UnixTime(now.secs().saturating_sub(60)),
+                )
+                .expect("add");
+        }
         let mut gate = CallerGate::new();
         for step in list(&case["steps"]) {
             match s(&step["op"]) {
@@ -391,6 +411,12 @@ fn caller_gate() {
                 }
                 "promote" => gate.promote(),
                 "sent_join_proof" => gate.sent_join_proof(),
+                "host_stream" => {
+                    let host = key(&ids[s(&step["host"])]);
+                    let got = gate.host_stream_authority(&local, &host, now);
+                    let got = got.as_ref().map_or("none", |r| r.as_str());
+                    assert_eq!(got, s(&step["result"]), "{name}: host_stream");
+                }
                 other => panic!("op {other}"),
             }
             assert_eq!(caller_state_name(gate.state()), s(&step["state"]), "{name}");

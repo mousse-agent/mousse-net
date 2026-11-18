@@ -11,8 +11,8 @@ use mousse_net_core::control::{
 use mousse_net_core::identity::IdentityPublicKey;
 use mousse_net_core::mux::{MuxEvent, PriorityClass, StreamId};
 use mousse_net_core::pairing::{
-    Arrival, CodeExchangeFactory, ExchangeRole, InvitationKind, JoinerAction, JoinerPairing,
-    JoinerRecord, JoinerState, PairedHost, PairingCode, Ticket,
+    Arrival, CodeExchangeFactory, ExchangeRole, InvitationKind, JoinerAction, JoinerName,
+    JoinerPairing, JoinerRecord, JoinerState, PairedHost, PairingCode, Ticket,
 };
 use mousse_net_core::session::{PeerSession, SessionEvent, RENEW_LEAD_SECS};
 use mousse_net_core::session_cert::SessionCertificate;
@@ -202,7 +202,10 @@ impl CallerDev {
             ticket,
             arrival,
             self.identity,
-            self.label.to_owned(),
+            JoinerName {
+                computer: self.label.to_owned(),
+                profile: Some("Sim".to_owned()),
+            },
             factory,
             stored.as_ref(),
             sim.wall(self.id),
@@ -632,18 +635,48 @@ impl CallerDev {
         }
     }
 
-    /// Store the flow's record, as the app would after every change.
-    fn save_record(&mut self) {
-        if let Mode::Joining(flow) = &self.mode {
-            let record = flow.record();
-            self.records.insert(record.ticket_hash, record);
+    /// Carry out the flow's writes as the app's store would: a
+    /// compare-and-swap on the record for the ticket hash, completed before
+    /// the flow goes on. Returns every other action, in order, with the
+    /// ones each write was holding in their place.
+    fn complete_writes(&mut self, actions: Vec<JoinerAction>) -> Vec<JoinerAction> {
+        let mut queue: std::collections::VecDeque<JoinerAction> = actions.into();
+        let mut out = Vec::new();
+        while let Some(action) = queue.pop_front() {
+            let JoinerAction::Persist { expected, record } = action else {
+                out.push(action);
+                continue;
+            };
+            let Mode::Joining(flow) = &mut self.mode else {
+                continue;
+            };
+            let more = if self.records.get(&record.ticket_hash).copied() == expected {
+                self.records.insert(record.ticket_hash, record);
+                flow.on_persisted()
+            } else {
+                flow.on_persist_failed()
+            };
+            for m in more.into_iter().rev() {
+                queue.push_front(m);
+            }
+        }
+        out
+    }
+
+    /// The pin is stored: the flow may clear its pending mark.
+    fn pin_stored(&mut self) {
+        if let Mode::Joining(flow) = &mut self.mode {
+            let actions = flow.on_pin_stored();
+            let rest = self.complete_writes(actions);
+            debug_assert!(rest.is_empty());
         }
     }
 
     fn apply(&mut self, sim: &mut Sim, conn: ConnectionId, actions: Vec<JoinerAction>) {
-        self.save_record();
+        let actions = self.complete_writes(actions);
         for action in actions {
             match action {
+                JoinerAction::Persist { .. } => unreachable!("writes are completed first"),
                 JoinerAction::Send(msg) => {
                     if let ControlMessage::CodeExchange { .. } = msg {
                         self.last_exchange_msg = Some(msg.clone());
@@ -668,11 +701,13 @@ impl CallerDev {
                     );
                     self.outcome = Outcome::Paired(host.clone());
                     self.just_paired = Some(host.clone());
+                    self.pin_stored();
                     self.become_paired(sim, conn, host.identity);
                 }
                 JoinerAction::AlreadyPaired => {
                     sim.say(self.id, format_args!("the host already grants this device"));
                     self.outcome = Outcome::AlreadyPaired;
+                    self.pin_stored();
                     if let Some(pin) = self.expected_host {
                         self.become_paired(sim, conn, pin);
                     }
@@ -897,8 +932,10 @@ impl CallerDev {
             Mode::Joining(flow) if was_active => {
                 self.active = None;
                 let actions = flow.on_closed(code);
-                let record = flow.record();
-                self.records.insert(record.ticket_hash, record);
+                let actions = self.complete_writes(actions);
+                let Mode::Joining(flow) = &mut self.mode else {
+                    return;
+                };
                 for a in &actions {
                     if let JoinerAction::Failed(c) = a {
                         sim.say(self.id, format_args!("pairing failed: {c:?}"));

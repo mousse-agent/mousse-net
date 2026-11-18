@@ -335,10 +335,14 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
     /// On a connection waiting for a proof, a valid proof for an open
     /// invitation admits it (join-only); anything else closes it. On a
     /// **live** connection (bound to the peer's grant in `grants`), the host
-    /// already said `AUTHORIZED {live}` and now answers the proof with one
-    /// more `AUTHORIZED`: `join_only` if the proof is valid for an open
-    /// invitation (the pairing that follows replaces the grant), else
-    /// `live` again. Either way a live connection is never closed here.
+    /// already said `AUTHORIZED {live}` and now answers the proof once
+    /// more: `AUTHORIZED {join_only}` if the proof is valid for an open
+    /// invitation (the pairing that follows replaces the grant); `PAIRED`
+    /// again if the bound grant's enrollment receipt names the proof's
+    /// invitation (that pairing took effect, and its `PAIRED` may have been
+    /// lost); else `AUTHORIZED {live}` (current access, which this
+    /// invitation did not create). Either way a live connection is never
+    /// closed here.
     #[allow(clippy::too_many_arguments)]
     pub fn on_join_proof(
         &mut self,
@@ -359,16 +363,25 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
         if grants.is_denied(joiner) || *joiner == self.host_identity {
             return close(ErrorCode::NotAuthorized);
         }
-        let live = grants.binding(conn).is_some();
+        let bound = grants.binding(conn).and_then(|id| grants.get(id));
         let refuse = || {
-            if live {
-                // Current access stands; the proof opened nothing.
-                vec![HostAction::Send {
-                    conn,
-                    message: ControlMessage::Authorized {
+            if let Some(grant) = bound {
+                // The proof opens nothing. If this invitation's pairing made
+                // the grant, say so again: the joiner may have lost its
+                // `PAIRED`. Otherwise current access stands. The connection
+                // is already authenticated as the grant's identity, so the
+                // receipt needs no MAC (the invitation's secret may be gone).
+                let message = if grant.enrolled_by == Some(*invitation) {
+                    ControlMessage::Paired {
+                        host_name: self.host_name.clone(),
+                        role: grant.role.clone(),
+                    }
+                } else {
+                    ControlMessage::Authorized {
                         state: AuthorizedState::Live,
-                    },
-                }]
+                    }
+                };
+                vec![HostAction::Send { conn, message }]
             } else {
                 vec![HostAction::Close {
                     conn,
@@ -656,6 +669,7 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
             role: inv.params.role.clone(),
             authorizing_owner: inv.params.authorizing_owner,
             expires_at: inv.params.grant_expires_at,
+            enrolled_by: Some(*invitation),
         };
         let (grant, events) = match grants.add(new_grant, now) {
             Ok(added) => added,

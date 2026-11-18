@@ -23,6 +23,7 @@ use std::fmt;
 use rand_core::CryptoRng;
 
 use crate::identity::IdentityPublicKey;
+use crate::pairing::InvitationId;
 use crate::time::UnixTime;
 use crate::{ConnectionId, ErrorCode};
 
@@ -121,7 +122,8 @@ pub enum GrantSource {
 pub struct RosterId(pub [u8; 32]);
 
 /// One grant: `{identity, name, role, source, authorizing owner/profile,
-/// adopted_into, granted_at}` plus an optional expiry.
+/// adopted_into, granted_at}` plus an optional expiry and the invitation
+/// that enrolled it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Grant {
     /// Local id.
@@ -143,6 +145,12 @@ pub struct Grant {
     /// When it stops being valid, if ever (this endpoint's clock). At this second the
     /// grant is already expired.
     pub expires_at: Option<UnixTime>,
+    /// The enrollment receipt: the invitation whose pairing created this
+    /// grant, if pairing created it (wire.md 7). The host answers a join
+    /// proof for that invitation on a connection live under this grant
+    /// with `PAIRED` again, so a joiner whose `PAIRED` was lost learns that
+    /// this invitation's role took effect. Stored with the grant.
+    pub enrolled_by: Option<InvitationId>,
 }
 
 impl Grant {
@@ -164,6 +172,9 @@ pub struct NewGrant {
     pub authorizing_owner: OwnerRef,
     /// Optional expiry.
     pub expires_at: Option<UnixTime>,
+    /// The invitation whose pairing creates this grant; `None` for a grant
+    /// made any other way.
+    pub enrolled_by: Option<InvitationId>,
 }
 
 /// A local denial: this identity may not hold a grant on this endpoint.
@@ -311,6 +322,7 @@ impl GrantTable {
             adopted_into: None,
             granted_at: now,
             expires_at: new.expires_at,
+            enrolled_by: new.enrolled_by,
         };
         self.by_identity.insert(grant.identity, id);
         self.grants.insert(id, grant);
@@ -463,6 +475,7 @@ mod tests {
             role: Role::owner(),
             authorizing_owner: OwnerRef::from_bytes([0x51; 16]),
             expires_at,
+            enrolled_by: None,
         }
     }
 

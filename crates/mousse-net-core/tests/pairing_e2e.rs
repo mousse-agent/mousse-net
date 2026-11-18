@@ -26,8 +26,8 @@ use mousse_net_core::mux::Frame;
 use mousse_net_core::pairing::{
     attempt_sid, binding_transcript, Arrival, AttemptId, CpaceExchangeFactory, HostAction,
     HostPairing, HostPairingError, InvitationId, InvitationKind, InvitationParams,
-    InvitationStatus, JoinerAction, JoinerError, JoinerPairing, JoinerRecord, JoinerState,
-    PairingCode, SessionExporters, Ticket, TicketSecret,
+    InvitationStatus, JoinerAction, JoinerError, JoinerName, JoinerPairing, JoinerRecord,
+    JoinerState, PairingCode, SessionExporters, Ticket, TicketSecret,
 };
 use mousse_net_core::{ConnectionId, ErrorCode, Millis, UnixTime};
 use rand_core::{TryCryptoRng, TryRng};
@@ -39,7 +39,8 @@ const NOW: u64 = 1_790_000_000;
 const HOST_SECRET: [u8; 32] = [0x11; 32];
 const JOINER_SECRET: [u8; 32] = [0x22; 32];
 const HOST_NAME: &str = "Desk";
-const JOINER_NAME: &str = "Phone";
+const JOINER_COMPUTER: &str = "Phone";
+const JOINER_PROFILE: &str = "Work";
 const ROLE: &str = "owner";
 /// The host profile's id: the authorizing owner of every grant here.
 const AUTHORIZING_OWNER: [u8; 16] = [0x51; 16];
@@ -216,6 +217,8 @@ impl TryCryptoRng for Script {}
 
 struct Joiner {
     pairing: Option<JoinerPairing<CpaceExchangeFactory>>,
+    /// The flow record as the app's store holds it.
+    stored: Option<JoinerRecord>,
     gate: CallerGate,
     rng: Script,
     conn: Option<u64>,
@@ -243,6 +246,7 @@ impl World {
                             name.clone(),
                             Joiner {
                                 pairing: None,
+                                stored: None,
                                 gate: CallerGate::new(),
                                 rng: Script::new(d),
                                 conn: None,
@@ -291,7 +295,7 @@ impl World {
                 };
                 let params = InvitationParams {
                     kind,
-                    role: Role::new(ROLE).expect("role"),
+                    role: Role::new(step.get("role").map_or(ROLE, s)).expect("role"),
                     authorizing_owner: OwnerRef::from_bytes(AUTHORIZING_OWNER),
                     routes: vec![ROUTE.into()],
                     grant_expires_at: None,
@@ -379,15 +383,20 @@ impl World {
                         NewGrant {
                             identity: joiner_key(),
                             name: s(&step["name"]).into(),
-                            role: Role::new(ROLE).expect("role"),
+                            role: Role::new(step.get("role").map_or(ROLE, s)).expect("role"),
                             authorizing_owner: OwnerRef::from_bytes(AUTHORIZING_OWNER),
                             expires_at: None,
+                            enrolled_by: None,
                         },
                         now,
                     )
                     .expect("grant");
                 assert!(events.is_empty());
                 Vec::new()
+            }
+            ("host", "tick") => {
+                let actions = self.host.tick(UnixTime(u(&step["at"])));
+                self.host_actions(actions)
             }
             ("host", "approve") => {
                 let conn = u(&step["conn"]);
@@ -419,7 +428,10 @@ impl World {
                     ticket,
                     arrival,
                     identity,
-                    JOINER_NAME.into(),
+                    JoinerName {
+                        computer: JOINER_COMPUTER.into(),
+                        profile: Some(JOINER_PROFILE.into()),
+                    },
                     CpaceExchangeFactory,
                     stored.as_ref(),
                     now,
@@ -427,7 +439,9 @@ impl World {
                 match pairing {
                     Ok(mut p) => {
                         p.set_host_pinned(step["host_pinned"] == true);
-                        self.joiner(name).pairing = Some(p);
+                        let j = self.joiner(name);
+                        j.pairing = Some(p);
+                        j.stored = stored;
                         Vec::new()
                     }
                     Err(e) => vec![json!({ "error": joiner_error_name(e) })],
@@ -526,7 +540,7 @@ impl World {
                     }
                     other => panic!("gate let {other:?} through"),
                 };
-                self.joiner_actions(name, actions)
+                self.joiner_actions(name, actions, step["crash_at_persist"] == true)
             }
             (name, "drop") => {
                 // The connection breaks: no GOAWAY reaches either side.
@@ -539,7 +553,7 @@ impl World {
                     let actions = self.host.on_connection_closed(ConnectionId(conn));
                     out.extend(self.host_actions(actions));
                 }
-                out.extend(self.joiner_actions(name, joiner_side));
+                out.extend(self.joiner_actions(name, joiner_side, false));
                 out
             }
             (name, "goaway") => {
@@ -547,7 +561,12 @@ impl World {
                 let j = self.joiner(name);
                 j.gate.close(code);
                 let actions = j.pairing.as_mut().expect("started").on_closed(Some(code));
-                self.joiner_actions(name, actions)
+                self.joiner_actions(name, actions, false)
+            }
+            (name, "proof_timeout") => {
+                let j = self.joiner(name);
+                let actions = j.pairing.as_mut().expect("started").on_proof_timeout();
+                self.joiner_actions(name, actions, false)
             }
             (name, "submit_code") => {
                 let code = PairingCode::parse(s(&step["code"])).expect("six digits");
@@ -555,8 +574,9 @@ impl World {
                 let pairing = j.pairing.as_mut().expect("started");
                 match pairing.submit_code(&code, &mut j.rng) {
                     Ok(actions) => {
-                        let mut out = self.attempt_info(name, &actions);
-                        out.extend(self.joiner_actions(name, actions));
+                        let done = self.joiner_actions(name, actions, false);
+                        let mut out = self.attempt_info(name, &done);
+                        out.extend(done);
                         out
                     }
                     Err(e) => vec![json!({ "error": joiner_error_name(e) })],
@@ -606,13 +626,42 @@ impl World {
         out
     }
 
-    fn joiner_actions(&mut self, name: &str, actions: Vec<JoinerAction>) -> Vec<J> {
-        let j = self.joiner(name);
-        let conn = j.conn.unwrap_or(0);
+    /// Carry out the joiner's actions as a well-behaved app: each write
+    /// lands in the store (a compare-and-swap) before the flow goes on, and
+    /// each reported pin is stored at once. With `crash`, the app is killed
+    /// right after the first write lands: nothing it was holding goes out.
+    fn joiner_actions(&mut self, name: &str, actions: Vec<JoinerAction>, crash: bool) -> Vec<J> {
+        let mut queue: VecDeque<JoinerAction> = actions.into();
         let mut out = Vec::new();
-        for a in actions {
-            match a {
-                JoinerAction::Send(m) => out.push(send(name, conn, &m)),
+        while let Some(a) = queue.pop_front() {
+            let j = self.joiner(name);
+            let conn = j.conn.unwrap_or(0);
+            let more = match a {
+                JoinerAction::Send(m) => {
+                    out.push(send(name, conn, &m));
+                    Vec::new()
+                }
+                JoinerAction::Persist { expected, record } => {
+                    assert_eq!(expected, j.stored, "the store holds another record");
+                    j.stored = Some(record);
+                    out.push(json!({ "persist": {
+                        "expected": expected.map(|r| hex(&r.to_bytes())),
+                        "record": hex(&record.to_bytes()),
+                    } }));
+                    if crash {
+                        out.push(json!({ "crashed": true }));
+                        j.pairing = None;
+                        if let Some(conn) = j.conn.take() {
+                            if self.gates.remove(&conn).is_some() {
+                                self.grants.unbind(ConnectionId(conn));
+                                let actions = self.host.on_connection_closed(ConnectionId(conn));
+                                out.extend(self.host_actions(actions));
+                            }
+                        }
+                        return out;
+                    }
+                    j.pairing.as_mut().expect("started").on_persisted()
+                }
                 JoinerAction::Paired(p) => {
                     j.gate.promote();
                     out.push(json!({ "paired": {
@@ -620,27 +669,41 @@ impl World {
                         "host_name": p.name,
                         "role": p.role.as_str(),
                     } }));
+                    j.pairing.as_mut().expect("started").on_pin_stored()
                 }
-                JoinerAction::AlreadyPaired => out.push(json!({ "already_paired": true })),
+                JoinerAction::AlreadyPaired => {
+                    out.push(json!({ "already_paired": true }));
+                    j.pairing.as_mut().expect("started").on_pin_stored()
+                }
                 JoinerAction::CodeRejected { attempts_left } => {
                     out.push(json!({ "code_rejected": { "attempts_left": attempts_left } }));
+                    Vec::new()
                 }
                 JoinerAction::Failed(code) => {
                     // A failed flow trusts the connection no further.
                     j.gate.close(code);
                     out.push(json!({ "failed": code.name() }));
+                    Vec::new()
                 }
+            };
+            for m in more.into_iter().rev() {
+                queue.push_front(m);
             }
         }
         out
     }
 
     /// The values a new attempt runs CPace with, derived from public inputs.
-    fn attempt_info(&mut self, name: &str, actions: &[JoinerAction]) -> Vec<J> {
-        let Some(attempt) = actions.iter().find_map(|a| match a {
-            JoinerAction::Send(ControlMessage::CodeExchange { attempt, .. }) => Some(*attempt),
-            _ => None,
-        }) else {
+    fn attempt_info(&mut self, name: &str, out: &[J]) -> Vec<J> {
+        let Some(attempt) = out
+            .iter()
+            .filter_map(|o| o.get("send"))
+            .filter(|m| m["from"] == name && m["type"] == "CODE_EXCHANGE")
+            .find_map(|m| match ControlMessage::decode(&unhex(&m["control"])) {
+                Ok(ControlMessage::CodeExchange { attempt, .. }) => Some(attempt),
+                _ => None,
+            })
+        else {
             return Vec::new();
         };
         let j = self.joiner(name);
@@ -719,6 +782,8 @@ impl World {
                     json!({
                         "state": joiner_state_name(p.state()),
                         "attempts_left": p.attempts_left(),
+                        "outcome_pending": p.outcome_pending(),
+                        "stored": j.stored.map(|r| hex(&r.to_bytes())),
                         "live": j.gate.is_live(),
                     }),
                 ))
@@ -1039,7 +1104,119 @@ fn outcome_after_lost_paired() -> J {
     r.event(connect("a", 2, exporter_pair("lost_paired/conn2")));
     r.finish(
         "outcome_after_lost_paired",
-        "The host verifies the joiner's confirmation, enrolls it and sends PAIRED, but the connection breaks before PAIRED arrives. The joiner keeps its outcome pending, reconnects with the same ticket and, as on every connection of a pairing flow, sends JOIN_PROOF right after its HELLO without waiting for the host. Step 2 finds the live grant: the host sends AUTHORIZED live at once. It then answers the proof: the invitation is consumed, so it opens nothing and the answer is AUTHORIZED live again (current access). The joiner takes the first live as a notice and the answer as its outcome: already paired.",
+        "The host verifies the joiner's confirmation, enrolls it and sends PAIRED, but the connection breaks before PAIRED arrives. The joiner marked its outcome pending (persist) before its confirmation went out; it reconnects with the same ticket and, as on every connection of a pairing flow, sends JOIN_PROOF right after its HELLO without waiting for the host. Step 2 finds the live grant: the host sends AUTHORIZED live at once. It then answers the proof: the grant's enrollment receipt names this invitation, so the answer is PAIRED again, with the invitation's role. The joiner takes the first live as a notice and PAIRED as its outcome: paired. Once the pin is stored it clears the pending mark (persist).",
+        2,
+    )
+}
+
+/// Finding: a role change that never committed must not read as success.
+fn role_change_not_committed() -> J {
+    let flow = "role_change";
+    let mut host = ticket_draws(flow);
+    host.push(u32_draw("code", 314_271));
+    host.push(u32_draw("next_code", 662_607));
+    host.push(bytes_draw("cpace_scalar_yb", "role_change/yb1", 32));
+    let mut r = Recorder::new(json!({ "host": host, "joiners": { "a": attempt_draws(flow, 1) } }));
+    let mut c = create(2);
+    c["role"] = json!("client");
+    r.event(c);
+    r.event(json!({ "party": "host", "event": "grant", "name": "Phone (Work)", "role": "owner" }));
+    let t = r.ticket();
+    r.event(json!({ "party": "a", "event": "start", "ticket": t, "arrival": "link", "host_pinned": true }));
+    r.event(connect("a", 1, exporter_pair("role_change/conn1")));
+    // Deliver by hand from here, so that the confirmation can be lost.
+    r.pump = false;
+    let out = r.event(submit("314271"));
+    let msg_a = sent_control(&out, "a", "CODE_EXCHANGE");
+    let out = r.event(json!({ "party": "host", "event": "receive", "conn": 1, "control": msg_a }));
+    let msg_b = sent_control(&out, "host", "CODE_EXCHANGE");
+    let out = r.event(json!({ "party": "a", "event": "receive", "control": msg_b }));
+    sent_control(&out, "a", "CODE_EXCHANGE");
+    r.event(json!({ "party": "a", "event": "drop" }));
+    r.event(json!({ "party": "host", "event": "tick", "at": NOW + 600 }));
+    r.pump = true;
+    r.event(connect("a", 2, exporter_pair("role_change/conn2")));
+    r.finish(
+        "role_change_not_committed",
+        "The device already holds an owner grant and a pin for the host. It opens a send link whose invitation would make it a client, and the code exchange runs on its live connection (the proof made it join-only). The joiner verifies the host's confirmation, marks its outcome pending (persist) and sends its own, but the connection breaks before the host reads it, so the host never enrolls it. The invitation then expires. On reconnect step 2 finds the old owner grant (AUTHORIZED live); the proof's invitation is no longer open and the grant's enrollment receipt does not name it (that grant came from elsewhere), so the answer is AUTHORIZED live, not PAIRED. The joiner reports already_paired (the device keeps the access it had; the client role is not in effect), not a completed pairing, and clears the pending mark once the pin is stored. The grant stays owner.",
+        2,
+    )
+}
+
+/// Finding: the pending mark is durable before the confirmation goes out.
+fn crash_after_pending_mark() -> J {
+    let flow = "crash_pending";
+    let mut host = ticket_draws(flow);
+    host.push(u32_draw("code", 141_421));
+    host.push(u32_draw("next_code", 173_205));
+    host.push(bytes_draw("cpace_scalar_yb", "crash_pending/yb1", 32));
+    let mut r = Recorder::new(json!({ "host": host, "joiners": { "a": attempt_draws(flow, 1) } }));
+    r.event(create(2));
+    let t = r.ticket();
+    r.event(start(&t));
+    r.event(connect("a", 1, exporter_pair("crash_pending/conn1")));
+    r.pump = false;
+    let out = r.event(submit("141421"));
+    let msg_a = sent_control(&out, "a", "CODE_EXCHANGE");
+    let out = r.event(json!({ "party": "host", "event": "receive", "conn": 1, "control": msg_a }));
+    let msg_b = sent_control(&out, "host", "CODE_EXCHANGE");
+    let out = r.event(
+        json!({ "party": "a", "event": "receive", "control": msg_b, "crash_at_persist": true }),
+    );
+    let record = out
+        .iter()
+        .find_map(|o| o.get("persist"))
+        .map(|p| p["record"].clone())
+        .expect("the pending mark was written");
+    r.pump = true;
+    r.event(
+        json!({ "party": "a", "event": "start", "ticket": t, "arrival": "link", "record": record }),
+    );
+    r.event(connect("a", 2, exporter_pair("crash_pending/conn2")));
+    r.finish(
+        "crash_after_pending_mark",
+        "Every write the joiner asks for (persist: a compare-and-swap of its flow record) lands before the actions that wait for it: the debit before msg_a, and the outcome-pending mark after the host's confirmation verified but before msg_c. Here the app is killed right after the pending mark lands, so msg_c never goes out and the host, seeing the connection drop, fails the attempt. Opening the link again with the stored record (2 attempts left, outcome pending) reconnects even though the flow could not know whether the host enrolled it. The host has no grant and the invitation is still open, so it admits the proof join-only: not enrolled. The joiner clears the pending mark (persist) and waits for the current code.",
+        2,
+    )
+}
+
+/// Spec gap: a proof timeout while learning a pending outcome.
+fn lost_paired_then_proof_timeout() -> J {
+    let flow = "lost_paired_timeout";
+    let mut host = ticket_draws(flow);
+    host.push(u32_draw("code", 271_801));
+    host.push(u32_draw("next_code", 577_215));
+    host.push(bytes_draw("cpace_scalar_yb", "lost_paired_timeout/yb1", 32));
+    let mut r = Recorder::new(json!({ "host": host, "joiners": { "a": attempt_draws(flow, 1) } }));
+    r.event(create(2));
+    let t = r.ticket();
+    r.event(start(&t));
+    r.event(connect("a", 1, exporter_pair("lost_paired_timeout/conn1")));
+    r.pump = false;
+    let out = r.event(submit("271801"));
+    let msg_a = sent_control(&out, "a", "CODE_EXCHANGE");
+    let out = r.event(json!({ "party": "host", "event": "receive", "conn": 1, "control": msg_a }));
+    let msg_b = sent_control(&out, "host", "CODE_EXCHANGE");
+    let out = r.event(json!({ "party": "a", "event": "receive", "control": msg_b }));
+    let msg_c = sent_control(&out, "a", "CODE_EXCHANGE");
+    let out = r.event(json!({ "party": "host", "event": "receive", "conn": 1, "control": msg_c }));
+    sent_control(&out, "host", "PAIRED");
+    r.event(json!({ "party": "a", "event": "drop" }));
+    // The next connection reaches something that never answers the proof.
+    let mut c = connect("a", 2, exporter_pair("lost_paired_timeout/conn2"));
+    c["host"] = json!(false);
+    r.event(c);
+    r.event(json!({ "party": "a", "event": "proof_timeout" }));
+    let out = r.event(json!({ "party": "a", "event": "save" }));
+    let record = out[0]["record"].clone();
+    r.pump = true;
+    r.event(
+        json!({ "party": "a", "event": "start", "ticket": t, "arrival": "link", "record": record }),
+    );
+    r.event(connect("a", 3, exporter_pair("lost_paired_timeout/conn3")));
+    r.finish(
+        "lost_paired_then_proof_timeout",
+        "PAIRED is lost as in outcome_after_lost_paired. The joiner's next connection gets no answer to its proof within 10 s (proof_timeout): it closes with not_authorized and the flow ends; it does not reconnect on its own. The stored record keeps the outcome pending, so opening the same ticket again (start with the saved record) reconnects, and the host's answer to the proof, PAIRED again for its receipt, gives the outcome.",
         2,
     )
 }
@@ -1185,12 +1362,12 @@ fn document() -> J {
         "conventions": {
             "time": NOW,
             "host": { "identity_secret": hex(&HOST_SECRET), "identity": hex(host_key().as_bytes()), "name": HOST_NAME },
-            "joiner": { "identity_secret": hex(&JOINER_SECRET), "identity": hex(joiner_key().as_bytes()), "name": JOINER_NAME },
+            "joiner": { "identity_secret": hex(&JOINER_SECRET), "identity": hex(joiner_key().as_bytes()), "computer": JOINER_COMPUTER, "profile": JOINER_PROFILE, "proof_name": "`<computer> (<profile>)` (Phone (Work)) with an in-person ticket, `<computer>` (Phone) with a send link (wire.md 10.3)" },
             "invitation": { "role": ROLE, "authorizing_owner": hex(&AUTHORIZING_OWNER), "routes": [ROUTE], "grant_expires_at": null },
             "draws": "Each party takes its draws in order. A `bytes` draw fills a request of exactly that length; a `u32` draw answers a request for a 32-bit integer. Host: invitation id (16), ticket secret (16), for send link the code (u32, drawn again while at least 4294000000); then for each new attempt the next code (u32, only while attempts are left after the debit) and the CPace scalar yb (32). Joiner: for each attempt the attempt id (16) and the CPace scalar ya (32). A CPace scalar is the 32 bytes with the top four bits of the last byte cleared, read little-endian.",
             "exporters": "Stand-in TLS exporter values per connection. Unless `host_exporters` is given, both ends see the same session.",
-            "events": "host/create: create an invitation of `kind`. host/grant: the host adds a grant named `name` for the joiner's identity (role and authorizing owner as for invitations), as left by an earlier pairing. <joiner>/start: the joiner opens `ticket` that arrived by `arrival` (in_app_scan: the app's own scanner; link: anything else); `host_pinned`: it already held a pin for the ticket's host from an earlier pairing; `record`: the stored flow record for this ticket, from an earlier save; `identity: host`: the joiner uses the host's identity key. <joiner>/save: output the flow's record as stored. <joiner>/connect: a new TLS connection `conn`; both ends send HELLO, the host runs step 2 at once (a live grant: AUTHORIZED live, and the proof is answered with a second AUTHORIZED when it arrives; no grant: await the join proof, sending nothing) and the joiner sends JOIN_PROOF right after its HELLO without waiting; with `host: false` the far end is scripted. <joiner>/drop: the joiner's connection breaks with no GOAWAY either way. host/receive and <joiner>/receive: a CONTROL message arrives (checked by that end's gate first). <joiner>/goaway: the host's GOAWAY arrives. <joiner>/submit_code: the owner types `code`. host/approve: the host owner approves the device on `conn`.",
-            "outputs": "send: a control message with its CONTROL frame. close: GOAWAY with its frame. attempt: the CPace inputs of a new attempt (CI is the binding transcript; sid as in wire.md). version: the minor version agreed from a HELLO. record: the joiner's stored flow record (canonical CBOR, wire.md 10.7; a local format). Others name host or joiner events: show_code, ask_approval, admitted_join_only, enrolled, invitation_ended, paired, code_rejected, failed (the joiner's flow ends with this code: its gate closes, and unless the step was a goaway or a drop, the joiner then closes the connection with GOAWAY of that code after any message listed before it in the step, wire.md 10.6 rule 9; that GOAWAY is not listed as a separate close), error, ignored.",
+            "events": "host/create: create an invitation of `kind` (with `role` if given, else the conventions' role). host/grant: the host adds a grant named `name` for the joiner's identity (`role` if given, else the conventions' role; authorizing owner as for invitations; no enrollment receipt), as left by an earlier pairing. host/tick: the host's clock reaches `at`; open invitations whose time is up end. <joiner>/start: the joiner opens `ticket` that arrived by `arrival` (in_app_scan: the app's own scanner; link: anything else); `host_pinned`: it already held a pin for the ticket's host from an earlier pairing; `record`: the stored flow record for this ticket, from an earlier save; `identity: host`: the joiner uses the host's identity key. <joiner>/save: output the flow's record as stored. <joiner>/connect: a new TLS connection `conn`; both ends send HELLO, the host runs step 2 at once (a live grant: AUTHORIZED live, and the proof is answered with a second AUTHORIZED when it arrives; no grant: await the join proof, sending nothing) and the joiner sends JOIN_PROOF right after its HELLO without waiting; with `host: false` the far end is scripted. <joiner>/drop: the joiner's connection breaks with no GOAWAY either way. host/receive and <joiner>/receive: a CONTROL message arrives (checked by that end's gate first). <joiner>/goaway: the host's GOAWAY arrives. <joiner>/proof_timeout: no answer to the joiner's proof within 10 s (wire.md 8.2). <joiner>/submit_code: the owner types `code`. A receive with `crash_at_persist`: the app is killed right after the first write it asks for lands; nothing it held goes out, its flow is gone and its connection breaks. host/approve: the host owner approves the device on `conn`.",
+            "outputs": "send: a control message with its CONTROL frame. close: GOAWAY with its frame. attempt: the CPace inputs of a new attempt (CI is the binding transcript; sid as in wire.md). version: the minor version agreed from a HELLO. record: the joiner's flow record (canonical CBOR, wire.md 10.7; a local format). persist: the joiner asks to store `record` if the store still holds `expected` (null: nothing yet); the harness completes it at once, then the actions that waited for it follow. crashed: the app was killed. paired and already_paired are followed at once by the pin being stored, after which the joiner may clear its pending mark (persist). Others name host or joiner events: show_code, ask_approval, admitted_join_only, enrolled, invitation_ended, paired, code_rejected, failed (the joiner's flow ends with this code: its gate closes, and unless the step was a goaway or a drop, the joiner then closes the connection with GOAWAY of that code after any message listed before it in the step, wire.md 10.6 rule 9; that GOAWAY is not listed as a separate close), error, ignored.",
         },
         "flows": [
             in_person(),
@@ -1200,6 +1377,9 @@ fn document() -> J {
             tampered_tickets(),
             proof_on_another_session(),
             outcome_after_lost_paired(),
+            role_change_not_committed(),
+            crash_after_pending_mark(),
+            lost_paired_then_proof_timeout(),
             send_link_live_needs_a_pin(),
             re_pair_while_granted(),
             swapped_in_person_link(),

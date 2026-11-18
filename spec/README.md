@@ -34,7 +34,7 @@ gaps. Each is now a normative rule with vectors.
 
 | Gap | Rule | Vector |
 |---|---|---|
-| When the join proof is sent | [`wire.md`](wire.md) 8, 10.3: the joiner sends `JOIN_PROOF` on every connection right after its own `HELLO`; the host runs step 2 at once, says nothing while it awaits a proof, and answers the proof under a live grant with a second `AUTHORIZED`. | `pairing-e2e.json` `connect` steps, `outcome_after_lost_paired` |
+| When the join proof is sent | [`wire.md`](wire.md) 8, 10.3: the joiner sends `JOIN_PROOF` on every connection right after its own `HELLO`; the host runs step 2 at once, says nothing while it awaits a proof, and answers the proof under a live grant with a second `AUTHORIZED`, or with `PAIRED` when the grant's enrollment receipt names its invitation. | `pairing-e2e.json` `connect` steps, `outcome_after_lost_paired` |
 | Messages after an attempt ends | [`wire.md`](wire.md) 10.7, "No resends": the gate first; an ended attempt gets `CODE_ABORT` with no work; on a running attempt every payload is the next message, so a repeat fails the attempt. | `pairing-attempts.json` `messages_after_the_joiner_aborted`, `different_payload_on_a_running_attempt_is_the_next_message`, `a_repeated_message_fails_the_attempt` |
 | Responder draw order on a bad first message | [`wire.md`](wire.md) 10.6, "Random draws in the vectors"; [`cpace.md`](cpace.md) 5.3: a convention of the vector harness, not a requirement. | `pairing-attempts.json` `bad_first_message_still_uses_the_draws` |
 | Repeated `HELLO` | [`wire.md`](wire.md) 2, "Only the first `HELLO` counts". | `hello.json` `repeated` |
@@ -46,6 +46,8 @@ gaps. Each is now a normative rule with vectors.
 | Which messages attempt logs list | [`wire.md`](wire.md) 8 step 1: logs leave out both `HELLO`s and start at `JOIN_PROOF`; replies to `submit_first`, `redeliver` and `inject` are recorded but not delivered. | `pairing-attempts.json` `description` |
 | First renewal tick with a candidate pending | [`wire.md`](wire.md) 6, "Renewal": the first request is skipped but counts, and the 30 s wait starts at that tick. | `session-lifecycle.json` `candidate_at_first_renewal` |
 | Transport close on a failed flow | [`wire.md`](wire.md) 10.6 rule 9: the joiner sends the step's messages, then `GOAWAY(C)`, unless the connection is already closed; the vectors' `failed` output stands for that `GOAWAY`. | `pairing-e2e.json` `send_link_live_needs_a_pin`, `conventions.outputs`; `pairing-attempts.json` `description` |
+| In-person name and profile label | [`wire.md`](wire.md) 10.3: in person sends `<computer> (<profile>)`, send link `<computer>`; the vectors give both parts. | `pairing-e2e.json` `conventions.joiner`; `pairing-attempts.json` `conventions.joiners` |
+| Proof timeout while learning a lost `PAIRED` | [`wire.md`](wire.md) 10.6 rule 7, "A proof that gets no answer ends the flow": terminal, no automatic reconnect; the pending mark stays, so reopening the ticket asks again. | `pairing-e2e.json` `lost_paired_then_proof_timeout` |
 
 ## Design review of the session certificate and pairing binding
 
@@ -62,3 +64,12 @@ gaps. Each is now a normative rule with vectors.
 | Pairing with itself | [`wire.md`](wire.md) 10.1, 10.3. | `pairing-e2e.json` `own_ticket`; `pairing-attempts.json` `join_proof_from_own_identity` |
 | Resend cache and cross-session replay rule | Removed ([`wire.md`](wire.md) 10.7): debit first stays; a replayed attempt id on another session is a new, debited attempt that cannot succeed. | `pairing-attempts.json` `attempt_replayed_on_another_connection_is_debited` |
 | Setting the wall clock back | [`wire.md`](wire.md) 6: a connection is also capped by monotonic time. | `session-lifecycle.json` `clock_rollback` |
+
+## Final design review before freeze
+
+| Finding | Rule | Vector |
+|---|---|---|
+| Recovery could report a role change that never committed | [`wire.md`](wire.md) 7 (`enrolled_by`), 8 step 3, 10.6 rule 7, 10.8: the grant keeps an enrollment receipt; the host answers a proof for that invitation with `PAIRED` and its role, and any other live answer is "already paired" with no role change. | `pairing-e2e.json` `outcome_after_lost_paired`, `role_change_not_committed`; `authz.json` `proof_answered_with_paired` |
+| Durable writes could trail what they protect | [`wire.md`](wire.md) 10.7: compare-and-swap writes; the debit before `msg_a`, the pending mark before `msg_c`, cleared only once the result and pin are stored. | `pairing-e2e.json` `persist` outputs, `crash_after_pending_mark` |
+| A host's grant read as authority over the caller | [`wire.md`](wire.md) 8 steps 4 and 5, 8.2: grants point one way; the caller authorizes host-opened streams against its own grants. | `authz.json` `host_opened_stream_needs_the_callers_grant` |
+| Discovery, ticket fragment and code entry disclosures | [`privacy.md`](privacy.md) (mDNS fields, fragment readable by page scripts); [`wire.md`](wire.md) 10.6 step 2 (codes typed only in the app or a trusted origin). | none |

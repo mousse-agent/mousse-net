@@ -27,8 +27,9 @@ use crate::pairing::CpaceExchangeFactory;
 use crate::pairing::{
     attempt_sid, binding_transcript, join_proof_input, join_proof_mac, Arrival, AttemptId,
     HostAction, HostPairing, HostPairingError, InvitationId, InvitationKind, InvitationParams,
-    InvitationStatus, JoinerAction, JoinerPairing, JoinerState, PairingCode, Route, RouteHost,
-    SessionExporters, Ticket, TicketSecret, JOIN_PROOF_KEY_INFO, SID_DOMAIN, TICKET_VERSION,
+    InvitationStatus, JoinerAction, JoinerName, JoinerPairing, JoinerState, PairingCode, Route,
+    RouteHost, SessionExporters, Ticket, TicketSecret, JOIN_PROOF_KEY_INFO, SID_DOMAIN,
+    TICKET_VERSION,
 };
 use crate::session_cert::{
     self, build_certificate, PendingCertificate, SessionKey, ValidityWindow,
@@ -451,7 +452,7 @@ fn authz_vectors() -> J {
     let b = hex(identity(&IDENTITY_B).public_key().as_bytes());
     let now = T + 60;
     json!({
-        "description": "Step 2 on the host after step 1 passed (`cases`), and the caller's gate (`caller_cases`). Host cases: `grants` and `denied` set up the table (grants added in order, then denials), the gate opens at wall time `now` and monotonic time 0 ms, then `steps` run in order. Caller cases: the gate starts awaiting AUTHORIZED; `sent_join_proof` means this side queued a JOIN_PROOF; `promote` means the joiner accepted PAIRED; `state` is the gate state after the step. Verdicts: allow, ignore, close:<code>.",
+        "description": "Step 2 on the host after step 1 passed (`cases`), and the caller's gate (`caller_cases`). Host cases: `grants` and `denied` set up the table (grants added in order, then denials), the gate opens at wall time `now` and monotonic time 0 ms, then `steps` run in order. Caller cases: the gate starts awaiting AUTHORIZED; `sent_join_proof` means this side queued a JOIN_PROOF; `promote` means the joiner accepted PAIRED; `host_stream` asks what the host identity `host` may do on a stream it opened, from the caller endpoint's own `local_grants` at `now` (the role of its live grant, or none; wire.md 8.2); `state` is the gate state after the step. Verdicts: allow, ignore, close:<code>.",
         "identities": { "a": a, "b": b },
         "cases": [
             {
@@ -655,6 +656,30 @@ fn authz_vectors() -> J {
                     { "op": "sent_join_proof", "state": "awaiting_authorization" },
                     { "op": "check", "traffic": "authorized_live", "verdict": "allow", "state": "awaiting_proof_answer" },
                     { "op": "check", "traffic": "stream", "verdict": "close:protocol_error", "state": "closed:protocol_error" },
+                ],
+            },
+            {
+                "name": "proof_answered_with_paired",
+                "description": "This side sent a JOIN_PROOF and the host's grant for it was made by that proof's invitation: after step 2's notice the host answers with PAIRED again (its enrollment receipt, wire.md 10.6 rule 7), and the connection is live.",
+                "steps": [
+                    { "op": "sent_join_proof", "state": "awaiting_authorization" },
+                    { "op": "check", "traffic": "authorized_live", "verdict": "allow", "state": "awaiting_proof_answer" },
+                    { "op": "check", "traffic": "paired", "verdict": "allow", "state": "live" },
+                    { "op": "check", "traffic": "stream", "verdict": "allow", "state": "live" },
+                    { "op": "check", "traffic": "paired", "verdict": "close:protocol_error", "state": "closed:protocol_error" },
+                ],
+            },
+            {
+                "name": "host_opened_stream_needs_the_callers_grant",
+                "description": "The host's AUTHORIZED lets the caller use the host, never the reverse. A live caller accepts a stream the host opens, but privileged work on it needs the caller's own grant for the host identity: here b (the host) holds one with role owner in the caller's table, and a holds none. Before the gate is live the answer is none whatever the table says.",
+                "now": now,
+                "local_grants": [{ "identity": "b", "role": "owner", "expires_at": null }],
+                "steps": [
+                    { "op": "host_stream", "host": "b", "result": "none", "state": "awaiting_authorization" },
+                    { "op": "check", "traffic": "authorized_live", "verdict": "allow", "state": "live" },
+                    { "op": "check", "traffic": "stream", "verdict": "allow", "state": "live" },
+                    { "op": "host_stream", "host": "b", "result": "owner", "state": "live" },
+                    { "op": "host_stream", "host": "a", "result": "none", "state": "live" },
                 ],
             },
             {
@@ -1589,7 +1614,7 @@ fn pairing_attempt_vectors() -> J {
             "time": T,
             "host": { "identity_secret": hex(&IDENTITY_A), "name": "Desk" },
             "invitation": { "role": "owner", "authorizing_owner": hex(&[0x51; 16]), "routes": [ROUTE], "grant_expires_at": null },
-            "joiners": "Each joiner's identity secret is one byte repeated 32 times: 0x50 for the first joiner a sequence names, 0x51 for the second, and so on. Its name is its letter.",
+            "joiners": "Each joiner's identity secret is one byte repeated 32 times: 0x50 for the first joiner a sequence names, 0x51 for the second, and so on. Its computer name is its letter and its profile label is `Work`, so its JOIN_PROOF name is `<letter> (Work)` for in person and `<letter>` for send link (wire.md 10.3). Every flow-record write the joiner asks for (wire.md 10.7) lands at once and is not listed.",
             "exporters": "On connection n both ends see the join exporter n repeated 32 times and the pair exporter n + 100 repeated 32 times.",
             "draws": "`draws` lists each party's random values in the order it takes them. A `bytes` draw fills a request of exactly that length; a `u32` draw answers a request for a 32-bit integer. Host: invitation id (16), ticket secret (16), for send link the first code (u32, drawn again while at least 4294000000); then for each new attempt, after the debit and before reading its first message, the next code (u32, only while attempts are left) and the CPace scalar yb (32). Joiner: for each attempt the attempt id (16) and the CPace scalar ya (32).",
         },
@@ -1693,6 +1718,33 @@ impl TryRng for Draws {
 
 impl TryCryptoRng for Draws {}
 
+/// Complete every flow-record write at once (wire.md 10.7) and every pin
+/// store, as a well-behaved app does; returns the other actions in order.
+fn settle(
+    pairing: &mut JoinerPairing<CpaceExchangeFactory>,
+    actions: Vec<JoinerAction>,
+) -> Vec<JoinerAction> {
+    let mut queue: std::collections::VecDeque<JoinerAction> = actions.into();
+    let mut out = Vec::new();
+    while let Some(a) = queue.pop_front() {
+        let more = match &a {
+            JoinerAction::Persist { .. } => pairing.on_persisted(),
+            JoinerAction::Paired(_) | JoinerAction::AlreadyPaired => {
+                out.push(a);
+                pairing.on_pin_stored()
+            }
+            _ => {
+                out.push(a);
+                Vec::new()
+            }
+        };
+        for m in more.into_iter().rev() {
+            queue.push_front(m);
+        }
+    }
+    out
+}
+
 struct ReplayJoiner {
     name: String,
     seed: u8,
@@ -1760,7 +1812,10 @@ impl Replay {
                 self.ticket.clone(),
                 arrival,
                 key,
-                name.into(),
+                JoinerName {
+                    computer: name.into(),
+                    profile: Some("Work".into()),
+                },
                 CpaceExchangeFactory,
                 None,
                 UnixTime(T),
@@ -1906,9 +1961,9 @@ impl Replay {
                     .iter()
                     .any(|a| matches!(a, HostAction::AdmittedJoinOnly { .. }))
                 {
-                    self.joiner(&who)
-                        .pairing
-                        .on_authorized(AuthorizedState::JoinOnly);
+                    let j = self.joiner(&who);
+                    let actions = j.pairing.on_authorized(AuthorizedState::JoinOnly);
+                    settle(&mut j.pairing, actions);
                 }
                 host_log.extend(actions);
             }
@@ -1970,7 +2025,7 @@ impl Replay {
                 self.shown_at_last_submit = shown;
                 let j = self.joiner(&who);
                 let actions = match j.pairing.submit_code(&code, &mut j.rng) {
-                    Ok(a) => a,
+                    Ok(a) => settle(&mut j.pairing, a),
                     Err(e) => {
                         let name = match e {
                             crate::pairing::JoinerError::WrongState => "wrong_state",
@@ -2019,6 +2074,7 @@ impl Replay {
                             }
                             other => panic!("unexpected {other:?}"),
                         };
+                        let actions = settle(&mut j.pairing, actions);
                         to_host.extend(actions.into_iter().filter_map(|a| match a {
                             JoinerAction::Send(m) => Some(m),
                             _ => None,
@@ -2031,7 +2087,9 @@ impl Replay {
                     _ => None,
                 });
                 if code.is_some() {
-                    self.joiner(&who).pairing.on_closed(code);
+                    let j = self.joiner(&who);
+                    let actions = j.pairing.on_closed(code);
+                    settle(&mut j.pairing, actions);
                 }
             }
             "redeliver" => {
@@ -2075,7 +2133,9 @@ impl Replay {
                 let actions = self.host.on_connection_closed(ConnectionId(conn));
                 self.host_did(&actions, conn);
                 host_log.extend(actions);
-                self.joiner(&who).pairing.on_closed(None);
+                let j = self.joiner(&who);
+                let actions = j.pairing.on_closed(None);
+                settle(&mut j.pairing, actions);
             }
             "approve" => {
                 let invitation = self.ticket.invitation;

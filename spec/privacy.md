@@ -21,9 +21,26 @@ phases must add. Each later phase updates this document before it ships.
 - **Pairing tickets** contain the host's identity key, the invitation id, the
   secret, the expiry and route hints (for example a LAN address). Anyone who
   sees the QR or link sees these. The link form keeps the ticket in the URL
-  fragment, which browsers do not send to web servers.
-- **Discovery** on the LAN is described here when it is built; it may reveal
-  that a Mousse host is present on the network.
+  fragment, which browsers do not send to web servers. Scripts on the page
+  that opens the link can still read the fragment, so any page a link
+  lands on learns the whole ticket. That is why a pairing code is typed
+  only in the installed app or a trusted web-client origin, never on a page
+  reached from a link ([`wire.md`](wire.md) 10.6 step 2): without the code,
+  a "Send link" ticket cannot pair.
+- **Discovery** on the LAN uses mDNS (DNS-SD). A running host advertises:
+  - the service type `_mousse._tcp.local.`, which tells everyone on the LAN
+    that a Mousse host is listening;
+  - an instance name `mousse-` followed by 12 random base32 characters, and
+    an mDNS host name `<instance>.local.`;
+  - the TCP port it listens on;
+  - a TXT record with only `v=1`, the protocol version;
+  - address records (A and AAAA) for the host's network interfaces.
+
+  The instance and host names are drawn fresh at every start and every 15
+  minutes. Nothing advertised names the device, its owner or its identity
+  key. An observer on the LAN can still link the advertisements over time
+  by IP and MAC address and by port, and can connect to learn the identity
+  key (below).
 - **Grants and denials** stay on the host. No list of paired devices leaves
   it.
 

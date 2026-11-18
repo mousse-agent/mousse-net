@@ -14,7 +14,7 @@
         "tcp://192.168.1.20:7443"
       ]
     },
-    "joiners": "Each joiner's identity secret is one byte repeated 32 times: 0x50 for the first joiner a sequence names, 0x51 for the second, and so on. Its name is its letter.",
+    "joiners": "Each joiner's identity secret is one byte repeated 32 times: 0x50 for the first joiner a sequence names, 0x51 for the second, and so on. Its computer name is its letter and its profile label is `Work`, so its JOIN_PROOF name is `<letter> (Work)` for in person and `<letter>` for send link (wire.md 10.3). Every flow-record write the joiner asks for (wire.md 10.7) lands at once and is not listed.",
     "time": 1790000000
   },
   "description": "Attempt-limit and repeat sequences for the send-link flow (spec wire.md, \"Send-link flow and the code\" and \"Attempt limits\"), plus one-enrollment for in person. Each step runs one operation and then the listed expectations hold. Ops: connect (the connection starts; after the two HELLO messages the joiner sends its join proof on conn and the host's AUTHORIZED, if any, reaches the joiner), submit (the joiner enters a code; messages flow until both sides stop), submit_first (only the joiner's first message reaches the host; the host's reply is recorded in `out` but not delivered to the joiner), redeliver (the joiner's last first message reaches the host again on conn, as a repeat or a replay; the reply is recorded, not delivered), connect_as_host (like connect, but the join proof is made with the host's own identity key), inject (the joiner's side sends `message` for `attempt`, \"current\" meaning the attempt of its last submit, with `payload`; the reply is recorded, not delivered), drop (conn closes), approve (host owner taps for conn). Codes: right (the code the host shows now), wrong (000000, or 000001 if 000000 is shown), stale (the code the host showed when the previous attempt started). `reply`: code_exchange (the host's only answer is one CODE_EXCHANGE for that attempt), code_abort (the host's only answer is CODE_ABORT pairing_failed for that attempt), none (no answer). `new_code` says whether the host showed a fresh code during the step. `closed` lists connections the host closed during the step. When `joiner_state` becomes failed with a code, the joiner also closes the connection with GOAWAY of that code after its listed messages, unless the host had already closed it (wire.md 10.6 rule 9); that close is not listed. `out` lists, in order, every control message each side sent during the step (`send`), host closes (`close`) and codes the host showed (`show_code`), except the HELLO each side sends first on every connection (wire.md, \"Connection start and step 2\"): a replay over real connections exchanges both HELLOs, checks the agreed version and starts comparing at JOIN_PROOF. Each side's sends keep their own order; on connect the two sides send independently, and `out` lists the joiner's before the host's.",
@@ -1794,7 +1794,7 @@
             {
               "send": {
                 "conn": 1,
-                "control": "a400030150f400927857aaf64114f561baacb37970025820e0bb1c0bfede8c1880760e9cb272e5f5562f10f697a5e9626c1ac786520437a1036161",
+                "control": "a400030150f400927857aaf64114f561baacb37970025820e0bb1c0bfede8c1880760e9cb272e5f5562f10f697a5e9626c1ac786520437a10368612028576f726b29",
                 "from": "a"
               }
             },
@@ -1816,7 +1816,7 @@
             {
               "send": {
                 "conn": 2,
-                "control": "a400030150f400927857aaf64114f561baacb3797002582014b2be3c080a051af2b1a3153a97ebfa9411b8d66756b65083e13e8de76c3848036162",
+                "control": "a400030150f400927857aaf64114f561baacb3797002582014b2be3c080a051af2b1a3153a97ebfa9411b8d66756b65083e13e8de76c38480368622028576f726b29",
                 "from": "b"
               }
             },

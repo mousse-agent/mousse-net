@@ -16,6 +16,82 @@ fn key(seed: u8) -> IdentityPublicKey {
     SoftwareKey::generate(&mut ChaCha20Rng::from_seed([seed; 32])).public_key()
 }
 
+fn name(computer: &str) -> JoinerName {
+    JoinerName {
+        computer: computer.into(),
+        profile: None,
+    }
+}
+
+/// A well-behaved app: every write the flow asks for lands at once, and
+/// every reported pin is stored at once. The writes themselves are left out
+/// of what it returns.
+trait Settle {
+    fn settle(&mut self, actions: Vec<JoinerAction>) -> Vec<JoinerAction>;
+    fn submit<R: CryptoRng + ?Sized>(
+        &mut self,
+        code: &PairingCode,
+        rng: &mut R,
+    ) -> Result<Vec<JoinerAction>, JoinerError>;
+    fn exchange_in(&mut self, attempt: AttemptId, payload: &[u8]) -> Vec<JoinerAction>;
+    fn authorized(&mut self, state: AuthorizedState) -> Vec<JoinerAction>;
+    fn closed(&mut self, code: Option<ErrorCode>) -> Vec<JoinerAction>;
+    fn abort(&mut self, attempt: AttemptId) -> Vec<JoinerAction>;
+    fn paired(&mut self, host_name: String, role: Role) -> Vec<JoinerAction>;
+}
+
+impl<F: CodeExchangeFactory> Settle for JoinerPairing<F> {
+    fn settle(&mut self, actions: Vec<JoinerAction>) -> Vec<JoinerAction> {
+        let mut queue: std::collections::VecDeque<JoinerAction> = actions.into();
+        let mut out = Vec::new();
+        while let Some(a) = queue.pop_front() {
+            let more = match &a {
+                JoinerAction::Persist { .. } => self.on_persisted(),
+                JoinerAction::Paired(_) | JoinerAction::AlreadyPaired => {
+                    out.push(a);
+                    self.on_pin_stored()
+                }
+                _ => {
+                    out.push(a);
+                    Vec::new()
+                }
+            };
+            for m in more.into_iter().rev() {
+                queue.push_front(m);
+            }
+        }
+        out
+    }
+    fn submit<R: CryptoRng + ?Sized>(
+        &mut self,
+        code: &PairingCode,
+        rng: &mut R,
+    ) -> Result<Vec<JoinerAction>, JoinerError> {
+        let a = self.submit_code(code, rng)?;
+        Ok(self.settle(a))
+    }
+    fn exchange_in(&mut self, attempt: AttemptId, payload: &[u8]) -> Vec<JoinerAction> {
+        let a = self.on_code_exchange(attempt, payload);
+        self.settle(a)
+    }
+    fn authorized(&mut self, state: AuthorizedState) -> Vec<JoinerAction> {
+        let a = self.on_authorized(state);
+        self.settle(a)
+    }
+    fn closed(&mut self, code: Option<ErrorCode>) -> Vec<JoinerAction> {
+        let a = self.on_closed(code);
+        self.settle(a)
+    }
+    fn abort(&mut self, attempt: AttemptId) -> Vec<JoinerAction> {
+        let a = self.on_code_abort(attempt);
+        self.settle(a)
+    }
+    fn paired(&mut self, host_name: String, role: Role) -> Vec<JoinerAction> {
+        let a = self.on_paired(host_name, role);
+        self.settle(a)
+    }
+}
+
 fn exporters(seed: u8) -> SessionExporters {
     SessionExporters {
         join: [seed; 32],
@@ -66,7 +142,7 @@ impl<F: CodeExchangeFactory + Clone> World<F> {
             ticket.clone(),
             arrival_for(ticket),
             key(seed),
-            format!("phone {seed}"),
+            name(&format!("phone {seed}")),
             self.factory.clone(),
             None,
             NOW,
@@ -107,7 +183,7 @@ impl<F: CodeExchangeFactory + Clone> World<F> {
                 state: AuthorizedState::JoinOnly,
             },
         }) {
-            assert!(joiner.on_authorized(AuthorizedState::JoinOnly).is_empty());
+            assert!(joiner.authorized(AuthorizedState::JoinOnly).is_empty());
         }
         actions
     }
@@ -157,10 +233,10 @@ impl<F: CodeExchangeFactory + Clone> World<F> {
             for m in to_joiner {
                 let actions = match m {
                     ControlMessage::CodeExchange { attempt, payload } => {
-                        joiner.on_code_exchange(attempt, &payload)
+                        joiner.exchange_in(attempt, &payload)
                     }
-                    ControlMessage::CodeAbort { attempt, .. } => joiner.on_code_abort(attempt),
-                    ControlMessage::Paired { host_name, role } => joiner.on_paired(host_name, role),
+                    ControlMessage::CodeAbort { attempt, .. } => joiner.abort(attempt),
+                    ControlMessage::Paired { host_name, role } => joiner.paired(host_name, role),
                     other => panic!("unexpected {other:?}"),
                 };
                 for a in actions {
@@ -198,7 +274,7 @@ fn new_joiner(
         ticket,
         arrival,
         key(seed),
-        "phone".into(),
+        name("phone"),
         CpaceExchangeFactory,
         stored,
         NOW,
@@ -252,7 +328,7 @@ fn in_person_pairing_needs_a_proof_and_one_tap() {
         Some(InvitationStatus::Consumed { grant })
     );
 
-    let paired = j.on_paired("Desk".into(), Role::owner());
+    let paired = j.paired("Desk".into(), Role::owner());
     assert!(matches!(&paired[..], [JoinerAction::Paired(p)] if p.identity == key(1)));
     // The invitation is spent: approving again is refused.
     assert_eq!(
@@ -410,7 +486,7 @@ fn send_link_pairs_after_both_confirmations() {
         .unwrap();
     assert_eq!(j.state(), JoinerState::AwaitingCode);
     let first = j
-        .submit_code(&code, &mut ChaCha20Rng::from_seed([5; 32]))
+        .submit(&code, &mut ChaCha20Rng::from_seed([5; 32]))
         .unwrap();
     let (host_log, joiner_log) = w.exchange(&mut j, 10, first);
     assert!(host_log
@@ -431,7 +507,7 @@ fn three_wrong_codes_end_the_invitation_on_both_sides() {
     assert_ne!(w.host.code(&ticket.invitation), Some(&wrong));
     let mut rng = ChaCha20Rng::from_seed([5; 32]);
     for left in [2u8, 1] {
-        let first = j.submit_code(&wrong, &mut rng).unwrap();
+        let first = j.submit(&wrong, &mut rng).unwrap();
         let (_, joiner_log) = w.exchange(&mut j, 10, first);
         assert_eq!(
             joiner_log,
@@ -445,7 +521,7 @@ fn three_wrong_codes_end_the_invitation_on_both_sides() {
             Some(InvitationStatus::Open)
         );
     }
-    let first = j.submit_code(&wrong, &mut rng).unwrap();
+    let first = j.submit(&wrong, &mut rng).unwrap();
     let (host_log, joiner_log) = w.exchange(&mut j, 10, first);
     assert_eq!(
         joiner_log,
@@ -459,10 +535,7 @@ fn three_wrong_codes_end_the_invitation_on_both_sides() {
         w.host.status(&ticket.invitation),
         Some(InvitationStatus::Ended(ErrorCode::AttemptsExhausted))
     );
-    assert_eq!(
-        j.submit_code(&wrong, &mut rng),
-        Err(JoinerError::WrongState)
-    );
+    assert_eq!(j.submit(&wrong, &mut rng), Err(JoinerError::WrongState));
 }
 
 impl World<CpaceExchangeFactory> {
@@ -475,7 +548,7 @@ impl World<CpaceExchangeFactory> {
         code: &PairingCode,
         rng: &mut ChaCha20Rng,
     ) -> (AttemptId, Vec<u8>) {
-        let first = j.submit_code(code, rng).unwrap();
+        let first = j.submit(code, rng).unwrap();
         let [JoinerAction::Send(ControlMessage::CodeExchange { attempt, payload })] = &first[..]
         else {
             panic!("no msg_a")
@@ -498,7 +571,7 @@ impl World<CpaceExchangeFactory> {
                 _ => None,
             })
             .expect("msg_b");
-        let out = j.on_code_exchange(*attempt, &msg_b);
+        let out = j.exchange_in(*attempt, &msg_b);
         let [JoinerAction::Send(ControlMessage::CodeExchange { payload: msg_c, .. })] = &out[..]
         else {
             panic!("no msg_c")
@@ -510,7 +583,9 @@ impl World<CpaceExchangeFactory> {
 
 /// The third attempt succeeds and the host enrolls the joiner, but `PAIRED`
 /// is lost with the connection. The joiner has no attempts left, yet it
-/// reconnects, even after its ticket ran out, and step 2 says live: paired.
+/// reconnects, even after its ticket ran out. Step 2 says live, and the
+/// grant's enrollment receipt names this invitation, so the host answers
+/// the proof with `PAIRED` again: paired, with the invitation's role.
 #[test]
 fn a_lost_paired_on_the_last_attempt_is_learned_on_reconnect() {
     let mut w = world();
@@ -520,7 +595,7 @@ fn a_lost_paired_on_the_last_attempt_is_learned_on_reconnect() {
     let mut rng = ChaCha20Rng::from_seed([5; 32]);
     let wrong = PairingCode::parse("000000").unwrap();
     for _ in 0..2 {
-        let first = j.submit_code(&wrong, &mut rng).unwrap();
+        let first = j.submit(&wrong, &mut rng).unwrap();
         w.exchange(&mut j, 10, first);
     }
     let right = w.host.code(&ticket.invitation).unwrap().clone();
@@ -538,24 +613,55 @@ fn a_lost_paired_on_the_last_attempt_is_learned_on_reconnect() {
         .any(|a| matches!(a, HostAction::Enrolled { .. })));
     // PAIRED never arrives.
     w.host.on_connection_closed(ConnectionId(10));
-    assert_eq!(j.on_closed(None), vec![]);
+    assert_eq!(j.closed(None), vec![]);
     assert_eq!(j.attempts_left(), 0);
     assert!(j.outcome_pending());
     assert_eq!(j.state(), JoinerState::Connecting);
 
     let later = NOW.plus(1_300);
-    assert!(j.on_connected(exporters(11), later).is_ok());
-    assert!(matches!(
-        crate::authz::decide(&w.grants, &key(2), later),
-        crate::authz::Step2::Live { .. }
-    ));
-    // Step 2's notice, then the answer to the proof.
-    assert_eq!(j.on_authorized(AuthorizedState::Live), vec![]);
-    assert_eq!(
-        j.on_authorized(AuthorizedState::Live),
-        vec![JoinerAction::AlreadyPaired]
+    let ControlMessage::JoinProof { mac, name, .. } = j.on_connected(exporters(11), later).unwrap()
+    else {
+        panic!("not a proof")
+    };
+    let mut grants = w.grants.clone();
+    let mut gate = crate::authz::ConnectionGate::open(
+        ConnectionId(11),
+        key(2),
+        &mut grants,
+        later,
+        crate::time::Millis(0),
     );
-    assert_eq!(j.state(), JoinerState::AlreadyPaired);
+    assert!(gate.check(crate::authz::Traffic::JoinProof) == crate::authz::Verdict::Allow);
+    // Step 2's notice, then the answer to the proof.
+    assert_eq!(j.authorized(AuthorizedState::Live), vec![]);
+    let answer = w.host.on_join_proof(
+        ConnectionId(11),
+        &key(2),
+        &exporters(11),
+        &ticket.invitation,
+        &mac,
+        &name,
+        &grants,
+        later,
+    );
+    let [HostAction::Send {
+        message: ControlMessage::Paired { host_name, role },
+        ..
+    }] = &answer[..]
+    else {
+        panic!("expected PAIRED as the answer, got {answer:?}")
+    };
+    let out = j.on_paired(host_name.clone(), role.clone());
+    assert!(matches!(&out[..], [JoinerAction::Paired(p)] if p.role == Role::owner()));
+    assert_eq!(j.state(), JoinerState::Paired);
+    // The pending mark goes only once the pin is stored.
+    assert!(j.outcome_pending());
+    let clear = j.on_pin_stored();
+    assert!(matches!(
+        &clear[..],
+        [JoinerAction::Persist { record, .. }] if !record.outcome_pending
+    ));
+    j.on_persisted();
     assert!(!j.outcome_pending());
 }
 
@@ -572,15 +678,15 @@ fn a_lost_confirmation_on_the_last_attempt_ends_after_reconnect() {
     // Two attempts are lost before they reach the host.
     for round in 0..2u8 {
         j.on_connected(exporters(20 + round), NOW).unwrap();
-        j.on_authorized(AuthorizedState::JoinOnly);
-        j.submit_code(&any, &mut rng).unwrap();
-        j.on_closed(None);
+        j.authorized(AuthorizedState::JoinOnly);
+        j.submit(&any, &mut rng).unwrap();
+        j.closed(None);
     }
     w.connect(&mut j, 10, 2);
     let right = w.host.code(&ticket.invitation).unwrap().clone();
     w.attempt_until_confirmation(&mut j, 10, &right, &mut rng);
     w.host.on_connection_closed(ConnectionId(10));
-    j.on_closed(None);
+    j.closed(None);
     assert!(j.outcome_pending());
     assert_eq!(w.host.attempts_left(&ticket.invitation), Some(2));
 
@@ -603,7 +709,7 @@ fn a_lost_confirmation_on_the_last_attempt_ends_after_reconnect() {
         invitation: ticket.invitation
     }));
     assert_eq!(
-        j.on_authorized(AuthorizedState::JoinOnly),
+        j.authorized(AuthorizedState::JoinOnly),
         vec![JoinerAction::Failed(ErrorCode::AttemptsExhausted)]
     );
     assert!(w.grants.live_grant(&key(2), NOW).is_none());
@@ -621,14 +727,14 @@ fn each_attempt_uses_a_fresh_code() {
     // A wrong guess: the attempt fails and a new code is shown.
     let wrong = PairingCode::parse("000000").unwrap();
     assert_ne!(wrong, first_code);
-    let first = j.submit_code(&wrong, &mut rng).unwrap();
+    let first = j.submit(&wrong, &mut rng).unwrap();
     let (host_log, _) = w.exchange(&mut j, 10, first);
     let second_code = shown_codes(&host_log).remove(0);
     assert_ne!(second_code, first_code);
     assert_eq!(w.host.code(&ticket.invitation), Some(&second_code));
 
     // The code shown before is no longer accepted.
-    let first = j.submit_code(&first_code, &mut rng).unwrap();
+    let first = j.submit(&first_code, &mut rng).unwrap();
     let (host_log, joiner_log) = w.exchange(&mut j, 10, first);
     assert_eq!(
         joiner_log,
@@ -637,7 +743,7 @@ fn each_attempt_uses_a_fresh_code() {
     let third_code = shown_codes(&host_log).remove(0);
 
     // The last attempt shows no further code, and the current one works.
-    let first = j.submit_code(&third_code, &mut rng).unwrap();
+    let first = j.submit(&third_code, &mut rng).unwrap();
     let (host_log, joiner_log) = w.exchange(&mut j, 10, first);
     assert!(shown_codes(&host_log).is_empty());
     assert_eq!(w.host.code(&ticket.invitation), None);
@@ -654,7 +760,7 @@ fn attempts_are_counted_across_routes_on_the_host() {
     for (i, conn) in [10u64, 11, 12].into_iter().enumerate() {
         let mut j = w.joiner(&ticket, 2);
         w.connect(&mut j, conn, 2);
-        let first = j.submit_code(&wrong, &mut rng).unwrap();
+        let first = j.submit(&wrong, &mut rng).unwrap();
         w.exchange(&mut j, conn, first);
         assert_eq!(w.host.attempts_left(&ticket.invitation), Some(2 - i as u8));
     }
@@ -685,7 +791,7 @@ fn a_repeated_message_fails_the_attempt_and_is_not_a_new_debit() {
     w.connect(&mut j, 10, 2);
     let code = w.host.code(&ticket.invitation).unwrap().clone();
     let first = j
-        .submit_code(&code, &mut ChaCha20Rng::from_seed([5; 32]))
+        .submit(&code, &mut ChaCha20Rng::from_seed([5; 32]))
         .unwrap();
     let [JoinerAction::Send(ControlMessage::CodeExchange { attempt, payload })] = &first[..] else {
         panic!()
@@ -728,14 +834,14 @@ fn a_repeated_host_message_fails_the_joiners_attempt() {
     w.connect(&mut j, 10, 2);
     let code = PairingCode::parse("000000").unwrap();
     let first = j
-        .submit_code(&code, &mut ChaCha20Rng::from_seed([5; 32]))
+        .submit(&code, &mut ChaCha20Rng::from_seed([5; 32]))
         .unwrap();
     let [JoinerAction::Send(ControlMessage::CodeExchange { attempt, .. })] = &first[..] else {
         panic!()
     };
     // Some message the joiner did not expect at this step, twice.
     let junk = vec![0u8; 8];
-    let actions = j.on_code_exchange(*attempt, &junk);
+    let actions = j.exchange_in(*attempt, &junk);
     assert!(
         actions.contains(&JoinerAction::Send(ControlMessage::CodeAbort {
             attempt: *attempt,
@@ -743,7 +849,7 @@ fn a_repeated_host_message_fails_the_joiners_attempt() {
         }))
     );
     assert_eq!(j.state(), JoinerState::AwaitingCode);
-    assert_eq!(j.on_code_exchange(*attempt, &junk), vec![]);
+    assert_eq!(j.exchange_in(*attempt, &junk), vec![]);
     assert_eq!(j.attempts_left(), 2);
 }
 
@@ -756,7 +862,7 @@ fn an_in_person_ticket_is_believed_only_from_the_in_app_scanner() {
         ticket.clone(),
         Arrival::Link,
         key(2),
-        "phone".into(),
+        name("phone"),
         CpaceExchangeFactory,
         None,
         NOW,
@@ -774,7 +880,7 @@ fn an_in_person_ticket_is_believed_only_from_the_in_app_scanner() {
             link.clone(),
             arrival,
             key(2),
-            "phone".into(),
+            name("phone"),
             CpaceExchangeFactory,
             None,
             NOW,
@@ -829,10 +935,10 @@ fn the_joiner_record_keeps_attempts_and_a_pending_outcome() {
     let ticket = w.invite_ticket_only(InvitationKind::SendLink);
     let mut j = new_joiner(ticket.clone(), 2, None).unwrap();
     j.on_connected(exporters(1), NOW).unwrap();
-    j.on_authorized(AuthorizedState::JoinOnly);
+    j.authorized(AuthorizedState::JoinOnly);
     let code = PairingCode::parse("111111").unwrap();
     let mut rng = ChaCha20Rng::from_seed([5; 32]);
-    j.submit_code(&code, &mut rng).unwrap();
+    j.submit(&code, &mut rng).unwrap();
     let record = j.record();
     assert_eq!(record.attempts_left, 2);
     let bytes = record.to_bytes();
@@ -860,7 +966,7 @@ fn the_joiner_record_keeps_attempts_and_a_pending_outcome() {
         ticket.clone(),
         Arrival::Link,
         key(2),
-        "phone".into(),
+        name("phone"),
         CpaceExchangeFactory,
         Some(&pending),
         ticket.expires_at.plus(60),
@@ -905,6 +1011,7 @@ fn a_granted_device_can_pair_again_by_link() {
                 role: Role::owner(),
                 authorizing_owner: OwnerRef::from_bytes([0x51; 16]),
                 expires_at: None,
+                enrolled_by: None,
             },
             NOW,
         )
@@ -920,7 +1027,7 @@ fn a_granted_device_can_pair_again_by_link() {
     // Step 2's notice reaches the joiner: it waits for the answer.
     let exp = exporters(10);
     let proof = j.on_connected(exp, NOW).unwrap();
-    assert_eq!(j.on_authorized(AuthorizedState::Live), vec![]);
+    assert_eq!(j.authorized(AuthorizedState::Live), vec![]);
     // The host reads the proof on the live connection and answers it.
     assert_eq!(gate.check(Traffic::JoinProof), Verdict::Allow);
     let ControlMessage::JoinProof {
@@ -966,11 +1073,11 @@ fn a_granted_device_can_pair_again_by_link() {
     );
     gate.admit_join_only(invitation);
 
-    assert_eq!(j.on_authorized(AuthorizedState::JoinOnly), vec![]);
+    assert_eq!(j.authorized(AuthorizedState::JoinOnly), vec![]);
     assert_eq!(j.state(), JoinerState::AwaitingCode);
     let code = w.host.code(&ticket.invitation).unwrap().clone();
     let first = j
-        .submit_code(&code, &mut ChaCha20Rng::from_seed([5; 32]))
+        .submit(&code, &mut ChaCha20Rng::from_seed([5; 32]))
         .unwrap();
     let (host_log, joiner_log) = w.exchange(&mut j, 10, first);
     assert!(matches!(&joiner_log[..], [JoinerAction::Paired(_)]));
@@ -999,6 +1106,7 @@ fn a_proof_on_a_live_connection_that_opens_nothing_is_answered_live() {
                 role: Role::owner(),
                 authorizing_owner: OwnerRef::from_bytes([0x51; 16]),
                 expires_at: None,
+                enrolled_by: None,
             },
             NOW,
         )
@@ -1033,10 +1141,10 @@ fn a_send_link_never_asks_for_approval() {
     let mut j = w.joiner(&ticket, 2);
     w.connect(&mut j, 10, 2);
     for _ in 0..2 {
-        let first = j.submit_code(&wrong, &mut rng).unwrap();
+        let first = j.submit(&wrong, &mut rng).unwrap();
         w.exchange(&mut j, 10, first);
     }
-    let first = j.submit_code(&wrong, &mut rng).unwrap();
+    let first = j.submit(&wrong, &mut rng).unwrap();
     let [JoinerAction::Send(ControlMessage::CodeExchange { attempt, payload })] = &first[..] else {
         panic!()
     };
@@ -1093,7 +1201,7 @@ fn both_sides_debit_before_exchange_work_even_when_it_fails_at_once() {
     w.connect(&mut j, 10, 2);
     let code = PairingCode::parse("123456").unwrap();
     let mut rng = ChaCha20Rng::from_seed([5; 32]);
-    let actions = j.submit_code(&code, &mut rng).unwrap();
+    let actions = j.submit(&code, &mut rng).unwrap();
     assert_eq!(j.attempts_left(), 2);
     assert!(actions.contains(&JoinerAction::CodeRejected { attempts_left: 2 }));
     // Host side: the first message of a new attempt debits, then fails.
@@ -1116,7 +1224,7 @@ fn an_abandoned_attempt_keeps_its_debit() {
     w.connect(&mut j, 10, 2);
     let code = w.host.code(&ticket.invitation).unwrap().clone();
     let first = j
-        .submit_code(&code, &mut ChaCha20Rng::from_seed([5; 32]))
+        .submit(&code, &mut ChaCha20Rng::from_seed([5; 32]))
         .unwrap();
     let [JoinerAction::Send(ControlMessage::CodeExchange { attempt, payload })] = &first[..] else {
         panic!()
@@ -1131,7 +1239,7 @@ fn an_abandoned_attempt_keeps_its_debit() {
     );
     // The link drops mid-attempt.
     w.host.on_connection_closed(ConnectionId(10));
-    j.on_closed(None);
+    j.closed(None);
     assert_eq!(w.host.attempts_left(&ticket.invitation), Some(2));
     assert_eq!(j.attempts_left(), 2);
     assert_eq!(j.state(), JoinerState::Connecting);
@@ -1146,14 +1254,14 @@ fn a_fake_host_can_use_up_the_joiners_attempts_but_no_more() {
     let code = PairingCode::parse("111111").unwrap();
     for round in 0..3u8 {
         j.on_connected(exporters(round), NOW).unwrap();
-        j.on_authorized(AuthorizedState::JoinOnly);
-        let first = j.submit_code(&code, &mut rng).unwrap();
+        j.authorized(AuthorizedState::JoinOnly);
+        let first = j.submit(&code, &mut rng).unwrap();
         let [JoinerAction::Send(ControlMessage::CodeExchange { attempt, .. })] = &first[..] else {
             panic!()
         };
-        j.on_code_abort(*attempt);
+        j.abort(*attempt);
         if round < 2 {
-            j.on_closed(None);
+            j.closed(None);
         }
     }
     assert_eq!(j.state(), JoinerState::Failed(ErrorCode::AttemptsExhausted));
@@ -1170,7 +1278,7 @@ fn send_link_joiner_refuses_paired_without_host_confirmation() {
     let mut j = w.joiner(&ticket, 2);
     w.connect(&mut j, 10, 2);
     assert_eq!(
-        j.on_paired("Desk".into(), Role::owner()),
+        j.paired("Desk".into(), Role::owner()),
         vec![JoinerAction::Failed(ErrorCode::ProtocolError)]
     );
 }
@@ -1186,9 +1294,9 @@ fn send_link_already_paired_needs_an_earlier_pin() {
     // Each joiner gets step 2's notice first, then the answer.
     let mut fresh = w.joiner(&ticket, 2);
     fresh.on_connected(exporters(10), NOW).unwrap();
-    assert_eq!(fresh.on_authorized(AuthorizedState::Live), vec![]);
+    assert_eq!(fresh.authorized(AuthorizedState::Live), vec![]);
     assert_eq!(
-        fresh.on_authorized(AuthorizedState::Live),
+        fresh.authorized(AuthorizedState::Live),
         vec![JoinerAction::Failed(ErrorCode::PairingFailed)]
     );
     assert_eq!(fresh.state(), JoinerState::Failed(ErrorCode::PairingFailed));
@@ -1196,9 +1304,9 @@ fn send_link_already_paired_needs_an_earlier_pin() {
     let mut known = w.joiner(&ticket, 2);
     known.set_host_pinned(true);
     known.on_connected(exporters(11), NOW).unwrap();
-    assert_eq!(known.on_authorized(AuthorizedState::Live), vec![]);
+    assert_eq!(known.authorized(AuthorizedState::Live), vec![]);
     assert_eq!(
-        known.on_authorized(AuthorizedState::Live),
+        known.authorized(AuthorizedState::Live),
         vec![JoinerAction::AlreadyPaired]
     );
 
@@ -1207,9 +1315,9 @@ fn send_link_already_paired_needs_an_earlier_pin() {
     let in_person = w.invite(InvitationKind::InPerson);
     let mut j = w.joiner(&in_person, 2);
     j.on_connected(exporters(12), NOW).unwrap();
-    assert_eq!(j.on_authorized(AuthorizedState::Live), vec![]);
+    assert_eq!(j.authorized(AuthorizedState::Live), vec![]);
     assert_eq!(
-        j.on_authorized(AuthorizedState::Live),
+        j.authorized(AuthorizedState::Live),
         vec![JoinerAction::AlreadyPaired]
     );
 }
@@ -1272,4 +1380,183 @@ fn cancelling_grants_nothing() {
             .approve(&ticket.invitation, ConnectionId(10), &mut w.grants, NOW),
         Err(HostPairingError::NotOpen)
     );
+}
+
+/// The debit is a durable write before the first share goes out: the flow
+/// hands out `msg_a` only once the I/O layer says the write landed.
+#[test]
+fn the_debit_is_stored_before_the_first_share_goes_out() {
+    let mut w = world();
+    let ticket = w.invite(InvitationKind::SendLink);
+    let mut j = w.joiner(&ticket, 2);
+    w.connect(&mut j, 10, 2);
+    let code = w.host.code(&ticket.invitation).unwrap().clone();
+    let mut rng = ChaCha20Rng::from_seed([5; 32]);
+    let out = j.submit_code(&code, &mut rng).unwrap();
+    let [JoinerAction::Persist { expected, record }] = &out[..] else {
+        panic!("expected only the debit write, got {out:?}")
+    };
+    assert_eq!(*expected, None);
+    assert_eq!(record.attempts_left, JOINER_ATTEMPTS_PER_FLOW - 1);
+    assert!(!record.outcome_pending);
+    let released = j.on_persisted();
+    assert!(matches!(
+        &released[..],
+        [JoinerAction::Send(ControlMessage::CodeExchange { .. })]
+    ));
+    // Nothing is held twice.
+    assert_eq!(j.on_persisted(), vec![]);
+}
+
+/// After the host's confirmation verifies, the outcome is marked pending
+/// durably before the joiner's own confirmation goes out.
+#[test]
+fn the_pending_mark_is_stored_before_the_confirmation_goes_out() {
+    let mut w = world();
+    let ticket = w.invite(InvitationKind::SendLink);
+    let mut j = w.joiner(&ticket, 2);
+    w.connect(&mut j, 10, 2);
+    let code = w.host.code(&ticket.invitation).unwrap().clone();
+    let mut rng = ChaCha20Rng::from_seed([5; 32]);
+    let first = j.submit(&code, &mut rng).unwrap();
+    let [JoinerAction::Send(ControlMessage::CodeExchange { attempt, payload })] = &first[..] else {
+        panic!("no msg_a")
+    };
+    let reply = w.host.on_code_exchange(
+        ConnectionId(10),
+        *attempt,
+        payload,
+        &mut w.grants,
+        NOW,
+        &mut w.rng,
+    );
+    let msg_b = reply
+        .iter()
+        .find_map(|a| match a {
+            HostAction::Send {
+                message: ControlMessage::CodeExchange { payload, .. },
+                ..
+            } => Some(payload.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let out = j.on_code_exchange(*attempt, &msg_b);
+    let [JoinerAction::Persist { expected, record }] = &out[..] else {
+        panic!("expected only the pending mark, got {out:?}")
+    };
+    assert_eq!(expected.map(|r| r.outcome_pending), Some(false));
+    assert!(record.outcome_pending);
+    assert!(j.outcome_pending());
+    let released = j.on_persisted();
+    assert!(matches!(
+        &released[..],
+        [JoinerAction::Send(ControlMessage::CodeExchange { .. })]
+    ));
+}
+
+/// A write that does not land (another flow on the same ticket changed the
+/// record, or storage failed) releases nothing and ends the flow.
+#[test]
+fn a_write_that_fails_sends_nothing() {
+    let mut w = world();
+    let ticket = w.invite(InvitationKind::SendLink);
+    let mut j = w.joiner(&ticket, 2);
+    w.connect(&mut j, 10, 2);
+    let code = w.host.code(&ticket.invitation).unwrap().clone();
+    let out = j
+        .submit_code(&code, &mut ChaCha20Rng::from_seed([5; 32]))
+        .unwrap();
+    assert!(matches!(&out[..], [JoinerAction::Persist { .. }]));
+    assert_eq!(
+        j.on_persist_failed(),
+        vec![JoinerAction::Failed(ErrorCode::InternalError)]
+    );
+    assert_eq!(j.on_persisted(), vec![]);
+    assert_eq!(j.state(), JoinerState::Failed(ErrorCode::InternalError));
+}
+
+/// A held message never goes out on a later connection.
+#[test]
+fn a_close_drops_what_a_write_was_holding() {
+    let mut w = world();
+    let ticket = w.invite(InvitationKind::SendLink);
+    let mut j = w.joiner(&ticket, 2);
+    w.connect(&mut j, 10, 2);
+    let code = w.host.code(&ticket.invitation).unwrap().clone();
+    j.submit_code(&code, &mut ChaCha20Rng::from_seed([5; 32]))
+        .unwrap();
+    j.on_closed(None);
+    assert_eq!(j.on_persisted(), vec![]);
+    assert_eq!(j.record().attempts_left, JOINER_ATTEMPTS_PER_FLOW - 1);
+}
+
+/// The proof names the profile only for an in-person ticket.
+#[test]
+fn the_proof_name_carries_the_profile_only_in_person() {
+    let w = world();
+    let full = JoinerName {
+        computer: "Phone".into(),
+        profile: Some("Work".into()),
+    };
+    for (kind, expected) in [
+        (InvitationKind::InPerson, "Phone (Work)"),
+        (InvitationKind::SendLink, "Phone"),
+    ] {
+        let ticket = w.invite_ticket_only(kind);
+        let mut j = JoinerPairing::new(
+            ticket.clone(),
+            arrival_for(&ticket),
+            key(2),
+            full.clone(),
+            CpaceExchangeFactory,
+            None,
+            NOW,
+        )
+        .unwrap();
+        let ControlMessage::JoinProof { name, .. } = j.on_connected(exporters(3), NOW).unwrap()
+        else {
+            panic!("not a proof")
+        };
+        assert_eq!(name, expected);
+    }
+    // The composed name must fit in 128 bytes.
+    let ticket = w.invite_ticket_only(InvitationKind::InPerson);
+    let long = JoinerName {
+        computer: "c".repeat(120),
+        profile: Some("profile".into()),
+    };
+    assert_eq!(
+        JoinerPairing::new(
+            ticket,
+            Arrival::InAppScan,
+            key(2),
+            long,
+            CpaceExchangeFactory,
+            None,
+            NOW,
+        )
+        .err(),
+        Some(JoinerError::InvalidName)
+    );
+}
+
+/// A proof timeout ends the flow but keeps a pending outcome stored, so a
+/// later start asks again.
+#[test]
+fn a_proof_timeout_ends_the_flow_and_keeps_the_pending_mark() {
+    let w = world();
+    let ticket = w.invite_ticket_only(InvitationKind::SendLink);
+    let stored = JoinerRecord {
+        ticket_hash: ticket.hash(),
+        attempts_left: 0,
+        outcome_pending: true,
+    };
+    let mut j = new_joiner(ticket.clone(), 2, Some(&stored)).unwrap();
+    j.on_connected(exporters(3), NOW).unwrap();
+    assert_eq!(
+        j.on_proof_timeout(),
+        vec![JoinerAction::Failed(ErrorCode::NotAuthorized)]
+    );
+    assert_eq!(j.record(), stored);
+    assert!(new_joiner(ticket, 2, Some(&j.record())).is_ok());
 }

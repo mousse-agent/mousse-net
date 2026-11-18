@@ -19,7 +19,15 @@
 //! host on streams until the host has said `AUTHORIZED {live}` (or `PAIRED`
 //! has made a join-only connection live). A caller that sent a `JOIN_PROOF`
 //! takes a first `AUTHORIZED {live}` as step 2's notice and waits for the
-//! host's answer to the proof, which is the next `AUTHORIZED`.
+//! host's answer to the proof: the next `AUTHORIZED`, or `PAIRED` when the
+//! host's grant came from that proof's invitation.
+//!
+//! **Grants point one way.** The host's grant lets the caller use the host;
+//! it says nothing about what the host may do on the caller. A live caller
+//! accepts streams the host opens, but before it dispatches any privileged
+//! operation on one it asks its own endpoint's grant table
+//! ([`CallerGate::host_stream_authority`]). The caller opening the first
+//! stream is an ordering rule only.
 
 use crate::control::{AuthorizedState, ControlMessage};
 use crate::grants::{GrantId, GrantTable, Role};
@@ -322,7 +330,8 @@ pub enum CallerGateState {
     AwaitingAuthorization,
     /// This side sent a `JOIN_PROOF` and the host said `AUTHORIZED {live}`
     /// from step 2; the host's answer to the proof is the next
-    /// `AUTHORIZED`. Nothing else but keepalive, `HELLO` and `GOAWAY` yet.
+    /// `AUTHORIZED` or a `PAIRED`. Nothing else but keepalive, `HELLO` and
+    /// `GOAWAY` yet.
     AwaitingProofAnswer,
     /// The host said join-only: pairing messages only.
     JoinOnly,
@@ -404,6 +413,12 @@ impl CallerGate {
                 };
                 Verdict::Allow
             }
+            // The answer to a proof whose invitation made the host's grant
+            // (its enrollment receipt): the connection stays live under it.
+            (S::AwaitingProofAnswer, T::Paired) => {
+                self.state = S::Live;
+                Verdict::Allow
+            }
             (_, T::Authorized(_)) => Verdict::Close(ErrorCode::ProtocolError),
             (S::JoinOnly, T::Pairing | T::Paired) => Verdict::Allow,
             // A late pairing message after enrollment means nothing.
@@ -436,6 +451,28 @@ impl CallerGate {
             self.state = CallerGateState::Closed(code);
         }
     }
+
+    /// What the host may do on a stream it opened (wire.md 8.2), decided
+    /// by this caller, before it dispatches any privileged operation there.
+    ///
+    /// The host's `AUTHORIZED` grants this caller access to the host, never
+    /// the reverse. The answer comes from `local`, this caller endpoint's
+    /// own grant table: the role of its live grant for `host` (the host
+    /// identity from step 1), and only while this gate is live. `None`
+    /// means no privileged operation; the stream may still carry what the
+    /// application allows without a grant, such as replies on a channel the
+    /// caller asked for.
+    pub fn host_stream_authority(
+        &self,
+        local: &GrantTable,
+        host: &IdentityPublicKey,
+        now: UnixTime,
+    ) -> Option<Role> {
+        if !self.is_live() {
+            return None;
+        }
+        local.live_grant(host, now).map(|g| g.role.clone())
+    }
 }
 
 #[cfg(test)]
@@ -461,6 +498,7 @@ mod tests {
                 role: Role::owner(),
                 authorizing_owner: OwnerRef::from_bytes([0x51; 16]),
                 expires_at: None,
+                enrolled_by: None,
             },
             NOW,
         )
@@ -603,12 +641,14 @@ mod tests {
         assert_eq!(gate.check(live), Verdict::Allow);
         gate.sent_join_proof();
         assert_eq!(gate.state(), CallerGateState::AwaitingProofAnswer);
+        // `PAIRED` as the answer: the proof's invitation made the grant.
+        let mut gate = CallerGate::new();
+        gate.sent_join_proof();
+        gate.check(live);
+        assert_eq!(gate.check(CallerTraffic::Paired), Verdict::Allow);
+        assert!(gate.is_live());
         // The host opens nothing before the answer.
-        for traffic in [
-            CallerTraffic::Stream,
-            CallerTraffic::Pairing,
-            CallerTraffic::Paired,
-        ] {
+        for traffic in [CallerTraffic::Stream, CallerTraffic::Pairing] {
             let mut gate = CallerGate::new();
             gate.sent_join_proof();
             gate.check(live);
@@ -617,6 +657,33 @@ mod tests {
                 Verdict::Close(ErrorCode::ProtocolError)
             );
         }
+    }
+
+    /// The host's `AUTHORIZED {live}` lets the caller use the host. It
+    /// gives the host nothing on the caller: privileged work on a stream the
+    /// host opened needs the caller's own grant for the host.
+    #[test]
+    fn a_host_stream_gets_only_what_the_caller_grants_the_host() {
+        let host = id(9);
+        let mut gate = CallerGate::new();
+        gate.check(CallerTraffic::Authorized(AuthorizedState::Live));
+        assert_eq!(gate.check(CallerTraffic::Stream), Verdict::Allow);
+        // The caller has no grant for the host: nothing privileged.
+        assert_eq!(gate.host_stream_authority(&table_with(1), &host, NOW), None);
+        // With one, the role comes from the caller's own table.
+        let mut local = table_with(9);
+        assert_eq!(
+            gate.host_stream_authority(&local, &host, NOW),
+            Some(Role::owner())
+        );
+        // A local denial wins.
+        local.deny(host, NOW);
+        assert_eq!(gate.host_stream_authority(&local, &host, NOW), None);
+        // Not live yet: nothing, whatever the table says.
+        let mut gate = CallerGate::new();
+        gate.sent_join_proof();
+        gate.check(CallerTraffic::Authorized(AuthorizedState::Live));
+        assert_eq!(gate.host_stream_authority(&table_with(9), &host, NOW), None);
     }
 
     #[test]

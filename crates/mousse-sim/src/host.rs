@@ -132,6 +132,7 @@ impl HostDev {
                 role: Role::owner(),
                 authorizing_owner: OwnerRef::from_bytes(PROFILE_ID),
                 expires_at: expires_in.map(|s| wall.plus(s)),
+                enrolled_by: None,
             },
             wall,
         );
