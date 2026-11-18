@@ -484,6 +484,19 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
                 }];
             }
         } else {
+            // An attempt id already seen on another connection is a replay:
+            // its binding holds the old session's exporter, so it can never
+            // succeed. Refuse it before the debit, with no exchange work, so
+            // replays cannot spend the invitation's attempts.
+            if inv.attempts.keys().any(|(_, seen)| *seen == attempt) {
+                return vec![HostAction::Send {
+                    conn,
+                    message: ControlMessage::CodeAbort {
+                        attempt,
+                        code: ErrorCode::PairingFailed,
+                    },
+                }];
+            }
             if inv.attempts_left == 0 {
                 return vec![HostAction::Close {
                     conn,

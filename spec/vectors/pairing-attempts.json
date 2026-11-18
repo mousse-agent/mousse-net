@@ -1,5 +1,5 @@
 {
-  "description": "Attempt-limit sequences for the send-link flow (spec wire.md, \"Send-link flow and the code\" and \"Attempt limits\"), plus one-enrollment for in person. Each step runs one operation and then the listed expectations hold. Ops: connect (joiner proves the ticket on conn), submit (joiner enters a code; messages flow until both sides stop), submit_first (only the joiner's first message reaches the host), redeliver (that first message reaches the host again on conn), drop (conn closes mid-attempt), approve (host owner taps for conn). Codes: right (the code the host shows now), wrong (any other code), stale (the code the host showed when the previous attempt started). `new_code` says whether the host showed a fresh code during the step. `closed` lists connections the host closed during the step.",
+  "description": "Attempt-limit sequences for the send-link flow (spec wire.md, \"Send-link flow and the code\" and \"Attempt limits\"), plus one-enrollment for in person. Each step runs one operation and then the listed expectations hold. Ops: connect (joiner proves the ticket on conn), submit (joiner enters a code; messages flow until both sides stop), submit_first (only the joiner's first message reaches the host), redeliver (that first message reaches the host again on conn), drop (conn closes mid-attempt), approve (host owner taps for conn). Codes: right (the code the host shows now), wrong (any other code), stale (the code the host showed when the previous attempt started). `new_code` says whether the host showed a fresh code during the step. `closed` lists connections the host closed during the step. `reply: code_abort` means the host's only answer was CODE_ABORT for that attempt.",
   "sequences": [
     {
       "kind": "send_link",
@@ -166,8 +166,9 @@
       ]
     },
     {
+      "description": "Joiner a's first message is replayed on b's connection. The attempt id was already seen on another connection, so the host refuses it with code_abort before any debit or exchange work, and shows no new code.",
       "kind": "send_link",
-      "name": "same_attempt_on_another_connection_counts",
+      "name": "attempt_replayed_on_another_connection_is_refused",
       "steps": [
         {
           "conn": 1,
@@ -188,9 +189,26 @@
         },
         {
           "conn": 2,
-          "host_attempts_left": 1,
+          "host_attempts_left": 2,
+          "host_status": "open",
           "joiner": "a",
-          "op": "redeliver"
+          "new_code": false,
+          "op": "redeliver",
+          "reply": "code_abort"
+        },
+        {
+          "conn": 1,
+          "host_attempts_left": 2,
+          "joiner": "a",
+          "op": "drop"
+        },
+        {
+          "conn": 2,
+          "host_attempts_left": 2,
+          "joiner": "a",
+          "new_code": false,
+          "op": "redeliver",
+          "reply": "code_abort"
         }
       ]
     },

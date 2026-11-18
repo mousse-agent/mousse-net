@@ -234,7 +234,7 @@ fn session_lifecycle_vectors() -> J {
     let deadline = local_na + SKEW;
     let renew_at = local_na - crate::session::RENEW_LEAD_SECS;
     json!({
-        "description": "A live path closes with cert_expired at the first second after the effective deadline (earlier not_after + 600). Renewal is due 1800 s before the earlier not_after. Replay: begin_path(1), on_authenticated(1, verify(peer_certificate, authenticated_at, pin), local window, authenticated_at), on_reopened(1), then tick at each `now`.",
+        "description": "A live path closes with cert_expired at the first second after the effective deadline (earlier not_after + 600). Renewal is due 1800 s before the earlier not_after; while no new path is current it is asked for again after 30 s, then 60, 120, 240 and every 300 s, until the deadline. Replay: begin_path(1), on_authenticated(1, verify(peer_certificate, authenticated_at, pin), local window, authenticated_at), on_reopened(1), then tick at each `now`.",
         "peer_certificate": hex(&peer),
         "pin": hex(a.public_key().as_bytes()),
         "local_window": { "not_before": local_nb, "not_after": local_na },
@@ -245,7 +245,16 @@ fn session_lifecycle_vectors() -> J {
             { "now": renew_at - 1, "events": [] },
             { "now": renew_at, "events": [{ "event": "renew_due", "conn": 1 }] },
             { "now": renew_at + 1, "events": [] },
-            { "now": deadline, "events": [] },
+            { "now": renew_at + 29, "events": [] },
+            { "now": renew_at + 30, "events": [{ "event": "renew_due", "conn": 1 }] },
+            { "now": renew_at + 89, "events": [] },
+            { "now": renew_at + 90, "events": [{ "event": "renew_due", "conn": 1 }] },
+            { "now": renew_at + 210, "events": [{ "event": "renew_due", "conn": 1 }] },
+            { "now": renew_at + 450, "events": [{ "event": "renew_due", "conn": 1 }] },
+            { "now": renew_at + 750, "events": [{ "event": "renew_due", "conn": 1 }] },
+            { "now": renew_at + 1049, "events": [] },
+            { "now": renew_at + 1050, "events": [{ "event": "renew_due", "conn": 1 }] },
+            { "now": deadline, "events": [{ "event": "renew_due", "conn": 1 }] },
             { "now": deadline + 1, "events": [{ "event": "close", "conn": 1, "code": "cert_expired" }] },
             { "now": deadline + 2, "events": [] },
         ],
@@ -1011,7 +1020,7 @@ fn hello_vectors() -> J {
 
 fn pairing_attempt_vectors() -> J {
     json!({
-        "description": "Attempt-limit sequences for the send-link flow (spec wire.md, \"Send-link flow and the code\" and \"Attempt limits\"), plus one-enrollment for in person. Each step runs one operation and then the listed expectations hold. Ops: connect (joiner proves the ticket on conn), submit (joiner enters a code; messages flow until both sides stop), submit_first (only the joiner's first message reaches the host), redeliver (that first message reaches the host again on conn), drop (conn closes mid-attempt), approve (host owner taps for conn). Codes: right (the code the host shows now), wrong (any other code), stale (the code the host showed when the previous attempt started). `new_code` says whether the host showed a fresh code during the step. `closed` lists connections the host closed during the step.",
+        "description": "Attempt-limit sequences for the send-link flow (spec wire.md, \"Send-link flow and the code\" and \"Attempt limits\"), plus one-enrollment for in person. Each step runs one operation and then the listed expectations hold. Ops: connect (joiner proves the ticket on conn), submit (joiner enters a code; messages flow until both sides stop), submit_first (only the joiner's first message reaches the host), redeliver (that first message reaches the host again on conn), drop (conn closes mid-attempt), approve (host owner taps for conn). Codes: right (the code the host shows now), wrong (any other code), stale (the code the host showed when the previous attempt started). `new_code` says whether the host showed a fresh code during the step. `closed` lists connections the host closed during the step. `reply: code_abort` means the host's only answer was CODE_ABORT for that attempt.",
         "sequences": [
             {
                 "name": "three_wrong_codes",
@@ -1054,13 +1063,16 @@ fn pairing_attempt_vectors() -> J {
                 ],
             },
             {
-                "name": "same_attempt_on_another_connection_counts",
+                "name": "attempt_replayed_on_another_connection_is_refused",
+                "description": "Joiner a's first message is replayed on b's connection. The attempt id was already seen on another connection, so the host refuses it with code_abort before any debit or exchange work, and shows no new code.",
                 "kind": "send_link",
                 "steps": [
                     { "op": "connect", "joiner": "a", "conn": 1 },
                     { "op": "submit_first", "joiner": "a", "conn": 1, "code": "right", "host_attempts_left": 2 },
                     { "op": "connect", "joiner": "b", "conn": 2 },
-                    { "op": "redeliver", "joiner": "a", "conn": 2, "host_attempts_left": 1 },
+                    { "op": "redeliver", "joiner": "a", "conn": 2, "reply": "code_abort", "host_attempts_left": 2, "host_status": "open", "new_code": false },
+                    { "op": "drop", "joiner": "a", "conn": 1, "host_attempts_left": 2 },
+                    { "op": "redeliver", "joiner": "a", "conn": 2, "reply": "code_abort", "host_attempts_left": 2, "new_code": false },
                 ],
             },
             {
@@ -1325,7 +1337,7 @@ impl Replay {
                     assert!(rounds < 16, "exchange does not settle");
                     let mut to_joiner = Vec::new();
                     for m in std::mem::take(&mut to_host) {
-                        let actions = self.deliver_to_host(conn, m);
+                        let actions = self.deliver_to_host(conn, m.clone());
                         self.last_reply = Some(sent(&actions));
                         for a in &actions {
                             if let HostAction::Send { conn: c, message } = a {
@@ -1378,9 +1390,25 @@ impl Replay {
                     .1
                     .clone();
                 let before = self.last_reply.clone();
-                let actions = self.deliver_to_host(conn, m);
+                let actions = self.deliver_to_host(conn, m.clone());
                 if step["same_reply"] == true {
                     assert_eq!(Some(sent(&actions)), before, "resend reply differs");
+                }
+                if step["reply"] == "code_abort" {
+                    let ControlMessage::CodeExchange { attempt, .. } = m else {
+                        panic!("first message")
+                    };
+                    assert_eq!(
+                        actions,
+                        vec![HostAction::Send {
+                            conn: ConnectionId(conn),
+                            message: ControlMessage::CodeAbort {
+                                attempt,
+                                code: ErrorCode::PairingFailed,
+                            },
+                        }],
+                        "refused without work"
+                    );
                 }
                 self.last_reply = Some(sent(&actions));
                 host_log.extend(actions);

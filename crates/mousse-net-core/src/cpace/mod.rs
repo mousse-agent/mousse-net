@@ -40,6 +40,12 @@ use primitives::{calculate_generator, isk, mac_key, scalar_mult, scalar_mult_vfy
 /// The shortest session id Mousse accepts.
 pub const MIN_SID_LEN: usize = 16;
 
+/// Whether the share at the start of `msg_a` or `msg_b` carries empty AD.
+/// Only reads the framing; no group work.
+pub(crate) fn share_has_empty_ad(msg: &[u8]) -> Result<bool, CpaceError> {
+    Ok(wire::parse_share(msg)?.ad.is_empty())
+}
+
 /// Whether a constant-time tag compare matched.
 #[cfg(not(mousse_control = "break-cpace"))]
 fn tags_match(equal: subtle::Choice) -> bool {

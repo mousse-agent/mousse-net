@@ -36,7 +36,7 @@ pub enum JoinerState {
     AwaitingPaired,
     /// Done.
     Paired,
-    /// The host already has a live grant for this device.
+    /// The host already has a live grant for this device: paired.
     AlreadyPaired,
     /// The flow ended.
     Failed(ErrorCode),
@@ -60,7 +60,9 @@ pub enum JoinerAction {
     Send(ControlMessage),
     /// Pairing finished. Store the pin.
     Paired(PairedHost),
-    /// The host already grants this device.
+    /// The host already grants this device (step 2 said live). The device
+    /// is paired: pin [`JoinerPairing::expected_host`]. This is also how a
+    /// joiner whose `PAIRED` was lost learns that it was enrolled.
     AlreadyPaired,
     /// The code was wrong (or the attempt failed); the owner may retype.
     CodeRejected {
@@ -115,6 +117,10 @@ pub struct JoinerPairing<F: CodeExchangeFactory> {
     attempts_left: u8,
     attempt: Option<JoinerAttempt<F::Exchange>>,
     exporters: Option<SessionExporters>,
+    /// The joiner sent its confirmation but the connection closed before
+    /// `PAIRED`: the host may have enrolled it. The next connection learns
+    /// the outcome, even with no attempts or ticket time left.
+    outcome_pending: bool,
 }
 
 impl<F: CodeExchangeFactory> JoinerPairing<F> {
@@ -140,6 +146,7 @@ impl<F: CodeExchangeFactory> JoinerPairing<F> {
             attempts_left: JOINER_ATTEMPTS_PER_FLOW,
             attempt: None,
             exporters: None,
+            outcome_pending: false,
         })
     }
 
@@ -163,6 +170,13 @@ impl<F: CodeExchangeFactory> JoinerPairing<F> {
         self.attempts_left
     }
 
+    /// The connection closed after this side sent its confirmation and
+    /// before `PAIRED` arrived. Reconnect to learn whether the host enrolled
+    /// this device: `AUTHORIZED {live}` means it did.
+    pub fn outcome_pending(&self) -> bool {
+        self.outcome_pending
+    }
+
     /// A new TLS connection to the pinned host is up. Returns the
     /// `JOIN_PROOF` to send after `HELLO`. Any attempt in progress on an
     /// older connection is abandoned; its debit stays.
@@ -177,7 +191,9 @@ impl<F: CodeExchangeFactory> JoinerPairing<F> {
         ) {
             return Err(JoinerError::WrongState);
         }
-        if self.ticket.check_fresh_for_joiner(now).is_err() {
+        // A pending outcome is learned from step 2, which needs no fresh
+        // ticket: a grant outlives its invitation.
+        if !self.outcome_pending && self.ticket.check_fresh_for_joiner(now).is_err() {
             self.state = JoinerState::Failed(ErrorCode::InvitationInvalid);
             return Err(JoinerError::Expired);
         }
@@ -205,6 +221,10 @@ impl<F: CodeExchangeFactory> JoinerPairing<F> {
         }
         match state {
             AuthorizedState::JoinOnly => {
+                // Not enrolled, and no attempts left to try again.
+                if self.ticket.kind == InvitationKind::SendLink && self.attempts_left == 0 {
+                    return self.fail(ErrorCode::AttemptsExhausted);
+                }
                 self.state = match self.ticket.kind {
                     InvitationKind::InPerson => JoinerState::AwaitingApproval,
                     InvitationKind::SendLink => JoinerState::AwaitingCode,
@@ -212,6 +232,8 @@ impl<F: CodeExchangeFactory> JoinerPairing<F> {
                 Vec::new()
             }
             AuthorizedState::Live => {
+                // Also how a pending outcome resolves: the host enrolled us.
+                self.outcome_pending = false;
                 self.state = JoinerState::AlreadyPaired;
                 vec![JoinerAction::AlreadyPaired]
             }
@@ -341,6 +363,7 @@ impl<F: CodeExchangeFactory> JoinerPairing<F> {
         }
         self.state = JoinerState::Paired;
         self.attempt = None;
+        self.outcome_pending = false;
         vec![JoinerAction::Paired(PairedHost {
             identity: self.ticket.host_identity,
             name: host_name,
@@ -358,6 +381,9 @@ impl<F: CodeExchangeFactory> JoinerPairing<F> {
         }
         self.attempt = None;
         self.exporters = None;
+        if self.state == JoinerState::AwaitingPaired {
+            self.outcome_pending = true;
+        }
         match code {
             Some(
                 c @ (ErrorCode::AttemptsExhausted
@@ -367,7 +393,7 @@ impl<F: CodeExchangeFactory> JoinerPairing<F> {
                 | ErrorCode::NotAuthorized),
             ) => self.fail(c),
             _ => {
-                self.state = if self.attempts_left == 0 {
+                self.state = if self.attempts_left == 0 && !self.outcome_pending {
                     JoinerState::Failed(ErrorCode::AttemptsExhausted)
                 } else {
                     JoinerState::Connecting

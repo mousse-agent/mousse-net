@@ -1,7 +1,7 @@
 {
   "authenticated_at": 1790003660,
   "deadline": 1790047400,
-  "description": "A live path closes with cert_expired at the first second after the effective deadline (earlier not_after + 600). Renewal is due 1800 s before the earlier not_after. Replay: begin_path(1), on_authenticated(1, verify(peer_certificate, authenticated_at, pin), local window, authenticated_at), on_reopened(1), then tick at each `now`.",
+  "description": "A live path closes with cert_expired at the first second after the effective deadline (earlier not_after + 600). Renewal is due 1800 s before the earlier not_after; while no new path is current it is asked for again after 30 s, then 60, 120, 240 and every 300 s, until the deadline. Replay: begin_path(1), on_authenticated(1, verify(peer_certificate, authenticated_at, pin), local window, authenticated_at), on_reopened(1), then tick at each `now`.",
   "local_window": {
     "not_after": 1790046800,
     "not_before": 1790003600
@@ -34,6 +34,77 @@
     },
     {
       "events": [],
+      "now": 1790045029
+    },
+    {
+      "events": [
+        {
+          "conn": 1,
+          "event": "renew_due"
+        }
+      ],
+      "now": 1790045030
+    },
+    {
+      "events": [],
+      "now": 1790045089
+    },
+    {
+      "events": [
+        {
+          "conn": 1,
+          "event": "renew_due"
+        }
+      ],
+      "now": 1790045090
+    },
+    {
+      "events": [
+        {
+          "conn": 1,
+          "event": "renew_due"
+        }
+      ],
+      "now": 1790045210
+    },
+    {
+      "events": [
+        {
+          "conn": 1,
+          "event": "renew_due"
+        }
+      ],
+      "now": 1790045450
+    },
+    {
+      "events": [
+        {
+          "conn": 1,
+          "event": "renew_due"
+        }
+      ],
+      "now": 1790045750
+    },
+    {
+      "events": [],
+      "now": 1790046049
+    },
+    {
+      "events": [
+        {
+          "conn": 1,
+          "event": "renew_due"
+        }
+      ],
+      "now": 1790046050
+    },
+    {
+      "events": [
+        {
+          "conn": 1,
+          "event": "renew_due"
+        }
+      ],
       "now": 1790047400
     },
     {

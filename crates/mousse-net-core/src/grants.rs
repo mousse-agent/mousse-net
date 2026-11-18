@@ -13,8 +13,9 @@
 //!   identity's grant, closes its channels, and blocks new grants until it is
 //!   lifted locally. Nothing else clears it.
 //!
-//! The table is plain state. The caller persists [`GrantTable::grants`] and
-//! [`GrantTable::denials`] and restores them with [`GrantTable::restore`].
+//! The table is plain state. The caller persists [`GrantTable::grants`],
+//! [`GrantTable::denials`] and [`GrantTable::next_grant_id`], and restores
+//! them with [`GrantTable::restore`].
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -249,16 +250,28 @@ impl GrantTable {
         Self::default()
     }
 
-    /// Rebuild a table from stored grants and denials. Channels are not
-    /// stored; they are rebound as connections arrive.
-    pub fn restore(grants: Vec<Grant>, denials: Vec<Denial>) -> Result<Self, GrantError> {
+    /// Rebuild a table from stored grants, denials and the stored
+    /// [`GrantTable::next_grant_id`]. Channels are not stored; they are
+    /// rebound as connections arrive.
+    ///
+    /// Grant ids are never reused, so the id high-water mark is stored on
+    /// its own: the grant that last used an id may have been removed before
+    /// the restart. A stored grant at or above `next_grant_id` means the
+    /// stored state is inconsistent.
+    pub fn restore(
+        grants: Vec<Grant>,
+        denials: Vec<Denial>,
+        next_grant_id: u64,
+    ) -> Result<Self, GrantError> {
         let mut table = Self::new();
+        table.next_id = next_grant_id;
         for d in denials {
             table.denials.insert(d.identity, d.denied_at);
         }
         for g in grants {
-            // Ids are never reused, even those of grants dropped below.
-            table.next_id = table.next_id.max(g.id.0.saturating_add(1));
+            if g.id.0 >= next_grant_id {
+                return Err(GrantError::Inconsistent);
+            }
             if table.denials.contains_key(&g.identity) {
                 continue; // a denial wins over any stored grant
             }
@@ -412,6 +425,12 @@ impl GrantTable {
         self.grants.values().filter_map(|g| g.expires_at).min()
     }
 
+    /// The id the next grant will get: one above every id ever issued,
+    /// including removed grants. Persist it with the grants.
+    pub fn next_grant_id(&self) -> u64 {
+        self.next_id
+    }
+
     /// All grants, for persistence and display.
     pub fn grants(&self) -> impl Iterator<Item = &Grant> {
         self.grants.values()
@@ -512,6 +531,7 @@ mod tests {
                 identity: id(2),
                 denied_at: NOW,
             }],
+            t.next_grant_id(),
         )
         .unwrap();
         assert!(restored.live_grant(&id(1), NOW).is_some());
@@ -520,6 +540,31 @@ mod tests {
         let mut restored = restored;
         let (next, _) = restored.add(new_grant(3, None), NOW).unwrap();
         assert_eq!(next, GrantId(2));
+    }
+
+    /// The newest grant is removed before a restart: its id stays used.
+    #[test]
+    fn restore_never_reuses_the_id_of_a_grant_removed_before_the_restart() {
+        let mut t = GrantTable::new();
+        t.add(new_grant(1, None), NOW).unwrap();
+        let (newest, _) = t.add(new_grant(2, None), NOW).unwrap();
+        t.remove(newest);
+        let grants: Vec<Grant> = t.grants().cloned().collect();
+        let mut restored = GrantTable::restore(grants, Vec::new(), t.next_grant_id()).unwrap();
+        let (next, _) = restored.add(new_grant(3, None), NOW).unwrap();
+        assert!(next > newest);
+        assert_eq!(restored.next_grant_id(), t.next_grant_id() + 1);
+    }
+
+    #[test]
+    fn restore_refuses_a_grant_at_or_above_the_stored_high_water_mark() {
+        let mut t = GrantTable::new();
+        let (only, _) = t.add(new_grant(1, None), NOW).unwrap();
+        let grants: Vec<Grant> = t.grants().cloned().collect();
+        assert_eq!(
+            GrantTable::restore(grants, Vec::new(), only.0).err(),
+            Some(GrantError::Inconsistent)
+        );
     }
 
     #[test]

@@ -13,7 +13,7 @@ use zeroize::Zeroizing;
 
 use super::proof::SID_LEN;
 use super::BindingTranscript;
-use crate::cpace::{sample_scalar, CpaceError, Initiator, Inputs, Responder};
+use crate::cpace::{sample_scalar, share_has_empty_ad, CpaceError, Initiator, Inputs, Responder};
 
 /// A 6-digit pairing code: six ASCII digits `0`-`9`, uniformly random.
 /// The digits are the exchange password and are never transmitted.
@@ -230,6 +230,18 @@ impl CodeExchange for CpaceExchange {
             ad: &[],
         };
         inputs.check().map_err(from_cpace)?;
+        // Version 1 sends empty AD both ways; a share with AD is refused
+        // before any group work.
+        let carries_share = matches!(
+            (self.role, &state),
+            (ExchangeRole::Responder, CpaceState::Fresh(_))
+                | (ExchangeRole::Initiator, CpaceState::AwaitingResponse(_))
+        );
+        if let (true, Some(share)) = (carries_share, incoming) {
+            if !share_has_empty_ad(share).map_err(from_cpace)? {
+                return Err(ExchangeError::Malformed);
+            }
+        }
         let (next, send, peer_confirmed) = match (self.role, state, incoming) {
             (ExchangeRole::Initiator, CpaceState::Fresh(ya), None) => {
                 let (initiator, msg_a) = Initiator::start_with_scalar(&inputs, ya);
@@ -517,6 +529,32 @@ mod tests {
             r.step(Some(&[0; crate::cpace::TAG_LEN])),
             Err(ExchangeError::ConfirmationFailed)
         );
+    }
+
+    /// A peer running CPace with the same code, transcript and sid but
+    /// non-empty AD would confirm; version 1 refuses its share instead.
+    #[test]
+    fn cpace_shares_with_associated_data_are_refused() {
+        let f = CpaceExchangeFactory;
+        let mut rng = ChaCha20Rng::from_seed([4; 32]);
+        let code = PairingCode::parse("123456").unwrap();
+        let b = binding(0);
+        let sid = [1u8; 32];
+        let inputs = Inputs {
+            prs: code.as_bytes(),
+            ci: b.as_bytes(),
+            sid: &sid,
+            ad: b"x",
+        };
+        // msg_a with AD, to our responder.
+        let (_, msg_a) = Initiator::start(&inputs, &mut rng).unwrap();
+        let mut r = f.start(ExchangeRole::Responder, &code, &b, &sid, &mut rng);
+        assert_eq!(r.step(Some(&msg_a)), Err(ExchangeError::Malformed));
+        // msg_b with AD, to our initiator.
+        let mut i = f.start(ExchangeRole::Initiator, &code, &b, &sid, &mut rng);
+        let ours = i.step(None).unwrap().send.unwrap();
+        let (_, msg_b) = Responder::respond(&inputs, &ours, &mut rng).unwrap();
+        assert_eq!(i.step(Some(&msg_b)), Err(ExchangeError::Malformed));
     }
 
     #[cfg(feature = "insecure-test-exchange")]
