@@ -1,6 +1,6 @@
 # Phase 1a design: the engine inside the desktop app
 
-Status: design, final after review round 3 (2026-11-18). Scope: PLAN "Phase 1a" (two desktops
+Status: design, frozen (2026-11-18). Scope: PLAN "Phase 1a" (two desktops
 on a LAN, in-person pairing only).
 
 - **Engine base:** `phase-1a`. Host persistence before `PAIRED` and grant
@@ -16,33 +16,7 @@ turns the new path on.
 **Goal:** a remote thread and a terminal work through the normal computer
 picker, with v1 networking off, on a fresh profile that has no `net.db`.
 
-Next: one last independent review. Earlier change tables are in commits
-`bddb00e` (round 1) and `001ba32` (round 2).
-
-## Changes since round 3
-
-F = first review, S = second review.
-
-| Finding | Resolution |
-|---|---|
-| F1, S3: local stream ids fail the receiver, store and Hub stream checks | §3.4: the map is cut. Engine streams keep the host's stream id, bound by `net_engine_streams(stream PK, peer_local_id)` and `authority = peer_local_id`. A subscribe to a stream bound to another authority is refused. §4.6 states the two-path result. S0 covers live records and a snapshot. |
-| F2, S2: v1-off gates | §4.3 and §4.5: `bridge.policy` is routed to the engine service for engine ids; `bridge/registerMethods.ts:110` and `:138` use `bridgeOn()`; `RoutedClient` gets its session from `directory.client`; `BridgeProfileService.ts:447` reads the directory; the engine service calls the session hooks. `picker-v1-off` sets terminal access through `bridge.policy`. |
-| S1: stream classification | §4.4: generic display serving is cut. Only explicit bindings are served, private streams are deleted with their bindings, and `second-reader` covers reads and blobs after removal. |
-| S4, F4: recovery transitions | §5.1 and §5.4: the ticket is kept in the `consented` row; a dial probes the pin first; `joined` replays `grant.add`; the host rebuilds `awaiting_pairback` from the grant; `removing` fences all Bridge work; `removed` stays as a tombstone; removal commits before it reports success. The spec reference is now `wire.md:814-821`. |
-| F3: no renewal after a 30-day lapse | §3.5: `renewSelf()` re-issues whatever the lapse. S0 also runs at +40 days. |
-| S: paging, artifact replies and staging | §3.3: three separate paths, each exercised in S0. The engine branch of staging is defined. |
-| S, F question 1: `result.get` | §3.7: engine callers only, immediate `outcome_uncertain` with no live execution, the remaining budget, and a recheck after the wait. |
-| S: Start over moves `net/` | §3.5: the survival promise is dropped. Start over also sets `net-engine/` aside. |
-| S: cross-machine recipe | §9: signed device results carrying both app revisions. |
-| Cuts and questions | The opaque-handle fallback is cut. The open questions are answered in §11. |
-
-**Kept from earlier rounds, with both reviewers' agreement:**
-
-- A daemon-wide helper upgrade.
-- No claimed node ids.
-- Login start in Phase 1b (`PLAN.md:200`).
-- Windows helper signing together with the app. `package.json` sets
-  `"signExecutable": false`.
+The review history is in this file's git log.
 
 ## Decisions
 
@@ -149,23 +123,57 @@ stores a port.
 Each frame is `u32 BE length | u8 type | body`, at most 1 MiB.
 
 - `0x01` JSON
-- `0x02` DATA: `u32 stream` + at most 64 KiB
-- `0x03` CREDIT: `u32 stream` + `u32 bytes`
+- `0x02` DATA: `u32 handle | u8 flags` + at most 64 KiB. Flag `0x01` is
+  FIN.
+- `0x03` CREDIT: `u32 handle | u32 bytes`
 
 A malformed frame closes the channel, and the daemon restarts the helper.
+
+**Stream handles.** Wire stream numbers restart on every connection
+(`mux/mod.rs:233`), so two peers or two paths can use the same number at
+once.
+
+- The helper gives every stream a handle that is unique for the life of
+  the spawn and never reused.
+- A handle is bound to (connection, generation, wire stream).
+- `stream.open` returns a handle, and `stream.incoming` carries one.
+- DATA, CREDIT and `stream.reset` name only handles.
+- A frame for an unknown or closed handle is dropped and counted.
+
+**FIN in order.**
+
+- FIN is a flag on a DATA frame, which may be empty, in that stream's own
+  queue. It therefore follows every byte queued before it.
+- There is no JSON `stream.fin`.
+- `stream.reset` is JSON and may overtake queued data, because a reset
+  discards the stream.
+
+E1 tests both: two connections using the same wire stream number at once,
+and a final write stalled on credit with FIN queued behind it.
 
 ### 2.2 Pumps, budget and priority (both sides)
 
 - **Independent pumps.** Reading never waits on writing.
 - **Writer order:** control (JSON and CREDIT), then interactive DATA, then
   bulk DATA. Streams take turns within a class.
-- **Admission.** Each side has an aggregate receive budget of 8 MiB.
-  - A side grants credit to a stream only from that budget, so the credit
-    granted and not yet consumed across all streams never exceeds it.
-  - Each stream gets at most 256 KiB.
-  - 1 MiB of the budget is reserved for interactive streams.
-  - A stream that cannot get credit waits. Its sender stalls, and nothing
-    buffers past the budget.
+- **Admission at the engine receive queue.**
+  - The engine gives every wire stream 256 KiB of initial credit when it
+    opens (`INITIAL_CREDIT`, `mux/mod.rs:29`). It queues arriving DATA in an
+    unbounded channel before any read (`conn.rs:866`).
+  - With up to 1,024 peer streams (`MAX_PEER_STREAMS`), that is 256 MiB per
+    connection, which app credit cannot bound.
+  - E2 therefore caps open streams at 32 per connection (both directions
+    counted) and 128 per helper. That keeps initial credit at or below
+    8 MiB per connection and 32 MiB per helper.
+  - A peer's open beyond a cap is reset; E2 names the reset code in
+    `spec/wire.md`. The app session queues its own opens past the cap.
+  - Credit beyond the initial grant returns only as the app reads (see
+    read-ahead below).
+  - E2 measures the queued bytes with app reads stalled on every stream,
+    and asserts they stay within these bounds.
+- **App credit.** Each side grants app-channel credit from an 8 MiB budget,
+  at most 256 KiB per stream, with 1 MiB reserved for interactive streams.
+  A stream that cannot get credit waits.
 - **Control.** 1 MiB of queue is reserved for control. `conn.*` events are
   coalesced per connection.
 - **Read-ahead.** The engine's `StreamReader::read` returns wire credit
@@ -203,9 +211,11 @@ Events carry `ev`.
     `conn.down {conn, identity, reason}`.
 - **Paths:** `path.reopened {conn}`.
   - Events: `path.reopen {identity, from, conn}` and `path.renew_failed`.
-- **Streams:** `stream.open {conn, label, class}`, `stream.accept`,
-  `stream.fin`, `stream.reset`, DATA and CREDIT.
-  - Event: `stream.incoming`.
+- **Streams:** `stream.open {conn, label, class}` returns `{handle}`.
+  - Also `stream.accept {handle}`, `stream.reset {handle, code}`, DATA
+    (with FIN) and CREDIT.
+  - Events: `stream.incoming {conn, handle, label, class}` and
+    `stream.reset`.
 
 Not in 1.0: deny lists, send links and tunnels. On an outbound connection,
 the helper resets every stream the host opens. On an inbound connection, it
@@ -252,7 +262,8 @@ Each message is `u32 BE length | JSON header | binary parts`.
     to before fetching its blob (§4.4).
   - **Staged write:** params larger than a message, or over 16,384 JSON
     nodes, go through `RoutedStager`. It calls `bridge.artifacts.open`,
-    then `blob.put` and `append` on `mousse.put`, then `routed.stage`.
+    then `blob.put` and `append` on `mousse.put`, then `routed.stage`. S0
+    runs this through the production allowlist.
     - Today the host checks the staged record's v1 author (`artifacts.ts`
       `verifyAuthor` sites).
     - The engine branch instead checks that the stream is an input artifact
@@ -303,7 +314,21 @@ therefore pass unchanged.
   and hourly while the switch is on. It re-issues this profile's own
   delegation however long it has lapsed, because the profile is its own
   authority.
-- S0 runs again with the clock moved 8 days and 40 days.
+- S0 runs again with the clock moved 8 days and 40 days, and holds a
+  terminal open through a renewal.
+- **Non-keeper profiles.** A profile that joined another computer's v1
+  network holds no root key, so `renewSelf()` cannot sign
+  (`NetIdentityService.ts:792`).
+  - There, the switch works only while v1 is on, because v1 keeps renewing
+    through its keeper.
+  - With v1 off, the switch refuses with "This profile's network is managed
+    by another computer. Turn its networking on, or Start over."
+  - S0 covers both cases.
+- **Roster changes.** The roster listener in `net.runtime()` releases
+  private resources for every node missing from the v1 roster
+  (`NetService.ts:910`, `BridgeProfileService.ts:689`). Engine local ids are
+  never in that roster, so `release` also keeps every node that the peer
+  directory lists in a serving state.
 
 **Consequence.** The profile becomes a v1 keeper. A later v1 join on it
 fails with "Local identity already exists" (`NetIdentityService.ts:155`)
@@ -336,6 +361,13 @@ one event turn, the host:
 - drops it from the directory.
 
 Only revocation aborts handlers.
+
+- Teardown is one idempotent function, `teardown(localId)`. It runs:
+  - on `grant.closed`;
+  - when the app sets the row to `removing` (§5.4);
+  - again on recovery, for every `removing` or `removed` row.
+- So a helper that dies after saving a removal, but before it sends
+  `grant.closed`, leaves nothing running.
 
 **Loss** (any other `conn.down`, or a helper exit):
 
@@ -420,7 +452,9 @@ into a new `checkNodePolicy(method, node, policy, config)`.
 - the `routed.*` rows of `ROUTED_METHODS`;
 - `routed.stream.open`, `routed.stream.close` and `routed.page` from
   `ROUTED_TRANSPORT_METHODS`;
-- `bridge.artifacts.open`, for staging;
+- `bridge.artifacts.open` and `routed.stage`, for staging.
+  `bridge.artifacts.open` authorizes its `forMethod` through the same
+  allowlist (`artifacts.ts:94-99`);
 - `net.info`, read-only, which RoutedClient uses to negotiate versions
   (`RoutedClient.ts:132`).
 
@@ -637,8 +671,12 @@ Remove on A for B:
    - From then on, `authorizeEngine`, §4.4 and the directory refuse all
      Bridge work for that id. This holds even if the app crashes before it
      calls the helper.
-   - At start, `removing` rows are replayed from step 2 before the engine
-     service serves anything.
+   - The same write starts `teardown(localId)` (§3.7). Handlers are
+     aborted, subscriptions and terminals end, and private resources are
+     released.
+   - At start, `teardown` runs again for every `removing` row. The row is
+     then replayed from step 2 before the engine service serves anything.
+   - A replay that finds the grant already gone carries on.
 2. **Helper (`grant.remove`):**
    1. Journal `revoke {grant}` to `<state>/revoke.journal` and fsync.
    2. Apply the change and save the grant table.
@@ -703,6 +741,10 @@ Components live in `src/renderer/components/netEngine/`.
 - **Add device dialog:** Show QR, or Scan (webcam, `jsQR`). The host's
   approval appears inside it.
   - With no camera, the dialog says "Scan from the other computer instead".
+- **Second profile on the same OS account:** this notice appears when the
+  switch turns on while another profile under this OS account already has
+  it on. One line: "Profiles in this account can read each other's files
+  and keys." Its tooltip explains the threat model (`PLAN.md:56`).
 - **Picker:** engine computers appear through `bridge.nodes`.
 - **Push:** `ui.notify {kind: "net-engine", profileId}` sends
   `netEngine:changed`.
@@ -723,6 +765,8 @@ Components live in `src/renderer/components/netEngine/`.
 - **Helper restart mid-invitation:** the QR regenerates. The joiner
   resumes from its journal (§5.1).
 - **Delegation expiry:** re-issued hourly (§3.5). S0 tests at +8 and +40 days.
+- **Helper crash after a removal is saved:** teardown already ran when the
+  row became `removing`, and it runs again at recovery.
 - **v1 Start over:** also sets `net-engine/` aside; devices show "Pair again".
 - **Wrong clock:** the neutral certificate-window message.
 - **Mixed versions:** the wire minor negotiates down. A different app major
@@ -770,7 +814,7 @@ plan = "docs/PLAN.md#phase-1a-two-desktops-on-a-lan-in-person-only"
 
 [[check]]
 id = "phase1a.app-channel"
-title = "Channel framing, credit admission, pumps and priority; bulk stalled both ways"
+title = "Unique handles under equal wire stream ids, FIN after a stalled final write, engine admission bounds with app reads stalled, priority with bulk stalled both ways"
 targets = ["windows-x64", "macos-arm64", "linux-x64"]
 min_tests = 14
 local = [
@@ -781,6 +825,21 @@ local = [
 control = [
   { name = "read-without-credit", breaks = "the helper reads engine streams without app credit", env = { RUSTFLAGS = '--cfg mousse_control="read-without-credit"' } },
   { name = "fifo-writer", breaks = "one FIFO writer queue for control, interactive and bulk", env = { RUSTFLAGS = '--cfg mousse_control="fifo-writer"' } },
+  { name = "fin-overtakes", breaks = "FIN is sent as a control message ahead of the stream's queued DATA", env = { RUSTFLAGS = '--cfg mousse_control="fin-overtakes"' } },
+  { name = "no-stream-cap", breaks = "the engine admits every peer stream at full initial credit", env = { RUSTFLAGS = '--cfg mousse_control="no-stream-cap"' } },
+]
+
+[[check]]
+id = "phase1a.helper-removal"
+title = "A crash between the grant change and its save never re-admits the removed peer at helper admission"
+targets = ["windows-x64", "linux-x64"]
+min_tests = 6
+local = [
+  { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_pairing", "--no-fail-fast"] },
+  { target = "linux-x64", host = "linux-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_pairing", "--no-fail-fast"] },
+]
+control = [
+  { name = "no-revoke-journal", breaks = "removal is not journaled, so a crash between change and save re-admits the peer", env = { RUSTFLAGS = '--cfg mousse_control="no-revoke-journal"' } },
 ]
 
 [[check]]
@@ -842,7 +901,7 @@ control = [
 
 [[check]]
 id = "phase1a.removal"
-title = "Removal refused at once, tears down Bridge work, prunes rows; a crash or failed save never re-admits the device"
+title = "Removal refused at once, tears down Bridge work (also when the helper dies after saving it with a PTY open), prunes rows, fails closed"
 targets = ["windows-x64", "linux-x64"]
 judge = "marker"
 app = true
@@ -853,12 +912,12 @@ local = [
 control = [
   { name = "keep-removed-grant", expect_reason = "still_connected", breaks = "removing a grant leaves it in force", env = { RUSTFLAGS = '--cfg mousse_control="keep-removed-grant"' } },
   { name = "keep-engine-work", expect_reason = "stale_work", breaks = "the host keeps handlers and subscriptions after grant.closed", env = { MOUSSE_NET_ENGINE_CONTROL = "keep-engine-work" } },
-  { name = "no-revoke-journal", expect_reason = "served_after_restart", breaks = "removal is not journaled, so a crash between change and save re-admits the device", env = { RUSTFLAGS = '--cfg mousse_control="no-revoke-journal"' } },
+  { name = "teardown-on-event-only", expect_reason = "stale_work", breaks = "teardown waits for grant.closed; the helper dies after saving the removal with a PTY open", env = { MOUSSE_NET_ENGINE_CONTROL = "teardown-on-event-only" } },
 ]
 
 [[check]]
 id = "phase1a.once-or-unknown"
-title = "Reply dropped after the host effect, caller helper killed: effect once or outcome unknown; a long call survives a path switch"
+title = "Reply dropped after the host effect, caller helper killed: effect once or outcome unknown"
 targets = ["windows-x64", "linux-x64"]
 judge = "marker"
 app = true
@@ -868,6 +927,19 @@ local = [
 ]
 control = [
   { name = "no-host-dedupe", expect_reason = "duplicate_effect", breaks = "the host runs a repeated call id or input sequence again", env = { MOUSSE_NET_ENGINE_CONTROL = "no-host-dedupe" } },
+]
+
+[[check]]
+id = "phase1a.path-switch"
+title = "A multi-minute call and a terminal survive a path switch with no gap in output"
+targets = ["windows-x64", "linux-x64"]
+judge = "marker"
+app = true
+local = [
+  { target = "windows-x64", host = "windows-x86_64", command = ["node", "{root}/tools/app-check/run.mjs", "phase1a.path-switch", "--out", "{out}"] },
+  { target = "linux-x64", host = "linux-x86_64", command = ["node", "{root}/tools/app-check/run.mjs", "phase1a.path-switch", "--out", "{out}"] },
+]
+control = [
   { name = "abort-on-path-replaced", expect_reason = "false_outcome", breaks = "closing the old path aborts its running handlers", env = { MOUSSE_NET_ENGINE_CONTROL = "abort-on-path-replaced" } },
 ]
 
@@ -899,7 +971,7 @@ control = [
 
 [[check]]
 id = "phase1a.shared-computer"
-title = "Two profiles per desktop, each paired with its own profile on the other; removing one pairing leaves the other working"
+title = "PC A pairs with Mac C, PC B with Mac D. A removes C: A's channels close; B's terminal to D stays usable throughout and reconnects after a restart; A cannot dial D and B cannot dial C"
 targets = ["pc-to-mac-lan"]
 judge = "marker"
 cross_machine = true
@@ -922,23 +994,37 @@ steps = "Unplug WAN; Show QR on the Mac; Scan on the PC; Connect; Yes; time to C
 Each slice is one PR and lands its own checks. E = engine repo,
 M = Mousse.
 
-| # | What | Proved by |
-|---|---|---|
-| S0 | M: `netEngine/session/*`, a `peers.ts` stub, `EngineCaller`, `checkNodePolicy`, `renewSelf`, runtime build and activation with v1 off, the `bridgeOn` gates, `bridge.policy` routing. Over in-memory engine streams, on a profile with no `net.db`, through the production caller path (`ThreadRouter` → `RoutedClient` → `directory.client`) and the real `rt.rpc`. Covers: terminal access set through `bridge.policy`; one routed call; a thread and a terminal (`net.info`, `routed.stream.open`); a paged read, a durable artifact reply and a staged write; live records and a snapshot; +8 and +40 days; no Hub needed by the picker views. Lists every node-id, reader and stream field in routed params and results, including `artifact.caller`. | `tests/netEngine/spike.test.ts`; go/no-go for §3–§4 |
-| E1 | `serve --app` on stdio, framing, hello, the helper's own log, exit on EOF | `tests/app_channel.rs` |
-| E2 | pumps, credit admission, read-ahead, priority | `phase1a.app-channel` |
-| E3 | invite, approval, `join {pinned}`, idempotent `grant.add`, the revoke journal with pause and replay, peers | `tests/app_pairing.rs`; Phase 0 `loopback.rs` |
-| E5a | persisted candidates, parallel dial, keep connected, browse-source trait, private-range routes | `phase1a.discovery` |
-| E5b | renewals → `path.reopen`, interface watcher, wake | `ManualClock` tests |
-| E6 | kit: `app = true`, `app/MOUSSE_REVISION`, `host_app_build`, `tools/app-check/run.mjs` | kit self-tests |
-| M1 | build and package; macOS local-network and keychain spike | the packaged app runs the helper on Windows and macOS |
-| M2 | spawn, restart, shutdown, pumps; `startNetworkedProfiles` | fake and real helper tests; parent hard kill |
-| M3 | engine session over the helper; `authorizeEngine`; allowlist; engine-only `result.get` waiting; §4.4 delivery checks; staging branch | `phase1a.once-or-unknown`, `phase1a.private-streams` |
-| M4 | peer directory, the §4.3 and §4.5 call sites, session hooks, stream binding | v1 Bridge tests unchanged; `phase1a.picker-v1-off` |
-| M5a | peer table, selection, revocation teardown, pairing journals and recovery, removal with tombstones, Start over hook | `phase1a.pair-both-ways`, `phase1a.removal`, `phase1a.reconnect` |
-| M5b | path switch | `phase1a.once-or-unknown` (long call); terminal output with no gap |
-| M6 | local methods, push, picker source | allow-list test |
-| M7 | §7 UI; `jsqr` | component tests; real-app captures; the cross-machine and manual checks |
+| # | Repo | What | Proved by |
+|---|---|---|---|
+| S0 | M | **Spike** over in-memory engine streams, on a profile with no `net.db`, through the production caller path (`ThreadRouter` → `RoutedClient` → `directory.client`) and the real `rt.rpc`. Includes `EngineCaller`, `checkNodePolicy`, `renewSelf`, runtime build and activation, the `bridgeOn` gates and `bridge.policy` routing. | `tests/netEngine/spike.test.ts` (see the list below); go/no-go for §3–§4 |
+| E1 | E | `serve --app` on stdio: framing with stream handles and in-order FIN, hello, the helper's own log, exit on EOF | `tests/app_channel.rs`: equal wire ids on two connections; a stalled final write |
+| E2 | E | pumps, app credit, engine receive admission (stream caps), read-ahead, priority | `phase1a.app-channel` |
+| E3 | E | invite, approval, `join {pinned}`, idempotent `grant.add`, the revoke journal with pause and replay, peers | `phase1a.helper-removal`; Phase 0 `loopback.rs` |
+| E5a | E | persisted candidates, parallel dial, keep connected, browse-source trait, private-range routes | `phase1a.discovery` |
+| E5b | E | renewals → `path.reopen`, interface watcher, wake | `ManualClock` tests |
+| E6 | E | kit: `app = true`, `app/MOUSSE_REVISION`, app builds in signed results, `tools/app-check/run.mjs` | kit self-tests |
+| M1 | M | build and package the helper; macOS local-network and keychain spike | the packaged app runs the helper on Windows and macOS |
+| M2 | M | spawn, restart, shutdown, pumps; `startNetworkedProfiles` | fake and real helper tests; packaged Windows and macOS parent hard kill |
+| M3 | M | engine session over the helper; `authorizeEngine` and allowlist; engine-only `result.get` waiting; §4.4 delivery checks; staging branch | `phase1a.once-or-unknown`, `phase1a.private-streams` |
+| M4 | M | peer directory, the §4.3 and §4.5 call sites, session hooks, stream binding, roster-release fix | v1 Bridge tests unchanged; `phase1a.picker-v1-off` |
+| M5a | M | peer table, selection, `teardown(localId)`, pairing journals and recovery, removal with tombstones, Start over hook | `phase1a.pair-both-ways`, `phase1a.removal`, `phase1a.reconnect` |
+| M5b | M | path switch | `phase1a.path-switch` |
+| M6 | M | local methods, push, picker source | allow-list test |
+| M7 | M | §7 UI, including the same-account notice; `jsqr` | component tests; real-app captures; `phase1a.pair-offline`, `phase1a.shared-computer`, `phase1a.pair-in-person` (attested) |
+
+**S0 covers:**
+
+- terminal access set through `bridge.policy`;
+- one routed call;
+- a thread and a terminal (`net.info`, `routed.stream.open`);
+- a paged read, a durable artifact reply and a staged write, the last
+  through the production allowlist (`routed.stage`);
+- live records and a snapshot;
+- +8 and +40 days, and a terminal held open through a renewal;
+- a v1 non-keeper profile: refused with v1 off, working with v1 on;
+- that the picker views need no Hub;
+- a list of every node-id, reader and stream field in routed params and
+  results, including `artifact.caller`.
 
 **Existing Mousse files touched**
 
@@ -952,8 +1038,8 @@ M = Mousse.
 - **Profiles:** `ProfileHost.ts`, `MousseMainService.ts`,
   `MmsProfileServices.ts` (start, stop and the `bridge` gate).
 - **Bridge:**
-  - `BridgeProfileService.ts`: gates, `activateBridge`, and reading the
-    directory.
+  - `BridgeProfileService.ts`: gates, `activateBridge`, reading the
+    directory, and `release` keeping serving engine nodes.
   - `bridge/registerMethods.ts`: the `bridgeOn()` gates.
   - `routed/ThreadRouter.ts` (client from the directory),
     `routed/RoutedClient.ts` (remaining budget), `remote/botReach.ts`,
@@ -971,7 +1057,7 @@ M = Mousse.
 Not touched: `sync/session.ts`, `sync/supervisor.ts`, `transports/*`,
 `link/*`, `NetDevicesSection.tsx` and `components/devices/*`.
 
-## 11. Risks and open questions
+## 11. Risks and settled questions
 
 **Risks**
 
@@ -985,7 +1071,7 @@ Not touched: `sync/session.ts`, `sync/supervisor.ts`, `transports/*`,
 4. **Linux without a secret service:** no endpoint; the switch says so.
 5. **No webcam on either desktop:** no pairing until Phase 1b send links.
 
-**Answered in round 3**
+**Settled questions**
 
 1. **`result.get` waiting:** for engine callers only (§3.7).
 2. **Start-up sweep:** enough, because the `removing` and `removed` states
