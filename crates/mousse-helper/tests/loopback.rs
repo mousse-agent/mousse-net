@@ -59,7 +59,17 @@ fn temp_dir(tag: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    std::env::temp_dir().join(format!("mousse-helper-it-{tag}-{}-{n}", std::process::id()))
+    // On Unix the control socket goes in this folder, and a socket path
+    // must stay short (104 bytes on macOS).
+    if cfg!(windows) {
+        std::env::temp_dir().join(format!("mousse-helper-it-{tag}-{}-{n}", std::process::id()))
+    } else {
+        PathBuf::from("/tmp").join(format!(
+            "mh-{tag}-{}-{}",
+            std::process::id(),
+            n % 1_000_000_000
+        ))
+    }
 }
 
 /// A command that prints `hello-<tag>` on the host.
@@ -740,6 +750,13 @@ fn the_state_folder_control_file_and_control_channel_are_owner_only() {
         // A named pipe that allows the current user alone.
         assert!(addr.starts_with(r"\\.\pipe\"), "{addr}");
         assert!(is_owner_only(std::path::Path::new(&addr)).unwrap(), "pipe");
+    } else {
+        // A Unix socket in the owner-only state folder, owner-only itself.
+        assert_eq!(addr, "unix:control.sock");
+        assert!(
+            is_owner_only(&host.dir.join("control.sock")).unwrap(),
+            "control.sock"
+        );
     }
     // The control channel still works for the owner.
     let status = host.run(&["id"]);

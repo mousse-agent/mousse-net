@@ -140,7 +140,7 @@ pub async fn run(
         None
     };
 
-    let mut control = ControlListener::bind().await?;
+    let mut control = ControlListener::bind(state_dir).await?;
     let token = hex(&random_bytes::<32>());
     ipc::write_control_file(state_dir, control.addr(), &token)?;
 
