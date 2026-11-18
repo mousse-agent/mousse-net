@@ -335,6 +335,9 @@ name = "mousse-sim"
 version = "0.1.0"
 dependencies = [
  "mousse-net-core",
+ "rand_chacha",
+ "rand_core",
+ "sha2",
 ]
 
 [[package]]
