@@ -313,7 +313,11 @@ includes both identity keys.
   after it, whatever it is doing.
 - **Renewal** starts at `min(not_after) − 1800`, but never before the later
   `not_before`. The side whose certificate runs out first issues a new one.
-  Renewal is a path switch.
+  Renewal is a path switch. While no new path has become current, renewal
+  is retried: 30 s after the first try, then waits of 60, 120 and 240 s,
+  then every 300 s, until the effective deadline. A retry is skipped while
+  a candidate path is still being brought up. Vectors:
+  `session-lifecycle.json`.
 - **Path switch:** open a new connection to the same peer, run step 1 with
   the **same pin**, reopen channels on it (the application resumes from its
   own cursors), then close the old connection with `PATH_REPLACED`. If the
@@ -354,7 +358,9 @@ Rules:
   identity removes its grant, closes its connections, and blocks new grants
   until the denial is lifted. Lifting a denial grants nothing. It has no
   effect on other endpoints of the same device.
-- Grant ids are local and never reused.
+- Grant ids are local and never reused, also across restarts: an endpoint
+  stores the next grant id with its grants, because the grant that last
+  used an id may already be gone.
 
 **Removal from another device (later phases).** Phase 0 removes grants only
 locally. When removal messages are added, an endpoint accepts one only from
@@ -561,7 +567,13 @@ Expiry:
   At `expires_at` the invitation ends and its join-only connections close
   with `INVITATION_INVALID`.
 - The joiner refuses to start while `now ≥ expires_at + 600` (its clock may
-  differ).
+  differ). A joiner that is only learning the outcome of an earlier attempt
+  (10.6) reconnects even after that.
+
+Invitations live only in the host endpoint's memory in version 1. When the
+host restarts, its open invitations end; their tickets then fail with
+`INVITATION_INVALID`, and the owner creates a new invitation. Grants made
+before the restart are stored and stay.
 
 The joiner pins the ticket's host identity for step 1 on first contact.
 
@@ -684,7 +696,7 @@ with these inputs:
 | `PRS` | the attempt's code (10.6): its 6 ASCII digits |
 | `CI` | the binding transcript bytes |
 | `sid` | the attempt's session id |
-| `ADa`, `ADb` | empty. Senders MUST send empty AD; receivers ignore AD. |
+| `ADa`, `ADb` | empty. Senders MUST send empty AD. A receiver refuses a share with non-empty AD as malformed, before any group work. |
 | Initiator (A) | the joiner |
 | Responder (B) | the host |
 
@@ -728,6 +740,19 @@ CPace output `ISK` is not used by pairing in version 1.
 6. Either side ends a failed attempt with `CODE_ABORT {attempt,
    PAIRING_FAILED}`. The joiner shows the attempts it has left and the owner
    may type the new code on the same connection.
+7. **Outcome after a lost connection.** Once the joiner has sent `msg_c`,
+   the host may have enrolled it. If the connection closes before `PAIRED`
+   arrives, the joiner does not count the attempt as failed yet. It
+   reconnects with the same ticket, even with no attempts left and even
+   after the ticket's joiner-side expiry, sends `HELLO` and `JOIN_PROOF` as
+   usual, and step 2 gives the outcome:
+   - `AUTHORIZED {live}`: the host enrolled it. Pairing succeeded ("already
+     paired"); the joiner keeps the ticket's host identity as its pin.
+   - `AUTHORIZED {join_only}`: not enrolled. With attempts left the owner
+     may type the current code; with none left the flow ends with
+     `ATTEMPTS_EXHAUSTED`.
+   - A close with `INVITATION_INVALID` or `ATTEMPTS_EXHAUSTED`: not
+     enrolled; the flow ends.
 
 Random draws, in order (vectors depend on it): the host draws the invitation
 id (16 bytes), the secret (16 bytes) and, for "Send link", the first code
@@ -750,7 +775,13 @@ attempt, the attempt id (16 bytes) and then its CPace scalar.
   attempts but cannot cancel the real host's invitation; each side's count is
   local.
 - **Attempt key.** The host keys attempts by **(TLS session, attempt id)**.
-  The same attempt id on another TLS session is a new, counted attempt.
+  An attempt id the host has already seen on another TLS session of the
+  invitation is a replay: its messages are bound to the old session's
+  exporter and can never succeed. The host answers it with `CODE_ABORT
+  {attempt, PAIRING_FAILED}` **before** any debit and without exchange work
+  or a new code, so replays cannot spend the invitation's attempts.
+  Vectors: `pairing-attempts.json`
+  `attempt_replayed_on_another_connection_is_refused`.
 - **Resends.** A sender may resend only a **byte-identical** message. When the
   host receives, for an existing attempt, a payload identical to the last one
   it received, it replies with the same bytes it sent before and does no new
@@ -775,7 +806,8 @@ routes:
 
 Cancelling or declining an invitation grants nothing. A joiner that already
 holds a live grant gets `AUTHORIZED {live}` at step 2 and pairing ends with
-"already paired".
+"already paired". That is also how a joiner whose `PAIRED` was lost learns
+that it was enrolled (10.6).
 
 ## 11. Control messages
 
