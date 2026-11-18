@@ -74,18 +74,11 @@ impl Limits {
         mousse_net_io::Limits::specs().chain(HelperLimits::SPECS)
     }
 
-    fn set(&mut self, name: &str, value: u64) -> Result<(), LimitError> {
-        if HelperLimits::SPECS.iter().any(|s| s.name == name) {
-            self.helper.set(name, value)
-        } else {
-            self.net.set(name, value)
-        }
-    }
-
     /// Defaults overridden by the `MOUSSE_NET_<NAME>` variables `var`
     /// returns. Errors name the variable and its allowed range.
     pub fn from_vars(var: impl Fn(&str) -> Option<OsString>) -> Result<Self, String> {
-        let mut limits = Self::DEFAULT;
+        let mut net = Vec::new();
+        let mut helper = Vec::new();
         for spec in Self::specs() {
             let key = format!("{ENV_PREFIX}{}", spec.name);
             let Some(raw) = var(&key) else {
@@ -97,18 +90,31 @@ impl Limits {
                 .ok_or_else(|| format!("{key} is not valid text; {range}"))?;
             let value = parse_whole(text)
                 .ok_or_else(|| format!("{key}={text:?} is not a whole number; {range}"))?;
-            limits.set(spec.name, value).map_err(|e| match e {
-                LimitError::OutOfRange { value, .. } => {
-                    format!("{key}={value} is out of range; {range}")
-                }
-                other => format!("{key}: {other}"),
-            })?;
+            if HelperLimits::SPECS.iter().any(|s| s.name == spec.name) {
+                helper.push((spec.name, value));
+            } else {
+                net.push((spec.name, value));
+            }
         }
-        limits
-            .net
-            .validate()
-            .map_err(|e| format!("{ENV_PREFIX}* limits do not agree: {e}"))?;
-        Ok(limits)
+        let explain = |e: LimitError| match e {
+            LimitError::OutOfRange {
+                name,
+                value,
+                min,
+                max,
+            } => format!(
+                "{ENV_PREFIX}{name}={value} is out of range; allowed range is {min} to {max}"
+            ),
+            LimitError::Conflict(why) => format!("{ENV_PREFIX}* limits do not agree: {why}"),
+            other => other.to_string(),
+        };
+        Ok(Self {
+            net: Self::DEFAULT.net.with_overrides(&net).map_err(explain)?,
+            helper: Self::DEFAULT
+                .helper
+                .with_overrides(&helper)
+                .map_err(explain)?,
+        })
     }
 
     /// Unknown `MOUSSE_NET_*` names among `names`, most likely typos.
@@ -199,10 +205,10 @@ mod tests {
             ("MOUSSE_NET_CAPTURE_WAIT_MS", "60000"),
         ]))
         .unwrap();
-        assert_eq!(l.net.core.clock_skew_secs, 120);
-        assert_eq!(l.net.io.connect_timeout_ms, 2_500);
+        assert_eq!(l.net.core().clock_skew_secs(), 120);
+        assert_eq!(l.net.io().connect_timeout_ms(), 2_500);
         assert_eq!(l.helper.capture_wait_ms, 60_000);
-        assert_eq!(l.net.core.join_proof_wait_ms, 10_000);
+        assert_eq!(l.net.core().join_proof_wait_ms(), 10_000);
     }
 
     #[test]

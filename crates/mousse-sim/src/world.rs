@@ -8,7 +8,7 @@ use mousse_net_core::pairing::{InvitationId, SessionExporters};
 use mousse_net_core::session_cert::{CertError, SessionCertificate, VerifiedSessionCert};
 use mousse_net_core::{ConnectionId, ErrorCode, Limits, UnixTime};
 
-const CLOCK_SKEW_SECS: u64 = Limits::DEFAULT.clock_skew_secs;
+const CLOCK_SKEW_SECS: u64 = Limits::DEFAULT.clock_skew_secs();
 use rand_core::Rng;
 
 use crate::caller::{CallerDev, Mode, Outcome, WRONG_ENDPOINT};

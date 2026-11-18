@@ -154,7 +154,7 @@ fn read_size(n: u64) -> usize {
 
 fn pty_size(cols: u16, rows: u16) -> PtySize {
     // `TERM_MAX_DIMENSION`, at most 4 000, so it fits.
-    let max = u16::try_from(crate::limits::helper().term_max_dimension).unwrap_or(u16::MAX);
+    let max = u16::try_from(crate::limits::helper().term_max_dimension()).unwrap_or(u16::MAX);
     PtySize {
         rows: rows.clamp(1, max),
         cols: cols.clamp(1, max),
@@ -233,7 +233,7 @@ fn spawn_pty(cols: u16, rows: u16, argv: &[String], out: mpsc::Sender<Out>) -> R
     let out_reader = out.clone();
     std::thread::spawn(move || {
         let mut answered = !cfg!(windows);
-        let mut buf = vec![0u8; read_size(crate::limits::helper().term_pty_read_bytes)];
+        let mut buf = vec![0u8; read_size(crate::limits::helper().term_pty_read_bytes())];
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
@@ -305,7 +305,7 @@ pub async fn serve(mut stream: MuxStream) {
     };
     let (mut rd, wr) = stream.split();
     let (out_tx, mut out_rx) =
-        mpsc::channel::<Out>(read_size(crate::limits::helper().term_output_queue));
+        mpsc::channel::<Out>(read_size(crate::limits::helper().term_output_queue()));
     let pty = match spawn_pty(cols, rows, &argv, out_tx) {
         Ok(pty) => pty,
         Err(e) => {
@@ -353,9 +353,9 @@ pub async fn serve(mut stream: MuxStream) {
                     // Let the last output through, then close the PTY so
                     // the reader ends; send EXIT even if it never does.
                     let limits = crate::limits::helper();
-                    close_master_after(&master, crate::limits::ms(limits.term_close_delay_ms));
+                    close_master_after(&master, crate::limits::ms(limits.term_close_delay_ms()));
                     grace = Some(Box::pin(tokio::time::sleep(crate::limits::ms(
-                        limits.term_exit_grace_ms,
+                        limits.term_exit_grace_ms(),
                     ))));
                 }
             },
@@ -466,7 +466,7 @@ pub async fn run_client(conn: &Connection, argv: Vec<String>) -> Result<ClientEn
     let stdin_wr = wr.clone();
     let stdin_task = tokio::spawn(async move {
         let mut stdin = tokio::io::stdin();
-        let mut buf = vec![0u8; read_size(crate::limits::helper().term_stdin_read_bytes)];
+        let mut buf = vec![0u8; read_size(crate::limits::helper().term_stdin_read_bytes())];
         loop {
             match stdin.read(&mut buf).await {
                 // No more input: finish our side; the command keeps running.
@@ -491,7 +491,7 @@ pub async fn run_client(conn: &Connection, argv: Vec<String>) -> Result<ClientEn
         let wr = wr.clone();
         tokio::spawn(async move {
             let mut last = (cols, rows);
-            let poll = crate::limits::ms(crate::limits::helper().term_resize_poll_ms);
+            let poll = crate::limits::ms(crate::limits::helper().term_resize_poll_ms());
             loop {
                 tokio::time::sleep(poll).await;
                 if let Ok(now) = crossterm::terminal::size() {

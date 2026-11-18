@@ -111,8 +111,8 @@ impl Advertiser {
     /// multicast sockets.
     pub fn start(port: u16, clock: Arc<dyn Clock>, limits: &IoLimits) -> Result<Self, NetError> {
         let daemon = ServiceDaemon::new().map_err(mdns_err)?;
-        let rotating = RotatingName::new(&mut os_rng(), clock.mono(), limits.mdns_rotate_ms);
-        let check = ms(limits.mdns_rotate_check_ms);
+        let rotating = RotatingName::new(&mut os_rng(), clock.mono(), limits.mdns_rotate_ms());
+        let check = ms(limits.mdns_rotate_check_ms());
         daemon
             .register(service(rotating.current(), port)?)
             .map_err(mdns_err)?;
@@ -196,7 +196,7 @@ mod tests {
         let mut r = os_rng();
         let names: BTreeSet<String> = (0..64)
             .map(|_| {
-                RotatingName::new(&mut r, Millis(0), IoLimits::DEFAULT.mdns_rotate_ms)
+                RotatingName::new(&mut r, Millis(0), IoLimits::DEFAULT.mdns_rotate_ms())
                     .current()
                     .to_owned()
             })

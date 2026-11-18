@@ -218,7 +218,7 @@ fn arrival(in_person: bool) -> mousse_net_core::pairing::Arrival {
 fn computer_name() -> String {
     let name = gethostname::gethostname().to_string_lossy().into_owned();
     let mut out: String = name.chars().filter(|c| !c.is_control()).collect();
-    let max = usize::try_from(limits::helper().computer_name_max_bytes).unwrap_or(usize::MAX);
+    let max = usize::try_from(limits::helper().computer_name_max_bytes()).unwrap_or(usize::MAX);
     while out.len() > max {
         out.pop();
     }
@@ -272,7 +272,7 @@ fn storage(insecure: bool) -> KeyStorage {
 /// `ENDPOINT_LOCK_WAIT_MS` before giving up.
 pub fn open_endpoint(dir: &Path, shared: bool) -> Result<Endpoint, String> {
     let limits = limits::helper();
-    let deadline = std::time::Instant::now() + limits::ms(limits.endpoint_lock_wait_ms);
+    let deadline = std::time::Instant::now() + limits::ms(limits.endpoint_lock_wait_ms());
     loop {
         let opened = if shared {
             Endpoint::open_shared(dir)
@@ -282,7 +282,7 @@ pub fn open_endpoint(dir: &Path, shared: bool) -> Result<Endpoint, String> {
         match opened {
             Ok(endpoint) => return Ok(endpoint),
             Err(mousse_net_io::NetError::Refused(_)) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(limits::ms(limits.endpoint_lock_retry_ms));
+                std::thread::sleep(limits::ms(limits.endpoint_lock_retry_ms()));
             }
             Err(e) => return Err(e.to_string()),
         }
@@ -611,7 +611,7 @@ async fn run(cli: Cli) -> Result<i32, String> {
                 routes,
                 command,
                 removal_timeout: Duration::from_secs(
-                    removal_timeout.unwrap_or(limits::helper().removal_wait_secs),
+                    removal_timeout.unwrap_or(limits::helper().removal_wait_secs()),
                 ),
                 out,
                 control,

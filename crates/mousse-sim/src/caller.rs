@@ -135,7 +135,7 @@ impl CallerDev {
             identity: certs::identity_key(key_label).public_key(),
             cert: certs::certificate(key_label, certs::grid(sim.wall(id)), lifetime),
             cert_lifetime: lifetime,
-            renew_lead: Limits::DEFAULT.renew_lead_secs,
+            renew_lead: Limits::DEFAULT.renew_lead_secs(),
             mode: Mode::Idle,
             expected_host: None,
             host_dev: 0,

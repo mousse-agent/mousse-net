@@ -8,6 +8,11 @@
 //!
 //! A limit the peer or a security bound depends on may only be tightened:
 //! its range ends at the value the spec gives.
+//!
+//! A limits value is always valid: its fields are private, and the only
+//! way to change them is [`Limits::with_overrides`], which checks every
+//! range and the limits that must agree, so a value outside the spec can
+//! never reach a state machine.
 
 use core::fmt;
 
@@ -80,9 +85,12 @@ impl fmt::Display for LimitError {
 
 impl std::error::Error for LimitError {}
 
-/// Define a set of limits: a `Copy` struct of `u64` fields with a `DEFAULT`
-/// constant, a `SPECS` table (name, default, range, what), and `get`/`set`
-/// by name. Each default is checked against its range at compile time.
+/// Define a set of limits: a `Copy` struct of private `u64` fields with a
+/// read accessor each, a `DEFAULT` constant, a `SPECS` table (name,
+/// default, range, what), `get` by name, and `with_overrides`, the one way
+/// to change values. Each default is checked against its range at compile
+/// time. An optional `agree(v) { ... }` block returns
+/// [`LimitError::Conflict`] when limits that must agree do not.
 ///
 /// ```
 /// mousse_net_core::define_limits! {
@@ -92,7 +100,10 @@ impl std::error::Error for LimitError {}
 ///         wait_ms = "WAIT_MS": 1_000, [10, 5_000];
 ///     }
 /// }
-/// assert_eq!(Example::DEFAULT.wait_ms, 1_000);
+/// assert_eq!(Example::DEFAULT.wait_ms(), 1_000);
+/// let tighter = Example::DEFAULT.with_overrides(&[("WAIT_MS", 50)]).unwrap();
+/// assert_eq!(tighter.wait_ms(), 50);
+/// assert!(Example::DEFAULT.with_overrides(&[("WAIT_MS", 9_000)]).is_err());
 /// ```
 #[macro_export]
 macro_rules! define_limits {
@@ -104,14 +115,12 @@ macro_rules! define_limits {
                 $field:ident = $env:literal: $default:expr, [$min:expr, $max:expr];
             )+
         }
+        $( agree($v:ident) $agree:block )?
     ) => {
         $(#[$meta])*
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         pub struct $name {
-            $(
-                #[doc = $doc]
-                pub $field: u64,
-            )+
+            $( $field: u64, )+
         }
 
         const _: () = {
@@ -139,6 +148,13 @@ macro_rules! define_limits {
                 )+
             ];
 
+            $(
+                #[doc = $doc]
+                pub const fn $field(&self) -> u64 {
+                    self.$field
+                }
+            )+
+
             /// The value of the limit called `name`.
             pub fn get(&self, name: &str) -> Option<u64> {
                 match name {
@@ -147,32 +163,33 @@ macro_rules! define_limits {
                 }
             }
 
-            /// Set the limit called `name`, within its range.
-            pub fn set(&mut self, name: &str, value: u64) -> Result<(), $crate::limits::LimitError> {
-                let spec = Self::SPECS
-                    .iter()
-                    .find(|s| s.name == name)
-                    .ok_or_else(|| $crate::limits::LimitError::Unknown(name.to_owned()))?;
-                spec.check(value)?;
-                match name {
-                    $( $env => self.$field = value, )+
-                    _ => {}
+            /// These limits with `overrides` (name, value) applied, all at
+            /// once. Every value must be within its range and the result's
+            /// limits must agree; otherwise the error names the first
+            /// problem and nothing is returned.
+            pub fn with_overrides(
+                &self,
+                overrides: &[(&str, u64)],
+            ) -> Result<Self, $crate::limits::LimitError> {
+                let mut out = *self;
+                for &(name, value) in overrides {
+                    let spec = Self::SPECS
+                        .iter()
+                        .find(|s| s.name == name)
+                        .ok_or_else(|| $crate::limits::LimitError::Unknown(name.to_owned()))?;
+                    spec.check(value)?;
+                    match name {
+                        $( $env => out.$field = value, )+
+                        _ => {}
+                    }
                 }
-                Ok(())
+                out.agree()?;
+                Ok(out)
             }
 
-            /// Check every value against its range.
-            pub fn check_ranges(&self) -> Result<(), $crate::limits::LimitError> {
-                $(
-                    $crate::limits::LimitSpec {
-                        name: $env,
-                        default: $default,
-                        min: $min,
-                        max: $max,
-                        what: $doc,
-                    }
-                    .check(self.$field)?;
-                )+
+            /// Whether the limits that must agree do.
+            fn agree(&self) -> Result<(), $crate::limits::LimitError> {
+                $( let $v = self; $agree )?
                 Ok(())
             }
         }
@@ -215,19 +232,13 @@ define_limits! {
         /// Code attempts the joiner allows per ticket; a stored flow record holds at most 3 (wire.md 10.7; tighten only).
         joiner_attempts_per_flow = "JOINER_ATTEMPTS_PER_FLOW": 3, [1, 3];
     }
-}
-
-impl Limits {
-    /// Check every range and the limits that must agree.
-    pub fn validate(&self) -> Result<(), LimitError> {
-        self.check_ranges()?;
-        if self.renew_retry_max_secs < self.renew_retry_first_secs {
+    agree(l) {
+        if l.renew_retry_max_secs < l.renew_retry_first_secs {
             return Err(LimitError::Conflict(format!(
                 "RENEW_RETRY_MAX_SECS ({}) is below RENEW_RETRY_FIRST_SECS ({})",
-                self.renew_retry_max_secs, self.renew_retry_first_secs
+                l.renew_retry_max_secs, l.renew_retry_first_secs
             )));
         }
-        Ok(())
     }
 }
 
@@ -239,24 +250,24 @@ mod tests {
     fn the_defaults_are_the_spec_values() {
         let d = Limits::DEFAULT;
         // wire.md 8, step 2.
-        assert_eq!(d.join_proof_wait_ms, 10_000);
+        assert_eq!(d.join_proof_wait_ms(), 10_000);
         // wire.md 9.2 to 9.4.
-        assert_eq!(d.keepalive_ms, 15_000);
-        assert_eq!(d.idle_timeout_ms, 45_000);
-        assert_eq!(d.max_peer_streams, 1_024);
-        assert_eq!(d.send_chunk_bytes, 16_384);
-        assert_eq!(d.credit_return_bytes, 65_536);
+        assert_eq!(d.keepalive_ms(), 15_000);
+        assert_eq!(d.idle_timeout_ms(), 45_000);
+        assert_eq!(d.max_peer_streams(), 1_024);
+        assert_eq!(d.send_chunk_bytes(), 16_384);
+        assert_eq!(d.credit_return_bytes(), 65_536);
         // wire.md 1.
-        assert_eq!(d.clock_skew_secs, 600);
+        assert_eq!(d.clock_skew_secs(), 600);
         // wire.md 6: renew 30 min before; retry after 30 s, at most 300 s.
-        assert_eq!(d.renew_lead_secs, 1_800);
-        assert_eq!(d.renew_retry_first_secs, 30);
-        assert_eq!(d.renew_retry_max_secs, 300);
+        assert_eq!(d.renew_lead_secs(), 1_800);
+        assert_eq!(d.renew_retry_first_secs(), 30);
+        assert_eq!(d.renew_retry_max_secs(), 300);
         // wire.md 10.2 and 10.7.
-        assert_eq!(d.ticket_lifetime_secs, 600);
-        assert_eq!(d.host_attempts_per_invitation, 3);
-        assert_eq!(d.joiner_attempts_per_flow, 3);
-        assert_eq!(d.validate(), Ok(()));
+        assert_eq!(d.ticket_lifetime_secs(), 600);
+        assert_eq!(d.host_attempts_per_invitation(), 3);
+        assert_eq!(d.joiner_attempts_per_flow(), 3);
+        assert_eq!(d.with_overrides(&[]), Ok(d));
         assert_eq!(Limits::default(), d);
     }
 
@@ -299,13 +310,14 @@ mod tests {
     }
 
     #[test]
-    fn set_checks_the_range_and_the_name() {
-        let mut l = Limits::DEFAULT;
-        assert_eq!(l.set("CLOCK_SKEW_SECS", 120), Ok(()));
-        assert_eq!(l.clock_skew_secs, 120);
+    fn overrides_check_the_range_and_the_name() {
+        let l = Limits::DEFAULT
+            .with_overrides(&[("CLOCK_SKEW_SECS", 120)])
+            .unwrap();
+        assert_eq!(l.clock_skew_secs(), 120);
         assert_eq!(l.get("CLOCK_SKEW_SECS"), Some(120));
         assert_eq!(
-            l.set("CLOCK_SKEW_SECS", 601),
+            l.with_overrides(&[("CLOCK_SKEW_SECS", 601)]),
             Err(LimitError::OutOfRange {
                 name: "CLOCK_SKEW_SECS",
                 value: 601,
@@ -313,9 +325,8 @@ mod tests {
                 max: 600
             })
         );
-        assert_eq!(l.clock_skew_secs, 120);
         assert_eq!(
-            l.set("JOINER_ATTEMPTS_PER_FLOW", 4),
+            l.with_overrides(&[("JOINER_ATTEMPTS_PER_FLOW", 4)]),
             Err(LimitError::OutOfRange {
                 name: "JOINER_ATTEMPTS_PER_FLOW",
                 value: 4,
@@ -323,14 +334,23 @@ mod tests {
                 max: 3
             })
         );
-        assert!(matches!(l.set("NO_SUCH", 1), Err(LimitError::Unknown(_))));
+        assert!(matches!(
+            l.with_overrides(&[("NO_SUCH", 1)]),
+            Err(LimitError::Unknown(_))
+        ));
     }
 
     #[test]
     fn retry_waits_must_agree() {
-        let mut l = Limits::DEFAULT;
-        l.set("RENEW_RETRY_FIRST_SECS", 20).unwrap();
-        l.set("RENEW_RETRY_MAX_SECS", 10).unwrap();
-        assert!(matches!(l.validate(), Err(LimitError::Conflict(_))));
+        // Checked once all overrides are in, so their order does not matter.
+        let l = Limits::DEFAULT
+            .with_overrides(&[("RENEW_RETRY_MAX_SECS", 10), ("RENEW_RETRY_FIRST_SECS", 5)])
+            .unwrap();
+        assert_eq!(l.renew_retry_max_secs(), 10);
+        assert!(matches!(
+            Limits::DEFAULT
+                .with_overrides(&[("RENEW_RETRY_FIRST_SECS", 20), ("RENEW_RETRY_MAX_SECS", 10)]),
+            Err(LimitError::Conflict(_))
+        ));
     }
 }

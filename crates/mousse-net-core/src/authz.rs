@@ -177,7 +177,7 @@ impl ConnectionGate {
                 Err(_) => GateState::Closed(ErrorCode::NotAuthorized),
             },
             Step2::AwaitJoinProof => GateState::AwaitingJoinProof {
-                deadline: mono.plus(limits.join_proof_wait_ms),
+                deadline: mono.plus(limits.join_proof_wait_ms()),
             },
             Step2::Close(code) => GateState::Closed(code),
         };
@@ -703,22 +703,23 @@ mod tests {
         let mut gate = ConnectionGate::open(ConnectionId(1), id(2), &mut grants, NOW, Millis(100));
         assert_eq!(
             gate.poll_timeout(),
-            Some(Millis(100 + Limits::DEFAULT.join_proof_wait_ms))
+            Some(Millis(100 + Limits::DEFAULT.join_proof_wait_ms()))
         );
         assert_eq!(
-            gate.on_timeout(Millis(100 + Limits::DEFAULT.join_proof_wait_ms - 1)),
+            gate.on_timeout(Millis(100 + Limits::DEFAULT.join_proof_wait_ms() - 1)),
             None
         );
         assert_eq!(
-            gate.on_timeout(Millis(100 + Limits::DEFAULT.join_proof_wait_ms)),
+            gate.on_timeout(Millis(100 + Limits::DEFAULT.join_proof_wait_ms())),
             Some(ErrorCode::NotAuthorized)
         );
     }
 
     #[test]
     fn a_tightened_join_proof_wait_is_used() {
-        let mut limits = Limits::DEFAULT;
-        limits.set("JOIN_PROOF_WAIT_MS", 2_000).unwrap();
+        let limits = Limits::DEFAULT
+            .with_overrides(&[("JOIN_PROOF_WAIT_MS", 2_000)])
+            .unwrap();
         let mut grants = GrantTable::new();
         let mut gate = ConnectionGate::open_with_limits(
             ConnectionId(1),

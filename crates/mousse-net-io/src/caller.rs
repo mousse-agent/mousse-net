@@ -36,6 +36,11 @@
 //!   app therefore resets nothing, and a crash after the confirmation still
 //!   learns the outcome. The mark is cleared once the app has stored the
 //!   pin and called [`Caller::pin_stored`].
+//! - One join per ticket at a time: a join holds its ticket
+//!   ([`FlowRecords::hold`]) from loading the record until the outcome is
+//!   settled and the pin stored, so another join of the same link, in this
+//!   process or another, cannot clear a pending mark the first still needs.
+//!   It is refused at once instead.
 //! - A caller that sent a `JOIN_PROOF` and has no answer 10 s later closes
 //!   the connection with `NOT_AUTHORIZED` (wire.md 8.2), and the join ends
 //!   without reconnecting.
@@ -66,7 +71,7 @@ use crate::error::NetError;
 use crate::limits::{ms, Limits};
 use crate::pipe::{connect_tcp_within, route_uri, Pipe, Route};
 use crate::rng::os_rng;
-use crate::store::{FlowRecords, MemoryFlowRecords};
+use crate::store::{FlowHold, FlowRecords, MemoryFlowRecords};
 use crate::tls::{self, Handshake, TlsPolicy};
 use crate::SharedSigner;
 
@@ -153,7 +158,8 @@ pub struct Caller<F: CodeExchangeFactory + Clone = CpaceExchangeFactory> {
     next_conn: AtomicU64,
     records: Arc<dyn FlowRecords>,
     /// Joins that ended paired with their outcome still marked pending,
-    /// by ticket hash, until the app says the pin is stored.
+    /// by ticket hash, until the app says the pin is stored. Each still
+    /// holds its ticket.
     settling: Mutex<HashMap<[u8; 32], SharedJoiner<F>>>,
 }
 
@@ -167,6 +173,9 @@ struct Flow<F: CodeExchangeFactory> {
     records: Arc<dyn FlowRecords>,
     /// The last write that failed, reported if the join fails.
     save_failed: Option<String>,
+    /// This flow's hold on its ticket, released when the flow is dropped:
+    /// when the join ends, or once the pin is stored.
+    _hold: FlowHold,
 }
 
 impl<F: CodeExchangeFactory> Flow<F> {
@@ -206,7 +215,8 @@ fn lock_joiner<F: CodeExchangeFactory>(joiner: &Mutex<Flow<F>>) -> MutexGuard<'_
 
 impl Caller<CpaceExchangeFactory> {
     /// A caller that pairs in person or with a send link (CPace).
-    /// `limits` should pass [`Limits::validate`].
+    /// `limits` is always within the allowed ranges
+    /// ([`Limits::with_overrides`] is the only way to change it).
     pub fn new(signer: SharedSigner, clock: Arc<dyn Clock>, limits: Limits) -> Self {
         Self::with_factory(signer, clock, limits, CpaceExchangeFactory)
     }
@@ -305,14 +315,14 @@ where
             .unwrap_or_default();
         let mut last = NetError::Refused("no known route to this host".into());
         for route in &routes {
-            let pipe = match connect_tcp_within(route, ms(self.limits.io.connect_timeout_ms)).await
-            {
-                Ok(pipe) => pipe,
-                Err(e) => {
-                    last = e;
-                    continue;
-                }
-            };
+            let pipe =
+                match connect_tcp_within(route, ms(self.limits.io().connect_timeout_ms())).await {
+                    Ok(pipe) => pipe,
+                    Err(e) => {
+                        last = e;
+                        continue;
+                    }
+                };
             let conn = match self.connect(pipe, pin).await {
                 Ok(conn) => conn,
                 Err(NetError::PeerCertificate(CertError::PinMismatch)) => continue,
@@ -342,7 +352,7 @@ where
             let events = paths
                 .sessions
                 .entry(pin)
-                .or_insert_with(|| PeerSession::with_limits(pin, &self.limits.core))
+                .or_insert_with(|| PeerSession::with_limits(pin, self.limits.core()))
                 .begin_path(conn);
             paths.run(events);
         }
@@ -351,7 +361,7 @@ where
         let session = paths
             .sessions
             .entry(pin)
-            .or_insert_with(|| PeerSession::with_limits(pin, &self.limits.core));
+            .or_insert_with(|| PeerSession::with_limits(pin, self.limits.core()));
         match result {
             Ok((stream, handshake)) => {
                 match session.on_authenticated(
@@ -387,7 +397,7 @@ where
     ) -> Connection {
         let (cmd_tx, cmd_rx) = conn::channel();
         lock(&self.paths).conns.insert(conn, cmd_tx.clone());
-        let skew = self.limits.core.clock_skew_secs;
+        let skew = self.limits.core().clock_skew_secs();
         let deadline = handshake
             .local_window
             .deadline_with_skew(skew)
@@ -401,7 +411,7 @@ where
             joiner,
             proof,
             answer_due: None,
-            answer_wait_ms: self.limits.io.proof_answer_wait_ms,
+            answer_wait_ms: self.limits.io().proof_answer_wait_ms(),
             clock: self.clock.clone(),
             paths: self.paths.clone(),
             conn,
@@ -495,14 +505,14 @@ where
         let mut last = None;
         let mut step1 = Step1Failures::default();
         for route in routes {
-            let pipe = match connect_tcp_within(route, ms(self.limits.io.connect_timeout_ms)).await
-            {
-                Ok(pipe) => pipe,
-                Err(e) => {
-                    last = Some(e);
-                    continue;
-                }
-            };
+            let pipe =
+                match connect_tcp_within(route, ms(self.limits.io().connect_timeout_ms())).await {
+                    Ok(pipe) => pipe,
+                    Err(e) => {
+                        last = Some(e);
+                        continue;
+                    }
+                };
             match self.dial(pipe, pin).await {
                 Ok(conn) => {
                     let mut order = vec![route.clone()];
@@ -600,6 +610,14 @@ where
         D: FnMut() -> Fut,
         Fut: Future<Output = Result<P, NetError>>,
     {
+        // A join of this ticket that ended paired and was never settled
+        // gives way: its pending mark stays stored, and this join learns
+        // the outcome again.
+        self.settling
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&ticket.hash());
+        let hold = self.records.hold(&ticket.hash())?;
         let stored = self.records.load(&ticket.hash())?;
         let mut pairing = JoinerPairing::with_limits(
             ticket.clone(),
@@ -614,7 +632,7 @@ where
             self.factory.clone(),
             stored.as_ref(),
             self.clock.now(),
-            &self.limits.core,
+            self.limits.core(),
         )
         .map_err(NetError::Join)?;
         pairing.set_host_pinned(host_pinned);
@@ -622,6 +640,7 @@ where
             pairing,
             records: self.records.clone(),
             save_failed: None,
+            _hold: hold,
         }));
         let result = self
             .join_redialling(pipe, ticket, &joiner, codes, redial)
@@ -701,7 +720,7 @@ where
                 lock(&self.paths)
                     .sessions
                     .entry(pin)
-                    .or_insert_with(|| PeerSession::with_limits(pin, &self.limits.core))
+                    .or_insert_with(|| PeerSession::with_limits(pin, self.limits.core()))
                     .on_path_closed(conn);
                 return Err(NetError::Join(e));
             }
@@ -767,7 +786,7 @@ where
 {
     let Some(recheck) = caller
         .upgrade()
-        .map(|caller| ms(caller.limits.io.clock_recheck_ms))
+        .map(|caller| ms(caller.limits.io().clock_recheck_ms()))
     else {
         return;
     };

@@ -100,7 +100,7 @@ impl HostDev {
             identity,
             cert,
             cert_lifetime: lifetime,
-            renew_lead: Limits::DEFAULT.renew_lead_secs,
+            renew_lead: Limits::DEFAULT.renew_lead_secs(),
             grants: GrantTable::new(),
             pairing,
             instance: 1,

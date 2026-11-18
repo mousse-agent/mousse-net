@@ -13,7 +13,7 @@ use mousse_net_core::session_cert::CertError;
 use mousse_net_core::ErrorCode;
 use mousse_net_io::certs::CertManager;
 use mousse_net_io::pipe::{connect_tcp, parse_route};
-use mousse_net_io::store::{FlowRecordStore, FlowRecords};
+use mousse_net_io::store::{FlowHold, FlowRecordStore, FlowRecords};
 use mousse_net_io::{tls, Caller, JoinOutcome, Limits, ManualClock, NetError, NoCode, TlsPolicy};
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
@@ -150,6 +150,10 @@ impl FlowRecords for BrokenRecords {
     fn swap(&self, _: Option<&JoinerRecord>, _: &JoinerRecord) -> Result<(), NetError> {
         Err(NetError::Store("disk full".into()))
     }
+
+    fn hold(&self, _: &[u8; 32]) -> Result<FlowHold, NetError> {
+        Ok(FlowHold::new(()))
+    }
 }
 
 /// Flow records on disk, in an app that is killed the moment the
@@ -169,6 +173,65 @@ impl FlowRecords for KilledAfterPendingMark {
         }
         Ok(())
     }
+
+    fn hold(&self, ticket_hash: &[u8; 32]) -> Result<FlowHold, NetError> {
+        self.0.hold(ticket_hash)
+    }
+}
+
+/// While one join of a link waits for its code, a second join of the same
+/// link on the same endpoint state is refused before it reads the flow
+/// record: it could otherwise clear a pending mark the first still needs.
+/// Once the first join ends, the link can be opened again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_join_of_a_link_in_progress_is_refused() {
+    let dir = temp_dir("one-join");
+    let signer = new_signer();
+    let mut host = TestHost::start(new_signer()).await;
+    let ticket = host.invite_kind(InvitationKind::SendLink);
+    let first = caller_with_records(signer.clone(), &dir);
+    let second = caller_with_records(signer, &dir);
+
+    let (type_tx, typed) = mpsc::unbounded_channel::<String>();
+    let (asks_tx, mut asks) = mpsc::unbounded_channel();
+    let mut codes = TypedCodes {
+        asks: asks_tx,
+        typed,
+    };
+    let pipe = connect_tcp(&host.route()).await.unwrap();
+    let join = first.join_with_code(pipe, &ticket, Arrival::Link, "laptop", &mut codes);
+    tokio::pin!(join);
+    tokio::select! {
+        ask = asks.recv() => assert_eq!(ask, Some(None)),
+        result = &mut join => panic!("the first join ended early: {result:?}"),
+    }
+
+    let pipe = connect_tcp(&host.route()).await.unwrap();
+    let mut no_code = NoCode;
+    let err = within(
+        "second join",
+        second.join_with_code(pipe, &ticket, Arrival::Link, "laptop", &mut no_code),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("another pairing with this link"),
+        "{err}"
+    );
+
+    // The owner gives up on the first; then the link opens again.
+    drop(type_tx);
+    assert!(within("first join", join).await.is_err());
+    let mut shown = None;
+    let (asks, result) = link_join(&second, &mut host, &ticket, &mut shown, |shown| {
+        Some(shown.into())
+    })
+    .await;
+    assert_eq!(asks, vec![None]);
+    assert!(matches!(result.unwrap().1, JoinOutcome::Paired(_)));
+    second.pin_stored(&ticket).unwrap();
+    host.stop().await;
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 /// The outcome-pending mark is stored before this side's confirmation goes
@@ -300,7 +363,7 @@ async fn a_proof_with_no_answer_closes_after_ten_seconds() {
             .is_err(),
         "gave up before the wait was over"
     );
-    clock.advance_mono(Limits::DEFAULT.io.proof_answer_wait_ms);
+    clock.advance_mono(Limits::DEFAULT.io().proof_answer_wait_ms());
     let err = within("give up", join).await.unwrap_err();
     assert!(closed_with(&err, ErrorCode::NotAuthorized), "{err:?}");
     silent.abort();

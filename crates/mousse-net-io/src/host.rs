@@ -55,7 +55,7 @@ pub struct HostConfig {
     /// The local owner or profile that authorizes grants made here.
     pub owner: OwnerRef,
     /// Limits ([`Limits::DEFAULT`] unless the app overrides some).
-    /// [`Host::new`] refuses values outside their allowed ranges.
+    /// A [`Limits`] is always within the allowed ranges.
     pub limits: Limits,
     /// Clock.
     pub clock: Arc<dyn Clock>,
@@ -398,10 +398,6 @@ where
         config: HostConfig,
         factory: F,
     ) -> Result<(Self, mpsc::UnboundedReceiver<HostEvent>), NetError> {
-        config
-            .limits
-            .validate()
-            .map_err(|e| NetError::Refused(e.to_string()))?;
         let store = config.state_dir.as_deref().map(GrantStore::in_dir);
         let grants = match &store {
             Some(store) => store.load()?,
@@ -424,7 +420,7 @@ where
                     identity,
                     config.name.clone(),
                     factory,
-                    &config.limits.core,
+                    config.limits.core(),
                 ),
                 gates: HashMap::new(),
                 conns: HashMap::new(),
@@ -468,12 +464,12 @@ where
                 &mut inner.grants,
                 self.shared.clock.now(),
                 self.shared.clock.mono(),
-                &self.shared.limits.core,
+                self.shared.limits.core(),
             );
             inner.gates.insert(conn, gate);
             inner.conns.insert(conn, cmd_tx.clone());
         }
-        let skew = self.shared.limits.core.clock_skew_secs;
+        let skew = self.shared.limits.core().clock_skew_secs();
         let deadline = handshake
             .local_window
             .deadline_with_skew(skew)
@@ -642,7 +638,7 @@ where
 async fn ticker<F: CodeExchangeFactory>(shared: Weak<Shared<F>>) {
     let Some(recheck) = shared
         .upgrade()
-        .map(|shared| ms(shared.limits.io.clock_recheck_ms))
+        .map(|shared| ms(shared.limits.io().clock_recheck_ms()))
     else {
         return;
     };

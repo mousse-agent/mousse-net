@@ -132,7 +132,7 @@ pub async fn run(
     let routes = route_hints(opts.listen_ip, port);
     let advertiser = if opts.mdns && !opts.listen_ip.is_loopback() {
         Some(
-            Advertiser::start(port, clock.clone(), &crate::limits::get().net.io)
+            Advertiser::start(port, clock.clone(), crate::limits::get().net.io())
                 .map_err(|e| format!("mDNS: {e}"))?,
         )
     } else {
@@ -184,7 +184,7 @@ pub async fn run(
         }
     }
     host.close_all(ErrorCode::NoError);
-    tokio::time::sleep(crate::limits::ms(crate::limits::helper().stop_linger_ms)).await;
+    tokio::time::sleep(crate::limits::ms(crate::limits::helper().stop_linger_ms())).await;
     ipc::remove_control_file(state_dir);
     if let Some(a) = advertiser {
         a.stop();
@@ -230,7 +230,7 @@ pub const INFO_LABEL: &str = "helper-info";
 async fn send_info(stream: mousse_net_io::MuxStream) {
     let (mut reader, writer) = stream.split();
     // `INFO_REQUEST_WAIT_MS` to finish the (empty) request.
-    let wait = crate::limits::ms(crate::limits::helper().info_request_wait_ms);
+    let wait = crate::limits::ms(crate::limits::helper().info_request_wait_ms());
     let request_ended = tokio::time::timeout(wait, reader.read()).await;
     if !matches!(request_ended, Ok(Ok(None))) {
         writer.reset(ErrorCode::ProtocolError);

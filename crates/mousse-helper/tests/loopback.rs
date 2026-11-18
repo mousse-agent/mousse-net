@@ -989,3 +989,46 @@ fn a_bad_limit_variable_stops_startup() {
         assert!(!dir.exists(), "{name}={value} created state");
     }
 }
+
+/// Two helper processes on one device open the same link. While the first
+/// waits for its code it holds the link, so the second is refused before
+/// it reads the flow record (it could otherwise clear a pending mark the
+/// first still needs). Killing the first, as a crash would, releases the
+/// link at once, and it pairs.
+#[test]
+fn a_link_being_joined_in_another_process_is_refused_until_that_process_ends() {
+    let host = Endpoint::init("hold-host");
+    let phone = Endpoint::init("hold-phone");
+    let server = host.serve("hostH", &[]);
+    let invite = host.spawn(&["invite", "--link", "--no-qr"]);
+    let ticket = invite.wait_for("TICKET ", WAIT)["TICKET ".len()..].to_owned();
+
+    let first = phone.spawn_with_stdin(&["join", &ticket]);
+    lines_with(&first, "shown on the host", 1);
+    let second = phone.run(&["join", &ticket]);
+    assert_eq!(second.code, Some(2), "{}", second.text());
+    assert!(
+        second
+            .stderr
+            .contains("another pairing with this link is in progress"),
+        "{}",
+        second.text()
+    );
+
+    drop(first);
+    let mut again = phone.spawn_with_stdin(&["join", &ticket]);
+    lines_with(&again, "shown on the host", 1);
+    let codes = lines_with(&invite, "CODE ", 1);
+    let code = codes[codes.len() - 1]
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("")
+        .to_owned();
+    again.type_line(&format!("{code}\n"));
+    let joined = again.finish(WAIT);
+    assert!(joined.ok(), "join: {}", joined.text());
+    invite.wait_for("paired: grant ", WAIT);
+
+    stop(&host, server);
+    cleanup(&[&host, &phone]);
+}

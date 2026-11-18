@@ -360,10 +360,10 @@ impl<F: CodeExchangeFactory> JoinerPairing<F> {
         now: UnixTime,
         limits: &Limits,
     ) -> Result<Self, JoinerError> {
-        let attempts_per_flow = u8::try_from(limits.joiner_attempts_per_flow)
+        let attempts_per_flow = u8::try_from(limits.joiner_attempts_per_flow())
             .unwrap_or(u8::MAX)
             .min(JOINER_ATTEMPTS_PER_FLOW);
-        let skew_secs = limits.clock_skew_secs;
+        let skew_secs = limits.clock_skew_secs();
         if ticket.host_identity == joiner {
             return Err(JoinerError::OwnTicket);
         }

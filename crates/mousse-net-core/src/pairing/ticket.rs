@@ -218,7 +218,7 @@ impl Ticket {
     /// Joiner-side freshness: valid while `now < expires_at + 10 min` (the
     /// default skew). The host checks its own record without skew.
     pub fn check_fresh_for_joiner(&self, now: UnixTime) -> Result<(), TicketError> {
-        self.check_fresh_for_joiner_with_skew(now, Limits::DEFAULT.clock_skew_secs)
+        self.check_fresh_for_joiner_with_skew(now, Limits::DEFAULT.clock_skew_secs())
     }
 
     /// Joiner-side freshness: valid while `now < expires_at + skew`.

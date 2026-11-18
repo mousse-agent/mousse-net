@@ -76,13 +76,13 @@ pub(crate) struct DriverLimits {
 
 impl DriverLimits {
     fn new(limits: &Limits) -> Self {
-        let io = &limits.io;
+        let io = limits.io();
         Self {
-            write_high_water: usize::try_from(io.write_high_water_bytes).unwrap_or(usize::MAX),
-            close_linger: ms(io.close_linger_ms),
-            deadline_poll: ms(io.deadline_poll_ms),
-            recheck: ms(io.clock_recheck_ms),
-            read_buffer: usize::try_from(io.read_buffer_bytes).unwrap_or(usize::MAX),
+            write_high_water: usize::try_from(io.write_high_water_bytes()).unwrap_or(usize::MAX),
+            close_linger: ms(io.close_linger_ms()),
+            deadline_poll: ms(io.deadline_poll_ms()),
+            recheck: ms(io.clock_recheck_ms()),
+            read_buffer: usize::try_from(io.read_buffer_bytes()).unwrap_or(usize::MAX),
         }
     }
 }
@@ -573,7 +573,7 @@ pub(crate) fn spawn<P: Pipe>(
         incoming: tokio::sync::Mutex::new(accept_rx),
     };
     let driver = Driver {
-        mux: Mux::with_limits(start.side, start.clock.mono(), &start.limits.core),
+        mux: Mux::with_limits(start.side, start.clock.mono(), start.limits.core()),
         limits: DriverLimits::new(&start.limits),
         deadline: Deadline::new(start.deadline, &*start.clock),
         clock: start.clock,

@@ -3,7 +3,9 @@
 //!
 //! [`HostConfig`](crate::HostConfig) and [`Caller::new`](crate::Caller::new)
 //! take a [`Limits`]; the helper fills it from `MOUSSE_NET_<NAME>` at
-//! startup (`docs/limits.md`).
+//! startup (`docs/limits.md`). Like the core's, a [`Limits`] is always
+//! valid: it changes only through [`Limits::with_overrides`], which checks
+//! every range and the limits that must agree.
 
 use std::time::Duration;
 
@@ -43,15 +45,21 @@ mousse_net_core::define_limits! {
         /// How often the advertiser checks whether the name is due to change.
         mdns_rotate_check_ms = "MDNS_ROTATE_CHECK_MS": 5_000, [100, 30_000];
     }
+    agree(io) {
+        if io.outcome_retry_max_ms < io.outcome_retry_first_ms {
+            return Err(LimitError::Conflict(format!(
+                "OUTCOME_RETRY_MAX_MS ({}) is below OUTCOME_RETRY_FIRST_MS ({})",
+                io.outcome_retry_max_ms, io.outcome_retry_first_ms
+            )));
+        }
+    }
 }
 
 /// The core's limits and the I/O layer's.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Limits {
-    /// The state machines' limits.
-    pub core: CoreLimits,
-    /// The I/O layer's own.
-    pub io: IoLimits,
+    core: CoreLimits,
+    io: IoLimits,
 }
 
 impl Limits {
@@ -60,6 +68,16 @@ impl Limits {
         core: CoreLimits::DEFAULT,
         io: IoLimits::DEFAULT,
     };
+
+    /// The state machines' limits.
+    pub const fn core(&self) -> &CoreLimits {
+        &self.core
+    }
+
+    /// The I/O layer's own.
+    pub const fn io(&self) -> &IoLimits {
+        &self.io
+    }
 
     /// Every limit: the core's, then the I/O layer's.
     pub fn specs() -> impl Iterator<Item = &'static LimitSpec> {
@@ -71,43 +89,37 @@ impl Limits {
         self.core.get(name).or_else(|| self.io.get(name))
     }
 
-    /// Set the limit called `name`, within its range.
-    pub fn set(&mut self, name: &str, value: u64) -> Result<(), LimitError> {
-        if CoreLimits::SPECS.iter().any(|s| s.name == name) {
-            self.core.set(name, value)
-        } else {
-            self.io.set(name, value)
-        }
-    }
-
-    /// Check every range and the limits that must agree.
-    pub fn validate(&self) -> Result<(), LimitError> {
-        self.core.validate()?;
-        self.io.check_ranges()?;
-        let io = &self.io;
-        if io.outcome_retry_max_ms < io.outcome_retry_first_ms {
-            return Err(LimitError::Conflict(format!(
-                "OUTCOME_RETRY_MAX_MS ({}) is below OUTCOME_RETRY_FIRST_MS ({})",
-                io.outcome_retry_max_ms, io.outcome_retry_first_ms
-            )));
-        }
-        if self.core.renew_lead_secs >= io.cert_lifetime_secs {
+    /// These limits with `overrides` (name, value) applied, all at once,
+    /// to the core's set or the I/O layer's. Every value must be within its
+    /// range and the result's limits must agree; otherwise the error names
+    /// the first problem.
+    pub fn with_overrides(&self, overrides: &[(&str, u64)]) -> Result<Self, LimitError> {
+        let (core, io): (Vec<_>, Vec<_>) = overrides
+            .iter()
+            .copied()
+            .partition(|(name, _)| CoreLimits::SPECS.iter().any(|s| s.name == *name));
+        let out = Self {
+            core: self.core.with_overrides(&core)?,
+            io: self.io.with_overrides(&io)?,
+        };
+        if out.core.renew_lead_secs() >= out.io.cert_lifetime_secs() {
             return Err(LimitError::Conflict(format!(
                 "RENEW_LEAD_SECS ({}) must be below CERT_LIFETIME_SECS ({}), or every new \
                  certificate would be due for renewal at once",
-                self.core.renew_lead_secs, io.cert_lifetime_secs
+                out.core.renew_lead_secs(),
+                out.io.cert_lifetime_secs()
             )));
         }
-        Ok(())
+        Ok(out)
     }
 
     /// The waits before each reconnect that learns a pending join outcome.
     pub fn outcome_retry_waits(&self) -> Vec<Duration> {
         let io = &self.io;
-        let mut wait = io.outcome_retry_first_ms;
-        (0..io.outcome_retries)
+        let mut wait = io.outcome_retry_first_ms();
+        (0..io.outcome_retries())
             .map(|_| {
-                let this = wait.min(io.outcome_retry_max_ms);
+                let this = wait.min(io.outcome_retry_max_ms());
                 wait = wait.saturating_mul(2);
                 Duration::from_millis(this)
             })
@@ -128,15 +140,15 @@ mod tests {
     fn the_defaults_are_the_spec_values() {
         let d = IoLimits::DEFAULT;
         // wire.md 8.2: the caller waits 10 s for the answer to its proof.
-        assert_eq!(d.proof_answer_wait_ms, 10_000);
+        assert_eq!(d.proof_answer_wait_ms(), 10_000);
         // wire.md 5.2: 24 h certificates.
-        assert_eq!(d.cert_lifetime_secs, 86_400);
+        assert_eq!(d.cert_lifetime_secs(), 86_400);
         // privacy.md: the mDNS name changes every 15 minutes.
-        assert_eq!(d.mdns_rotate_ms, 15 * 60 * 1_000);
+        assert_eq!(d.mdns_rotate_ms(), 15 * 60 * 1_000);
         // wire.md 6: a connection closes in the first second after its
         // deadline, so the clocks are read at least once a second.
-        assert_eq!(d.clock_recheck_ms, 1_000);
-        assert_eq!(Limits::DEFAULT.validate(), Ok(()));
+        assert_eq!(d.clock_recheck_ms(), 1_000);
+        assert_eq!(Limits::DEFAULT.with_overrides(&[]), Ok(Limits::DEFAULT));
         assert_eq!(Limits::default(), Limits::DEFAULT);
     }
 
@@ -171,30 +183,55 @@ mod tests {
     }
 
     #[test]
-    fn set_reaches_both_sets() {
-        let mut l = Limits::DEFAULT;
-        l.set("CLOCK_SKEW_SECS", 300).unwrap();
-        l.set("CONNECT_TIMEOUT_MS", 2_000).unwrap();
-        assert_eq!(l.core.clock_skew_secs, 300);
-        assert_eq!(l.io.connect_timeout_ms, 2_000);
+    fn overrides_reach_both_sets() {
+        let l = Limits::DEFAULT
+            .with_overrides(&[("CLOCK_SKEW_SECS", 300), ("CONNECT_TIMEOUT_MS", 2_000)])
+            .unwrap();
+        assert_eq!(l.core().clock_skew_secs(), 300);
+        assert_eq!(l.io().connect_timeout_ms(), 2_000);
         assert!(matches!(
-            l.set("CERT_LIFETIME_SECS", 86_401),
+            l.with_overrides(&[("CERT_LIFETIME_SECS", 86_401)]),
             Err(LimitError::OutOfRange { .. })
         ));
-        assert!(matches!(l.set("NOPE", 1), Err(LimitError::Unknown(_))));
+        // A core limit is checked against the spec too: no wider proof
+        // wait or clock skew can be built.
+        assert!(matches!(
+            l.with_overrides(&[("CLOCK_SKEW_SECS", 601)]),
+            Err(LimitError::OutOfRange { .. })
+        ));
+        assert!(matches!(
+            l.with_overrides(&[("PROOF_ANSWER_WAIT_MS", 10_001)]),
+            Err(LimitError::OutOfRange { .. })
+        ));
+        assert!(matches!(
+            l.with_overrides(&[("NOPE", 1)]),
+            Err(LimitError::Unknown(_))
+        ));
     }
 
     #[test]
     fn limits_that_must_agree_are_checked() {
-        let mut l = Limits::DEFAULT;
-        l.set("RENEW_LEAD_SECS", 7_200).unwrap();
-        l.set("CERT_LIFETIME_SECS", 3_600).unwrap();
-        assert!(matches!(l.validate(), Err(LimitError::Conflict(_))));
-
-        let mut l = Limits::DEFAULT;
-        l.set("OUTCOME_RETRY_FIRST_MS", 500).unwrap();
-        l.set("OUTCOME_RETRY_MAX_MS", 100).unwrap();
-        assert!(matches!(l.validate(), Err(LimitError::Conflict(_))));
+        assert!(matches!(
+            Limits::DEFAULT
+                .with_overrides(&[("RENEW_LEAD_SECS", 7_200), ("CERT_LIFETIME_SECS", 3_600)]),
+            Err(LimitError::Conflict(_))
+        ));
+        assert!(matches!(
+            Limits::DEFAULT.with_overrides(&[
+                ("OUTCOME_RETRY_FIRST_MS", 500),
+                ("OUTCOME_RETRY_MAX_MS", 100)
+            ]),
+            Err(LimitError::Conflict(_))
+        ));
+        // Checked once all are in: a first wait above the default cap is
+        // fine with a larger cap.
+        let l = Limits::DEFAULT
+            .with_overrides(&[
+                ("OUTCOME_RETRY_FIRST_MS", 5_000),
+                ("OUTCOME_RETRY_MAX_MS", 8_000),
+            ])
+            .unwrap();
+        assert_eq!(l.io().outcome_retry_first_ms(), 5_000);
     }
 
     #[test]
@@ -202,6 +239,7 @@ mod tests {
         let waits: Vec<u64> = Limits::DEFAULT
             .outcome_retry_waits()
             .iter()
+            .copied()
             .map(|d| d.as_millis() as u64)
             .collect();
         assert_eq!(waits, [250, 500, 1_000, 2_000]);

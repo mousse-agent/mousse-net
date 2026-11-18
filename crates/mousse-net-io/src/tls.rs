@@ -56,8 +56,8 @@ impl TlsPolicy {
     /// The policy for `limits`.
     pub fn from_limits(limits: &Limits) -> Self {
         Self {
-            skew_secs: limits.core.clock_skew_secs,
-            handshake_timeout: ms(limits.io.handshake_timeout_ms),
+            skew_secs: limits.core().clock_skew_secs(),
+            handshake_timeout: ms(limits.io().handshake_timeout_ms()),
         }
     }
 }

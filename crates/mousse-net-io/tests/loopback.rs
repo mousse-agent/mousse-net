@@ -314,8 +314,8 @@ async fn a_path_is_renewed_before_its_deadline_and_replaced_only_after_reopening
     // Both devices reach the renewal time: the earlier not_after minus the
     // renewal lead (the deadline adds the clock skew to not_after).
     let renew_at = old.deadline().0
-        - CoreLimits::DEFAULT.clock_skew_secs
-        - CoreLimits::DEFAULT.renew_lead_secs;
+        - CoreLimits::DEFAULT.clock_skew_secs()
+        - CoreLimits::DEFAULT.renew_lead_secs();
     let skip = renew_at as i64 - clock.now().0 as i64;
     clock.advance(skip);
     host.clock.advance(skip);
@@ -370,8 +370,8 @@ async fn a_renewed_path_is_closed_when_nobody_takes_paths_any_more() {
     });
 
     let renew_at = old.deadline().0
-        - CoreLimits::DEFAULT.clock_skew_secs
-        - CoreLimits::DEFAULT.renew_lead_secs;
+        - CoreLimits::DEFAULT.clock_skew_secs()
+        - CoreLimits::DEFAULT.renew_lead_secs();
     let skip = renew_at as i64 - clock.now().0 as i64;
     clock.advance(skip);
     host.clock.advance(skip);

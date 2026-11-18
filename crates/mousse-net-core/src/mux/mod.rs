@@ -247,11 +247,11 @@ impl Mux {
             cursor: [0, 0],
             closing: None,
             goaway_sent: false,
-            keepalive_ms: limits.keepalive_ms,
-            idle_timeout_ms: limits.idle_timeout_ms,
-            max_peer_streams: usize::try_from(limits.max_peer_streams).unwrap_or(usize::MAX),
-            send_chunk: usize::try_from(limits.send_chunk_bytes).unwrap_or(usize::MAX),
-            credit_return: limits.credit_return_bytes,
+            keepalive_ms: limits.keepalive_ms(),
+            idle_timeout_ms: limits.idle_timeout_ms(),
+            max_peer_streams: usize::try_from(limits.max_peer_streams()).unwrap_or(usize::MAX),
+            send_chunk: usize::try_from(limits.send_chunk_bytes()).unwrap_or(usize::MAX),
+            credit_return: limits.credit_return_bytes(),
         }
     }
 
@@ -637,7 +637,7 @@ impl Mux {
 mod tests {
     use super::*;
 
-    const SEND_CHUNK: usize = Limits::DEFAULT.send_chunk_bytes as usize;
+    const SEND_CHUNK: usize = Limits::DEFAULT.send_chunk_bytes() as usize;
 
     fn pump(from: &mut Mux, to: &mut Mux, now: Millis) -> Vec<MuxEvent> {
         let mut events = Vec::new();
@@ -836,9 +836,9 @@ mod tests {
 
     #[test]
     fn tightened_keepalive_and_idle_limits_are_used() {
-        let mut limits = Limits::DEFAULT;
-        limits.set("KEEPALIVE_MS", 5_000).unwrap();
-        limits.set("IDLE_TIMEOUT_MS", 30_000).unwrap();
+        let limits = Limits::DEFAULT
+            .with_overrides(&[("KEEPALIVE_MS", 5_000), ("IDLE_TIMEOUT_MS", 30_000)])
+            .unwrap();
         let mut m = Mux::with_limits(MuxRole::Caller, Millis(0), &limits);
         assert_eq!(m.poll_timeout(), Some(Millis(5_000)));
         m.on_timeout(Millis(5_000)).unwrap();
@@ -850,16 +850,20 @@ mod tests {
     #[test]
     fn keepalive_after_15s_and_idle_close_after_45s() {
         let mut m = Mux::new(MuxRole::Caller, Millis(0));
-        assert_eq!(m.poll_timeout(), Some(Millis(Limits::DEFAULT.keepalive_ms)));
-        m.on_timeout(Millis(Limits::DEFAULT.keepalive_ms - 1))
+        assert_eq!(
+            m.poll_timeout(),
+            Some(Millis(Limits::DEFAULT.keepalive_ms()))
+        );
+        m.on_timeout(Millis(Limits::DEFAULT.keepalive_ms() - 1))
             .unwrap();
         assert_eq!(
-            m.poll_transmit(Millis(Limits::DEFAULT.keepalive_ms - 1)),
+            m.poll_transmit(Millis(Limits::DEFAULT.keepalive_ms() - 1)),
             None
         );
-        m.on_timeout(Millis(Limits::DEFAULT.keepalive_ms)).unwrap();
+        m.on_timeout(Millis(Limits::DEFAULT.keepalive_ms()))
+            .unwrap();
         let ping = m
-            .poll_transmit(Millis(Limits::DEFAULT.keepalive_ms))
+            .poll_transmit(Millis(Limits::DEFAULT.keepalive_ms()))
             .unwrap();
         assert!(matches!(
             decode_frame(&ping).unwrap().unwrap().0,
@@ -871,17 +875,17 @@ mod tests {
         }
         .encode();
         assert_eq!(
-            m.receive(&pong, Millis(Limits::DEFAULT.keepalive_ms + 40))
+            m.receive(&pong, Millis(Limits::DEFAULT.keepalive_ms() + 40))
                 .unwrap(),
             vec![MuxEvent::Pong { rtt_ms: 40 }]
         );
         // Nothing more from the peer: idle close 45 s after the last receive.
-        let last = Limits::DEFAULT.keepalive_ms + 40;
+        let last = Limits::DEFAULT.keepalive_ms() + 40;
         assert!(m
-            .on_timeout(Millis(last + Limits::DEFAULT.idle_timeout_ms - 1))
+            .on_timeout(Millis(last + Limits::DEFAULT.idle_timeout_ms() - 1))
             .is_ok());
         assert_eq!(
-            m.on_timeout(Millis(last + Limits::DEFAULT.idle_timeout_ms)),
+            m.on_timeout(Millis(last + Limits::DEFAULT.idle_timeout_ms())),
             Err(MuxError {
                 code: ErrorCode::IdleTimeout
             })

@@ -134,7 +134,7 @@ pub(crate) fn verify(
 #[cfg(test)]
 mod tests {
     use super::*;
-    const CLOCK_SKEW_SECS: u64 = mousse_net_core::Limits::DEFAULT.clock_skew_secs;
+    const CLOCK_SKEW_SECS: u64 = mousse_net_core::Limits::DEFAULT.clock_skew_secs();
 
     #[test]
     fn cached_and_full_verification_agree() {

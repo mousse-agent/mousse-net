@@ -189,7 +189,7 @@ impl TestHost {
     /// Skip the join-proof wait, so an ungranted connection is refused now.
     pub fn skip_join_wait(&self) {
         self.clock
-            .advance_mono(Limits::DEFAULT.core.join_proof_wait_ms + 1_000);
+            .advance_mono(Limits::DEFAULT.core().join_proof_wait_ms() + 1_000);
     }
 
     /// Stop listening and close every connection, as a quit would.

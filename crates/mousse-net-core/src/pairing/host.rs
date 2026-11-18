@@ -225,8 +225,8 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
             factory,
             invitations: BTreeMap::new(),
             by_conn: BTreeMap::new(),
-            ticket_lifetime_secs: limits.ticket_lifetime_secs,
-            attempts_per_invitation: u8::try_from(limits.host_attempts_per_invitation)
+            ticket_lifetime_secs: limits.ticket_lifetime_secs(),
+            attempts_per_invitation: u8::try_from(limits.host_attempts_per_invitation())
                 .unwrap_or(u8::MAX),
         }
     }

@@ -167,7 +167,7 @@ impl ValidityWindow {
     /// Whether `now` is inside `[not_before - 10 min, not_after + 10 min]`
     /// (the default skew).
     pub fn accepts(&self, now: UnixTime) -> bool {
-        self.accepts_with_skew(now, Limits::DEFAULT.clock_skew_secs)
+        self.accepts_with_skew(now, Limits::DEFAULT.clock_skew_secs())
     }
 
     /// Whether `now` is inside `[not_before - skew, not_after + skew]`.
@@ -178,7 +178,7 @@ impl ValidityWindow {
     /// The last second a session on this certificate may stay open:
     /// `not_after + 10 min` (the default skew).
     pub fn effective_deadline(&self) -> UnixTime {
-        self.deadline_with_skew(Limits::DEFAULT.clock_skew_secs)
+        self.deadline_with_skew(Limits::DEFAULT.clock_skew_secs())
     }
 
     /// The last second a session on this certificate may stay open:
@@ -439,7 +439,12 @@ pub fn verify(
     now: UnixTime,
     expected_identity: Option<&IdentityPublicKey>,
 ) -> Result<VerifiedSessionCert, CertError> {
-    verify_with_skew(der, now, expected_identity, Limits::DEFAULT.clock_skew_secs)
+    verify_with_skew(
+        der,
+        now,
+        expected_identity,
+        Limits::DEFAULT.clock_skew_secs(),
+    )
 }
 
 /// [`verify`] allowing `skew_secs` of clock difference

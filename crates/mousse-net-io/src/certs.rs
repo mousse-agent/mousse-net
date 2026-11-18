@@ -39,8 +39,8 @@ impl CertManager {
         Self {
             signer,
             clock,
-            lifetime_secs: limits.io.cert_lifetime_secs.clamp(1, MAX_LIFETIME_SECS),
-            renew_lead_secs: limits.core.renew_lead_secs,
+            lifetime_secs: limits.io().cert_lifetime_secs().clamp(1, MAX_LIFETIME_SECS),
+            renew_lead_secs: limits.core().renew_lead_secs(),
             current: Mutex::new(None),
         }
     }
@@ -83,7 +83,7 @@ mod tests {
     use crate::clock::ManualClock;
     use mousse_net_core::identity::SoftwareKey;
 
-    const RENEW_LEAD_SECS: u64 = Limits::DEFAULT.core.renew_lead_secs;
+    const RENEW_LEAD_SECS: u64 = Limits::DEFAULT.core().renew_lead_secs();
 
     #[test]
     fn renews_only_near_the_end_of_the_window() {

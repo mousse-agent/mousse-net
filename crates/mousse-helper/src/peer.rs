@@ -55,7 +55,7 @@ pub fn parse_ticket(text: &str) -> Result<Ticket, String> {
 
 /// How long a TCP connect may take (`CONNECT_TIMEOUT_MS`).
 fn connect_timeout() -> Duration {
-    crate::limits::ms(crate::limits::get().net.io.connect_timeout_ms)
+    crate::limits::ms(crate::limits::get().net.io().connect_timeout_ms())
 }
 
 /// Wall-clock now, in Unix seconds.
@@ -657,7 +657,7 @@ async fn host_build(conn: &Connection) -> Result<String, String> {
     // request side ends here and the host sees a clean FIN.
     wr.finish();
     let limits = crate::limits::helper();
-    let max = usize::try_from(limits.info_answer_max_bytes).unwrap_or(usize::MAX);
+    let max = usize::try_from(limits.info_answer_max_bytes()).unwrap_or(usize::MAX);
     let read = async {
         let mut bytes = Vec::new();
         while let Some(chunk) = rd.read().await.map_err(|e| describe(&e))? {
@@ -668,7 +668,7 @@ async fn host_build(conn: &Connection) -> Result<String, String> {
         }
         Ok(bytes)
     };
-    let wait = crate::limits::ms(limits.info_answer_wait_ms);
+    let wait = crate::limits::ms(limits.info_answer_wait_ms());
     let bytes = tokio::time::timeout(wait, read)
         .await
         .map_err(|_| format!("no answer in {}", crate::limits::describe(wait)))??;
@@ -715,7 +715,7 @@ async fn capture(conn: &Connection, argv: Vec<String>) -> Result<(i32, String), 
             }
         }
     };
-    let wait = crate::limits::ms(crate::limits::helper().capture_wait_ms);
+    let wait = crate::limits::ms(crate::limits::helper().capture_wait_ms());
     let code = tokio::time::timeout(wait, read).await.map_err(|_| {
         format!(
             "the command did not finish in {}",

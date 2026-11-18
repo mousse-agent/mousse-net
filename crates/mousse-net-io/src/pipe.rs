@@ -51,7 +51,7 @@ pub fn route_uri(route: &Route) -> String {
 /// Dial a `tcp://` route within the default connect timeout. Other routes
 /// need discovery first.
 pub async fn connect_tcp(route: &Route) -> Result<TcpStream, NetError> {
-    connect_tcp_within(route, ms(Limits::DEFAULT.io.connect_timeout_ms)).await
+    connect_tcp_within(route, ms(Limits::DEFAULT.io().connect_timeout_ms())).await
 }
 
 /// Dial a `tcp://` route, giving up after `timeout`

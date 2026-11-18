@@ -185,10 +185,10 @@ impl PeerSession {
             renewal: None,
             candidate: None,
             limits: SessionLimits {
-                renew_lead_secs: limits.renew_lead_secs,
-                renew_retry_first_secs: limits.renew_retry_first_secs,
-                renew_retry_max_secs: limits.renew_retry_max_secs,
-                clock_skew_secs: limits.clock_skew_secs,
+                renew_lead_secs: limits.renew_lead_secs(),
+                renew_retry_first_secs: limits.renew_retry_first_secs(),
+                renew_retry_max_secs: limits.renew_retry_max_secs(),
+                clock_skew_secs: limits.clock_skew_secs(),
             },
         }
     }
@@ -375,8 +375,8 @@ mod tests {
     use super::*;
     use crate::identity::SoftwareKey;
     use crate::session_cert::{issue, verify};
-    const CLOCK_SKEW_SECS: u64 = Limits::DEFAULT.clock_skew_secs;
-    const RENEW_LEAD_SECS: u64 = Limits::DEFAULT.renew_lead_secs;
+    const CLOCK_SKEW_SECS: u64 = Limits::DEFAULT.clock_skew_secs();
+    const RENEW_LEAD_SECS: u64 = Limits::DEFAULT.renew_lead_secs();
     use rand_chacha::ChaCha20Rng;
     use rand_core::SeedableRng;
 
