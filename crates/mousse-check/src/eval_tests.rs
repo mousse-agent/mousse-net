@@ -40,7 +40,7 @@ targets = ["pc"]
 [[check.local]]
 target = "pc"
 host = "windows-x86_64"
-command = ["cargo", "test"]
+command = ["cargo", "test", "--release"]
 [[check.control]]
 name = "break"
 breaks = "the verifier"
@@ -640,7 +640,7 @@ fn a_local_run_with_another_profile_does_not_count() {
 #[test]
 fn a_changed_check_configuration_makes_local_runs_incomplete() {
     let changes: [fn(&mut Check); 5] = [
-        |c| c.local[0].command.push("--release".into()),
+        |c| c.local[0].command.push("--locked".into()),
         |c| {
             c.local[0].env.insert("X".into(), "1".into());
         },

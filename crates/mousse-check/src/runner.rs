@@ -416,13 +416,9 @@ pub fn command_for(
     local: &LocalRun,
     control: Option<&Control>,
 ) -> (Vec<String>, BTreeMap<String, String>) {
-    let mut cmd = local.command.clone();
+    let cmd = crate::manifest::effective_command(local, control);
     let mut env = local.env.clone();
     if let Some(k) = control {
-        if let Some(c) = &k.command {
-            cmd = c.clone();
-        }
-        cmd.extend(k.args.iter().cloned());
         env.extend(k.env.iter().map(|(a, b)| (a.clone(), b.clone())));
     }
     (cmd, env)

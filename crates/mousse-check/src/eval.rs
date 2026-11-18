@@ -393,15 +393,11 @@ const CONFIG_CHANGED: &str =
 fn eval_local(inp: &Inputs<'_>, check: &Check, target: &str, local: &LocalRun) -> Outcome {
     let mut fails = Vec::new();
     let mut gaps = Vec::new();
-    let profile = inp.manifest.run_profile(check);
+    // The record's profile is what the executed command built with (see
+    // `command_profile`), not the manifest's label.
+    let profile = inp.manifest.device_profile(check);
     let usable = |r: &RunRecord, control| -> Result<(), String> {
-        check_build(
-            inp.commits,
-            inp.build,
-            &r.build,
-            Some(&profile),
-            inp.allow_dirty,
-        )?;
+        check_build(inp.commits, inp.build, &r.build, profile, inp.allow_dirty)?;
         if r.config != inp.manifest.config_digest(check, target, control) {
             return Err(CONFIG_CHANGED.into());
         }

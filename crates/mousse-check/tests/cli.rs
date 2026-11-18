@@ -174,60 +174,35 @@ fn signed_device_results_complete_the_phase_and_tampering_breaks_it() {
     assert_eq!(o.status.code(), Some(1), "{out}");
     assert!(row(&out, "phase9.device").contains("INCOMPLETE"), "{out}");
 
-    // A device key, trusted for the phone cell, committed.
-    let o = run(d, &["device", "keygen", "--out", "phone.key"]);
-    assert!(o.status.success(), "{}", text(&o));
-    let public = String::from_utf8_lossy(&o.stdout).trim().to_string();
-    let o = run(
-        d,
-        &[
-            "device",
-            "add",
-            "--name",
-            "phone",
-            "--key",
-            &public,
-            "--targets",
-            "phone",
-        ],
-    );
-    assert!(o.status.success(), "{}", text(&o));
-    git(d, &["add", "-A"]);
-    git(d, &["commit", "-q", "-m", "trust the phone"]);
+    trust_phone(d);
 
-    // The phone's normal run and control run, signed. The build comes from git.
-    let unsigned = |outcome: &str| {
-        format!(
-            "{{\"check\": \"phase9.device\", \"target\": \"phone\", \"outcome\": \"{outcome}\", \"details\": \"probe\"}}"
-        )
-    };
+    // Before running, the phone records the configuration it runs under.
+    let normal_digest = digest(d, &["phase9.device"]);
+    let control_digest = digest(d, &["phase9.device", "--control", "break"]);
+    assert_ne!(normal_digest, control_digest);
+
+    // The phone's normal run and control run. The build comes from git.
     // Outside the checkout, so they do not make the tree dirty.
     let normal = d.with_extension("normal.json");
     let control = d.with_extension("control.json");
-    std::fs::write(&normal, unsigned("PASS")).unwrap();
-    std::fs::write(&control, unsigned("FAIL")).unwrap();
-    let o = run(
-        d,
-        &[
-            "sign",
-            "--device-key",
-            "phone.key",
-            "--profile",
-            "release",
-            normal.to_str().unwrap(),
-        ],
-    );
+    std::fs::write(&normal, phone_result("PASS", Some(&normal_digest))).unwrap();
+    std::fs::write(&control, phone_result("FAIL", None)).unwrap();
+
+    // A result without a recorded digest is not signed.
+    let o = sign(d, &["--control", "break", control.to_str().unwrap()]);
+    assert!(!o.status.success(), "{}", text(&o));
+    assert!(text(&o).contains("config-digest"), "{}", text(&o));
+
+    // The normal result carries its digest; the control's comes with --config.
+    let o = sign(d, &[normal.to_str().unwrap()]);
     assert!(o.status.success(), "{}", text(&o));
-    let o = run(
+    let o = sign(
         d,
         &[
-            "sign",
-            "--device-key",
-            "phone.key",
-            "--profile",
-            "release",
             "--control",
             "break",
+            "--config",
+            &control_digest,
             control.to_str().unwrap(),
         ],
     );
@@ -276,6 +251,104 @@ fn signed_device_results_complete_the_phase_and_tampering_breaks_it() {
     let out = text(&o);
     assert_eq!(o.status.code(), Some(1), "{out}");
     assert!(out.contains("[TAMPERED]"), "{out}");
+}
+
+/// A device key, trusted for the phone cell, committed.
+fn trust_phone(d: &Path) {
+    let o = run(d, &["device", "keygen", "--out", "phone.key"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let public = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    let o = run(
+        d,
+        &[
+            "device",
+            "add",
+            "--name",
+            "phone",
+            "--key",
+            &public,
+            "--targets",
+            "phone",
+        ],
+    );
+    assert!(o.status.success(), "{}", text(&o));
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-q", "-m", "trust the phone"]);
+}
+
+/// `mousse-check config-digest <args>`.
+fn digest(d: &Path, args: &[&str]) -> String {
+    let mut all = vec!["config-digest"];
+    all.extend_from_slice(args);
+    let o = run(d, &all);
+    assert!(o.status.success(), "{}", text(&o));
+    String::from_utf8_lossy(&o.stdout).trim().to_string()
+}
+
+/// A phone result file, with the digest it recorded if any.
+fn phone_result(outcome: &str, config: Option<&str>) -> String {
+    let config = config
+        .map(|c| format!(", \"config\": \"{c}\""))
+        .unwrap_or_default();
+    format!(
+        "{{\"check\": \"phase9.device\", \"target\": \"phone\", \"outcome\": \"{outcome}\", \"details\": \"probe\"{config}}}"
+    )
+}
+
+/// `mousse-check sign` with the phone's key.
+fn sign(d: &Path, args: &[&str]) -> Output {
+    let mut all = vec!["sign", "--device-key", "phone.key", "--profile", "release"];
+    all.extend_from_slice(args);
+    run(d, &all)
+}
+
+#[test]
+fn a_result_produced_under_an_old_configuration_stays_incomplete() {
+    let r = repo("old-config", false);
+    let d = &r.dir;
+    trust_phone(d);
+    let normal_digest = digest(d, &["phase9.device"]);
+    let control_digest = digest(d, &["phase9.device", "--control", "break"]);
+
+    // The control changes after the phone recorded its digests...
+    let path = d.join("checks/phase9.toml");
+    let m = std::fs::read_to_string(&path).unwrap();
+    let changed = m.replacen(
+        "targets = [\"phone\"]\n[[check.control]]\nname = \"break\"\nbreaks = \"everything\"\nenv = { PROBE_MODE = \"break\" }",
+        "targets = [\"phone\"]\n[[check.control]]\nname = \"break\"\nbreaks = \"everything\"\nenv = { PROBE_MODE = \"break2\" }",
+        1,
+    );
+    assert_ne!(m, changed);
+    std::fs::write(&path, changed).unwrap();
+    git(d, &["commit", "-q", "-am", "change the control"]);
+
+    // ...so signing its results now does not make them count.
+    let normal = d.with_extension("normal.json");
+    let control = d.with_extension("control.json");
+    std::fs::write(&normal, phone_result("PASS", Some(&normal_digest))).unwrap();
+    std::fs::write(&control, phone_result("FAIL", Some(&control_digest))).unwrap();
+    for file in [&normal, &control] {
+        let control_args: &[&str] = if file == &control {
+            &["--control", "break"]
+        } else {
+            &[]
+        };
+        let mut args = control_args.to_vec();
+        args.push(file.to_str().unwrap());
+        let o = sign(d, &args);
+        assert!(o.status.success(), "{}", text(&o));
+        if file == &control {
+            assert!(text(&o).contains("another configuration"), "{}", text(&o));
+        }
+        std::fs::remove_file(file).unwrap();
+    }
+    let o = run(d, &["report", "phase9", "--full"]);
+    let out = text(&o);
+    let device = row(&out, "phase9.device");
+    assert!(
+        device.contains("INCOMPLETE") && device.contains("configuration"),
+        "{out}"
+    );
 }
 
 #[test]

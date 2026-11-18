@@ -257,11 +257,6 @@ impl Manifest {
         c.profile.as_deref().or(self.profile.as_deref())
     }
 
-    /// The profile a local run of `c` records (`debug` if none is set).
-    pub fn run_profile(&self, c: &Check) -> String {
-        self.device_profile(c).unwrap_or("debug").to_string()
-    }
-
     /// Digest of everything that decides what one run of `c` on `target`
     /// proves: the judge, test minimum, markers, profile, matrix cases, the
     /// local commands for that target (command, working directory, env) and,
@@ -368,6 +363,27 @@ impl Manifest {
                     ));
                 }
             }
+            if let Some(want) = self.device_profile(c) {
+                for l in &c.local {
+                    let mut runs = vec![(String::from("the check"), effective_command(l, None))];
+                    for k in c.control.iter().filter(|k| k.missing.is_none()) {
+                        runs.push((format!("control {}", k.name), effective_command(l, Some(k))));
+                    }
+                    for (what, cmd) in runs {
+                        match command_profile(&cmd) {
+                            Some(p) if p == want => {}
+                            got => {
+                                return Err(format!(
+                                    "{}: needs profile {want}, but {what} on {} builds {}; add --release or --profile {want} to the cargo command",
+                                    c.id,
+                                    l.target,
+                                    got.as_deref().unwrap_or("with no profile the kit can see (not a cargo build, run or test)")
+                                ))
+                            }
+                        }
+                    }
+                }
+            }
             let mut seen = BTreeSet::new();
             for k in &c.control {
                 if !seen.insert(k.name.as_str()) {
@@ -428,9 +444,112 @@ impl Manifest {
     }
 }
 
+/// The command one run executes: the local command, or the control's
+/// replacement, plus the control's args.
+pub fn effective_command(local: &LocalRun, control: Option<&Control>) -> Vec<String> {
+    let mut cmd = local.command.clone();
+    if let Some(k) = control {
+        if let Some(c) = &k.command {
+            cmd = c.clone();
+        }
+        cmd.extend(k.args.iter().cloned());
+    }
+    cmd
+}
+
+/// The cargo profile a command builds with: `cargo [+toolchain] build | run
+/// | test | bench` and its `--release`, `-r` or `--profile <name>` before any
+/// `--`. `dev` is reported as `debug`, cargo's folder name for it. `None`
+/// for anything else: the kit cannot see which profile a script uses.
+pub fn command_profile(cmd: &[String]) -> Option<String> {
+    let program = Path::new(cmd.first()?).file_stem()?.to_str()?;
+    if !program.eq_ignore_ascii_case("cargo") {
+        return None;
+    }
+    let mut args = cmd[1..]
+        .iter()
+        .map(String::as_str)
+        .skip_while(|a| a.starts_with('+') || a.starts_with('-'));
+    let mut profile = match args.next()? {
+        "build" | "b" | "run" | "r" | "test" | "t" => "debug",
+        "bench" => "release",
+        _ => return None,
+    }
+    .to_string();
+    while let Some(a) = args.next() {
+        match a {
+            "--" => break,
+            "--release" | "-r" => profile = "release".into(),
+            "--profile" => profile = args.next()?.to_string(),
+            _ => {
+                if let Some(p) = a.strip_prefix("--profile=") {
+                    profile = p.to_string();
+                }
+            }
+        }
+    }
+    if profile == "dev" {
+        profile = "debug".into();
+    }
+    Some(profile)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn words(text: &str) -> Vec<String> {
+        text.split_whitespace().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn the_profile_comes_from_the_cargo_command() {
+        let p = |t: &str| command_profile(&words(t));
+        assert_eq!(p("cargo test -p x").as_deref(), Some("debug"));
+        assert_eq!(
+            p("cargo run --release -p x -- --out y").as_deref(),
+            Some("release")
+        );
+        assert_eq!(p("cargo +stable run -r -p x").as_deref(), Some("release"));
+        assert_eq!(p("cargo build --profile ci").as_deref(), Some("ci"));
+        assert_eq!(p("cargo build --profile=dev").as_deref(), Some("debug"));
+        // After `--` the flags belong to the program, not to cargo.
+        assert_eq!(p("cargo run -p x -- --release").as_deref(), Some("debug"));
+        assert_eq!(
+            p("C:/bin/cargo.exe test --release").as_deref(),
+            Some("release")
+        );
+        assert_eq!(p("sh probe.sh"), None);
+        assert_eq!(p("cargo fmt"), None);
+    }
+
+    #[test]
+    fn a_check_that_needs_a_profile_must_build_with_it() {
+        let text = |cmd: &str, control_args: &str| {
+            BASE.replace("command = [\"cargo\", \"test\"]", cmd)
+                .replace(
+                    "title = \"test\"\n",
+                    "title = \"test\"\nprofile = \"release\"\n",
+                )
+                + &format!(
+                    "[[check.control]]\nname = \"k\"\nbreaks = \"x\"\nargs = {control_args}\n"
+                )
+        };
+        // The label says release, the command builds debug.
+        let err = Manifest::parse(&text(
+            "command = [\"cargo\", \"test\"]",
+            "[\"--features\", \"k\"]",
+        ))
+        .unwrap_err();
+        assert!(err.contains("needs profile release"), "{err}");
+        // A script: the kit cannot see the profile.
+        assert!(Manifest::parse(&text("command = [\"sh\", \"t.sh\"]", "[\"--k\"]")).is_err());
+        Manifest::parse(&text(
+            "command = [\"cargo\", \"test\", \"--release\"]",
+            "[\"--features\", \"k\"]",
+        ))
+        .unwrap();
+    }
 
     const BASE: &str = r#"
 phase = "phase9"
