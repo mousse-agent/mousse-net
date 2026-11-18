@@ -6,9 +6,47 @@ connection is refused. It runs on `mousse-net-io` and the `mousse-helper`
 binary.
 
 Pairing is in person by default: the host owner answers "Is the device next
-to you?". With a send link (`invite --link`) the host shows a 6-digit code,
-a fresh one for each attempt, and `join` asks for it; the code is checked
+to you?" for every request; nothing approves a device the owner has not
+seen. With a send link (`invite --link`) the host shows a 6-digit code, a
+fresh one for each attempt, and `join` asks for it; the code is checked
 with CPace, and three wrong codes end the invitation.
+
+## Joining
+
+- How the ticket arrived matters. An in-person ticket pairs only when it
+  was scanned from the host's screen: `join --in-person` (and
+  `slice-check --in-person`) says so. Without the flag a ticket counts as
+  sent (pasted or opened as a link), and an in-person one is refused with
+  `PAIRING_FAILED` before anything is sent.
+- The name in the join proof: in person `--name` or this computer's name;
+  with a send link the computer name only, since the far end has not yet
+  shown it is the real host (`--name` is not used).
+- A rejected code shows "That code didn't work. If you typed it exactly as
+  shown on the other device, the link may have been swapped; get a new one
+  another way." The attempts left are kept per ticket in the endpoint's
+  owner-only state (`joins/<ticket hash>.cbor`), so closing the helper and
+  opening the link again does not give three new tries. Each attempt is
+  saved before its first message goes out; if the save fails, nothing is
+  sent.
+- After sending its join proof the joiner waits 10 s for the host's answer,
+  then closes with `NOT_AUTHORIZED`.
+- Any certificate failure on a candidate address means "try the next one".
+  An error shows only when no address passed, the clock message (the
+  certificate is outside its time window) first. Another device at an
+  address alone reads as `pin_mismatch`.
+
+## Connections
+
+- TLS 1.3 only, both sides authenticated, no resumption or early data. Key
+  exchange offers X25519MLKEM768 then X25519 and requires X25519MLKEM768;
+  there is no switch to turn it off.
+- A connection ends at its deadline on the wall clock or the same span on
+  the monotonic clock from when it started, whichever comes first. Both
+  are read again at least once a second, so a device that slept past either
+  closes as soon as it resumes, and setting the clock back never extends a
+  connection.
+- The host opens no stream on a connection before the caller has opened
+  one.
 
 ## On one machine
 
@@ -27,14 +65,18 @@ cargo test -p mousse-helper --test loopback --no-fail-fast
   B's channels, A's terminal stays open and A reconnects after a restart, and
   A's peer cannot reach B;
 - a second process for the same endpoint does not start;
-- send link: the right code pairs; three wrong codes end the invitation, a
-  fresh code is shown for each attempt and the ended ticket is refused;
+- send link: the right code pairs and the grant carries the computer name
+  only; three wrong codes end the invitation, a fresh code is shown for
+  each attempt, the same device opening the link again has no tries left
+  and another device is refused;
+- an in-person ticket used without `--in-person` is refused before the
+  owner is asked;
 - removing the grant kills a silent command even after the caller finished
   sending (its stdin was empty);
 - two devices join with one in-person ticket: "yes" to the question about
   the first pairs only the first, though the second asked meanwhile;
-- the state folder, `control.json` and (on Windows) the control pipe are
-  owner-only;
+- the state folder, `control.json` and the control channel (the Windows
+  pipe, the Unix socket) are owner-only;
 - a `control.json` left by an older build does not stop `id`, `grants` and
   `remove` from working offline;
 - `slice-check` runs end to end on loopback, and names chosen by the other
@@ -58,8 +100,15 @@ again to everything already in it, so files from an older build, or ones
 that gained a wider access entry, are owner-only again. `serve` takes local
 commands (`invite`, `grants`, `remove`, `stop`) over a control channel: on
 Windows a named pipe that only the current user can open and that refuses
-remote clients, on Unix 127.0.0.1. `control.json` holds where it listens and
-a random token that every request must carry. A `control.json` that is not
+remote clients; on Unix a socket, `control.sock`, in the owner-only state
+folder. On Unix each side checks the other's user id from the socket
+(`SO_PEERCRED` or `getpeereid`): `serve` drops connections from another
+user, and a command sends its token only to a listener run by its own user.
+Commands always look for the socket in the state folder, never at an
+address read from a file, so a `control.json` left by a crash cannot point
+them elsewhere. A socket path is short (104 bytes on macOS), so the state
+folder's path must stay under about 90 characters; `serve` says so if not. `control.json` holds where it listens and a random token
+that every request must carry. A `control.json` that is not
 in the current layout (an older build wrote `port`) counts as no `serve`
 running, so the commands take their offline path.
 
@@ -120,14 +169,17 @@ Mac:
 ```
 mousse-helper --state ./mac-state --insecure-file-key init
 mousse-helper --state ./mac-state --insecure-file-key serve --listen-ip 0.0.0.0 --name mac-mini
-mousse-helper --state ./mac-state --insecure-file-key invite --approve-next --no-qr
+mousse-helper --state ./mac-state --insecure-file-key invite --no-qr
 ```
+
+`invite` asks "Is the device next to you?" when the PC joins; answer `y`.
+A scripted run feeds the answer on its standard input.
 
 PC (Windows):
 
 ```
 mousse-helper --state J:\...\pc-state --insecure-file-key init
-mousse-helper --state J:\...\pc-state --insecure-file-key slice-check --name pc ^
+mousse-helper --state J:\...\pc-state --insecure-file-key slice-check --in-person --name pc ^
   --route tcp://192.168.0.59:58505 --ticket <TICKET> --host-build <MAC BUILD> ^
   --out result.json -- uname -a
 ```
