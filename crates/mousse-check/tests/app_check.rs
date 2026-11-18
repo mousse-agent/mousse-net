@@ -89,7 +89,14 @@ fn run_mjs(app: Option<&Path>, args: &[&str]) -> Output {
         .args(args)
         .current_dir(root())
         .env_remove("MOUSSE_NET_ENGINE_CONTROL")
-        .env_remove("MOUSSE_APP_DIR");
+        .env_remove("MOUSSE_APP_DIR")
+        // Its own target folder: the workspace one holds the helper the
+        // helper's tests built with every feature, and a default build there
+        // would replace it under them.
+        .env(
+            "CARGO_TARGET_DIR",
+            Path::new(env!("CARGO_TARGET_TMPDIR")).join("app-check-build"),
+        );
     if let Some(a) = app {
         cmd.env("MOUSSE_APP_DIR", a);
     }
