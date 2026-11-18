@@ -823,7 +823,13 @@ impl Driver {
         // stopped, so the pipe does not stay open.
         drop(slot);
         drop(ask_rx);
-        if tokio::time::timeout(self.limits.close_linger, &mut writer)
+        // Meanwhile, what the peer still sends is read and dropped until it
+        // closes too, within the same linger. A socket closed with unread
+        // data resets the connection, and the reset can destroy what the
+        // peer has not read yet: the GOAWAY that says why.
+        let drain = async { while matches!(rd.read(&mut buf).await, Ok(n) if n > 0) {} };
+        let linger = async { tokio::join!(&mut writer, drain) };
+        if tokio::time::timeout(self.limits.close_linger, linger)
             .await
             .is_err()
         {

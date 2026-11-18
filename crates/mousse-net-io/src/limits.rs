@@ -28,7 +28,7 @@ mousse_net_core::define_limits! {
         clock_recheck_ms = "CLOCK_RECHECK_MS": 1_000, [10, 1_000];
         /// How often a write still pending checks the connection deadline.
         deadline_poll_ms = "DEADLINE_POLL_MS": 50, [1, 1_000];
-        /// How long a closing connection may take to send its last frame and shut the pipe down.
+        /// How long a closing connection may take to send its last frame and shut the pipe down, reading and dropping what the peer still sends meanwhile.
         close_linger_ms = "CLOSE_LINGER_MS": 2_000, [100, 30_000];
         /// Queued bytes per stream above which a write waits.
         write_high_water_bytes = "WRITE_HIGH_WATER_BYTES": 262_144, [16_384, 67_108_864];

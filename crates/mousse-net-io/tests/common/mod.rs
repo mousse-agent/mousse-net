@@ -273,7 +273,7 @@ pub async fn dial(
     pin: IdentityPublicKey,
 ) -> Result<Connection, NetError> {
     let pipe = connect_tcp(route).await?;
-    caller.dial(pipe, pin).await
+    within("dial", caller.dial(pipe, pin)).await
 }
 
 /// Open a terminal-like interactive stream and check one round trip.
