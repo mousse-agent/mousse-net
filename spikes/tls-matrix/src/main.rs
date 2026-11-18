@@ -1,11 +1,14 @@
 //! Native runner for the crypto matrix.
 //!
-//! Usage: `tls-matrix [--out DIR] [--same-only] [--pipe-only]`
+//! Usage: `tls-matrix [--out DIR] [--print-results] [--same-only] [--pipe-only]`
 //!
-//! Prints one line per provider pair and one JSON result per pair. With
-//! `--out`, writes each result to `DIR/<target>__<client>__<server>.json`.
+//! Prints one line per provider pair. With `--out`, writes each result to
+//! `DIR/<target>__<client>__<server>.json`. With `--print-results`, also
+//! prints one `MATRIX_RESULT {file, result}` line per pair, for devices whose
+//! files are not reachable (`scripts/matrix-results.mjs --stdin` writes them).
 //! `MOUSSE_MATRIX_BREAK=1` swaps the pinned server key, so the run must FAIL.
-//! `MOUSSE_BUILD_ID` overrides the build id (default: git short sha + profile).
+//! Build id: `MOUSSE_BUILD_ID` at run time, else at build time, else the git
+//! short sha (with `-dirty` if the spike's sources changed) plus the profile.
 //! Exits non-zero if any pair fails.
 
 use std::path::PathBuf;
@@ -13,7 +16,7 @@ use std::process::{Command, ExitCode};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tls_matrix::handshake::Params;
-use tls_matrix::matrix::{self, Transport};
+use tls_matrix::matrix::{self, Transport, RESULT_LINE_PREFIX};
 use tls_matrix::TARGET;
 
 fn profile() -> &'static str {
@@ -41,6 +44,9 @@ fn build_id() -> String {
             return id;
         }
     }
+    if let Some(id) = option_env!("MATRIX_BUILD_ID") {
+        return id.to_string();
+    }
     let sha = git(&["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".into());
     // Dirty only if the spike's own sources changed since that commit.
     let dirty = git(&[
@@ -59,12 +65,14 @@ fn build_id() -> String {
 fn main() -> ExitCode {
     let mut out_dir: Option<PathBuf> = None;
     let mut include_cross = true;
+    let mut print_results = false;
     let mut transports = Transport::available();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--out" => out_dir = args.next().map(PathBuf::from),
             "--same-only" => include_cross = false,
+            "--print-results" => print_results = true,
             "--pipe-only" => transports = vec![Transport::Pipe],
             other => {
                 eprintln!("unknown argument: {other}");
@@ -103,6 +111,13 @@ fn main() -> ExitCode {
         };
         if result.outcome != "PASS" {
             println!("{json}");
+        }
+        if print_results {
+            let line = serde_json::json!({
+                "file": matrix::result_file_name(TARGET, client, server),
+                "result": &result,
+            });
+            println!("{RESULT_LINE_PREFIX}{line}");
         }
         if let Some(dir) = &out_dir {
             let path = dir.join(matrix::result_file_name(TARGET, client, server));

@@ -1,7 +1,7 @@
 //! The same handshakes inside a browser dedicated Worker. Needs a browser and
 //! its WebDriver, so it only builds with the `browser-worker` feature. Run
 //! with `--nocapture` to print one `MATRIX_RESULT` line per provider pair;
-//! `scripts/run-wasm.mjs --stdin --out <dir>` turns them into result files.
+//! `scripts/matrix-results.mjs --stdin --out <dir>` turns them into result files.
 //! Commands per browser: spec/matrix/targets.md.
 #![cfg(all(target_arch = "wasm32", feature = "browser-worker"))]
 

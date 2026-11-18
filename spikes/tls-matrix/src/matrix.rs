@@ -8,6 +8,10 @@ use crate::provider::Provider;
 /// Check name the owner test kit looks for.
 pub const CHECK: &str = "phase0.crypto-matrix";
 
+/// Prefix of result lines printed to a log, collected by
+/// `scripts/matrix-results.mjs --stdin`.
+pub const RESULT_LINE_PREFIX: &str = "MATRIX_RESULT ";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Transport {
     /// Both endpoints in one process, records passed through memory.

@@ -9,8 +9,7 @@ use wasm_bindgen::prelude::*;
 use crate::handshake::Params;
 use crate::matrix::{self, MatrixResult, Transport};
 
-/// Marker for result lines printed by tests, collected by `scripts/run-wasm.mjs --stdin`.
-pub const RESULT_LINE_PREFIX: &str = "MATRIX_RESULT ";
+use crate::matrix::RESULT_LINE_PREFIX;
 
 #[derive(Serialize)]
 struct Entry {
