@@ -21,20 +21,7 @@ struct Finding {
     what: &'static str,
 }
 
-const KNOWN_CORE_FINDINGS: &[Finding] = &[
-    Finding {
-        drill: Drill::PairingLimits,
-        invariant: Invariant::PairingAgreement,
-        seed: 2171,
-        what: "a joiner whose third attempt succeeded but whose PAIRED was lost                with the connection ends as AttemptsExhausted while the host keeps                the grant",
-    },
-    Finding {
-        drill: Drill::Handshake,
-        invariant: Invariant::GrantIdsUnique,
-        seed: 21,
-        what: "GrantTable::restore takes the next grant id from the stored grants                only, so the id of a removed newest grant is reused after a restart",
-    },
-];
+const KNOWN_CORE_FINDINGS: &[Finding] = &[];
 
 fn is_known(drill: Drill, invariant: Invariant) -> bool {
     KNOWN_CORE_FINDINGS

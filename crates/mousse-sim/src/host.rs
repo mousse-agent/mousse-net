@@ -939,7 +939,9 @@ impl HostDev {
         self.grants = if keep {
             let grants = self.grants.grants().cloned().collect();
             let denials = self.grants.denials().collect();
-            GrantTable::restore(grants, denials).expect("a table restores from its own contents")
+            let next_grant_id = self.grants.next_grant_id();
+            GrantTable::restore(grants, denials, next_grant_id)
+                .expect("a table restores from its own contents")
         } else {
             self.issued_grant_ids.clear();
             GrantTable::new()
