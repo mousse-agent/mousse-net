@@ -8,8 +8,8 @@
 //!   core's [`ConnectionGate`](mousse_net_core::authz::ConnectionGate), so an
 //!   ungranted peer can never open a stream.
 //! - `HELLO` is the first thing each side sends and must be the first control
-//!   message received; core's `negotiate_version` decides the minor version
-//!   or closes with `UNSUPPORTED_VERSION`.
+//!   message received; core's `HelloState` decides the minor version
+//!   or closes with `UNSUPPORTED_VERSION`; a later `HELLO` is ignored.
 //! - The connection closes with `CERT_EXPIRED` after the effective deadline
 //!   of the two certificates. The deadline is checked before every inbound
 //!   frame, every stream open or send, and every write, not only when the
@@ -34,7 +34,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mousse_net_core::authz::{Traffic, Verdict};
-use mousse_net_core::control::{negotiate_version, ControlMessage, VersionSupport};
+use mousse_net_core::control::{ControlMessage, HelloOutcome, HelloState, VersionSupport};
 use mousse_net_core::identity::IdentityPublicKey;
 use mousse_net_core::mux::{
     decode_frame, frame_type, Frame, Mux, MuxEvent, MuxRole, PriorityClass, StreamError, StreamId,
@@ -521,7 +521,7 @@ pub(crate) fn spawn<P: Pipe>(
         accept: accept_tx,
         streams: HashMap::new(),
         blocked: Vec::new(),
-        peer_hello: None,
+        hello: HelloState::new(VersionSupport::LOCAL),
         reason: None,
         before_close: VecDeque::new(),
     };
@@ -540,7 +540,8 @@ struct Driver {
     accept: mpsc::UnboundedSender<MuxStream>,
     streams: HashMap<u32, mpsc::UnboundedSender<StreamEvent>>,
     blocked: Vec<(StreamId, oneshot::Sender<Result<(), NetError>>)>,
-    peer_hello: Option<u64>,
+    /// The peer's `HELLO`s so far.
+    hello: HelloState,
     reason: Option<CloseReason>,
     /// Encoded frames a closing step produced, sent before the GOAWAY.
     before_close: VecDeque<Vec<u8>>,
@@ -927,25 +928,28 @@ impl Driver {
         }
     }
 
-    /// The `HELLO` rule, then the role's gate.
+    /// The `HELLO` rule (core's [`HelloState`]: the peer's first `HELLO`
+    /// fixes the version or closes, later ones are ignored), then the
+    /// role's gate.
     fn gate(&mut self, traffic: Traffic, message: Option<&ControlMessage>) -> Verdict {
-        match (self.peer_hello, traffic) {
-            (None, Traffic::Hello) => {
-                if let Some(ControlMessage::Hello {
+        match traffic {
+            Traffic::Hello => {
+                let Some(ControlMessage::Hello {
                     major_version,
                     minor_version,
                 }) = message
-                {
-                    match negotiate_version(VersionSupport::LOCAL, *major_version, *minor_version) {
-                        Ok(agreed) => self.peer_hello = Some(agreed),
-                        Err(code) => return Verdict::Close(code),
-                    }
+                else {
+                    return Verdict::Close(ErrorCode::ProtocolError);
+                };
+                match self.hello.on_hello(*major_version, *minor_version) {
+                    HelloOutcome::Agreed(_) => {}
+                    HelloOutcome::Ignored => return Verdict::Ignore,
+                    HelloOutcome::Close(code) => return Verdict::Close(code),
                 }
             }
-            (Some(_), Traffic::Hello) => return Verdict::Close(ErrorCode::ProtocolError),
-            (None, Traffic::Keepalive | Traffic::GoAway) => {}
-            (None, _) => return Verdict::Close(ErrorCode::ProtocolError),
-            (Some(_), _) => {}
+            Traffic::Keepalive | Traffic::GoAway => {}
+            _ if self.hello.agreed().is_none() => return Verdict::Close(ErrorCode::ProtocolError),
+            _ => {}
         }
         self.role.check(traffic, message)
     }
@@ -1322,6 +1326,39 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn a_later_hello_is_ignored_whatever_it_holds() {
+        let (conn, mut peer, _valve, _clock) = connected(3_600).await;
+        // The peer's first HELLO was accepted; these must change nothing,
+        // not even one naming another major version.
+        for (major_version, minor_version) in [
+            (VersionSupport::LOCAL.major, VersionSupport::LOCAL.minor),
+            (VersionSupport::LOCAL.major + 1, 0),
+        ] {
+            let hello = ControlMessage::Hello {
+                major_version,
+                minor_version,
+            };
+            peer.mux.send_control(hello.encode()).unwrap();
+        }
+        peer.flush().await;
+        // The connection still carries streams afterwards.
+        let stream = within(
+            "open",
+            conn.open_stream(PriorityClass::Interactive, "terminal"),
+        )
+        .await
+        .unwrap();
+        stream.writer.write(b"after").await.unwrap();
+        assert!(within("data", peer.read_until(|f| matches!(f, Frame::Data { .. }))).await);
+        assert!(
+            !peer.frames.iter().any(|f| matches!(f, Frame::GoAway { .. })),
+            "{:?}",
+            peer.frames
+        );
+        assert!(!matches!(conn.status(), ConnStatus::Closed(_)));
     }
 
     #[tokio::test]
