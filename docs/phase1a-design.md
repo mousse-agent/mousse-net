@@ -1,473 +1,684 @@
 # Phase 1a design: the engine inside the desktop app
 
-Status: design, 2026-11-18. Scope: PLAN "Phase 1a" (two desktops on a LAN,
-in-person pairing only). Engine base: `phase-1a` from the finished Phase 0.
-App base: Mousse `master` at `0bc1d29d8`.
+Status: design, round 2 (2026-11-18). Scope: PLAN "Phase 1a" (two desktops
+on a LAN, in-person pairing only). Engine base: `phase-1a`; host persistence
+before `PAIRED` and grant expiry at the traffic gate are being fixed in
+Phase 0 on `p0-fix3-io`, and this design assumes those fixes. App base:
+Mousse `master` at `b495dd151`.
 
-Phase 1a adds the engine **beside** Mousse Net v1. v1 keeps working until
-Phase 2 deletes it; edits to v1 files are small seams only, and a
-per-profile switch turns the new path on.
+Phase 1a adds the engine beside Mousse Net v1. v1 keeps working until
+Phase 2 deletes it, and edits to v1 files stay small. A per-profile switch
+turns the new path on. The goal is that a remote thread and a terminal work
+through the normal computer picker **with v1 networking off**, on a fresh
+profile.
 
-Next step: a two-member review council reads this design. The calls it
-should challenge first are listed under "Open questions for review" (§9).
+## Changes since round 1
+
+Round 1 had two reviews, both 4/10. Each finding (F = first review,
+S = second, number = finding) is mapped to where it is resolved, or why it
+is rejected.
+
+| Finding | Resolution |
+|---|---|
+| F2, S1, open question 1: `NetSyncSession` reuse fails on `verifyRecord`/`verifyAuthor` (`session.ts:1798`, `NetIdentityService.ts:420`) and `revalidateIdentity` | Not reused. A narrow engine session (§3) keeps `DurableRpcDispatcher`, `SubscriptionReceiver`, the stream store and the codec. Record authenticity comes from the pinned channel at ingest and from a stored origin on reopen (§3.4). |
+| F1, S1: Bridge finds computers in the v1 roster (`ThreadRouter.pairedComputers`, `accountDevices`, `deviceNameOf`, stager, `BridgeHub.session`), and the renderer reads `net.status`/`bridge.nodes` | New Bridge peer-directory port fed by the v1 roster and the engine table (§4.3). Engine peers appear in the normal picker. Proved by check `phase1a.picker-v1-off`. |
+| F3, S2: who can use the path, `makeSession` needs v1 enrollment, the node-id claim is unproven | The engine path owns its gates. It mints a local id per peer fingerprint and grant, translates ids at the session boundary, and creates no synthetic users or delegations (§4). The same-Mousse-ID case and two local profiles pairing each other are decided in §4.4. |
+| F4, S3: pair back grants `owner` with no joiner consent; paste links have no code; hints not LAN-only; enrollment and removal persistence | The joiner consents explicitly. Pair back is a direct local grant and the host simply dials; no invitation or spec machinery (§5). Durable receipts, idempotent recovery and explicit partial states. Copy/paste links dropped. Ticket hints private-range only. Removal fails closed (§5.4). Host persistence before `PAIRED` comes from `p0-fix3-io`. |
+| F5, S4: `preferredSession` returns any open session; no RPC on the caller side; old path wins | Direction-aware selection: newest outbound generation only. Client capability is separate from serving authority, and a late close cannot unpublish the replacement (§3.5). Revocation tears Bridge down at once (§3.6). |
+| F6: both desktops need inbound reachability | Per-direction reachability shown with fix text (§7); Risk 3 covers both machines. |
+| S5, F9 (queues): one-frame claim, blocked reader, read-ahead, messages over 256 KiB | Independent pumps, bounded queues, reserved control capacity, interactive-first both ways, bounded read-ahead, and one stream per call so large bodies stream under credit (§2.3, §3.2). Tests stall bulk in both directions. |
+| S6, F9 (lifecycle): `startActiveProfiles` has no caller; isolation; fencing; log; retry; Windows; env var; signing | §1. `startActiveProfiles` has no caller (verified). A background start of networked profiles is added with per-profile isolation. The app channel is now the child's stdio, so it is fenced by the process and needs no attach, linger or takeover. The helper writes its own log. Slow retry. `MOUSSE_NET_HELPER` only unpackaged. Signing: see Rejected. |
+| F7, S7: checks not bound to builds, controls in the wrong binary, physical steps, tautological controls, reconnect without discovery, blind byte cut, shared topology, no pair-back check | §9 rewritten: both builds bound; debug helpers spawned by the harness; physical steps ATTESTED; automated cells inject ticket and approval and say so; `cable-plugged` control; injectable browse source; reply dropped by id after the host effect; four-endpoint topology; a pair-back check; each check lands with its slice. |
+| F8: risky seam late; E5/M5 too big; checks in M8 | Slice S0 (vertical spike) comes first; E5 and M5 are split; checks land with their slices (§10). |
+| F9 minor: `self.node` claim, Remove clean-up, rename refresh, untested macOS permission and long call across a path switch | No claims any more. Remove deletes the local id's policy row and private-stream bindings (§5.4). The name refreshes on each connection (§3.3). macOS local-network/keychain spike in M1. Multi-minute call across a path switch tested in M5b. |
+| Situations (both) | §8, one line each. |
+| Cuts (both) | Done: tunnel lane, global approval prompt, deny messages in protocol 1.0, linger/takeover, "new mDNS instance" retry, identity-at-init check, pre-approved invitation machinery. |
+
+**Rejected or changed**
+
+- **Login start (S6):** not in 1a. A profile is reachable once Mousse has
+  been opened since login; the daemon stays up after the window closes
+  (`src/main/index.ts`: "daemon keeps running"). A login item is
+  per-OS packaging work (Run key, `SMAppService`, autostart) and no 1a exit
+  item needs it. It lands with the CLI and headless work in Phase 1b; the
+  PLAN §8 wording is noted as Phase 1b.
+- **Signing only the helper (F9, coordinator):** the Windows app itself is
+  unsigned today (`package.json` `"signExecutable": false`). Signing only
+  the helper buys nothing for SmartScreen or the firewall prompt. The
+  helper is signed with the same certificate in the same release step that
+  signs the app; until then it ships as unsigned as the app.
+- **Upgrading helpers one profile at a time (S, daily use):** an update
+  replaces the daemon, and every helper exits with its daemon (stdio EOF),
+  so all helpers stop together and the new daemon starts them. A staggered
+  upgrade adds nothing.
+- **Keeping the node-id claim (F, open question 2):** superseded by the
+  agreed local id per fingerprint.
 
 ## Decisions
 
-Calls made for this design. Each is final for Phase 1a unless a check or a
-design review proves it wrong.
-
-1. **The daemon owns the helper.** Each profile's daemon services spawn,
-   attach to, restart and stop that profile's helper. The helper lives as
-   long as the daemon plus a 60 s linger, so a restarted daemon re-attaches
-   to the running helper. Hosting without a running daemon waits
-   for the headless daemon (PLAN Phase 3/8).
-2. **One app channel per helper, on the existing control listener.** The
-   app attaches with the `control.json` token, then the connection switches
-   to binary framing. Application streams are **multiplexed over that one
-   channel** with per-stream credit; no socket per stream.
-3. **The v1 session layer stays; its transport and identity go.**
-   `NetSyncSession`, `DurableRpcDispatcher` and `SubscriptionReceiver` run
-   over engine streams through a new `EngineMux`. v1 TLS, mux, roster and
-   delegation checks, enrollment and route records are not used on this
-   path.
-4. **Identity:** the engine endpoint identity is the device. The app's
-   `NodeId` for an engine peer is the peer's own node id, claimed in the
-   session hello and bound to the endpoint fingerprint on first session
-   (under the engine pin). Presets and per-device policy keep keying on
-   `NodeId`; the device list keys on the fingerprint.
-5. **Authorization in the app comes from the grant role.** Phase 1a creates
-   only `owner` grants (in-person pairing by the owner). An `owner` peer is
-   treated as this user's own computer; any other role is refused by the
-   app until Teams lands on the engine path (Phase 1b at the earliest).
-6. **Sessions are one-way.** A connection carries calls from the caller to
-   the host only, authorized by the host's grant. The other direction uses
-   the other side's own connection. **Pairing is made two-way** by an
-   automatic "pair back" under the one in-person approval (see §2.4).
-7. **Phase 1a sessions carry Bridge only:** core routed RPC, terminals and
-   the private and display streams Bridge reads. Spaces, presence, editor
-   tunnels and phone features stay on v1.
-8. **The app helper never runs its own terminals.** In app mode the helper's
-   `term` label is refused; terminals are the app's routed `pty.*` calls.
-9. **QR on desktops:** the joining desktop scans the host's QR with its
-   webcam (`jsQR` in the renderer). "Paste link" is the fallback, with the
-   in-person warning. No codes in Phase 1a.
+1. **The daemon owns each profile's helper as a child process.** The app
+   channel is the child's stdin/stdout. The helper exits when that channel
+   closes, so it lives exactly as long as its daemon.
+2. **One channel, multiplexed,** with independent read and write pumps,
+   bounded queues, reserved control capacity and interactive-first
+   scheduling both ways (§2).
+3. **A narrow engine session** carries Bridge only: routed RPC, stream
+   subscriptions (thread display, private streams, terminals) and blob
+   reads. It uses one engine stream per call, per subscription and per blob.
+   `DurableRpcDispatcher`, `SubscriptionReceiver`, the stream store and the
+   codec are reused; `NetSyncSession` is not.
+4. **Local ids:** each engine peer gets a locally minted `NodeId`, keyed by
+   (local endpoint, peer fingerprint, grant). Re-pairing mints a new one.
+   Peers never claim ids, and ids that cross the wire are translated at the
+   session boundary.
+5. **`owner` is a typed local grant.** It allows an explicit Bridge method
+   and stream allowlist, plus the existing per-call policy checks.
+   `RpcContext.caller` becomes a union, and engine callers carry no
+   delegation.
+6. **One-way connections, two-way pairing.** A connection carries calls
+   from caller to host only. Pairing makes both directions in one ceremony:
+   the joiner consents in its dialog and grants the host locally, and the
+   host dials back. "Connected" means both directions work.
+7. **Bridge reads computers through a peer-directory port** fed by the v1
+   roster and the engine table. Engine peers appear in the normal picker.
+8. **In person = webcam scan only in 1a.** No paste or copy of links;
+   shared links (with a code) are Phase 1b. Ticket hints are private-range
+   addresses only.
+9. **Reachable once Mousse has been opened since login** (no login item in
+   1a).
 10. **Keep connected:** each helper keeps one outbound path to every paired
-    host while both are online, so the device list shows live state and
-    calls start at once.
-11. **A computer paired over both v1 and the engine is two devices** in
-    Phase 1a. An engine claim of a node id that is in the v1 roster is
-    refused, so the two paths never share a policy row.
-12. **Helper binary** is built from a pinned engine commit by
-    `scripts/build-net-helper.mjs` and shipped as an extra resource, like
-    `voice-engine`.
+    host while both are online.
 
 ## 1. Helper lifecycle
 
-**Spawn.** `MmsProfileServices.start()` creates `EngineHelper` when the
-profile's switch is on (`<profileDir>/net-engine/settings.json`,
-`{"enabled": true}`; default off; `MOUSSE_NET_ENGINE=1` turns it on in dev).
-`ProfileHost.startActiveProfiles()` already starts every active profile, so
-every networked profile gets its helper, not only the open one.
+**Which profiles run a helper.** `ProfileHost.startActiveProfiles()` has no
+caller today, and the GUI starts a profile's services on demand. Phase 1a
+adds `ProfileHost.startNetworkedProfiles()`. The daemon calls it in the
+background after it reports ready (`MousseMainService.ts`), so startup is
+not slowed. It starts services only for profiles whose switch is on
+(`<profileDir>/net-engine/settings.json`, `{"enabled": true, "profile":
+"<profile id>"}`). Each profile starts in its own `try`: a failure marks
+that profile's switch status "Couldn't start" and logs it, and the other
+profiles carry on.
 
-- State dir: `<profileDir>/net-engine/endpoint/` (owner-only, as in Phase 0).
-  If no endpoint exists, the daemon runs `mousse-helper --state <dir> init`
-  once; the endpoint makes its own random profile id.
-- Command: `mousse-helper --state <dir> serve --app --listen-ip 0.0.0.0
-  --name "<computer> (<profile name>)"`. Not `--insecure-file-key`: the key
-  is in the OS keystore, one entry per endpoint id.
-- stdout/stderr go to `<profileDir>/net-engine/helper.log` (2 × 1 MB,
-  rotated by the daemon). Secrets are never logged (Phase 0 rule).
+**Spawn.** The profile's `EngineHelper` runs:
 
-**Attach first.** Before spawning, the daemon reads `control.json`. If a
-helper answers there (an orphan from a crashed daemon), it attaches. If the
-orphan's `build` differs from the bundled helper's, it sends `shutdown` and
-spawns the bundled one. The endpoint lock guarantees one helper per
-endpoint; a spawn that fails on the lock retries attach.
+    mousse-helper --state <profileDir>/net-engine/endpoint serve --app --listen-ip 0.0.0.0
 
-**Binary.** Packaged: `process.resourcesPath/net-helper/mousse-helper[.exe]`.
-Dev: `MOUSSE_NET_HELPER` or `native/net-helper/target/package/`. The engine
-commit is pinned in `native/net-helper/ENGINE_COMMIT`;
-`scripts/build-net-helper.mjs` builds `cargo build --release --locked -p
-mousse-helper` from it (`--require` for packaging, like
-`build-voice-engine.mjs`). macOS signs it with the app identity. No helper
-in the build: the switch shows "Not in this build" and stays off.
+The display name is not on the command line; it arrives in `hello`. If no
+endpoint exists, the daemon first runs `mousse-helper --state <dir> init`.
+`settings.json` records the app profile id. If the endpoint was made for
+another profile id (a copied profile folder), the folder is moved aside,
+re-initialized, and its devices show "Pair again". The key stays in the OS
+keystore, one entry per endpoint id; `--insecure-file-key` is never used.
 
-**Version handshake.** The first app message is `hello {proto: [1, 0]}`
-(major, minor). The helper answers with its `proto`, `build`, endpoint
-identity, port and routes. Different major: the daemon stops it and
-respawns the bundled binary; if that also differs, the switch shows
-"Networking helper is out of date" and stays off. Minor: both use the
-lower. The daemon also checks the identity against the one it recorded at
-`init`; a different identity means a swapped state dir and is refused.
+**Channel and fencing.** In app mode the helper speaks the §2 framing on
+stdin/stdout and writes nothing else there. Its log goes to
+`<state>/helper.log`, which it rotates itself (2 × 1 MB, secrets never
+logged). The channel belongs to one process, so there is no token, no
+attach, no takeover and no linger. Every event the daemon handles is tagged
+with that spawn's generation number, and events from an older generation
+are dropped. The CLI keeps the Phase 0 control listener.
 
-**Crash restart.** Exit or channel EOF without `shutdown`: restart after
-0.5 s, doubling to 30 s; the backoff resets after 60 s up. Five crashes in
-5 minutes stop retries and show "Networking helper keeps stopping" until the
-switch is toggled or the app restarts. Each restart is a fresh attach; the
-app's sessions on the dead helper end as link loss (§3.4).
+**Exit with the daemon.** When stdin reaches EOF (the daemon exited or
+crashed), the helper sends `GOAWAY NO_ERROR` and exits within 1 s. On
+Windows a crashed parent closes its pipe handles, so EOF arrives without a
+job object; M2 tests a hard kill of the daemon stand-in on Windows and
+macOS. If a spawn finds the endpoint lock still held, the daemon retries
+for 5 s, then reports "Another helper is still running".
 
-**Detach and linger.** If the app channel closes, the helper closes every
-peer connection (`GOAWAY NO_ERROR`), keeps listening, refuses app streams
-with `REFUSED_STREAM`, and exits after 60 s without a new attach. A second
-attach replaces the first (the old one gets `{ev: "replaced"}`).
+**Binary.** Packaged builds use `process.resourcesPath/net-helper/mousse-helper[.exe]`,
+resolved in the daemon process. Unpackaged builds also honour
+`MOUSSE_NET_HELPER`, then `native/net-helper/target/package/`. The engine
+commit is pinned in `native/net-helper/ENGINE_COMMIT`, and
+`scripts/build-net-helper.mjs` builds it like `build-voice-engine.mjs`. A
+build with no helper shows "Not in this build".
 
-**Shutdown.** Profile dispose, switch off or app quit: `shutdown`, the
-helper closes with `NO_ERROR` and exits within 1 s; the daemon kills it
-after 3 s.
+**Version.** The first frame is `hello {proto: [1, 0], name, profile}`; the
+helper answers with `{proto, build, identity, device, port, routes}`. A
+different major is a packaging error: "Networking helper is out of date",
+switch off. For the minor version, both sides use the lower one.
 
-**Kept port.** The helper owns it: `port` (and `fixed_port`, Phase 1b) in
-the endpoint file, as `Endpoint::bind(PortChoice::Kept)` does today. The app
-never stores a port. If the kept port is taken at start, the helper takes a
-new one and keeps that; peers find it through mDNS.
+**Restart.** If the helper exits without `shutdown`, the daemon restarts it
+after 0.5 s, doubling to 5 min, and keeps trying at 5 min. The backoff
+resets after 60 s up. After three fast crashes the status reads "Networking
+helper keeps stopping (retrying)".
+
+**Shutdown.** Profile dispose, switch off, app update or quit sends
+`shutdown`; the daemon kills the helper after 3 s.
+
+**Kept port:** owned by the helper in its endpoint file (`Endpoint::bind`,
+`PortChoice::Kept`). The app never stores a port.
 
 ## 2. App ↔ helper protocol
 
-### 2.1 Transport and auth
+### 2.1 Framing
 
-The Phase 0 control listener: a named pipe on Windows that only the current
-user can open and that refuses remote clients; `127.0.0.1` plus token on
-Unix. The app reads `control.json` (owner-only), connects, and sends one
-line `{"cmd":"app","token":…,"proto":[1,0]}`. A wrong token gets the
-Phase 0 error line and the close. After `{"attached":true}` the connection
-uses the framing below. CLI commands (`invite`, `grants`, …) keep working
-on the same listener with line JSON.
+`u32 BE length | u8 type | body`; the length counts the type byte and the
+body, and is at most 1 MiB.
 
-Why not stdio: the helper must outlive a daemon restart and accept a new
-attach. Why not a socket per stream: one auth point, no pipe-instance or
-port churn, and stream resets, peer-down and removal events stay ordered
-with the data they end.
+- `0x01` JSON: one object.
+- `0x02` DATA: `u32 stream` + up to 64 KiB.
+- `0x03` CREDIT: `u32 stream` + `u32 bytes`.
 
-### 2.2 Framing
+A malformed frame closes the channel, and the daemon restarts the helper.
 
-`u32 BE length | u8 type | body`, length = type + body, at most 1 MiB.
+### 2.2 Pumps, queues and priority (both sides)
 
-| type | body |
+- **Independent pumps.** Reading never waits on writing. The helper has
+  one reader task and one writer task. The daemon reads in its `data`
+  handler and writes from one drain loop.
+- **Writer queues on each side:** control (JSON) first, then interactive
+  DATA, then bulk DATA. Within a class, streams take turns per frame.
+  Credit frames count as control.
+- **Bounds:**
+  - Per stream: the peer's credit, at most 256 KiB, so the sender never
+    queues more.
+  - Aggregate DATA queued: 8 MiB per side. Above it the side stops
+    returning credit.
+  - Control queue: 1 MiB reserved and never used by DATA. Event floods
+    such as `conn.*` are coalesced per connection.
+- **Bounded read-ahead.** The engine's `StreamReader::read` returns wire
+  credit at once (`conn.rs:202`). So the helper calls `read` for a stream
+  only while bytes buffered for the app plus 64 KiB fit inside the app's
+  credit for that stream. The remote writer therefore stalls when the app
+  stalls.
+- **Latency claim:** an interactive frame waits behind at most one DATA
+  frame already being written (≤ 64 KiB) plus what the OS pipe already
+  holds; the pipe buffer is set to 64 KiB where the OS allows. E2 measures
+  it.
+
+### 2.3 Messages (protocol 1.0)
+
+Requests carry `id`; replies are `{re, ...}` or `{re, error, reason}`;
+events carry `ev`. Reasons use the wire's words.
+
+- **Session:** `hello`; `config.set {name}`; `shutdown`.
+- **Host:** `invite.create` returns `{invitation, uri, routes,
+  expires_at}`; `invite.cancel`; `approval.answer {request, yes}`. Events:
+  `approval {request, invitation, name, device}`, `enrolled {invitation,
+  grant, identity}`, `invite.ended`.
+- **Joiner:** `join {ticket}` returns `{identity, name, role}`;
+  `join.cancel`. Event: `join.progress {re, step}`.
+- **Grants and peers:**
+  - `grants.list`, `peers.list`;
+  - `grant.add {identity, name, receipt}`: a direct `owner` grant, used
+    only by pair back (§5);
+  - `grant.remove {grant}` replies after the save, or after networking is
+    paused (§5.4);
+  - `peer.add {identity, name, routes}` and `peer.forget {identity}`;
+  - `peer.addresses.set {identity, routes}`.
+  - Events: `grant.closed {grant, connections}`, `store.failed {what}`.
+- **Connections:** `dial {identity}` returns `{conn, route}`. Events:
+  `conn.up {conn, identity, dir, grant?, role, deadline}`, `conn.down
+  {conn, identity, reason}`.
+- **Paths:** `path.reopened {conn}`. Events: `path.reopen {identity, from,
+  conn}`, `path.renew_failed`.
+- **Streams:** `stream.open {conn, label, class}` returns `{stream}`;
+  `stream.accept`, `stream.fin`, `stream.reset {stream, code}`, DATA,
+  CREDIT. Events: `stream.incoming {conn, stream, label, class}`,
+  `stream.fin`, `stream.reset`.
+
+Deny lists, send links and tunnels are not in 1.0.
+
+On an outbound connection the helper resets every stream the host opens.
+On an inbound connection it passes on only the §3.2 labels.
+
+## 3. The engine session
+
+New code in `src/mms/netEngine/session/`. It does not import
+`NetSyncSession` or `link/mux`.
+
+### 3.1 What it reuses
+
+| Reused | How |
 |---|---|
-| `0x01` JSON | one UTF-8 JSON object (request, reply or event) |
-| `0x02` DATA | `u32 stream` + bytes (≤ 64 KiB) |
-| `0x03` CREDIT | `u32 stream` + `u32 bytes` |
+| `DurableRpcDispatcher` | serves engine calls through `request/result/cancel` with an engine caller (§4.2); same ledger, idempotent ids, `outcome_uncertain` |
+| `SubscriptionReceiver` | per subscription, with an engine `verify` callback (§3.4) and the store's cursor |
+| `SqliteStreamStore` (`rt.streams`) | stores received records, with a side table for their origin |
+| `sync/codec.ts` | `encodeMessage`/`decodeEnvelope` for record bytes |
 
-A bad length, type or JSON closes the channel. The app side reuses the
-length-prefix idea of `src/mms/protocol/framing.ts` in its own module;
-`framing.ts` is not changed.
+### 3.2 Streams
 
-### 2.3 Streams and backpressure
+| Label | Class | Opened by | Carries |
+|---|---|---|---|
+| `mousse.hello` | interactive | caller, once per connection | `{proto, name}` both ways; then the stream stays open as the liveness and rename channel |
+| `mousse.rpc` | per method: interactive, or bulk for `ROUTED_LARGE_READS` and long methods | caller, one per call | `call {id, idem, method, params, deadline}`, then `progress*` and `result`; `result.get {id}` and `cancel {id}` use their own stream |
+| `mousse.sub` | interactive | caller, one per subscription | `subscribe {stream key, cursor}`, then `head`, `records`, `delta`, `snapshot*`, `end {code}` |
+| `mousse.blob` | bulk | caller, one per fetch | `get {stream key, blob}`, then bytes, then `FIN` |
 
-Each direction of each app stream starts with 256 KiB of credit, as on the
-wire.
+Each message is `u32 BE length | JSON header | binary parts`, at most
+16 MiB. Large params and results stream under credit: the receiver
+reassembles a message as its bytes arrive and returns credit as it buffers.
+Per-message size and the 8 MiB aggregate bound memory, and a message over
+16 MiB resets its stream with `too_large`. The 48 KiB staging path
+(`RoutedStager`) is not used on engine sessions; the client tells
+`RoutedClient` its inline limit (16 MiB).
 
-- **Helper → app:** the helper calls `StreamReader::read` only while it has
-  app credit for that stream, so a slow app consumer leaves engine credit
-  unreturned and the remote writer waits. Backpressure reaches the peer.
-- **App → helper:** the app sends DATA only within credit; the helper
-  returns credit when `StreamWriter::write` completes (it waits at the
-  engine's high-water mark).
-- **One pipe, two classes:** the helper writes interactive frames ahead of
-  bulk frames to the app, and DATA frames are at most 64 KiB, so a bulk
-  transfer cannot hold up a keystroke for more than one frame.
+### 3.3 Hello and names
 
-Stream ids are `u32`, assigned by the helper, never reused within an attach.
+The caller opens `mousse.hello` right after `conn.up`. Both sides send
+`{proto: [1,0], name}`. A different major closes the connection, and the row
+reads "Update Mousse on <name>". The name refreshes the device row on every
+connection, so a rename shows up. No node ids are sent.
 
-### 2.4 Messages (protocol 1.0)
+### 3.4 Record authenticity
 
-Requests carry `id`; replies are `{re, ok…}` or `{re, error, reason}`.
-Events carry `ev`. Identities are SEC1 hex; `device` is the 16-hex short id.
+- **At ingest:** a record received on a `mousse.sub` stream of a live
+  outbound connection to pinned peer P is accepted only if:
+  - its descriptor's authority is P's local id here;
+  - its envelope names that stream;
+  - the receiver's cursor and overlap rules pass.
 
-| Group | App → helper | Helper → app |
-|---|---|---|
-| Session | `hello {proto}`; `config.set {name}`; `shutdown` | `hello {proto, build, identity, device, port, routes, mdns}`; `ev: replaced` |
-| Invite (host) | `invite.create {kind:"in_person"}` → `{invitation, ticket, uri, routes, expires_at}`; `invite.cancel {invitation}`; `approval.answer {request, yes}` | `ev: approval {request, invitation, name, device}`; `ev: enrolled {invitation, grant, identity}`; `ev: invite.ended {invitation, reason}`; `ev: stale {request}` |
-| Join (caller) | `join {ticket, name}` → `{identity, name, role}` or `error`; `join.cancel {id}` | `ev: join.progress {re, step: dialing, waiting_approval or paired_back}` |
-| Peers and grants | `grants.list`; `peers.list`; `grant.remove {grant, deny}`; `peer.forget {identity}`; `denials.list`; `deny.remove {identity}`; `peer.addresses.set {identity, routes}` | `ev: grant.closed {grant, connections}`; `ev: store.failed {what, error}` |
-| Connections | `dial {identity}` → `{conn, route, current}`; `conn.close {conn}` | `ev: conn.up {conn, identity, dir: in or out, grant?, role, name, deadline}`; `ev: conn.down {conn, identity, reason}` |
-| Paths | `path.reopened {conn}` | `ev: path.reopen {identity, from, conn}`; `ev: path.renew_failed {identity, error}` |
-| Streams | `stream.open {conn, label, class}` → `{stream}`; `stream.accept {stream}`; `stream.fin {stream}`; `stream.reset {stream, code}`; DATA; CREDIT | `ev: stream.incoming {conn, stream, label, class}`; `ev: stream.fin`; `ev: stream.reset {stream, code}`; DATA; CREDIT |
+  Signatures and v1 authors are not checked. The engine pin is the proof.
+  The record is stored with its origin in a new table
+  `net_engine_record_origin(stream, seq, peer_local_id, grant)`.
+- **On reopen from disk:** readers of these streams (thread projection,
+  hub, artifacts) ask the peer directory (§4.3) to verify a record.
+  - **Engine origin:** valid while that local id still names a live
+    pairing.
+  - **Removed peer:** the stream reads as gone.
+  - **v1 origin:** the existing `verifyAuthor` path.
 
-Errors use the wire's reason words (`not_authorized`, `grant_revoked`,
-`pin_mismatch`, `path_replaced`, …). `join` is the long-running request
-that reports the pairing outcome; `grant.remove` replies only after the
-channels it closed are closed.
+  The local database is owner-only, like every other local store.
+- **Host side:** records are produced as today by `ThreadStreamAdapter`,
+  signed with the profile's local node key. The engine switch creates that
+  local key and self identity if missing, using the existing local
+  `bootstrapAuthority` with no passphrase. No v1 transport, listener or
+  roster peer is turned on. S0 proves this on a fresh profile.
 
-**Pair back (new, engine side).** When `join` succeeds, the joiner's helper
-makes an in-person invitation **pre-approved for exactly the host it just
-pinned** and sends its ticket on a `mousse.pair-back` stream of the new
-connection. The host's helper accepts it only from a joiner its owner
-approved in this invitation, joins that ticket, and reports
-`join.progress {step:"paired_back"}` and a second `enrolled` on the joiner.
-Any other identity presenting that ticket is declined. One tap, two grants,
-both `owner`. This is a helper behaviour plus a short spec addendum
-(`spec/wire.md` §10.9); the wire itself is unchanged.
+### 3.5 Direction and selection
 
-## 3. The app's session layer on the engine
+- **Serving authority** exists only on inbound connections, from the
+  grant in `conn.up`.
+- **Client capability** exists only on outbound connections.
 
-### 3.1 What runs unchanged, what is cut
+These are two objects, never inferred from what ports a session has.
 
-| Kept | Cut on the engine path |
-|---|---|
-| `NetSyncSession` message handling: RPC, subscriptions, blobs, snapshots, pings | v1 TLS (`SecureChannel` becomes a stub) |
-| `DurableRpcDispatcher` ledger and idempotent ids, `outcome_uncertain` | v1 mux (`link/mux`) |
-| `SubscriptionReceiver` cursors | roster and delegation in `hello`, roster listener, delegation expiry |
-| `NodeStreamAuthority`, private streams, `SqliteNodePolicy` | enrollment, route records, `lan.port.v1`, presence, tunnels, Spaces discovery |
+`EngineSessions.client(localId)` returns the client of the newest outbound
+generation that is open. Each new connection to a peer increments that
+peer's generation. A closing client clears the slot only if the slot still
+holds its own generation, so a late close cannot unpublish the replacement.
+Both dial orders are tested.
 
-### 3.2 `EngineMux`
+### 3.6 Revocation, loss and path switch
 
-New `src/mms/netEngine/engineMux.ts` implements `Mux` (`contracts.ts`) over
-three engine streams the caller opens after `conn.up`:
+- **Revocation** (`grant.closed`, or `conn.down` with `grant_revoked`):
+  within one event turn the host side
+  - aborts that caller's running handlers through the dispatcher,
+  - ends its subscriptions and blob reads,
+  - ends terminals it attached with no grace period,
+  - and drops it from the directory.
 
-| v1 lane | label | class |
-|---|---|---|
-| control | `mousse.app.control` | interactive |
-| bulk | `mousse.app.bulk` | bulk |
-| tunnel | `mousse.app.tunnel` (opened, unused in 1a) | interactive |
+  The caller side marks the computer "Removed by <name>" (§5.4).
+- **Loss** (helper exit, `conn.down` for other reasons): open calls end as
+  link loss. `RoutedClient` waits up to 30 s and retries with the same id;
+  the host ledger returns the result or `outcome_uncertain`, shown as
+  "outcome unknown". Terminal input keeps its sequence numbers, and the
+  host drops repeats. PTYs are daemon-owned, so a helper restart does not
+  end them. After a host daemon restart a terminal whose PTY is gone shows
+  as ended.
+- **Path switch** (`path.reopen`): run `hello` on the new connection;
+  re-subscribe every live subscription on it from its cursor; wait until
+  each has its `head`; publish the new generation; let calls on the old
+  connection finish (at most 5 s); then send `path.reopened`. The old
+  connection closes with `PATH_REPLACED`. M5b covers a multi-minute call
+  across a switch.
 
-Each message is `u32 BE length | encodeMessage(header, parts)` (`sync/codec.ts`).
-`queued(lane)` is the bytes waiting for helper credit. A reset of any lane
-stream, or `conn.down`, closes the mux with the mapped error. The host side
-builds its session when `mousse.app.control` arrives and attaches the other
-two as they come; any other label is reset with `REFUSED_STREAM`.
+## 4. Identity and Bridge
 
-### 3.3 Seams in shared files (smallest edits)
+### 4.1 Local ids
 
-- `sync/session.ts`: option `enginePeer?: { bind(claimed: NodeId): SyncSession['peer']; expiresAt(): number }`.
-  With it, the session's own `hello` omits `roster` and `delegation` (both
-  already optional in the wire type), `hello()` calls `bind` instead of the
-  roster path, `revalidateIdentity`/`currentDelegation` are skipped, and the
-  expiry timer uses `expiresAt()` (the connection deadline). About 50 lines.
-- `sync/rpcDispatcher.ts`: option `enginePeerCaps?(peer): readonly NodeCapability[] | undefined`.
-  When it returns caps, `authorize()` uses them instead of the roster
-  lookup; the method checks, `requires` and `authorizeMethod` hook stay.
-  About 10 lines. This is the same site where PR #868 wires its Teams
-  decision (§3.5), so both paths share one authorization point.
-- `NetService.ts`: constructor option `engine?: EnginePeers`; public
-  `openEngineSession({mux, channel, enginePeer, dir})` that calls the
-  existing `makeSession` (all per-node policy, authority and private-stream
-  closures reused) and records the link as transport `engine`;
-  `connectedHere`/`admitted` also accept a node the engine reports as
-  granted. About 40 lines.
+`net_engine_peers(local_id PK, endpoint, fingerprint, grant, peer_record,
+name, state, paired_at)` lives in the profile's `net.db`, created by the
+engine module.
 
-Because engine sessions live in `NetService`'s own session set,
-`net.session(node)`, `streamSubscribed`, `publishDelta`, `publish` and
-`failStream` work for them unchanged, so **Bridge (RoutedClient,
-ThreadRouter, attached terminals, BridgeHub) needs no edit**: they ask
-`net.session(node)` per call.
+- `local_id` is `newId('node')`, minted when a pairing is first recorded.
+  It is unique per (local endpoint, full peer fingerprint, grant).
+- Removing a device deletes its row, its `net_node_policy` row, its
+  private-stream bindings, its record origins and its streams. A re-pair
+  gets a new id, so policy and ledger history never carry over.
 
-Direction (Decision 6): the host-side session gets `rpc` and the stream
-store; the caller-side session gets no `rpc` port and an authority that
-refuses every read, so a host can never call into a caller over that
-caller's connection.
+**Translation at the session boundary:**
 
-### 3.4 Connect, path switch, loss
+- The host fills any caller-node field in params from the session.
+- Private stream keys travel with the reader segment as the token `@you`,
+  which each side swaps for its own id.
+- The caller qualifies results with its local id for the host.
 
-- `EngineNetService` keeps one `SyncSupervisor` per paired host whose
-  `connect()` is: `dial` → open the three lane streams → `openEngineSession`
-  → `await opened`.
-- **Path switch** (`ev: path.reopen`, from renewal or address change): build
-  a second session on the new `conn` and wait for `opened`, so new lookups
-  land on it; let the old session's in-flight RPCs finish (at most 5 s,
-  still well inside the old deadline); then `path.reopened {conn}`. The
-  helper calls `Caller::reopened`, the old connection closes with
-  `PATH_REPLACED`, and subscriptions that were on it re-attach on the new
-  session from their cursors (the attached-terminal `reconcile` path).
-  Nothing is replayed blindly.
-- **Loss** (helper crash, `conn.down`): sessions close as link loss.
-  `RoutedClient` waits up to 30 s and retries with the **same** RPC id; the
-  host's ledger returns the stored result, or `outcome_uncertain`, which the
-  UI shows as "outcome unknown". Terminal input keeps its sequence numbers,
-  so the host drops repeats.
-- **Removal** (`grant_revoked` / `not_authorized`): the supervisor stops
-  retrying, and the device shows "No longer accepts this computer" with
-  Remove.
+S0 lists every node-id field in `ROUTED_METHODS` params and results and
+assigns each to one of these three rules.
 
-### 3.5 What to reuse from the paused v1 branches
+### 4.2 Authorization
 
-Networking work on v1 has stopped, so neither branch constrains Phase 1a.
+`RpcContext.caller` becomes `V1Peer | EngineCaller`, where `EngineCaller`
+is `{source: 'engine', node: local_id, user: self user, grant, endpoint}`
+and has no `delegation`.
 
-- **PR #868 (Teams access), reuse later, not in 1a:** `teamAccess()` in
-  `src/mms/teams/access.ts` (pure, deny-by-default, typed reasons), the
-  `TeamDirectory` port in `src/shared/teams/types.ts` and the `crossUser`
-  column on routed rows in `src/shared/bridge/routed.ts`. When Teams comes
-  to the engine path, `enginePeerCaps`' caller in `authorize()` calls
-  `teamAccess()` with the peer's bound user id, exactly where #868 calls it
-  for v1. Its `netTeams` flag and the roster checks it keeps for allowed
-  teammates are v1 and are not inherited. Phase 1a does not depend on #868
-  merging; if it never merges, those three files are taken as they are.
-- **`lan-offline-connect`, ignore:** it teaches v1's multicast LAN transport
-  to reconnect without the relay. The engine has its own discovery (§5), so
-  none of it carries over.
+- **Owner principal:** an `owner` grant means the owner acting from
+  another of their computers, so `user` is this profile's own user id.
+  It is the key handlers already use for "who started this run" and
+  uploads.
+- **Compiler audit:** every reader of `caller.delegation` must narrow the
+  union first.
+- **Dispatcher:** `DurableRpcDispatcher.authorize()` sends engine callers
+  to `authorizeEngine`. It checks:
+  - the grant is live and still `owner`;
+  - the method is in `ENGINE_OWNER_METHODS`, an explicit list in
+    `src/shared/netEngine/allowlist.ts` taken from `ROUTED_METHODS` (no
+    editor, tunnel or Spaces methods);
+  - the existing `authorizeMethod` hook and per-node policy, keyed by
+    `local_id`: blocked, terminal, max permission mode, bots, agent reach.
+- **Streams:** served only if they are display streams of kind
+  `node.thread` or lists, or private streams whose reader is that caller's
+  `local_id`. Policy checks are as today.
+- Other roles get nothing in 1a.
 
-## 4. Identity mapping
+### 4.3 Bridge peer-directory port
 
-| Thing | Keyed on | Where |
-|---|---|---|
-| Who the peer is (TLS, pins, grants) | endpoint identity (P-256), fingerprint | helper state dir |
-| Device list row | fingerprint | `netEngine.devices` |
-| App node id | peer's own `self.node`, claimed in `hello.node` | `net_engine_peers(fingerprint PK, node UNIQUE, name, role, claimed_user, paired_at)` in the profile's `net.db`, created by the engine module |
-| Presets and per-device policy | `NodeId` | existing `net_node_policy` via `SqliteNodePolicy` |
-| RPC caps | grant role → caps | `enginePeerCaps`: `owner` → `COMPUTER_NODE_CAPABILITIES`; others → none in 1a |
-| `peer.user` | `owner` → this profile's own user id | synthesized |
-| `peer.delegation` | synthesized, never signed, sent or stored: `subject` node, `owner` self user, `name` grant name, `caps` as above, `keyEpoch 0`, `expiresAt` the connection deadline | in memory |
+New `src/mms/bridge/peers.ts`:
 
-Binding rules: the first session with a fingerprint binds its claimed node.
-A later different claim from that fingerprint, a claim of a node bound to
-another fingerprint, or a claim of a node in this profile's v1 roster closes
-the session with `conflict`. Removing a device deletes its row, so a
-re-pair binds afresh.
+    interface PeerDirectory {
+      computers(): ComputerRef[]          // listed, not blocked, connected
+      name(node): string | undefined
+      has(node): boolean
+      client(node): BridgeClient          // rpc, rpcResult, rpcCancel, subscribe, getBlob; throws peer_offline
+      verifyRecord(stream, record): void  // §3.4
+      publish / publishDelta / discardDeltas / failStream / isSubscribed
+    }
 
-Teams: the app keeps Teams authorization keyed on `(user, node)` as today.
-On the engine path that needs a teammate's user id bound at pairing, which
-Phase 1a does not create (open question 3).
+It merges two sources:
 
-The device list shows each engine device once, as its grant name
-"<computer> (<profile>)" (the joiner sets this as its helper `--name`), with
-the short id in a tooltip, and whether each direction is granted.
+- **v1:** today's roster logic, moved behind the port unchanged.
+- **Engine:** the engine table.
 
-## 5. Discovery
+Today's Bridge code switches to the port:
 
-- **Advertise:** the existing `Advertiser`: one rotating random instance
-  (`mousse-` + 12 base32, new at every start and every 15 min), random host
-  name, TXT `v=1` only. Never an owner, profile or computer name.
-- **Candidates**, in order: the last working route; manual addresses set on
-  the device; the ticket's route hints; mDNS results (browse 1.5 s on
-  demand, cached 60 s). At most 32, dialled four at a time with a 2 s
-  connect timeout.
-- **Pin mismatch** on a candidate means another endpoint (another profile on
-  that computer, or a device that took the address): skip it with no
-  warning and no re-pin (`Caller::dial_candidates` already does this). The
+- `ThreadRouter.pairedComputers` and `isOnline`
+- `botReach.accountDevices`
+- `deviceNameOf`
+- `RoutedStager`: v1 only
+- `BridgeHub.session`'s roster check (`hub/service.ts:256`) and the check
+  in `canReceive` (`:1183`)
+- the author and roster checks in `artifacts.ts` (`verifyAuthor` at `:191`, `:283`, `:381`; roster at `:531`)
+- `ThreadStreamAdapter`'s `isSubscribed`, `onDelta` and `onRecord` fan-out,
+  which today calls `net.publish`
+
+Bridge's gate becomes "v1 Bridge features on, or the engine switch on".
+`bridge.nodes` returns the merged list. In the renderer, `computers.ts`
+asks for `bridge.nodes` when `netEngine.status` says on, even if
+`net.status` is off. `NetService.ts` is not changed.
+
+### 4.4 Cases
+
+- **Same Mousse ID on both desktops, also paired over v1:** the computer
+  appears twice in 1a, once per path. The row's tooltip says which path.
+  Nothing links them, because that would need a cross-proof of v1 and
+  engine keys, and v1 goes in Phase 2. With v1 off, one row.
+- **Two profiles on one computer pairing each other:** allowed; they are
+  separate endpoints. The approval shows "<computer> (<profile>)".
+- **Teams:** none on the engine path in 1a. Before Phase 2 it needs
+  account membership authenticated independently and bound to the
+  endpoint, then `teamAccess()` (PR #868) at the `authorizeEngine` site.
+
+## 5. Pairing both ways
+
+### 5.1 Ceremony
+
+1. Host: Add device → Show QR. `invite.create`; the QR holds the
+   in-person ticket.
+2. Joiner: Add device → Scan. After the scan the dialog reads
+   "Connect to <host>? <host> will also be able to use this computer." and
+   offers **Connect** and Cancel. This tap is the joiner's consent to both
+   directions.
+3. The joiner's helper joins. The host's dialog asks "Is <computer>
+   (<profile>) next to you?" with Yes and No. The approval lives inside the
+   host's Add-device dialog; closing it or switching profile cancels the
+   invitation.
+4. Host persists the grant, then sends `PAIRED` (`p0-fix3-io`). The
+   joiner's app writes a durable receipt (`state = joined`, the host's
+   identity, `receipt = random 128-bit`).
+5. The joiner calls `grant.add {host identity, name, receipt}` and records
+   `state = granted`. Its client then sends `pairback {routes, receipt}` on
+   its `mousse.hello` stream.
+6. The host's app checks that the identity of that connection is the grant
+   it just made, then calls `peer.add {identity from the connection,
+   routes}` and dials back. A successful `conn.up` (out) there and its
+   `hello` mark `state = connected` on the host, which answers
+   `pairback.done {receipt}`. The joiner records `state = connected`.
+
+The host's identity and the routes come from the pinned connection, never
+from a ticket either side could have forwarded.
+
+### 5.2 States and recovery
+
+Device rows show:
+
+- `connected`: "Connected", both directions work.
+- `joined` or `granted` on the joiner, `peer_added` on the host: "Finishing
+  pairing…". This is retried on every connection: the joiner re-sends
+  `pairback` until `pairback.done`. `grant.add` and `peer.add` are
+  idempotent by identity and receipt.
+- One direction failing for 2 minutes: "<host> can't reach this computer"
+  or "This computer can't reach <host>", with fix text (firewall, same
+  network). Remove is always offered.
+
+If Cancel is pressed before the host's Yes, nothing is granted on either
+side. If the joiner crashes after `PAIRED`, its receipt resumes the steps
+at next start. If the host crashes before dialling back, the joiner's
+retry resumes them.
+
+### 5.3 Ticket hints
+
+1a tickets carry only RFC 1918, IPv4 link-local excluded, and IPv6 ULA
+(`fc00::/7`) addresses. CGNAT/tailnet (`100.64/10`) addresses are left out;
+they come in Phase 1b.
+
+### 5.4 Removal (fail-closed)
+
+Remove on A for B:
+
+1. Remove B's grant and forget B's pin, both in A's helper.
+2. Delete B's row and data (§4.1).
+
+The helper's grant removal writes the grant table before replying. If the
+save fails, the helper **pauses all networking**: it closes every
+connection, stops listening and refuses dials. It retries the save every
+second, and the app shows "Couldn't save a removal; networking is paused".
+A restart in that state starts paused until the save succeeds. A removed
+device can never come back because of a failed save.
+
+On B, a refusal from the pinned A with `not_authorized` or
+`grant_revoked` removes B's grant for A as well. The row then reads
+"Removed by <A>", with Remove to clear it.
+
+## 6. Discovery
+
+- **Advertise:** the existing rotating random instance; TXT `v=1` only.
+- **Candidates**, in order: last working route; manual addresses; ticket
+  hints; mDNS results (browse 1.5 s, cached 60 s). They are persisted in
+  the helper's peer record (`peers.json`), since `Caller` keeps routes in
+  memory only (`caller.rs:108`).
+- **Dialling:** in parallel, four at a time, 2 s connect timeout. This
+  replaces the sequential `dial_candidates` loop (`caller.rs:395`) in E5a.
+- **Pin mismatch:** the next candidate, with no warning and no re-pin. The
   pinned host's own refusal stops the search.
 - **Background:** while a paired host is down, retry at 1 s doubling to
-  60 s; a new mDNS instance appearing, or a local interface change (polled
-  every 5 s), retries at once. An interface change also re-registers mDNS
-  and re-dials hosts whose current path used a vanished local address
-  (make-before-break, §3.4).
-- **Manual fallback:** "Add address" on a device stores `tcp://host:port`
-  in the helper's peer record (`peer.addresses.set`). mDNS can be off and
-  pairing still works through the ticket's hints.
+  60 s. A local interface change (polled every 5 s) or a wake (§8) retries
+  at once. A new mDNS instance name is not a trigger, because names rotate.
+- **Browse source:** a trait with the mDNS implementation and a
+  file-backed one that only debug builds read (`MOUSSE_HELPER_BROWSE_FILE`),
+  for checks.
 
-## 6. UI (behind the switch)
+## 7. UI
 
-New files only, under `src/renderer/components/netEngine/`, mounted with
-one line each. Copy stays short; details go in tooltips.
+All new components live under `src/renderer/components/netEngine/`.
 
 - **Settings → Devices:** `EngineDevicesSection`, mounted in
-  `SettingsPage.tsx` beside `NetDevicesSection` (which is not edited).
-  - Switch: "New networking (LAN)". Tooltip: what it is, that v1 devices
-    are unaffected.
-  - Rows: name, online/offline, "LAN" or the address in use. A selected row
-    gets a background highlight only. Row menu: Access (the existing preset
-    control, reused read-only by `node`), Add address, Remove.
-  - "Add device" opens a dialog with two tabs:
-    - **Show QR** (this computer hosts): QR of the in-person ticket and
-      "Copy link". Tooltip on Copy: "Sharing this link shares the tap."
-    - **Scan** (this computer joins): webcam scan (`jsQR`), and "Paste link".
-      Then "Waiting for <host> to accept…", then "Connected".
-- **Approval prompt:** `EngineApprovalPrompt`, mounted in `main.tsx` beside
-  `EnrollmentRequestPrompt`: "Is <computer> (<profile>) next to you?" with
-  Yes and No; the short id under the name. One prompt per request id; it
-  closes when the invitation ends.
-- **Remove:** confirm "Remove <name>? It loses access at once." Removing
-  removes the grant and forgets the pin. The other side's row then reads
-  "No longer accepts this computer".
-- **Second profile:** when the switch is turned on and another profile on
-  this computer already has it on, one line under the switch: "Profiles on
-  this computer pair separately but share this OS account."
+  `SettingsPage.tsx`.
+  - Switch "New networking (LAN)".
+  - Rows: name, the short id in small text (two profiles look alike),
+    state from §5.2 per direction, and "LAN" or the address in use.
+  - Clock errors use the PLAN's neutral message: "the certificate is
+    outside its validity window; check this device's clock".
+  - Menu: Access (the existing preset control, by `local_id`), Add
+    address, Remove.
+  - A selected row gets a background highlight only.
+- **Add device dialog:** Show QR or Scan (webcam, `jsQR`). The host's
+  approval question appears inside this dialog. If the helper restarts
+  during an invitation, the QR regenerates. No camera: "Scan from the
+  other computer instead" (both directions pair either way).
+- **Normal picker:** engine computers appear wherever v1 computers do,
+  through `bridge.nodes`.
+- **Push:** `ui.notify {kind: "net-engine", profileId}` →
+  `netEngine:changed`. Windows refresh only for their own profile.
 
-Plumbing: `src/shared/netEngine/local.ts` lists `netEngine.status`,
-`netEngine.enable`, `netEngine.invite.create`, `netEngine.invite.cancel`,
-`netEngine.approval.answer`, `netEngine.join`, `netEngine.join.cancel`,
-`netEngine.devices`, `netEngine.remove`, `netEngine.addresses.set`. Changes
-push as `ui.notify {kind:"net-engine"}` → `netEngine:changed`.
+## 8. Situations
 
-## 7. Owner checks: `checks/phase1a.toml` (sketch)
+- **Sleep/wake:** the helper sees a monotonic jump over 10 s. It pings
+  every connection with a 2 s deadline, drops dead ones, resets backoff,
+  re-registers mDNS and re-dials; clients resume from cursors.
+- **App update:** the daemon stops profiles, so helpers get `shutdown` or
+  EOF and exit; the new daemon starts them. No lock outlives the old
+  daemon by more than 3 s.
+- **Profile switch:** every networked profile's helper keeps running.
+  Dialogs and actions apply to the selected profile, and its open
+  Add-device dialog cancels its invitation.
+- **Profile remove:** stop the helper, delete the keystore entry and the
+  state folder.
+- **Profile restore without its key:** re-init; devices show "Pair again".
+- **Profile copy:** the profile-id mismatch (§1) re-inits the copy.
+- **Helper restart mid-invitation:** the invitation is gone. The host's QR
+  regenerates; the joiner sees "Scan again".
+- **Wrong clock:** the neutral message on the device row; no guess about
+  which side is wrong.
+- **Mixed versions:** an engine wire minor mismatch negotiates down. An app
+  protocol major mismatch shows "Update Mousse on <name>".
+- **Helper restart with live terminals:** PTYs survive (daemon-owned), and
+  output resumes from the cursor.
 
-Engine-only checks are cargo tests. Checks that need the app run the Mousse
-harness `scripts/net-engine-check.mjs` (two daemons, real helpers) with the
-`marker` judge. The harness prints the app commit in its details and as
-`extra.app_build`. App controls are `MOUSSE_NET_ENGINE_CONTROL=<name>`,
-honoured only in unpackaged builds.
+## 9. Owner checks: `checks/phase1a.toml` (sketch)
+
+**Build binding.** App-level checks run `scripts/net-engine-check.mjs`
+(Mousse repo) with `MOUSSE_NET_HELPER` pointing at the kit's own build of
+the helper. A control check builds that helper in debug with the control's
+cfg, so the defect is in the binary the harness spawns.
+
+Every result carries `extra.app_build` (clean Mousse commit) and
+`extra.helper_build`. A kit change, landing in E6, adds
+`require_extra = ["app_build", "helper_build"]` and requires `helper_build`
+to equal the build under test. App controls are
+`MOUSSE_NET_ENGINE_CONTROL=<name>`; app faults are
+`MOUSSE_NET_ENGINE_FAULT=<name>`. Both work only in unpackaged builds.
+
+**Topology.** Shared-computer checks use four endpoints:
+
+- PC profile A paired with Mac profile C;
+- PC profile B paired with Mac profile D.
 
 ```toml
 phase = "phase1a"
 title = "Two desktops on a LAN (in-person only)"
 plan = "docs/PLAN.md#phase-1a-two-desktops-on-a-lan-in-person-only"
-# No [defer]: Phase 1a has no CPace check (in person needs no code).
-# Inline `control = [...]` is the same TOML as [[check.control]] blocks.
+# Inline `control = [...]` equals [[check.control]] blocks. A slice lands its checks.
 
-[[check]]  # local: cargo test -p mousse-helper --test app_channel
+[[check]]  # S0: cargo-free; node harness, two fresh profiles in one machine, v1 off
+id = "phase1a.picker-v1-off"
+title = "With v1 off on fresh profiles, a remote thread and a terminal work through the normal picker"
+targets = ["windows-x64", "macos-arm64"]
+judge = "marker"
+control = [{ name = "roster-only-directory", expect_reason = "not_listed",
+  breaks = "the peer directory reads only the v1 roster", env = { MOUSSE_NET_ENGINE_CONTROL = "roster-only-directory" } }]
+
+[[check]]  # E1+E2: cargo test -p mousse-helper --test app_channel --test app_streams
 id = "phase1a.app-channel"
-title = "Only the owner's app attaches; frames, credit and version are enforced"
+title = "Channel framing, credit, pumps and priority: bulk stalled both ways, interactive echo p95 < 20 ms, revocation event < 100 ms"
 targets = ["windows-x64", "macos-arm64", "linux-x64"]
-min_tests = 12
-control = [{ name = "app-skip-token", breaks = "attach accepted without the control token",
-             env = { RUSTFLAGS = '--cfg mousse_control="app-skip-token"' } }]
+min_tests = 14
+control = [
+  { name = "read-without-credit", breaks = "the helper reads engine streams without app credit",
+    env = { RUSTFLAGS = '--cfg mousse_control="read-without-credit"' } },
+  { name = "fifo-writer", breaks = "one FIFO writer queue for control, interactive and bulk",
+    env = { RUSTFLAGS = '--cfg mousse_control="fifo-writer"' } },
+]
 
-[[check]]  # local: cargo test -p mousse-helper --test app_streams
-id = "phase1a.backpressure"
-title = "A stalled app stream stops the remote writer; other streams keep moving"
-targets = ["windows-x64", "macos-arm64", "linux-x64"]
-min_tests = 4
-control = [{ name = "read-without-credit", breaks = "the helper reads engine streams without app credit",
-             env = { RUSTFLAGS = '--cfg mousse_control="read-without-credit"' } }]
-
-[[check]]  # device result: harness confirms 1.1.1.1:443 and DNS unreachable, times scan to connected
+[[check]]  # automated LAN cell: the kit injects the ticket and answers the approval (stated in details); offline verified
 id = "phase1a.pair-offline"
-title = "Router cable unplugged: scan, tap, connected in under 10 s"
+title = "Internet unreachable: pair over LAN and connected both ways in under 10 s"
 targets = ["pc-to-mac-lan"]
 judge = "marker"
 cross_machine = true
-control = [{ name = "wan-only-hints", expect_reason = "unreachable",
-             breaks = "tickets carry no LAN hints and mDNS is off, so pairing needs a route off the LAN",
-             env = { MOUSSE_NET_ENGINE_CONTROL = "wan-only-hints" } }]
+control = [{ name = "cable-plugged", expect_reason = "internet_reachable",
+  breaks = "run with the router's WAN cable in; the harness must refuse it", env = { MOUSSE_CHECK_EXPECT_ONLINE = "1" } }]
 
-[[check]]  # local cells: loopback, restart with mDNS off, host moves 127.0.0.2 -> 127.0.0.3; device cell: real LAN, DHCP change
+[[check]]
+id = "phase1a.pair-in-person"
+title = "Router cable unplugged: webcam scan, Connect, Yes, connected in under 10 s"
+targets = ["pc-to-mac-lan"]
+manual = true
+steps = "unplug WAN; Show QR on the Mac; Scan on the PC; Connect; Yes; time to Connected on both"
+
+[[check]]  # E5a+M5a: loopback; restart with mDNS off (kept port); host moves 127.0.0.2 -> .3 found via the browse file
 id = "phase1a.reconnect"
 title = "Reconnects after a restart of either side and after the host's address changes"
 targets = ["windows-x64", "linux-x64", "pc-to-mac-lan"]
 judge = "marker"
 control = [
-  { name = "forget-kept-port", expect_reason = "unreachable", breaks = "a fresh port at every start (run with mDNS off)",
+  { name = "forget-kept-port", expect_reason = "unreachable", breaks = "a fresh port at every start",
     env = { RUSTFLAGS = '--cfg mousse_control="forget-kept-port"' } },
   { name = "no-rediscovery", expect_reason = "unreachable", breaks = "the caller tries only the last working route",
     env = { RUSTFLAGS = '--cfg mousse_control="no-rediscovery"' } },
 ]
 
-[[check]]
+[[check]]  # M5a: one ceremony gives both directions; kill joiner after PAIRED and host before dial-back: recovers to Connected; Cancel before Yes grants nothing
+id = "phase1a.pair-both-ways"
+title = "Pair back: consent, durable recovery, Connected only when both directions work"
+targets = ["windows-x64", "linux-x64"]
+judge = "marker"
+control = [{ name = "no-pairback-retry", expect_reason = "one_way_stuck",
+  breaks = "the joiner does not resend pairback after a crash", env = { MOUSSE_NET_ENGINE_CONTROL = "no-pairback-retry" } }]
+
+[[check]]  # M5a: routed call and live terminal end at once; next dial refused; save failure pauses networking and a restart keeps it refused
 id = "phase1a.removal"
-title = "Removal refused at once: routed call and live terminal end, next dial refused"
+title = "Removal refused at once, closes channels and tears down Bridge work; fails closed on a save error"
 targets = ["windows-x64", "macos-arm64", "linux-x64"]
 judge = "marker"
 control = [
   { name = "keep-removed-grant", expect_reason = "still_connected", breaks = "removing a grant leaves it in force",
     env = { RUSTFLAGS = '--cfg mousse_control="keep-removed-grant"' } },
-  { name = "keep-engine-session", expect_reason = "still_served", breaks = "the app keeps serving after grant_revoked",
-    env = { MOUSSE_NET_ENGINE_CONTROL = "keep-engine-session" } },
+  { name = "keep-engine-work", expect_reason = "stale_work", breaks = "the host app keeps handlers and subscriptions after grant.closed",
+    env = { MOUSSE_NET_ENGINE_CONTROL = "keep-engine-work" } },
+  { name = "save-fails-open", expect_reason = "served_after_failed_save", breaks = "a failed save leaves networking on",
+    env = { RUSTFLAGS = '--cfg mousse_control="save-fails-open"' } },
 ]
 
-[[check]]  # A removes the shared desktop: A's channels close; B stays connected with a live terminal and reconnects after a restart; neither dials the other's peers
+[[check]]  # four endpoints (A<->C, B<->D); A removes C: A's channels close; B<->D stays, B's terminal stays live, B reconnects after restart; A cannot dial D, B cannot dial C
 id = "phase1a.shared-computer"
-title = "Two profiles on one desktop each pair both ways with their own second desktop"
+title = "Two profiles on one desktop, each paired both ways with its own profile on the second desktop"
 targets = ["pc-to-mac-lan"]
 judge = "marker"
 cross_machine = true
-control = [{ name = "shared-endpoint-state", breaks = "one key and one grant table for every endpoint on the machine",
-             env = { RUSTFLAGS = '--cfg mousse_control="shared-endpoint-state"' } }]
+control = [{ name = "shared-endpoint-state", expect_reason = "other_profile_affected",
+  breaks = "one key and one grant table for every endpoint on the machine",
+  env = { RUSTFLAGS = '--cfg mousse_control="shared-endpoint-state"' } }]
 
-[[check]]  # `mousse-check proxy` cuts the pipe once the host's reply starts; the kit kills the caller's helper; the input "echo <marker> >> f" keeps its sequence number across retries; the kit counts <marker> in f
+[[check]]  # host fault drops the reply of the identified call after the effect; kit kills the caller's helper; retry; kit reads the effect file. PTY input dedupe tested separately.
 id = "phase1a.once-or-unknown"
-title = "Dropped ack and killed helper: the effect happens once, or the caller shows outcome unknown"
+title = "Dropped reply and killed helper: the effect happens once, or the caller shows outcome unknown"
 targets = ["windows-x64", "linux-x64"]
 judge = "marker"
 control = [
-  { name = "no-host-dedupe", expect_reason = "duplicate_effect", breaks = "the host runs a repeated RPC id or input sequence again",
+  { name = "no-host-dedupe", expect_reason = "duplicate_effect", breaks = "the host runs a repeated call id or input sequence again",
     env = { MOUSSE_NET_ENGINE_CONTROL = "no-host-dedupe" } },
   { name = "claim-success-on-loss", expect_reason = "false_outcome", breaks = "the caller reports success when the outcome is unknown",
     env = { MOUSSE_NET_ENGINE_CONTROL = "claim-success-on-loss" } },
 ]
 
-[[check]]  # local: cargo test -p mousse-net-io --test discovery (mDNS capture on a private interface)
-id = "phase1a.discovery-privacy"
-title = "mDNS carries no name; a pin mismatch moves to the next candidate with no warning or re-pin"
+[[check]]  # E5a: mDNS capture; pin mismatch skips to the next candidate
+id = "phase1a.discovery"
+title = "mDNS carries no name; a pin mismatch moves on with no warning or re-pin; hints are private-range only"
 targets = ["linux-x64", "macos-arm64"]
-min_tests = 6
+min_tests = 8
 control = [
   { name = "name-in-instance", breaks = "the instance name carries the device name",
     env = { RUSTFLAGS = '--cfg mousse_control="name-in-instance"' } },
@@ -476,110 +687,79 @@ control = [
 ]
 ```
 
-The cable-unplugged check depends on the owner's network, so it is a
-device result signed with `mousse-check sign`, never a local run. The
-first-run firewall and local-network prompts are answered before timing
-starts (Risk 4).
+## 10. Work breakdown
 
-## 8. Work breakdown
+Each slice is one agent's PR and lands its own checks. E = engine repo,
+M = Mousse. Existing Mousse files are in bold.
 
-Ordered; each slice is one agent's PR. "E" is the engine repo, "M" is
-Mousse. Existing v1 files are in bold; their edits stay at the seams of
-§3.3.
-
-| # | Repo, paths | What | Proved by |
+| # | Paths | What | Proved by |
 |---|---|---|---|
-| E1 | E `crates/mousse-helper/src/{ipc.rs,serve.rs,main.rs}`, new `app.rs`, `appframe.rs` | `serve --app`; `app` attach on the control listener; framing; hello/version; replace and linger; `term` refused in app mode | `tests/app_channel.rs` (fake app in Rust): bad token, wrong major, oversize frame, second attach replaces first, `term` refused; control `app-skip-token` |
-| E2 | E new `streams.rs`; `serve.rs` | app streams over the channel with credit, interactive-first writer | `tests/app_streams.rs`: 64 MiB round trip intact; stalled stream blocks the remote writer while another stream keeps flowing; control `read-without-credit` |
-| E3 | E `serve.rs`, `peer.rs`, new `app_pairing.rs` | host and caller in one process: invite/approval/join, grants, peers, remove/deny, addresses | `tests/app_pairing.rs`: two app-mode helpers pair on loopback; stale approval refused; removal closes before the reply; existing `loopback.rs` still passes |
-| E4 | E `mousse-net-io/src/{host.rs,caller.rs}`, `spec/wire.md` §10.9, `app_pairing.rs` | pair back: pre-approved invitation scoped to one identity, `mousse.pair-back` stream | both grants after one approval; a third identity with the ticket is declined; `sim` seed for the pre-approval |
-| E5 | E new `paths.rs`; `mousse-net-io/src/discovery.rs` | dial candidates, keep connected, `start_renewals` → `path.reopen`/`reopened`, interface watcher, continuous browse | `tests/app_paths.rs` with `ManualClock`: renewal reopen and confirm; restart reconnect via kept port; address change on loopback aliases; pin mismatch skipped; controls `forget-kept-port`, `no-rediscovery`, `stop-on-mismatch`, `name-in-instance` |
-| E6 | E `crates/mousse-check`, `checks/phase1a.toml` | manifest; `mousse-check proxy` (cut after N reply bytes) | kit self-tests; `mousse-check phase1a` lists every cell |
-| M1 | M `scripts/build-net-helper.mjs`, `native/net-helper/ENGINE_COMMIT`, `package.json` (extraResources, script) | build and package the helper | script builds on Windows and macOS; packaged app has `resources/net-helper` |
-| M2 | M new `src/mms/netEngine/{helperProcess,helperChannel,frames}.ts` | spawn/attach/restart/shutdown; requests, events, stream credit | `tests/netEngine/helperChannel.test.ts` against a fake helper; one test against the real binary when built (skipped otherwise) |
-| M3 | M new `src/mms/netEngine/{engineMux,engineChannel}.ts` | `Mux` over three helper streams | `Mux` contract tests on `EngineMux`; `queued()` grows when credit is withheld |
-| M4 | M **`sync/session.ts`**, **`sync/rpcDispatcher.ts`** | `enginePeer` and `enginePeerCaps` seams | two sessions over `EngineMux`: hello without roster; RPC allowed by `owner` caps, refused for other roles; conflicting node claim refused; focused v1 session and dispatcher tests unchanged |
-| M5 | M **`NetService.ts`**, **`MmsProfileServices.ts`**, new `src/mms/netEngine/{service,peers,registerMethods}.ts` | `EngineNetService`: peer table, sessions in/out, supervisors, path switch, removal | two in-process profiles with real helpers: routed call and terminal over the engine; removal ends the terminal and refuses the next call; path switch keeps terminal output gap-free and without repeats; killed helper → restart → reconnect |
-| M6 | M new `src/shared/netEngine/local.ts`; **`registerGuiIpc.ts`**, **`protocolEventBridge.ts`**, **`preload/index.ts`** | methods and the `netEngine:changed` push | allow-list test; event reaches the renderer |
-| M7 | M new `src/renderer/components/netEngine/*`; **`SettingsPage.tsx`**, **`main.tsx`**; dependency `jsqr` | §6 UI | component tests (list, approve, remove, scan/paste); real-app before/after captures in the PR |
-| M8 | M new `scripts/net-engine-check.mjs`, control hooks in `netEngine/*` | app-level checks and controls of §7 | each check prints PASS; each control prints FAIL with its reason |
+| S0 | M new `src/mms/netEngine/session/*`, `peers.ts` stub; **`rpcDispatcher.ts`** (`EngineCaller`) | vertical spike over in-memory engine streams, no helper: two fresh profiles, v1 off, one routed call and one terminal stream; node-id field list (§4.1); local bootstrap of the signing key | `tests/netEngine/spike.test.ts`; output is the go/no-go for §3–§4 |
+| E1 | E `mousse-helper/src/{main.rs,serve.rs}`, new `app.rs`, `appframe.rs`, `log.rs` | `serve --app` on stdio, framing, hello, own log, exit on EOF, `term` refused | `tests/app_channel.rs` |
+| E2 | E new `streams.rs` | pumps, queues, credit, read-ahead, priority | `tests/app_streams.rs`: bulk stalled both ways; latency thresholds; 64 MiB intact; controls `read-without-credit`, `fifo-writer` |
+| E3 | E `serve.rs`, `peer.rs`, new `app_pairing.rs`; `mousse-net-io/src/host.rs` (`grant_direct`) | host and caller in one process; invite/approval/join; `grant.add`/`remove` with fail-closed pause; `peer.add`/`forget`/`addresses` | `tests/app_pairing.rs`; control `save-fails-open`; Phase 0 `loopback.rs` passes |
+| E5a | E new `paths.rs`; `mousse-net-io/src/{caller.rs,discovery.rs}` | persisted candidates, parallel dial, keep connected, browse-source trait, private-range hints | `tests/app_paths.rs`; check `phase1a.discovery` |
+| E5b | E `paths.rs` | renewals → `path.reopen`/`reopened`, interface watcher, wake detection | `ManualClock` tests: reopen then confirm; wake; address change |
+| E6 | E `crates/mousse-check`, `checks/phase1a.toml` | `require_extra`, build binding | kit self-tests |
+| M1 | M `scripts/build-net-helper.mjs`, `native/net-helper/ENGINE_COMMIT`, **`package.json`** | build and package; macOS local-network and keychain spike for a daemon-spawned helper | packaged app runs the helper on Windows and macOS |
+| M2 | M new `src/mms/netEngine/{helperProcess,helperChannel}.ts`; **`ProfileHost.ts`**, **`MousseMainService.ts`** | spawn, restart, shutdown, pumps; `startNetworkedProfiles` with isolation | fake-helper tests; real-helper test; hard kill of the parent on Windows and macOS ends the helper |
+| M3 | M `netEngine/session/*` | full engine session over the helper; dispatcher `authorizeEngine`; allowlist | session tests; check `phase1a.once-or-unknown` |
+| M4 | M **`bridge/peers.ts`** (new) and the Bridge call sites in §4.3; **`BridgeProfileService.ts`** | peer-directory port; publish fan-out; gate | v1 Bridge tests unchanged; check `phase1a.picker-v1-off` |
+| M5a | M new `netEngine/{service,peers,pairing}.ts`; **`MmsProfileServices.ts`** | peer table, selection, revocation teardown, both-ways pairing, removal | checks `phase1a.pair-both-ways`, `phase1a.removal`, `phase1a.reconnect` |
+| M5b | M `netEngine/service.ts` | path switch | terminal output gap-free across a switch; multi-minute call survives it |
+| M6 | M new `src/shared/netEngine/local.ts`; **`registerGuiIpc.ts`**, **`protocolEventBridge.ts`**, **`preload/index.ts`**, **`renderer/lib/computers.ts`** | methods, push, picker source | allow-list test |
+| M7 | M new `components/netEngine/*`; **`SettingsPage.tsx`**; dependency `jsqr` | §7 UI | component tests; real-app captures; checks `phase1a.pair-offline`, `phase1a.pair-in-person`, `phase1a.shared-computer` |
 
-**Existing Mousse files Phase 1a touches, and why**
+**Existing Mousse files touched, and why**
 
-| File | Why |
-|---|---|
-| `src/mms/net/sync/session.ts` | `enginePeer` option (§3.3) |
-| `src/mms/net/sync/rpcDispatcher.ts` | `enginePeerCaps` option |
-| `src/mms/net/NetService.ts` | `engine` option, `openEngineSession`, two `admitted` checks |
-| `src/mms/MmsProfileServices.ts` | start/stop `EngineNetService` under the switch; register methods |
-| `src/main/ipc/registerGuiIpc.ts` | spread `NET_ENGINE_LOCAL_METHODS` |
-| `src/main/mms/protocolEventBridge.ts` | `net-engine` notify → `netEngine:changed` |
-| `src/preload/index.ts` | `net.onEngineChanged` |
-| `src/renderer/components/SettingsPage.tsx` | mount `EngineDevicesSection` |
-| `src/renderer/main.tsx` | mount `EngineApprovalPrompt` |
-| `package.json` | extraResources, build script, `jsqr` |
+- **Profiles and daemon:**
+  - `ProfileHost.ts` and `MousseMainService.ts`: background
+    `startNetworkedProfiles`.
+  - `MmsProfileServices.ts`: start and stop the engine service under the
+    switch.
+- **Dispatcher:** `sync/rpcDispatcher.ts` and `contracts.ts`
+  (`RpcContext.caller` union): `EngineCaller` and `authorizeEngine`.
+- **Bridge:** `BridgeProfileService.ts`, `routed/ThreadRouter.ts`,
+  `remote/botReach.ts`, `routed/deviceName.ts`, `routed/stager.ts`,
+  `routed/RoutedClient.ts` (inline limit), `hub/service.ts`,
+  `artifacts.ts`: read peers, sessions and record checks through the port.
+- **Handlers:** any that read `caller.delegation`, as the compiler lists
+  them.
+- **Main, preload and renderer:**
+  - `registerGuiIpc.ts`, `protocolEventBridge.ts` and `preload/index.ts`:
+    methods and the push;
+  - `renderer/lib/computers.ts`: the picker source;
+  - `SettingsPage.tsx`: the mount.
+- **Packaging:** `package.json`.
 
-Not touched: `NetDevicesSection.tsx`, `components/devices/*`,
-`transports/*`, `link/*`, `framing.ts`, `shared/net/local.ts`, Bridge. The
-devices screen stays separate in Phase 1a so v1 keeps working untouched;
-Phase 2 folds the engine list into it when v1 goes.
+Not touched: `NetService.ts`, `sync/session.ts`, `sync/supervisor.ts`,
+`transports/*`, `link/*`, `NetDevicesSection.tsx`, `components/devices/*`.
 
-## 9. Risks and open questions
+## 11. Risks and open questions
 
 **Risks**
 
-1. **The session seam may be bigger than 50 lines.** `session.ts` refers to
-   roster and delegation about 100 times. If `enginePeer` cannot stay small,
-   the fallback is a slim `EngineSession` that implements only what Bridge
-   uses (`rpc`, `rpcResult`, `rpcCancel`, `subscribe`, `getBlob`), still
-   with the same ledger and cursors.
-2. **v1 regressions from the seams.** The three seams in v1 files are off
-   unless an engine peer is present; M4 and M5 run the focused v1 session,
-   dispatcher and NetService tests to show v1 is unchanged.
-3. **Desktops without a webcam.** Paste is the fallback. It weakens "in
-   person" to "whoever has the link", which the warning states.
-4. **First-run OS prompts.** Windows Firewall on the first `0.0.0.0` listen
-   and the macOS local-network prompt can blow the 10 s budget the first
-   time. The check runs after the prompts are answered; the installer may
-   add a firewall rule later.
-5. **Linux without a secret service.** No keystore means no endpoint; the
-   switch says so. `--insecure-file-key` is never used by the app.
-6. **Pair-back auto-approval** is a new trust step. It is scoped to one
-   pinned identity and one invitation, but it needs the design review
-   before E4 merges.
+1. **Bridge identity runs deeper than listed.** S0 is the gate. If the
+   node-id field list or the record-check sites in §4.3 grow past a day's
+   work, stop and re-plan before E-slices beyond E2.
+2. **Host-side signing still uses the local v1 key** (§3.4). It is local
+   only, but Phase 2 must replace the record author when v1 identity goes.
+3. **Both desktops need inbound reachability**, so Windows Firewall and the
+   macOS local-network prompt can appear on either machine. Rows say which
+   direction fails and how to fix it. The in-person check runs after the
+   prompts are answered.
+4. **Linux without a secret service:** no endpoint; the switch says so.
+5. **No webcam on either desktop:** cannot pair until Phase 1b send links.
 
-**Open questions for review** (least sure first)
+**Open questions for round 2**
 
-1. **Reusing `NetSyncSession` at all** (Decision 3). The alternative is a
-   new, small engine-native app session (RPC + cursored streams only) that
-   Phase 2 keeps while v1's session goes. Reuse is faster for 1a; a new one
-   may be less to delete later. Which costs less over Phases 1a–2?
-2. **The node id claim** (Decision 4, §4): binding the peer's self-claimed
-   `NodeId` under the engine pin, versus a local random id per fingerprint
-   (IDs here are "never derived from keys") plus translation of node ids
-   that cross the wire (private stream keys, qualified results).
-3. **One-way sessions plus pair back** (Decisions 6, §2.4): two
-   connections per pair of desktops and an automatic second enrollment,
-   versus one connection that both sides may call over, authorized by each
-   side's own grant table.
-4. **Multiplexing streams over the app channel** (§2.3) instead of the
-   kernel's backpressure from one local socket per stream.
-5. **Helper life tied to the daemon** (Decision 1) versus a helper that
-   runs on its own for the OS session (PLAN §8). If tied, should the
-   daemon start at login?
-6. **`owner` peers act as this user** (Decision 5, synthesized
-   `peer.user` and delegation): is synthesizing v1 identity objects
-   acceptable as a Phase 1a bridge?
-
-**Other open questions**
-
-1. Should the joiner's display name include the profile name by default,
-   or only when the computer has more than one networked profile?
-2. Does an `owner` grant from pairing stay the only role until Phase 4, or
-   does Phase 1b add a `client` role with a preset of its own?
-3. Teams on the engine path: bind a teammate's user id at pairing (claimed
-   in `hello`, held under the pin, shown in the approval), then key Teams
-   rules on `(user, node)` as today? This needs deciding before Phase 2
-   deletes v1.
-4. Spaces sync, presence and editor tunnels over the engine: which phase,
-   and with which author identity once the v1 roster is gone?
+1. Is the origin-table trust model (§3.4) enough for records read back
+   after a peer is removed and re-paired under a new local id? This design
+   deletes them on removal.
+2. `EngineCaller.user = self user` for `owner` (§4.2): acceptable as the
+   owner's own principal, or should handlers move to a separate principal
+   field now?
+3. Should "Finishing pairing…" time out into an automatic removal of the
+   half grant, rather than staying until Remove?
+4. Is the `@you` token swap for private stream keys enough, or should
+   engine sessions use stream handles that carry no node ids at all?
