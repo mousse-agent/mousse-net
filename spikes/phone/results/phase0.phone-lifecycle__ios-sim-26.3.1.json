@@ -1,0 +1,120 @@
+{
+  "build": "b7bdf85+release",
+  "check": "phase0.phone-lifecycle",
+  "details": {
+    "bindings": "swift (UniFFI 0.32.2), strict concurrency, Swift 6 mode",
+    "blackholeSkips": [],
+    "breakMode": null,
+    "failures": [],
+    "iterations": 20,
+    "libTarget": "aarch64-apple-ios-sim",
+    "promptMs": 250,
+    "socketBaseline": {
+      "count": 0,
+      "waitedMs": 1524
+    },
+    "steps": {
+      "cancel-pending-dial": {
+        "failures": 0,
+        "max": 4.119624853134155,
+        "p50": 0.399,
+        "p95": 2.091,
+        "runs": 20
+      },
+      "dial-after-stop-refused": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 20
+      },
+      "dial-echo": {
+        "failures": 0,
+        "max": 12.587834,
+        "p50": 2.503,
+        "p95": 8.189,
+        "runs": 20
+      },
+      "dial-pending-before-cancel": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 20
+      },
+      "events-bounded-batches": {
+        "failures": 0,
+        "max": 8,
+        "p50": 8,
+        "p95": 8,
+        "runs": 20
+      },
+      "events-expected": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 20
+      },
+      "events-overflow-counted": {
+        "failures": 0,
+        "max": 24,
+        "p50": 24,
+        "p95": 24,
+        "runs": 20
+      },
+      "no-live-dials-after-cancel": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 20
+      },
+      "no-socket-leak": {
+        "failures": 0,
+        "max": 0,
+        "p50": 0,
+        "p95": 0,
+        "runs": 20
+      },
+      "no-task-leak-before-stop": {
+        "failures": 0,
+        "max": 1,
+        "p50": 1,
+        "p95": 1,
+        "runs": 20
+      },
+      "start": {
+        "failures": 0,
+        "max": 0.9172499179840088,
+        "p50": 0.066,
+        "p95": 0.096,
+        "runs": 20
+      },
+      "stop": {
+        "failures": 0,
+        "max": 17.98216700553894,
+        "p50": 1.314,
+        "p95": 9.582,
+        "runs": 20
+      },
+      "stop-resolves-pending-dial": {
+        "failures": 0,
+        "max": 18.003124952316284,
+        "p50": 1.358,
+        "p95": 9.611,
+        "runs": 20
+      },
+      "task-cancel-resolves": {
+        "failures": 0,
+        "max": 12.204792022705078,
+        "p50": 0.581,
+        "p95": 4.375,
+        "runs": 20
+      }
+    },
+    "unroutable": "10.255.255.1:9"
+  },
+  "outcome": "PASS",
+  "target": "ios-sim-26.3.1"
+}

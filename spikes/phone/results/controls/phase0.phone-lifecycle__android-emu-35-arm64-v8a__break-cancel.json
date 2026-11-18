@@ -1,0 +1,221 @@
+{
+  "build": "b7bdf85+release",
+  "check": "phase0.phone-lifecycle",
+  "details": {
+    "bindings": "kotlin (UniFFI 0.32.2), coroutines",
+    "blackholeSkips": [],
+    "breakMode": "cancel",
+    "failures": [
+      {
+        "note": "TIMED_OUT",
+        "step": "cancel-pending-dial",
+        "value": 2001.5300839999982
+      },
+      {
+        "note": "live 2",
+        "step": "no-live-dials-after-cancel",
+        "value": null
+      },
+      {
+        "note": "only the echo listener may remain",
+        "step": "no-task-leak-before-stop",
+        "value": 3
+      },
+      {
+        "note": "STARTED, DIAL_STARTED(127.0.0.1:33253), DIAL_CONNECTED(127.0.0.1:33253), ECHO_OK(1024 bytes), DIAL_STARTED(10.255.255.1:9), DIAL_STARTED(10.255.255.1:9)",
+        "step": "events-expected",
+        "value": null
+      },
+      {
+        "note": "TIMED_OUT",
+        "step": "cancel-pending-dial",
+        "value": 2000.6756679999999
+      },
+      {
+        "note": "live 2",
+        "step": "no-live-dials-after-cancel",
+        "value": null
+      },
+      {
+        "note": "only the echo listener may remain",
+        "step": "no-task-leak-before-stop",
+        "value": 3
+      },
+      {
+        "note": "STARTED, DIAL_STARTED(127.0.0.1:43777), DIAL_CONNECTED(127.0.0.1:43777), ECHO_OK(1024 bytes), DIAL_STARTED(10.255.255.1:9), DIAL_STARTED(10.255.255.1:9)",
+        "step": "events-expected",
+        "value": null
+      },
+      {
+        "note": "TIMED_OUT",
+        "step": "cancel-pending-dial",
+        "value": 2000.4078759999975
+      },
+      {
+        "note": "live 2",
+        "step": "no-live-dials-after-cancel",
+        "value": null
+      },
+      {
+        "note": "only the echo listener may remain",
+        "step": "no-task-leak-before-stop",
+        "value": 3
+      },
+      {
+        "note": "STARTED, DIAL_STARTED(127.0.0.1:41559), DIAL_CONNECTED(127.0.0.1:41559), ECHO_OK(1024 bytes), DIAL_STARTED(10.255.255.1:9), DIAL_STARTED(10.255.255.1:9)",
+        "step": "events-expected",
+        "value": null
+      },
+      {
+        "note": "TIMED_OUT",
+        "step": "cancel-pending-dial",
+        "value": 2000.470460000004
+      },
+      {
+        "note": "live 2",
+        "step": "no-live-dials-after-cancel",
+        "value": null
+      },
+      {
+        "note": "only the echo listener may remain",
+        "step": "no-task-leak-before-stop",
+        "value": 3
+      },
+      {
+        "note": "STARTED, DIAL_STARTED(127.0.0.1:44781), DIAL_CONNECTED(127.0.0.1:44781), ECHO_OK(1024 bytes), DIAL_STARTED(10.255.255.1:9), DIAL_STARTED(10.255.255.1:9)",
+        "step": "events-expected",
+        "value": null
+      },
+      {
+        "note": "TIMED_OUT",
+        "step": "cancel-pending-dial",
+        "value": 2001.2170419999966
+      },
+      {
+        "note": "live 2",
+        "step": "no-live-dials-after-cancel",
+        "value": null
+      },
+      {
+        "note": "only the echo listener may remain",
+        "step": "no-task-leak-before-stop",
+        "value": 3
+      },
+      {
+        "note": "STARTED, DIAL_STARTED(127.0.0.1:43889), DIAL_CONNECTED(127.0.0.1:43889), ECHO_OK(1024 bytes), DIAL_STARTED(10.255.255.1:9), DIAL_STARTED(10.255.255.1:9)",
+        "step": "events-expected",
+        "value": null
+      }
+    ],
+    "iterations": 5,
+    "libTarget": "aarch64-linux-android",
+    "promptMs": 250,
+    "socketBaseline": {
+      "count": 11,
+      "waitedMs": 1769
+    },
+    "steps": {
+      "cancel-pending-dial": {
+        "failures": 5,
+        "max": 2001.5300839999982,
+        "p50": 2000.676,
+        "p95": 2001.53,
+        "runs": 5
+      },
+      "dial-after-stop-refused": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 5
+      },
+      "dial-echo": {
+        "failures": 0,
+        "max": 2.412793,
+        "p50": 0.414,
+        "p95": 2.413,
+        "runs": 5
+      },
+      "dial-pending-before-cancel": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 5
+      },
+      "events-bounded-batches": {
+        "failures": 0,
+        "max": 6,
+        "p50": 6,
+        "p95": 6,
+        "runs": 5
+      },
+      "events-expected": {
+        "failures": 5,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 5
+      },
+      "events-overflow-counted": {
+        "failures": 0,
+        "max": 24,
+        "p50": 24,
+        "p95": 24,
+        "runs": 5
+      },
+      "no-live-dials-after-cancel": {
+        "failures": 5,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 5
+      },
+      "no-socket-leak": {
+        "failures": 0,
+        "max": 0,
+        "p50": 0,
+        "p95": 0,
+        "runs": 5
+      },
+      "no-task-leak-before-stop": {
+        "failures": 5,
+        "max": 3,
+        "p50": 3,
+        "p95": 3,
+        "runs": 5
+      },
+      "start": {
+        "failures": 0,
+        "max": 2.5267499999972642,
+        "p50": 0.644,
+        "p95": 2.527,
+        "runs": 5
+      },
+      "stop": {
+        "failures": 0,
+        "max": 5.657749999998487,
+        "p50": 0.929,
+        "p95": 5.658,
+        "runs": 5
+      },
+      "stop-resolves-pending-dial": {
+        "failures": 0,
+        "max": 9.028041999998095,
+        "p50": 3.151,
+        "p95": 9.028,
+        "runs": 5
+      },
+      "task-cancel-resolves": {
+        "failures": 0,
+        "max": 1.3282920000019658,
+        "p50": 0.648,
+        "p95": 1.328,
+        "runs": 5
+      }
+    },
+    "unroutable": "10.255.255.1:9"
+  },
+  "outcome": "FAIL",
+  "target": "android-emu-35-arm64-v8a"
+}
