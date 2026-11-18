@@ -446,7 +446,7 @@ const MAX_ENCODABLE_TIME: u64 = 253_402_300_799;
 
 /// Serial number: SHA-256 of the SPKI DER, first 16 bytes, with the first
 /// byte forced into `0x40..=0x7f` (positive, no leading zero, fixed length).
-fn serial_for(spki: &[u8]) -> [u8; 16] {
+pub(crate) fn serial_for(spki: &[u8]) -> [u8; 16] {
     let hash = Sha256::digest(spki);
     let mut serial = [0u8; 16];
     serial.copy_from_slice(&hash[..16]);
@@ -465,7 +465,7 @@ fn name_der() -> Vec<u8> {
     asn1::tlv(asn1::SEQUENCE, &asn1::tlv(asn1::SET, &attr))
 }
 
-fn binding_der(version: u64, identity_key: &[u8], identity_signature: &[u8]) -> Vec<u8> {
+pub(crate) fn binding_der(version: u64, identity_key: &[u8], identity_signature: &[u8]) -> Vec<u8> {
     asn1::wrap(
         asn1::SEQUENCE,
         &[

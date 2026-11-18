@@ -56,6 +56,22 @@ pub enum CborError {
     TooDeep,
 }
 
+impl CborError {
+    /// Stable snake_case name, used in test vectors.
+    pub const fn code(self) -> &'static str {
+        match self {
+            CborError::Truncated => "truncated",
+            CborError::TrailingBytes => "trailing_bytes",
+            CborError::NonCanonical => "non_canonical",
+            CborError::UnsortedKeys => "unsorted_keys",
+            CborError::NonIntegerKey => "non_integer_key",
+            CborError::Unsupported => "unsupported",
+            CborError::InvalidUtf8 => "invalid_utf8",
+            CborError::TooDeep => "too_deep",
+        }
+    }
+}
+
 impl fmt::Display for CborError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let text = match self {

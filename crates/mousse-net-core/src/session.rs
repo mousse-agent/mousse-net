@@ -6,8 +6,8 @@
 //! brought up to replace it.
 //!
 //! - **Deadline.** A path's effective deadline is the earlier of the two
-//!   certificates' `not_after`, plus the 10 min skew. At that second the path
-//!   closes with `CERT_EXPIRED`.
+//!   certificates' `not_after`, plus the 10 min skew. The path may run through
+//!   that second and closes with `CERT_EXPIRED` at the first second after it.
 //! - **Renewal.** [`RENEW_LEAD_SECS`] before the earlier `not_after`, the
 //!   session asks for a new path (a fresh handshake, with a fresh certificate
 //!   if ours is the one running out). Renewal is just a path switch.

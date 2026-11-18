@@ -1,0 +1,273 @@
+{
+  "description": "Attempt-limit sequences for the send-link flow (spec wire.md, \"Attempt limits\"), plus one-enrollment for in person. Each step runs one operation and then the listed expectations hold. Ops: connect (joiner proves the ticket on conn), submit (joiner enters the right or a wrong code; messages flow until both sides stop), submit_first (only the joiner's first message reaches the host), redeliver (that first message reaches the host again on conn), drop (conn closes mid-attempt), approve (host owner taps for conn). `closed` lists connections the host closed during the step.",
+  "sequences": [
+    {
+      "kind": "send_link",
+      "name": "three_wrong_codes",
+      "steps": [
+        {
+          "conn": 1,
+          "host_attempts_left": 3,
+          "joiner": "a",
+          "joiner_attempts_left": 3,
+          "joiner_state": "awaiting_code",
+          "op": "connect"
+        },
+        {
+          "code": "wrong",
+          "conn": 1,
+          "host_attempts_left": 2,
+          "host_status": "open",
+          "joiner": "a",
+          "joiner_attempts_left": 2,
+          "joiner_state": "awaiting_code",
+          "op": "submit"
+        },
+        {
+          "code": "wrong",
+          "conn": 1,
+          "host_attempts_left": 1,
+          "host_status": "open",
+          "joiner": "a",
+          "joiner_attempts_left": 1,
+          "joiner_state": "awaiting_code",
+          "op": "submit"
+        },
+        {
+          "closed": [
+            [
+              1,
+              "attempts_exhausted"
+            ]
+          ],
+          "code": "wrong",
+          "conn": 1,
+          "host_attempts_left": 0,
+          "host_status": "ended:attempts_exhausted",
+          "joiner": "a",
+          "joiner_attempts_left": 0,
+          "joiner_state": "failed:attempts_exhausted",
+          "op": "submit"
+        },
+        {
+          "code": "right",
+          "conn": 1,
+          "joiner": "a",
+          "op": "submit",
+          "result": "wrong_state"
+        }
+      ]
+    },
+    {
+      "kind": "send_link",
+      "name": "wrong_then_right",
+      "steps": [
+        {
+          "conn": 1,
+          "joiner": "a",
+          "op": "connect"
+        },
+        {
+          "code": "wrong",
+          "conn": 1,
+          "host_attempts_left": 2,
+          "joiner": "a",
+          "joiner_attempts_left": 2,
+          "op": "submit"
+        },
+        {
+          "code": "right",
+          "conn": 1,
+          "host_attempts_left": 1,
+          "host_status": "consumed",
+          "joiner": "a",
+          "joiner_attempts_left": 1,
+          "joiner_state": "paired",
+          "op": "submit"
+        }
+      ]
+    },
+    {
+      "kind": "send_link",
+      "name": "resend_is_not_a_new_attempt",
+      "steps": [
+        {
+          "conn": 1,
+          "joiner": "a",
+          "op": "connect"
+        },
+        {
+          "code": "right",
+          "conn": 1,
+          "host_attempts_left": 2,
+          "joiner": "a",
+          "joiner_attempts_left": 2,
+          "op": "submit_first"
+        },
+        {
+          "conn": 1,
+          "host_attempts_left": 2,
+          "joiner": "a",
+          "op": "redeliver",
+          "same_reply": true
+        },
+        {
+          "conn": 1,
+          "host_attempts_left": 2,
+          "joiner": "a",
+          "op": "redeliver",
+          "same_reply": true
+        }
+      ]
+    },
+    {
+      "kind": "send_link",
+      "name": "same_attempt_on_another_connection_counts",
+      "steps": [
+        {
+          "conn": 1,
+          "joiner": "a",
+          "op": "connect"
+        },
+        {
+          "code": "right",
+          "conn": 1,
+          "host_attempts_left": 2,
+          "joiner": "a",
+          "op": "submit_first"
+        },
+        {
+          "conn": 2,
+          "joiner": "b",
+          "op": "connect"
+        },
+        {
+          "conn": 2,
+          "host_attempts_left": 1,
+          "joiner": "a",
+          "op": "redeliver"
+        }
+      ]
+    },
+    {
+      "kind": "send_link",
+      "name": "attempts_shared_across_routes",
+      "steps": [
+        {
+          "conn": 1,
+          "joiner": "a",
+          "op": "connect"
+        },
+        {
+          "code": "wrong",
+          "conn": 1,
+          "host_attempts_left": 2,
+          "joiner": "a",
+          "op": "submit"
+        },
+        {
+          "conn": 2,
+          "joiner": "b",
+          "op": "connect"
+        },
+        {
+          "code": "wrong",
+          "conn": 2,
+          "host_attempts_left": 1,
+          "joiner": "b",
+          "op": "submit"
+        },
+        {
+          "conn": 3,
+          "joiner": "c",
+          "op": "connect"
+        },
+        {
+          "closed": [
+            [
+              1,
+              "attempts_exhausted"
+            ],
+            [
+              2,
+              "attempts_exhausted"
+            ],
+            [
+              3,
+              "attempts_exhausted"
+            ]
+          ],
+          "code": "wrong",
+          "conn": 3,
+          "host_attempts_left": 0,
+          "host_status": "ended:attempts_exhausted",
+          "joiner": "c",
+          "op": "submit"
+        }
+      ]
+    },
+    {
+      "kind": "send_link",
+      "name": "dropped_attempt_keeps_its_debit",
+      "steps": [
+        {
+          "conn": 1,
+          "joiner": "a",
+          "op": "connect"
+        },
+        {
+          "code": "right",
+          "conn": 1,
+          "host_attempts_left": 2,
+          "joiner": "a",
+          "joiner_attempts_left": 2,
+          "op": "submit_first"
+        },
+        {
+          "conn": 1,
+          "host_attempts_left": 2,
+          "host_status": "open",
+          "joiner": "a",
+          "joiner_attempts_left": 2,
+          "joiner_state": "connecting",
+          "op": "drop"
+        }
+      ]
+    },
+    {
+      "kind": "in_person",
+      "name": "two_joiners_one_enrollment",
+      "steps": [
+        {
+          "conn": 1,
+          "joiner": "a",
+          "joiner_state": "awaiting_approval",
+          "op": "connect"
+        },
+        {
+          "conn": 2,
+          "joiner": "b",
+          "joiner_state": "awaiting_approval",
+          "op": "connect"
+        },
+        {
+          "closed": [
+            [
+              1,
+              "invitation_invalid"
+            ]
+          ],
+          "conn": 2,
+          "host_status": "consumed",
+          "op": "approve",
+          "result": "ok"
+        },
+        {
+          "conn": 1,
+          "op": "approve",
+          "result": "not_open"
+        }
+      ]
+    }
+  ]
+}

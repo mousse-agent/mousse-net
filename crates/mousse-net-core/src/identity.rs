@@ -55,6 +55,18 @@ pub enum SignatureError {
     Invalid,
 }
 
+impl SignatureError {
+    /// Stable snake_case name, used in test vectors.
+    pub const fn code(self) -> &'static str {
+        match self {
+            SignatureError::NotRaw => "not_raw",
+            SignatureError::BadDer => "bad_der",
+            SignatureError::OutOfRange => "out_of_range",
+            SignatureError::Invalid => "invalid",
+        }
+    }
+}
+
 impl fmt::Display for SignatureError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {

@@ -1,0 +1,82 @@
+{
+  "der_to_raw": [
+    {
+      "der": "304402204f726ed8884f7a11b1bc74325ebf6cc4a19dd60b72f568642c35538d6e80647f02202800c28881fdc017a3170440e3e012771cd467aec3bc3d4a371e80f5c636a8bf",
+      "name": "plain",
+      "raw": "4f726ed8884f7a11b1bc74325ebf6cc4a19dd60b72f568642c35538d6e80647f2800c28881fdc017a3170440e3e012771cd467aec3bc3d4a371e80f5c636a8bf"
+    },
+    {
+      "der": "304602210081d94a4ebc5fa51e5d36b7309abf8f659af9dcbd30e33a8f6804c336a7b609dd0221009ddee536a1b88d2d52999338de63a534470b3d719663f4367e9bfa8be88192bc",
+      "name": "r_high_bit_needs_zero_byte",
+      "raw": "81d94a4ebc5fa51e5d36b7309abf8f659af9dcbd30e33a8f6804c336a7b609dd9ddee536a1b88d2d52999338de63a534470b3d719663f4367e9bfa8be88192bc"
+    },
+    {
+      "der": "3044021f3ce60973f4ceb6fb0b4c210cf83113c1062523f7bcbc760417915881045159022100b062483f6d1c395de8fc08b4d93c7ff38f29103927b51142c3143cfe98c7dd36",
+      "name": "r_shorter_than_32_bytes",
+      "raw": "003ce60973f4ceb6fb0b4c210cf83113c1062523f7bcbc760417915881045159b062483f6d1c395de8fc08b4d93c7ff38f29103927b51142c3143cfe98c7dd36"
+    },
+    {
+      "der": "30450221002a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a02203b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b",
+      "error": "bad_der",
+      "name": "integer_with_extra_zero"
+    },
+    {
+      "der": "30440220ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff02203b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b",
+      "error": "bad_der",
+      "name": "negative_integer"
+    },
+    {
+      "der": "304402202a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a02203b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b00",
+      "error": "bad_der",
+      "name": "trailing_byte"
+    },
+    {
+      "der": "30814402202a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a02203b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b",
+      "error": "bad_der",
+      "name": "long_form_length"
+    },
+    {
+      "der": "304702202a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a02203b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b020101",
+      "error": "bad_der",
+      "name": "three_integers"
+    },
+    {
+      "der": "30450221012a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a02203b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b",
+      "error": "out_of_range",
+      "name": "r_is_33_bytes"
+    },
+    {
+      "der": "302502010002203b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b",
+      "error": "out_of_range",
+      "name": "r_is_zero"
+    },
+    {
+      "der": "314402202a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a02203b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b",
+      "error": "bad_der",
+      "name": "not_a_sequence"
+    }
+  ],
+  "description": "DER Ecdsa-Sig-Value to 64-byte raw r||s (spec wire.md, \"DER to raw\"). `der_to_raw` cases convert; `raw_only` cases are inputs where raw is required.",
+  "raw_only": [
+    {
+      "input": "4f726ed8884f7a11b1bc74325ebf6cc4a19dd60b72f568642c35538d6e80647f2800c28881fdc017a3170440e3e012771cd467aec3bc3d4a371e80f5c636a8bf",
+      "name": "raw_64_bytes",
+      "result": "ok"
+    },
+    {
+      "input": "304402204f726ed8884f7a11b1bc74325ebf6cc4a19dd60b72f568642c35538d6e80647f02202800c28881fdc017a3170440e3e012771cd467aec3bc3d4a371e80f5c636a8bf",
+      "name": "der_given_as_raw",
+      "result": "not_raw"
+    },
+    {
+      "input": "4f726ed8884f7a11b1bc74325ebf6cc4a19dd60b72f568642c35538d6e80647f2800c28881fdc017a3170440e3e012771cd467aec3bc3d4a371e80f5c636a8",
+      "name": "63_bytes",
+      "result": "not_raw"
+    },
+    {
+      "input": "00000000000000000000000000000000000000000000000000000000000000003b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b",
+      "name": "r_zero",
+      "result": "out_of_range"
+    }
+  ]
+}

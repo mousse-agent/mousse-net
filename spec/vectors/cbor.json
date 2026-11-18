@@ -1,0 +1,152 @@
+{
+  "description": "The canonical CBOR subset (spec wire.md, \"Canonical CBOR\"). Valid items decode and re-encode to the same bytes. Invalid items are rejected with the given error.",
+  "invalid": [
+    {
+      "description": "empty input",
+      "error": "truncated",
+      "hex": ""
+    },
+    {
+      "description": "bytes length past end",
+      "error": "truncated",
+      "hex": "4201"
+    },
+    {
+      "description": "24 in two bytes",
+      "error": "non_canonical",
+      "hex": "1817"
+    },
+    {
+      "description": "255 in three bytes",
+      "error": "non_canonical",
+      "hex": "1900ff"
+    },
+    {
+      "description": "indefinite byte string",
+      "error": "non_canonical",
+      "hex": "5f4101ff"
+    },
+    {
+      "description": "indefinite array",
+      "error": "non_canonical",
+      "hex": "9f01ff"
+    },
+    {
+      "description": "keys out of order",
+      "error": "unsorted_keys",
+      "hex": "a202010101"
+    },
+    {
+      "description": "duplicate key",
+      "error": "unsorted_keys",
+      "hex": "a201010101"
+    },
+    {
+      "description": "text key",
+      "error": "non_integer_key",
+      "hex": "a1616101"
+    },
+    {
+      "description": "negative integer",
+      "error": "unsupported",
+      "hex": "20"
+    },
+    {
+      "description": "tag",
+      "error": "unsupported",
+      "hex": "c000"
+    },
+    {
+      "description": "half float",
+      "error": "unsupported",
+      "hex": "f93c00"
+    },
+    {
+      "description": "true",
+      "error": "unsupported",
+      "hex": "f5"
+    },
+    {
+      "description": "null",
+      "error": "unsupported",
+      "hex": "f6"
+    },
+    {
+      "description": "bad UTF-8",
+      "error": "invalid_utf8",
+      "hex": "62c328"
+    },
+    {
+      "description": "trailing byte",
+      "error": "trailing_bytes",
+      "hex": "0000"
+    },
+    {
+      "description": "9 nested arrays",
+      "error": "too_deep",
+      "hex": "81818181818181818100"
+    }
+  ],
+  "valid": [
+    {
+      "diagnostic": "0",
+      "hex": "00"
+    },
+    {
+      "diagnostic": "23",
+      "hex": "17"
+    },
+    {
+      "diagnostic": "24",
+      "hex": "1818"
+    },
+    {
+      "diagnostic": "255",
+      "hex": "18ff"
+    },
+    {
+      "diagnostic": "256",
+      "hex": "190100"
+    },
+    {
+      "diagnostic": "65536",
+      "hex": "1a00010000"
+    },
+    {
+      "diagnostic": "4294967296",
+      "hex": "1b0000000100000000"
+    },
+    {
+      "diagnostic": "h''",
+      "hex": "40"
+    },
+    {
+      "diagnostic": "h'0102'",
+      "hex": "420102"
+    },
+    {
+      "diagnostic": "\"a\"",
+      "hex": "6161"
+    },
+    {
+      "diagnostic": "[]",
+      "hex": "80"
+    },
+    {
+      "diagnostic": "[1, [2]]",
+      "hex": "82018102"
+    },
+    {
+      "diagnostic": "{}",
+      "hex": "a0"
+    },
+    {
+      "diagnostic": "{1: \"x\", 2: h'00'}",
+      "hex": "a2016178024100"
+    },
+    {
+      "diagnostic": "8 nested arrays",
+      "hex": "818181818181818100"
+    }
+  ]
+}

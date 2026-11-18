@@ -36,6 +36,9 @@ pub mod session;
 pub mod session_cert;
 pub mod time;
 
+#[cfg(test)]
+mod vectors;
+
 pub use codes::ErrorCode;
 pub use time::{Millis, UnixTime, CLOCK_SKEW_SECS};
 
