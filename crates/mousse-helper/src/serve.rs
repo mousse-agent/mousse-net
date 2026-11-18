@@ -221,11 +221,26 @@ async fn handle_connection(host: Host, pipe: TcpStream, addr: SocketAddr) {
 /// The stream label on which a paired caller asks for this host's build.
 pub const INFO_LABEL: &str = "helper-info";
 
+/// How long a `helper-info` requester has to finish its (empty) request.
+const INFO_REQUEST_WAIT: Duration = Duration::from_secs(5);
+
 /// Answer a `helper-info` stream: `{"build": ...}`, then finish.
+///
+/// The request is the stream itself, so the caller finishes its side right
+/// after opening it. The answer goes out once that `FIN` arrives: both
+/// halves then end cleanly and the stream does not stay half open. A
+/// requester that sends data or does not finish in time gets the stream
+/// reset instead.
 async fn send_info(stream: mousse_net_io::MuxStream) {
+    let (mut reader, writer) = stream.split();
+    let request_ended = tokio::time::timeout(INFO_REQUEST_WAIT, reader.read()).await;
+    if !matches!(request_ended, Ok(Ok(None))) {
+        writer.reset(ErrorCode::ProtocolError);
+        return;
+    }
     let line = json!({"build": crate::BUILD}).to_string();
-    if stream.writer.write(line.as_bytes()).await.is_ok() {
-        stream.writer.finish();
+    if writer.write(line.as_bytes()).await.is_ok() {
+        writer.finish();
     }
 }
 
@@ -245,7 +260,7 @@ fn on_event(state: &State, event: HostEvent) {
                     let id = request_id(&req);
                     print_line(format!(
                         "approval requested for {} ({device}) request {id}",
-                        req.name
+                        crate::printable(&req.name)
                     ));
                     let _ = tx.send(json!({
                         "event": "approval",
@@ -260,7 +275,7 @@ fn on_event(state: &State, event: HostEvent) {
                 None => {
                     print_line(format!(
                         "approval needed for {} ({device}) but no invite is waiting; declining",
-                        req.name
+                        crate::printable(&req.name)
                     ));
                     state.host.decline(&req.invitation);
                 }

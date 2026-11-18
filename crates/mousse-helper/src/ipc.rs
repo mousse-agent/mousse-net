@@ -44,6 +44,13 @@ pub fn write_control_file(dir: &Path, addr: &str, token: &str) -> Result<(), Str
     write_atomic(&control_path(dir), &bytes).map_err(|e| e.to_string())
 }
 
+/// The control file of `dir`, or `None` if there is none or it is not in
+/// the current layout.
+fn read_control_file(dir: &Path) -> Option<ControlFile> {
+    let bytes = std::fs::read(control_path(dir)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
 /// Forget the control file (on exit).
 pub fn remove_control_file(dir: &Path) {
     let _ = std::fs::remove_file(control_path(dir));
@@ -188,12 +195,16 @@ async fn connect(addr: &str) -> Result<Option<Channel>, String> {
 
 /// Connect to the running `serve` of `dir` and send `request` (the token is
 /// added). `Ok(None)` if no `serve` is running there.
+///
+/// A `control.json` this build cannot read (an older layout with `port`
+/// instead of `addr`, or a torn file) names no `serve` this build could
+/// reach, so it counts as stale like a file whose listener is gone: the
+/// command takes its offline path. A starting `serve` rewrites the file in
+/// the current layout.
 pub async fn request(dir: &Path, mut request: Value) -> Result<Option<Channel>, String> {
-    let Ok(bytes) = std::fs::read(control_path(dir)) else {
+    let Some(file) = read_control_file(dir) else {
         return Ok(None);
     };
-    let file: ControlFile =
-        serde_json::from_slice(&bytes).map_err(|e| format!("control.json: {e}"))?;
     let Some(mut channel) = connect(&file.addr).await? else {
         return Ok(None);
     };
@@ -228,6 +239,28 @@ mod tests {
         assert!(token_matches("abc", "abc"));
         assert!(!token_matches("abd", "abc"));
         assert!(!token_matches("ab", "abc"));
+    }
+
+    #[tokio::test]
+    async fn a_control_file_in_an_older_layout_counts_as_no_serve_running() {
+        let dir = std::env::temp_dir().join(format!(
+            "mousse-helper-ipc-old-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for old in [
+            &br#"{"port":49152,"token":"00","pid":1}"#[..],
+            b"{\"addr\":",
+        ] {
+            std::fs::write(control_path(&dir), old).unwrap();
+            let got = request(&dir, serde_json::json!({"cmd": "status"})).await;
+            assert!(matches!(got, Ok(None)), "{:?}", got.err());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

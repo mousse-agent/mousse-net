@@ -13,6 +13,9 @@
 //!   checkout it happens to run in. `MOUSSE_BUILD_ID` overrides it (the test
 //!   kit sets it). Dirty means any uncommitted change, untracked files
 //!   included, except the kit's own `checks/results` and `checks/runs`.
+//!   The must-fail control compiled in (or `none`) goes in
+//!   `MOUSSE_HELPER_CONTROL`; both show in `--version`, so a test can tell
+//!   that the binary it runs is the one built with it.
 
 use std::path::Path;
 use std::process::Command;
@@ -40,6 +43,10 @@ fn main() {
         _ => from_git(&profile),
     };
     println!("cargo:rustc-env=MOUSSE_HELPER_BUILD={build}");
+    println!(
+        "cargo:rustc-env=MOUSSE_HELPER_CONTROL={}",
+        from_cfg.as_deref().unwrap_or("none")
+    );
 }
 
 fn git(args: &[&str]) -> Option<String> {

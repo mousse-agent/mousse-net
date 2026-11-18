@@ -313,7 +313,7 @@ pub fn print_peers(dir: &Path) -> Result<(), String> {
         let id = p.pin().map(|k| short_id(&k)).unwrap_or_default();
         println!(
             "{id}  {}  {}  {}",
-            p.name,
+            crate::printable(&p.name),
             p.role,
             p.routes_to_try().join(" ")
         );
@@ -402,7 +402,11 @@ pub async fn slice_check(side: &CallerSide, opts: SliceCheck) -> i32 {
     let host_build = match (steps.host_build.clone(), opts.host_build.clone()) {
         (Some(reported), Some(given)) if reported != given => {
             steps.fail(
-                format!("the host reports build {reported}, not {given}"),
+                format!(
+                    "the host reports build {}, not {}",
+                    crate::printable(&reported),
+                    crate::printable(&given)
+                ),
                 "host_build_mismatch",
             );
             Some(reported)
@@ -459,14 +463,14 @@ async fn run_slice(side: &CallerSide, opts: &SliceCheck, steps: &mut Steps) {
     };
     steps.pass(format!(
         "paired with {} ({}) via {} using {}",
-        peer.name,
+        crate::printable(&peer.name),
         short_id(&ticket.host_identity),
         peer.last_route.clone().unwrap_or_default(),
         conn.kx_group()
     ));
     match host_build(&conn).await {
         Ok(build) => {
-            steps.pass(format!("the host runs build {build}"));
+            steps.pass(format!("the host runs build {}", crate::printable(&build)));
             steps.host_build = Some(build);
         }
         Err(e) => return steps.fail(format!("ask the host for its build: {e}"), "host_build"),
@@ -480,8 +484,9 @@ async fn run_slice(side: &CallerSide, opts: &SliceCheck, steps: &mut Steps) {
                 .find(|l| !l.is_empty())
                 .unwrap_or("");
             steps.pass(format!(
-                "terminal ran {:?}: {first}",
-                opts.command.join(" ")
+                "terminal ran {:?}: {}",
+                opts.command.join(" "),
+                crate::printable(first)
             ));
         }
         Ok((code, output)) => {
@@ -579,7 +584,10 @@ async fn host_build(conn: &Connection) -> Result<String, String> {
         )
         .await
         .map_err(|e| describe(&e))?;
-    let (mut rd, _wr) = stream.split();
+    let (mut rd, wr) = stream.split();
+    // The request is the stream itself: nothing more is sent, so the
+    // request side ends here and the host sees a clean FIN.
+    wr.finish();
     let read = async {
         let mut bytes = Vec::new();
         while let Some(chunk) = rd.read().await.map_err(|e| describe(&e))? {

@@ -3,15 +3,55 @@
 //! opening terminals.
 
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const WAIT: Duration = Duration::from_secs(20);
 
-fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_mousse-helper")
+/// The helper these tests run: a private copy of the binary cargo built
+/// with them, checked to be that build.
+///
+/// Cargo puts every build of the helper at the same path, whatever its
+/// flags, so a build with a must-fail control (another configuration
+/// sharing the target folder) can replace it while these tests run or
+/// just before. Without the copy and the check, the revocation tests then
+/// fail for a defect they were not compiled with (`keep-removed-grant`
+/// leaves the terminal open).
+fn bin() -> &'static Path {
+    static BIN: OnceLock<PathBuf> = OnceLock::new();
+    BIN.get_or_init(|| {
+        let built = Path::new(env!("CARGO_BIN_EXE_mousse-helper"));
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("helper-under-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Copies left by earlier runs; one still running stays.
+        for old in std::fs::read_dir(&dir).unwrap().flatten() {
+            let _ = std::fs::remove_file(old.path());
+        }
+        let copy = dir.join(format!(
+            "mousse-helper-{}{}",
+            std::process::id(),
+            std::env::consts::EXE_SUFFIX
+        ));
+        std::fs::copy(built, &copy).unwrap();
+        let out = Command::new(&copy).arg("--version").output().unwrap();
+        let expected = format!(
+            "mousse-helper {} build {} control {}",
+            env!("CARGO_PKG_VERSION"),
+            env!("MOUSSE_HELPER_BUILD"),
+            env!("MOUSSE_HELPER_CONTROL")
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            expected,
+            "{} is not the build these tests were compiled with: another build \
+             (other flags, same target folder) replaced it; give each \
+             configuration its own CARGO_TARGET_DIR",
+            built.display()
+        );
+        copy
+    })
 }
 
 fn temp_dir(tag: &str) -> PathBuf {
@@ -706,4 +746,144 @@ fn the_state_folder_control_file_and_control_channel_are_owner_only() {
     assert!(status.stdout.contains("serving at"), "{}", status.text());
     stop(&host, server);
     cleanup(&[&host]);
+}
+
+#[test]
+fn a_control_file_left_by_an_older_build_does_not_block_the_offline_commands() {
+    let host = Endpoint::init("oldctl-host");
+    let peer = Endpoint::init("oldctl-peer");
+    let server = host.serve("hostO", &[]);
+    let (grant, _) = pair(&host, &peer, "laptop");
+    stop(&host, server);
+    // An older `serve` recorded a port instead of an address and was
+    // killed before it could remove the file.
+    std::fs::write(
+        host.dir.join("control.json"),
+        br#"{"port":49152,"token":"00ff","pid":1}"#,
+    )
+    .unwrap();
+
+    let id = host.run(&["id"]);
+    assert!(id.ok() && id.stdout.contains("profile"), "{}", id.text());
+    let listed = host.run(&["grants"]);
+    assert!(
+        listed.ok() && listed.stdout.contains("laptop"),
+        "{}",
+        listed.text()
+    );
+    let removed = host.run(&["remove", &grant.to_string()]);
+    assert!(
+        removed.ok() && removed.stdout.contains("host not running"),
+        "{}",
+        removed.text()
+    );
+    let listed = host.run(&["grants"]);
+    assert!(listed.stdout.contains("no grants"), "{}", listed.text());
+    cleanup(&[&host, &peer]);
+}
+
+/// `text` shows a peer's name escaped: the part after its newline does
+/// not start a line of its own, and no escape sequence reaches the
+/// terminal.
+fn assert_escaped(text: &str, after_newline: &str) {
+    assert!(
+        !text.contains(&format!("\n{after_newline}")),
+        "a peer's name started a line\n{text}"
+    );
+    assert!(
+        !text.contains('\u{1b}'),
+        "an escape sequence got through\n{text}"
+    );
+}
+
+#[test]
+fn the_slice_check_runs_on_loopback_and_peer_names_print_escaped() {
+    // Names chosen to forge log lines and drive a terminal.
+    let host_name = "hostS\nPASS forged by the host\u{1b}[2J";
+    let device_name = "laptop\nconnected forged by the device\u{1b}[31m";
+    let host = Endpoint::init("slice-host");
+    let peer = Endpoint::init("slice-peer");
+    let server = host.serve(host_name, &[]);
+    let invite = host.spawn(&["invite", "--approve-next", "--no-qr"]);
+    let ticket_line = invite.wait_for("TICKET ", WAIT);
+    let ticket = ticket_line.trim_start_matches("TICKET ").trim().to_owned();
+
+    let out = temp_dir("slice-result").with_extension("json");
+    let out_arg = out.display().to_string();
+    let command = echo_command("slice");
+    let mut args = vec![
+        "slice-check",
+        "--ticket",
+        &ticket,
+        "--name",
+        device_name,
+        "--removal-timeout",
+        "60",
+        "--out",
+        &out_arg,
+        "--",
+    ];
+    args.extend(command.iter().map(String::as_str));
+    let check = peer.spawn(&args);
+    check.wait_for("WAITING ", WAIT);
+    let paired = invite.wait_for("paired: grant ", WAIT);
+    let grant = paired.split_whitespace().nth(2).unwrap().to_owned();
+
+    let listed = host.run(&["grants"]);
+    assert!(
+        listed
+            .stdout
+            .contains(r"laptop\nconnected forged by the device\u{1b}[31m"),
+        "{}",
+        listed.text()
+    );
+    assert_escaped(&listed.stdout, "connected forged");
+    let removed = host.run(&["remove", &grant]);
+    assert!(removed.ok(), "{}", removed.text());
+
+    let done = check.finish(WAIT + Duration::from_secs(15));
+    assert_eq!(done.code, Some(0), "{}", done.text());
+    assert!(done.stdout.contains("RESULT PASS"), "{}", done.text());
+    // The host answered the build question, which it does only once the
+    // request side of that stream is finished.
+    assert!(
+        done.stdout.contains(&format!(
+            "PASS the host runs build {}",
+            env!("MOUSSE_HELPER_BUILD")
+        )),
+        "{}",
+        done.text()
+    );
+    assert!(
+        done.stdout
+            .contains(r"paired with hostS\nPASS forged by the host\u{1b}[2J ("),
+        "{}",
+        done.text()
+    );
+    assert_escaped(&done.stdout, "PASS forged");
+    let result: serde_json::Value = serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
+    assert_eq!(result["outcome"], "PASS", "{result}");
+
+    let peers = peer.run(&["peers"]);
+    assert_escaped(&peers.stdout, "PASS forged");
+    assert!(
+        peers.stdout.contains(r"hostS\nPASS forged"),
+        "{}",
+        peers.text()
+    );
+
+    // The host's log and the inviting command show the device's name.
+    let log = server.proc.out();
+    assert!(
+        log.contains(r"approval requested for laptop\nconnected forged"),
+        "{log}"
+    );
+    assert_escaped(&log, "connected forged");
+    let asked = invite.out();
+    assert!(asked.contains(r"laptop\nconnected forged"), "{asked}");
+    assert_escaped(&asked, "connected forged");
+    drop(invite);
+    stop(&host, server);
+    cleanup(&[&host, &peer]);
+    let _ = std::fs::remove_file(&out);
 }

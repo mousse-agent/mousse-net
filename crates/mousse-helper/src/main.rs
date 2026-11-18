@@ -39,6 +39,16 @@ mod peer;
 /// This build: `<commit>[-dirty]+<profile>`, fixed at compile time (see
 /// `build.rs`; `MOUSSE_BUILD_ID` overrides it).
 pub const BUILD: &str = env!("MOUSSE_HELPER_BUILD");
+
+/// `--version`: the package version, the build and the must-fail control
+/// compiled in (`none` normally).
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " build ",
+    env!("MOUSSE_HELPER_BUILD"),
+    " control ",
+    env!("MOUSSE_HELPER_CONTROL")
+);
 mod serve;
 mod term;
 
@@ -57,7 +67,7 @@ use serde_json::{json, Value};
 
 /// One Mousse endpoint: pairing, grants and terminal channels.
 #[derive(Parser)]
-#[command(name = "mousse-helper", version)]
+#[command(name = "mousse-helper", version = VERSION)]
 struct Cli {
     /// The endpoint's state directory (one per profile).
     #[arg(long, global = true, env = "MOUSSE_HELPER_STATE")]
@@ -199,6 +209,35 @@ fn computer_name() -> String {
     }
 }
 
+/// A name another device chose, made safe to print on one line: control
+/// characters (newlines, escape sequences), bidirectional and invisible
+/// formatting characters and backslashes are written as escapes, so the
+/// name can neither start a fake log line nor drive the terminal.
+pub fn printable(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control()
+                || matches!(
+                    c,
+                    '\u{200B}'..='\u{200F}'
+                        | '\u{2028}'..='\u{202E}'
+                        | '\u{2060}'..='\u{2069}'
+                        | '\u{FEFF}'
+                ) =>
+            {
+                out.push_str(&format!("\\u{{{:x}}}", u32::from(c)));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn storage(insecure: bool) -> KeyStorage {
     if insecure {
         KeyStorage::InsecureFile
@@ -243,7 +282,7 @@ fn print_grants(reply: &Value) {
             "{}  {}  {}  {}  connections {}",
             g["id"],
             g["device"].as_str().unwrap_or(""),
-            g["name"].as_str().unwrap_or(""),
+            printable(g["name"].as_str().unwrap_or("")),
             g["role"].as_str().unwrap_or(""),
             g["connections"]
         );
@@ -384,7 +423,7 @@ async fn invite(dir: &Path, link: bool, approve_next: bool, no_qr: bool) -> Resu
                 let request = event["request"].as_str().unwrap_or("").to_owned();
                 let question = format!(
                     "\"{}\" ({}) wants to pair. Is the device next to you?",
-                    event["name"].as_str().unwrap_or(""),
+                    printable(event["name"].as_str().unwrap_or("")),
                     event["device"].as_str().unwrap_or("")
                 );
                 queued.push_back((request, question));
@@ -485,7 +524,7 @@ async fn run(cli: Cli) -> Result<i32, String> {
                 peer::join(&side, &ticket, &name.unwrap_or_else(computer_name), &routes).await?;
             println!(
                 "paired with {} ({})",
-                record.name,
+                printable(&record.name),
                 short_id(&ticket.host_identity)
             );
         }
@@ -571,4 +610,26 @@ fn main() {
     let _ = std::io::stdout().flush();
     // Exit now: a pending stdin read must not keep the process alive.
     std::process::exit(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::printable;
+
+    #[test]
+    fn a_peer_name_prints_on_one_line_without_terminal_controls() {
+        assert_eq!(printable("Ana's laptop"), "Ana's laptop");
+        assert_eq!(
+            printable("x\nconnected 1234 from 10.0.0.1\r\x1b[2J\t\u{7}"),
+            r"x\nconnected 1234 from 10.0.0.1\r\u{1b}[2J\t\u{7}"
+        );
+        // Bidirectional overrides and invisible characters, and C1 controls.
+        assert_eq!(
+            printable("a\u{202E}b\u{200B}c\u{2066}d\u{feff}\u{9b}"),
+            r"a\u{202e}b\u{200b}c\u{2066}d\u{feff}\u{9b}"
+        );
+        // A backslash cannot fake an escape.
+        assert_eq!(printable(r"a\nb"), r"a\\nb");
+        assert!(!printable("\u{85}\u{2028}").chars().any(char::is_control));
+    }
 }
