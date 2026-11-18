@@ -13,8 +13,8 @@ Set `CARGO_TARGET_DIR` outside the checkout: build output inside it makes the tr
 | Status | Meaning |
 | --- | --- |
 | PASS | The run passed **and** every must-fail control printed FAIL, for the build under test, on a clean tree. |
-| FAIL | The run failed, a control did not fail, a control printed no FAIL line (build error, missing feature), the check has no control, a control is marked missing, or the check is deferred without permission. |
-| INCOMPLETE | No result for the build under test yet, a placeholder, or a dirty tree. |
+| FAIL | The run failed, a control did not fail, a control printed no FAIL line (build error, missing feature), a control failed for another reason than its `expect_reason`, the check has no control, a control is marked missing, or the check is deferred without permission. |
+| INCOMPLETE | No result for the build under test and the check's current configuration yet, a placeholder, or a dirty tree. |
 | DEFERRED | The phase's `[defer]` table allows this check to be deferred, and it is. |
 | ATTESTED | Someone recorded a manual step. Counts only for checks marked `manual`; on an automated check it is shown but blocks the verdict. |
 
@@ -22,7 +22,9 @@ The phase passes when every cell is PASS, an allowed DEFERRED, or an ATTESTED ma
 
 ## Build under test
 
-`<commit>[-dirty]+<profile>`. The commit is the last one that changed anything outside `checks/`, so committing results, attestations, manifests or the device list does not make results stale. Any other change, including a new commit to the code, needs fresh results. Uncommitted changes outside `checks/results/` and `checks/runs/` make the tree dirty; no cell passes on a dirty tree without `--allow-dirty` (shown in the table and the verdict).
+`<commit>[-dirty]+<profile>`. The commit is the last one that changed anything outside `checks/`, so committing results, attestations, manifests or the device list does not make results stale. Any other change, including a new commit to the code, needs fresh results.
+
+Evidence must also match the check's current configuration. Every local run record and signed result carries `config`, a SHA-256 digest of what decides what the run proves: the judge, `min_tests`, the markers, the profile, the matrix cases, the target's `[[check.local]]` commands (`command`, `cwd`, `env`) and, for a control, its `command`, `args`, `env` and `expect_reason`. A committed change to any of these makes that check's old results INCOMPLETE until it runs again. `title`, `plan`, `breaks` and `device_steps` are descriptions and do not count. Uncommitted changes outside `checks/results/` and `checks/runs/` make the tree dirty; no cell passes on a dirty tree without `--allow-dirty` (shown in the table and the verdict).
 
 ## Manifests (`<phase>.toml`)
 
@@ -38,14 +40,15 @@ Each `[[check]]`:
 | `judge` | `cargo-test` (default), `marker`, or `matrix` |
 | `min_tests` | `cargo-test`: the normal run must pass at least this many tests |
 | `pass_marker`, `fail_marker` | default `PASS <id>` / `FAIL <id>`; must be a whole line |
-| `profile` | profile device results must carry |
+| `profile` | profile results must carry; local runs record it (default `debug`) and records with another profile do not count |
+| `cross_machine` | one machine dials another: each result must name the host's build in `extra.host_build`, and both builds must be the build under test |
 | `placeholder` | not wired yet: cells are INCOMPLETE and the phase run skips it (`run` still runs it) |
 | `deferred` | deferred; only counts if `[defer]` lists it |
 | `manual`, `steps` | a manual step; cells can only be ATTESTED |
 | `device_steps` | how a device produces its result, shown while the cell is INCOMPLETE |
 | `timeout_secs` | per run, default 3600 |
 | `[[check.local]]` | `target`, `host` (`windows-x86_64`, `macos-aarch64`, `linux-x86_64`, ...), `command`, optional `cwd`, `env`, `placeholder`. Runs when the kit is on that host. `{root}`, `{out}` (a fresh folder per run) and `{build}` are replaced; `MOUSSE_BUILD_ID` is set. |
-| `[[check.control]]` | `name`, `breaks` (what is broken), and `args` (appended), `env` (added) or `command` (replaces). `missing = "reason"` while the control does not exist: the check is FAIL until it does. |
+| `[[check.control]]` | `name`, `breaks` (what is broken), and `args` (appended), `env` (added) or `command` (replaces). `missing = "reason"` while the control does not exist: the check is FAIL until it does. `expect_reason = "<word>"`: the control must fail for this reason (see below). |
 | `[check.matrix]` | `providers`, `providers_for` (per target), `legacy_results` (unsigned files shown but never counted) |
 
 Judges:
@@ -54,9 +57,17 @@ Judges:
 - `marker`: pass = exit 0 and the pass line, no fail line. A control works only if it exits non-zero and prints the fail line.
 - `matrix`: as `marker`, and the run must write a PASS file for every ordered provider pair into `{out}` (spec/matrix/targets.md format).
 
+A control with `expect_reason` must also show that reason. A local run must print it on the FAIL line, as `FAIL <id> reason=<word>`; a device result must carry it as `extra.reason` (or `reason=<word>` in `details`). A control that fails for another reason, or gives none, is FAIL: something other than the named defect broke the run.
+
+## Local run records
+
+`checks/runs/` (not committed) holds this machine's last run of each part. A record names its check, target, part, build, `host` (`<os>-<arch>`), `runner` (the `[[check.local]]` entry that produced it) and `config`. Records count only for a cell with a `[[check.local]]` entry for this machine's host, and only if they name that host and entry. Every other cell, including every device-only cell, counts only signed results.
+
 ## Results from other machines
 
-Device results are JSON payloads `{check, target, case?, control?, build, platform, outcome, details, time, device, extra?}` signed with the device's P-256 key (ECDSA/SHA-256, raw r‖s, over `"mousse-check-result-v1\0" ‖ payload`). The file keeps the exact signed payload text. The kit checks the key is in `devices.toml`, the payload names that device, the device is trusted for that target, and the build is the build under test.
+Device results are JSON payloads `{check, target, case?, control?, build, platform, outcome, details, time, device, config, extra?}` signed with the device's P-256 key (ECDSA/SHA-256, raw r‖s, over `"mousse-check-result-v1\0" ‖ payload`). The file keeps the exact signed payload text. The kit checks the key is in `devices.toml`, the payload names that device, the device is trusted for that target, the build is the build under test and `config` matches the check's current configuration. `run --sign-with` fills `config` from the run; `sign` takes it from the result file or, if absent, from the signing checkout's manifest, so the signer vouches that the run used the check as configured there.
+
+`sign` also keeps these top-level fields of a result file in `extra`: `reason`, `host_build` and `caller_build` (and `reason` inside an object `details`). For a `cross_machine` check, `build` is the caller's build and `extra.host_build` the host's; both, and `extra.caller_build` if present, must be the build under test. A result without `extra.host_build` does not count.
 
 A cell from devices passes when, for this build, every case (one, or every matrix pair) has a PASS, no result says FAIL, and every control has at least one result and all of them say FAIL. A changed or forged file is listed as TAMPERED and blocks the verdict.
 

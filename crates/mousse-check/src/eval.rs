@@ -9,9 +9,14 @@
 //! 3. An automated check with no control, or with a control marked missing,
 //!    is FAIL.
 //! 4. A placeholder is INCOMPLETE.
-//! 5. Evidence (a local run record, else signed device results) must be for
-//!    the build under test; anything else is INCOMPLETE. Any FAIL, any
-//!    control that did not fail, or a control that printed no FAIL line is
+//! 5. Evidence must be for the build under test and the check's current
+//!    configuration (its digest, see `Manifest::config_digest`); anything
+//!    else is INCOMPLETE. Local run records count only for a target with a
+//!    `[[check.local]]` entry for this machine's host, and only if that entry
+//!    produced them with the check's profile. Every other cell needs signed
+//!    device results. Cross-machine cells also need the host's build to be
+//!    the build under test. Any FAIL, any control that did not fail, printed
+//!    no FAIL line or failed for another reason than its `expect_reason` is
 //!    FAIL. Missing parts are INCOMPLETE.
 //! 6. On a dirty tree, PASS becomes INCOMPLETE unless `--allow-dirty`.
 //! 7. An attestation on an automated check shows as ATTESTED but blocks the
@@ -27,8 +32,8 @@ use serde::Serialize;
 
 use crate::build::{check_build, BuildState, Commits};
 use crate::evidence::{Attestation, Evidence, ResultPayload};
-use crate::manifest::{Check, Judge, Manifest};
-use crate::runner::{RunRecord, RunVerdict};
+use crate::manifest::{Check, Judge, LocalRun, Manifest};
+use crate::runner::{runner_id, RunRecord, RunVerdict};
 
 /// One cell's status.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -95,6 +100,9 @@ pub struct Report {
 /// Everything the evaluation reads.
 pub struct Inputs<'a> {
     pub manifest: &'a Manifest,
+    /// `<os>-<arch>` of this machine: only `[[check.local]]` entries for it
+    /// can produce local run records that count.
+    pub host: &'a str,
     pub build: &'a BuildState,
     pub commits: &'a dyn Commits,
     pub allow_dirty: bool,
@@ -312,15 +320,34 @@ fn eval_automated(inp: &Inputs<'_>, check: &Check, target: &str) -> Outcome {
             format!("not wired yet on {target}: {why}"),
         );
     }
-    let has_records = inp
-        .records
-        .iter()
-        .any(|r| r.check == check.id && r.target == target);
+    // Local records count only when this machine is the configured runner
+    // for the cell; every other cell is judged from signed results alone.
+    let runner = check.local_on(target, inp.host);
+    let has_records = runner.is_some_and(|l| {
+        inp.records
+            .iter()
+            .any(|r| r.check == check.id && r.target == target && from_runner(r, l))
+    });
     let has_results = inp
         .evidence
         .results
         .iter()
         .any(|r| r.check == check.id && r.target == target);
+    if let (Some(l), false, false) = (runner, has_records, has_results) {
+        let replaced = inp
+            .records
+            .iter()
+            .any(|r| r.check == check.id && r.target == target && r.host == l.host);
+        if replaced {
+            return out(
+                Status::Incomplete,
+                format!(
+                    "{CONFIG_CHANGED}: the last runs here used another command; `mousse-check run {}` again",
+                    check.id
+                ),
+            );
+        }
+    }
     if let (Some(l), false, false) = (local, has_records, has_results) {
         return out(
             Status::Incomplete,
@@ -332,8 +359,8 @@ fn eval_automated(inp: &Inputs<'_>, check: &Check, target: &str) -> Outcome {
             ),
         );
     }
-    if has_records {
-        let o = eval_local(inp, check, target);
+    if let (Some(l), true) = (runner, has_records) {
+        let o = eval_local(inp, check, target, l);
         if o.status != Status::Incomplete || !has_results {
             return o;
         }
@@ -341,29 +368,51 @@ fn eval_automated(inp: &Inputs<'_>, check: &Check, target: &str) -> Outcome {
     eval_device(inp, check, target)
 }
 
+/// The record names this `[[check.local]]` entry and its host.
+fn from_runner(r: &RunRecord, l: &LocalRun) -> bool {
+    r.host == l.host && r.runner == runner_id(l)
+}
+
 fn record<'a>(
     inp: &'a Inputs<'_>,
     check: &Check,
     target: &str,
+    local: &LocalRun,
     part: &str,
 ) -> Option<&'a RunRecord> {
     inp.records
         .iter()
         .filter(|r| r.check == check.id && r.target == target && r.part == part)
+        .filter(|r| from_runner(r, local))
         .max_by(|a, b| a.time.cmp(&b.time))
 }
 
-fn eval_local(inp: &Inputs<'_>, check: &Check, target: &str) -> Outcome {
+const CONFIG_CHANGED: &str =
+    "run with another configuration of this check (the manifest changed since)";
+
+fn eval_local(inp: &Inputs<'_>, check: &Check, target: &str, local: &LocalRun) -> Outcome {
     let mut fails = Vec::new();
     let mut gaps = Vec::new();
-    let usable =
-        |r: &RunRecord| check_build(inp.commits, inp.build, &r.build, None, inp.allow_dirty);
-    let normal = record(inp, check, target, "normal");
+    let profile = inp.manifest.run_profile(check);
+    let usable = |r: &RunRecord, control| -> Result<(), String> {
+        check_build(
+            inp.commits,
+            inp.build,
+            &r.build,
+            Some(&profile),
+            inp.allow_dirty,
+        )?;
+        if r.config != inp.manifest.config_digest(check, target, control) {
+            return Err(CONFIG_CHANGED.into());
+        }
+        Ok(())
+    };
+    let normal = record(inp, check, target, local, "normal");
     let mut normal_total = None;
     let mut normal_summary = String::new();
     match normal {
         None => gaps.push("not run for this build".to_string()),
-        Some(r) => match usable(r) {
+        Some(r) => match usable(r, None) {
             Err(why) => gaps.push(format!("last run does not count: {why}")),
             Ok(_) => match r.verdict {
                 RunVerdict::Pass => {
@@ -375,12 +424,21 @@ fn eval_local(inp: &Inputs<'_>, check: &Check, target: &str) -> Outcome {
         },
     }
     for k in &check.control {
-        match record(inp, check, target, &k.name) {
+        match record(inp, check, target, local, &k.name) {
             None => gaps.push(format!("control {} not run", k.name)),
-            Some(r) => match usable(r) {
+            Some(r) => match usable(r, Some(k)) {
                 Err(why) => gaps.push(format!("control {} does not count: {why}", k.name)),
                 Ok(_) => match r.verdict {
                     RunVerdict::FailedAsRequired => {
+                        if let Some(want) = &k.expect_reason {
+                            if r.reason.as_ref() != Some(want) {
+                                fails.push(format!(
+                                    "control {} failed with reason {}, it must fail with reason={want}",
+                                    k.name,
+                                    r.reason.as_deref().unwrap_or("(none given)")
+                                ));
+                            }
+                        }
                         if check.judge == Judge::CargoTest {
                             if let (Some(a), Some(b)) = (normal_total, r.tests_total) {
                                 if a != b {
@@ -395,6 +453,10 @@ fn eval_local(inp: &Inputs<'_>, check: &Check, target: &str) -> Outcome {
                     RunVerdict::DidNotFail => fails.push(format!(
                         "control did not fail: {} ({}): {}",
                         k.name, k.breaks, r.summary
+                    )),
+                    RunVerdict::WrongReason => fails.push(format!(
+                        "control {} failed for the wrong reason: {}",
+                        k.name, r.summary
                     )),
                     _ => fails.push(format!(
                         "control {} did not print FAIL: {}",
@@ -427,7 +489,7 @@ fn legacy_note(inp: &Inputs<'_>, check: &Check, target: &str) -> String {
 }
 
 fn eval_device(inp: &Inputs<'_>, check: &Check, target: &str) -> Outcome {
-    let profile = check.profile.as_deref().or(inp.manifest.profile.as_deref());
+    let profile = inp.manifest.device_profile(check);
     let all: Vec<&ResultPayload> = inp
         .evidence
         .results
@@ -449,8 +511,8 @@ fn eval_device(inp: &Inputs<'_>, check: &Check, target: &str) -> Outcome {
     let mut stale = Vec::new();
     let mut ok = Vec::new();
     for r in all {
-        match check_build(inp.commits, inp.build, &r.build, profile, inp.allow_dirty) {
-            Ok(_) => ok.push(r),
+        match device_result_counts(inp, check, target, profile, r) {
+            Ok(()) => ok.push(r),
             Err(why) => stale.push(why),
         }
     }
@@ -458,7 +520,7 @@ fn eval_device(inp: &Inputs<'_>, check: &Check, target: &str) -> Outcome {
         return out(
             Status::Incomplete,
             format!(
-                "{} signed result(s), none for this build: {}{legacy}",
+                "{} signed result(s), none for this build and configuration: {}{legacy}",
                 stale.len(),
                 stale.first().cloned().unwrap_or_default()
             ),
@@ -520,11 +582,30 @@ fn eval_device(inp: &Inputs<'_>, check: &Check, target: &str) -> Outcome {
                 r.device, r.outcome, k.name, k.breaks
             ));
         }
+        if let Some(want) = &k.expect_reason {
+            for r in rs.iter().filter(|r| r.outcome == "FAIL") {
+                let got = r.reason();
+                if got.as_ref() != Some(want) {
+                    fails.push(format!(
+                        "control {} on {} failed with reason {}, it must fail with reason={want}",
+                        k.name,
+                        r.device,
+                        got.as_deref().unwrap_or("(none given)")
+                    ));
+                }
+            }
+        }
     }
     if !fails.is_empty() {
         return out(Status::Fail, fails.join("; "));
     }
     if !gaps.is_empty() {
+        if let Some(why) = stale.first() {
+            gaps.push(format!(
+                "{} other signed result(s) do not count: {why}",
+                stale.len()
+            ));
+        }
         return out(Status::Incomplete, format!("{}{hint}", gaps.join("; ")));
     }
     let mut devices: Vec<&str> = normal.iter().map(|r| r.device.as_str()).collect();
@@ -540,6 +621,46 @@ fn eval_device(inp: &Inputs<'_>, check: &Check, target: &str) -> Outcome {
             check.control.len()
         ),
     )
+}
+
+/// Why a verified device result does not count for this cell: another
+/// build (the caller's, and for a cross-machine cell the host's), another
+/// check configuration, or an unknown control.
+fn device_result_counts(
+    inp: &Inputs<'_>,
+    check: &Check,
+    target: &str,
+    profile: Option<&str>,
+    r: &ResultPayload,
+) -> Result<(), String> {
+    let build = |claimed: &str| {
+        check_build(inp.commits, inp.build, claimed, profile, inp.allow_dirty).map(|_| ())
+    };
+    build(&r.build)?;
+    let control = match &r.control {
+        None => None,
+        Some(name) => Some(
+            check
+                .control_named(name)
+                .ok_or_else(|| format!("names control {name}, which this check does not have"))?,
+        ),
+    };
+    let want = inp.manifest.config_digest(check, target, control);
+    match &r.config {
+        None => return Err("carries no check configuration digest".into()),
+        Some(c) if *c != want => return Err(CONFIG_CHANGED.into()),
+        Some(_) => {}
+    }
+    if check.cross_machine {
+        let host = r
+            .extra_str("host_build")
+            .ok_or("does not say which build the host ran (extra.host_build)")?;
+        build(host).map_err(|why| format!("host: {why}"))?;
+        if let Some(caller) = r.extra_str("caller_build") {
+            build(caller).map_err(|why| format!("caller: {why}"))?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

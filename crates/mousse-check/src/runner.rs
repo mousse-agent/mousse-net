@@ -43,6 +43,10 @@ pub enum RunVerdict {
     /// Control run neither passed nor printed FAIL (build error, crash,
     /// timeout): it proves nothing.
     NoFailLine,
+    /// Control run printed FAIL, but not with the reason the control must
+    /// fail with: something else broke, so it proves nothing about the
+    /// defect it names.
+    WrongReason,
 }
 
 /// Judged result with a one-line summary.
@@ -195,8 +199,57 @@ pub fn judge_normal(judge: Judge, check: &Check, out: &RunOutput) -> Judged {
     }
 }
 
-/// Judge a control run.
-pub fn judge_control(judge: Judge, check: &Check, out: &RunOutput) -> Judged {
+/// The `reason=<word>` on the check's FAIL line, if any.
+pub fn fail_reason(check: &Check, text: &str) -> Option<String> {
+    let marker = check.fail_marker();
+    text.lines()
+        .map(str::trim)
+        .filter(|l| has_marker(l, &marker))
+        .find_map(|l| reason_word(&l[marker.len()..]))
+}
+
+/// The word after `reason=` in `text`, if any.
+pub fn reason_word(text: &str) -> Option<String> {
+    let at = text.find("reason=")?;
+    let word: String = text[at + "reason=".len()..]
+        .chars()
+        .take_while(|c| !c.is_whitespace() && !matches!(c, ';' | ',' | ')' | '"'))
+        .collect();
+    (!word.is_empty()).then_some(word)
+}
+
+/// Judge a control run. With `expect_reason`, a FAIL line must also carry
+/// `reason=<expect_reason>`.
+pub fn judge_control(
+    judge: Judge,
+    check: &Check,
+    expect_reason: Option<&str>,
+    out: &RunOutput,
+) -> Judged {
+    let judged = judge_control_line(judge, check, out);
+    let Some(want) = expect_reason else {
+        return judged;
+    };
+    if judged.verdict != RunVerdict::FailedAsRequired {
+        return judged;
+    }
+    match fail_reason(check, &out.text) {
+        Some(got) if got == want => Judged {
+            summary: format!("{} (reason={got})", judged.summary),
+            ..judged
+        },
+        got => Judged {
+            verdict: RunVerdict::WrongReason,
+            summary: format!(
+                "failed with reason {}, the control must fail with reason={want}",
+                got.as_deref().unwrap_or("(none given)")
+            ),
+            ..judged
+        },
+    }
+}
+
+fn judge_control_line(judge: Judge, check: &Check, out: &RunOutput) -> Judged {
     let judged = |verdict, summary: String, total| Judged {
         verdict,
         summary,
@@ -488,6 +541,32 @@ pub struct RunRecord {
     #[serde(default)]
     pub tests_total: Option<u64>,
     pub log: String,
+    /// `<os>-<arch>` of the machine that ran it.
+    #[serde(default)]
+    pub host: String,
+    /// The `[[check.local]]` entry that ran it (see [`runner_id`]).
+    #[serde(default)]
+    pub runner: String,
+    /// [`crate::manifest::Manifest::config_digest`] at the time of the run.
+    #[serde(default)]
+    pub config: String,
+    /// The `reason=` word on a control's FAIL line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Names one `[[check.local]]` entry: `local:<target>@<host>:<digest>`,
+/// the digest covering its command, working directory and env.
+pub fn runner_id(local: &LocalRun) -> String {
+    use sha2::Digest;
+    let text = serde_json::json!({
+        "command": local.command,
+        "cwd": local.cwd,
+        "env": local.env,
+    })
+    .to_string();
+    let digest = crate::util::to_hex(&sha2::Sha256::digest(text.as_bytes()));
+    format!("local:{}@{}:{}", local.target, local.host, &digest[..16])
 }
 
 #[cfg(test)]
@@ -540,17 +619,17 @@ min_tests = 3
             "error: Package `x` does not have the feature `control-y`",
         );
         assert_eq!(
-            judge_control(Judge::CargoTest, &c, &build_error).verdict,
+            judge_control(Judge::CargoTest, &c, None, &build_error).verdict,
             RunVerdict::NoFailLine
         );
         let broke = out(101, "test result: FAILED. 4 passed; 2 failed; 0 ignored;");
         assert_eq!(
-            judge_control(Judge::CargoTest, &c, &broke).verdict,
+            judge_control(Judge::CargoTest, &c, None, &broke).verdict,
             RunVerdict::FailedAsRequired
         );
         let unaffected = out(0, "test result: ok. 6 passed; 0 failed; 0 ignored;");
         assert_eq!(
-            judge_control(Judge::CargoTest, &c, &unaffected).verdict,
+            judge_control(Judge::CargoTest, &c, None, &unaffected).verdict,
             RunVerdict::DidNotFail
         );
     }
@@ -598,16 +677,40 @@ min_tests = 3
             RunVerdict::Fail
         );
         assert_eq!(
-            judge_control(Judge::Marker, &c, &out(0, "FAIL phase9.x")).verdict,
+            judge_control(Judge::Marker, &c, None, &out(0, "FAIL phase9.x")).verdict,
             RunVerdict::DidNotFail
         );
         assert_eq!(
-            judge_control(Judge::Marker, &c, &out(1, "panicked")).verdict,
+            judge_control(Judge::Marker, &c, None, &out(1, "panicked")).verdict,
             RunVerdict::NoFailLine
         );
         assert_eq!(
-            judge_control(Judge::Marker, &c, &out(1, "FAIL phase9.x")).verdict,
+            judge_control(Judge::Marker, &c, None, &out(1, "FAIL phase9.x")).verdict,
             RunVerdict::FailedAsRequired
+        );
+    }
+
+    #[test]
+    fn a_control_that_fails_for_another_reason_does_not_count() {
+        let c = check("marker");
+        let pin = Some("pin_mismatch");
+        let judged = |text: &str| judge_control(Judge::Marker, &c, pin, &out(1, text)).verdict;
+        assert_eq!(
+            judged("FAIL phase9.x reason=pin_mismatch"),
+            RunVerdict::FailedAsRequired
+        );
+        assert_eq!(
+            judged("FAIL phase9.x reason=timeout"),
+            RunVerdict::WrongReason
+        );
+        assert_eq!(judged("FAIL phase9.x"), RunVerdict::WrongReason);
+        // A reason on another line is not the FAIL line's reason.
+        assert_eq!(
+            judged(
+                "note reason=pin_mismatch
+FAIL phase9.x"
+            ),
+            RunVerdict::WrongReason
         );
     }
 }

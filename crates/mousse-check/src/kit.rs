@@ -12,8 +12,8 @@ use crate::eval::{evaluate, Inputs, Report};
 use crate::evidence::{self, file_part, DeviceList, Evidence, ResultPayload};
 use crate::manifest::{Check, Judge, Manifest};
 use crate::runner::{
-    command_for, execute, judge_control, judge_matrix_files, judge_normal, read_matrix_dir,
-    RunRecord, RunVerdict, Vars,
+    command_for, execute, fail_reason, judge_control, judge_matrix_files, judge_normal,
+    read_matrix_dir, runner_id, RunRecord, RunVerdict, Vars,
 };
 use crate::util::{now_rfc3339, to_hex};
 
@@ -198,8 +198,10 @@ impl Kit {
             .collect();
         let records = self.records();
         let legacy = self.legacy_notes(m);
+        let here = host();
         Ok(evaluate(&Inputs {
             manifest: m,
+            host: &here,
             build: &state,
             commits: &self.git,
             allow_dirty,
@@ -208,13 +210,6 @@ impl Kit {
             rejected_paths: &rejected,
             legacy: &legacy,
         }))
-    }
-
-    fn profile_for(m: &Manifest, c: &Check) -> String {
-        c.profile
-            .clone()
-            .or_else(|| m.profile.clone())
-            .unwrap_or_else(|| "debug".into())
     }
 
     /// Run a check's local commands on this machine. Returns false if any
@@ -229,7 +224,7 @@ impl Kit {
         signer: Option<&Signer>,
     ) -> Result<bool, String> {
         let state = self.state()?;
-        let build = state.id(&Self::profile_for(m, c)).to_string();
+        let build = state.id(&m.run_profile(c)).to_string();
         let here = host();
         let mut all_ok = true;
         let mut ran = 0;
@@ -299,7 +294,7 @@ impl Kit {
                             j
                         }
                     }
-                    Some(_) => judge_control(c.judge, c, &output),
+                    Some(k) => judge_control(c.judge, c, k.expect_reason.as_deref(), &output),
                 };
                 let ok = matches!(
                     judged.verdict,
@@ -327,6 +322,10 @@ impl Kit {
                         .unwrap_or(&log)
                         .display()
                         .to_string(),
+                    host: here.clone(),
+                    runner: runner_id(local),
+                    config: m.config_digest(c, &local.target, k),
+                    reason: k.and_then(|_| fail_reason(c, &output.text)),
                 };
                 let path = self.runs_dir().join(format!("{stem}.json"));
                 std::fs::create_dir_all(self.runs_dir()).map_err(|e| e.to_string())?;
@@ -374,14 +373,18 @@ impl Kit {
             platform: s.platform.clone(),
             outcome: match rec.verdict {
                 RunVerdict::Pass | RunVerdict::DidNotFail => "PASS",
-                RunVerdict::Fail | RunVerdict::FailedAsRequired => "FAIL",
+                RunVerdict::Fail | RunVerdict::FailedAsRequired | RunVerdict::WrongReason => "FAIL",
                 RunVerdict::NoFailLine => "INCOMPLETE",
             }
             .to_string(),
             details: rec.summary.clone(),
             time: rec.time.clone(),
             device: s.device.clone(),
-            extra: Value::Null,
+            config: Some(rec.config.clone()),
+            extra: match &rec.reason {
+                Some(r) => serde_json::json!({ "reason": r }),
+                None => Value::Null,
+            },
         };
         let mut payloads = Vec::new();
         if c.judge == Judge::Matrix && control.is_none() {
@@ -419,6 +422,7 @@ fn verdict_word(v: RunVerdict) -> &'static str {
         RunVerdict::FailedAsRequired => "control FAILED as required",
         RunVerdict::DidNotFail => "control DID NOT FAIL",
         RunVerdict::NoFailLine => "control printed no FAIL line",
+        RunVerdict::WrongReason => "control FAILED for the wrong reason",
     }
 }
 
@@ -493,11 +497,46 @@ pub fn payload_from(v: &Value, a: &SignArgs<'_>) -> Result<ResultPayload, String
         .or_else(|| a.default_build.clone())
         .ok_or("no build in the result and no git checkout to take it from")?;
     crate::build::BuildId::parse(&build)?;
-    let extra = if is_matrix {
+    let mut extra = if is_matrix {
         serde_json::json!({"kx_group": s("kx_group"), "suite": s("suite")})
     } else {
-        v.get("extra").cloned().unwrap_or(Value::Null)
+        match v.get("extra") {
+            Some(Value::Object(o)) => Value::Object(o.clone()),
+            Some(Value::Null) | None => serde_json::json!({}),
+            Some(other) => return Err(format!("extra must be an object, not {other}")),
+        }
     };
+    // Fields a result file may carry at the top level (or, for the reason,
+    // inside an object `details`) are kept in `extra`, where the kit reads
+    // them.
+    let details = match v.get("details") {
+        Some(Value::String(d)) => d.clone(),
+        Some(Value::Null) | None => String::new(),
+        Some(other) => other.to_string(),
+    };
+    let lifted = [
+        (
+            "reason",
+            s("reason").or_else(|| {
+                v.get("details")
+                    .and_then(|d| d.get("reason"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            }),
+        ),
+        ("host_build", s("host_build")),
+        ("caller_build", s("caller_build")),
+    ];
+    if let Value::Object(o) = &mut extra {
+        for (key, value) in lifted {
+            if let Some(value) = value {
+                o.entry(key).or_insert(Value::String(value));
+            }
+        }
+    }
+    if extra.as_object().is_some_and(|o| o.is_empty()) {
+        extra = Value::Null;
+    }
     Ok(ResultPayload {
         check,
         target,
@@ -510,9 +549,10 @@ pub fn payload_from(v: &Value, a: &SignArgs<'_>) -> Result<ResultPayload, String
             .or_else(|| s("platform"))
             .unwrap_or_else(host),
         outcome,
-        details: s("details").unwrap_or_default(),
+        details,
         time: s("time").unwrap_or_else(now_rfc3339),
         device: a.device.to_string(),
+        config: s("config"),
         extra,
     })
 }
@@ -520,4 +560,46 @@ pub fn payload_from(v: &Value, a: &SignArgs<'_>) -> Result<ResultPayload, String
 /// Hex public key for display.
 pub fn public_hex(key: &SoftwareKey) -> String {
     to_hex(key.public_key().as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args() -> SignArgs<'static> {
+        SignArgs {
+            check: None,
+            target: None,
+            control: None,
+            platform: Some("test"),
+            default_build: None,
+            device: "pc",
+        }
+    }
+
+    #[test]
+    fn a_result_files_reason_and_host_build_are_kept_where_the_kit_reads_them() {
+        let v = serde_json::json!({
+            "check": "phase0.thin-slice-cross-machine",
+            "target": "pc-to-mac-lan",
+            "control": "wrong-identity",
+            "outcome": "FAIL",
+            "details": "FAIL pair in person: refused",
+            "build": "1111111+release",
+            "host_build": "1111111+debug",
+            "reason": "pin_mismatch",
+        });
+        let p = payload_from(&v, &args()).unwrap();
+        assert_eq!(p.reason().as_deref(), Some("pin_mismatch"));
+        assert_eq!(p.extra_str("host_build"), Some("1111111+debug"));
+        assert_eq!(p.control.as_deref(), Some("wrong-identity"));
+
+        // An object `details` with a reason inside it.
+        let mut v = v;
+        v.as_object_mut().unwrap().remove("reason");
+        v["details"] = serde_json::json!({ "reason": "pin_mismatch", "step": "pair" });
+        let p = payload_from(&v, &args()).unwrap();
+        assert_eq!(p.reason().as_deref(), Some("pin_mismatch"));
+        assert!(p.details.contains("\"step\""), "{}", p.details);
+    }
 }

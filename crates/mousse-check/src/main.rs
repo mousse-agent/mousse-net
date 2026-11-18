@@ -327,7 +327,10 @@ fn cmd_sign(kit: &Kit, a: &Args) -> Result<ExitCode, String> {
     let mut n = 0;
     for file in &a.positional {
         for v in read_unsigned(Path::new(file))? {
-            let p = payload_from(&v, &sa).map_err(|e| format!("{file}: {e}"))?;
+            let mut p = payload_from(&v, &sa).map_err(|e| format!("{file}: {e}"))?;
+            if p.config.is_none() {
+                p.config = Some(config_for(kit, &p.check, &p.target, p.control.as_deref())?);
+            }
             let path = write_signed(&out_dir, &p, &key)?;
             println!("signed {}", path.display());
             n += 1;
@@ -335,6 +338,28 @@ fn cmd_sign(kit: &Kit, a: &Args) -> Result<ExitCode, String> {
     }
     eprintln!("{n} result(s) signed as {device}");
     Ok(ExitCode::SUCCESS)
+}
+
+/// The configuration digest of one run, from this checkout's manifest: the
+/// signer vouches that the run used the check as configured here.
+fn config_for(
+    kit: &Kit,
+    check: &str,
+    target: &str,
+    control: Option<&str>,
+) -> Result<String, String> {
+    let (m, c) = kit.find_check(check)?;
+    if !c.targets.iter().any(|t| t == target) {
+        return Err(format!("{check} has no target {target}"));
+    }
+    let control = match control {
+        None => None,
+        Some(name) => Some(
+            c.control_named(name)
+                .ok_or_else(|| format!("{check} has no control {name}"))?,
+        ),
+    };
+    Ok(m.config_digest(&c, target, control))
 }
 
 fn cmd_attest(kit: &Kit, a: &Args) -> Result<ExitCode, String> {

@@ -1161,6 +1161,7 @@ dependencies = [
  "mousse-net-core",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "toml",
  "zeroize",
 ]

@@ -51,8 +51,31 @@ pub struct ResultPayload {
     pub time: String,
     /// The signing device's name in `checks/devices.toml`.
     pub device: String,
+    /// The check configuration the run used
+    /// ([`crate::manifest::Manifest::config_digest`]). A result without it,
+    /// or with another one, does not count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<String>,
+    /// Anything else. Read by the kit: `reason` (why a control failed) and,
+    /// for cross-machine checks, `host_build` (the host's build) and an
+    /// optional `caller_build`.
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub extra: serde_json::Value,
+}
+
+impl ResultPayload {
+    /// A string field of `extra`.
+    pub fn extra_str(&self, key: &str) -> Option<&str> {
+        self.extra.get(key).and_then(serde_json::Value::as_str)
+    }
+
+    /// Why the run failed: `extra.reason`, else a `reason=<word>` in the
+    /// details.
+    pub fn reason(&self) -> Option<String> {
+        self.extra_str("reason")
+            .map(str::to_string)
+            .or_else(|| crate::runner::reason_word(&self.details))
+    }
 }
 
 /// The file a device hands over.
@@ -399,6 +422,7 @@ mod tests {
             details: "ok".into(),
             time: "2026-11-18T00:00:00Z".into(),
             device: "mac".into(),
+            config: Some("c".into()),
             extra: serde_json::Value::Null,
         }
     }
