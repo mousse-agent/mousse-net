@@ -46,6 +46,21 @@ The code exchange used by "Send link" pairing (CPace) is specified in
   pair again.
 - The ALPN value carries the major version. A TLS peer MUST offer exactly
   `mousse/1` and MUST fail the handshake if it is not selected.
+- **One major version per connection.** The ALPN major, the version in both
+  session certificates (extension and signed record, which a verifier
+  requires to be equal) and the major in `HELLO` MUST all be the same
+  number. A certificate whose version differs from the negotiated ALPN major
+  is `unsupported_version`; a `HELLO` whose major differs closes with
+  `UNSUPPORTED_VERSION` (below). Major `1` has exactly one of each.
+- **The ticket version fixes the pairing algorithms.** Ticket version `1`
+  means CPace profile 1 ([`cpace.md`](cpace.md)), the join proof of 10.3 and
+  the transcript of 10.5. There is no algorithm negotiation inside a
+  ticket version; a new profile needs a new ticket version.
+- **Security requirements never weaken within a major version.** A newer
+  minor version may add requirements; it MUST NOT relax any MUST of this
+  document (TLS policy in 5.4, the checks of 5.4, pins, grants, the join
+  proof, attempt limits). Two compatible minors therefore always meet the
+  stricter set of rules.
 
 **Minor version negotiation.** Each side speaks one major version and a
 range of minor versions, from its oldest to its newest. An implementation
@@ -134,6 +149,24 @@ its public key and its signatures appear on the wire.
 
 The **fingerprint** of a public key is `H(65-byte SEC1 point)`. It is a local
 display and indexing value; it does not appear on the wire.
+
+**What the identity key signs (frozen).** The identity key signs only
+canonical CBOR maps (section 3) whose key `1` is a text domain string, and
+each domain string names exactly one record type. Major version 1 has one
+domain: `mousse-session-v1`, the session record (5.1). A new signed record
+needs a new domain string that no other record uses; the identity key MUST
+never sign raw bytes, a hash supplied from outside, or a record without its
+domain at key 1. This keeps any two signed things from ever being confused,
+whatever is added later. In `mousse-net-core`, `IdentitySigner` accepts only
+an `IdentityRecord`, which only the core builds.
+
+**Hardware keys stay usable while unlocked.** A session certificate is
+renewed in the background (section 6). A key store that asks for user
+presence (a fingerprint, a PIN, a tap) on every signature would stop
+renewal, and every session would end at its certificate's deadline. An
+identity key MUST be usable for signing without a user-presence prompt from
+the device's first unlock after start until it shuts down; a platform
+option that requires presence per use MUST NOT be set on it.
 
 ### 4.2 Raw signatures
 
@@ -275,6 +308,24 @@ authentication**. Both certificates are session certificates. The signature
 scheme for `CertificateVerify` is `ecdsa_secp256r1_sha256`. TLS server name
 and Web PKI checks do not apply; the checks below replace them.
 
+**TLS policy.** These are requirements, not defaults:
+
+- **Full mutual TLS on every connection.** Each side sends and verifies a
+  session certificate on every connection, including reconnects, bulk
+  sessions and path switches.
+- **No resumption, no PSK.** A client MUST NOT offer a pre-shared key or a
+  resumption ticket; a server MUST NOT issue tickets and MUST NOT accept a
+  PSK. Every connection runs a full handshake and the checks below.
+- **No 0-RTT.** Neither side sends or accepts early data.
+- **Key exchange groups.** A native endpoint offers `X25519MLKEM768` first
+  and `X25519` second, and no others. A native endpoint MUST complete the
+  handshake only on `X25519MLKEM768`: a connection that negotiated any other
+  group is closed before any application data. `X25519` alone is reserved
+  for a future browser profile that cannot do the hybrid group (Phase 5,
+  deferred and not specified here); until that profile exists, no endpoint
+  accepts a classical-only connection.
+- **ALPN** exactly `mousse/1` (section 2).
+
 Each side verifies the peer's certificate at its own wall time `now`, with an
 **expected identity** (pin):
 
@@ -306,9 +357,14 @@ this exact order, including certificates that break more than one rule
    and version; the identity signature verifies over it with the identity
    key, else `identity_signature_invalid`. (An identity signature made for
    another session key fails here.)
-9. `now` is inside the widened window (5.2), else `outside_window`.
-10. If a pin is given, the identity key equals it byte for byte, else
-    `pin_mismatch`.
+9. If a pin is given, the identity key equals it byte for byte, else
+   `pin_mismatch`.
+10. `now` is inside the widened window (5.2), else `outside_window`.
+
+The pin comes before the window on purpose: a certificate from some other
+endpoint is `pin_mismatch` whatever its window says, so a foreign endpoint
+on a candidate address always reads as "not this peer", never as a clock
+problem (`session-cert.json` case `precedence_pin_before_window`).
 
 The TLS stack separately verifies `CertificateVerify` with the session key,
 as usual. Together, these prove that the peer holds the session key now and
@@ -320,8 +376,11 @@ endpoint that answers on a candidate fails the pin (`pin_mismatch`), another
 endpoint holds that address: for example another profile's helper on the
 same computer, or another computer that took the address. The caller aborts
 that handshake before sending any data, tries the next candidate, shows no
-warning and keeps its pin unchanged. Vector: `session-cert.json` case
-`another_endpoint_on_lan_address`.
+warning and keeps its pin unchanged. The same holds for any other step 1
+failure on a candidate address: the caller tries the next candidate, and
+shows an error (for `outside_window`, the clock message) only when no
+candidate succeeded. Vectors: `session-cert.json` cases
+`another_endpoint_on_lan_address` and `precedence_pin_before_window`.
 
 ### 5.5 TLS exporters
 
@@ -371,6 +430,16 @@ includes both identity keys.
   new connection fails, the old one keeps running until its own deadline.
 - A device holds at most one current and one candidate path per peer. A newer
   candidate replaces an older one, which closes with `PATH_REPLACED`.
+- **The wall clock cannot extend a connection.** When step 1 passes, each
+  side also notes its monotonic clock and caps the connection at that reading
+  plus the time that was left until the effective deadline:
+  `mono_deadline = mono_at_authentication + (effective deadline + 1 −
+  now) × 1000` ms. The connection closes with `CERT_EXPIRED` at the first of
+  the two: the wall clock passing the effective deadline, or the monotonic
+  clock reaching `mono_deadline`. Setting the wall clock back therefore never
+  keeps a connection open past its certificates, and renewal still runs on
+  the wall clock. A device that sleeps or suspends checks both again when it
+  resumes. Vectors: `session-lifecycle.json` `clock_rollback`.
 
 ## 7. Grants
 
@@ -379,7 +448,7 @@ Authorization lives on each host endpoint as its own table of **grants** and
 fixes the semantics both ends rely on; the storage format is local.
 
 A grant is `{identity, name, role, source, authorizing owner, adopted_into,
-granted_at, expires_at?}`:
+enrolled_by, granted_at, expires_at?}`:
 
 - `identity`: the peer endpoint's 65-byte identity key.
 - `name`: 1 to 128 bytes of UTF-8. The app uses `<computer> (<profile>)`.
@@ -391,6 +460,11 @@ granted_at, expires_at?}`:
   never changed. Never a display name. With one owner profile per endpoint,
   this is the endpoint's own profile.
 - `adopted_into`: always empty in version 1.
+- `enrolled_by`: the grant's **enrollment receipt**: the id of the
+  invitation whose enrollment (10.8) made this grant, or empty for a grant
+  made any other way. It is stored with the grant, so it survives restarts,
+  and it goes when the grant goes. The host uses it to answer a joiner whose
+  `PAIRED` was lost (10.6 rule 7).
 - `expires_at`: optional. At that second the grant is already expired.
 
 Rules:
@@ -434,10 +508,41 @@ the TLS client and the **host** is the TLS server.
      `AUTHORIZED {state: live}`;
    - otherwise: wait for a `JOIN_PROOF`. If none arrives within **10 s**,
      close with `NOT_AUTHORIZED`.
-3. After a valid join proof (10.3) the connection is **join-only** and the
-   host sends `AUTHORIZED {state: join_only}`. On a join-only connection only
-   pairing messages are allowed. When pairing enrolls the device, the
-   connection becomes live under the new grant.
+3. The host answers a `JOIN_PROOF` (10.3) with one `AUTHORIZED` or a close:
+   - awaiting a proof: a valid join proof for an open invitation makes the
+     connection **join-only** and the host sends
+     `AUTHORIZED {state: join_only}`;
+   - live: a granted device may send one `JOIN_PROOF`, before any stream
+     frame. A valid proof for an open invitation makes the connection
+     join-only, and the host sends `AUTHORIZED {state: join_only}`: the
+     device pairs again, and enrollment replaces its grant (section 7). Any
+     other proof opens nothing, and the connection stays live under its
+     grant. If the grant's enrollment receipt names the proof's invitation,
+     the host answers `PAIRED {host name, role}` with the grant's role
+     (10.6 rule 7); the connection is already authenticated as the grant's
+     identity, so this answer needs no valid MAC, and the invitation may be
+     gone. Otherwise the host answers `AUTHORIZED {state: live}` again. A
+     second proof, or one after a stream frame, closes with
+     `PROTOCOL_ERROR`.
+
+   On a join-only connection only pairing messages are allowed. When pairing
+   enrolls the device, the connection becomes live under the new grant.
+4. **The caller opens streams first.** A host opens no stream on a
+   connection until the caller has opened one. A caller that sent a
+   `JOIN_PROOF` opens no stream before the host's answer to it. So a host
+   stream can never cross the answer to a proof. This rule only orders
+   streams; it gives the host no authority (step 5).
+5. **Grants point one way.** Step 2 and the host's `AUTHORIZED` decide what
+   the caller may do on the host, never what the host may do on the caller.
+   Once the caller is live, its gate (8.2) lets a stream the host opens
+   through, but before the caller dispatches any privileged operation on
+   such a stream, it MUST authorize the host itself against its own grant
+   table (section 7): the host identity needs a live grant there, and the
+   operation must fit that grant's role. Without one, the caller refuses the
+   operation (for example by resetting the stream) and the connection stays
+   up. A pairing creates no grant on the joiner, so a joiner's host has no
+   authority on it unless the joiner's owner grants it separately. Vectors:
+   `authz.json` `host_opened_stream_needs_the_callers_grant`.
 
 ### 8.1 What the host accepts
 
@@ -447,7 +552,7 @@ connection's state:
 | Traffic | Awaiting proof | Join-only | Live |
 |---|---|---|---|
 | `PING`, `PONG`, `HELLO`, `GOAWAY` | allow | allow | allow |
-| `JOIN_PROOF` | allow | close `PROTOCOL_ERROR` | ignore |
+| `JOIN_PROOF` | allow | close `PROTOCOL_ERROR` | allow once, before any stream frame; otherwise close `PROTOCOL_ERROR` |
 | `CODE_EXCHANGE`, `CODE_ABORT` | close `NOT_AUTHORIZED` | allow | ignore |
 | Any stream frame (`OPEN`, `DATA`, `CREDIT`, `FIN`, `RESET`) | close `NOT_AUTHORIZED` | close `NOT_AUTHORIZED` | allow |
 | `AUTHORIZED`, `PAIRED` (host-only messages) | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` |
@@ -462,18 +567,28 @@ authorization**; `AUTHORIZED` moves it to live or join-only. A join-only
 caller becomes live when it accepts `PAIRED` (10.4, 10.6), which for "Send
 link" is only after it verified the host's confirmation.
 
-| Traffic from the host | Awaiting `AUTHORIZED` | Join-only | Live |
-|---|---|---|---|
-| `PING`, `PONG`, `HELLO`, `GOAWAY` | allow | allow | allow |
-| `AUTHORIZED` | allow, then live or join-only | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` |
-| `CODE_EXCHANGE`, `CODE_ABORT` | close `PROTOCOL_ERROR` | allow | ignore |
-| `PAIRED` | close `PROTOCOL_ERROR` | allow | close `PROTOCOL_ERROR` |
-| Any stream frame, including a stream the host opens | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` | allow |
-| `JOIN_PROOF` (caller-only message) | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` |
+A caller that sent a `JOIN_PROOF` on the connection reads a first
+`AUTHORIZED {live}` as step 2's notice only and moves to **awaiting the
+answer**; the next `AUTHORIZED`, or a `PAIRED` (an enrollment receipt), is
+the host's answer to the proof (8, step 3). If it read the notice before its
+proof went out, it moves to awaiting the answer when it sends the proof. A
+caller that has had no answer 10 s after sending its proof closes the
+connection with `NOT_AUTHORIZED`; a joiner's flow then ends (10.6 rule
+7).
+
+| Traffic from the host | Awaiting `AUTHORIZED` | Awaiting the answer | Join-only | Live |
+|---|---|---|---|---|
+| `PING`, `PONG`, `HELLO`, `GOAWAY` | allow | allow | allow | allow |
+| `AUTHORIZED` | allow, then live or join-only; `live` after this side sent a proof: awaiting the answer | allow, then live or join-only | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` |
+| `CODE_EXCHANGE`, `CODE_ABORT` | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` | allow | ignore |
+| `PAIRED` | close `PROTOCOL_ERROR` | allow, then live (the answer to the proof) | allow | close `PROTOCOL_ERROR` |
+| Any stream frame, including a stream the host opens | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` | allow |
+| `JOIN_PROOF` (caller-only message) | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` |
 
 So a host can never open a stream on a caller that has not been told it is
-live. After a close, everything else is ignored. Vectors: `authz.json`
-`caller_cases`.
+live. Being live lets the host's streams through this gate only; what they
+may do is decided by the caller's own grants (8, step 5). After a close,
+everything else is ignored. Vectors: `authz.json` `caller_cases`.
 
 ## 9. Mux
 
@@ -584,6 +699,28 @@ host's record and in the ticket.
 
 Browsers always use "Send link".
 
+**The kind is believed only as far as the ticket's arrival supports it.**
+"In person" skips the code, so it is safe only when the ticket came straight
+off the host's screen. The joiner's app tells the pairing flow how the ticket
+arrived:
+
+- **in-app scan:** the app's own scanner read the QR code from a screen in
+  front of the user;
+- **link:** anything else, including a link opened from another app or a
+  browser, a pasted link, and a QR code opened through the system camera
+  (which hands the app a link).
+
+A ticket of kind 1 is accepted only from an in-app scan. Any other arrival
+of a kind 1 ticket ends the flow with `PAIRING_FAILED` before the joiner
+dials, so a swapped link that claims "in person" can neither be approved by
+a fake host nor end as "already paired"; nothing is pinned. A held pin does
+not change this. Kind 2 is accepted from either arrival. Vectors:
+`pairing-e2e.json` `swapped_in_person_link`.
+
+**A device never pairs with itself.** A joiner whose own identity key is the
+ticket's host identity ends the flow with `PAIRING_FAILED` before it dials
+(10.3 covers the host side). Vectors: `pairing-e2e.json` `own_ticket`.
+
 ### 10.2 Ticket
 
 The ticket is a canonical CBOR map:
@@ -681,10 +818,12 @@ A joiner in a pairing flow sends `JOIN_PROOF` on **every** connection of
 the flow, right after its own `HELLO`, without waiting for anything from
 the host. It cannot know whether the host already holds a grant for it
 (after a lost `PAIRED`, 10.6, it may), and the host never says that it is
-waiting for a proof. A host whose step 2 found a live grant ignores the
-proof (8.1) and has already sent `AUTHORIZED {live}`. A caller that is not
-in a pairing flow never sends `JOIN_PROOF`. Vectors: `pairing-e2e.json`
-(the `connect` steps, and `outcome_after_lost_paired`).
+waiting for a proof. A host whose step 2 found a live grant has already sent
+`AUTHORIZED {live}`; it answers the proof as section 8, step 3 says, and the
+joiner takes that answer, not step 2's notice, as the outcome (10.6 rule 8).
+A caller that is not in a pairing flow never sends `JOIN_PROOF`. Vectors:
+`pairing-e2e.json` (the `connect` steps, `outcome_after_lost_paired`,
+`role_change_not_committed` and `re_pair_while_granted`).
 
 The proof is:
 
@@ -702,8 +841,11 @@ mac   = HMAC-SHA256(key, input)
 The host recomputes `mac` with the identity keys from this TLS session and
 compares in constant time. The host closes with `INVITATION_INVALID` if the
 invitation is unknown, not open, or the `mac` is wrong; it uses one code for
-all of these on purpose. A denied identity gets `NOT_AUTHORIZED`. A second
-`JOIN_PROOF` on a join-only connection is `PROTOCOL_ERROR`.
+all of these on purpose (on a live connection it answers `AUTHORIZED
+{live}` instead, section 8). A denied identity, and a joiner whose identity
+key is the host's own, get `NOT_AUTHORIZED`. A second `JOIN_PROOF` on a
+join-only connection is `PROTOCOL_ERROR`. Vectors: `pairing-attempts.json`
+`join_proof_from_own_identity`.
 
 The proof shows that the joiner holds the ticket, bound to this TLS session
 and to both identities, so it cannot be replayed on another connection or by
@@ -711,8 +853,25 @@ another device.
 
 The joiner's **name** (`JOIN_PROOF` key 3) is not covered by the MAC. It is a
 claim the joiner makes about itself, shown to the host owner as sent and
-stored in the grant. The app sends `<computer> (<profile>)`, so the field
-allows 1 to 128 bytes.
+stored in the grant. The field allows 1 to 128 bytes. The proof goes out
+before the code has shown that the far end is the real host, so the name
+reveals no more than needed:
+
+- "In person" (from an in-app scan, 10.1): the app sends
+  `<computer> (<profile>)`: the computer name, one space, and the joining
+  profile's label in parentheses, such as `Phone (Work)`. A joiner with no
+  profile label sends `<computer>` alone.
+- "Send link": the app sends `<computer>` only, never the profile label.
+  The label is sent only after the host's confirmation verified; version 1
+  has no message for that yet, so a send-link grant is named after the
+  computer until a later minor version adds one ([`privacy.md`](privacy.md)).
+
+The host shows and stores the name exactly as sent; it never splits it.
+Vectors give the two parts and the name they make: in `pairing-e2e.json`
+the joiner is computer `Phone` with profile label `Work`, so its in-person
+proof names `Phone (Work)` and its send-link proof `Phone`; in
+`pairing-attempts.json` each joiner's computer name is its letter with
+profile label `Work` (`a (Work)` in person, `a` for a send link).
 
 ### 10.4 In-person flow
 
@@ -794,7 +953,14 @@ CPace output `ISK` is not used by pairing in version 1.
    the invitation is created.
 2. The owner types the code into the joiner. It reaches the joiner
    independently of the link (from the host's screen or a separate call). The
-   digits are never transmitted.
+   digits are never transmitted. **Codes are typed only where the joiner's
+   identity lives:** in the installed app, or in a web client at a trusted
+   origin the user bookmarked or installed. A page reached from a link (a
+   handoff or landing page) never asks for or receives a code; it can only
+   hand the ticket to the app or the trusted client. A script on any page
+   that opens the link can read the ticket in its fragment
+   ([`privacy.md`](privacy.md)), so the code is what keeps such a page from
+   pairing.
 3. The joiner starts an **attempt**: it picks a random 16-byte attempt id and
    runs the code exchange (10.5) as **initiator**. The host runs it as
    **responder** and answers with the same attempt id.
@@ -810,31 +976,63 @@ CPace output `ISK` is not used by pairing in version 1.
    host's confirmation, and then becomes live (8.2).
 6. Either side ends a failed attempt with `CODE_ABORT {attempt,
    PAIRING_FAILED}`. The joiner shows the attempts it has left and the owner
-   may type the new code on the same connection.
-7. **Outcome after a lost connection.** Once the joiner has sent `msg_c`,
-   the host may have enrolled it. If the connection closes before `PAIRED`
-   arrives, the joiner does not count the attempt as failed yet. It
-   reconnects with the same ticket, even with no attempts left and even
-   after the ticket's joiner-side expiry, sends `HELLO` and `JOIN_PROOF` as
-   usual, and step 2 gives the outcome:
-   - `AUTHORIZED {live}`: the host enrolled it. Pairing succeeded ("already
-     paired"); the joiner keeps the ticket's host identity as its pin.
+   may type the new code on the same connection. Because a right-looking code
+   that fails may mean the far end is not the real host, the joiner says so:
+   "That code didn't work. If you typed it exactly as shown on the other
+   device, the link may have been swapped; get a new one another way."
+7. **Outcome after a lost connection.** Once the joiner has verified the
+   host's confirmation, it marks the outcome pending (10.7) and sends
+   `msg_c`; from then on the host may have enrolled it. If the connection
+   closes before `PAIRED` arrives, the joiner does not count the attempt as
+   failed yet. It reconnects with the same ticket, even with no attempts
+   left and even after the ticket's joiner-side expiry, sends `HELLO` and
+   `JOIN_PROOF` as usual, and the host's answer to the proof gives the
+   outcome (a host that holds a grant for it sends step 2's `AUTHORIZED
+   {live}` first, then answers the proof; section 8):
+   - `PAIRED {host name, role}`: this invitation enrolled it, with that
+     role: the host found its grant's enrollment receipt (section 7). The
+     pairing succeeded; the joiner pins the ticket's host identity as for
+     any `PAIRED`.
+   - `AUTHORIZED {live}`: the device has access, but not from this
+     invitation (its grant came from elsewhere, for example an earlier
+     pairing). The role this invitation offered is **not** in effect and the
+     joiner must not report it. The flow ends "already paired" and the
+     joiner pins the ticket's host identity.
    - `AUTHORIZED {join_only}`: not enrolled. With attempts left the owner
      may type the current code; with none left the flow ends with
      `ATTEMPTS_EXHAUSTED`.
    - A close with `INVITATION_INVALID` or `ATTEMPTS_EXHAUSTED`: not
      enrolled; the flow ends.
+
+   The joiner keeps "outcome pending" in its stored flow record (10.7), so
+   it still learns the outcome after the app was closed or killed. It clears
+   the mark only once the outcome is settled: after `PAIRED` or `AUTHORIZED
+   {live}`, once the pin is durably stored; otherwise when the answer above
+   arrives.
+
+   **A proof that gets no answer ends the flow.** If the answer to the proof
+   does not arrive within 10 s (8.2), the joiner closes with
+   `NOT_AUTHORIZED` and the flow ends with that code, also while it is
+   learning a pending outcome: it does not reconnect on its own. The
+   pending mark stays stored, so opening the same ticket again starts a new
+   flow that reconnects and asks again (allowed with no attempts left and
+   after the joiner-side expiry, as above). Vectors: `pairing-e2e.json`
+   `outcome_after_lost_paired`, `role_change_not_committed` and
+   `lost_paired_then_proof_timeout`.
 8. **"Already paired" needs a reason to trust the host.** A link travels
    over channels anyone may tamper with, so a swapped link can name another
    key, and step 1 then passes against whoever holds it. A "Send link"
-   joiner therefore accepts `AUTHORIZED {live}` as "already paired" only
-   when it already held a pin for the ticket's host identity before this
-   flow started (an earlier pairing, not this ticket), or while it is
-   learning the outcome of its own lost `PAIRED` (7). Otherwise the flow
-   ends with `PAIRING_FAILED`, the joiner closes the connection with it
-   (9), and nothing is pinned. An in-person ticket is read off the host's
-   own screen, so this does not apply to it. Vectors: `pairing-e2e.json`
-   `send_link_live_needs_a_pin`.
+   joiner therefore accepts `AUTHORIZED {live}` or `PAIRED` as the answer
+   to its proof (on a connection that step 2 made live) only when it
+   already held a pin for the ticket's host identity before this flow
+   started (an earlier pairing, not this ticket), or while it is learning
+   the outcome of its own lost `PAIRED` (7). Otherwise the flow ends with `PAIRING_FAILED`, the joiner closes the
+   connection with it (9), and nothing is pinned. A joiner with no pin whose
+   host still holds a grant for it is not stuck: the host answers a valid
+   proof with `AUTHORIZED {join_only}` and the pairing replaces the grant
+   (section 8). An in-person ticket comes only from an in-app scan (10.1), so
+   this rule does not apply to it. Vectors: `pairing-e2e.json`
+   `send_link_live_needs_a_pin` and `re_pair_while_granted`.
 9. **A failed flow closes the connection.** When the joiner's flow ends
    with an error code C (for example `PAIRING_FAILED` under 8, or
    `ATTEMPTS_EXHAUSTED` after its third failed attempt), the joiner first
@@ -845,17 +1043,19 @@ CPace output `ISK` is not used by pairing in version 1.
    nothing more. A failed attempt (6) is not a failed flow: it sends only
    `CODE_ABORT` and the connection stays up.
 
-Random draws, in order (vectors depend on it): the host draws the invitation
-id (16 bytes), the secret (16 bytes) and, for "Send link", the first code
-when it creates the invitation; for each new attempt, the next code (if
-attempts are left) and then its CPace scalar. The host draws both when the
-first message of the new attempt arrives, after the debit and **before** it
-reads that message: a malformed or invalid `msg_a` still uses up the next
-code and the scalar. The joiner draws, for each attempt, the attempt id (16
-bytes) and then its CPace scalar. A code is one 32-bit draw, repeated while
-it is at least 4 294 000 000; a CPace scalar is one 32-byte draw (repeated
-only in the 2^-252 case of zero, [`cpace.md`](cpace.md) 5.2). Vectors:
-`pairing-attempts.json` lists every draw of every sequence.
+**Random draws in the vectors.** The order of random draws is a convention
+of the vector harness, not a requirement: an implementation may draw in any
+order, from any secure source, and replays the vectors by feeding its draws
+from the listed values. The reference implementation draws as follows, and
+the vectors list draws in this order: the host draws the invitation id (16
+bytes), the secret (16 bytes) and, for "Send link", the first code when it
+creates the invitation; for each new attempt, the next code (if attempts are
+left) and then its CPace scalar, after the debit and before it reads that
+attempt's first message. The joiner draws, for each attempt, the attempt id
+(16 bytes) and then its CPace scalar. A code is one 32-bit draw, repeated
+while it is at least 4 294 000 000; a CPace scalar is one 32-byte draw
+(repeated only in the 2^-252 case of zero, [`cpace.md`](cpace.md) 5.2).
+Vectors: `pairing-attempts.json` lists every draw of every sequence.
 
 ### 10.7 Attempt limits
 
@@ -867,40 +1067,62 @@ only in the 2^-252 case of zero, [`cpace.md`](cpace.md) 5.2). Vectors:
   When none are left and no attempt is running, the invitation ends and its
   join-only connections close with `ATTEMPTS_EXHAUSTED`. A new attempt with
   none left closes its connection with `ATTEMPTS_EXHAUSTED`.
-- **Joiner:** 3 attempts per code-entry flow (one ticket, one local flow).
-  After the third failure the flow ends. A fake host can use up the joiner's
-  attempts but cannot cancel the real host's invitation; each side's count is
-  local.
-- **Attempt key.** The host keys attempts by **(TLS session, attempt id)**.
-  An attempt id the host has already seen on another TLS session of the
-  invitation is a replay: its messages are bound to the old session's
-  exporter and can never succeed. The host answers it with `CODE_ABORT
-  {attempt, PAIRING_FAILED}` **before** any debit and without exchange work
-  or a new code, so replays cannot spend the invitation's attempts.
-  Vectors: `pairing-attempts.json`
-  `attempt_replayed_on_another_connection_is_refused`.
-- **Resends and messages after an attempt ends.** The connection's gate
-  (8.1) runs first; the rules below apply only to `CODE_EXCHANGE` and
-  `CODE_ABORT` it allows (join-only). A sender may resend only a
-  **byte-identical** message. For each (TLS session, attempt id) the host
-  keeps two values: the last payload it read as an exchange message (the
-  first message, or one taken under rule 3), and the message it sent in
-  answer to it (its `CODE_EXCHANGE` reply, or the `CODE_ABORT` that failed
-  the attempt). For a `CODE_EXCHANGE` on an attempt it already has:
-  1. a payload identical to the last one received: send the kept message
-     again, byte for byte, and do nothing else (no debit, no draw, no
-     exchange work), whether the attempt is running or ended;
-  2. otherwise, on an attempt that ended (failed, or aborted by the
-     joiner): send `CODE_ABORT {attempt, PAIRING_FAILED}`, with no debit,
-     no other work and no change to the kept values;
-  3. otherwise, on a running attempt: the payload is the next exchange
-     message, and the attempt goes on or fails as 10.5 says.
+- **Joiner:** 3 attempts per ticket, counted across every time the link is
+  opened. The joiner stores a **flow record** keyed by the ticket hash: the
+  attempts it has left and whether an outcome is pending (10.6 rule 7). It
+  loads the record when the same ticket is opened again, so neither
+  reopening the link nor killing the app resets the count. A record for
+  another ticket hash is refused. Every change to the record is written
+  durably **before** what depends on it goes out:
+  1. **The debit:** written before the attempt's first message (`msg_a`).
+  2. **The pending mark:** set after the host's confirmation verified and
+     written before the joiner's own confirmation (`msg_c`) goes out, so a
+     crash right after sending it cannot forget that the host may have
+     enrolled it.
+  3. **Clearing the mark:** only once the outcome is durable: after
+     `PAIRED` or "already paired", once the pin is stored; otherwise with
+     the answer that settled it.
 
-  A `CODE_ABORT` from the joiner ends a running attempt (its debit stays)
-  and changes neither kept value. A `CODE_ABORT` for an attempt the host
-  does not have on this TLS session is ignored. The joiner ignores a
-  repeated identical host message and any message for an attempt that is
-  not its current one. Vectors: `pairing-attempts.json`.
+  Each write is atomic and conditional on the stored record being the one
+  this flow last read or wrote (compare and swap), so two flows on the same
+  ticket (two windows, or a link opened twice) cannot both spend the same
+  attempt. If a write fails or the stored record changed, nothing that
+  waited for it is sent and the flow ends with `INTERNAL_ERROR`; opening the
+  ticket again starts from the stored record. Vectors: `pairing-e2e.json`
+  (`persist` outputs; `crash_after_pending_mark`).
+  After the third failure the flow ends; a later start with no attempts left
+  and nothing pending ends at once with `ATTEMPTS_EXHAUSTED`. A fake host can
+  use up the joiner's attempts but cannot cancel the real host's invitation;
+  each side's count is local. Vectors: `pairing-e2e.json`
+  `joiner_cap_survives_reopening`.
+
+  The record is canonical CBOR `{1: "mousse-joiner-flow-v1", 2: ticket hash
+  (32 bytes), 3: attempts left (0 to 3), 4: outcome pending (0 or 1)}`. It
+  is local state: its format is fixed so stored records survive upgrades.
+- **Attempt key.** The host keys attempts by **(TLS session, attempt id)**.
+  An attempt id seen on another TLS session is a new attempt on this one:
+  it is debited first like any other, and it can never succeed, because its
+  messages are bound to the other session's exporter and the other
+  joiner's identity. Vectors: `pairing-attempts.json`
+  `attempt_replayed_on_another_connection_is_debited`.
+- **No resends.** The transport is reliable and ordered, so a sender never
+  sends a message twice. The connection's gate (8.1) runs first; the rules
+  below apply only to `CODE_EXCHANGE` and `CODE_ABORT` it allows
+  (join-only). For a `CODE_EXCHANGE` on an attempt the host already has on
+  this TLS session:
+  1. on an attempt that ended (succeeded, failed, or aborted by the
+     joiner): send `CODE_ABORT {attempt, PAIRING_FAILED}`, with no debit
+     and no other work;
+  2. on a running attempt: the payload is the next exchange message, and
+     the attempt goes on or fails as 10.5 says. A repeated message does not
+     fit the next step, so it fails the attempt.
+
+  A `CODE_ABORT` from the joiner ends a running attempt (its debit stays).
+  A `CODE_ABORT` for an attempt the host does not have on this TLS session
+  is ignored. On the joiner, a host message that does not fit the current
+  attempt's next step fails that attempt in the same way; any message for
+  an attempt that is not its current one is ignored. Vectors:
+  `pairing-attempts.json`.
 
 ### 10.8 Enrollment
 
@@ -918,11 +1140,20 @@ routes:
 5. Close every other join-only connection of the invitation with
    `INVITATION_INVALID`.
 
+Step 2's grant records this invitation as its enrollment receipt (section
+7), in the same atomic step.
+
 Cancelling or declining an invitation grants nothing. A joiner that already
-holds a live grant gets `AUTHORIZED {live}` at step 2 and pairing ends with
-"already paired". That is also how a joiner whose `PAIRED` was lost learns
-that it was enrolled (10.6). A "Send link" joiner believes it only for a host
-it pinned before the flow, or for its own lost `PAIRED` (10.6, rule 8).
+holds a live grant gets `AUTHORIZED {live}` at step 2; if the invitation is
+still open, its valid proof starts a normal pairing that replaces the grant
+(section 8, step 3). Otherwise the host's answer is `PAIRED` again if this
+invitation made the grant, which is how a joiner whose `PAIRED` was lost
+learns that it was enrolled (10.6 rule 7), and `AUTHORIZED {live}` if it did
+not; then pairing ends with "already paired". A "Send link" joiner believes
+either answer only for a host it pinned before the flow, or for its own
+lost `PAIRED` (10.6, rule 8). When a pairing replaces a grant, the
+connection it ran on is bound to the new grant and every other connection
+bound to the old one closes with `GRANT_REVOKED`.
 
 ## 11. Control messages
 
@@ -934,11 +1165,11 @@ extra keys and field rule failures close the connection with
 | Type | Name | Direction | Fields |
 |---|---|---|---|
 | 1 | `HELLO` | both, first | `1`: uint major version, `2`: uint newest minor version (section 2) |
-| 2 | `AUTHORIZED` | host → caller | `1`: uint state, `1` live or `2` join-only |
+| 2 | `AUTHORIZED` | host → caller | `1`: uint state, `1` live or `2` join-only. Sent at step 2, and once more as the answer to a `JOIN_PROOF` on a live connection (section 8). Authorizes the caller on the host only (section 8, step 5) |
 | 3 | `JOIN_PROOF` | caller → host | `1`: bytes invitation id (16), `2`: bytes mac (32), `3`: text joiner name (1–128 bytes, not covered by the MAC) |
 | 4 | `CODE_EXCHANGE` | both | `1`: bytes attempt id (16), `2`: bytes payload (1–1024) |
 | 5 | `CODE_ABORT` | both | `1`: bytes attempt id (16), `2`: uint error code (at most 65 535; unknown codes read as `INTERNAL_ERROR`) |
-| 6 | `PAIRED` | host → joiner | `1`: text host name (1–128 bytes), `2`: text role (section 7 rules) |
+| 6 | `PAIRED` | host → joiner | `1`: text host name (1–128 bytes), `2`: text role (section 7 rules). Sent on enrollment (10.8), and as the answer to a `JOIN_PROOF` on a live connection whose grant this invitation made (section 8, step 3) |
 
 ## 12. Error codes
 

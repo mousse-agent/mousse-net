@@ -4,17 +4,17 @@
 use std::sync::{Arc, Mutex};
 
 use mousse_net_core::identity::IdentityPublicKey;
-use mousse_net_core::session::RENEW_LEAD_SECS;
 use mousse_net_core::session_cert::{self, SessionCertificate, ValidityWindow, MAX_LIFETIME_SECS};
 use mousse_net_core::UnixTime;
 
 use crate::clock::Clock;
 use crate::error::NetError;
+use crate::limits::Limits;
 use crate::rng::os_rng;
 use crate::SharedSigner;
 
 /// Holds the current session certificate and issues a new one when it is
-/// within [`RENEW_LEAD_SECS`] of `not_after` (or not yet valid).
+/// within the renewal lead of `not_after` (or not yet valid).
 ///
 /// Each new connection takes [`CertManager::current`]. A connection keeps the
 /// certificate it started with and closes at its effective deadline.
@@ -22,21 +22,25 @@ pub struct CertManager {
     signer: SharedSigner,
     clock: Arc<dyn Clock>,
     lifetime_secs: u64,
+    renew_lead_secs: u64,
     current: Mutex<Option<SessionCertificate>>,
 }
 
 impl CertManager {
-    /// A manager that issues 24 h certificates.
+    /// A manager with the default limits: 24 h certificates, renewed 30
+    /// minutes before they run out.
     pub fn new(signer: SharedSigner, clock: Arc<dyn Clock>) -> Self {
-        Self::with_lifetime(signer, clock, MAX_LIFETIME_SECS)
+        Self::with_limits(signer, clock, &Limits::DEFAULT)
     }
 
-    /// A manager with a custom certificate lifetime (at most 24 h).
-    pub fn with_lifetime(signer: SharedSigner, clock: Arc<dyn Clock>, lifetime_secs: u64) -> Self {
+    /// A manager with the certificate lifetime (at most 24 h) and renewal
+    /// lead from `limits`.
+    pub fn with_limits(signer: SharedSigner, clock: Arc<dyn Clock>, limits: &Limits) -> Self {
         Self {
             signer,
             clock,
-            lifetime_secs: lifetime_secs.clamp(1, MAX_LIFETIME_SECS),
+            lifetime_secs: limits.io().cert_lifetime_secs().clamp(1, MAX_LIFETIME_SECS),
+            renew_lead_secs: limits.core().renew_lead_secs(),
             current: Mutex::new(None),
         }
     }
@@ -54,7 +58,7 @@ impl CertManager {
             .lock()
             .map_err(|_| NetError::Signer("certificate lock poisoned".into()))?;
         if let Some(cert) = slot.as_ref() {
-            if !needs_renewal(cert.window(), now) {
+            if !needs_renewal(cert.window(), now, self.renew_lead_secs) {
                 return Ok(cert.clone());
             }
         }
@@ -67,9 +71,10 @@ impl CertManager {
     }
 }
 
-/// Whether a certificate with `window` should be replaced at `now`.
-pub fn needs_renewal(window: ValidityWindow, now: UnixTime) -> bool {
-    now < window.not_before() || now.plus(RENEW_LEAD_SECS) >= window.not_after()
+/// Whether a certificate with `window` should be replaced at `now`, given
+/// the renewal lead.
+pub fn needs_renewal(window: ValidityWindow, now: UnixTime, renew_lead_secs: u64) -> bool {
+    now < window.not_before() || now.plus(renew_lead_secs) >= window.not_after()
 }
 
 #[cfg(test)]
@@ -78,16 +83,23 @@ mod tests {
     use crate::clock::ManualClock;
     use mousse_net_core::identity::SoftwareKey;
 
+    const RENEW_LEAD_SECS: u64 = Limits::DEFAULT.core().renew_lead_secs();
+
     #[test]
     fn renews_only_near_the_end_of_the_window() {
         let window = ValidityWindow::starting_at(UnixTime(1_000), 86_400).unwrap();
-        assert!(!needs_renewal(window, UnixTime(1_000)));
+        assert!(!needs_renewal(window, UnixTime(1_000), RENEW_LEAD_SECS));
         assert!(!needs_renewal(
             window,
-            UnixTime(87_400 - RENEW_LEAD_SECS - 1)
+            UnixTime(87_400 - RENEW_LEAD_SECS - 1),
+            RENEW_LEAD_SECS
         ));
-        assert!(needs_renewal(window, UnixTime(87_400 - RENEW_LEAD_SECS)));
-        assert!(needs_renewal(window, UnixTime(999)));
+        assert!(needs_renewal(
+            window,
+            UnixTime(87_400 - RENEW_LEAD_SECS),
+            RENEW_LEAD_SECS
+        ));
+        assert!(needs_renewal(window, UnixTime(999), RENEW_LEAD_SECS));
     }
 
     #[test]

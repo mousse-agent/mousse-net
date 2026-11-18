@@ -7,18 +7,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use mousse_net_core::authz::JOIN_PROOF_WAIT_MS;
 use mousse_net_core::grants::{GrantId, OwnerRef};
 use mousse_net_core::identity::{IdentityPublicKey, SoftwareKey};
 use mousse_net_core::mux::PriorityClass;
-use mousse_net_core::pairing::{CpaceExchangeFactory, InvitationKind, Ticket};
+use mousse_net_core::pairing::{Arrival, CpaceExchangeFactory, InvitationKind, Ticket};
 use mousse_net_core::ErrorCode;
 use mousse_net_io::pipe::{accept_tcp, connect_tcp, route_from_addr, route_uri, Route};
 use mousse_net_io::rng::os_rng;
 use mousse_net_io::store::hex;
 use mousse_net_io::{
-    Caller, CloseReason, CodeEntry, Connection, Endpoint, Host, HostConfig, HostEvent, ManualClock,
-    MuxStream, NetError, PortChoice, SharedSigner, TlsPolicy,
+    Caller, CloseReason, CodeEntry, Connection, Endpoint, Host, HostConfig, HostEvent, Limits,
+    ManualClock, MuxStream, NetError, PortChoice, SharedSigner,
 };
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -65,7 +64,7 @@ impl TestHost {
             name: "test host".into(),
             state_dir: None,
             owner: OwnerRef::from_bytes([0x5a; 16]),
-            policy: TlsPolicy::default(),
+            limits: Limits::DEFAULT,
             clock: clock.clone(),
             ticket_identity: None,
         };
@@ -189,7 +188,8 @@ impl TestHost {
 
     /// Skip the join-proof wait, so an ungranted connection is refused now.
     pub fn skip_join_wait(&self) {
-        self.clock.advance_mono(JOIN_PROOF_WAIT_MS + 1_000);
+        self.clock
+            .advance_mono(Limits::DEFAULT.core().join_proof_wait_ms() + 1_000);
     }
 
     /// Stop listening and close every connection, as a quit would.
@@ -244,18 +244,18 @@ async fn serve_echo(conn: Connection, streams: Arc<AtomicUsize>) {
 }
 
 pub fn new_caller(signer: SharedSigner) -> Caller {
-    Caller::new(signer, Arc::new(ManualClock::new()), TlsPolicy::default())
+    Caller::new(signer, Arc::new(ManualClock::new()), Limits::DEFAULT)
 }
 
 pub fn new_caller_with_clock(signer: SharedSigner, clock: Arc<ManualClock>) -> Caller {
-    Caller::new(signer, clock, TlsPolicy::default())
+    Caller::new(signer, clock, Limits::DEFAULT)
 }
 
 /// Pair `caller` with `host` in person, approving on the host.
 pub async fn pair(caller: &Caller, host: &mut TestHost, name: &str) -> Connection {
     let ticket = host.invite();
     let pipe = connect_tcp(&host.route()).await.unwrap();
-    let join = caller.join(pipe, &ticket, name);
+    let join = caller.join(pipe, &ticket, Arrival::InAppScan, name);
     let approve = host.approve_next_request();
     let (result, ()) = tokio::join!(within("join", join), approve);
     let (conn, outcome) = result.unwrap();

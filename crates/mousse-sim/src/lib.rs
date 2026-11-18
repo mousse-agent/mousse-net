@@ -114,8 +114,8 @@ pub enum Bug {
     /// The joiner pre-computes its first exchange message before the code is
     /// submitted (so before the debit).
     JoinerWorkBeforeDebit,
-    /// The joiner starts a fresh pairing state machine on every reconnect, so
-    /// its 3-attempt limit resets inside one code-entry flow.
+    /// The joiner starts a fresh pairing state machine on every reconnect and
+    /// ignores its stored record, so its 3-attempt limit for the ticket resets.
     JoinerNewFlowOnReconnect,
     /// Devices never run the session deadline, so traffic continues past the
     /// certificate's effective deadline.

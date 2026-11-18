@@ -34,6 +34,7 @@ const _: () = {
 };
 
 mod ipc;
+mod limits;
 mod peer;
 
 /// This build: `<commit>[-dirty]+<profile>`, fixed at compile time (see
@@ -99,9 +100,6 @@ enum Command {
         /// Without it, the port picked at the first start is kept.
         #[arg(long)]
         port: Option<u16>,
-        /// Approve the next in-person join without asking.
-        #[arg(long)]
-        approve_next: bool,
         /// Don't advertise on mDNS (it is off anyway on loopback).
         #[arg(long)]
         no_mdns: bool,
@@ -111,15 +109,13 @@ enum Command {
     },
     /// Make an invitation on the running host and print the ticket and a QR
     /// code. In person (the default), answer "Is the device next to you?";
-    /// with --link, show the code to type on the joining device.
+    /// with --link, show the code to type on the joining device. Every
+    /// in-person request is put to the owner; none is approved unseen.
     Invite {
         /// A send link: the joining device types a 6-digit code shown here,
         /// a fresh one for each attempt.
         #[arg(long)]
         link: bool,
-        /// Answer yes without asking (in person).
-        #[arg(long)]
-        approve_next: bool,
         /// Print only the ticket line, no QR code.
         #[arg(long)]
         no_qr: bool,
@@ -128,7 +124,13 @@ enum Command {
     Join {
         /// The ticket (the fragment, or a link containing `#`).
         ticket: String,
-        /// The name the host sees (default: this computer's name).
+        /// The ticket was scanned from the host's screen. An in-person
+        /// ticket pairs only this way; without the flag a ticket counts as
+        /// sent (pasted or opened as a link).
+        #[arg(long)]
+        in_person: bool,
+        /// The name the host sees in person (default: this computer's
+        /// name). A send link sends the computer name only.
         #[arg(long)]
         name: Option<String>,
         /// Address to use instead of the ticket's, as tcp://host:port.
@@ -167,15 +169,22 @@ enum Command {
         /// The host's ticket.
         #[arg(long)]
         ticket: String,
-        /// The name the host sees.
+        /// The ticket was scanned from the host's screen. An in-person
+        /// ticket pairs only this way; without the flag a ticket counts as
+        /// sent (pasted or opened as a link).
+        #[arg(long)]
+        in_person: bool,
+        /// The name the host sees in person. A send link sends the
+        /// computer name only.
         #[arg(long)]
         name: Option<String>,
         /// Address to use instead of the ticket's.
         #[arg(long = "route")]
         routes: Vec<String>,
-        /// Seconds to wait for the removal.
-        #[arg(long, default_value_t = 300)]
-        removal_timeout: u64,
+        /// Seconds to wait for the removal (default:
+        /// MOUSSE_NET_REMOVAL_WAIT_SECS, 300).
+        #[arg(long)]
+        removal_timeout: Option<u64>,
         /// Where to write the result JSON.
         #[arg(long)]
         out: Option<PathBuf>,
@@ -196,10 +205,21 @@ enum Command {
     },
 }
 
+/// How a ticket reached this device: `--in-person` for a scan of the
+/// host's screen, anything else counts as sent.
+fn arrival(in_person: bool) -> mousse_net_core::pairing::Arrival {
+    if in_person {
+        mousse_net_core::pairing::Arrival::InAppScan
+    } else {
+        mousse_net_core::pairing::Arrival::Link
+    }
+}
+
 fn computer_name() -> String {
     let name = gethostname::gethostname().to_string_lossy().into_owned();
     let mut out: String = name.chars().filter(|c| !c.is_control()).collect();
-    while out.len() > 64 {
+    let max = usize::try_from(limits::helper().computer_name_max_bytes()).unwrap_or(usize::MAX);
+    while out.len() > max {
         out.pop();
     }
     if out.is_empty() {
@@ -247,11 +267,12 @@ fn storage(insecure: bool) -> KeyStorage {
 }
 
 /// Open the endpoint in `dir` (`shared` for caller commands). A process
-/// that just exited may hold its
-/// lock for a moment (Windows releases it asynchronously), so a held lock
-/// is retried for up to two seconds before giving up.
+/// that just exited may hold its lock for a moment (Windows releases it
+/// asynchronously), so a held lock is retried for up to
+/// `ENDPOINT_LOCK_WAIT_MS` before giving up.
 pub fn open_endpoint(dir: &Path, shared: bool) -> Result<Endpoint, String> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let limits = limits::helper();
+    let deadline = std::time::Instant::now() + limits::ms(limits.endpoint_lock_wait_ms());
     loop {
         let opened = if shared {
             Endpoint::open_shared(dir)
@@ -261,7 +282,7 @@ pub fn open_endpoint(dir: &Path, shared: bool) -> Result<Endpoint, String> {
         match opened {
             Ok(endpoint) => return Ok(endpoint),
             Err(mousse_net_io::NetError::Refused(_)) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(100));
+                std::thread::sleep(limits::ms(limits.endpoint_lock_retry_ms()));
             }
             Err(e) => return Err(e.to_string()),
         }
@@ -341,7 +362,7 @@ fn ask_yes_no(question: &str) -> bool {
     matches!(line.trim(), "y" | "Y" | "yes" | "Yes")
 }
 
-async fn invite(dir: &Path, link: bool, approve_next: bool, no_qr: bool) -> Result<(), String> {
+async fn invite(dir: &Path, link: bool, no_qr: bool) -> Result<(), String> {
     let mut ch = ipc::request(dir, json!({"cmd": "invite", "link": link}))
         .await?
         .ok_or("no host is running for this endpoint (start `serve` first)")?;
@@ -372,7 +393,13 @@ async fn invite(dir: &Path, link: bool, approve_next: bool, no_qr: bool) -> Resu
         })
         .unwrap_or_default();
     println!("routes: {}", routes.join(" "));
-    println!("waiting for the device to join (the ticket is valid for 10 minutes)");
+    let valid = peer::parse_ticket(&ticket)
+        .map(|t| t.expires_at.secs().saturating_sub(peer::now_secs()))
+        .unwrap_or(0);
+    println!(
+        "waiting for the device to join (the ticket is valid for {})",
+        validity(valid)
+    );
     let _ = std::io::stdout().flush();
     // One question on screen at a time, in the order asked. Events keep
     // arriving meanwhile: the invitation may pair or end while one is open.
@@ -381,12 +408,6 @@ async fn invite(dir: &Path, link: bool, approve_next: bool, no_qr: bool) -> Resu
     loop {
         if asking.is_none() {
             if let Some((request, question)) = queued.pop_front() {
-                if approve_next {
-                    println!("{question} [y/N] y (--approve-next)");
-                    ch.send(&json!({"answer": true, "request": request}))
-                        .await?;
-                    continue;
-                }
                 let ask = tokio::task::spawn_blocking(move || ask_yes_no(&question));
                 asking = Some((request, ask));
             }
@@ -458,6 +479,21 @@ async fn invite(dir: &Path, link: bool, approve_next: bool, no_qr: bool) -> Resu
     }
 }
 
+/// How long a ticket stays valid, for people: whole minutes from a minute
+/// up, else seconds.
+fn validity(secs: u64) -> String {
+    if secs < 60 {
+        return format!("{secs} s");
+    }
+    let minutes = (secs + 30) / 60;
+    let unit = if minutes == 1 { "minute" } else { "minutes" };
+    if secs.is_multiple_of(60) {
+        format!("{minutes} {unit}")
+    } else {
+        format!("about {minutes} {unit}")
+    }
+}
+
 async fn run(cli: Cli) -> Result<i32, String> {
     let dir = cli.state.unwrap_or_else(serve::default_state_dir);
     let insecure = cli.insecure_file_key;
@@ -495,7 +531,6 @@ async fn run(cli: Cli) -> Result<i32, String> {
         Command::Serve {
             listen_ip,
             port,
-            approve_next,
             no_mdns,
             name,
         } => {
@@ -503,25 +538,22 @@ async fn run(cli: Cli) -> Result<i32, String> {
                 name: name.unwrap_or_else(computer_name),
                 listen_ip,
                 port,
-                approve_next,
                 mdns: !no_mdns,
             };
             serve::run(&dir, insecure, opts).await?;
         }
-        Command::Invite {
-            link,
-            approve_next,
-            no_qr,
-        } => invite(&dir, link, approve_next, no_qr).await?,
+        Command::Invite { link, no_qr } => invite(&dir, link, no_qr).await?,
         Command::Join {
             ticket,
+            in_person,
             name,
             routes,
         } => {
             let ticket = peer::parse_ticket(&ticket)?;
             let side = peer::CallerSide::open(&dir, insecure)?;
+            let name = peer::join_name(&ticket, name, computer_name());
             let (_conn, record) =
-                peer::join(&side, &ticket, &name.unwrap_or_else(computer_name), &routes).await?;
+                peer::join(&side, &ticket, arrival(in_person), &name, &routes).await?;
             println!(
                 "paired with {} ({})",
                 printable(&record.name),
@@ -556,6 +588,7 @@ async fn run(cli: Cli) -> Result<i32, String> {
         }
         Command::SliceCheck {
             ticket,
+            in_person,
             name,
             routes,
             removal_timeout,
@@ -573,10 +606,13 @@ async fn run(cli: Cli) -> Result<i32, String> {
             };
             let opts = peer::SliceCheck {
                 ticket,
-                name: name.unwrap_or_else(computer_name),
+                arrival: arrival(in_person),
+                name,
                 routes,
                 command,
-                removal_timeout: Duration::from_secs(removal_timeout),
+                removal_timeout: Duration::from_secs(
+                    removal_timeout.unwrap_or(limits::helper().removal_wait_secs()),
+                ),
                 out,
                 control,
                 host_build,
@@ -590,6 +626,11 @@ async fn run(cli: Cli) -> Result<i32, String> {
 
 fn main() {
     let cli = Cli::parse();
+    // Limits come from MOUSSE_NET_* once, before anything runs.
+    if let Err(e) = limits::init_from_env() {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -614,7 +655,16 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::printable;
+    use super::{printable, validity};
+
+    #[test]
+    fn the_ticket_validity_reads_in_minutes() {
+        assert_eq!(validity(600), "10 minutes");
+        assert_eq!(validity(599), "about 10 minutes");
+        assert_eq!(validity(60), "1 minute");
+        assert_eq!(validity(100), "about 2 minutes");
+        assert_eq!(validity(20), "20 s");
+    }
 
     #[test]
     fn a_peer_name_prints_on_one_line_without_terminal_controls() {

@@ -7,7 +7,9 @@
 //!   access for the current user. A folder's entry is inherited by what is
 //!   created in it, so new files start owner-only as well.
 //!
-//! This is the only module with `unsafe` code: the Windows security calls.
+//! This is the only module with `unsafe` code: the Windows security calls
+//! and, on Unix, reading the effective user id (`geteuid`) that the control
+//! socket compares with its peer's.
 
 use std::fs;
 use std::io;
@@ -87,6 +89,14 @@ mod imp {
         Ok(fs::metadata(path)?.permissions().mode() & 0o077 == 0)
     }
 
+    /// The effective user id of this process.
+    #[allow(unsafe_code)]
+    pub fn current_uid() -> u32 {
+        // SAFETY: geteuid takes no arguments, touches no memory of ours and
+        // cannot fail.
+        unsafe { libc::geteuid() }
+    }
+
     pub fn replace_durably(from: &Path, to: &Path) -> io::Result<()> {
         fs::rename(from, to)?;
         if let Some(dir) = to.parent() {
@@ -98,6 +108,9 @@ mod imp {
 
 #[cfg(windows)]
 pub use imp::create_pipe_server;
+
+#[cfg(unix)]
+pub use imp::current_uid;
 
 #[cfg(windows)]
 #[allow(unsafe_code)]

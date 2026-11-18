@@ -8,8 +8,8 @@
 //!   core's [`ConnectionGate`](mousse_net_core::authz::ConnectionGate), so an
 //!   ungranted peer can never open a stream.
 //! - `HELLO` is the first thing each side sends and must be the first control
-//!   message received; core's `negotiate_version` decides the minor version
-//!   or closes with `UNSUPPORTED_VERSION`.
+//!   message received; core's `HelloState` decides the minor version
+//!   or closes with `UNSUPPORTED_VERSION`; a later `HELLO` is ignored.
 //! - The connection closes with `CERT_EXPIRED` after the effective deadline
 //!   of the two certificates. The deadline is checked before every inbound
 //!   frame, every stream open or send, and every write, not only when the
@@ -17,6 +17,10 @@
 //!   queued stream data is dropped. A write still waiting on the pipe when
 //!   the deadline passes is abandoned with the pipe, so its bytes never
 //!   leave after the deadline.
+//! - The deadline is also kept on the monotonic clock from the start of the
+//!   connection (wire.md 6), so setting the wall clock back never extends
+//!   it. Both are checked again at least once a second, so a device that
+//!   slept past either closes as soon as it resumes.
 //! - A step that ends the connection (for example a joiner's last failed
 //!   code attempt) sends the messages it produced, then one `GOAWAY`
 //!   (wire.md 10.6, rule 9).
@@ -34,14 +38,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mousse_net_core::authz::{Traffic, Verdict};
-use mousse_net_core::control::{negotiate_version, ControlMessage, VersionSupport};
+use mousse_net_core::control::{ControlMessage, HelloOutcome, HelloState, VersionSupport};
 use mousse_net_core::identity::IdentityPublicKey;
 use mousse_net_core::mux::{
     decode_frame, frame_type, Frame, Mux, MuxEvent, MuxRole, PriorityClass, StreamError, StreamId,
     MAX_CONTROL_PAYLOAD,
 };
 use mousse_net_core::pairing::{PairedHost, PairingCode};
-use mousse_net_core::{ConnectionId, ErrorCode, UnixTime};
+use mousse_net_core::{ConnectionId, ErrorCode, Millis, UnixTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, WriteHalf};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
@@ -49,17 +53,67 @@ use tokio_rustls::TlsStream;
 
 use crate::clock::Clock;
 use crate::error::NetError;
+use crate::limits::{ms, Limits};
 use crate::pipe::Pipe;
 
-/// Queued bytes per stream above which [`StreamWriter::write`] waits.
-pub const WRITE_HIGH_WATER: usize = 256 * 1024;
+/// The driver's limits, from [`Limits`], as the types it uses.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DriverLimits {
+    /// Queued bytes per stream above which [`StreamWriter::write`] waits.
+    write_high_water: usize,
+    /// How long a closing connection may take to send its last frame and
+    /// shut the pipe down before it is dropped.
+    close_linger: Duration,
+    /// How often a write still pending checks the deadline.
+    deadline_poll: Duration,
+    /// The longest the driver sleeps without reading both clocks again.
+    /// Timers do not run while a device sleeps, so this is what notices, on
+    /// resume, a deadline that passed meanwhile.
+    recheck: Duration,
+    /// Bytes read from the pipe at a time.
+    read_buffer: usize,
+}
 
-/// How long a closing connection may take to send its last frame and shut
-/// the pipe down before it is dropped.
-const CLOSE_LINGER: Duration = Duration::from_secs(2);
+impl DriverLimits {
+    fn new(limits: &Limits) -> Self {
+        let io = limits.io();
+        Self {
+            write_high_water: usize::try_from(io.write_high_water_bytes()).unwrap_or(usize::MAX),
+            close_linger: ms(io.close_linger_ms()),
+            deadline_poll: ms(io.deadline_poll_ms()),
+            recheck: ms(io.clock_recheck_ms()),
+            read_buffer: usize::try_from(io.read_buffer_bytes()).unwrap_or(usize::MAX),
+        }
+    }
+}
 
-/// How often a write still pending checks the deadline.
-const DEADLINE_POLL: Duration = Duration::from_millis(50);
+/// The end of a connection: the effective deadline on the wall clock, and
+/// the same span on the monotonic clock from when the connection started
+/// (`mono_deadline`, wire.md 6). It ends at whichever comes first.
+#[derive(Clone, Copy, Debug)]
+struct Deadline {
+    wall: UnixTime,
+    mono: Millis,
+}
+
+impl Deadline {
+    fn new(wall: UnixTime, clock: &dyn Clock) -> Self {
+        let left = wall
+            .secs()
+            .saturating_add(1)
+            .saturating_sub(clock.now().secs());
+        Self {
+            wall,
+            mono: clock.mono().plus(left.saturating_mul(1000)),
+        }
+    }
+
+    /// Past the wall deadline (the connection may run through that second
+    /// and no further), or at the monotonic one.
+    fn passed(&self, clock: &dyn Clock) -> bool {
+        clock.now() > self.wall || clock.mono() >= self.mono
+    }
+}
 
 /// Why a connection ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -157,6 +211,12 @@ pub(crate) trait Role: Send + 'static {
     fn on_code(&mut self, _code: PairingCode, out: &mut Outbox) {
         out.close = Some(ErrorCode::ProtocolError);
     }
+    /// When the role next needs [`Role::on_wake`], on the monotonic clock.
+    fn wake_at(&self) -> Option<Millis> {
+        None
+    }
+    /// A timer ran (at least at [`Role::wake_at`], maybe earlier).
+    fn on_wake(&mut self, _mono: Millis, _out: &mut Outbox) {}
 }
 
 pub(crate) enum Cmd {
@@ -254,8 +314,9 @@ pub struct StreamWriter {
 }
 
 impl StreamWriter {
-    /// Queue bytes. Waits while more than [`WRITE_HIGH_WATER`] bytes are
-    /// queued on this stream.
+    /// Queue bytes. Waits while more than
+    /// [`IoLimits::write_high_water_bytes`](crate::limits::IoLimits::write_high_water_bytes)
+    /// are queued on this stream.
     pub async fn write(&self, bytes: &[u8]) -> Result<(), NetError> {
         if bytes.is_empty() {
             return Ok(());
@@ -483,6 +544,7 @@ pub(crate) struct Start<P: Pipe> {
     pub kx_group: String,
     pub deadline: UnixTime,
     pub clock: Arc<dyn Clock>,
+    pub limits: Limits,
 }
 
 /// A command sender for a driver that is about to start. The host registers
@@ -511,9 +573,10 @@ pub(crate) fn spawn<P: Pipe>(
         incoming: tokio::sync::Mutex::new(accept_rx),
     };
     let driver = Driver {
-        mux: Mux::new(start.side, start.clock.mono()),
+        mux: Mux::with_limits(start.side, start.clock.mono(), start.limits.core()),
+        limits: DriverLimits::new(&start.limits),
+        deadline: Deadline::new(start.deadline, &*start.clock),
         clock: start.clock,
-        deadline: start.deadline,
         role,
         cmd_tx,
         status: status_tx,
@@ -521,7 +584,7 @@ pub(crate) fn spawn<P: Pipe>(
         accept: accept_tx,
         streams: HashMap::new(),
         blocked: Vec::new(),
-        peer_hello: None,
+        hello: HelloState::new(VersionSupport::LOCAL),
         reason: None,
         before_close: VecDeque::new(),
     };
@@ -531,8 +594,9 @@ pub(crate) fn spawn<P: Pipe>(
 
 struct Driver {
     mux: Mux,
+    limits: DriverLimits,
     clock: Arc<dyn Clock>,
-    deadline: UnixTime,
+    deadline: Deadline,
     role: Box<dyn Role>,
     cmd_tx: mpsc::UnboundedSender<Cmd>,
     status: watch::Sender<ConnStatus>,
@@ -540,7 +604,8 @@ struct Driver {
     accept: mpsc::UnboundedSender<MuxStream>,
     streams: HashMap<u32, mpsc::UnboundedSender<StreamEvent>>,
     blocked: Vec<(StreamId, oneshot::Sender<Result<(), NetError>>)>,
-    peer_hello: Option<u64>,
+    /// The peer's `HELLO`s so far.
+    hello: HelloState,
     reason: Option<CloseReason>,
     /// Encoded frames a closing step produced, sent before the GOAWAY.
     before_close: VecDeque<Vec<u8>>,
@@ -576,7 +641,13 @@ impl Driver {
         // TLS (where a credit could go stale after a FIN, or data outlive
         // the deadline).
         let (ask_tx, mut ask_rx) = mpsc::channel::<oneshot::Sender<Vec<u8>>>(1);
-        let mut writer = tokio::spawn(writer_task(wr, ask_tx, self.clock.clone(), self.deadline));
+        let mut writer = tokio::spawn(writer_task(
+            wr,
+            ask_tx,
+            self.clock.clone(),
+            self.deadline,
+            self.limits,
+        ));
         let mut slot: Option<oneshot::Sender<Vec<u8>>> = None;
 
         let hello = ControlMessage::Hello {
@@ -588,7 +659,7 @@ impl Driver {
         self.role.on_start(&mut out);
         self.apply(out);
 
-        let mut buf = vec![0u8; 32 * 1024];
+        let mut buf = vec![0u8; self.limits.read_buffer];
         let mut inbuf: Vec<u8> = Vec::new();
         // Once closing, the writer has this long to take the GOAWAY.
         let mut give_up: Option<Instant> = None;
@@ -601,7 +672,7 @@ impl Driver {
                 self.mark_closing();
             }
             if self.mux.is_closing() && give_up.is_none() {
-                give_up = Some(Instant::now() + CLOSE_LINGER);
+                give_up = Some(Instant::now() + self.limits.close_linger);
             }
             if slot.is_some() {
                 if let Some(frame) = self.next_frame() {
@@ -672,7 +743,7 @@ impl Driver {
         // stopped, so the pipe does not stay open.
         drop(slot);
         drop(ask_rx);
-        if tokio::time::timeout(CLOSE_LINGER, &mut writer)
+        if tokio::time::timeout(self.limits.close_linger, &mut writer)
             .await
             .is_err()
         {
@@ -691,32 +762,47 @@ impl Driver {
     fn next_wake(&self) -> Instant {
         let now = Instant::now();
         let mono = self.clock.mono();
-        let mut wake = now + Duration::from_secs(3600);
+        // Never later than the recheck.
+        let mut wake = now + self.limits.recheck;
         if let Some(t) = self.mux.poll_timeout() {
+            wake = wake.min(now + Duration::from_millis(t.since(mono)));
+        }
+        if let Some(t) = self.role.wake_at() {
             wake = wake.min(now + Duration::from_millis(t.since(mono)));
         }
         let wall = self.clock.now();
         let until_deadline = self
             .deadline
+            .wall
             .secs()
             .saturating_add(1)
             .saturating_sub(wall.secs());
         wake.min(now + Duration::from_secs(until_deadline))
+            .min(now + Duration::from_millis(self.deadline.mono.since(mono)))
     }
 
     fn on_timer(&mut self) {
-        if let Err(e) = self.mux.on_timeout(self.clock.mono()) {
-            self.reason.get_or_insert(CloseReason::Local(e.code));
-        }
+        let mono = self.clock.mono();
+        // The deadline first: after a long sleep the idle timer is due too,
+        // and the connection ended because its certificates did.
         if self.expired() {
             self.close(ErrorCode::CertExpired);
+            return;
+        }
+        if let Err(e) = self.mux.on_timeout(mono) {
+            self.reason.get_or_insert(CloseReason::Local(e.code));
+        }
+        if !self.mux.is_closing() {
+            let mut out = Outbox::default();
+            self.role.on_wake(mono, &mut out);
+            self.apply(out);
         }
     }
 
     /// Past the effective deadline: the connection may run through that
     /// second and no further.
     fn expired(&self) -> bool {
-        self.clock.now() > self.deadline
+        self.deadline.passed(&*self.clock)
     }
 
     fn mark_closing(&self) {
@@ -852,7 +938,9 @@ impl Driver {
                 continue;
             }
             match self.mux.queued(stream) {
-                Some(queued) if queued > WRITE_HIGH_WATER => still.push((stream, reply)),
+                Some(queued) if queued > self.limits.write_high_water => {
+                    still.push((stream, reply))
+                }
                 // Below the mark, or the stream already completed.
                 _ => {
                     let _ = reply.send(Ok(()));
@@ -927,25 +1015,28 @@ impl Driver {
         }
     }
 
-    /// The `HELLO` rule, then the role's gate.
+    /// The `HELLO` rule (core's [`HelloState`]: the peer's first `HELLO`
+    /// fixes the version or closes, later ones are ignored), then the
+    /// role's gate.
     fn gate(&mut self, traffic: Traffic, message: Option<&ControlMessage>) -> Verdict {
-        match (self.peer_hello, traffic) {
-            (None, Traffic::Hello) => {
-                if let Some(ControlMessage::Hello {
+        match traffic {
+            Traffic::Hello => {
+                let Some(ControlMessage::Hello {
                     major_version,
                     minor_version,
                 }) = message
-                {
-                    match negotiate_version(VersionSupport::LOCAL, *major_version, *minor_version) {
-                        Ok(agreed) => self.peer_hello = Some(agreed),
-                        Err(code) => return Verdict::Close(code),
-                    }
+                else {
+                    return Verdict::Close(ErrorCode::ProtocolError);
+                };
+                match self.hello.on_hello(*major_version, *minor_version) {
+                    HelloOutcome::Agreed(_) => {}
+                    HelloOutcome::Ignored => return Verdict::Ignore,
+                    HelloOutcome::Close(code) => return Verdict::Close(code),
                 }
             }
-            (Some(_), Traffic::Hello) => return Verdict::Close(ErrorCode::ProtocolError),
-            (None, Traffic::Keepalive | Traffic::GoAway) => {}
-            (None, _) => return Verdict::Close(ErrorCode::ProtocolError),
-            (Some(_), _) => {}
+            Traffic::Keepalive | Traffic::GoAway => {}
+            _ if self.hello.agreed().is_none() => return Verdict::Close(ErrorCode::ProtocolError),
+            _ => {}
         }
         self.role.check(traffic, message)
     }
@@ -1026,7 +1117,8 @@ async fn writer_task<P: Pipe>(
     mut wr: WriteHalf<TlsStream<P>>,
     ask: mpsc::Sender<oneshot::Sender<Vec<u8>>>,
     clock: Arc<dyn Clock>,
-    deadline: UnixTime,
+    deadline: Deadline,
+    limits: DriverLimits,
 ) {
     loop {
         let (tx, rx) = oneshot::channel();
@@ -1037,7 +1129,7 @@ async fn writer_task<P: Pipe>(
             break;
         };
         let goaway = is_goaway(&frame);
-        if !goaway && clock.now() > deadline {
+        if !goaway && deadline.passed(&*clock) {
             continue;
         }
         let send = async {
@@ -1045,13 +1137,16 @@ async fn writer_task<P: Pipe>(
             wr.flush().await
         };
         let sent = if goaway {
-            matches!(tokio::time::timeout(CLOSE_LINGER, send).await, Ok(Ok(())))
+            matches!(
+                tokio::time::timeout(limits.close_linger, send).await,
+                Ok(Ok(()))
+            )
         } else {
             // The deadline is checked first on every poll, so the pipe can
             // take more of the frame only while the deadline has not passed.
             tokio::select! {
                 biased;
-                () = past(&*clock, deadline) => return,
+                () = past(&*clock, deadline, limits.deadline_poll) => return,
                 result = send => result.is_ok(),
             }
         };
@@ -1062,7 +1157,7 @@ async fn writer_task<P: Pipe>(
             break;
         }
     }
-    let _ = tokio::time::timeout(CLOSE_LINGER, wr.shutdown()).await;
+    let _ = tokio::time::timeout(limits.close_linger, wr.shutdown()).await;
 }
 
 async fn sleep_until_some(at: Option<Instant>) {
@@ -1074,12 +1169,16 @@ async fn sleep_until_some(at: Option<Instant>) {
 
 /// Ready once `clock` is past `deadline`. The clock is read on every poll
 /// (also when whatever it races against wakes the task) and at least every
-/// [`DEADLINE_POLL`].
-fn past(clock: &dyn Clock, deadline: UnixTime) -> impl std::future::Future<Output = ()> + '_ {
-    let mut tick = tokio::time::interval(DEADLINE_POLL);
+/// `poll`.
+fn past(
+    clock: &dyn Clock,
+    deadline: Deadline,
+    poll: Duration,
+) -> impl std::future::Future<Output = ()> + '_ {
+    let mut tick = tokio::time::interval(poll);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     std::future::poll_fn(move |cx| {
-        if clock.now() > deadline {
+        if deadline.passed(clock) {
             return std::task::Poll::Ready(());
         }
         while tick.poll_tick(cx).is_ready() {}
@@ -1287,6 +1386,7 @@ mod tests {
                 kx_group: handshake.kx_group,
                 deadline: UnixTime(clock.now().0 + deadline_in),
                 clock: clock.clone(),
+                limits: Limits::DEFAULT,
             },
             Box::new(OpenRole),
             cmd_tx,
@@ -1322,6 +1422,72 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// A clock that jumps past either deadline while nothing is due, as
+    /// after a sleep: the connection closes with `CERT_EXPIRED` at the next
+    /// recheck, with no traffic and no timer set for that moment.
+    #[tokio::test]
+    async fn a_jump_past_either_deadline_closes_at_the_next_recheck() {
+        for wall in [true, false] {
+            let (conn, mut peer, _valve, clock) = connected(3_600).await;
+            if wall {
+                clock.advance(3_602);
+            } else {
+                // Setting the wall clock back does not help either.
+                clock.advance(-7_200);
+                clock.advance_mono(3_601_000);
+            }
+            assert!(
+                within(
+                    "GOAWAY",
+                    peer.read_until(|f| matches!(f, Frame::GoAway { .. }))
+                )
+                .await,
+                "wall: {wall}"
+            );
+            assert_eq!(
+                within("closed", conn.closed()).await,
+                CloseReason::Local(ErrorCode::CertExpired),
+                "wall: {wall}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_later_hello_is_ignored_whatever_it_holds() {
+        let (conn, mut peer, _valve, _clock) = connected(3_600).await;
+        // The peer's first HELLO was accepted; these must change nothing,
+        // not even one naming another major version.
+        for (major_version, minor_version) in [
+            (VersionSupport::LOCAL.major, VersionSupport::LOCAL.minor),
+            (VersionSupport::LOCAL.major + 1, 0),
+        ] {
+            let hello = ControlMessage::Hello {
+                major_version,
+                minor_version,
+            };
+            peer.mux.send_control(hello.encode()).unwrap();
+        }
+        peer.flush().await;
+        // The connection still carries streams afterwards.
+        let stream = within(
+            "open",
+            conn.open_stream(PriorityClass::Interactive, "terminal"),
+        )
+        .await
+        .unwrap();
+        stream.writer.write(b"after").await.unwrap();
+        assert!(within("data", peer.read_until(|f| matches!(f, Frame::Data { .. }))).await);
+        assert!(
+            !peer
+                .frames
+                .iter()
+                .any(|f| matches!(f, Frame::GoAway { .. })),
+            "{:?}",
+            peer.frames
+        );
+        assert!(!matches!(conn.status(), ConnStatus::Closed(_)));
     }
 
     #[tokio::test]

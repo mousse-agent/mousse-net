@@ -15,8 +15,9 @@ use mousse_net_core::pairing::{
     binding_transcript, CodeExchangeFactory, CreatedInvitation, ExchangeRole, HostAction,
     HostPairing, InvitationId, InvitationKind, InvitationParams, PairingCode, SID_LEN,
 };
-use mousse_net_core::session::{PeerSession, SessionEvent, RENEW_LEAD_SECS};
+use mousse_net_core::session::{PeerSession, SessionEvent};
 use mousse_net_core::session_cert::SessionCertificate;
+use mousse_net_core::Limits;
 use mousse_net_core::{ConnectionId, ErrorCode};
 
 use crate::certs;
@@ -90,7 +91,7 @@ impl HostDev {
         let pairing = HostPairing::new(
             identity,
             label.to_owned(),
-            CountingFactory::new(id, 1, 0, sim.work.clone()),
+            CountingFactory::new(id, 1, sim.work.clone()),
         );
         Self {
             id,
@@ -99,7 +100,7 @@ impl HostDev {
             identity,
             cert,
             cert_lifetime: lifetime,
-            renew_lead: RENEW_LEAD_SECS,
+            renew_lead: Limits::DEFAULT.renew_lead_secs(),
             grants: GrantTable::new(),
             pairing,
             instance: 1,
@@ -132,6 +133,7 @@ impl HostDev {
                 role: Role::owner(),
                 authorizing_owner: OwnerRef::from_bytes(PROFILE_ID),
                 expires_at: expires_in.map(|s| wall.plus(s)),
+                enrolled_by: None,
             },
             wall,
         );
@@ -235,7 +237,8 @@ impl HostDev {
         let mut session = PeerSession::new(peer);
         session.begin_path(conn);
         let mut close = None;
-        match session.on_authenticated(conn, &ep.auth.peer, ep.auth.local_window, wall) {
+        match session.on_authenticated(conn, &ep.auth.peer, ep.auth.local_window, wall, sim.mono())
+        {
             Ok(_) => {
                 let _ = session.on_reopened(conn);
             }
@@ -628,7 +631,7 @@ impl HostDev {
             &hc.ep.auth.peer.identity,
             &hc.ep.auth.exporters.pair,
         );
-        let factory = CountingFactory::new(self.id, self.instance, 0, sim.work.clone());
+        let factory = CountingFactory::new(self.id, self.instance, sim.work.clone());
         let sid = [0; SID_LEN];
         let _ = factory.start(ExchangeRole::Responder, code, &binding, &sid, &mut sim.rng);
         sim.say(self.id, format_args!("precomputes its exchange share"));
@@ -784,7 +787,7 @@ impl HostDev {
             }
             let mut close = None;
             if !skip_deadline {
-                for ev in hc.session.tick(wall) {
+                for ev in hc.session.tick(wall, mono) {
                     if let SessionEvent::Close { code, .. } = ev {
                         close = Some(code);
                     }
@@ -826,6 +829,9 @@ impl HostDev {
             if !skip_deadline {
                 if let Some(w) = hc.session.next_deadline() {
                     take(sim.due_ms(self.id, w));
+                }
+                if let Some(m) = hc.session.next_mono_deadline() {
+                    take(m.ms().max(sim.now + 1));
                 }
             }
             if let Some(m) = hc.gate.poll_timeout() {
@@ -956,7 +962,7 @@ impl HostDev {
         self.pairing = HostPairing::new(
             self.identity,
             self.label.to_owned(),
-            CountingFactory::new(self.id, self.instance, 0, sim.work.clone()),
+            CountingFactory::new(self.id, self.instance, sim.work.clone()),
         );
         self.invitations.clear();
         self.last_attempts_left.clear();

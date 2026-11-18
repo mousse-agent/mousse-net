@@ -1,15 +1,23 @@
-//! Local state files: the host's grant table and the caller's paired hosts.
+//! Local state files: the host's grant table, the caller's paired hosts and
+//! the joiner's flow records.
 //!
 //! Every write goes to a temporary file in the same directory, is flushed to
 //! disk, then renamed over the old file, so a crash leaves either the old or
 //! the new contents. On Unix the files are readable by the owner only.
+//!
+//! Files that several processes on one endpoint update (`peers.json`, the
+//! joiner's flow records) are read, changed and written under an OS file
+//! lock, which the OS releases when the process holding it dies.
 
-use std::fs::{self, OpenOptions};
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use mousse_net_core::grants::{Denial, Grant, GrantId, GrantSource, GrantTable, OwnerRef, Role};
 use mousse_net_core::identity::IdentityPublicKey;
+use mousse_net_core::pairing::{InvitationId, JoinerRecord};
 use mousse_net_core::UnixTime;
 use serde::{Deserialize, Serialize};
 
@@ -103,6 +111,23 @@ fn store_err(path: &Path, e: std::io::Error) -> NetError {
     NetError::Store(format!("{}: {e}", path.display()))
 }
 
+/// Open (creating it if needed) the lock file at `path`.
+fn open_lock(path: &Path) -> Result<File, NetError> {
+    File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .map_err(|e| store_err(path, e))
+}
+
+/// Hold the lock file at `path`, waiting for any other holder.
+fn hold_lock(path: &Path) -> Result<File, NetError> {
+    let file = open_lock(path)?;
+    file.lock().map_err(|e| store_err(path, e))?;
+    Ok(file)
+}
+
 fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, NetError> {
     match fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
@@ -121,6 +146,11 @@ struct GrantRecord {
     authorizing_owner: String,
     granted_at: u64,
     expires_at: Option<u64>,
+    /// The enrollment receipt: the hex id of the invitation whose pairing
+    /// made this grant (wire.md 7). Absent for a grant made another way,
+    /// and in files written before receipts were kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    enrolled_by: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -189,6 +219,15 @@ impl GrantStore {
                 adopted_into: None,
                 granted_at: UnixTime(g.granted_at),
                 expires_at: g.expires_at.map(UnixTime),
+                enrolled_by: match g.enrolled_by {
+                    Some(text) => Some(InvitationId(
+                        unhex(&text)
+                            .ok()
+                            .and_then(|b| b.try_into().ok())
+                            .ok_or_else(|| bad("enrollment receipt"))?,
+                    )),
+                    None => None,
+                },
             });
         }
         let mut denials = Vec::with_capacity(file.denials.len());
@@ -218,6 +257,7 @@ impl GrantStore {
                     authorizing_owner: hex(g.authorizing_owner.as_bytes()),
                     granted_at: g.granted_at.secs(),
                     expires_at: g.expires_at.map(|t| t.secs()),
+                    enrolled_by: g.enrolled_by.map(|i| hex(&i.0)),
                 })
                 .collect(),
             denials: table
@@ -275,10 +315,14 @@ struct PeerFile {
     peers: Vec<PeerRecord>,
 }
 
-/// The caller's paired hosts on disk.
+/// The caller's paired hosts on disk. Every change reads, changes and
+/// writes the file under an exclusive lock on `peers.lock` in the same
+/// folder, so processes on one endpoint (a join storing a pin, a dial
+/// noting the route that worked) never undo each other's writes.
 #[derive(Clone, Debug)]
 pub struct PeerStore {
     path: PathBuf,
+    lock_path: PathBuf,
 }
 
 impl PeerStore {
@@ -286,6 +330,7 @@ impl PeerStore {
     pub fn in_dir(dir: &Path) -> Self {
         Self {
             path: dir.join("peers.json"),
+            lock_path: dir.join("peers.lock"),
         }
     }
 
@@ -304,18 +349,202 @@ impl PeerStore {
 
     /// Insert or replace (by identity) one host.
     pub fn upsert(&self, record: PeerRecord) -> Result<(), NetError> {
-        let mut peers = self.load()?;
-        peers.retain(|p| p.identity != record.identity);
-        peers.push(record);
-        self.save(peers)
+        self.update(|peers| {
+            peers.retain(|p| p.identity != record.identity);
+            peers.push(record);
+        })
     }
 
-    /// Replace the whole list.
-    pub fn save(&self, peers: Vec<PeerRecord>) -> Result<(), NetError> {
+    /// Change the list with `change` and write it, all under the lock: no
+    /// other writer runs between the read and the write.
+    pub fn update(&self, change: impl FnOnce(&mut Vec<PeerRecord>)) -> Result<(), NetError> {
+        if let Some(dir) = self.lock_path.parent() {
+            fs::create_dir_all(dir).map_err(|e| store_err(dir, e))?;
+        }
+        let _lock = hold_lock(&self.lock_path)?;
+        let mut peers = self.load()?;
+        change(&mut peers);
+        self.write(peers)
+        // The lock goes with `_lock`.
+    }
+
+    fn write(&self, peers: Vec<PeerRecord>) -> Result<(), NetError> {
         let file = PeerFile { version: 1, peers };
         let bytes =
             serde_json::to_vec_pretty(&file).map_err(|e| store_err(&self.path, e.into()))?;
         write_atomic(&self.path, &bytes)
+    }
+}
+
+/// Where a joiner keeps its flow records (wire.md 10.7): per ticket hash,
+/// the code attempts left and whether an outcome is pending. Reopening a
+/// link or restarting the app loads them, so neither resets the count.
+pub trait FlowRecords: Send + Sync {
+    /// The record kept for `ticket_hash`, if any. One that cannot be read
+    /// is an error, never "none", which would reset the count.
+    fn load(&self, ticket_hash: &[u8; 32]) -> Result<Option<JoinerRecord>, NetError>;
+    /// Keep `record` in place of the one for its ticket hash, durably and
+    /// atomically, but only if the stored record is still `expected`
+    /// (`None`: no record yet). If it is not, write nothing and return an
+    /// error: another flow on the same ticket wrote first, and two flows
+    /// must never spend the same attempt.
+    fn swap(&self, expected: Option<&JoinerRecord>, record: &JoinerRecord) -> Result<(), NetError>;
+    /// Make this flow the only one on `ticket_hash` until the returned hold
+    /// is dropped, or refuse at once if another flow (in this process or
+    /// another) has it. A join holds it from loading the record until the
+    /// outcome is settled and the pin stored; a store kept on disk must use
+    /// a lock the OS releases when the holding process dies. Without it, a
+    /// second flow could read the first one's pending mark and clear it
+    /// before the first sent its confirmation.
+    fn hold(&self, ticket_hash: &[u8; 32]) -> Result<FlowHold, NetError>;
+}
+
+/// A flow's hold on its ticket ([`FlowRecords::hold`]); released on drop.
+pub struct FlowHold {
+    _guard: Box<dyn Send + Sync>,
+}
+
+impl FlowHold {
+    /// A hold that lasts as long as `guard` does.
+    pub fn new(guard: impl Send + Sync + 'static) -> Self {
+        Self {
+            _guard: Box::new(guard),
+        }
+    }
+}
+
+impl std::fmt::Debug for FlowHold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FlowHold")
+    }
+}
+
+fn flow_in_progress() -> NetError {
+    NetError::Refused("another pairing with this link is in progress on this device".into())
+}
+
+fn changed_under_us() -> NetError {
+    NetError::Store("another pairing with the same link changed its record first".into())
+}
+
+/// Flow records kept in memory, for as long as the process runs.
+#[derive(Debug, Default)]
+pub struct MemoryFlowRecords {
+    records: Mutex<HashMap<[u8; 32], JoinerRecord>>,
+    held: Arc<Mutex<HashSet<[u8; 32]>>>,
+}
+
+/// Releases a [`MemoryFlowRecords`] hold.
+struct MemoryHold {
+    held: Arc<Mutex<HashSet<[u8; 32]>>>,
+    ticket_hash: [u8; 32],
+}
+
+impl Drop for MemoryHold {
+    fn drop(&mut self) {
+        self.held
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.ticket_hash);
+    }
+}
+
+impl FlowRecords for MemoryFlowRecords {
+    fn load(&self, ticket_hash: &[u8; 32]) -> Result<Option<JoinerRecord>, NetError> {
+        let map = self.records.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(map.get(ticket_hash).copied())
+    }
+
+    fn swap(&self, expected: Option<&JoinerRecord>, record: &JoinerRecord) -> Result<(), NetError> {
+        let mut map = self.records.lock().unwrap_or_else(|e| e.into_inner());
+        if map.get(&record.ticket_hash) != expected {
+            return Err(changed_under_us());
+        }
+        map.insert(record.ticket_hash, *record);
+        Ok(())
+    }
+
+    fn hold(&self, ticket_hash: &[u8; 32]) -> Result<FlowHold, NetError> {
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        if !held.insert(*ticket_hash) {
+            return Err(flow_in_progress());
+        }
+        Ok(FlowHold::new(MemoryHold {
+            held: self.held.clone(),
+            ticket_hash: *ticket_hash,
+        }))
+    }
+}
+
+/// Flow records on disk: one canonical CBOR file per ticket hash in a
+/// `joins` folder that only the owner can read, each written atomically.
+/// A swap holds an exclusive lock on `joins/flows.lock` while it reads,
+/// compares and writes, so flows in this process and in other processes on
+/// the same endpoint state take turns. A flow's hold is an exclusive lock
+/// on `joins/<ticket hash>.lock`, which the OS releases if the process
+/// dies.
+#[derive(Clone, Debug)]
+pub struct FlowRecordStore {
+    dir: PathBuf,
+}
+
+impl FlowRecordStore {
+    /// The `joins` folder in `dir`.
+    pub fn in_dir(dir: &Path) -> Self {
+        Self {
+            dir: dir.join("joins"),
+        }
+    }
+
+    /// The file for `ticket_hash`.
+    pub fn path(&self, ticket_hash: &[u8; 32]) -> PathBuf {
+        self.dir.join(format!("{}.cbor", hex(ticket_hash)))
+    }
+
+    fn make_dir(&self) -> Result<(), NetError> {
+        if !self.dir.exists() {
+            crate::private::make_private_dir(&self.dir).map_err(|e| store_err(&self.dir, e))?;
+        }
+        Ok(())
+    }
+}
+
+impl FlowRecords for FlowRecordStore {
+    fn load(&self, ticket_hash: &[u8; 32]) -> Result<Option<JoinerRecord>, NetError> {
+        let path = self.path(ticket_hash);
+        let Some(bytes) = read_optional(&path)? else {
+            return Ok(None);
+        };
+        let record = JoinerRecord::from_bytes(&bytes)
+            .map_err(|e| NetError::Store(format!("{}: {e}", path.display())))?;
+        if record.ticket_hash != *ticket_hash {
+            return Err(NetError::Store(format!(
+                "{}: the record is for another ticket",
+                path.display()
+            )));
+        }
+        Ok(Some(record))
+    }
+
+    fn swap(&self, expected: Option<&JoinerRecord>, record: &JoinerRecord) -> Result<(), NetError> {
+        self.make_dir()?;
+        let _lock = hold_lock(&self.dir.join("flows.lock"))?;
+        if self.load(&record.ticket_hash)?.as_ref() != expected {
+            return Err(changed_under_us());
+        }
+        write_atomic(&self.path(&record.ticket_hash), &record.to_bytes())
+        // The lock goes with `_lock`.
+    }
+
+    fn hold(&self, ticket_hash: &[u8; 32]) -> Result<FlowHold, NetError> {
+        self.make_dir()?;
+        let path = self.dir.join(format!("{}.lock", hex(ticket_hash)));
+        let file = open_lock(&path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(FlowHold::new(file)),
+            Err(TryLockError::WouldBlock) => Err(flow_in_progress()),
+            Err(TryLockError::Error(e)) => Err(store_err(&path, e)),
+        }
     }
 }
 
@@ -331,6 +560,39 @@ mod tests {
             std::env::temp_dir().join(format!("mousse-net-io-{tag}-{}", hex(&random_bytes::<6>())));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn a_flow_record_is_kept_owner_only_and_never_read_for_another_ticket() {
+        let dir = temp_dir("joins");
+        let store = FlowRecordStore::in_dir(&dir);
+        let record = JoinerRecord {
+            ticket_hash: [3; 32],
+            attempts_left: 1,
+            outcome_pending: true,
+        };
+        assert_eq!(store.load(&[3; 32]).unwrap(), None);
+        store.swap(None, &record).unwrap();
+        assert_eq!(store.load(&[3; 32]).unwrap(), Some(record));
+        // A swap from a record that is no longer stored writes nothing.
+        let spent = JoinerRecord {
+            attempts_left: 0,
+            ..record
+        };
+        assert!(store.swap(None, &spent).is_err());
+        assert_eq!(store.load(&[3; 32]).unwrap(), Some(record));
+        store.swap(Some(&record), &spent).unwrap();
+        assert_eq!(store.load(&[3; 32]).unwrap(), Some(spent));
+        assert!(crate::private::is_owner_only(&store.path(&[3; 32])).unwrap());
+        assert!(crate::private::is_owner_only(&dir.join("joins")).unwrap());
+
+        // A record filed under another ticket's name is refused, and so is
+        // one that does not parse: neither reads as "no record".
+        fs::copy(store.path(&[3; 32]), store.path(&[4; 32])).unwrap();
+        assert!(store.load(&[4; 32]).is_err());
+        fs::write(store.path(&[5; 32]), b"junk").unwrap();
+        assert!(store.load(&[5; 32]).is_err());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -357,6 +619,7 @@ mod tests {
                     role: Role::owner(),
                     authorizing_owner: OwnerRef::from_bytes([7; 16]),
                     expires_at: Some(UnixTime(9_999)),
+                    enrolled_by: Some(InvitationId([9; 16])),
                 },
                 UnixTime(100),
             )
@@ -369,6 +632,7 @@ mod tests {
         assert_eq!(g.name, "laptop");
         assert_eq!(g.expires_at, Some(UnixTime(9_999)));
         assert_eq!(g.authorizing_owner, OwnerRef::from_bytes([7; 16]));
+        assert_eq!(g.enrolled_by, Some(InvitationId([9; 16])));
         assert!(loaded.is_denied(&b));
         // No temporary files are left behind.
         let leftovers: Vec<_> = fs::read_dir(&dir)
@@ -390,6 +654,7 @@ mod tests {
             role: Role::owner(),
             authorizing_owner: OwnerRef::from_bytes([1; 16]),
             expires_at: None,
+            enrolled_by: None,
         };
         let mut table = GrantTable::new();
         let a = SoftwareKey::generate(&mut os_rng()).public_key();
@@ -414,6 +679,67 @@ mod tests {
         )
         .unwrap();
         assert!(store.load().is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_flow_hold_is_exclusive_until_dropped() {
+        let dir = temp_dir("holds");
+        let disk = FlowRecordStore::in_dir(&dir);
+        let memory = MemoryFlowRecords::default();
+        let stores: [&dyn FlowRecords; 2] = [&disk, &memory];
+        for store in stores {
+            let first = store.hold(&[1; 32]).unwrap();
+            let err = store.hold(&[1; 32]).unwrap_err();
+            assert!(matches!(err, NetError::Refused(_)), "{err:?}");
+            // Another ticket is not held.
+            let other = store.hold(&[2; 32]).unwrap();
+            drop(first);
+            let again = store.hold(&[1; 32]).unwrap();
+            drop((again, other));
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Writers that run at once each keep their change: none writes back a
+    /// list it read before another's write.
+    #[test]
+    fn concurrent_peer_writers_lose_nothing() {
+        let dir = temp_dir("peers-race");
+        let ids: Vec<String> = (0..24)
+            .map(|_| hex(SoftwareKey::generate(&mut os_rng()).public_key().as_bytes()))
+            .collect();
+        let start = std::sync::Barrier::new(ids.len());
+        std::thread::scope(|scope| {
+            for id in &ids {
+                let (dir, start) = (&dir, &start);
+                scope.spawn(move || {
+                    // Its own store value, as another process would have.
+                    let store = PeerStore::in_dir(dir);
+                    start.wait();
+                    store
+                        .upsert(PeerRecord {
+                            name: "host".into(),
+                            identity: id.clone(),
+                            role: "owner".into(),
+                            routes: Vec::new(),
+                            last_route: None,
+                            paired_at: 1,
+                        })
+                        .unwrap();
+                });
+            }
+        });
+        let mut kept: Vec<String> = PeerStore::in_dir(&dir)
+            .load()
+            .unwrap()
+            .into_iter()
+            .map(|p| p.identity)
+            .collect();
+        kept.sort();
+        let mut want = ids.clone();
+        want.sort();
+        assert_eq!(kept, want);
         fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -155,6 +155,176 @@
       ]
     },
     {
+      "description": "This side sent a JOIN_PROOF. The host's first AUTHORIZED live is step 2's notice; the next AUTHORIZED answers the proof.",
+      "name": "proof_answer_after_live_notice",
+      "steps": [
+        {
+          "op": "sent_join_proof",
+          "state": "awaiting_authorization"
+        },
+        {
+          "op": "check",
+          "state": "awaiting_proof_answer",
+          "traffic": "authorized_live",
+          "verdict": "allow"
+        },
+        {
+          "op": "check",
+          "state": "join_only",
+          "traffic": "authorized_join_only",
+          "verdict": "allow"
+        },
+        {
+          "op": "check",
+          "state": "join_only",
+          "traffic": "pairing",
+          "verdict": "allow"
+        }
+      ]
+    },
+    {
+      "name": "proof_answered_live",
+      "steps": [
+        {
+          "op": "sent_join_proof",
+          "state": "awaiting_authorization"
+        },
+        {
+          "op": "check",
+          "state": "awaiting_proof_answer",
+          "traffic": "authorized_live",
+          "verdict": "allow"
+        },
+        {
+          "op": "check",
+          "state": "live",
+          "traffic": "authorized_live",
+          "verdict": "allow"
+        },
+        {
+          "op": "check",
+          "state": "live",
+          "traffic": "stream",
+          "verdict": "allow"
+        }
+      ]
+    },
+    {
+      "name": "live_notice_read_before_the_proof_went_out",
+      "steps": [
+        {
+          "op": "check",
+          "state": "live",
+          "traffic": "authorized_live",
+          "verdict": "allow"
+        },
+        {
+          "op": "sent_join_proof",
+          "state": "awaiting_proof_answer"
+        }
+      ]
+    },
+    {
+      "description": "A host opens no stream before the caller has; here before its answer to the proof.",
+      "name": "host_stream_before_the_proof_answer",
+      "steps": [
+        {
+          "op": "sent_join_proof",
+          "state": "awaiting_authorization"
+        },
+        {
+          "op": "check",
+          "state": "awaiting_proof_answer",
+          "traffic": "authorized_live",
+          "verdict": "allow"
+        },
+        {
+          "op": "check",
+          "state": "closed:protocol_error",
+          "traffic": "stream",
+          "verdict": "close:protocol_error"
+        }
+      ]
+    },
+    {
+      "description": "This side sent a JOIN_PROOF and the host's grant for it was made by that proof's invitation: after step 2's notice the host answers with PAIRED again (its enrollment receipt, wire.md 10.6 rule 7), and the connection is live.",
+      "name": "proof_answered_with_paired",
+      "steps": [
+        {
+          "op": "sent_join_proof",
+          "state": "awaiting_authorization"
+        },
+        {
+          "op": "check",
+          "state": "awaiting_proof_answer",
+          "traffic": "authorized_live",
+          "verdict": "allow"
+        },
+        {
+          "op": "check",
+          "state": "live",
+          "traffic": "paired",
+          "verdict": "allow"
+        },
+        {
+          "op": "check",
+          "state": "live",
+          "traffic": "stream",
+          "verdict": "allow"
+        },
+        {
+          "op": "check",
+          "state": "closed:protocol_error",
+          "traffic": "paired",
+          "verdict": "close:protocol_error"
+        }
+      ]
+    },
+    {
+      "description": "The host's AUTHORIZED lets the caller use the host, never the reverse. A live caller accepts a stream the host opens, but privileged work on it needs the caller's own grant for the host identity: here b (the host) holds one with role owner in the caller's table, and a holds none. Before the gate is live the answer is none whatever the table says.",
+      "local_grants": [
+        {
+          "expires_at": null,
+          "identity": "b",
+          "role": "owner"
+        }
+      ],
+      "name": "host_opened_stream_needs_the_callers_grant",
+      "now": 1790000060,
+      "steps": [
+        {
+          "host": "b",
+          "op": "host_stream",
+          "result": "none",
+          "state": "awaiting_authorization"
+        },
+        {
+          "op": "check",
+          "state": "live",
+          "traffic": "authorized_live",
+          "verdict": "allow"
+        },
+        {
+          "op": "check",
+          "state": "live",
+          "traffic": "stream",
+          "verdict": "allow"
+        },
+        {
+          "host": "b",
+          "op": "host_stream",
+          "result": "owner",
+          "state": "live"
+        },
+        {
+          "host": "a",
+          "op": "host_stream",
+          "result": "none",
+          "state": "live"
+        }
+      ]
+    },
+    {
       "name": "join_proof_from_host",
       "steps": [
         {
@@ -307,11 +477,6 @@
         },
         {
           "op": "check",
-          "traffic": "join_proof",
-          "verdict": "ignore"
-        },
-        {
-          "op": "check",
           "traffic": "pairing",
           "verdict": "ignore"
         },
@@ -319,6 +484,94 @@
           "op": "check",
           "traffic": "host_only",
           "verdict": "close:protocol_error"
+        }
+      ]
+    },
+    {
+      "denied": [],
+      "description": "A granted device may send one JOIN_PROOF, before any stream; the host answers it (wire.md 8). A second proof closes the connection.",
+      "grants": [
+        {
+          "expires_at": null,
+          "identity": "a",
+          "role": "owner"
+        }
+      ],
+      "name": "live_grant_one_proof",
+      "now": 1790000060,
+      "peer": "a",
+      "step2": "live",
+      "steps": [
+        {
+          "op": "check",
+          "traffic": "join_proof",
+          "verdict": "allow"
+        },
+        {
+          "op": "check",
+          "traffic": "join_proof",
+          "verdict": "close:protocol_error"
+        }
+      ]
+    },
+    {
+      "denied": [],
+      "grants": [
+        {
+          "expires_at": null,
+          "identity": "a",
+          "role": "owner"
+        }
+      ],
+      "name": "live_grant_proof_after_stream",
+      "now": 1790000060,
+      "peer": "a",
+      "step2": "live",
+      "steps": [
+        {
+          "op": "check",
+          "traffic": "stream",
+          "verdict": "allow"
+        },
+        {
+          "op": "check",
+          "traffic": "join_proof",
+          "verdict": "close:protocol_error"
+        }
+      ]
+    },
+    {
+      "denied": [],
+      "description": "The proof was valid for an open invitation: the live connection becomes pairing only until enrollment replaces the grant.",
+      "grants": [
+        {
+          "expires_at": null,
+          "identity": "a",
+          "role": "owner"
+        }
+      ],
+      "name": "live_grant_pairs_again",
+      "now": 1790000060,
+      "peer": "a",
+      "step2": "live",
+      "steps": [
+        {
+          "op": "check",
+          "traffic": "join_proof",
+          "verdict": "allow"
+        },
+        {
+          "op": "admit_join_only"
+        },
+        {
+          "op": "check",
+          "traffic": "pairing",
+          "verdict": "allow"
+        },
+        {
+          "op": "check",
+          "traffic": "stream",
+          "verdict": "close:not_authorized"
         }
       ]
     },
@@ -410,7 +663,7 @@
       ]
     }
   ],
-  "description": "Step 2 on the host after step 1 passed (`cases`), and the caller's gate (`caller_cases`). Host cases: `grants` and `denied` set up the table (grants added in order, then denials), the gate opens at wall time `now` and monotonic time 0 ms, then `steps` run in order. Caller cases: the gate starts awaiting AUTHORIZED; `promote` means the joiner accepted PAIRED; `state` is the gate state after the step. Verdicts: allow, ignore, close:<code>.",
+  "description": "Step 2 on the host after step 1 passed (`cases`), and the caller's gate (`caller_cases`). Host cases: `grants` and `denied` set up the table (grants added in order, then denials), the gate opens at wall time `now` and monotonic time 0 ms, then `steps` run in order. Caller cases: the gate starts awaiting AUTHORIZED; `sent_join_proof` means this side queued a JOIN_PROOF; `promote` means the joiner accepted PAIRED; `host_stream` asks what the host identity `host` may do on a stream it opened, from the caller endpoint's own `local_grants` at `now` (the role of its live grant, or none; wire.md 8.2); `state` is the gate state after the step. Verdicts: allow, ignore, close:<code>.",
   "identities": {
     "a": "040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794",
     "b": "04d65a93977caa3d1b081852ff57a79e465f1660577304baead505dd3a48589cf350185e895372df6221ea3a137557e473fddb6755f05bd507c3c533fce9c91285"

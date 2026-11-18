@@ -5,11 +5,11 @@
 //! - Both verifiers call [`session_cert::verify`]. The caller passes the
 //!   stored pin (or, on first contact, the ticket's host identity) on every
 //!   connection. The host passes no pin; step 2 decides what the peer may do.
-//! - No session resumption and no tickets, so every connection runs the
-//!   verifier again.
-//! - Key exchange is X25519MLKEM768 or X25519 (aws-lc-rs). With
-//!   [`TlsPolicy::require_hybrid`] a connection that did not negotiate the
-//!   hybrid group is closed after the handshake.
+//! - No session resumption, no tickets, no PSK and no early data, so every
+//!   connection runs a full handshake and the verifier again.
+//! - Key exchange offers X25519MLKEM768 first and X25519 second (aws-lc-rs),
+//!   and a connection that did not negotiate X25519MLKEM768 is closed
+//!   before any application data (wire.md 5.4).
 
 use std::fmt;
 use std::sync::Arc;
@@ -37,36 +37,48 @@ use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 
 use crate::clock::Clock;
 use crate::error::NetError;
+use crate::limits::{ms, Limits};
 use crate::pipe::Pipe;
 
 /// The only `CertificateVerify` scheme peers use.
 pub const SCHEME: SignatureScheme = SignatureScheme::ECDSA_NISTP256_SHA256;
 
-/// How long a TLS handshake may take.
-pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Session policy knobs.
+/// The TLS policy. Wire.md 5.4 makes the protocol choices requirements, so
+/// the only settings are two limits: the clock skew the verifiers allow and
+/// how long a handshake may take.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TlsPolicy {
-    /// Close a connection that did not negotiate X25519MLKEM768. Native
-    /// peers always offer it, so this catches a build that lost it.
-    pub require_hybrid: bool,
+    skew_secs: u64,
+    handshake_timeout: Duration,
 }
 
-impl Default for TlsPolicy {
-    fn default() -> Self {
+impl TlsPolicy {
+    /// The policy for `limits`.
+    pub fn from_limits(limits: &Limits) -> Self {
         Self {
-            require_hybrid: true,
+            skew_secs: limits.core().clock_skew_secs(),
+            handshake_timeout: ms(limits.io().handshake_timeout_ms()),
         }
     }
 }
 
-/// The aws-lc-rs provider with the hybrid group preferred, trimmed to
-/// X25519MLKEM768 and X25519.
+impl Default for TlsPolicy {
+    fn default() -> Self {
+        Self::from_limits(&Limits::DEFAULT)
+    }
+}
+
+/// The groups a native endpoint offers, in order.
+pub const KX_GROUPS: [NamedGroup; 2] = [NamedGroup::X25519MLKEM768, NamedGroup::X25519];
+
+/// The aws-lc-rs provider offering exactly [`KX_GROUPS`], in that order.
 pub fn provider() -> Arc<CryptoProvider> {
     let mut p = rustls::crypto::aws_lc_rs::default_provider();
-    p.kx_groups
-        .retain(|g| matches!(g.name(), NamedGroup::X25519MLKEM768 | NamedGroup::X25519));
+    let all = std::mem::take(&mut p.kx_groups);
+    p.kx_groups = KX_GROUPS
+        .iter()
+        .filter_map(|name| all.iter().find(|g| g.name() == *name).copied())
+        .collect();
     Arc::new(p)
 }
 
@@ -159,6 +171,7 @@ fn cert_error(e: CertError) -> Error {
 /// Check a `CertificateVerify` signature with the session key of `cert`.
 fn verify_cert_verify(
     clock: &dyn Clock,
+    skew_secs: u64,
     message: &[u8],
     cert: &CertificateDer<'_>,
     dss: &DigitallySignedStruct,
@@ -168,7 +181,8 @@ fn verify_cert_verify(
             rustls::PeerMisbehaved::SignedHandshakeWithUnadvertisedSigScheme,
         ));
     }
-    let verified = session_cert::verify(cert.as_ref(), clock.now(), None).map_err(cert_error)?;
+    let verified = session_cert::verify_with_skew(cert.as_ref(), clock.now(), None, skew_secs)
+        .map_err(cert_error)?;
     verified
         .verify_tls_signature(message, dss.signature())
         .map_err(|_| Error::InvalidCertificate(CertificateError::BadSignature))?;
@@ -190,6 +204,7 @@ fn checked_pin(pin: &IdentityPublicKey) -> Option<&IdentityPublicKey> {
 struct PinnedHostVerifier {
     pin: IdentityPublicKey,
     clock: Arc<dyn Clock>,
+    skew_secs: u64,
 }
 
 impl ServerCertVerifier for PinnedHostVerifier {
@@ -204,10 +219,11 @@ impl ServerCertVerifier for PinnedHostVerifier {
         if !intermediates.is_empty() {
             return Err(cert_error(CertError::Malformed));
         }
-        session_cert::verify(
+        session_cert::verify_with_skew(
             end_entity.as_ref(),
             self.clock.now(),
             checked_pin(&self.pin),
+            self.skew_secs,
         )
         .map_err(cert_error)?;
         Ok(ServerCertVerified::assertion())
@@ -228,7 +244,7 @@ impl ServerCertVerifier for PinnedHostVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, Error> {
-        verify_cert_verify(&*self.clock, message, cert, dss)
+        verify_cert_verify(&*self.clock, self.skew_secs, message, cert, dss)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -240,6 +256,7 @@ impl ServerCertVerifier for PinnedHostVerifier {
 #[derive(Debug)]
 struct AnyDeviceVerifier {
     clock: Arc<dyn Clock>,
+    skew_secs: u64,
 }
 
 impl ClientCertVerifier for AnyDeviceVerifier {
@@ -264,7 +281,8 @@ impl ClientCertVerifier for AnyDeviceVerifier {
         if !intermediates.is_empty() {
             return Err(cert_error(CertError::Malformed));
         }
-        session_cert::verify(end_entity.as_ref(), self.clock.now(), None).map_err(cert_error)?;
+        session_cert::verify_with_skew(end_entity.as_ref(), self.clock.now(), None, self.skew_secs)
+            .map_err(cert_error)?;
         Ok(ClientCertVerified::assertion())
     }
 
@@ -283,7 +301,7 @@ impl ClientCertVerifier for AnyDeviceVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, Error> {
-        verify_cert_verify(&*self.clock, message, cert, dss)
+        verify_cert_verify(&*self.clock, self.skew_secs, message, cert, dss)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -296,16 +314,32 @@ pub fn client_config(
     own: &SessionCertificate,
     pin: IdentityPublicKey,
     clock: Arc<dyn Clock>,
+    policy: TlsPolicy,
+) -> Result<Arc<ClientConfig>, NetError> {
+    client_config_on(provider(), own, pin, clock, policy)
+}
+
+fn client_config_on(
+    provider: Arc<CryptoProvider>,
+    own: &SessionCertificate,
+    pin: IdentityPublicKey,
+    clock: Arc<dyn Clock>,
+    policy: TlsPolicy,
 ) -> Result<Arc<ClientConfig>, NetError> {
     let mut config =
-        ClientConfig::builder_with_details(provider(), Arc::new(ClockTime(clock.clone())))
+        ClientConfig::builder_with_details(provider, Arc::new(ClockTime(clock.clone())))
             .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(|e| NetError::Tls(e.to_string()))?
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(PinnedHostVerifier { pin, clock }))
+            .with_custom_certificate_verifier(Arc::new(PinnedHostVerifier {
+                pin,
+                clock,
+                skew_secs: policy.skew_secs,
+            }))
             .with_client_cert_resolver(Arc::new(OwnCert(certified_key(own))));
     config.alpn_protocols = vec![ALPN.to_vec()];
     config.resumption = Resumption::disabled();
+    config.enable_early_data = false;
     config.enable_sni = false;
     Ok(Arc::new(config))
 }
@@ -314,16 +348,22 @@ pub fn client_config(
 pub fn server_config(
     own: &SessionCertificate,
     clock: Arc<dyn Clock>,
+    policy: TlsPolicy,
 ) -> Result<Arc<ServerConfig>, NetError> {
     let mut config =
         ServerConfig::builder_with_details(provider(), Arc::new(ClockTime(clock.clone())))
             .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(|e| NetError::Tls(e.to_string()))?
-            .with_client_cert_verifier(Arc::new(AnyDeviceVerifier { clock }))
+            .with_client_cert_verifier(Arc::new(AnyDeviceVerifier {
+                clock,
+                skew_secs: policy.skew_secs,
+            }))
             .with_cert_resolver(Arc::new(OwnCert(certified_key(own))));
     config.alpn_protocols = vec![ALPN.to_vec()];
     config.session_storage = Arc::new(NoServerSessionStorage {});
     config.send_tls13_tickets = 0;
+    config.max_early_data_size = 0;
+    config.send_half_rtt_data = false;
     Ok(Arc::new(config))
 }
 
@@ -376,7 +416,7 @@ fn finish(
         .negotiated_key_exchange_group()
         .map(|g| g.name())
         .ok_or_else(|| NetError::Tls("no key exchange group".into()))?;
-    if policy.require_hybrid && group != NamedGroup::X25519MLKEM768 {
+    if group != NamedGroup::X25519MLKEM768 {
         return Err(NetError::Tls(format!(
             "key exchange {group:?} is not the hybrid group"
         )));
@@ -385,8 +425,13 @@ fn finish(
         .peer_certificates()
         .and_then(|c| c.first())
         .ok_or_else(|| NetError::Tls("peer sent no certificate".into()))?;
-    let peer = session_cert::verify(der.as_ref(), clock.now(), pin.and_then(checked_pin))
-        .map_err(NetError::PeerCertificate)?;
+    let peer = session_cert::verify_with_skew(
+        der.as_ref(),
+        clock.now(),
+        pin.and_then(checked_pin),
+        policy.skew_secs,
+    )
+    .map_err(NetError::PeerCertificate)?;
     Ok(Handshake {
         peer,
         local_window,
@@ -403,10 +448,10 @@ pub async fn connect<P: Pipe>(
     clock: Arc<dyn Clock>,
     policy: TlsPolicy,
 ) -> Result<(TlsStream<P>, Handshake), NetError> {
-    let config = client_config(own, pin, clock.clone())?;
+    let config = client_config(own, pin, clock.clone(), policy)?;
     let name = ServerName::try_from("mousse-session").map_err(|e| NetError::Tls(e.to_string()))?;
     let stream = tokio::time::timeout(
-        HANDSHAKE_TIMEOUT,
+        policy.handshake_timeout,
         TlsConnector::from(config).connect(name, pipe),
     )
     .await
@@ -427,14 +472,77 @@ pub async fn accept<P: Pipe>(
     clock: Arc<dyn Clock>,
     policy: TlsPolicy,
 ) -> Result<(TlsStream<P>, Handshake), NetError> {
-    let config = server_config(own, clock.clone())?;
-    let stream = tokio::time::timeout(HANDSHAKE_TIMEOUT, TlsAcceptor::from(config).accept(pipe))
-        .await
-        .map_err(|_| NetError::Timeout("TLS handshake"))?
-        .map_err(map_handshake_error)?;
+    let config = server_config(own, clock.clone(), policy)?;
+    let stream = tokio::time::timeout(
+        policy.handshake_timeout,
+        TlsAcceptor::from(config).accept(pipe),
+    )
+    .await
+    .map_err(|_| NetError::Timeout("TLS handshake"))?
+    .map_err(map_handshake_error)?;
     let conn = stream.get_ref().1;
     let exporters =
         exporters(|label| conn.export_keying_material([0u8; 32], label.as_bytes(), None))?;
     let handshake = finish(conn, exporters, &*clock, None, own.window(), policy)?;
     Ok((TlsStream::Server(stream), handshake))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::certs::CertManager;
+    use crate::clock::ManualClock;
+    use crate::rng::os_rng;
+    use mousse_net_core::identity::SoftwareKey;
+
+    fn cert(clock: Arc<ManualClock>) -> SessionCertificate {
+        CertManager::new(Arc::new(SoftwareKey::generate(&mut os_rng())), clock)
+            .current()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_native_endpoint_offers_the_hybrid_group_then_x25519_and_no_other() {
+        let names: Vec<NamedGroup> = provider().kx_groups.iter().map(|g| g.name()).collect();
+        assert_eq!(names, KX_GROUPS.to_vec());
+    }
+
+    /// A caller that offers X25519 alone completes the TLS handshake, and
+    /// the host closes it before any application data.
+    #[tokio::test]
+    async fn a_connection_without_the_hybrid_group_is_refused() {
+        let clock = Arc::new(ManualClock::new());
+        let (caller, host) = (cert(clock.clone()), cert(clock.clone()));
+        let mut classical = rustls::crypto::aws_lc_rs::default_provider();
+        classical
+            .kx_groups
+            .retain(|g| g.name() == NamedGroup::X25519);
+        let config = client_config_on(
+            Arc::new(classical),
+            &caller,
+            *host.identity(),
+            clock.clone(),
+            TlsPolicy::default(),
+        )
+        .unwrap();
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let name = ServerName::try_from("mousse-session").unwrap();
+        let (dialled, accepted) = tokio::join!(
+            TlsConnector::from(config).connect(name, a),
+            accept(b, &host, clock.clone(), TlsPolicy::default()),
+        );
+        let dialled = dialled.unwrap();
+        assert_eq!(
+            dialled
+                .get_ref()
+                .1
+                .negotiated_key_exchange_group()
+                .map(|g| g.name()),
+            Some(NamedGroup::X25519)
+        );
+        match accepted {
+            Err(NetError::Tls(e)) => assert!(e.contains("hybrid"), "{e}"),
+            other => panic!("accepted a classical-only connection: {:?}", other.err()),
+        }
+    }
 }

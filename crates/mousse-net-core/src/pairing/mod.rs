@@ -11,7 +11,7 @@
 //! The code exchange itself sits behind [`CodeExchange`]; the real one is
 //! CPace ([`CpaceExchangeFactory`]), with the joiner as initiator and the host
 //! as responder. This module owns the binding transcript and session id it
-//! must use, attempt limits, resends and atomic one-enrollment consumption.
+//! must use, attempt limits and atomic one-enrollment consumption.
 
 mod exchange;
 mod host;
@@ -30,10 +30,11 @@ pub use exchange::{
 };
 pub use host::{
     CreatedInvitation, HostAction, HostPairing, HostPairingError, InvitationParams,
-    InvitationStatus, HOST_ATTEMPTS_PER_INVITATION,
+    InvitationStatus,
 };
 pub use joiner::{
-    JoinerAction, JoinerError, JoinerPairing, JoinerState, PairedHost, JOINER_ATTEMPTS_PER_FLOW,
+    Arrival, JoinerAction, JoinerError, JoinerName, JoinerPairing, JoinerRecord, JoinerState,
+    PairedHost, CODE_FAILED_MESSAGE, JOINER_ATTEMPTS_PER_FLOW, JOINER_RECORD_DOMAIN,
 };
 pub use proof::{
     attempt_sid, binding_transcript, join_proof_input, join_proof_mac, verify_join_proof,
@@ -43,10 +44,7 @@ pub use proof::{
 pub use route::{
     Route, RouteHost, RouteSkip, MAX_DNS_NAME_LEN, MAX_MDNS_INSTANCE_LEN, RESERVED_SCHEMES,
 };
-pub use ticket::{
-    Ticket, TicketError, TicketSecret, MAX_ROUTES, MAX_ROUTE_LEN, TICKET_LIFETIME_SECS,
-    TICKET_VERSION,
-};
+pub use ticket::{Ticket, TicketError, TicketSecret, MAX_ROUTES, MAX_ROUTE_LEN, TICKET_VERSION};
 
 /// A 16-byte random invitation id, chosen by the host.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

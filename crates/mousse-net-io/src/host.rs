@@ -10,12 +10,15 @@
 //! The grant table is saved after every change. A change whose save fails
 //! still takes effect in memory (access ends at once) but the call reports
 //! the failure, and the host retries the save every second until it works.
+//! Enrollment is the exception: a new grant is saved before the
+//! connection is promoted or `PAIRED` is sent, and if that save fails the
+//! grant is dropped and the pairing fails with `INTERNAL_ERROR`, so a
+//! device is never told it is paired under a grant a restart would lose.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
-use std::time::Duration;
 
 use mousse_net_core::authz::{ConnectionGate, GateState, Traffic, Verdict};
 use mousse_net_core::control::{AuthorizedState, ControlMessage};
@@ -27,7 +30,7 @@ use mousse_net_core::pairing::{
     InvitationId, InvitationKind, InvitationParams, InvitationStatus, PairingCode,
     SessionExporters,
 };
-use mousse_net_core::{ConnectionId, ErrorCode};
+use mousse_net_core::{ConnectionId, ErrorCode, UnixTime};
 use tokio::sync::mpsc;
 
 use crate::certs::CertManager;
@@ -35,6 +38,7 @@ use crate::clock::Clock;
 use crate::conn::{self, CloseReason, Cmd, ConnStatus, Connection, Outbox, Role as ConnRole};
 use crate::endpoint::Endpoint;
 use crate::error::NetError;
+use crate::limits::{ms, Limits};
 use crate::pipe::Pipe;
 use crate::rng::os_rng;
 use crate::store::GrantStore;
@@ -50,8 +54,9 @@ pub struct HostConfig {
     pub state_dir: Option<PathBuf>,
     /// The local owner or profile that authorizes grants made here.
     pub owner: OwnerRef,
-    /// TLS policy.
-    pub policy: TlsPolicy,
+    /// Limits ([`Limits::DEFAULT`] unless the app overrides some).
+    /// A [`Limits`] is always within the allowed ranges.
+    pub limits: Limits,
     /// Clock.
     pub clock: Arc<dyn Clock>,
     /// The identity tickets and pairing name, when it differs from the
@@ -72,7 +77,7 @@ impl HostConfig {
             name,
             state_dir: Some(endpoint.grants_dir()),
             owner: endpoint.owner()?,
-            policy: TlsPolicy::default(),
+            limits: Limits::DEFAULT,
             clock,
             ticket_identity: None,
         })
@@ -141,7 +146,6 @@ struct Inner<F: CodeExchangeFactory> {
     store: Option<GrantStore>,
     /// The last save failed; the ticker retries it.
     unsaved: bool,
-    approve_next: bool,
     events: mpsc::UnboundedSender<HostEvent>,
 }
 
@@ -150,8 +154,12 @@ struct Shared<F: CodeExchangeFactory> {
     certs: CertManager,
     clock: Arc<dyn Clock>,
     policy: TlsPolicy,
+    limits: Limits,
     owner: OwnerRef,
     next_conn: AtomicU64,
+    /// Tests stop the ticker to show what holds without it.
+    #[cfg(test)]
+    ticker_paused: std::sync::atomic::AtomicBool,
 }
 
 /// A host. Cheap to clone; all clones share state.
@@ -207,6 +215,44 @@ where
         }
     }
 
+    /// Remove the grants past their expiry, close their connections and
+    /// save.
+    fn expire_grants(&mut self, now: UnixTime) {
+        let before = self.grants.grants().count();
+        let events = self.grants.tick(now);
+        let changed = self.grants.grants().count() != before;
+        self.apply_grant_events(events);
+        if changed || self.unsaved {
+            // A failure is reported as an event and retried by the ticker.
+            let _ = self.persist();
+        }
+    }
+
+    /// Whether `conn` is live under a grant that is still live at `now`.
+    /// A grant found past its expiry is removed here and its connections
+    /// closed with `GRANT_REVOKED`, without waiting for the ticker.
+    fn live_now(&mut self, conn: ConnectionId, now: UnixTime) -> bool {
+        let Some(GateState::Live { grant }) = self.gates.get(&conn).map(|g| g.state().clone())
+        else {
+            return false;
+        };
+        let live = self
+            .grants
+            .get(grant)
+            .is_some_and(|g| g.expires_at.is_none_or(|at| now < at));
+        if !live {
+            self.expire_grants(now);
+            // Gone some other way: the connection must not stay live.
+            if matches!(
+                self.gates.get(&conn).map(|g| g.state()),
+                Some(GateState::Live { .. })
+            ) {
+                self.close_conn(conn, ErrorCode::GrantRevoked);
+            }
+        }
+        live
+    }
+
     fn apply_grant_events(&mut self, events: Vec<GrantEvent>) {
         for event in events {
             let GrantEvent::CloseChannels {
@@ -224,7 +270,57 @@ where
         }
     }
 
-    fn apply(&mut self, actions: Vec<HostAction>, clock: &dyn Clock) {
+    /// Save an enrollment before anything acts on it. `actions` came from a
+    /// pairing call that ran on the grant table as it was in `before`. When
+    /// they enroll a device, the new grant is saved first, so the gate is
+    /// promoted and `PAIRED` sent only for a grant that survives a restart.
+    /// If the save fails the table goes back to `before` and the pairing
+    /// fails: the enrolling connection closes with `INTERNAL_ERROR`, no
+    /// `PAIRED` is sent and the invitation ends.
+    fn commit_enrollment(
+        &mut self,
+        before: GrantTable,
+        actions: Vec<HostAction>,
+    ) -> Vec<HostAction> {
+        let enrolling: Vec<ConnectionId> = actions
+            .iter()
+            .filter_map(|a| match a {
+                HostAction::Enrolled { conn, .. } => Some(*conn),
+                _ => None,
+            })
+            .collect();
+        if enrolling.is_empty() || self.persist().is_ok() {
+            return actions;
+        }
+        self.grants = before;
+        actions
+            .into_iter()
+            .flat_map(|action| match action {
+                HostAction::Enrolled {
+                    invitation, conn, ..
+                } => vec![
+                    HostAction::Close {
+                        conn,
+                        code: ErrorCode::InternalError,
+                    },
+                    HostAction::InvitationEnded {
+                        invitation,
+                        reason: ErrorCode::InternalError,
+                    },
+                ],
+                // The grant table is back as it was: nothing it reported
+                // happened.
+                HostAction::Grant(_) => Vec::new(),
+                HostAction::Send {
+                    conn,
+                    message: ControlMessage::Paired { .. },
+                } if enrolling.contains(&conn) => Vec::new(),
+                other => vec![other],
+            })
+            .collect()
+    }
+
+    fn apply(&mut self, actions: Vec<HostAction>) {
         let mut queue: VecDeque<HostAction> = actions.into();
         let mut persist = false;
         while let Some(action) = queue.pop_front() {
@@ -243,24 +339,14 @@ where
                     joiner,
                     name,
                 } => {
-                    if self.approve_next {
-                        self.approve_next = false;
-                        if let Ok(more) =
-                            self.pairing
-                                .approve(&invitation, conn, &mut self.grants, clock.now())
-                        {
-                            queue.extend(more);
-                        }
-                    } else {
-                        let _ = self
-                            .events
-                            .send(HostEvent::ApprovalRequested(ApprovalRequest {
-                                invitation,
-                                conn,
-                                joiner,
-                                name,
-                            }));
-                    }
+                    let _ = self
+                        .events
+                        .send(HostEvent::ApprovalRequested(ApprovalRequest {
+                            invitation,
+                            conn,
+                            joiner,
+                            name,
+                        }));
                 }
                 HostAction::ShowCode { invitation, code } => {
                     let _ = self.events.send(HostEvent::ShowCode { invitation, code });
@@ -271,11 +357,11 @@ where
                     grant,
                     identity,
                 } => {
+                    // Already saved by `commit_enrollment`.
                     if let Some(gate) = self.gates.get_mut(&conn) {
                         gate.promote(grant);
                     }
                     self.send(conn, Cmd::Status(ConnStatus::Live));
-                    persist = true;
                     let _ = self.events.send(HostEvent::Enrolled {
                         invitation,
                         grant,
@@ -330,19 +416,26 @@ where
         let shared = Arc::new(Shared {
             inner: Mutex::new(Inner {
                 grants,
-                pairing: HostPairing::new(identity, config.name.clone(), factory),
+                pairing: HostPairing::with_limits(
+                    identity,
+                    config.name.clone(),
+                    factory,
+                    config.limits.core(),
+                ),
                 gates: HashMap::new(),
                 conns: HashMap::new(),
                 store,
                 unsaved: false,
-                approve_next: false,
                 events,
             }),
-            certs: CertManager::new(signer, config.clock.clone()),
+            certs: CertManager::with_limits(signer, config.clock.clone(), &config.limits),
             clock: config.clock,
-            policy: config.policy,
+            policy: TlsPolicy::from_limits(&config.limits),
+            limits: config.limits,
             owner: config.owner,
             next_conn: AtomicU64::new(1),
+            #[cfg(test)]
+            ticker_paused: std::sync::atomic::AtomicBool::new(false),
         });
         tokio::spawn(ticker(Arc::downgrade(&shared)));
         Ok((Self { shared }, events_rx))
@@ -365,25 +458,28 @@ where
         {
             let mut inner = lock(&self.shared);
             let inner = &mut *inner;
-            let gate = ConnectionGate::open(
+            let gate = ConnectionGate::open_with_limits(
                 conn,
                 peer,
                 &mut inner.grants,
                 self.shared.clock.now(),
                 self.shared.clock.mono(),
+                self.shared.limits.core(),
             );
             inner.gates.insert(conn, gate);
             inner.conns.insert(conn, cmd_tx.clone());
         }
+        let skew = self.shared.limits.core().clock_skew_secs();
         let deadline = handshake
             .local_window
-            .effective_deadline()
-            .min(handshake.peer.window.effective_deadline());
+            .deadline_with_skew(skew)
+            .min(handshake.peer.window.deadline_with_skew(skew));
         let role = HostRole {
             shared: self.shared.clone(),
             conn,
             peer,
             exporters: handshake.exporters,
+            caller_opened: false,
         };
         Ok(conn::spawn(
             conn::Start {
@@ -394,6 +490,7 @@ where
                 kx_group: handshake.kx_group,
                 deadline,
                 clock: self.shared.clock.clone(),
+                limits: self.shared.limits,
             },
             Box::new(role),
             cmd_tx,
@@ -431,6 +528,7 @@ where
     pub fn approve(&self, request: &ApprovalRequest) -> Result<(), NetError> {
         let mut inner = lock(&self.shared);
         let inner = &mut *inner;
+        let before = inner.grants.clone();
         let actions = inner
             .pairing
             .approve(
@@ -440,7 +538,8 @@ where
                 self.shared.clock.now(),
             )
             .map_err(|e| NetError::Refused(e.to_string()))?;
-        inner.apply(actions, &*self.shared.clock);
+        let actions = inner.commit_enrollment(before, actions);
+        inner.apply(actions);
         Ok(())
     }
 
@@ -448,19 +547,14 @@ where
     pub fn decline(&self, invitation: &InvitationId) {
         let mut inner = lock(&self.shared);
         let actions = inner.pairing.decline(invitation);
-        inner.apply(actions, &*self.shared.clock);
+        inner.apply(actions);
     }
 
     /// Cancel an open invitation.
     pub fn cancel(&self, invitation: &InvitationId) {
         let mut inner = lock(&self.shared);
         let actions = inner.pairing.cancel(invitation);
-        inner.apply(actions, &*self.shared.clock);
-    }
-
-    /// Approve the next in-person request without asking (scripted runs).
-    pub fn set_approve_next(&self, on: bool) {
-        lock(&self.shared).approve_next = on;
+        inner.apply(actions);
     }
 
     /// All grants.
@@ -539,25 +633,32 @@ where
     }
 }
 
-/// Grant expiry, invitation expiry and the join-proof wait, once a second.
+/// Grant expiry, invitation expiry and the join-proof wait, every
+/// [`IoLimits::clock_recheck_ms`](crate::limits::IoLimits::clock_recheck_ms).
 async fn ticker<F: CodeExchangeFactory>(shared: Weak<Shared<F>>) {
-    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    let Some(recheck) = shared
+        .upgrade()
+        .map(|shared| ms(shared.limits.io().clock_recheck_ms()))
+    else {
+        return;
+    };
+    let mut interval = tokio::time::interval(recheck);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         interval.tick().await;
         let Some(shared) = shared.upgrade() else {
             return;
         };
+        #[cfg(test)]
+        if shared.ticker_paused.load(Ordering::SeqCst) {
+            continue;
+        }
         let now = shared.clock.now();
         let mono = shared.clock.mono();
         let mut inner = lock(&shared);
-        let events = inner.grants.tick(now);
-        if !events.is_empty() || inner.unsaved {
-            inner.apply_grant_events(events);
-            let _ = inner.persist();
-        }
+        inner.expire_grants(now);
         let actions = inner.pairing.tick(now);
-        inner.apply(actions, &*shared.clock);
+        inner.apply(actions);
         let overdue: Vec<(ConnectionId, ErrorCode)> = inner
             .gates
             .iter_mut()
@@ -574,6 +675,9 @@ struct HostRole<F: CodeExchangeFactory> {
     conn: ConnectionId,
     peer: IdentityPublicKey,
     exporters: SessionExporters,
+    /// The caller has opened a stream (a stream frame passed the gate).
+    /// The host opens none before that (wire.md 8, step 4).
+    caller_opened: bool,
 }
 
 impl<F> ConnRole for HostRole<F>
@@ -597,11 +701,23 @@ where
     }
 
     fn check(&mut self, traffic: Traffic, _message: Option<&ControlMessage>) -> Verdict {
+        let now = self.shared.clock.now();
         let mut inner = lock(&self.shared);
-        match inner.gates.get_mut(&self.conn) {
+        // Stream traffic needs the bound grant to be live now, not only when
+        // the ticker last looked.
+        if matches!(traffic, Traffic::Stream) && !inner.live_now(self.conn, now) {
+            if let Some(GateState::Closed(code)) = inner.gates.get(&self.conn).map(|g| g.state()) {
+                return Verdict::Close(*code);
+            }
+        }
+        let verdict = match inner.gates.get_mut(&self.conn) {
             Some(gate) => gate.check(traffic),
             None => Verdict::Close(ErrorCode::InternalError),
+        };
+        if verdict == Verdict::Allow && matches!(traffic, Traffic::Stream) {
+            self.caller_opened = true;
         }
+        verdict
     }
 
     fn on_control(&mut self, message: ControlMessage, _out: &mut Outbox) {
@@ -609,6 +725,7 @@ where
         let clock = &*shared.clock;
         let mut guard = lock(&shared);
         let inner = &mut *guard;
+        let before = inner.grants.clone();
         let actions = match message {
             ControlMessage::JoinProof {
                 invitation,
@@ -639,15 +756,16 @@ where
             // the gate.
             _ => Vec::new(),
         };
-        inner.apply(actions, clock);
+        let actions = inner.commit_enrollment(before, actions);
+        inner.apply(actions);
     }
 
     fn may_open(&self) -> bool {
-        let inner = lock(&self.shared);
-        matches!(
-            inner.gates.get(&self.conn).map(|g| g.state()),
-            Some(GateState::Live { .. })
-        )
+        if !self.caller_opened {
+            return false;
+        }
+        let now = self.shared.clock.now();
+        lock(&self.shared).live_now(self.conn, now)
     }
 
     fn on_closed(&mut self, _reason: &CloseReason) {
@@ -657,6 +775,171 @@ where
         inner.conns.remove(&self.conn);
         inner.grants.unbind(self.conn);
         let actions = inner.pairing.on_connection_closed(self.conn);
-        inner.apply(actions, &*shared.clock);
+        inner.apply(actions);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use mousse_net_core::grants::NewGrant;
+    use mousse_net_core::identity::SoftwareKey;
+    use mousse_net_core::mux::PriorityClass;
+    use mousse_net_core::pairing::CpaceExchangeFactory;
+
+    use super::*;
+    use crate::caller::Caller;
+    use crate::clock::ManualClock;
+
+    async fn within<T>(what: &str, fut: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(std::time::Duration::from_secs(5), fut)
+            .await
+            .unwrap_or_else(|_| panic!("timed out: {what}"))
+    }
+
+    struct Live {
+        host: Host,
+        clock: Arc<ManualClock>,
+        expires_at: UnixTime,
+        hosted: Connection,
+        dialled: Connection,
+    }
+
+    /// A caller with a grant that expires in a minute, connected to the
+    /// host over an in-memory pipe.
+    async fn live() -> Live {
+        let clock = Arc::new(ManualClock::new());
+        let owner = OwnerRef([1; OwnerRef::LEN]);
+        let config = HostConfig {
+            name: "desk".into(),
+            state_dir: None,
+            owner,
+            limits: Limits::DEFAULT,
+            clock: clock.clone(),
+            ticket_identity: None,
+        };
+        let key = Arc::new(SoftwareKey::generate(&mut os_rng()));
+        let (host, _events) = Host::new(key, config, CpaceExchangeFactory).unwrap();
+        let caller = Caller::new(
+            Arc::new(SoftwareKey::generate(&mut os_rng())),
+            Arc::new(ManualClock::new()),
+            Limits::DEFAULT,
+        );
+        let now = clock.now();
+        let expires_at = UnixTime(now.0 + 60);
+        let grant = NewGrant {
+            identity: caller.identity(),
+            name: "laptop".into(),
+            role: Role::owner(),
+            authorizing_owner: owner,
+            expires_at: Some(expires_at),
+            enrolled_by: None,
+        };
+        lock(&host.shared).grants.add(grant, now).unwrap();
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let (hosted, dialled) = tokio::join!(host.accept(a), caller.dial(b, host.identity()));
+        Live {
+            host,
+            clock,
+            expires_at,
+            hosted: hosted.unwrap(),
+            dialled: dialled.unwrap(),
+        }
+    }
+
+    impl Live {
+        /// The grant's expiry second arrives while the ticker is stopped.
+        fn expire_without_the_ticker(&self) {
+            self.host.shared.ticker_paused.store(true, Ordering::SeqCst);
+            self.clock.freeze_at(self.expires_at);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stream_after_the_grant_expired_is_refused_without_the_ticker() {
+        let live = live().await;
+        let before = live
+            .dialled
+            .open_stream(PriorityClass::Interactive, "terminal")
+            .await
+            .unwrap();
+        before.writer.write(b"in time").await.unwrap();
+        assert!(within("the first stream", live.hosted.accept_stream())
+            .await
+            .is_some());
+
+        live.expire_without_the_ticker();
+        let after = live
+            .dialled
+            .open_stream(PriorityClass::Interactive, "terminal")
+            .await
+            .unwrap();
+        let _ = after.writer.write(b"too late").await;
+        assert!(
+            within("no second stream", live.hosted.accept_stream())
+                .await
+                .is_none(),
+            "a stream was admitted under an expired grant"
+        );
+        assert_eq!(
+            within("closed", live.hosted.closed()).await,
+            CloseReason::Local(ErrorCode::GrantRevoked)
+        );
+        assert_eq!(
+            within("closed", live.dialled.closed()).await,
+            CloseReason::Peer(ErrorCode::GrantRevoked)
+        );
+        assert!(live.host.grants().is_empty());
+    }
+
+    impl Live {
+        /// The caller opens a stream and the host takes it.
+        async fn caller_opens_one(&self) {
+            let stream = self
+                .dialled
+                .open_stream(PriorityClass::Interactive, "terminal")
+                .await
+                .unwrap();
+            stream.writer.write(b"first").await.unwrap();
+            assert!(within("the caller's stream", self.hosted.accept_stream())
+                .await
+                .is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn the_host_opens_no_stream_before_the_caller_opened_one() {
+        let live = live().await;
+        assert!(live
+            .hosted
+            .open_stream(PriorityClass::Interactive, "terminal")
+            .await
+            .is_err());
+        live.caller_opens_one().await;
+        let stream = live
+            .hosted
+            .open_stream(PriorityClass::Interactive, "terminal")
+            .await
+            .unwrap();
+        stream.writer.write(b"from the host").await.unwrap();
+        assert!(within("the host's stream", live.dialled.accept_stream())
+            .await
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn the_host_opens_no_stream_under_an_expired_grant() {
+        let live = live().await;
+        live.caller_opens_one().await;
+        live.expire_without_the_ticker();
+        assert!(live
+            .hosted
+            .open_stream(PriorityClass::Interactive, "terminal")
+            .await
+            .is_err());
+        assert_eq!(
+            within("closed", live.dialled.closed()).await,
+            CloseReason::Peer(ErrorCode::GrantRevoked)
+        );
+        assert!(live.host.grants().is_empty());
     }
 }

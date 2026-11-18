@@ -6,7 +6,9 @@ use mousse_net_core::grants::{Denial, Grant};
 use mousse_net_core::identity::IdentityPublicKey;
 use mousse_net_core::pairing::{InvitationId, SessionExporters};
 use mousse_net_core::session_cert::{CertError, SessionCertificate, VerifiedSessionCert};
-use mousse_net_core::{ConnectionId, ErrorCode, UnixTime, CLOCK_SKEW_SECS};
+use mousse_net_core::{ConnectionId, ErrorCode, Limits, UnixTime};
+
+const CLOCK_SKEW_SECS: u64 = Limits::DEFAULT.clock_skew_secs();
 use rand_core::Rng;
 
 use crate::caller::{CallerDev, Mode, Outcome, WRONG_ENDPOINT};
@@ -520,10 +522,11 @@ impl World {
         let nb = cert.window().not_before().secs();
         let na = cert.window().not_after().secs();
         let n = now.secs();
-        let expected = if n + CLOCK_SKEW_SECS < nb || n > na + CLOCK_SKEW_SECS {
-            Err(CertError::OutsideWindow)
-        } else if pin.is_some_and(|p| p != *cert.identity()) {
+        // The pin comes before the window (wire.md 5.4, checks 9 and 10).
+        let expected = if pin.is_some_and(|p| p != *cert.identity()) {
             Err(CertError::PinMismatch)
+        } else if n + CLOCK_SKEW_SECS < nb || n > na + CLOCK_SKEW_SECS {
+            Err(CertError::OutsideWindow)
         } else {
             Ok(())
         };

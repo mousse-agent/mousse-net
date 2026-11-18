@@ -10,7 +10,6 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use mousse_net_core::grants::GrantId;
 use mousse_net_core::identity::{IdentityPublicKey, SoftwareKey};
@@ -35,7 +34,6 @@ pub struct ServeOptions {
     pub name: String,
     pub listen_ip: IpAddr,
     pub port: Option<u16>,
-    pub approve_next: bool,
     pub mdns: bool,
 }
 
@@ -108,6 +106,7 @@ pub async fn run(
     let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
     let mut config = HostConfig::for_endpoint(&endpoint, opts.name.clone(), clock.clone())
         .map_err(|e| e.to_string())?;
+    config.limits = crate::limits::get().net;
     let signer: SharedSigner = match break_mode().as_deref() {
         Some("wrong-identity") => {
             // Tickets and pairing use the real key; only TLS presents
@@ -120,9 +119,6 @@ pub async fn run(
     };
     let (host, mut events) =
         Host::new(signer, config, CpaceExchangeFactory).map_err(|e| e.to_string())?;
-    if opts.approve_next {
-        host.set_approve_next(true);
-    }
     let choice = match opts.port {
         None => PortChoice::Kept,
         Some(0) => PortChoice::Auto,
@@ -135,12 +131,15 @@ pub async fn run(
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     let routes = route_hints(opts.listen_ip, port);
     let advertiser = if opts.mdns && !opts.listen_ip.is_loopback() {
-        Some(Advertiser::start(port, clock.clone()).map_err(|e| format!("mDNS: {e}"))?)
+        Some(
+            Advertiser::start(port, clock.clone(), crate::limits::get().net.io())
+                .map_err(|e| format!("mDNS: {e}"))?,
+        )
     } else {
         None
     };
 
-    let mut control = ControlListener::bind().await?;
+    let mut control = ControlListener::bind(state_dir).await?;
     let token = hex(&random_bytes::<32>());
     ipc::write_control_file(state_dir, control.addr(), &token)?;
 
@@ -185,7 +184,7 @@ pub async fn run(
         }
     }
     host.close_all(ErrorCode::NoError);
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(crate::limits::ms(crate::limits::helper().stop_linger_ms())).await;
     ipc::remove_control_file(state_dir);
     if let Some(a) = advertiser {
         a.stop();
@@ -221,9 +220,6 @@ async fn handle_connection(host: Host, pipe: TcpStream, addr: SocketAddr) {
 /// The stream label on which a paired caller asks for this host's build.
 pub const INFO_LABEL: &str = "helper-info";
 
-/// How long a `helper-info` requester has to finish its (empty) request.
-const INFO_REQUEST_WAIT: Duration = Duration::from_secs(5);
-
 /// Answer a `helper-info` stream: `{"build": ...}`, then finish.
 ///
 /// The request is the stream itself, so the caller finishes its side right
@@ -233,7 +229,9 @@ const INFO_REQUEST_WAIT: Duration = Duration::from_secs(5);
 /// reset instead.
 async fn send_info(stream: mousse_net_io::MuxStream) {
     let (mut reader, writer) = stream.split();
-    let request_ended = tokio::time::timeout(INFO_REQUEST_WAIT, reader.read()).await;
+    // `INFO_REQUEST_WAIT_MS` to finish the (empty) request.
+    let wait = crate::limits::ms(crate::limits::helper().info_request_wait_ms());
+    let request_ended = tokio::time::timeout(wait, reader.read()).await;
     if !matches!(request_ended, Ok(Ok(None))) {
         writer.reset(ErrorCode::ProtocolError);
         return;

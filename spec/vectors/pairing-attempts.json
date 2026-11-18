@@ -14,10 +14,10 @@
         "tcp://192.168.1.20:7443"
       ]
     },
-    "joiners": "Each joiner's identity secret is one byte repeated 32 times: 0x50 for the first joiner a sequence names, 0x51 for the second, and so on. Its name is its letter.",
+    "joiners": "Each joiner's identity secret is one byte repeated 32 times: 0x50 for the first joiner a sequence names, 0x51 for the second, and so on. Its computer name is its letter and its profile label is `Work`, so its JOIN_PROOF name is `<letter> (Work)` for in person and `<letter>` for send link (wire.md 10.3). Every flow-record write the joiner asks for (wire.md 10.7) lands at once and is not listed.",
     "time": 1790000000
   },
-  "description": "Attempt-limit and resend sequences for the send-link flow (spec wire.md, \"Send-link flow and the code\" and \"Attempt limits\"), plus one-enrollment for in person. Each step runs one operation and then the listed expectations hold. Ops: connect (the connection starts; after the two HELLO messages the joiner sends its join proof on conn and the host's AUTHORIZED, if any, reaches the joiner), submit (the joiner enters a code; messages flow until both sides stop), submit_first (only the joiner's first message reaches the host; the host's reply is recorded in `out` but not delivered to the joiner), redeliver (that first message reaches the host again on conn; the reply is recorded, not delivered), inject (the joiner's side sends `message` for `attempt`, \"current\" meaning the attempt of its last submit, with `payload`; the reply is recorded, not delivered), drop (conn closes), approve (host owner taps for conn). Codes: right (the code the host shows now), wrong (000000, or 000001 if 000000 is shown), stale (the code the host showed when the previous attempt started). `reply`: first_reply (the same messages, byte for byte, as the host's answer to that first message), code_abort (the host's only answer is CODE_ABORT pairing_failed for that attempt), none (no answer). `new_code` says whether the host showed a fresh code during the step. `closed` lists connections the host closed during the step. When `joiner_state` becomes failed with a code, the joiner also closes the connection with GOAWAY of that code after its listed messages, unless the host had already closed it (wire.md 10.6 rule 9); that close is not listed. `out` lists, in order, every control message each side sent during the step (`send`), host closes (`close`) and codes the host showed (`show_code`), except the HELLO each side sends first on every connection (wire.md, \"Connection start and step 2\"): a replay over real connections exchanges both HELLOs, checks the agreed version and starts comparing at JOIN_PROOF. Each side's sends keep their own order; on connect the two sides send independently, and `out` lists the joiner's before the host's.",
+  "description": "Attempt-limit and repeat sequences for the send-link flow (spec wire.md, \"Send-link flow and the code\" and \"Attempt limits\"), plus one-enrollment for in person. Each step runs one operation and then the listed expectations hold. Ops: connect (the connection starts; after the two HELLO messages the joiner sends its join proof on conn and the host's AUTHORIZED, if any, reaches the joiner), submit (the joiner enters a code; messages flow until both sides stop), submit_first (only the joiner's first message reaches the host; the host's reply is recorded in `out` but not delivered to the joiner), redeliver (the joiner's last first message reaches the host again on conn, as a repeat or a replay; the reply is recorded, not delivered), connect_as_host (like connect, but the join proof is made with the host's own identity key), inject (the joiner's side sends `message` for `attempt`, \"current\" meaning the attempt of its last submit, with `payload`; the reply is recorded, not delivered), drop (conn closes), approve (host owner taps for conn). Codes: right (the code the host shows now), wrong (000000, or 000001 if 000000 is shown), stale (the code the host showed when the previous attempt started). `reply`: code_exchange (the host's only answer is one CODE_EXCHANGE for that attempt), code_abort (the host's only answer is CODE_ABORT pairing_failed for that attempt), none (no answer). `new_code` says whether the host showed a fresh code during the step. `closed` lists connections the host closed during the step. When `joiner_state` becomes failed with a code, the joiner also closes the connection with GOAWAY of that code after its listed messages, unless the host had already closed it (wire.md 10.6 rule 9); that close is not listed. `out` lists, in order, every control message each side sent during the step (`send`), host closes (`close`) and codes the host showed (`show_code`), except the HELLO each side sends first on every connection (wire.md, \"Connection start and step 2\"): a replay over real connections exchanges both HELLOs, checks the agreed version and starts comparing at JOIN_PROOF. Each side's sends keep their own order; on connect the two sides send independently, and `out` lists the joiner's before the host's.",
   "sequences": [
     {
       "draws": {
@@ -568,6 +568,7 @@
       "ticket": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450f400927857aaf64114f561baacb3797005508c79a1dc1476ab573216a4020764bde5061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
     },
     {
+      "description": "The joiner's msg_a reaches the host twice on the same connection. The second copy does not fit the attempt's next step, so the attempt fails with code_abort and no new debit. Anything more for the ended attempt gets code_abort and no work.",
       "draws": {
         "a": [
           {
@@ -596,7 +597,7 @@
         ]
       },
       "kind": "send_link",
-      "name": "resend_is_not_a_new_attempt",
+      "name": "a_repeated_message_fails_the_attempt",
       "steps": [
         {
           "conn": 1,
@@ -666,12 +667,12 @@
             {
               "send": {
                 "conn": 1,
-                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad0258622062f95f725a624ede5e2f3a4fa65687901214c4b7444326b97993a9e5f8b8dc3e006886875760e1d84b759a5988cc09e0225ca1fc5f067d1c3909a1bf3106eb6a896cd3b6b24107924f46ffdafd4bc89110cf05e8eeae9faa369133ee6729f58efa",
+                "control": "a3000501509a9ec1a2a6c152e5b938b4dd05f045ad020a",
                 "from": "host"
               }
             }
           ],
-          "reply": "first_reply"
+          "reply": "code_abort"
         },
         {
           "conn": 1,
@@ -690,18 +691,18 @@
             {
               "send": {
                 "conn": 1,
-                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad0258622062f95f725a624ede5e2f3a4fa65687901214c4b7444326b97993a9e5f8b8dc3e006886875760e1d84b759a5988cc09e0225ca1fc5f067d1c3909a1bf3106eb6a896cd3b6b24107924f46ffdafd4bc89110cf05e8eeae9faa369133ee6729f58efa",
+                "control": "a3000501509a9ec1a2a6c152e5b938b4dd05f045ad020a",
                 "from": "host"
               }
             }
           ],
-          "reply": "first_reply"
+          "reply": "code_abort"
         }
       ],
       "ticket": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450f400927857aaf64114f561baacb3797005508c79a1dc1476ab573216a4020764bde5061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
     },
     {
-      "description": "The host answered msg_a; then the joiner aborts the attempt. The abort ends the attempt and keeps its debit, but changes neither kept value: msg_a again gets the same msg_b, byte for byte. A different payload on the ended attempt gets code_abort, with no debit. An abort for an attempt the host does not have is ignored.",
+      "description": "The host answered msg_a; then the joiner aborts the attempt. The abort ends the attempt and keeps its debit. msg_a again, or any other payload, on the ended attempt gets code_abort, with no debit. An abort for an attempt the host does not have is ignored.",
       "draws": {
         "a": [
           {
@@ -730,7 +731,7 @@
         ]
       },
       "kind": "send_link",
-      "name": "resend_after_the_joiner_aborted",
+      "name": "messages_after_the_joiner_aborted",
       "steps": [
         {
           "conn": 1,
@@ -819,12 +820,12 @@
             {
               "send": {
                 "conn": 1,
-                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad0258622062f95f725a624ede5e2f3a4fa65687901214c4b7444326b97993a9e5f8b8dc3e006886875760e1d84b759a5988cc09e0225ca1fc5f067d1c3909a1bf3106eb6a896cd3b6b24107924f46ffdafd4bc89110cf05e8eeae9faa369133ee6729f58efa",
+                "control": "a3000501509a9ec1a2a6c152e5b938b4dd05f045ad020a",
                 "from": "host"
               }
             }
           ],
-          "reply": "first_reply"
+          "reply": "code_abort"
         },
         {
           "attempt": "current",
@@ -876,7 +877,7 @@
       "ticket": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450f400927857aaf64114f561baacb3797005508c79a1dc1476ab573216a4020764bde5061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
     },
     {
-      "description": "After msg_a, a different payload on the running attempt is read as msg_c: 64 zero bytes are a wrong confirmation, so the attempt fails with code_abort. The kept payload is now those 64 bytes, so msg_a again is a different payload on an ended attempt: code_abort, with no debit.",
+      "description": "After msg_a, a different payload on the running attempt is read as msg_c: 64 zero bytes are a wrong confirmation, so the attempt fails with code_abort. msg_a again, on the ended attempt: code_abort, with no debit.",
       "draws": {
         "a": [
           {
@@ -1208,7 +1209,7 @@
       "ticket": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450f400927857aaf64114f561baacb3797005508c79a1dc1476ab573216a4020764bde5061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
     },
     {
-      "description": "Joiner a's first message is replayed on b's connection. The attempt id was already seen on another connection, so the host refuses it with code_abort before any debit or exchange work, and shows no new code.",
+      "description": "Joiner a's first message is replayed on b's connection. Attempts are kept per connection, so there it is a new attempt: debited first, a fresh code is shown, and the host answers msg_b. It can never succeed: its binding holds b's identity and b's session exporter. Dropping b's connection ends it; the debit stays.",
       "draws": {
         "a": [
           {
@@ -1234,11 +1235,17 @@
           },
           {
             "bytes": "ab855d60925a997603d78a3f20d154abd8ddfa6974eedf6b3784290c606b04fd"
+          },
+          {
+            "u32": 291520
+          },
+          {
+            "bytes": "c961e366b6ea14d411fcc53dea4f44c9bb4d7408de0ea89a53f1ecf3f3d0a462"
           }
         ]
       },
       "kind": "send_link",
-      "name": "attempt_replayed_on_another_connection_is_refused",
+      "name": "attempt_replayed_on_another_connection_is_debited",
       "steps": [
         {
           "conn": 1,
@@ -1316,10 +1323,10 @@
         },
         {
           "conn": 2,
-          "host_attempts_left": 2,
+          "host_attempts_left": 1,
           "host_status": "open",
           "joiner": "a",
-          "new_code": false,
+          "new_code": true,
           "op": "redeliver",
           "out": [
             {
@@ -1330,45 +1337,76 @@
               }
             },
             {
+              "show_code": "291520"
+            },
+            {
               "send": {
                 "conn": 2,
-                "control": "a3000501509a9ec1a2a6c152e5b938b4dd05f045ad020a",
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad025862205493fbda6531e5d9ff7857cdd3f58e0d2e15365878e73ea454fb7979d5f6d54100d44c264e1eb355dc65be0886b42e52f3ec8666b572baad6e8a12e347a8ad01681bbbc37623a213a54cf3d3256f69952f0dd2c73393eb6000f7ad4999ef3bfed5",
                 "from": "host"
               }
             }
           ],
-          "reply": "code_abort"
-        },
-        {
-          "conn": 1,
-          "host_attempts_left": 2,
-          "joiner": "a",
-          "op": "drop",
-          "out": []
+          "reply": "code_exchange"
         },
         {
           "conn": 2,
-          "host_attempts_left": 2,
+          "host_attempts_left": 1,
+          "host_status": "open",
+          "joiner": "b",
+          "op": "drop",
+          "out": []
+        }
+      ],
+      "ticket": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450f400927857aaf64114f561baacb3797005508c79a1dc1476ab573216a4020764bde5061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
+    },
+    {
+      "description": "A join proof made with the host's own identity key, valid for the open invitation: a device never pairs with itself, so the host closes with not_authorized and the invitation stays open (wire.md 10.3).",
+      "draws": {
+        "host": [
+          {
+            "bytes": "f400927857aaf64114f561baacb37970"
+          },
+          {
+            "bytes": "8c79a1dc1476ab573216a4020764bde5"
+          },
+          {
+            "u32": 3678650693
+          }
+        ]
+      },
+      "kind": "send_link",
+      "name": "join_proof_from_own_identity",
+      "steps": [
+        {
+          "closed": [
+            [
+              1,
+              "not_authorized"
+            ]
+          ],
+          "conn": 1,
+          "host_attempts_left": 3,
+          "host_status": "open",
           "joiner": "a",
           "new_code": false,
-          "op": "redeliver",
+          "op": "connect_as_host",
           "out": [
             {
               "send": {
-                "conn": 2,
-                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02582220c295b8339d9905adfcbd09312dcfa1b8dd9b76bb06fa98cc0521cdf3e5d41a6200",
+                "conn": 1,
+                "control": "a400030150f400927857aaf64114f561baacb37970025820770891bc6fef68bd6c60cc550e117137a91dfd5806d83d9bf38200084dd19f07036161",
                 "from": "a"
               }
             },
             {
-              "send": {
-                "conn": 2,
-                "control": "a3000501509a9ec1a2a6c152e5b938b4dd05f045ad020a",
+              "close": {
+                "code": "not_authorized",
+                "conn": 1,
                 "from": "host"
               }
             }
-          ],
-          "reply": "code_abort"
+          ]
         }
       ],
       "ticket": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450f400927857aaf64114f561baacb3797005508c79a1dc1476ab573216a4020764bde5061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
@@ -1756,7 +1794,7 @@
             {
               "send": {
                 "conn": 1,
-                "control": "a400030150f400927857aaf64114f561baacb37970025820e0bb1c0bfede8c1880760e9cb272e5f5562f10f697a5e9626c1ac786520437a1036161",
+                "control": "a400030150f400927857aaf64114f561baacb37970025820e0bb1c0bfede8c1880760e9cb272e5f5562f10f697a5e9626c1ac786520437a10368612028576f726b29",
                 "from": "a"
               }
             },
@@ -1778,7 +1816,7 @@
             {
               "send": {
                 "conn": 2,
-                "control": "a400030150f400927857aaf64114f561baacb3797002582014b2be3c080a051af2b1a3153a97ebfa9411b8d66756b65083e13e8de76c3848036162",
+                "control": "a400030150f400927857aaf64114f561baacb3797002582014b2be3c080a051af2b1a3153a97ebfa9411b8d66756b65083e13e8de76c38480368622028576f726b29",
                 "from": "b"
               }
             },

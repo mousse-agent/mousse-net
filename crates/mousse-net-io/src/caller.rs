@@ -25,32 +25,53 @@
 //!   connection drops after this side confirmed the code and before
 //!   `PAIRED` arrived, the join reconnects with the same joiner to learn the
 //!   outcome before it reports anything.
+//! - The joiner believes an "in person" ticket only from the app's own
+//!   scanner: the app says how the ticket arrived ([`Arrival`]).
+//! - The joiner's flow record (code attempts left, outcome pending) is kept
+//!   in [`FlowRecords`] by ticket hash: loaded when a join starts and
+//!   written whenever the pairing state machine asks, as a compare-and-swap
+//!   that lands before anything that depends on it goes out (wire.md
+//!   10.7): the debit before the attempt's first message, the pending mark
+//!   before this side's confirmation. Reopening a link or restarting the
+//!   app therefore resets nothing, and a crash after the confirmation still
+//!   learns the outcome. The mark is cleared once the app has stored the
+//!   pin and called [`Caller::pin_stored`].
+//! - One join per ticket at a time: a join holds its ticket
+//!   ([`FlowRecords::hold`]) from loading the record until the outcome is
+//!   settled and the pin stored, so another join of the same link, in this
+//!   process or another, cannot clear a pending mark the first still needs.
+//!   It is refused at once instead.
+//! - A caller that sent a `JOIN_PROOF` and has no answer 10 s later closes
+//!   the connection with `NOT_AUTHORIZED` (wire.md 8.2), and the join ends
+//!   without reconnecting.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
-use std::time::Duration;
 
+use mousse_net_core::authz::CallerGateState;
 use mousse_net_core::authz::{CallerGate, CallerTraffic, Traffic, Verdict};
 use mousse_net_core::control::{AuthorizedState, ControlMessage};
 use mousse_net_core::identity::IdentityPublicKey;
 use mousse_net_core::mux::MuxRole;
 use mousse_net_core::pairing::{
-    CodeExchangeFactory, CpaceExchangeFactory, InvitationKind, JoinerAction, JoinerPairing,
-    JoinerState, PairedHost, PairingCode, Ticket,
+    Arrival, CodeExchangeFactory, CpaceExchangeFactory, InvitationKind, JoinerAction, JoinerName,
+    JoinerPairing, JoinerState, PairedHost, PairingCode, Ticket,
 };
 use mousse_net_core::session::{PeerSession, SessionEvent};
 use mousse_net_core::session_cert::CertError;
-use mousse_net_core::{ConnectionId, ErrorCode};
+use mousse_net_core::{ConnectionId, ErrorCode, Millis};
 use tokio::sync::mpsc;
 
 use crate::certs::CertManager;
 use crate::clock::Clock;
 use crate::conn::{self, CloseReason, Cmd, ConnStatus, Connection, Outbox, Role as ConnRole};
 use crate::error::NetError;
-use crate::pipe::{connect_tcp, route_uri, Pipe, Route};
+use crate::limits::{ms, Limits};
+use crate::pipe::{connect_tcp_within, route_uri, Pipe, Route};
 use crate::rng::os_rng;
+use crate::store::{FlowHold, FlowRecords, MemoryFlowRecords};
 use crate::tls::{self, Handshake, TlsPolicy};
 use crate::SharedSigner;
 
@@ -59,7 +80,9 @@ use crate::SharedSigner;
 pub enum JoinOutcome {
     /// The host enrolled this device. Store the pin.
     Paired(PairedHost),
-    /// The host already had a live grant for this device.
+    /// The host grants this device access now. That says nothing about
+    /// which invitation the grant came from: it may be this one (its
+    /// `PAIRED` was lost), another one, or an earlier pairing.
     AlreadyPaired,
 }
 
@@ -129,37 +152,73 @@ pub struct Caller<F: CodeExchangeFactory + Clone = CpaceExchangeFactory> {
     certs: Arc<CertManager>,
     clock: Arc<dyn Clock>,
     policy: TlsPolicy,
+    limits: Limits,
     factory: F,
     paths: Arc<Mutex<Paths>>,
     next_conn: AtomicU64,
+    records: Arc<dyn FlowRecords>,
+    /// Joins that ended paired with their outcome still marked pending,
+    /// by ticket hash, until the app says the pin is stored. Each still
+    /// holds its ticket.
+    settling: Mutex<HashMap<[u8; 32], SharedJoiner<F>>>,
 }
 
 fn lock(paths: &Mutex<Paths>) -> MutexGuard<'_, Paths> {
     paths.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// One join's pairing state, shared by every connection the join uses.
-type SharedJoiner<F> = Arc<Mutex<JoinerPairing<F>>>;
+/// One join's pairing state and where its flow record is kept.
+struct Flow<F: CodeExchangeFactory> {
+    pairing: JoinerPairing<F>,
+    records: Arc<dyn FlowRecords>,
+    /// The last write that failed, reported if the join fails.
+    save_failed: Option<String>,
+    /// This flow's hold on its ticket, released when the flow is dropped:
+    /// when the join ends, or once the pin is stored.
+    _hold: FlowHold,
+}
 
-fn lock_joiner<F: CodeExchangeFactory>(
-    joiner: &Mutex<JoinerPairing<F>>,
-) -> MutexGuard<'_, JoinerPairing<F>> {
+impl<F: CodeExchangeFactory> Flow<F> {
+    /// Carry out the record writes among `actions`, in order, each a
+    /// compare-and-swap (wire.md 10.7). The one place a record is written.
+    /// Returns the other actions; what a write held back comes out only
+    /// after it landed, and is dropped if it failed (the flow then ends).
+    fn run(&mut self, actions: Vec<JoinerAction>) -> Vec<JoinerAction> {
+        let mut queue: VecDeque<JoinerAction> = actions.into();
+        let mut out = Vec::new();
+        while let Some(action) = queue.pop_front() {
+            let JoinerAction::Persist { expected, record } = action else {
+                out.push(action);
+                continue;
+            };
+            let more = match self.records.swap(expected.as_ref(), &record) {
+                Ok(()) => self.pairing.on_persisted(),
+                Err(e) => {
+                    self.save_failed = Some(e.to_string());
+                    self.pairing.on_persist_failed()
+                }
+            };
+            for m in more.into_iter().rev() {
+                queue.push_front(m);
+            }
+        }
+        out
+    }
+}
+
+/// One join's flow, shared by every connection the join uses.
+type SharedJoiner<F> = Arc<Mutex<Flow<F>>>;
+
+fn lock_joiner<F: CodeExchangeFactory>(joiner: &Mutex<Flow<F>>) -> MutexGuard<'_, Flow<F>> {
     joiner.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// How often a join reconnects to learn a pending outcome, and the waits
-/// before each try.
-const OUTCOME_RETRIES: [Duration; 4] = [
-    Duration::from_millis(200),
-    Duration::from_millis(500),
-    Duration::from_secs(1),
-    Duration::from_secs(2),
-];
-
 impl Caller<CpaceExchangeFactory> {
     /// A caller that pairs in person or with a send link (CPace).
-    pub fn new(signer: SharedSigner, clock: Arc<dyn Clock>, policy: TlsPolicy) -> Self {
-        Self::with_factory(signer, clock, policy, CpaceExchangeFactory)
+    /// `limits` is always within the allowed ranges
+    /// ([`Limits::with_overrides`] is the only way to change it).
+    pub fn new(signer: SharedSigner, clock: Arc<dyn Clock>, limits: Limits) -> Self {
+        Self::with_factory(signer, clock, limits, CpaceExchangeFactory)
     }
 }
 
@@ -172,16 +231,51 @@ where
     pub fn with_factory(
         signer: SharedSigner,
         clock: Arc<dyn Clock>,
-        policy: TlsPolicy,
+        limits: Limits,
         factory: F,
     ) -> Self {
         Self {
-            certs: Arc::new(CertManager::new(signer, clock.clone())),
+            certs: Arc::new(CertManager::with_limits(signer, clock.clone(), &limits)),
             clock,
-            policy,
+            policy: TlsPolicy::from_limits(&limits),
+            limits,
             factory,
             paths: Arc::new(Mutex::new(Paths::default())),
             next_conn: AtomicU64::new(1),
+            records: Arc::new(MemoryFlowRecords::default()),
+            settling: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Keep joiner flow records in `records` (by default they are kept in
+    /// memory, for as long as the process runs). An app keeps them in its
+    /// endpoint state ([`crate::Endpoint::flow_records`]).
+    pub fn use_flow_records(&mut self, records: Arc<dyn FlowRecords>) {
+        self.records = records;
+    }
+
+    /// The app has durably stored the pin for the host of `ticket`, after a
+    /// join with it returned. Clears the join's outcome-pending mark, which
+    /// may go only once the result is stored (wire.md 10.7). Until this is
+    /// called the mark stays, so opening the ticket again asks the host
+    /// again; that is safe, only slower.
+    pub fn pin_stored(&self, ticket: &Ticket) -> Result<(), NetError> {
+        let flow = self
+            .settling
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&ticket.hash());
+        let Some(flow) = flow else {
+            return Ok(());
+        };
+        let mut flow = lock_joiner(&flow);
+        let actions = flow.pairing.on_pin_stored();
+        flow.run(actions);
+        match flow.save_failed.take() {
+            Some(e) => Err(NetError::Store(format!(
+                "the pairing record could not be saved: {e}"
+            ))),
+            None => Ok(()),
         }
     }
 
@@ -221,13 +315,14 @@ where
             .unwrap_or_default();
         let mut last = NetError::Refused("no known route to this host".into());
         for route in &routes {
-            let pipe = match connect_tcp(route).await {
-                Ok(pipe) => pipe,
-                Err(e) => {
-                    last = e;
-                    continue;
-                }
-            };
+            let pipe =
+                match connect_tcp_within(route, ms(self.limits.io().connect_timeout_ms())).await {
+                    Ok(pipe) => pipe,
+                    Err(e) => {
+                        last = e;
+                        continue;
+                    }
+                };
             let conn = match self.connect(pipe, pin).await {
                 Ok(conn) => conn,
                 Err(NetError::PeerCertificate(CertError::PinMismatch)) => continue,
@@ -257,7 +352,7 @@ where
             let events = paths
                 .sessions
                 .entry(pin)
-                .or_insert_with(|| PeerSession::new(pin))
+                .or_insert_with(|| PeerSession::with_limits(pin, self.limits.core()))
                 .begin_path(conn);
             paths.run(events);
         }
@@ -266,7 +361,7 @@ where
         let session = paths
             .sessions
             .entry(pin)
-            .or_insert_with(|| PeerSession::new(pin));
+            .or_insert_with(|| PeerSession::with_limits(pin, self.limits.core()));
         match result {
             Ok((stream, handshake)) => {
                 match session.on_authenticated(
@@ -274,6 +369,7 @@ where
                     &handshake.peer,
                     handshake.local_window,
                     self.clock.now(),
+                    self.clock.mono(),
                 ) {
                     Ok(events) => paths.run(events),
                     // The control build lets a different identity through.
@@ -301,10 +397,11 @@ where
     ) -> Connection {
         let (cmd_tx, cmd_rx) = conn::channel();
         lock(&self.paths).conns.insert(conn, cmd_tx.clone());
+        let skew = self.limits.core().clock_skew_secs();
         let deadline = handshake
             .local_window
-            .effective_deadline()
-            .min(handshake.peer.window.effective_deadline());
+            .deadline_with_skew(skew)
+            .min(handshake.peer.window.deadline_with_skew(skew));
         let (joiner, proof) = match joiner {
             Some((j, p)) => (Some(j), Some(p)),
             None => (None, None),
@@ -313,6 +410,9 @@ where
             gate: CallerGate::new(),
             joiner,
             proof,
+            answer_due: None,
+            answer_wait_ms: self.limits.io().proof_answer_wait_ms(),
+            clock: self.clock.clone(),
             paths: self.paths.clone(),
             conn,
             pin,
@@ -326,6 +426,7 @@ where
                 kx_group: handshake.kx_group,
                 deadline,
                 clock: self.clock.clone(),
+                limits: self.limits,
             },
             Box::new(role),
             cmd_tx,
@@ -387,25 +488,31 @@ where
     /// Dial the host pinned as `pin` at the first of `routes` that answers
     /// as that host, over TCP.
     ///
-    /// A candidate whose identity is not the pin is another endpoint (for
+    /// Any step 1 failure on a candidate means "not this host here": a
+    /// candidate whose identity is not the pin is another endpoint (for
     /// example another profile on the same computer, or a device that took
-    /// the address): it is skipped without a warning and never re-pinned.
-    /// Once the pinned host itself refuses (for example `NOT_AUTHORIZED`),
-    /// the refusal is returned and no further candidate is tried.
+    /// the address), and it is skipped without a warning and never
+    /// re-pinned; the same goes for any other certificate failure. Only when
+    /// no candidate passed is a certificate failure reported, the window
+    /// one (a clock problem) first. Once the pinned host itself refuses (for
+    /// example `NOT_AUTHORIZED`), the refusal is returned and no further
+    /// candidate is tried.
     pub async fn dial_candidates(
         &self,
         routes: &[Route],
         pin: IdentityPublicKey,
     ) -> Result<(Connection, Route), NetError> {
         let mut last = None;
+        let mut step1 = Step1Failures::default();
         for route in routes {
-            let pipe = match connect_tcp(route).await {
-                Ok(pipe) => pipe,
-                Err(e) => {
-                    last = Some(e);
-                    continue;
-                }
-            };
+            let pipe =
+                match connect_tcp_within(route, ms(self.limits.io().connect_timeout_ms())).await {
+                    Ok(pipe) => pipe,
+                    Err(e) => {
+                        last = Some(e);
+                        continue;
+                    }
+                };
             match self.dial(pipe, pin).await {
                 Ok(conn) => {
                     let mut order = vec![route.clone()];
@@ -413,10 +520,13 @@ where
                     self.remember_routes(pin, order);
                     return Ok((conn, route.clone()));
                 }
-                Err(NetError::PeerCertificate(CertError::PinMismatch)) => continue,
+                Err(NetError::PeerCertificate(e)) => step1.note(e),
                 Err(e @ NetError::Closed(_)) => return Err(e),
                 Err(e) => last = Some(e),
             }
+        }
+        if let Some(e) = step1.report() {
+            return Err(e);
         }
         Err(last.unwrap_or_else(|| {
             NetError::Refused(format!(
@@ -427,14 +537,18 @@ where
     }
 
     /// Pair with the host in an in-person `ticket` over `pipe`. Waits for
-    /// the host owner's approval.
+    /// the host owner's approval. `arrival` says how the ticket reached
+    /// this device: an in-person ticket is accepted only from
+    /// [`Arrival::InAppScan`].
     pub async fn join<P: Pipe>(
         &self,
         pipe: P,
         ticket: &Ticket,
+        arrival: Arrival,
         name: &str,
     ) -> Result<(Connection, JoinOutcome), NetError> {
-        self.join_with_code(pipe, ticket, name, &mut NoCode).await
+        self.join_with_code(pipe, ticket, arrival, name, &mut NoCode)
+            .await
     }
 
     /// Pair with the host in `ticket` over `pipe`. In person, wait for the
@@ -446,6 +560,7 @@ where
         &self,
         pipe: P,
         ticket: &Ticket,
+        arrival: Arrival,
         name: &str,
         codes: &mut C,
     ) -> Result<(Connection, JoinOutcome), NetError> {
@@ -454,7 +569,7 @@ where
                 "no address to reconnect to".into(),
             )))
         };
-        self.join_with_redial(pipe, ticket, name, codes, false, no_redial)
+        self.join_with_redial(pipe, ticket, arrival, name, codes, false, no_redial)
             .await
     }
 
@@ -466,14 +581,91 @@ where
     ///   after this side confirmed the code and before `PAIRED` arrived,
     ///   the join reconnects through it (a few times, with short waits) and
     ///   keeps the same pairing state, so the host's answer settles the
-    ///   outcome: `AUTHORIZED {live}` means it enrolled this device.
+    ///   outcome: `PAIRED` means this invitation enrolled the device, and
+    ///   `AUTHORIZED {live}` means it has access that this invitation did
+    ///   not give (its role is not in effect), reported as
+    ///   [`JoinOutcome::AlreadyPaired`].
+    ///
+    /// After storing the pin for a successful join, call
+    /// [`Caller::pin_stored`].
+    ///
+    /// A refusal before dialing (an in-person ticket that did not come from
+    /// the in-app scanner, this device's own ticket, an expired ticket, no
+    /// attempts left) is [`NetError::Join`]; its `code()` is the error the
+    /// app reports.
+    #[allow(clippy::too_many_arguments)]
     pub async fn join_with_redial<P, C, D, Fut>(
         &self,
         pipe: P,
         ticket: &Ticket,
+        arrival: Arrival,
         name: &str,
         codes: &mut C,
         host_pinned: bool,
+        redial: D,
+    ) -> Result<(Connection, JoinOutcome), NetError>
+    where
+        P: Pipe,
+        C: CodeEntry,
+        D: FnMut() -> Fut,
+        Fut: Future<Output = Result<P, NetError>>,
+    {
+        // A join of this ticket that ended paired and was never settled
+        // gives way: its pending mark stays stored, and this join learns
+        // the outcome again.
+        self.settling
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&ticket.hash());
+        let hold = self.records.hold(&ticket.hash())?;
+        let stored = self.records.load(&ticket.hash())?;
+        let mut pairing = JoinerPairing::with_limits(
+            ticket.clone(),
+            arrival,
+            self.identity(),
+            // The app composes the name for the ticket's kind (wire.md
+            // 10.3), so it is passed through as is.
+            JoinerName {
+                computer: name.to_owned(),
+                profile: None,
+            },
+            self.factory.clone(),
+            stored.as_ref(),
+            self.clock.now(),
+            self.limits.core(),
+        )
+        .map_err(NetError::Join)?;
+        pairing.set_host_pinned(host_pinned);
+        let joiner: SharedJoiner<F> = Arc::new(Mutex::new(Flow {
+            pairing,
+            records: self.records.clone(),
+            save_failed: None,
+            _hold: hold,
+        }));
+        let result = self
+            .join_redialling(pipe, ticket, &joiner, codes, redial)
+            .await;
+        let mut flow = lock_joiner(&joiner);
+        if result.is_ok() && flow.pairing.outcome_pending() {
+            self.settling
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(ticket.hash(), joiner.clone());
+        }
+        match (result, flow.save_failed.take()) {
+            (Err(_), Some(e)) => Err(NetError::Store(format!(
+                "the pairing record could not be saved: {e}"
+            ))),
+            (result, _) => result,
+        }
+    }
+
+    async fn join_redialling<P, C, D, Fut>(
+        &self,
+        pipe: P,
+        ticket: &Ticket,
+        joiner: &SharedJoiner<F>,
+        codes: &mut C,
         mut redial: D,
     ) -> Result<(Connection, JoinOutcome), NetError>
     where
@@ -482,23 +674,13 @@ where
         D: FnMut() -> Fut,
         Fut: Future<Output = Result<P, NetError>>,
     {
-        let mut joiner = JoinerPairing::new(
-            ticket.clone(),
-            self.identity(),
-            name.to_owned(),
-            self.factory.clone(),
-            self.clock.now(),
-        )
-        .map_err(|e| NetError::Ticket(e.to_string()))?;
-        joiner.set_host_pinned(host_pinned);
-        let joiner: SharedJoiner<F> = Arc::new(Mutex::new(joiner));
-        let mut result = self.join_once(pipe, ticket, &joiner, codes).await;
-        let mut retries = OUTCOME_RETRIES.iter();
+        let mut result = self.join_once(pipe, ticket, joiner, codes).await;
+        let mut retries = self.limits.outcome_retry_waits().into_iter();
         // Reconnect only while the outcome is unknown. A refusal the host
         // gave (or the joiner reached) on a reconnect is the answer: the
         // flow has failed, and that refusal is what the join reports.
-        while result.is_err() && lock_joiner(&joiner).outcome_pending() {
-            if matches!(lock_joiner(&joiner).state(), JoinerState::Failed(_)) {
+        while result.is_err() && lock_joiner(joiner).pairing.outcome_pending() {
+            if matches!(lock_joiner(joiner).pairing.state(), JoinerState::Failed(_)) {
                 break;
             }
             let Some(wait) = retries.next() else {
@@ -508,9 +690,9 @@ where
                         .into(),
                 ));
             };
-            tokio::time::sleep(*wait).await;
+            tokio::time::sleep(wait).await;
             result = match redial().await {
-                Ok(pipe) => self.join_once(pipe, ticket, &joiner, codes).await,
+                Ok(pipe) => self.join_once(pipe, ticket, joiner, codes).await,
                 Err(e) => Err(e),
             };
         }
@@ -527,16 +709,20 @@ where
     ) -> Result<(Connection, JoinOutcome), NetError> {
         let pin = ticket.host_identity;
         let (conn, stream, handshake) = self.handshake(pipe, pin).await?;
-        let proof = lock_joiner(joiner).on_connected(handshake.exporters, self.clock.now());
+        let proof = {
+            let mut flow = lock_joiner(joiner);
+            flow.pairing
+                .on_connected(handshake.exporters, self.clock.now())
+        };
         let proof = match proof {
             Ok(proof) => proof,
             Err(e) => {
                 lock(&self.paths)
                     .sessions
                     .entry(pin)
-                    .or_insert_with(|| PeerSession::new(pin))
+                    .or_insert_with(|| PeerSession::with_limits(pin, self.limits.core()))
                     .on_path_closed(conn);
-                return Err(NetError::Ticket(e.to_string()));
+                return Err(NetError::Join(e));
             }
         };
         let connection = self.start(conn, stream, handshake, pin, Some((joiner.clone(), proof)));
@@ -598,7 +784,13 @@ where
     F: CodeExchangeFactory + Clone + Send + Sync + 'static,
     F::Exchange: Send,
 {
-    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    let Some(recheck) = caller
+        .upgrade()
+        .map(|caller| ms(caller.limits.io().clock_recheck_ms()))
+    else {
+        return;
+    };
+    let mut interval = tokio::time::interval(recheck);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         interval.tick().await;
@@ -609,12 +801,13 @@ where
             return;
         }
         let now = caller.clock.now();
+        let mono = caller.clock.mono();
         let due: Vec<(IdentityPublicKey, ConnectionId)> = {
             let mut paths = lock(&caller.paths);
             let mut due = Vec::new();
             let mut other = Vec::new();
             for (pin, session) in paths.sessions.iter_mut() {
-                for event in session.tick(now) {
+                for event in session.tick(now, mono) {
                     match event {
                         SessionEvent::RenewDue { conn } => due.push((*pin, conn)),
                         event => other.push(event),
@@ -642,20 +835,63 @@ where
     }
 }
 
+/// Step 1 failures on candidate addresses, reported only when no candidate
+/// passed (wire.md 5.4). Note each one and try the next address.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Step1Failures {
+    window: Option<CertError>,
+    other: Option<CertError>,
+}
+
+impl Step1Failures {
+    /// A candidate failed step 1 with `e`.
+    pub fn note(&mut self, e: CertError) {
+        match e {
+            CertError::OutsideWindow => self.window = Some(e),
+            e => self.other = Some(e),
+        }
+    }
+
+    /// The failure to show: the window one (the clock message) first. A
+    /// pin mismatch alone is no failure of this host, so it is not shown.
+    pub fn report(&self) -> Option<NetError> {
+        self.window
+            .or(self.other.filter(|e| *e != CertError::PinMismatch))
+            .map(NetError::PeerCertificate)
+    }
+}
+
 struct CallerRole<F: CodeExchangeFactory> {
     gate: CallerGate,
     joiner: Option<SharedJoiner<F>>,
     proof: Option<ControlMessage>,
+    /// When the answer to our `JOIN_PROOF` is due, once it is sent.
+    answer_due: Option<Millis>,
+    /// How long the answer may take
+    /// ([`IoLimits::proof_answer_wait_ms`](crate::limits::IoLimits::proof_answer_wait_ms)).
+    answer_wait_ms: u64,
+    clock: Arc<dyn Clock>,
     paths: Arc<Mutex<Paths>>,
     conn: ConnectionId,
     pin: IdentityPublicKey,
 }
 
 impl<F: CodeExchangeFactory> CallerRole<F> {
+    /// Our `JOIN_PROOF` went out and the host has not answered it: no
+    /// `AUTHORIZED` yet, or only step 2's `live` notice.
+    fn awaiting_answer(&self) -> bool {
+        matches!(
+            self.gate.state(),
+            CallerGateState::AwaitingAuthorization | CallerGateState::AwaitingProofAnswer
+        )
+    }
+
     fn joiner_actions(&mut self, actions: Vec<JoinerAction>, out: &mut Outbox) {
         for action in actions {
             match action {
                 JoinerAction::Send(message) => out.control.push(message),
+                // `Flow::run` carries out every write first.
+                JoinerAction::Persist { .. } => {}
                 JoinerAction::Paired(host) => {
                     self.gate.promote();
                     out.status = Some(ConnStatus::Paired(host));
@@ -684,6 +920,28 @@ where
     fn on_start(&mut self, out: &mut Outbox) {
         if let Some(proof) = self.proof.take() {
             out.control.push(proof);
+            self.gate.sent_join_proof();
+            self.answer_due = Some(self.clock.mono().plus(self.answer_wait_ms));
+        }
+    }
+
+    fn wake_at(&self) -> Option<Millis> {
+        self.answer_due.filter(|_| self.awaiting_answer())
+    }
+
+    fn on_wake(&mut self, mono: Millis, out: &mut Outbox) {
+        if self.awaiting_answer() && self.answer_due.is_some_and(|due| mono >= due) {
+            // The flow ends here, also while it learns a pending outcome:
+            // the join does not reconnect (wire.md 10.6 rule 7).
+            if let Some(joiner) = self.joiner.clone() {
+                let mut flow = lock_joiner(&joiner);
+                let actions = flow.pairing.on_proof_timeout();
+                let actions = flow.run(actions);
+                drop(flow);
+                self.joiner_actions(actions, out);
+            }
+            self.gate.close(ErrorCode::NotAuthorized);
+            out.close = Some(ErrorCode::NotAuthorized);
         }
     }
 
@@ -712,7 +970,8 @@ where
             }
             return;
         };
-        let mut joiner = lock_joiner(&joiner);
+        let mut flow = lock_joiner(&joiner);
+        let joiner = &mut flow.pairing;
         let actions = match message {
             ControlMessage::Authorized { state } => {
                 let actions = joiner.on_authorized(state);
@@ -734,15 +993,25 @@ where
             ControlMessage::CodeAbort { attempt, .. } => joiner.on_code_abort(attempt),
             _ => vec![JoinerAction::Failed(ErrorCode::ProtocolError)],
         };
-        drop(joiner);
+        // Writes land before what they hold; a failed one ends the flow.
+        let actions = flow.run(actions);
+        drop(flow);
         self.joiner_actions(actions, out);
     }
 
     fn on_code(&mut self, code: PairingCode, out: &mut Outbox) {
         let actions = match &self.joiner {
-            Some(joiner) => lock_joiner(joiner)
-                .submit_code(&code, &mut os_rng())
-                .unwrap_or_else(|_| vec![JoinerAction::Failed(ErrorCode::ProtocolError)]),
+            Some(joiner) => {
+                let mut flow = lock_joiner(joiner);
+                match flow.pairing.submit_code(&code, &mut os_rng()) {
+                    // The debit is saved before the attempt's first message
+                    // goes out; without that save the message never does.
+                    Ok(actions) => flow.run(actions),
+                    Err(e) => vec![JoinerAction::Failed(
+                        e.code().unwrap_or(ErrorCode::ProtocolError),
+                    )],
+                }
+            }
             None => vec![JoinerAction::Failed(ErrorCode::ProtocolError)],
         };
         self.joiner_actions(actions, out);
@@ -754,7 +1023,9 @@ where
 
     fn on_closed(&mut self, reason: &CloseReason) {
         if let Some(joiner) = &self.joiner {
-            let _ = lock_joiner(joiner).on_closed(reason.code());
+            let mut flow = lock_joiner(joiner);
+            let actions = flow.pairing.on_closed(reason.code());
+            flow.run(actions);
         }
         self.gate.close(reason.code().unwrap_or(ErrorCode::NoError));
         let mut paths = lock(&self.paths);

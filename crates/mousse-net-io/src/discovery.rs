@@ -3,7 +3,7 @@
 //!
 //! The advertised record says only "a Mousse host is listening here": the
 //! instance name and the mDNS host name are random, change on every start
-//! and every [`ROTATE_EVERY_MS`], and the TXT record carries just the
+//! and every [`IoLimits::mdns_rotate_ms`], and the TXT record carries just the
 //! protocol version. Nothing in it names the device or its identity. A
 //! caller that is looking for a paired host tries each address it finds;
 //! TLS with the stored pin tells the right host from the others.
@@ -19,13 +19,11 @@ use rand_core::CryptoRng;
 
 use crate::clock::Clock;
 use crate::error::NetError;
+use crate::limits::{ms, IoLimits};
 use crate::rng::os_rng;
 
 /// The DNS-SD service type.
 pub const SERVICE_TYPE: &str = "_mousse._tcp.local.";
-
-/// How often the instance name changes while running (15 minutes).
-pub const ROTATE_EVERY_MS: u64 = 15 * 60 * 1000;
 
 /// Prefix of every instance name.
 pub const NAME_PREFIX: &str = "mousse-";
@@ -109,10 +107,12 @@ pub struct Advertiser {
 }
 
 impl Advertiser {
-    /// Start advertising `port`. Opens multicast sockets.
-    pub fn start(port: u16, clock: Arc<dyn Clock>) -> Result<Self, NetError> {
+    /// Start advertising `port`, rotating the name as `limits` say. Opens
+    /// multicast sockets.
+    pub fn start(port: u16, clock: Arc<dyn Clock>, limits: &IoLimits) -> Result<Self, NetError> {
         let daemon = ServiceDaemon::new().map_err(mdns_err)?;
-        let rotating = RotatingName::new(&mut os_rng(), clock.mono(), ROTATE_EVERY_MS);
+        let rotating = RotatingName::new(&mut os_rng(), clock.mono(), limits.mdns_rotate_ms());
+        let check = ms(limits.mdns_rotate_check_ms());
         daemon
             .register(service(rotating.current(), port)?)
             .map_err(mdns_err)?;
@@ -121,7 +121,7 @@ impl Advertiser {
         let task_name = name.clone();
         let task = tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                tokio::time::sleep(check).await;
                 let mut guard = match task_name.lock() {
                     Ok(guard) => guard,
                     Err(_) => return,
@@ -196,7 +196,7 @@ mod tests {
         let mut r = os_rng();
         let names: BTreeSet<String> = (0..64)
             .map(|_| {
-                RotatingName::new(&mut r, Millis(0), ROTATE_EVERY_MS)
+                RotatingName::new(&mut r, Millis(0), IoLimits::DEFAULT.mdns_rotate_ms())
                     .current()
                     .to_owned()
             })

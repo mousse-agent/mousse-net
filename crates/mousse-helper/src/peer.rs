@@ -5,13 +5,14 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use mousse_net_core::pairing::{InvitationKind, Route, Ticket};
+use mousse_net_core::pairing::{Arrival, InvitationKind, Route, Ticket, CODE_FAILED_MESSAGE};
+use mousse_net_core::session_cert::CertError;
 use mousse_net_core::ErrorCode;
-use mousse_net_io::pipe::{connect_tcp, parse_route, route_uri};
+use mousse_net_io::pipe::{connect_tcp_within, parse_route, route_uri};
 use mousse_net_io::store::{hex, short_id, PeerRecord, PeerStore};
 use mousse_net_io::{
-    Caller, CloseReason, CodeEntry, Connection, Endpoint, JoinOutcome, NetError, SystemClock,
-    TlsPolicy,
+    Caller, CloseReason, CodeEntry, Connection, Endpoint, JoinOutcome, NetError, Step1Failures,
+    SystemClock,
 };
 use serde_json::json;
 
@@ -25,16 +26,19 @@ pub struct CallerSide {
 
 impl CallerSide {
     /// Open the endpoint in `dir` (taking its lock) and load its key.
+    /// Pairing flow records (attempts left per ticket) live in the
+    /// endpoint's owner-only state, so they survive a restart.
     pub fn open(dir: &Path, insecure_file_key: bool) -> Result<Self, String> {
         let endpoint = crate::open_endpoint(dir, true)?;
         let key = endpoint
             .load_identity(insecure_file_key)
             .map_err(|e| e.to_string())?;
-        let caller = Caller::new(
+        let mut caller = Caller::new(
             Arc::new(key),
             Arc::new(SystemClock::new()),
-            TlsPolicy::default(),
+            crate::limits::get().net,
         );
+        caller.use_flow_records(Arc::new(endpoint.flow_records()));
         Ok(Self { endpoint, caller })
     }
 
@@ -49,7 +53,13 @@ pub fn parse_ticket(text: &str) -> Result<Ticket, String> {
     Ticket::from_fragment(fragment).map_err(|e| format!("bad ticket: {e:?}"))
 }
 
-fn now_secs() -> u64 {
+/// How long a TCP connect may take (`CONNECT_TIMEOUT_MS`).
+fn connect_timeout() -> Duration {
+    crate::limits::ms(crate::limits::get().net.io().connect_timeout_ms())
+}
+
+/// Wall-clock now, in Unix seconds.
+pub fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -80,10 +90,13 @@ impl CodeEntry for TypedCode {
     async fn code(&mut self, retry: Option<u8>) -> Option<String> {
         match retry {
             None => println!("Type the 6-digit code shown on the host:"),
-            Some(left) => println!(
-                "Wrong code. Type the new code shown on the host ({left} {} left):",
-                if left == 1 { "try" } else { "tries" }
-            ),
+            Some(left) => {
+                println!("{CODE_FAILED_MESSAGE}");
+                println!(
+                    "Type the new code shown on the host ({left} {} left):",
+                    if left == 1 { "try" } else { "tries" }
+                );
+            }
         }
         tokio::task::spawn_blocking(|| {
             let mut line = String::new();
@@ -139,18 +152,47 @@ pub fn reason_of(e: &NetError) -> String {
             Some(code) => code.name().to_lowercase(),
             None => "connection_dropped".into(),
         },
+        NetError::Join(e) => match e.code() {
+            Some(code) => code.name().to_lowercase(),
+            None => "pairing_refused".into(),
+        },
+        NetError::Store(_) => "store".into(),
         _ => "error".into(),
     }
 }
 
+/// The name a joining device sends in its join proof (wire.md 10.3): with
+/// a send link the computer name only, since the far end has not yet shown
+/// it is the real host; in person the name chosen (default: the computer
+/// name).
+pub fn join_name(ticket: &Ticket, chosen: Option<String>, computer: String) -> String {
+    match (ticket.kind, chosen) {
+        (InvitationKind::SendLink, Some(_)) => {
+            println!("a send link sends only this computer's name; --name is not used");
+            computer
+        }
+        (_, chosen) => chosen.unwrap_or(computer),
+    }
+}
+
 /// Pair with the host in `ticket`, trying `routes` (default: the ticket's).
-/// Stores the host's pin on success.
+/// `arrival` says how the ticket reached this device: an in-person ticket
+/// pairs only from a scan of the host's screen. Stores the host's pin on
+/// success.
 pub async fn join(
     side: &CallerSide,
     ticket: &Ticket,
+    arrival: Arrival,
     name: &str,
     routes: &[String],
 ) -> Result<(Connection, PeerRecord), Failure> {
+    if ticket.kind == InvitationKind::InPerson && arrival == Arrival::Link {
+        return Err(Failure::new(
+            "this is an in-person ticket: scan it from the host's screen (pass --in-person \
+             only when you did); a ticket sent another way cannot pair (PAIRING_FAILED)",
+            "pairing_failed",
+        ));
+    }
     let candidates = if routes.is_empty() {
         usable_routes(&ticket.routes)
     } else {
@@ -173,9 +215,12 @@ pub async fn join(
         println!("joining; the host owner is asked to confirm");
     }
     let mut last = Failure::new("no route answered", "unreachable");
+    // Any step 1 failure on an address means "try the next one"; one is
+    // shown only when no address passed (wire.md 5.4).
+    let mut step1 = Step1Failures::default();
     for route in &candidates {
         let hint = route_uri(route);
-        let pipe = match connect_tcp(route).await {
+        let pipe = match connect_tcp_within(route, connect_timeout()).await {
             Ok(p) => p,
             Err(e) => {
                 last = Failure::new(format!("{hint}: {e}"), "unreachable");
@@ -184,10 +229,10 @@ pub async fn join(
         };
         // If the connection drops before PAIRED, the join reconnects here
         // to learn whether the host enrolled this device.
-        let redial = || connect_tcp(route);
+        let redial = || connect_tcp_within(route, connect_timeout());
         match side
             .caller
-            .join_with_redial(pipe, ticket, name, &mut TypedCode, pinned, redial)
+            .join_with_redial(pipe, ticket, arrival, name, &mut TypedCode, pinned, redial)
             .await
         {
             Ok((conn, outcome)) => {
@@ -213,23 +258,34 @@ pub async fn join(
                 side.peers()
                     .upsert(record.clone())
                     .map_err(|e| Failure::new(e.to_string(), "store"))?;
+                // The pin is stored: the join's outcome is no longer pending.
+                side.caller
+                    .pin_stored(ticket)
+                    .map_err(|e| Failure::new(e.to_string(), "store"))?;
                 side.caller
                     .remember_routes(ticket.host_identity, vec![route.clone()]);
                 return Ok((conn, record));
             }
             // Another endpoint at this address: try the next one.
-            Err(NetError::PeerCertificate(
-                mousse_net_core::session_cert::CertError::PinMismatch,
-            )) => {
+            Err(NetError::PeerCertificate(CertError::PinMismatch)) => {
+                step1.note(CertError::PinMismatch);
                 last = Failure::new(
                     format!("{hint}: another device answered (pin mismatch)"),
                     "pin_mismatch",
                 );
             }
+            // Any other step 1 failure: the next address may pass.
+            Err(NetError::PeerCertificate(e)) => {
+                step1.note(e);
+                last = Failure::of(&NetError::PeerCertificate(e));
+            }
             Err(e) => return Err(Failure::of(&e)),
         }
     }
-    Err(last)
+    match step1.report() {
+        Some(e) => Err(Failure::of(&e)),
+        None => Err(last),
+    }
 }
 
 /// A readable reason for a failed or closed connection.
@@ -237,6 +293,10 @@ pub fn describe(e: &NetError) -> String {
     match e {
         NetError::Closed(reason) => describe_close(reason),
         NetError::PeerCertificate(c) => format!("the host's identity was refused: {c}"),
+        NetError::Join(e) => match e.code() {
+            Some(code) => format!("pairing: {e} ({})", code.name().to_uppercase()),
+            None => format!("pairing: {e}"),
+        },
         other => other.to_string(),
     }
 }
@@ -251,9 +311,9 @@ fn describe_close(reason: &CloseReason) -> String {
             "the ticket is used, expired or unknown (INVITATION_INVALID)".into()
         }
         Some(ErrorCode::PairingDeclined) => "the host owner said no (PAIRING_DECLINED)".into(),
-        Some(ErrorCode::AttemptsExhausted) => {
-            "too many wrong codes; the invitation ended (ATTEMPTS_EXHAUSTED)".into()
-        }
+        Some(ErrorCode::AttemptsExhausted) => format!(
+            "{CODE_FAILED_MESSAGE} No tries are left; the invitation ended (ATTEMPTS_EXHAUSTED)"
+        ),
         _ => format!("connection closed: {reason}"),
     }
 }
@@ -349,7 +409,10 @@ pub async fn term(side: &CallerSide, query: &str, routes: &[String], argv: Vec<S
 /// Options for the cross-machine slice check.
 pub struct SliceCheck {
     pub ticket: String,
-    pub name: String,
+    /// How the ticket reached this device.
+    pub arrival: Arrival,
+    /// The name chosen with --name (see [`join_name`]).
+    pub name: Option<String>,
     pub routes: Vec<String>,
     pub command: Vec<String>,
     pub removal_timeout: Duration,
@@ -457,9 +520,14 @@ async fn run_slice(side: &CallerSide, opts: &SliceCheck, steps: &mut Steps) {
         Ok(t) => t,
         Err(e) => return steps.fail(format!("ticket: {e}"), "bad_ticket"),
     };
-    let (conn, peer) = match join(side, &ticket, &opts.name, &opts.routes).await {
+    let what = match ticket.kind {
+        InvitationKind::SendLink => "pair with a send link",
+        _ => "pair in person",
+    };
+    let name = join_name(&ticket, opts.name.clone(), crate::computer_name());
+    let (conn, peer) = match join(side, &ticket, opts.arrival, &name, &opts.routes).await {
         Ok(v) => v,
-        Err(e) => return steps.fail(format!("pair in person: {}", e.text), &e.reason),
+        Err(e) => return steps.fail(format!("{what}: {}", e.text), &e.reason),
     };
     steps.pass(format!(
         "paired with {} ({}) via {} using {}",
@@ -528,7 +596,7 @@ async fn run_slice(side: &CallerSide, opts: &SliceCheck, steps: &mut Steps) {
     }
     println!(
         "WAITING remove this device on the host (grant for {:?}) within {} s",
-        opts.name,
+        name,
         opts.removal_timeout.as_secs()
     );
     let drain = async {
@@ -588,19 +656,22 @@ async fn host_build(conn: &Connection) -> Result<String, String> {
     // The request is the stream itself: nothing more is sent, so the
     // request side ends here and the host sees a clean FIN.
     wr.finish();
+    let limits = crate::limits::helper();
+    let max = usize::try_from(limits.info_answer_max_bytes()).unwrap_or(usize::MAX);
     let read = async {
         let mut bytes = Vec::new();
         while let Some(chunk) = rd.read().await.map_err(|e| describe(&e))? {
             bytes.extend(chunk);
-            if bytes.len() > 4096 {
+            if bytes.len() > max {
                 return Err("the host's answer is too long".to_string());
             }
         }
         Ok(bytes)
     };
-    let bytes = tokio::time::timeout(Duration::from_secs(10), read)
+    let wait = crate::limits::ms(limits.info_answer_wait_ms());
+    let bytes = tokio::time::timeout(wait, read)
         .await
-        .map_err(|_| "no answer in 10 s".to_string())??;
+        .map_err(|_| format!("no answer in {}", crate::limits::describe(wait)))??;
     let info: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|e| format!("bad answer: {e}"))?;
     info.get("build")
@@ -644,8 +715,12 @@ async fn capture(conn: &Connection, argv: Vec<String>) -> Result<(i32, String), 
             }
         }
     };
-    let code = tokio::time::timeout(Duration::from_secs(30), read)
-        .await
-        .map_err(|_| "the command did not finish in 30 s".to_string())??;
+    let wait = crate::limits::ms(crate::limits::helper().capture_wait_ms());
+    let code = tokio::time::timeout(wait, read).await.map_err(|_| {
+        format!(
+            "the command did not finish in {}",
+            crate::limits::describe(wait)
+        )
+    })??;
     Ok((code, String::from_utf8_lossy(&output).into_owned()))
 }

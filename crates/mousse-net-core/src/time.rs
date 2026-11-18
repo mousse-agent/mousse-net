@@ -1,11 +1,5 @@
 //! Explicit time values. Core never reads a clock.
 
-/// Allowed clock difference between two devices, in seconds (±10 minutes).
-///
-/// The same rule applies everywhere a signed time is checked: certificate
-/// windows, live-session deadlines and ticket expiry on the joiner.
-pub const CLOCK_SKEW_SECS: u64 = 600;
-
 /// Wall-clock time in whole seconds since the Unix epoch (UTC).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct UnixTime(pub u64);

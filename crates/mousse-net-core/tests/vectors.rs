@@ -91,7 +91,8 @@ fn session_certificates() {
 
     // Rebuilding the certificate from its parts gives the same bytes.
     let pending = PendingCertificate::new(sk, ValidityWindow::new(nb, na).expect("window"));
-    assert_eq!(pending.record(), record.as_slice());
+    assert_eq!(pending.record().as_bytes(), record.as_slice());
+    assert_eq!(pending.record().domain(), session_cert::SESSION_DOMAIN);
     let cert = pending.finish(id.public_key(), sig).expect("finish");
     assert_eq!(cert.der(), unhex(&v["certificate"]));
     let der = cert.der();
@@ -153,13 +154,13 @@ fn live_path_closes_at_certificate_expiry() {
     let conn = ConnectionId(1);
     session.begin_path(conn);
     session
-        .on_authenticated(conn, &peer, local, at)
+        .on_authenticated(conn, &peer, local, at, mono(at, at))
         .expect("authenticated");
     session.on_reopened(conn).expect("reopened");
     let path = *session.current().expect("current");
     assert_eq!(path.renew_at, UnixTime(u(&doc["renew_at"])));
     assert_eq!(path.deadline, UnixTime(u(&doc["deadline"])));
-    check_ticks(&mut session, &doc["ticks"]);
+    check_ticks(&mut session, at, &doc["ticks"]);
 
     // The same path again; after the first request a new path with the
     // same certificates becomes current. The retries keep their schedule.
@@ -167,18 +168,21 @@ fn live_path_closes_at_certificate_expiry() {
     let mut session = PeerSession::new(pin);
     session.begin_path(conn);
     session
-        .on_authenticated(conn, &peer, local, at)
+        .on_authenticated(conn, &peer, local, at, mono(at, at))
         .expect("authenticated");
     session.on_reopened(conn).expect("reopened");
-    assert_eq!(session.tick(path.renew_at).len(), 1);
+    assert_eq!(
+        session.tick(path.renew_at, mono(at, path.renew_at)).len(),
+        1
+    );
     let switch_at = UnixTime(u(&switch["switch_at"]));
     let second = ConnectionId(2);
     session.begin_path(second);
     session
-        .on_authenticated(second, &peer, local, switch_at)
+        .on_authenticated(second, &peer, local, switch_at, mono(at, switch_at))
         .expect("authenticated");
     session.on_reopened(second).expect("reopened");
-    check_ticks(&mut session, &switch["ticks"]);
+    check_ticks(&mut session, at, &switch["ticks"]);
 
     // A retry skipped while a candidate comes up still counts, also the
     // first request at the renewal time.
@@ -189,22 +193,39 @@ fn live_path_closes_at_certificate_expiry() {
         let mut session = PeerSession::new(pin);
         session.begin_path(conn);
         session
-            .on_authenticated(conn, &peer, local, at)
+            .on_authenticated(conn, &peer, local, at, mono(at, at))
             .expect("authenticated");
         session.on_reopened(conn).expect("reopened");
         if first_tick {
-            assert_eq!(session.tick(path.renew_at).len(), 1);
+            assert_eq!(
+                session.tick(path.renew_at, mono(at, path.renew_at)).len(),
+                1
+            );
         }
         for step in list(&doc[name]["steps"]) {
             let id = || ConnectionId(u(&step["conn"]));
             match s(&step["op"]) {
-                "tick" => check_ticks(&mut session, &J::Array(vec![step.clone()])),
+                "tick" => check_ticks(&mut session, at, &J::Array(vec![step.clone()])),
                 "begin_path" => assert!(session.begin_path(id()).is_empty()),
                 "path_closed" => session.on_path_closed(id()),
                 other => panic!("op {other}"),
             }
         }
     }
+
+    // Setting the wall clock back does not keep the path open.
+    let rollback = &doc["clock_rollback"];
+    let mut session = PeerSession::new(pin);
+    session.begin_path(conn);
+    session
+        .on_authenticated(conn, &peer, local, at, mono(at, at))
+        .expect("authenticated");
+    session.on_reopened(conn).expect("reopened");
+    assert_eq!(
+        session.next_mono_deadline(),
+        Some(Millis(u(&rollback["mono_deadline_ms"])))
+    );
+    check_ticks(&mut session, at, &rollback["ticks"]);
 
     let late = &doc["new_connection_after_deadline"];
     let err = session_cert::verify(
@@ -216,10 +237,21 @@ fn live_path_closes_at_certificate_expiry() {
     assert_eq!(err.code(), s(&late["result"]));
 }
 
-fn check_ticks(session: &mut PeerSession, ticks: &J) {
+/// The vectors' monotonic clock: 0 ms at `authenticated_at`, running with
+/// the wall clock unless a tick says otherwise.
+fn mono(authenticated_at: UnixTime, now: UnixTime) -> Millis {
+    Millis((now.secs() - authenticated_at.secs()) * 1_000)
+}
+
+fn check_ticks(session: &mut PeerSession, at: UnixTime, ticks: &J) {
     for tick in list(ticks) {
+        let now = UnixTime(u(&tick["now"]));
+        let mono = match tick.get("mono_ms") {
+            Some(ms) => Millis(u(ms)),
+            None => mono(at, now),
+        };
         let events: Vec<String> = session
-            .tick(UnixTime(u(&tick["now"])))
+            .tick(now, mono)
             .into_iter()
             .map(|e| match e {
                 SessionEvent::RenewDue { conn } => format!("renew_due/{}", conn.0),
@@ -279,6 +311,7 @@ fn authorization() {
                         role: Role::new(s(&g["role"])).expect("role"),
                         authorizing_owner: OwnerRef::from_bytes([0x51; 16]),
                         expires_at: g["expires_at"].as_u64().map(UnixTime),
+                        enrolled_by: None,
                     },
                     UnixTime(now.secs() - 60),
                 )
@@ -338,6 +371,7 @@ fn caller_traffic(name: &str) -> CallerTraffic {
 fn caller_state_name(state: CallerGateState) -> String {
     match state {
         CallerGateState::AwaitingAuthorization => "awaiting_authorization".into(),
+        CallerGateState::AwaitingProofAnswer => "awaiting_proof_answer".into(),
         CallerGateState::JoinOnly => "join_only".into(),
         CallerGateState::Live => "live".into(),
         CallerGateState::Closed(code) => format!("closed:{}", code.name()),
@@ -347,8 +381,27 @@ fn caller_state_name(state: CallerGateState) -> String {
 #[test]
 fn caller_gate() {
     let doc = load("authz.json");
+    let ids = &doc["identities"];
     for case in list(&doc["caller_cases"]) {
         let name = s(&case["name"]);
+        let now = UnixTime(case["now"].as_u64().unwrap_or(0));
+        // The caller endpoint's own grants, for streams the host opens.
+        let mut local = GrantTable::new();
+        for g in case["local_grants"].as_array().into_iter().flatten() {
+            local
+                .add(
+                    NewGrant {
+                        identity: key(&ids[s(&g["identity"])]),
+                        name: "device".into(),
+                        role: Role::new(s(&g["role"])).expect("role"),
+                        authorizing_owner: OwnerRef::from_bytes([0x51; 16]),
+                        expires_at: g["expires_at"].as_u64().map(UnixTime),
+                        enrolled_by: None,
+                    },
+                    UnixTime(now.secs().saturating_sub(60)),
+                )
+                .expect("add");
+        }
         let mut gate = CallerGate::new();
         for step in list(&case["steps"]) {
             match s(&step["op"]) {
@@ -357,6 +410,13 @@ fn caller_gate() {
                     assert_eq!(got, s(&step["verdict"]), "{name}: {}", s(&step["traffic"]));
                 }
                 "promote" => gate.promote(),
+                "sent_join_proof" => gate.sent_join_proof(),
+                "host_stream" => {
+                    let host = key(&ids[s(&step["host"])]);
+                    let got = gate.host_stream_authority(&local, &host, now);
+                    let got = got.as_ref().map_or("none", |r| r.as_str());
+                    assert_eq!(got, s(&step["result"]), "{name}: host_stream");
+                }
                 other => panic!("op {other}"),
             }
             assert_eq!(caller_state_name(gate.state()), s(&step["state"]), "{name}");

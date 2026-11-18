@@ -8,21 +8,22 @@ use std::time::{Duration, Instant};
 
 use common::*;
 use mousse_net_core::control::ControlMessage;
+use mousse_net_core::grants::Role;
 use mousse_net_core::mux::{Mux, MuxEvent, MuxRole, PriorityClass};
 use mousse_net_core::pairing::{
-    BindingTranscript, CodeExchange, CodeExchangeFactory, CpaceExchangeFactory, ExchangeError,
-    ExchangeRole, ExchangeStep, InvitationKind, InvitationStatus, PairingCode, Ticket, SID_LEN,
+    Arrival, BindingTranscript, CodeExchange, CodeExchangeFactory, CpaceExchangeFactory,
+    ExchangeError, ExchangeRole, ExchangeStep, InvitationKind, InvitationStatus, JoinerError,
+    PairingCode, Ticket, SID_LEN,
 };
-use mousse_net_core::session::RENEW_LEAD_SECS;
 use mousse_net_core::{
-    ErrorCode, Millis, UnixTime, CLOCK_SKEW_SECS, PROTOCOL_MINOR_VERSION, PROTOCOL_VERSION,
+    ErrorCode, Limits as CoreLimits, Millis, UnixTime, PROTOCOL_MINOR_VERSION, PROTOCOL_VERSION,
 };
 use mousse_net_io::certs::CertManager;
 use mousse_net_io::keystore::KeyStorage;
 use mousse_net_io::pipe::{connect_tcp, route_from_addr};
 use mousse_net_io::store::GrantStore;
 use mousse_net_io::{
-    tls, Caller, Clock, Endpoint, JoinOutcome, ManualClock, NetError, NoCode, PathEvent,
+    tls, Caller, Clock, Endpoint, JoinOutcome, Limits, ManualClock, NetError, NoCode, PathEvent,
     PortChoice, TlsPolicy,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -43,7 +44,11 @@ async fn join_with(
     ticket: &Ticket,
 ) -> Result<(mousse_net_io::Connection, JoinOutcome), NetError> {
     let pipe = connect_tcp(&host.route()).await?;
-    within("join", caller.join(pipe, ticket, "laptop")).await
+    within(
+        "join",
+        caller.join(pipe, ticket, Arrival::InAppScan, "laptop"),
+    )
+    .await
 }
 
 /// Connect with `pin` and let the host's join-proof wait run out. The
@@ -193,7 +198,10 @@ async fn a_ticket_replayed_after_use_is_refused() {
     let first = new_caller(new_signer());
     let pipe = connect_tcp(&host.route()).await.unwrap();
     let (joined, ()) = tokio::join!(
-        within("join", first.join(pipe, &ticket, "laptop")),
+        within(
+            "join",
+            first.join(pipe, &ticket, Arrival::InAppScan, "laptop")
+        ),
         host.approve_next_request()
     );
     assert!(matches!(joined.unwrap().1, JoinOutcome::Paired(_)));
@@ -220,8 +228,18 @@ async fn an_expired_ticket_is_refused_by_the_host_and_by_the_joiner() {
     late_clock.advance(901);
     let late = new_caller_with_clock(new_signer(), late_clock);
     let pipe = connect_tcp(&host.route()).await.unwrap();
-    let err = late.join(pipe, &ticket, "laptop").await.unwrap_err();
-    assert!(matches!(err, NetError::Ticket(_)), "{err:?}");
+    let err = late
+        .join(pipe, &ticket, Arrival::InAppScan, "laptop")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, NetError::Join(JoinerError::Expired)),
+        "{err:?}"
+    );
+    assert_eq!(
+        JoinerError::Expired.code(),
+        Some(ErrorCode::InvitationInvalid)
+    );
 
     // The host's clock is past the expiry: it refuses the join proof.
     host.clock.advance(601);
@@ -295,7 +313,9 @@ async fn a_path_is_renewed_before_its_deadline_and_replaced_only_after_reopening
 
     // Both devices reach the renewal time: the earlier not_after minus the
     // renewal lead (the deadline adds the clock skew to not_after).
-    let renew_at = old.deadline().0 - CLOCK_SKEW_SECS - RENEW_LEAD_SECS;
+    let renew_at = old.deadline().0
+        - CoreLimits::DEFAULT.clock_skew_secs()
+        - CoreLimits::DEFAULT.renew_lead_secs();
     let skip = renew_at as i64 - clock.now().0 as i64;
     clock.advance(skip);
     host.clock.advance(skip);
@@ -349,7 +369,9 @@ async fn a_renewed_path_is_closed_when_nobody_takes_paths_any_more() {
         let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
     });
 
-    let renew_at = old.deadline().0 - CLOCK_SKEW_SECS - RENEW_LEAD_SECS;
+    let renew_at = old.deadline().0
+        - CoreLimits::DEFAULT.clock_skew_secs()
+        - CoreLimits::DEFAULT.renew_lead_secs();
     let skip = renew_at as i64 - clock.now().0 as i64;
     clock.advance(skip);
     host.clock.advance(skip);
@@ -399,6 +421,78 @@ async fn a_removal_that_cannot_be_saved_reports_it_and_still_ends_access_at_once
     assert!(host.host.has_unsaved_changes());
 
     // Once the file can be written again, the host saves on its own.
+    std::fs::remove_dir(store.path()).unwrap();
+    within("the retried save", async {
+        while host.host.has_unsaved_changes() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert_eq!(store.load().unwrap().grants().count(), 0);
+    host.stop().await;
+    drop(endpoint);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_enrollment_that_cannot_be_saved_fails_the_pairing() {
+    let dir = temp_dir("unsaved-enroll");
+    let (mut endpoint, key) = Endpoint::create(&dir, None, KeyStorage::InsecureFile).unwrap();
+    let store = GrantStore::in_dir(&endpoint.grants_dir());
+    let mut host = TestHost::start_endpoint(&mut endpoint, Arc::new(key), "desk").await;
+    // A folder where grants.json goes: no save can replace it.
+    std::fs::create_dir_all(store.path()).unwrap();
+
+    // In person, approved by the owner.
+    let caller = new_caller(new_signer());
+    let ticket = host.invite();
+    let pipe = connect_tcp(&host.route()).await.unwrap();
+    let (joined, ()) = tokio::join!(
+        within(
+            "join",
+            caller.join(pipe, &ticket, Arrival::InAppScan, "laptop")
+        ),
+        host.approve_next_request()
+    );
+    let err = joined.map(|(_, outcome)| outcome).unwrap_err();
+    assert!(closed_with(&err, ErrorCode::InternalError), "{err:?}");
+    assert_eq!(host.invitation_ended().await, ErrorCode::InternalError);
+    assert!(host.host.grants().is_empty());
+
+    // A send link, settled by the code exchange. The close after its
+    // confirmation looks like a lost PAIRED to the joiner, so it reconnects
+    // to ask, and the host has no grant for it.
+    let phone = new_caller(new_signer());
+    let ticket = host.invite_kind(InvitationKind::SendLink);
+    let (type_tx, typed) = mpsc::unbounded_channel();
+    let (asks_tx, mut asks) = mpsc::unbounded_channel();
+    let mut codes = TypedCodes {
+        asks: asks_tx,
+        typed,
+    };
+    let route = host.route();
+    let pipe = connect_tcp(&route).await.unwrap();
+    let join = phone.join_with_redial(
+        pipe,
+        &ticket,
+        Arrival::Link,
+        "phone",
+        &mut codes,
+        false,
+        || connect_tcp(&route),
+    );
+    let typing = async {
+        let code = host.next_code().await;
+        assert_eq!(within("ask", asks.recv()).await, Some(None));
+        type_tx.send(code).unwrap();
+    };
+    let (joined, ()) = tokio::join!(within("join", join), typing);
+    let err = joined.map(|(_, outcome)| outcome).unwrap_err();
+    assert!(closed_with(&err, ErrorCode::InvitationInvalid), "{err:?}");
+    assert_eq!(host.invitation_ended().await, ErrorCode::InternalError);
+    assert!(host.host.grants().is_empty());
+
+    // Nothing was saved, and nothing waits to be.
     std::fs::remove_dir(store.path()).unwrap();
     within("the retried save", async {
         while host.host.has_unsaved_changes() {
@@ -484,7 +578,7 @@ fn start_link_join(
         let pipe = connect_tcp(&route).await?;
         let mut codes = TypedCodes { asks, typed };
         caller
-            .join_with_code(pipe, &ticket, "phone", &mut codes)
+            .join_with_code(pipe, &ticket, Arrival::Link, "phone", &mut codes)
             .await
     });
     (type_tx, asks_rx, join)
@@ -593,7 +687,7 @@ async fn a_lost_paired_is_settled_by_reconnecting_with_the_same_join() {
     let caller = Arc::new(Caller::with_factory(
         new_signer(),
         Arc::new(ManualClock::new()),
-        TlsPolicy::default(),
+        Limits::DEFAULT,
         FlagConfirm(flag.clone()),
     ));
     let ticket = host.invite_kind(InvitationKind::SendLink);
@@ -625,7 +719,15 @@ async fn a_lost_paired_is_settled_by_reconnecting_with_the_same_join() {
                 }
             };
             caller
-                .join_with_redial(first, &ticket, "phone", &mut codes, false, redial)
+                .join_with_redial(
+                    first,
+                    &ticket,
+                    Arrival::Link,
+                    "phone",
+                    &mut codes,
+                    false,
+                    redial,
+                )
                 .await
         })
     };
@@ -634,8 +736,12 @@ async fn a_lost_paired_is_settled_by_reconnecting_with_the_same_join() {
     type_tx.send(code).unwrap();
     let (conn, outcome) = within("join", join).await.unwrap().unwrap();
     // The first connection lost PAIRED; the same join reconnected once and
-    // learned from AUTHORIZED {live} that the host enrolled it.
-    assert_eq!(outcome, JoinOutcome::AlreadyPaired);
+    // the host, whose grant this invitation made, answered the proof with
+    // PAIRED again.
+    assert!(
+        matches!(&outcome, JoinOutcome::Paired(h) if h.role == Role::owner()),
+        "{outcome:?}"
+    );
     assert_eq!(redials.load(Ordering::SeqCst), 1);
     assert!(host.grant_of(&caller.identity()).is_some());
     assert_echo(&mut open_echo(&conn).await, b"after the lost PAIRED").await;
@@ -643,33 +749,71 @@ async fn a_lost_paired_is_settled_by_reconnecting_with_the_same_join() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_send_link_ends_already_paired_only_for_a_host_pinned_before() {
+async fn a_granted_device_pairs_again_by_link_and_already_paired_needs_a_pin() {
     let mut host = TestHost::start(new_signer()).await;
-    let caller = new_caller(new_signer());
+    let caller = Arc::new(new_caller(new_signer()));
     drop(pair(&caller, &mut host, "laptop").await);
+    let old = host.grant_of(&caller.identity()).unwrap();
 
-    // The device has a grant, but does not claim to know this host: a send
-    // link must not skip the code exchange on the host's word alone.
+    // The device has a grant but no pin: an open send link starts a normal
+    // code exchange on the live connection, and enrollment replaces the
+    // grant.
     let ticket = host.invite_kind(InvitationKind::SendLink);
+    let (type_tx, typed) = mpsc::unbounded_channel();
+    let (asks, mut asks_rx) = mpsc::unbounded_channel();
+    let join = {
+        let (caller, ticket, route) = (caller.clone(), ticket.clone(), host.route());
+        tokio::spawn(async move {
+            let pipe = connect_tcp(&route).await?;
+            let mut codes = TypedCodes { asks, typed };
+            caller
+                .join_with_code(pipe, &ticket, Arrival::Link, "laptop", &mut codes)
+                .await
+        })
+    };
+    let code = host.next_code().await;
+    assert_eq!(within("ask", asks_rx.recv()).await, Some(None));
+    type_tx.send(code).unwrap();
+    let (conn, outcome) = within("join", join).await.unwrap().unwrap();
+    assert!(matches!(outcome, JoinOutcome::Paired(_)), "{outcome:?}");
+    let new = host.grant_of(&caller.identity()).unwrap();
+    assert_ne!(new, old);
+    open_echo(&conn).await;
+    drop(conn);
+    // The app stores the pin, which clears the outcome-pending mark. The
+    // pin is then lost.
+    caller.pin_stored(&ticket).unwrap();
+
+    // The invitation is consumed now, so a proof opens nothing; the host
+    // answers with PAIRED from the grant's receipt. Without a pin from
+    // before, a send link must not end paired on the host's word alone.
     let pipe = connect_tcp(&host.route()).await.unwrap();
     let err = within(
         "join",
-        caller.join_with_code(pipe, &ticket, "laptop", &mut NoCode),
+        caller.join_with_code(pipe, &ticket, Arrival::Link, "laptop", &mut NoCode),
     )
     .await
     .unwrap_err();
     assert!(closed_with(&err, ErrorCode::PairingFailed), "{err}");
 
-    // With its earlier pin, it is already paired.
+    // With its earlier pin, the host's answer is believed.
     let pipe = connect_tcp(&host.route()).await.unwrap();
     let no_redial = || async { Err::<tokio::net::TcpStream, _>(NetError::Refused("none".into())) };
     let (conn, outcome) = within(
         "join",
-        caller.join_with_redial(pipe, &ticket, "laptop", &mut NoCode, true, no_redial),
+        caller.join_with_redial(
+            pipe,
+            &ticket,
+            Arrival::Link,
+            "laptop",
+            &mut NoCode,
+            true,
+            no_redial,
+        ),
     )
     .await
     .unwrap();
-    assert_eq!(outcome, JoinOutcome::AlreadyPaired);
+    assert!(matches!(outcome, JoinOutcome::Paired(_)), "{outcome:?}");
     open_echo(&conn).await;
     host.stop().await;
 }
@@ -717,8 +861,18 @@ async fn send_link_pairs_with_the_right_code_and_three_wrong_codes_end_it() {
     );
     assert_eq!(host.grant_of(&stranger.identity()), None);
 
-    // The ended invitation does not admit the device again.
-    let (_type_code, _asks, join) = start_link_join(stranger.clone(), &host, ticket);
+    // Opening the link again resets nothing: the joiner kept its count and
+    // refuses before dialling.
+    let (_type_code, _asks, join) = start_link_join(stranger.clone(), &host, ticket.clone());
+    let err = within("join", join).await.unwrap().unwrap_err();
+    assert!(
+        matches!(err, NetError::Join(JoinerError::AttemptsExhausted)),
+        "{err}"
+    );
+
+    // The ended invitation does not admit another device either.
+    let other = Arc::new(new_caller(new_signer()));
+    let (_type_code, _asks, join) = start_link_join(other, &host, ticket);
     let err = within("join", join).await.unwrap().unwrap_err();
     assert!(closed_with(&err, ErrorCode::InvitationInvalid), "{err}");
     host.stop().await;
@@ -731,7 +885,7 @@ async fn a_refusal_after_a_lost_paired_is_reported_as_the_answer() {
     let caller = Arc::new(Caller::with_factory(
         new_signer(),
         Arc::new(ManualClock::new()),
-        TlsPolicy::default(),
+        Limits::DEFAULT,
         FlagConfirm(flag.clone()),
     ));
     let ticket = host.invite_kind(InvitationKind::SendLink);
@@ -768,7 +922,15 @@ async fn a_refusal_after_a_lost_paired_is_reported_as_the_answer() {
                 }
             };
             caller
-                .join_with_redial(first, &ticket, "phone", &mut codes, false, redial)
+                .join_with_redial(
+                    first,
+                    &ticket,
+                    Arrival::Link,
+                    "phone",
+                    &mut codes,
+                    false,
+                    redial,
+                )
                 .await
         })
     };
