@@ -8,6 +8,12 @@
 //! Files that several processes on one endpoint update (`peers.json`, the
 //! joiner's flow records) are read, changed and written under an OS file
 //! lock, which the OS releases when the process holding it dies.
+//!
+//! An enrollment is recorded as pending (`grants-pending.json`) before the
+//! grant table that holds it replaces the old one, and the record is
+//! cleared only once that table is saved. Loading the table drops every
+//! grant still recorded as pending, so an enrollment the host reported as
+//! failed is never honored after a restart, whatever step failed.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -76,15 +82,37 @@ pub fn short_id(identity: &IdentityPublicKey) -> String {
 
 /// Write `bytes` to `path` atomically (temp file, flush, rename).
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), NetError> {
+    write_atomic_checked(path, bytes).map_err(|f| f.error)
+}
+
+/// A failed [`write_atomic_checked`].
+#[derive(Debug)]
+pub struct WriteFailure {
+    /// What failed.
+    pub error: NetError,
+    /// The rename was made and only making it durable failed: the new
+    /// content is at the path now and may or may not survive a power loss.
+    /// Otherwise the file is as it was.
+    pub in_place: bool,
+}
+
+/// [`write_atomic`], telling a failure that left the file as it was from
+/// one after the rename, whose outcome is not known.
+pub fn write_atomic_checked(path: &Path, bytes: &[u8]) -> Result<(), WriteFailure> {
+    let failed = |error| WriteFailure {
+        error,
+        in_place: false,
+    };
     let dir = path
         .parent()
-        .ok_or_else(|| NetError::Store(format!("{} has no parent", path.display())))?;
-    fs::create_dir_all(dir).map_err(|e| store_err(dir, e))?;
+        .ok_or_else(|| failed(NetError::Store(format!("{} has no parent", path.display()))))?;
+    fs::create_dir_all(dir).map_err(|e| failed(store_err(dir, e)))?;
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
-        .ok_or_else(|| NetError::Store(format!("bad file name {}", path.display())))?;
+        .ok_or_else(|| failed(NetError::Store(format!("bad file name {}", path.display()))))?;
     let tmp = dir.join(format!(".{name}.tmp-{}", hex(&random_bytes::<6>())));
+    let mut renaming = false;
     let result = (|| -> std::io::Result<()> {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
@@ -99,12 +127,23 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), NetError> {
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
+        renaming = true;
         crate::private::replace_durably(&tmp, path)
     })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // The temporary file is gone only if the rename was made.
+            let in_place = renaming && !tmp.exists();
+            if !in_place {
+                let _ = fs::remove_file(&tmp);
+            }
+            Err(WriteFailure {
+                error: store_err(path, e),
+                in_place,
+            })
+        }
     }
-    result.map_err(|e| store_err(path, e))
 }
 
 fn store_err(path: &Path, e: std::io::Error) -> NetError {
@@ -169,10 +208,54 @@ struct GrantFile {
     denials: Vec<DenialRecord>,
 }
 
-/// The host's grant table on disk.
+/// An enrollment saved in the grant table and not yet committed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PendingEnrollment {
+    /// The new grant.
+    pub grant: GrantId,
+    /// The enrolled device.
+    pub identity: IdentityPublicKey,
+    /// The invitation that enrolled it.
+    pub invitation: InvitationId,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct PendingRecord {
+    grant: u64,
+    identity: String,
+    invitation: String,
+}
+
+impl PendingRecord {
+    fn of(e: &PendingEnrollment) -> Self {
+        Self {
+            grant: e.grant.0,
+            identity: hex(e.identity.as_bytes()),
+            invitation: hex(&e.invitation.0),
+        }
+    }
+
+    /// Whether `grant` is the one this enrollment made.
+    fn made(&self, grant: &Grant) -> bool {
+        self.grant == grant.id.0
+            && self.identity == hex(grant.identity.as_bytes())
+            && grant
+                .enrolled_by
+                .is_some_and(|i| self.invitation == hex(&i.0))
+    }
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct PendingFile {
+    version: u32,
+    enrollments: Vec<PendingRecord>,
+}
+
+/// The host's grant table on disk, and the enrollments not yet committed.
 #[derive(Clone, Debug)]
 pub struct GrantStore {
     path: PathBuf,
+    pending: PathBuf,
 }
 
 impl GrantStore {
@@ -180,12 +263,60 @@ impl GrantStore {
     pub fn in_dir(dir: &Path) -> Self {
         Self {
             path: dir.join("grants.json"),
+            pending: dir.join("grants-pending.json"),
         }
     }
 
     /// The file path.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Where the enrollments not yet committed are recorded.
+    pub fn pending_path(&self) -> &Path {
+        &self.pending
+    }
+
+    fn load_pending(&self) -> Result<Vec<PendingRecord>, NetError> {
+        let Some(bytes) = read_optional(&self.pending)? else {
+            return Ok(Vec::new());
+        };
+        let file: PendingFile =
+            serde_json::from_slice(&bytes).map_err(|e| store_err(&self.pending, e.into()))?;
+        Ok(file.enrollments)
+    }
+
+    fn write_pending(&self, enrollments: Vec<PendingRecord>) -> Result<(), NetError> {
+        let file = PendingFile {
+            version: 1,
+            enrollments,
+        };
+        let bytes =
+            serde_json::to_vec_pretty(&file).map_err(|e| store_err(&self.pending, e.into()))?;
+        write_atomic(&self.pending, &bytes)
+    }
+
+    /// Record `enrollments` as pending, durably, before the table that
+    /// holds them is saved. Until [`GrantStore::commit_enrollments`], a
+    /// load drops their grants. Earlier records stay.
+    pub fn begin_enrollments(&self, enrollments: &[PendingEnrollment]) -> Result<(), NetError> {
+        let mut records = self.load_pending()?;
+        for e in enrollments {
+            let record = PendingRecord::of(e);
+            if !records.contains(&record) {
+                records.push(record);
+            }
+        }
+        self.write_pending(records)
+    }
+
+    /// The table saved last holds exactly what the host has in force: no
+    /// enrollment is pending any more. Writes only if one was recorded.
+    pub fn commit_enrollments(&self) -> Result<(), NetError> {
+        if self.load_pending()?.is_empty() {
+            return Ok(());
+        }
+        self.write_pending(Vec::new())
     }
 
     /// Load the table; a missing file is an empty table.
@@ -237,12 +368,22 @@ impl GrantStore {
                 denied_at: UnixTime(d.denied_at),
             });
         }
+        // An enrollment saved but never committed was reported as failed:
+        // its grant is not honored.
+        let pending = self.load_pending()?;
+        grants.retain(|g| !pending.iter().any(|p| p.made(g)));
         GrantTable::restore(grants, denials, file.next_grant_id)
             .map_err(|e| NetError::Store(format!("{}: {e}", self.path.display())))
     }
 
     /// Save the table atomically.
     pub fn save(&self, table: &GrantTable) -> Result<(), NetError> {
+        self.save_checked(table).map_err(|f| f.error)
+    }
+
+    /// [`GrantStore::save`], telling whether a failure may have left the
+    /// new table in place (see [`WriteFailure`]).
+    pub fn save_checked(&self, table: &GrantTable) -> Result<(), WriteFailure> {
         let file = GrantFile {
             version: GRANT_FILE_VERSION,
             next_grant_id: table.next_grant_id(),
@@ -268,9 +409,11 @@ impl GrantStore {
                 })
                 .collect(),
         };
-        let bytes =
-            serde_json::to_vec_pretty(&file).map_err(|e| store_err(&self.path, e.into()))?;
-        write_atomic(&self.path, &bytes)
+        let bytes = serde_json::to_vec_pretty(&file).map_err(|e| WriteFailure {
+            error: store_err(&self.path, e.into()),
+            in_place: false,
+        })?;
+        write_atomic_checked(&self.path, &bytes)
     }
 }
 
@@ -345,6 +488,21 @@ impl PeerStore {
             p.pin()?;
         }
         Ok(file.peers)
+    }
+
+    /// Note that `route` reached the host pinned as `identity`: set
+    /// `last_route` on its record as stored now, under the lock, and
+    /// change nothing else, so a re-pair of the same host meanwhile keeps
+    /// its name, role and routes. With no record for it, nothing changes.
+    pub fn note_route(&self, identity: &IdentityPublicKey, route: String) -> Result<(), NetError> {
+        self.update(|peers| {
+            if let Some(p) = peers
+                .iter_mut()
+                .find(|p| p.pin().ok().as_ref() == Some(identity))
+            {
+                p.last_route = Some(route);
+            }
+        })
     }
 
     /// Insert or replace (by identity) one host.
@@ -501,10 +659,19 @@ impl FlowRecordStore {
         self.dir.join(format!("{}.cbor", hex(ticket_hash)))
     }
 
+    /// Make the folder, durably: a debit saved in a new folder must
+    /// survive a power loss with it. Its parent is synced on this
+    /// process's first use of the folder, whoever made it, and again after
+    /// a failed sync, until one works.
     fn make_dir(&self) -> Result<(), NetError> {
-        if !self.dir.exists() {
-            crate::private::make_private_dir(&self.dir).map_err(|e| store_err(&self.dir, e))?;
+        static READY: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
+        let mut ready = READY.lock().unwrap_or_else(|e| e.into_inner());
+        let ready = ready.get_or_insert_with(HashSet::new);
+        if ready.contains(&self.dir) && self.dir.is_dir() {
+            return Ok(());
         }
+        crate::private::make_private_dir_durably(&self.dir).map_err(|e| store_err(&self.dir, e))?;
+        ready.insert(self.dir.clone());
         Ok(())
     }
 }
@@ -740,6 +907,136 @@ mod tests {
         let mut want = ids.clone();
         want.sort();
         assert_eq!(kept, want);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn peer(id: &str, name: &str, role: &str) -> PeerRecord {
+        PeerRecord {
+            name: name.into(),
+            identity: id.into(),
+            role: role.into(),
+            routes: vec!["tcp://10.0.0.2:7443".into()],
+            last_route: None,
+            paired_at: 1,
+        }
+    }
+
+    /// A dial that read the host's record before the host was paired
+    /// again notes its route on the record as it is now: the re-pair's
+    /// name and role stay, also when the two run at once.
+    #[test]
+    fn a_dial_never_undoes_a_re_pair_of_the_same_host() {
+        let dir = temp_dir("repair-dial");
+        let store = PeerStore::in_dir(&dir);
+        let key = SoftwareKey::generate(&mut os_rng()).public_key();
+        let id = hex(key.as_bytes());
+        store.upsert(peer(&id, "old", "member")).unwrap();
+
+        // In turn: the dial's copy is stale by the time it notes the route.
+        let stale = store.load().unwrap().remove(0);
+        store.upsert(peer(&id, "new", "owner")).unwrap();
+        store
+            .note_route(&stale.pin().unwrap(), "tcp://10.0.0.9:7443".into())
+            .unwrap();
+        let now = store.load().unwrap();
+        assert_eq!(now.len(), 1);
+        assert_eq!(
+            (now[0].name.as_str(), now[0].role.as_str()),
+            ("new", "owner")
+        );
+        assert_eq!(now[0].last_route.as_deref(), Some("tcp://10.0.0.9:7443"));
+
+        // At once: one re-pair and several dials of the same host.
+        let start = std::sync::Barrier::new(5);
+        std::thread::scope(|scope| {
+            let (dir, start, id) = (&dir, &start, &id);
+            scope.spawn(move || {
+                let store = PeerStore::in_dir(dir);
+                start.wait();
+                for i in 0..40 {
+                    store
+                        .upsert(peer(id, &format!("repair-{i}"), "owner"))
+                        .unwrap();
+                }
+            });
+            for d in 0..4 {
+                scope.spawn(move || {
+                    let store = PeerStore::in_dir(dir);
+                    start.wait();
+                    for _ in 0..40 {
+                        store
+                            .note_route(&key, format!("tcp://10.0.1.{d}:7443"))
+                            .unwrap();
+                    }
+                });
+            }
+        });
+        let now = store.load().unwrap();
+        assert_eq!(now.len(), 1);
+        assert_eq!(now[0].name, "repair-39");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The folder for flow records gets its parent synced on first use in
+    /// a process even when another process made it, and again after a
+    /// sync that failed.
+    #[test]
+    fn the_flow_record_folder_is_synced_on_first_use_and_after_a_failed_sync() {
+        let dir = temp_dir("joins-sync");
+        let store = FlowRecordStore::in_dir(&dir);
+        // Made by someone else, without a sync here.
+        fs::create_dir_all(dir.join("joins")).unwrap();
+        crate::private::faults::fail_syncs(&dir, 1);
+        let record = JoinerRecord {
+            ticket_hash: [9; 32],
+            attempts_left: 3,
+            outcome_pending: false,
+        };
+        // The first use syncs, and the failed sync fails the write.
+        assert!(store.swap(None, &record).is_err());
+        assert_eq!(store.load(&[9; 32]).unwrap(), None);
+        // The next use syncs again, and the write lands.
+        store.swap(None, &record).unwrap();
+        assert_eq!(store.load(&[9; 32]).unwrap(), Some(record));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A grant recorded as a pending enrollment is dropped on load until
+    /// the enrollment is committed.
+    #[test]
+    fn a_pending_enrollment_is_not_loaded_until_committed() {
+        let dir = temp_dir("pending");
+        let store = GrantStore::in_dir(&dir);
+        let mut table = GrantTable::new();
+        let identity = SoftwareKey::generate(&mut os_rng()).public_key();
+        let invitation = InvitationId([4; 16]);
+        let (grant, _) = table
+            .add(
+                NewGrant {
+                    identity,
+                    name: "phone".into(),
+                    role: Role::owner(),
+                    authorizing_owner: OwnerRef::from_bytes([1; 16]),
+                    expires_at: None,
+                    enrolled_by: Some(invitation),
+                },
+                UnixTime(1),
+            )
+            .unwrap();
+        store
+            .begin_enrollments(&[PendingEnrollment {
+                grant,
+                identity,
+                invitation,
+            }])
+            .unwrap();
+        store.save(&table).unwrap();
+        let loaded = store.load().unwrap();
+        assert!(loaded.grants().next().is_none());
+        // Its id is not given out again.
+        assert_eq!(loaded.next_grant_id(), table.next_grant_id());
+        store.commit_enrollments().unwrap();
+        assert_eq!(store.load().unwrap().grants().count(), 1);
         fs::remove_dir_all(&dir).unwrap();
     }
 

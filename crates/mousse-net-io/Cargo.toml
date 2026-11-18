@@ -36,5 +36,5 @@ keyring = { version = "=3.6.3", features = ["apple-native"] }
 keyring = { version = "=3.6.3", features = ["sync-secret-service", "crypto-rust"] }
 
 [dev-dependencies]
-tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
 rand_chacha = "=0.10.0"

@@ -403,6 +403,52 @@ fn pair_in_person_run_a_terminal_then_removing_the_grant_closes_it() {
     cleanup(&[&host, &peer]);
 }
 
+/// A first address whose TLS fails (it hangs up at once) is a step 1
+/// failure like a certificate one: the join tries the next address and
+/// pairs there.
+#[test]
+fn a_join_whose_first_address_fails_tls_pairs_on_the_next() {
+    let host = Endpoint::init("tlsnext");
+    let peer = Endpoint::init("tlsnextp");
+    let server = host.serve("hostA", &[]);
+    let dropper = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead = format!("tcp://{}", dropper.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for tcp in dropper.incoming() {
+            drop(tcp);
+        }
+    });
+
+    let mut invite = host.spawn_with_stdin(&["invite", "--no-qr"]);
+    let ticket_line = invite.wait_for("TICKET ", WAIT);
+    let ticket = ticket_line.trim_start_matches("TICKET ").trim().to_owned();
+    let live = server.route();
+    let join = peer.spawn(&[
+        "join",
+        &ticket,
+        "--in-person",
+        "--name",
+        "laptop",
+        "--route",
+        &dead,
+        "--route",
+        &live,
+    ]);
+    invite.wait_for("Is the device next to you?", WAIT);
+    invite.type_line("y\n");
+    let joined = join.finish(WAIT);
+    assert!(joined.ok(), "join: {}", joined.text());
+    assert!(
+        joined.stdout.contains("paired with hostA"),
+        "{}",
+        joined.text()
+    );
+    drop(invite);
+
+    stop(&host, server);
+    cleanup(&[&host, &peer]);
+}
+
 #[test]
 fn rejections_wrong_identity_used_ticket_and_declined_pairing() {
     let host = Endpoint::init("rhost");
@@ -1004,7 +1050,9 @@ fn a_link_being_joined_in_another_process_is_refused_until_that_process_ends() {
     let ticket = invite.wait_for("TICKET ", WAIT)["TICKET ".len()..].to_owned();
 
     let first = phone.spawn_with_stdin(&["join", &ticket]);
-    lines_with(&first, "shown on the host", 1);
+    // The code prompt comes once the host admitted the join, which is
+    // after the join took the link: the banner before it does not.
+    lines_with(&first, "Type the 6-digit code", 1);
     let second = phone.run(&["join", &ticket]);
     assert_eq!(second.code, Some(2), "{}", second.text());
     assert!(
@@ -1017,7 +1065,7 @@ fn a_link_being_joined_in_another_process_is_refused_until_that_process_ends() {
 
     drop(first);
     let mut again = phone.spawn_with_stdin(&["join", &ticket]);
-    lines_with(&again, "shown on the host", 1);
+    lines_with(&again, "Type the 6-digit code", 1);
     let codes = lines_with(&invite, "CODE ", 1);
     let code = codes[codes.len() - 1]
         .split_whitespace()

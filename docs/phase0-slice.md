@@ -42,11 +42,16 @@ set to.
   not in effect.
 - After sending its join proof the joiner waits 10 s for the host's answer,
   then closes with `NOT_AUTHORIZED` and the join ends, also while it is
-  learning a lost `PAIRED`; opening the link again asks again.
-- Any certificate failure on a candidate address means "try the next one".
-  An error shows only when no address passed, the clock message (the
-  certificate is outside its time window) first. Another device at an
-  address alone reads as `pin_mismatch`.
+  learning a lost `PAIRED`; opening the link again asks again. An answer
+  that arrives at the end of the wait is refused even if it is read before
+  the timer runs; the host likewise refuses a join proof that arrives after
+  its own wait.
+- Any step 1 failure on a candidate address (no answer, a failed TLS
+  handshake, a certificate refused) means "try the next one", also when
+  it ends the reconnects that learn a lost `PAIRED`. An error shows only
+  when no address passed, the clock message (the certificate is outside
+  its time window) first. Another device at an address alone reads as
+  `pin_mismatch`.
 
 ## Connections
 
@@ -140,7 +145,15 @@ stops before a retry works the grant is back after a restart.
 
 A new grant is saved before the joiner is told it is paired. If that save
 fails, the pairing fails with `INTERNAL_ERROR` and the host keeps no grant,
-so no device holds a pin for a host that would forget it on restart.
+so no device holds a pin for a host that would forget it on restart. A
+save can fail after the file was replaced (the folder sync): the host then
+writes the table without the grant again at once, and until a save works
+it serves no grant, so a restart cannot bring back a pairing that was
+reported failed.
+
+The owner's approval and each pairing message act only if the device's
+connection still waits for them: a removal or denial that closed it first
+wins, and no grant is made.
 
 The owner test kit runs the same suite and its controls:
 

@@ -1,21 +1,18 @@
 //! The joiner's side of pairing over loopback TCP: how the ticket arrived,
-//! the stored flow record, the wait for the proof's answer, and step 1
-//! failures on candidate addresses.
+//! the stored flow record, and step 1 failures on candidate addresses (the
+//! wait for the proof's answer is in `proof_wait.rs`).
 
 mod common;
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use common::*;
 use mousse_net_core::pairing::{Arrival, InvitationKind, JoinerError, JoinerRecord, Ticket};
 use mousse_net_core::session_cert::CertError;
 use mousse_net_core::ErrorCode;
-use mousse_net_io::certs::CertManager;
 use mousse_net_io::pipe::{connect_tcp, parse_route};
 use mousse_net_io::store::{FlowHold, FlowRecordStore, FlowRecords};
-use mousse_net_io::{tls, Caller, JoinOutcome, Limits, ManualClock, NetError, NoCode, TlsPolicy};
-use tokio::io::AsyncReadExt;
+use mousse_net_io::{Caller, JoinOutcome, NetError, NoCode};
 use tokio::sync::mpsc;
 
 /// A caller whose flow records live in `dir`.
@@ -234,6 +231,50 @@ async fn a_second_join_of_a_link_in_progress_is_refused() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// Once the pin is stored the link is free again, also while the join's
+/// connection stays open: opening it again asks the host, whose answer is
+/// its receipt for this device.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_settled_link_opens_again_while_its_connection_stays_open() {
+    let dir = temp_dir("settled");
+    let mut host = TestHost::start(new_signer()).await;
+    let ticket = host.invite_kind(InvitationKind::SendLink);
+    let caller = caller_with_records(new_signer(), &dir);
+    let mut shown = None;
+    let (_, result) = link_join(&caller, &mut host, &ticket, &mut shown, |shown| {
+        Some(shown.into())
+    })
+    .await;
+    let (first, outcome) = result.unwrap();
+    assert!(matches!(outcome, JoinOutcome::Paired(_)), "{outcome:?}");
+    caller.pin_stored(&ticket).unwrap();
+    let _echo = open_echo(&first).await;
+
+    let route = host.route();
+    let pipe = connect_tcp(&route).await.unwrap();
+    let mut no_code = NoCode;
+    let (_again, outcome) = within(
+        "join again",
+        caller.join_with_redial(
+            pipe,
+            &ticket,
+            Arrival::Link,
+            "laptop",
+            &mut no_code,
+            true,
+            || connect_tcp(&route),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome, JoinOutcome::Paired(_)), "{outcome:?}");
+    // The first connection was open all along.
+    let mut echo = open_echo(&first).await;
+    assert_echo(&mut echo, b"still").await;
+    host.stop().await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// The outcome-pending mark is stored before this side's confirmation goes
 /// out. If the app dies right after it lands, the confirmation never
 /// leaves and the host enrolls nothing; opening the link again with the
@@ -322,51 +363,6 @@ async fn an_attempt_whose_debit_cannot_be_saved_sends_nothing() {
     assert_eq!(asks, vec![None, Some(2), Some(1)]);
     assert!(result.is_err());
     host.stop().await;
-}
-
-/// A host that completes TLS and then never answers the join proof: the
-/// joiner closes with `NOT_AUTHORIZED` once 10 s have passed.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_proof_with_no_answer_closes_after_ten_seconds() {
-    let host_clock = Arc::new(ManualClock::new());
-    let host_cert = CertManager::new(new_signer(), host_clock.clone())
-        .current()
-        .unwrap();
-    let host_identity = *host_cert.identity();
-    let listener = tokio::net::TcpListener::bind((LOOPBACK, 0)).await.unwrap();
-    let route = parse_route(&format!("tcp://{}", listener.local_addr().unwrap())).unwrap();
-    let silent = tokio::spawn(async move {
-        let (tcp, _) = listener.accept().await.unwrap();
-        let (mut tls, _) = tls::accept(tcp, &host_cert, host_clock, TlsPolicy::default())
-            .await
-            .unwrap();
-        let mut buf = [0u8; 4096];
-        while matches!(tls.read(&mut buf).await, Ok(n) if n > 0) {}
-    });
-
-    // A ticket naming the silent host.
-    let real = TestHost::start(new_signer()).await;
-    let mut ticket = real.invite();
-    ticket.host_identity = host_identity;
-    real.stop().await;
-
-    let clock = Arc::new(ManualClock::new());
-    let caller = new_caller_with_clock(new_signer(), clock.clone());
-    let pipe = connect_tcp(&route).await.unwrap();
-    let mut no_code = NoCode;
-    let join = caller.join_with_code(pipe, &ticket, Arrival::InAppScan, "laptop", &mut no_code);
-    tokio::pin!(join);
-    // Not before the wait is over.
-    assert!(
-        tokio::time::timeout(Duration::from_millis(1_500), &mut join)
-            .await
-            .is_err(),
-        "gave up before the wait was over"
-    );
-    clock.advance_mono(Limits::DEFAULT.io().proof_answer_wait_ms());
-    let err = within("give up", join).await.unwrap_err();
-    assert!(closed_with(&err, ErrorCode::NotAuthorized), "{err:?}");
-    silent.abort();
 }
 
 /// Any step 1 failure on a candidate address means "try the next one". A

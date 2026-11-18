@@ -25,6 +25,23 @@ pub fn make_private_dir(dir: &Path) -> io::Result<()> {
     restrict_contents(dir)
 }
 
+/// [`make_private_dir`], made durable: its parent is synced (Unix), so a
+/// file saved in it and reported saved does not vanish with the folder on
+/// a power loss. The parent is synced every time, also when the folder
+/// exists already: another process may have made it without the sync
+/// landing, or an earlier sync here may have failed.
+pub fn make_private_dir_durably(dir: &Path) -> io::Result<()> {
+    make_private_dir(dir)?;
+    if let Some(parent) = dir.parent() {
+        #[cfg(test)]
+        if faults::take_sync(parent) {
+            return Err(io::Error::other("injected: the folder sync failed"));
+        }
+        imp::sync_dir(parent)?;
+    }
+    Ok(())
+}
+
 fn restrict_contents(dir: &Path) -> io::Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
@@ -65,8 +82,85 @@ pub fn is_owner_only(path: &Path) -> io::Result<bool> {
 
 /// Rename `from` over `to`. On Windows the rename is written through to
 /// disk before it returns; on Unix the folder is synced after it.
+///
+/// A failure after the rename (the folder sync) leaves `from` gone and the
+/// new content at `to`, not known to be durable: callers tell the two
+/// cases apart by whether `from` still exists.
 pub fn replace_durably(from: &Path, to: &Path) -> io::Result<()> {
-    imp::replace_durably(from, to)
+    #[cfg(test)]
+    let fault = faults::take(to);
+    #[cfg(test)]
+    if fault == Some(faults::Fault::BeforeRename) {
+        return Err(io::Error::other("injected: the write failed"));
+    }
+    imp::replace_durably(from, to)?;
+    #[cfg(test)]
+    if fault == Some(faults::Fault::AfterRename) {
+        return Err(io::Error::other("injected: the folder sync failed"));
+    }
+    Ok(())
+}
+
+/// Test faults: make the next durable replaces of a path fail before or
+/// after the rename (a failed write, a failed folder sync), and folder
+/// syncs fail.
+#[cfg(test)]
+pub(crate) mod faults {
+    use std::collections::{HashMap, VecDeque};
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    /// What the next replace of a path does.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Fault {
+        /// Works.
+        None,
+        /// Fails before the rename: the file stays as it was.
+        BeforeRename,
+        /// Fails after the rename: the new content is in place.
+        AfterRename,
+    }
+
+    type Plans = Mutex<Option<HashMap<PathBuf, VecDeque<Fault>>>>;
+
+    static REPLACES: Plans = Mutex::new(None);
+    static SYNCS: Plans = Mutex::new(None);
+
+    fn plan(plans: &Plans, path: &Path, faults: &[Fault]) {
+        let mut map = plans.lock().unwrap_or_else(|e| e.into_inner());
+        map.get_or_insert_with(HashMap::new)
+            .insert(path.to_path_buf(), faults.iter().copied().collect());
+    }
+
+    fn next(plans: &Plans, path: &Path) -> Option<Fault> {
+        let mut map = plans.lock().unwrap_or_else(|e| e.into_inner());
+        map.as_mut()
+            .and_then(|m| m.get_mut(path))
+            .and_then(VecDeque::pop_front)
+    }
+
+    /// The next replaces of `path` do what `faults` says, in order.
+    pub fn plan_replaces(path: &Path, faults: &[Fault]) {
+        plan(&REPLACES, path, faults);
+    }
+
+    /// The next `count` replaces of `path` fail after their rename.
+    pub fn fail_after_rename(path: &Path, count: usize) {
+        plan_replaces(path, &vec![Fault::AfterRename; count]);
+    }
+
+    /// The next `count` syncs of the folder `dir` fail.
+    pub fn fail_syncs(dir: &Path, count: usize) {
+        plan(&SYNCS, dir, &vec![Fault::AfterRename; count]);
+    }
+
+    pub(super) fn take(path: &Path) -> Option<Fault> {
+        next(&REPLACES, path)
+    }
+
+    pub(super) fn take_sync(dir: &Path) -> bool {
+        next(&SYNCS, dir).is_some_and(|f| f != Fault::None)
+    }
 }
 
 fn restrict(path: &Path, dir: bool) -> io::Result<()> {
@@ -100,9 +194,13 @@ mod imp {
     pub fn replace_durably(from: &Path, to: &Path) -> io::Result<()> {
         fs::rename(from, to)?;
         if let Some(dir) = to.parent() {
-            fs::File::open(dir)?.sync_all()?;
+            sync_dir(dir)?;
         }
         Ok(())
+    }
+
+    pub fn sync_dir(dir: &Path) -> io::Result<()> {
+        fs::File::open(dir)?.sync_all()
     }
 }
 
@@ -373,6 +471,13 @@ mod imp {
         if ok == 0 {
             return Err(io::Error::last_os_error());
         }
+        Ok(())
+    }
+
+    /// Nothing to do: NTFS logs folder changes in order, and the
+    /// write-through rename of a file saved in the folder flushes the log
+    /// up to it, the folder's creation included.
+    pub fn sync_dir(_dir: &Path) -> io::Result<()> {
         Ok(())
     }
 

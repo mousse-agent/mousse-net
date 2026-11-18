@@ -37,6 +37,22 @@ pub enum NetError {
     StreamLimit,
 }
 
+impl NetError {
+    /// The failure came before step 1 completed: the address was not
+    /// reached, or the TLS handshake or its certificate check failed. Such
+    /// a failure says nothing about the host, so another of its addresses
+    /// may still pass.
+    pub fn is_step1(&self) -> bool {
+        matches!(
+            self,
+            NetError::Io(_)
+                | NetError::Tls(_)
+                | NetError::Timeout(_)
+                | NetError::PeerCertificate(_)
+        )
+    }
+}
+
 impl fmt::Display for NetError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

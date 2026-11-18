@@ -14,6 +14,16 @@
 //! connection is promoted or `PAIRED` is sent, and if that save fails the
 //! grant is dropped and the pairing fails with `INTERNAL_ERROR`, so a
 //! device is never told it is paired under a grant a restart would lose.
+//! A save that failed after its rename (the folder sync) may have left the
+//! new grant on disk, where a restart would load it: the host writes the
+//! table without it again at once, and until such a save works it serves no
+//! grant at all (every connection closes with `INTERNAL_ERROR`).
+//!
+//! A pairing message and the owner's approval act only if the connection's
+//! gate still admits them under the same lock as the pairing step, so a
+//! removal or denial that closed the connection in between wins. Deadlines
+//! are checked before the traffic they bound: a join proof that arrives
+//! after the join-proof wait is refused even before the ticker runs.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -30,7 +40,7 @@ use mousse_net_core::pairing::{
     InvitationId, InvitationKind, InvitationParams, InvitationStatus, PairingCode,
     SessionExporters,
 };
-use mousse_net_core::{ConnectionId, ErrorCode, UnixTime};
+use mousse_net_core::{ConnectionId, ErrorCode, Millis, UnixTime};
 use tokio::sync::mpsc;
 
 use crate::admission::StreamAdmission;
@@ -42,7 +52,7 @@ use crate::error::NetError;
 use crate::limits::{ms, Limits};
 use crate::pipe::Pipe;
 use crate::rng::os_rng;
-use crate::store::GrantStore;
+use crate::store::{GrantStore, PendingEnrollment, WriteFailure};
 use crate::tls::{self, TlsPolicy};
 use crate::SharedSigner;
 
@@ -151,6 +161,11 @@ struct Inner<F: CodeExchangeFactory> {
     store: Option<GrantStore>,
     /// The last save failed; the ticker retries it.
     unsaved: bool,
+    /// An enrollment was rolled back after its save renamed the file into
+    /// place, and the table without it is not saved yet: a restart could
+    /// honor a grant this host reported as failed. No grant is served until
+    /// a save works.
+    reconcile: bool,
     events: mpsc::UnboundedSender<HostEvent>,
 }
 
@@ -166,7 +181,14 @@ struct Shared<F: CodeExchangeFactory> {
     /// Tests stop the ticker to show what holds without it.
     #[cfg(test)]
     ticker_paused: std::sync::atomic::AtomicBool,
+    /// Tests run this after a pairing message passed the gate and before
+    /// it is handled; it stays until it returns true.
+    #[cfg(test)]
+    after_pairing_check: Mutex<Option<PairingHook>>,
 }
+
+#[cfg(test)]
+type PairingHook = Box<dyn FnMut() -> bool + Send>;
 
 /// A host. Cheap to clone; all clones share state.
 pub struct Host<F: CodeExchangeFactory = CpaceExchangeFactory> {
@@ -205,20 +227,57 @@ where
     /// Save the grant table. On failure the change stays in effect in
     /// memory, the host reports [`HostEvent::StoreFailed`] and retries.
     fn persist(&mut self) -> Result<(), NetError> {
+        self.persist_checked().map_err(|f| f.error)
+    }
+
+    /// [`Inner::persist`], telling whether a failure may have left the
+    /// table in place on disk.
+    fn persist_checked(&mut self) -> Result<(), WriteFailure> {
         let Some(store) = &self.store else {
             return Ok(());
         };
-        match store.save(&self.grants) {
+        match store.save_checked(&self.grants) {
             Ok(()) => {
                 self.unsaved = false;
+                self.reconcile = false;
                 Ok(())
             }
-            Err(e) => {
+            Err(f) => {
                 self.unsaved = true;
-                let _ = self.events.send(HostEvent::StoreFailed(e.to_string()));
-                Err(e)
+                let _ = self
+                    .events
+                    .send(HostEvent::StoreFailed(f.error.to_string()));
+                Err(f)
             }
         }
+    }
+
+    /// Save the table holding the enrollments `pending`, so that a restart
+    /// honors them only if this returns `Ok`: they are recorded as pending
+    /// first, then the table is saved, then the record is cleared. Until
+    /// it is cleared a load drops their grants, so a failure at any step,
+    /// and a restart before the table without them is saved, leaves none
+    /// of them in force.
+    fn save_enrollment(&mut self, pending: &[PendingEnrollment]) -> Result<(), WriteFailure> {
+        let Some(store) = self.store.clone() else {
+            return Ok(());
+        };
+        let events = self.events.clone();
+        let failed = move |error: NetError, in_place: bool| {
+            let _ = events.send(HostEvent::StoreFailed(error.to_string()));
+            WriteFailure { error, in_place }
+        };
+        if let Err(e) = store.begin_enrollments(pending) {
+            return Err(failed(e, false));
+        }
+        self.persist_checked()?;
+        store.commit_enrollments().map_err(|e| failed(e, true))
+    }
+
+    /// Whether grants may be served: no rolled-back enrollment is waiting
+    /// to be saved away.
+    fn serving(&self) -> bool {
+        !self.reconcile
     }
 
     /// Remove the grants past their expiry, close their connections and
@@ -288,17 +347,42 @@ where
         before: GrantTable,
         actions: Vec<HostAction>,
     ) -> Vec<HostAction> {
-        let enrolling: Vec<ConnectionId> = actions
+        let (enrolling, pending): (Vec<ConnectionId>, Vec<PendingEnrollment>) = actions
             .iter()
             .filter_map(|a| match a {
-                HostAction::Enrolled { conn, .. } => Some(*conn),
+                HostAction::Enrolled {
+                    invitation,
+                    conn,
+                    grant,
+                    identity,
+                } => Some((
+                    *conn,
+                    PendingEnrollment {
+                        grant: *grant,
+                        identity: *identity,
+                        invitation: *invitation,
+                    },
+                )),
                 _ => None,
             })
-            .collect();
-        if enrolling.is_empty() || self.persist().is_ok() {
+            .unzip();
+        if enrolling.is_empty() {
             return actions;
         }
+        let failure = match self.save_enrollment(&pending) {
+            Ok(()) => return actions,
+            Err(f) => f,
+        };
         self.grants = before;
+        if failure.in_place && self.persist().is_err() {
+            // The file may hold the grant just refused. Serve nothing until
+            // the table without it is saved; the ticker retries.
+            self.reconcile = true;
+            let conns: Vec<ConnectionId> = self.conns.keys().copied().collect();
+            for conn in conns {
+                self.close_conn(conn, ErrorCode::InternalError);
+            }
+        }
         actions
             .into_iter()
             .flat_map(|action| match action {
@@ -432,6 +516,7 @@ where
                 conns: HashMap::new(),
                 store,
                 unsaved: false,
+                reconcile: false,
                 events,
             }),
             certs: CertManager::with_limits(signer, config.clock.clone(), &config.limits),
@@ -445,6 +530,8 @@ where
             next_conn: AtomicU64::new(1),
             #[cfg(test)]
             ticker_paused: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            after_pairing_check: Mutex::new(None),
         });
         tokio::spawn(ticker(Arc::downgrade(&shared)));
         Ok((Self { shared }, events_rx))
@@ -467,7 +554,7 @@ where
         {
             let mut inner = lock(&self.shared);
             let inner = &mut *inner;
-            let gate = ConnectionGate::open_with_limits(
+            let mut gate = ConnectionGate::open_with_limits(
                 conn,
                 peer,
                 &mut inner.grants,
@@ -475,6 +562,9 @@ where
                 self.shared.clock.mono(),
                 self.shared.limits.core(),
             );
+            if !inner.serving() {
+                gate.close(ErrorCode::InternalError);
+            }
             inner.gates.insert(conn, gate);
             inner.conns.insert(conn, cmd_tx.clone());
         }
@@ -538,6 +628,17 @@ where
     pub fn approve(&self, request: &ApprovalRequest) -> Result<(), NetError> {
         let mut inner = lock(&self.shared);
         let inner = &mut *inner;
+        // Under the same lock as the enrollment: a removal, denial or close
+        // that reached this connection first wins.
+        let waiting = matches!(
+            inner.gates.get(&request.conn).map(|g| g.state()),
+            Some(GateState::JoinOnly { invitation }) if *invitation == request.invitation
+        );
+        if !waiting || !inner.serving() {
+            return Err(NetError::Refused(
+                "the device's connection is no longer waiting for an answer".into(),
+            ));
+        }
         let before = inner.grants.clone();
         let actions = inner
             .pairing
@@ -705,6 +806,37 @@ struct HostRole<F: CodeExchangeFactory> {
     caller_opened: bool,
 }
 
+impl<F: CodeExchangeFactory> HostRole<F> {
+    fn check_locked(&mut self, traffic: Traffic) -> Verdict {
+        let now = self.shared.clock.now();
+        let mono = self.shared.clock.mono();
+        let mut inner = lock(&self.shared);
+        // The join-proof wait first: a proof that arrives after it is
+        // refused even if the ticker has not run yet.
+        if let Some(code) = inner
+            .gates
+            .get_mut(&self.conn)
+            .and_then(|g| g.on_timeout(mono))
+        {
+            return Verdict::Close(code);
+        }
+        if !inner.serving() && !matches!(traffic, Traffic::Keepalive | Traffic::GoAway) {
+            return Verdict::Close(ErrorCode::InternalError);
+        }
+        // Stream traffic needs the bound grant to be live now, not only when
+        // the ticker last looked.
+        if matches!(traffic, Traffic::Stream) && !inner.live_now(self.conn, now) {
+            if let Some(GateState::Closed(code)) = inner.gates.get(&self.conn).map(|g| g.state()) {
+                return Verdict::Close(*code);
+            }
+        }
+        match inner.gates.get_mut(&self.conn) {
+            Some(gate) => gate.check(traffic),
+            None => Verdict::Close(ErrorCode::InternalError),
+        }
+    }
+}
+
 impl<F> ConnRole for HostRole<F>
 where
     F: CodeExchangeFactory + Send + 'static,
@@ -726,21 +858,27 @@ where
     }
 
     fn check(&mut self, traffic: Traffic, _message: Option<&ControlMessage>) -> Verdict {
-        let now = self.shared.clock.now();
-        let mut inner = lock(&self.shared);
-        // Stream traffic needs the bound grant to be live now, not only when
-        // the ticker last looked.
-        if matches!(traffic, Traffic::Stream) && !inner.live_now(self.conn, now) {
-            if let Some(GateState::Closed(code)) = inner.gates.get(&self.conn).map(|g| g.state()) {
-                return Verdict::Close(*code);
-            }
-        }
-        let verdict = match inner.gates.get_mut(&self.conn) {
-            Some(gate) => gate.check(traffic),
-            None => Verdict::Close(ErrorCode::InternalError),
-        };
+        let verdict = self.check_locked(traffic);
         if verdict == Verdict::Allow && matches!(traffic, Traffic::Stream) {
             self.caller_opened = true;
+        }
+        #[cfg(test)]
+        if verdict == Verdict::Allow && matches!(traffic, Traffic::Pairing) {
+            let hook = self
+                .shared
+                .after_pairing_check
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            if let Some(mut hook) = hook {
+                if !hook() {
+                    *self
+                        .shared
+                        .after_pairing_check
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(hook);
+                }
+            }
         }
         verdict
     }
@@ -750,6 +888,23 @@ where
         let clock = &*shared.clock;
         let mut guard = lock(&shared);
         let inner = &mut *guard;
+        // The gate passed this message, but the lock was let go since: act
+        // only if the gate still admits it now, under the lock the pairing
+        // step runs under. A removal or denial that closed the connection
+        // in between wins.
+        let admitted = matches!(
+            (inner.gates.get(&self.conn).map(|g| g.state()), &message),
+            (
+                Some(GateState::AwaitingJoinProof { .. } | GateState::Live { .. }),
+                ControlMessage::JoinProof { .. }
+            ) | (
+                Some(GateState::JoinOnly { .. }),
+                ControlMessage::CodeExchange { .. } | ControlMessage::CodeAbort { .. }
+            )
+        );
+        if !admitted || !inner.serving() {
+            return;
+        }
         let before = inner.grants.clone();
         let actions = match message {
             ControlMessage::JoinProof {
@@ -790,7 +945,28 @@ where
             return false;
         }
         let now = self.shared.clock.now();
-        lock(&self.shared).live_now(self.conn, now)
+        let mut inner = lock(&self.shared);
+        inner.serving() && inner.live_now(self.conn, now)
+    }
+
+    /// The join-proof deadline, so the driver checks it before it reads
+    /// on, not only when the ticker runs.
+    fn wake_at(&self) -> Option<Millis> {
+        match lock(&self.shared).gates.get(&self.conn).map(|g| g.state()) {
+            Some(GateState::AwaitingJoinProof { deadline }) => Some(*deadline),
+            _ => None,
+        }
+    }
+
+    fn on_wake(&mut self, mono: Millis, out: &mut Outbox) {
+        let mut inner = lock(&self.shared);
+        if let Some(code) = inner
+            .gates
+            .get_mut(&self.conn)
+            .and_then(|g| g.on_timeout(mono))
+        {
+            out.close = Some(code);
+        }
     }
 
     fn on_closed(&mut self, _reason: &CloseReason) {
@@ -809,7 +985,7 @@ mod tests {
     use mousse_net_core::grants::NewGrant;
     use mousse_net_core::identity::SoftwareKey;
     use mousse_net_core::mux::PriorityClass;
-    use mousse_net_core::pairing::CpaceExchangeFactory;
+    use mousse_net_core::pairing::{Arrival, CpaceExchangeFactory, Ticket};
 
     use super::*;
     use crate::caller::Caller;
@@ -967,5 +1143,323 @@ mod tests {
             CloseReason::Peer(ErrorCode::GrantRevoked)
         );
         assert!(live.host.grants().is_empty());
+    }
+
+    /// A host whose grants live in `state_dir`, and its events.
+    fn host_in(state_dir: Option<PathBuf>) -> (Host, mpsc::UnboundedReceiver<HostEvent>) {
+        let config = HostConfig {
+            name: "desk".into(),
+            state_dir,
+            owner: OwnerRef([1; OwnerRef::LEN]),
+            limits: Limits::DEFAULT,
+            clock: Arc::new(ManualClock::new()),
+            ticket_identity: None,
+        };
+        let key = Arc::new(SoftwareKey::generate(&mut os_rng()));
+        Host::new(key, config, CpaceExchangeFactory).unwrap()
+    }
+
+    fn fresh_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "mousse-host-{tag}-{}",
+            crate::store::hex(&crate::rng::random_bytes::<6>())
+        ))
+    }
+
+    fn new_caller() -> Caller {
+        Caller::new(
+            Arc::new(SoftwareKey::generate(&mut os_rng())),
+            Arc::new(ManualClock::new()),
+            Limits::DEFAULT,
+        )
+    }
+
+    /// Grant `identity` in memory, as an earlier pairing would have.
+    fn grant(host: &Host, identity: IdentityPublicKey) -> GrantId {
+        let mut inner = lock(&host.shared);
+        let now = host.shared.clock.now();
+        let new = NewGrant {
+            identity,
+            name: "laptop".into(),
+            role: Role::owner(),
+            authorizing_owner: host.shared.owner,
+            expires_at: None,
+            enrolled_by: None,
+        };
+        inner.grants.add(new, now).unwrap().0
+    }
+
+    fn ticket(host: &Host, kind: InvitationKind) -> Ticket {
+        let created = host.invite(kind, vec!["tcp://127.0.0.1:1".into()]).unwrap();
+        Ticket::from_fragment(&created.fragment).unwrap()
+    }
+
+    fn granted(host: &Host, identity: &IdentityPublicKey) -> bool {
+        host.grants().iter().any(|g| g.identity == *identity)
+    }
+
+    async fn next_request(events: &mut mpsc::UnboundedReceiver<HostEvent>) -> ApprovalRequest {
+        loop {
+            match within("approval request", events.recv()).await {
+                Some(HostEvent::ApprovalRequested(request)) => return request,
+                Some(_) => continue,
+                None => panic!("host events ended"),
+            }
+        }
+    }
+
+    type Joined = Result<(Connection, crate::caller::JoinOutcome), NetError>;
+
+    /// Join `host` in person over an in-memory pipe; `on_request` runs
+    /// when the owner is asked. Returns how the join ended.
+    async fn join_in_person(
+        host: &Host,
+        events: &mut mpsc::UnboundedReceiver<HostEvent>,
+        caller: &Caller,
+        on_request: impl FnOnce(ApprovalRequest),
+    ) -> Joined {
+        let ticket = ticket(host, InvitationKind::InPerson);
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let accepting = host.clone();
+        let accept = tokio::spawn(async move { accepting.accept(a).await });
+        let join = caller.join(b, &ticket, Arrival::InAppScan, "laptop");
+        tokio::pin!(join);
+        let request = tokio::select! {
+            request = next_request(events) => request,
+            _ = &mut join => panic!("the join ended before the owner was asked"),
+        };
+        on_request(request);
+        let result = within("join", join).await;
+        accept.abort();
+        result
+    }
+
+    fn refused_with(result: &Joined, code: ErrorCode) -> bool {
+        matches!(result, Err(NetError::Closed(CloseReason::Peer(c))) if *c == code)
+    }
+
+    /// The enrollment's save renamed the table into place and then failed
+    /// (the folder sync): the host reports the pairing failed, so it writes
+    /// the table without the grant again at once. A restart finds no grant.
+    #[tokio::test]
+    async fn a_save_that_failed_after_its_rename_is_saved_away_at_once() {
+        let dir = fresh_dir("rename");
+        let (host, mut events) = host_in(Some(dir.clone()));
+        let caller = new_caller();
+        let store = GrantStore::in_dir(&dir);
+        let result = join_in_person(&host, &mut events, &caller, |request| {
+            crate::private::faults::fail_after_rename(store.path(), 1);
+            host.approve(&request).unwrap();
+        })
+        .await;
+        assert!(
+            refused_with(&result, ErrorCode::InternalError),
+            "{:?}",
+            result.err()
+        );
+        assert!(!granted(&host, &caller.identity()));
+        assert!(store.load().unwrap().grants().next().is_none());
+        assert!(lock(&host.shared).serving());
+        assert!(!host.has_unsaved_changes());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// When writing the table again fails too, the host serves no grant
+    /// until a save works: a granted device is refused, then served again
+    /// once the ticker saved the table without the failed enrollment.
+    #[tokio::test]
+    async fn the_host_serves_no_grant_until_the_failed_enrollment_is_saved_away() {
+        let dir = fresh_dir("reconcile");
+        let (host, mut events) = host_in(Some(dir.clone()));
+        let other = new_caller();
+        grant(&host, other.identity());
+        let caller = new_caller();
+        let store = GrantStore::in_dir(&dir);
+        let result = join_in_person(&host, &mut events, &caller, |request| {
+            crate::private::faults::fail_after_rename(store.path(), 2);
+            host.approve(&request).unwrap();
+        })
+        .await;
+        assert!(
+            refused_with(&result, ErrorCode::InternalError),
+            "{:?}",
+            result.err()
+        );
+        assert!(!lock(&host.shared).serving());
+
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let (hosted, _dialled) = tokio::join!(host.accept(a), other.dial(b, host.identity()));
+        assert_eq!(
+            within("refused", hosted.unwrap().closed()).await,
+            CloseReason::Local(ErrorCode::InternalError)
+        );
+
+        within("saved", async {
+            while host.has_unsaved_changes() {
+                tokio::time::sleep(ms(Limits::DEFAULT.io().clock_recheck_ms())).await;
+            }
+        })
+        .await;
+        assert!(lock(&host.shared).serving());
+        let saved = store.load().unwrap();
+        assert!(saved.grants().all(|g| g.identity != caller.identity()));
+        assert!(saved.grants().any(|g| g.identity == other.identity()));
+
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let (hosted, dialled) = tokio::join!(host.accept(a), other.dial(b, host.identity()));
+        let (hosted, dialled) = (hosted.unwrap(), dialled.unwrap());
+        let stream = dialled
+            .open_stream(PriorityClass::Interactive, "terminal")
+            .await
+            .unwrap();
+        stream.writer.write(b"back").await.unwrap();
+        assert!(within("served again", hosted.accept_stream())
+            .await
+            .is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Approve an in-person join of `host` while saves fail as `table` and
+    /// `pending` plan, expect the pairing to fail, then restart the host
+    /// from its folder, with the old host's ticker stopped so nothing
+    /// retries the save first.
+    async fn failed_enrollment_then_restart(
+        tag: &str,
+        table: &[crate::private::faults::Fault],
+        pending: &[crate::private::faults::Fault],
+    ) -> (Host, IdentityPublicKey, PathBuf) {
+        let dir = fresh_dir(tag);
+        let (host, mut events) = host_in(Some(dir.clone()));
+        host.shared.ticker_paused.store(true, Ordering::SeqCst);
+        let caller = new_caller();
+        let store = GrantStore::in_dir(&dir);
+        let result = join_in_person(&host, &mut events, &caller, |request| {
+            crate::private::faults::plan_replaces(store.path(), table);
+            crate::private::faults::plan_replaces(store.pending_path(), pending);
+            host.approve(&request).unwrap();
+        })
+        .await;
+        assert!(
+            refused_with(&result, ErrorCode::InternalError),
+            "{:?}",
+            result.err()
+        );
+        assert!(!granted(&host, &caller.identity()));
+        drop(host);
+        let (restarted, _events) = host_in(Some(dir.clone()));
+        (restarted, caller.identity(), dir)
+    }
+
+    /// The enrollment's table landed (its sync failed) and the corrective
+    /// write failed before its rename, so the file still holds the grant
+    /// when the host stops. The restarted host does not honor it.
+    #[tokio::test]
+    async fn a_restart_honors_no_enrollment_whose_corrective_write_failed() {
+        use crate::private::faults::Fault;
+        let (host, identity, dir) = failed_enrollment_then_restart(
+            "restart",
+            &[Fault::AfterRename, Fault::BeforeRename],
+            &[],
+        )
+        .await;
+        assert!(GrantStore::in_dir(&dir)
+            .load()
+            .is_ok_and(|t| t.grants().next().is_none()));
+        assert!(!granted(&host, &identity));
+        assert!(lock(&host.shared).serving());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The table with the grant was saved but clearing the pending record
+    /// failed, and so did the corrective write: the pairing failed, and a
+    /// restart does not honor it either.
+    #[tokio::test]
+    async fn a_restart_honors_no_enrollment_whose_commit_failed() {
+        use crate::private::faults::Fault;
+        let (host, identity, dir) = failed_enrollment_then_restart(
+            "commit",
+            &[Fault::None, Fault::BeforeRename],
+            &[Fault::None, Fault::BeforeRename],
+        )
+        .await;
+        assert!(!granted(&host, &identity));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Recording the enrollment as pending failed: nothing was saved, the
+    /// pairing failed, and the host keeps serving.
+    #[tokio::test]
+    async fn an_enrollment_that_could_not_be_recorded_as_pending_fails_cleanly() {
+        use crate::private::faults::Fault;
+        let (host, identity, dir) =
+            failed_enrollment_then_restart("begin", &[], &[Fault::BeforeRename]).await;
+        assert!(!granted(&host, &identity));
+        assert!(lock(&host.shared).serving());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// In person: the owner says yes after the device's grant was removed
+    /// (which closed its connection). The approval is refused and no grant
+    /// comes back.
+    #[tokio::test]
+    async fn an_approval_after_the_grant_was_removed_enrolls_nothing() {
+        let (host, mut events) = host_in(None);
+        let caller = new_caller();
+        let old = grant(&host, caller.identity());
+        let result = join_in_person(&host, &mut events, &caller, |request| {
+            assert!(host.remove_grant(old).unwrap());
+            assert!(host.approve(&request).is_err());
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(!granted(&host, &caller.identity()));
+    }
+
+    /// The code the host shows, typed as soon as it is shown.
+    struct ShownCode(mpsc::UnboundedReceiver<HostEvent>);
+
+    impl crate::caller::CodeEntry for ShownCode {
+        async fn code(&mut self, _retry: Option<u8>) -> Option<String> {
+            loop {
+                if let HostEvent::ShowCode { code, .. } = self.0.recv().await? {
+                    return Some(code.as_str().to_owned());
+                }
+            }
+        }
+    }
+
+    /// With a send link: the device's final code confirmation passes the
+    /// gate, then its grant is removed before the message is handled. The
+    /// removal wins: no grant is made again.
+    #[tokio::test]
+    async fn a_code_confirmation_racing_the_grant_removal_enrolls_nothing() {
+        let (host, events) = host_in(None);
+        let caller = new_caller();
+        let old = grant(&host, caller.identity());
+        let ticket = ticket(&host, InvitationKind::SendLink);
+        // The joiner's second pairing message is its confirmation.
+        let removing = host.clone();
+        let mut seen = 0;
+        *host.shared.after_pairing_check.lock().unwrap() = Some(Box::new(move || {
+            seen += 1;
+            if seen < 2 {
+                return false;
+            }
+            assert!(removing.remove_grant(old).unwrap());
+            true
+        }));
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let accepting = host.clone();
+        let accept = tokio::spawn(async move { accepting.accept(a).await });
+        let mut codes = ShownCode(events);
+        let result = within(
+            "join",
+            caller.join_with_code(b, &ticket, Arrival::Link, "laptop", &mut codes),
+        )
+        .await;
+        accept.abort();
+        assert!(result.is_err());
+        assert!(host.shared.after_pairing_check.lock().unwrap().is_none());
+        assert!(!granted(&host, &caller.identity()));
     }
 }

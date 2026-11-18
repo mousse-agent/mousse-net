@@ -157,6 +157,9 @@ pub fn reason_of(e: &NetError) -> String {
             None => "pairing_refused".into(),
         },
         NetError::Store(_) => "store".into(),
+        NetError::Tls(_) => "tls".into(),
+        NetError::Timeout(_) => "timeout".into(),
+        NetError::Io(_) => "unreachable".into(),
         _ => "error".into(),
     }
 }
@@ -236,28 +239,35 @@ pub async fn join(
             .await
         {
             Ok((conn, outcome)) => {
-                let existing = side.peers().load().ok().and_then(|ps| {
-                    ps.into_iter()
-                        .find(|p| p.pin().ok() == Some(ticket.host_identity))
-                });
-                let (host_name, role) = match outcome {
-                    JoinOutcome::Paired(host) => (host.name, format!("{:?}", host.role)),
-                    JoinOutcome::AlreadyPaired => match &existing {
-                        Some(p) => (p.name.clone(), p.role.clone()),
-                        None => (short_id(&ticket.host_identity), "unknown".into()),
-                    },
-                };
-                let record = PeerRecord {
-                    name: host_name,
-                    identity: hex(ticket.host_identity.as_bytes()),
-                    role,
-                    routes: ticket.routes.clone(),
-                    last_route: Some(hint.clone()),
-                    paired_at: now_secs(),
-                };
+                // Built from the stored record as it is under the lock, so
+                // a write by another process meanwhile is not undone.
+                let mut stored = None;
                 side.peers()
-                    .upsert(record.clone())
+                    .update(|peers| {
+                        let existing = peers
+                            .iter()
+                            .find(|p| p.pin().ok() == Some(ticket.host_identity));
+                        let (host_name, role) = match outcome {
+                            JoinOutcome::Paired(host) => (host.name, format!("{:?}", host.role)),
+                            JoinOutcome::AlreadyPaired => match existing {
+                                Some(p) => (p.name.clone(), p.role.clone()),
+                                None => (short_id(&ticket.host_identity), "unknown".into()),
+                            },
+                        };
+                        let record = PeerRecord {
+                            name: host_name,
+                            identity: hex(ticket.host_identity.as_bytes()),
+                            role,
+                            routes: ticket.routes.clone(),
+                            last_route: Some(hint.clone()),
+                            paired_at: now_secs(),
+                        };
+                        peers.retain(|p| p.pin().ok() != Some(ticket.host_identity));
+                        peers.push(record.clone());
+                        stored = Some(record);
+                    })
                     .map_err(|e| Failure::new(e.to_string(), "store"))?;
+                let record = stored.expect("the update ran");
                 // The pin is stored: the join's outcome is no longer pending.
                 side.caller
                     .pin_stored(ticket)
@@ -274,10 +284,15 @@ pub async fn join(
                     "pin_mismatch",
                 );
             }
-            // Any other step 1 failure: the next address may pass.
+            // Any other certificate failure: the next address may pass.
             Err(NetError::PeerCertificate(e)) => {
                 step1.note(e);
                 last = Failure::of(&NetError::PeerCertificate(e));
+            }
+            // A step 1 failure of another kind (TLS, timeout, no answer):
+            // the next address may pass too.
+            Err(e) if e.is_step1() => {
+                last = Failure::new(format!("{hint}: {}", describe(&e)), &reason_of(&e));
             }
             Err(e) => return Err(Failure::of(&e)),
         }
@@ -357,9 +372,9 @@ pub async fn dial(
         .dial_candidates(&candidates, pin)
         .await
         .map_err(|e| describe(&e))?;
-    let mut record = peer.clone();
-    record.last_route = Some(route_uri(&used));
-    let _ = side.peers().upsert(record);
+    // Only the route is noted, on the record as stored now: a re-pair of
+    // this host meanwhile keeps its name, role and routes.
+    let _ = side.peers().note_route(&pin, route_uri(&used));
     Ok(conn)
 }
 

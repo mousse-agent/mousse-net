@@ -748,6 +748,74 @@ async fn a_lost_paired_is_settled_by_reconnecting_with_the_same_join() {
     host.stop().await;
 }
 
+/// The PAIRED is lost and every reconnect reaches another device: the join
+/// reports the step 1 failure (the pin mismatch), not a generic refusal,
+/// so the app can try the host's other addresses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconnects_that_meet_another_device_report_the_step_one_failure() {
+    let mut host = TestHost::start(new_signer()).await;
+    let stranger = TestHost::start(new_signer()).await;
+    let flag = Arc::new(AtomicU8::new(0));
+    let caller = Arc::new(Caller::with_factory(
+        new_signer(),
+        Arc::new(ManualClock::new()),
+        Limits::DEFAULT,
+        FlagConfirm(flag.clone()),
+    ));
+    let ticket = host.invite_kind(InvitationKind::SendLink);
+    let (type_tx, typed) = mpsc::unbounded_channel();
+    let (asks, mut asks_rx) = mpsc::unbounded_channel();
+    let join = {
+        let (caller, ticket, route, elsewhere) = (
+            caller.clone(),
+            ticket.clone(),
+            host.route(),
+            stranger.route(),
+        );
+        tokio::spawn(async move {
+            let first = LosePaired {
+                tcp: connect_tcp(&route).await?,
+                flag: Some(flag),
+            };
+            let mut codes = TypedCodes { asks, typed };
+            let redial = || {
+                let elsewhere = elsewhere.clone();
+                async move {
+                    Ok(LosePaired {
+                        tcp: connect_tcp(&elsewhere).await?,
+                        flag: None,
+                    })
+                }
+            };
+            caller
+                .join_with_redial(
+                    first,
+                    &ticket,
+                    Arrival::Link,
+                    "phone",
+                    &mut codes,
+                    false,
+                    redial,
+                )
+                .await
+        })
+    };
+    let code = host.next_code().await;
+    assert_eq!(within("ask", asks_rx.recv()).await, Some(None));
+    type_tx.send(code).unwrap();
+    // Every retry wait runs: allow for them on top of the usual wait.
+    let retries: Duration = Limits::DEFAULT.outcome_retry_waits().iter().sum();
+    let err = tokio::time::timeout(retries + WAIT, join)
+        .await
+        .expect("the join ended")
+        .unwrap()
+        .map(|(_, outcome)| outcome)
+        .unwrap_err();
+    assert!(is_pin_mismatch(&err), "{err:?}");
+    host.stop().await;
+    stranger.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_granted_device_pairs_again_by_link_and_already_paired_needs_a_pin() {
     let mut host = TestHost::start(new_signer()).await;
