@@ -92,7 +92,10 @@ fn mdns_err(e: mdns_sd::Error) -> NetError {
     NetError::Io(std::io::Error::other(e.to_string()))
 }
 
-fn service(name: &str, port: u16) -> Result<ServiceInfo, NetError> {
+/// The record advertised for instance `name` on `port`: the instance and
+/// the mDNS host name are both `name` (random, see [`RotatingName`]), the
+/// addresses are this machine's, and the TXT record holds only `v=1`.
+pub fn record(name: &str, port: u16) -> Result<ServiceInfo, NetError> {
     let host = format!("{name}.local.");
     ServiceInfo::new(SERVICE_TYPE, name, &host, "", port, &[("v", "1")][..])
         .map(ServiceInfo::enable_addr_auto)
@@ -114,7 +117,7 @@ impl Advertiser {
         let rotating = RotatingName::new(&mut os_rng(), clock.mono(), limits.mdns_rotate_ms());
         let check = ms(limits.mdns_rotate_check_ms());
         daemon
-            .register(service(rotating.current(), port)?)
+            .register(record(rotating.current(), port)?)
             .map_err(mdns_err)?;
         let name = Arc::new(Mutex::new(rotating));
         let task_daemon = daemon.clone();
@@ -128,7 +131,7 @@ impl Advertiser {
                 };
                 if let Some(old) = guard.poll(&mut os_rng(), clock.mono()) {
                     let _ = task_daemon.unregister(&format!("{old}.{SERVICE_TYPE}"));
-                    if let Ok(info) = service(guard.current(), port) {
+                    if let Ok(info) = record(guard.current(), port) {
                         let _ = task_daemon.register(info);
                     }
                 }
@@ -169,6 +172,72 @@ pub async fn browse(wait: Duration) -> Result<Vec<SocketAddr>, NetError> {
     Ok(found.into_iter().collect())
 }
 
+/// What a browse found: addresses where some Mousse host may listen. TLS
+/// with the stored pin tells which host each one is.
+pub type BrowseFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Vec<SocketAddr>, NetError>> + Send + 'a>,
+>;
+
+/// Where a caller looks for hosts on the LAN (Phase 1a §6): mDNS
+/// ([`MdnsBrowse`]), or in tests a source that needs no multicast.
+pub trait BrowseSource: Send + Sync {
+    /// Look for hosts, listening up to `wait`.
+    fn browse(&self, wait: Duration) -> BrowseFuture<'_>;
+}
+
+/// Browse with mDNS. Opens multicast sockets on every browse.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MdnsBrowse;
+
+impl BrowseSource for MdnsBrowse {
+    fn browse(&self, wait: Duration) -> BrowseFuture<'_> {
+        Box::pin(browse(wait))
+    }
+}
+
+/// A browse source whose results are reused for
+/// [`IoLimits::browse_cache_ms`], so dials to several hosts, or one host
+/// retried, browse once. A failed browse is not kept.
+pub struct CachedBrowse {
+    source: Arc<dyn BrowseSource>,
+    clock: Arc<dyn Clock>,
+    wait: Duration,
+    keep_ms: u64,
+    cache: tokio::sync::Mutex<Option<(Millis, Vec<SocketAddr>)>>,
+}
+
+impl CachedBrowse {
+    /// Cache `source`, timed by `clock`'s monotonic reading.
+    pub fn new(source: Arc<dyn BrowseSource>, clock: Arc<dyn Clock>, limits: &IoLimits) -> Self {
+        Self {
+            source,
+            clock,
+            wait: ms(limits.browse_wait_ms()),
+            keep_ms: limits.browse_cache_ms(),
+            cache: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// The cached results while they are fresh, else a new browse.
+    /// Concurrent callers share one browse.
+    pub async fn addresses(&self) -> Result<Vec<SocketAddr>, NetError> {
+        let mut cache = self.cache.lock().await;
+        if let Some((at, found)) = cache.as_ref() {
+            if self.clock.mono() < at.plus(self.keep_ms) {
+                return Ok(found.clone());
+            }
+        }
+        let found = self.source.browse(self.wait).await?;
+        *cache = Some((self.clock.mono(), found.clone()));
+        Ok(found)
+    }
+
+    /// Forget the cached results (the network changed).
+    pub async fn forget(&self) {
+        *self.cache.lock().await = None;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,6 +246,46 @@ mod tests {
 
     fn rng(seed: u8) -> ChaCha20Rng {
         ChaCha20Rng::from_seed([seed; 32])
+    }
+
+    struct Counting(std::sync::atomic::AtomicUsize);
+
+    impl BrowseSource for Counting {
+        fn browse(&self, _wait: Duration) -> BrowseFuture<'_> {
+            let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move { Ok(vec![SocketAddr::from(([10, 0, 0, n as u8], 7443))]) })
+        }
+    }
+
+    #[tokio::test]
+    async fn browse_results_are_reused_until_they_are_stale() {
+        let clock = Arc::new(crate::clock::ManualClock::new());
+        clock.freeze_mono();
+        let source = Arc::new(Counting(Default::default()));
+        let cache = CachedBrowse::new(source.clone(), clock.clone(), &IoLimits::DEFAULT);
+        let first = cache.addresses().await.unwrap();
+        clock.advance_mono(IoLimits::DEFAULT.browse_cache_ms() - 1);
+        assert_eq!(cache.addresses().await.unwrap(), first);
+        clock.advance_mono(1);
+        let second = cache.addresses().await.unwrap();
+        assert_ne!(second, first);
+        cache.forget().await;
+        assert_ne!(cache.addresses().await.unwrap(), second);
+        assert_eq!(source.0.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn the_record_holds_the_random_name_and_the_version_only() {
+        let name = random_instance_name(&mut os_rng());
+        let info = record(&name, 7443).unwrap();
+        assert_eq!(info.get_fullname(), format!("{name}.{SERVICE_TYPE}"));
+        assert_eq!(info.get_hostname(), format!("{name}.local."));
+        let props: Vec<(String, String)> = info
+            .get_properties()
+            .iter()
+            .map(|p| (p.key().to_owned(), p.val_str().to_owned()))
+            .collect();
+        assert_eq!(props, vec![("v".to_owned(), "1".to_owned())]);
     }
 
     #[test]

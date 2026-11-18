@@ -48,6 +48,14 @@ mousse_net_core::define_limits! {
         streams_per_connection = "STREAMS_PER_CONNECTION": 32, [1, 1_024];
         /// Streams all connections of one endpoint (one helper) may have open together, both directions counted; a peer's open beyond it is refused with REFUSED_STREAM.
         streams_per_endpoint = "STREAMS_PER_ENDPOINT": 128, [1, 1_024];
+        /// Caller: candidate addresses for one host dialled at once (Phase 1a §6).
+        dial_parallel = "DIAL_PARALLEL": 4, [1, 64];
+        /// Caller: how long one candidate address may take to connect and pass step 1 before the next is tried (Phase 1a §6).
+        dial_timeout_ms = "DIAL_TIMEOUT_MS": 2_000, [100, 60_000];
+        /// How long an mDNS browse listens for answers (Phase 1a §6).
+        browse_wait_ms = "BROWSE_WAIT_MS": 1_500, [100, 30_000];
+        /// How long browse results are reused before the next browse (Phase 1a §6; 0 browses every time).
+        browse_cache_ms = "BROWSE_CACHE_MS": 60_000, [0, 3_600_000];
     }
     agree(io) {
         if io.outcome_retry_max_ms < io.outcome_retry_first_ms {

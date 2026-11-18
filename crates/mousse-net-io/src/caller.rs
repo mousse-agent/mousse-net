@@ -334,31 +334,45 @@ where
             .get(&pin)
             .cloned()
             .unwrap_or_default();
-        let mut last = NetError::Refused("no known route to this host".into());
-        for route in &routes {
-            let pipe =
-                match connect_tcp_within(route, ms(self.limits.io().connect_timeout_ms())).await {
-                    Ok(pipe) => pipe,
-                    Err(e) => {
-                        last = e;
-                        continue;
-                    }
-                };
-            let conn = match self.connect(pipe, pin).await {
-                Ok(conn) => conn,
-                Err(NetError::PeerCertificate(CertError::PinMismatch)) => continue,
-                Err(e) => {
-                    last = e;
-                    continue;
-                }
-            };
-            return match conn.settled(false).await {
-                status if status.is_live() => Ok(conn),
-                ConnStatus::Closed(reason) => Err(NetError::Closed(reason)),
-                other => Err(NetError::Refused(format!("unexpected state {other:?}"))),
-            };
+        self.race(&routes, pin).await.map(|(conn, _)| conn)
+    }
+
+    /// A connection that passed step 1 with `pin` becomes the host's
+    /// candidate path. Nothing in the session changes before step 1
+    /// passed, so tries that fail or lose a race leave no trace.
+    fn admit(
+        &self,
+        pin: IdentityPublicKey,
+        handshake: &Handshake,
+    ) -> Result<ConnectionId, NetError> {
+        let conn = ConnectionId(self.next_conn.fetch_add(1, Ordering::Relaxed));
+        let mut paths = lock(&self.paths);
+        let session = paths
+            .sessions
+            .entry(pin)
+            .or_insert_with(|| PeerSession::with_limits(pin, self.limits.core()));
+        let mut events = session.begin_path(conn);
+        let checked = session.on_authenticated(
+            conn,
+            &handshake.peer,
+            handshake.local_window,
+            self.clock.now(),
+            self.clock.mono(),
+        );
+        let refused = match checked {
+            Ok(more) => {
+                events.extend(more);
+                None
+            }
+            // The control build lets a different identity through.
+            Err(_) if cfg!(mousse_control = "skip-pin-check") => None,
+            Err(e) => Some(NetError::Refused(format!("new path refused: {e:?}"))),
+        };
+        paths.run(events);
+        match refused {
+            Some(e) => Err(e),
+            None => Ok(conn),
         }
-        Err(last)
     }
 
     async fn handshake<P: Pipe>(
@@ -367,45 +381,10 @@ where
         pin: IdentityPublicKey,
     ) -> Result<(ConnectionId, tokio_rustls::TlsStream<P>, Handshake), NetError> {
         let own = self.certs.current()?;
-        let conn = ConnectionId(self.next_conn.fetch_add(1, Ordering::Relaxed));
-        {
-            let mut paths = lock(&self.paths);
-            let events = paths
-                .sessions
-                .entry(pin)
-                .or_insert_with(|| PeerSession::with_limits(pin, self.limits.core()))
-                .begin_path(conn);
-            paths.run(events);
-        }
-        let result = tls::connect(pipe, &own, pin, self.clock.clone(), self.policy).await;
-        let mut paths = lock(&self.paths);
-        let session = paths
-            .sessions
-            .entry(pin)
-            .or_insert_with(|| PeerSession::with_limits(pin, self.limits.core()));
-        match result {
-            Ok((stream, handshake)) => {
-                match session.on_authenticated(
-                    conn,
-                    &handshake.peer,
-                    handshake.local_window,
-                    self.clock.now(),
-                    self.clock.mono(),
-                ) {
-                    Ok(events) => paths.run(events),
-                    // The control build lets a different identity through.
-                    Err(_) if cfg!(mousse_control = "skip-pin-check") => {}
-                    Err(e) => {
-                        return Err(NetError::Refused(format!("new path refused: {e:?}")));
-                    }
-                }
-                Ok((conn, stream, handshake))
-            }
-            Err(e) => {
-                session.on_path_closed(conn);
-                Err(e)
-            }
-        }
+        let (stream, handshake) =
+            tls::connect(pipe, &own, pin, self.clock.clone(), self.policy).await?;
+        let conn = self.admit(pin, &handshake)?;
+        Ok((conn, stream, handshake))
     }
 
     fn start<P: Pipe>(
@@ -507,8 +486,14 @@ where
         }
     }
 
-    /// Dial the host pinned as `pin` at the first of `routes` that answers
-    /// as that host, over TCP.
+    /// Dial the host pinned as `pin` at whichever of `routes` answers as
+    /// that host first, over TCP (Phase 1a §6).
+    ///
+    /// Up to [`IoLimits::dial_parallel`](crate::limits::IoLimits::dial_parallel)
+    /// candidates are tried at once, in order, each given
+    /// [`IoLimits::dial_timeout_ms`](crate::limits::IoLimits::dial_timeout_ms)
+    /// to connect and pass step 1, so a slow or silent address never holds
+    /// up the rest.
     ///
     /// Any step 1 failure on a candidate means "not this host here": a
     /// candidate whose identity is not the pin is another endpoint (for
@@ -516,34 +501,83 @@ where
     /// the address), and it is skipped without a warning and never
     /// re-pinned; the same goes for any other certificate failure. Only when
     /// no candidate passed is a certificate failure reported, the window
-    /// one (a clock problem) first. Once the pinned host itself refuses (for
-    /// example `NOT_AUTHORIZED`), the refusal is returned and no further
-    /// candidate is tried.
+    /// one (a clock problem) first. The first candidate to pass step 1 is
+    /// the pinned host: the other tries end, and if the host then refuses
+    /// (for example `NOT_AUTHORIZED`) the refusal is returned and no
+    /// further candidate is tried.
     pub async fn dial_candidates(
         &self,
         routes: &[Route],
         pin: IdentityPublicKey,
     ) -> Result<(Connection, Route), NetError> {
+        let (conn, route) = self.race(routes, pin).await?;
+        self.promote_first(&conn);
+        let mut order = vec![route.clone()];
+        order.extend(routes.iter().filter(|r| **r != route).cloned());
+        self.remember_routes(pin, order);
+        Ok((conn, route))
+    }
+
+    /// [`Caller::dial_candidates`] without making the path current: the
+    /// live connection and the route it used.
+    async fn race(
+        &self,
+        routes: &[Route],
+        pin: IdentityPublicKey,
+    ) -> Result<(Connection, Route), NetError> {
+        let io = self.limits.io();
+        let parallel = usize::try_from(io.dial_parallel()).unwrap_or(1).max(1);
+        let within = ms(io.dial_timeout_ms());
+        let connect_within = ms(io.connect_timeout_ms()).min(within);
+        let own = self.certs.current()?;
+        let mut queue = routes.iter().cloned();
+        let mut tries = tokio::task::JoinSet::new();
         let mut last = None;
         let mut step1 = Step1Failures::default();
-        for route in routes {
-            let pipe =
-                match connect_tcp_within(route, ms(self.limits.io().connect_timeout_ms())).await {
-                    Ok(pipe) => pipe,
-                    Err(e) => {
-                        last = Some(e);
-                        continue;
-                    }
+        loop {
+            while tries.len() < parallel {
+                let Some(route) = queue.next() else {
+                    break;
                 };
-            match self.dial(pipe, pin).await {
-                Ok(conn) => {
-                    let mut order = vec![route.clone()];
-                    order.extend(routes.iter().filter(|r| *r != route).cloned());
-                    self.remember_routes(pin, order);
-                    return Ok((conn, route.clone()));
+                let (own, clock, policy) = (own.clone(), self.clock.clone(), self.policy);
+                tries.spawn(async move {
+                    let attempt = async {
+                        let pipe = connect_tcp_within(&route, connect_within).await?;
+                        tls::connect(pipe, &own, pin, clock, policy).await
+                    };
+                    let result = tokio::time::timeout(within, attempt)
+                        .await
+                        .unwrap_or(Err(NetError::Timeout("candidate address")));
+                    (route, result)
+                });
+            }
+            let Some(joined) = tries.join_next().await else {
+                break;
+            };
+            // A try that panicked is a candidate that failed.
+            let Ok((route, result)) = joined else {
+                continue;
+            };
+            match result {
+                Ok((stream, handshake)) => {
+                    // Step 1 passed: this is the pinned host. The other
+                    // tries end here.
+                    tries.abort_all();
+                    let id = self.admit(pin, &handshake)?;
+                    let conn = self.start(id, stream, handshake, pin, None);
+                    return match conn.settled(false).await {
+                        status if status.is_live() => Ok((conn, route)),
+                        ConnStatus::Closed(reason) => Err(NetError::Closed(reason)),
+                        other => Err(NetError::Refused(format!("unexpected state {other:?}"))),
+                    };
+                }
+                // The control build stops at the first other identity.
+                Err(NetError::PeerCertificate(CertError::PinMismatch))
+                    if cfg!(mousse_control = "stop-on-mismatch") =>
+                {
+                    return Err(NetError::PeerCertificate(CertError::PinMismatch));
                 }
                 Err(NetError::PeerCertificate(e)) => step1.note(e),
-                Err(e @ NetError::Closed(_)) => return Err(e),
                 Err(e) => last = Some(e),
             }
         }
