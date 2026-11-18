@@ -17,6 +17,10 @@
 //!   queued stream data is dropped. A write still waiting on the pipe when
 //!   the deadline passes is abandoned with the pipe, so its bytes never
 //!   leave after the deadline.
+//! - The deadline is also kept on the monotonic clock from the start of the
+//!   connection (wire.md 6), so setting the wall clock back never extends
+//!   it. Both are checked again at least once a second, so a device that
+//!   slept past either closes as soon as it resumes.
 //! - A step that ends the connection (for example a joiner's last failed
 //!   code attempt) sends the messages it produced, then one `GOAWAY`
 //!   (wire.md 10.6, rule 9).
@@ -41,7 +45,7 @@ use mousse_net_core::mux::{
     MAX_CONTROL_PAYLOAD,
 };
 use mousse_net_core::pairing::{PairedHost, PairingCode};
-use mousse_net_core::{ConnectionId, ErrorCode, UnixTime};
+use mousse_net_core::{ConnectionId, ErrorCode, Millis, UnixTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, WriteHalf};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
@@ -60,6 +64,39 @@ const CLOSE_LINGER: Duration = Duration::from_secs(2);
 
 /// How often a write still pending checks the deadline.
 const DEADLINE_POLL: Duration = Duration::from_millis(50);
+
+/// The longest the driver sleeps without reading both clocks again. Timers
+/// do not run while a device sleeps, so this is what notices, on resume,
+/// a deadline that passed meanwhile.
+const RECHECK: Duration = Duration::from_secs(1);
+
+/// The end of a connection: the effective deadline on the wall clock, and
+/// the same span on the monotonic clock from when the connection started
+/// (`mono_deadline`, wire.md 6). It ends at whichever comes first.
+#[derive(Clone, Copy, Debug)]
+struct Deadline {
+    wall: UnixTime,
+    mono: Millis,
+}
+
+impl Deadline {
+    fn new(wall: UnixTime, clock: &dyn Clock) -> Self {
+        let left = wall
+            .secs()
+            .saturating_add(1)
+            .saturating_sub(clock.now().secs());
+        Self {
+            wall,
+            mono: clock.mono().plus(left.saturating_mul(1000)),
+        }
+    }
+
+    /// Past the wall deadline (the connection may run through that second
+    /// and no further), or at the monotonic one.
+    fn passed(&self, clock: &dyn Clock) -> bool {
+        clock.now() > self.wall || clock.mono() >= self.mono
+    }
+}
 
 /// Why a connection ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -157,6 +194,12 @@ pub(crate) trait Role: Send + 'static {
     fn on_code(&mut self, _code: PairingCode, out: &mut Outbox) {
         out.close = Some(ErrorCode::ProtocolError);
     }
+    /// When the role next needs [`Role::on_wake`], on the monotonic clock.
+    fn wake_at(&self) -> Option<Millis> {
+        None
+    }
+    /// A timer ran (at least at [`Role::wake_at`], maybe earlier).
+    fn on_wake(&mut self, _mono: Millis, _out: &mut Outbox) {}
 }
 
 pub(crate) enum Cmd {
@@ -512,8 +555,8 @@ pub(crate) fn spawn<P: Pipe>(
     };
     let driver = Driver {
         mux: Mux::new(start.side, start.clock.mono()),
+        deadline: Deadline::new(start.deadline, &*start.clock),
         clock: start.clock,
-        deadline: start.deadline,
         role,
         cmd_tx,
         status: status_tx,
@@ -532,7 +575,7 @@ pub(crate) fn spawn<P: Pipe>(
 struct Driver {
     mux: Mux,
     clock: Arc<dyn Clock>,
-    deadline: UnixTime,
+    deadline: Deadline,
     role: Box<dyn Role>,
     cmd_tx: mpsc::UnboundedSender<Cmd>,
     status: watch::Sender<ConnStatus>,
@@ -696,28 +739,43 @@ impl Driver {
         if let Some(t) = self.mux.poll_timeout() {
             wake = wake.min(now + Duration::from_millis(t.since(mono)));
         }
+        if let Some(t) = self.role.wake_at() {
+            wake = wake.min(now + Duration::from_millis(t.since(mono)));
+        }
         let wall = self.clock.now();
         let until_deadline = self
             .deadline
+            .wall
             .secs()
             .saturating_add(1)
             .saturating_sub(wall.secs());
         wake.min(now + Duration::from_secs(until_deadline))
+            .min(now + Duration::from_millis(self.deadline.mono.since(mono)))
+            .min(now + RECHECK)
     }
 
     fn on_timer(&mut self) {
-        if let Err(e) = self.mux.on_timeout(self.clock.mono()) {
-            self.reason.get_or_insert(CloseReason::Local(e.code));
-        }
+        let mono = self.clock.mono();
+        // The deadline first: after a long sleep the idle timer is due too,
+        // and the connection ended because its certificates did.
         if self.expired() {
             self.close(ErrorCode::CertExpired);
+            return;
+        }
+        if let Err(e) = self.mux.on_timeout(mono) {
+            self.reason.get_or_insert(CloseReason::Local(e.code));
+        }
+        if !self.mux.is_closing() {
+            let mut out = Outbox::default();
+            self.role.on_wake(mono, &mut out);
+            self.apply(out);
         }
     }
 
     /// Past the effective deadline: the connection may run through that
     /// second and no further.
     fn expired(&self) -> bool {
-        self.clock.now() > self.deadline
+        self.deadline.passed(&*self.clock)
     }
 
     fn mark_closing(&self) {
@@ -1030,7 +1088,7 @@ async fn writer_task<P: Pipe>(
     mut wr: WriteHalf<TlsStream<P>>,
     ask: mpsc::Sender<oneshot::Sender<Vec<u8>>>,
     clock: Arc<dyn Clock>,
-    deadline: UnixTime,
+    deadline: Deadline,
 ) {
     loop {
         let (tx, rx) = oneshot::channel();
@@ -1041,7 +1099,7 @@ async fn writer_task<P: Pipe>(
             break;
         };
         let goaway = is_goaway(&frame);
-        if !goaway && clock.now() > deadline {
+        if !goaway && deadline.passed(&*clock) {
             continue;
         }
         let send = async {
@@ -1079,11 +1137,11 @@ async fn sleep_until_some(at: Option<Instant>) {
 /// Ready once `clock` is past `deadline`. The clock is read on every poll
 /// (also when whatever it races against wakes the task) and at least every
 /// [`DEADLINE_POLL`].
-fn past(clock: &dyn Clock, deadline: UnixTime) -> impl std::future::Future<Output = ()> + '_ {
+fn past(clock: &dyn Clock, deadline: Deadline) -> impl std::future::Future<Output = ()> + '_ {
     let mut tick = tokio::time::interval(DEADLINE_POLL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     std::future::poll_fn(move |cx| {
-        if clock.now() > deadline {
+        if deadline.passed(clock) {
             return std::task::Poll::Ready(());
         }
         while tick.poll_tick(cx).is_ready() {}
@@ -1326,6 +1384,36 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// A clock that jumps past either deadline while nothing is due, as
+    /// after a sleep: the connection closes with `CERT_EXPIRED` at the next
+    /// recheck, with no traffic and no timer set for that moment.
+    #[tokio::test]
+    async fn a_jump_past_either_deadline_closes_at_the_next_recheck() {
+        for wall in [true, false] {
+            let (conn, mut peer, _valve, clock) = connected(3_600).await;
+            if wall {
+                clock.advance(3_602);
+            } else {
+                // Setting the wall clock back does not help either.
+                clock.advance(-7_200);
+                clock.advance_mono(3_601_000);
+            }
+            assert!(
+                within(
+                    "GOAWAY",
+                    peer.read_until(|f| matches!(f, Frame::GoAway { .. }))
+                )
+                .await,
+                "wall: {wall}"
+            );
+            assert_eq!(
+                within("closed", conn.closed()).await,
+                CloseReason::Local(ErrorCode::CertExpired),
+                "wall: {wall}"
+            );
+        }
     }
 
     #[tokio::test]
