@@ -10,7 +10,7 @@ use serde_json::Value;
 use crate::build::{BuildState, Git};
 use crate::eval::{evaluate, Inputs, Report};
 use crate::evidence::{self, file_part, DeviceList, Evidence, ResultPayload};
-use crate::manifest::{Check, Judge, Manifest};
+use crate::manifest::{command_profile, Check, Judge, Manifest};
 use crate::runner::{
     command_for, execute, fail_reason, judge_control, judge_matrix_files, judge_normal,
     read_matrix_dir, runner_id, RunRecord, RunVerdict, Vars,
@@ -224,7 +224,6 @@ impl Kit {
         signer: Option<&Signer>,
     ) -> Result<bool, String> {
         let state = self.state()?;
-        let build = state.id(&m.run_profile(c)).to_string();
         let here = host();
         let mut all_ok = true;
         let mut ran = 0;
@@ -277,6 +276,10 @@ impl Kit {
                 std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
                 let log = self.runs_dir().join("logs").join(format!("{stem}.log"));
                 let (cmd, env) = command_for(local, k);
+                // The profile the command actually builds with; a command
+                // the kit cannot read is recorded as `unknown`.
+                let profile = command_profile(&cmd).unwrap_or_else(|| "unknown".into());
+                let build = state.id(&profile).to_string();
                 eprint!("  {} @ {} [{part}] ... ", c.id, local.target);
                 let started = Instant::now();
                 let vars = Vars {
@@ -476,6 +479,9 @@ pub struct SignArgs<'a> {
     pub control: Option<&'a str>,
     pub platform: Option<&'a str>,
     pub default_build: Option<String>,
+    /// The configuration digest the producer recorded before the run
+    /// (`mousse-check config-digest`), for results that do not carry one.
+    pub config: Option<&'a str>,
     pub device: &'a str,
 }
 
@@ -552,7 +558,7 @@ pub fn payload_from(v: &Value, a: &SignArgs<'_>) -> Result<ResultPayload, String
         details,
         time: s("time").unwrap_or_else(now_rfc3339),
         device: a.device.to_string(),
-        config: s("config"),
+        config: s("config").or_else(|| a.config.map(str::to_string)),
         extra,
     })
 }
@@ -573,6 +579,7 @@ mod tests {
             control: None,
             platform: Some("test"),
             default_build: None,
+            config: None,
             device: "pc",
         }
     }
