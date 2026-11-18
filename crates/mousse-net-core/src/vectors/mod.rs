@@ -1115,6 +1115,77 @@ fn mux_vectors() -> J {
             bad("open_class_2", with_payload(1, 1, &open(2, "rpc")), "bad_payload"),
             bad("open_non_canonical", with_payload(1, 1, &open_non_canonical), "bad_payload"),
         ],
+        "streams": mux_stream_vectors(),
+    })
+}
+
+/// Stream rules on a receiving mux. Results are written by hand: they pin
+/// the rules, not this implementation's output.
+fn mux_stream_vectors() -> J {
+    let open = |id: u32| Frame::Open {
+        stream: StreamId(id),
+        class: PriorityClass::Interactive,
+        label: "rpc".into(),
+    };
+    let data = |id: u32| Frame::Data {
+        stream: StreamId(id),
+        payload: b"hi".to_vec(),
+    };
+    let credit = |id: u32| Frame::Credit {
+        stream: StreamId(id),
+        increment: 1,
+    };
+    let fin = |id: u32| Frame::Fin {
+        stream: StreamId(id),
+    };
+    let reset = |id: u32| Frame::Reset {
+        stream: StreamId(id),
+        code: ErrorCode::Cancelled,
+    };
+    let step = |f: Frame, result: J| json!({ "hex": hex(&f.encode()), "frame": frame_json(&f), "result": result });
+    let case = |name: &str, role: &str, steps: Vec<J>| json!({ "name": name, "role": role, "steps": steps });
+    let protocol = json!("close:protocol_error");
+    json!({
+        "description": "Stream rules (spec wire.md, \"Streams\") on a mux that receives each step's frame in order. `role` is the receiving side: a host's peer opens odd ids from 1, a caller's peer even ids from 2, in order with no gaps. `result` is the list of events the frame produced (opened:<id>, data:<id>:<bytes>, finished:<id>, reset:<id>:<code>; an empty list means the frame was ignored), or close:<code> (the mux closes and its next frame out is GOAWAY with that code; no later step follows).",
+        "cases": [
+            case("open_in_order", "host", vec![
+                step(open(1), json!(["opened:1"])),
+                step(open(3), json!(["opened:3"])),
+            ]),
+            case("first_open_skips_an_id", "host", vec![step(open(3), protocol.clone())]),
+            case("open_skips_an_id", "host", vec![
+                step(open(1), json!(["opened:1"])),
+                step(open(5), protocol.clone()),
+            ]),
+            case("host_open_skips_an_id", "caller", vec![
+                step(open(2), json!(["opened:2"])),
+                step(open(6), protocol.clone()),
+            ]),
+            case("open_repeated", "host", vec![
+                step(open(1), json!(["opened:1"])),
+                step(open(1), protocol.clone()),
+            ]),
+            case("open_wrong_parity", "host", vec![step(open(2), protocol.clone())]),
+            case("data_on_a_never_opened_id", "host", vec![
+                step(open(1), json!(["opened:1"])),
+                step(data(3), protocol.clone()),
+            ]),
+            case("credit_on_an_own_id_never_opened", "host", vec![step(credit(2), protocol.clone())]),
+            case("frames_on_a_gone_stream_are_ignored", "host", vec![
+                step(open(1), json!(["opened:1"])),
+                step(data(1), json!(["data:1:2"])),
+                step(reset(1), json!(["reset:1:cancelled"])),
+                step(data(1), json!([])),
+                step(credit(1), json!([])),
+                step(fin(1), json!([])),
+                step(reset(1), json!([])),
+            ]),
+            case("data_after_fin", "host", vec![
+                step(open(1), json!(["opened:1"])),
+                step(fin(1), json!(["finished:1"])),
+                step(data(1), json!("close:stream_closed")),
+            ]),
+        ],
     })
 }
 

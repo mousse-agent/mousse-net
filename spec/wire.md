@@ -523,9 +523,10 @@ An unknown error code in `RESET` or `GOAWAY` is not a frame error; treat it as
 ### 9.2 Streams
 
 - The caller opens streams with **odd** ids starting at 1; the host with
-  **even** ids starting at 2. Each side's ids strictly increase. A peer-opened
-  id with the wrong parity, or not above the highest one seen, is
-  `PROTOCOL_ERROR`.
+  **even** ids starting at 2. Each side opens its ids in order with no gaps
+  (1, 3, 5, … and 2, 4, 6, …), so every id up to a side's highest opened id
+  was opened. A peer `OPEN` with any other id (wrong parity, repeated, lower
+  or skipping one) is `PROTOCOL_ERROR`.
 - A stream starts with `OPEN`. `DATA` may follow at once.
 - `FIN` ends one direction. `DATA` or a second `FIN` after the peer's `FIN`
   is `STREAM_CLOSED`. A stream is gone when both sides have sent `FIN`.

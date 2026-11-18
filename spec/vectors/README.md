@@ -33,7 +33,7 @@ conforming implementation passes every case, including every rejection.
 | `pairing-e2e.json` | 8, 10, 11 | Whole pairings between a host and joiners, replayable byte for byte from the scripted random draws (`rng`): in person, "Send link" (including a redrawn code), three wrong codes ending the invitation, the joiner's own 3-attempt limit against a fake host, tampered tickets (secret and invitation id), a proof made on another TLS session, and a lost `PAIRED` learned on the next connection (the host sends `AUTHORIZED {live}` and ignores the join proof). Every step lists what each side does: messages as control bytes and mux frames, closes, shown codes, attempt ids with their `CI` and `sid`, and the final state. |
 | `cbor.json` | 3 | Canonical CBOR that must decode and re-encode unchanged, and inputs that must be rejected with the given error, including indefinite lengths (`non_canonical`) and inputs that break several rules (the first in wire.md's order wins). |
 | `der-raw.json` | 4.2, 4.3 | DER to raw conversion and its rejections; inputs where only raw is accepted. |
-| `mux.json` | 9.1 | Frames that decode and re-encode unchanged; inputs that need more bytes or are rejected, with the reason. |
+| `mux.json` | 9.1, 9.2 | Frames that decode and re-encode unchanged; inputs that need more bytes or are rejected, with the reason; stream rules on a receiving mux (`streams`): ids opened in order with no gaps, frames on never-opened ids, frames on gone streams, `DATA` after `FIN`. |
 | `control.json` | 11 | Control messages that decode and re-encode unchanged; messages that must be rejected. |
 
 Code-exchange (CPace) vectors live in `cpace*.json` files, documented in

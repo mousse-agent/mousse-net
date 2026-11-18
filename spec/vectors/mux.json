@@ -112,6 +112,311 @@
       "result": "bad_payload"
     }
   ],
+  "streams": {
+    "cases": [
+      {
+        "name": "open_in_order",
+        "role": "host",
+        "steps": [
+          {
+            "frame": {
+              "class": 0,
+              "label": "rpc",
+              "stream": 1,
+              "type": "open"
+            },
+            "hex": "000000010100000008a201000263727063",
+            "result": [
+              "opened:1"
+            ]
+          },
+          {
+            "frame": {
+              "class": 0,
+              "label": "rpc",
+              "stream": 3,
+              "type": "open"
+            },
+            "hex": "000000030100000008a201000263727063",
+            "result": [
+              "opened:3"
+            ]
+          }
+        ]
+      },
+      {
+        "name": "first_open_skips_an_id",
+        "role": "host",
+        "steps": [
+          {
+            "frame": {
+              "class": 0,
+              "label": "rpc",
+              "stream": 3,
+              "type": "open"
+            },
+            "hex": "000000030100000008a201000263727063",
+            "result": "close:protocol_error"
+          }
+        ]
+      },
+      {
+        "name": "open_skips_an_id",
+        "role": "host",
+        "steps": [
+          {
+            "frame": {
+              "class": 0,
+              "label": "rpc",
+              "stream": 1,
+              "type": "open"
+            },
+            "hex": "000000010100000008a201000263727063",
+            "result": [
+              "opened:1"
+            ]
+          },
+          {
+            "frame": {
+              "class": 0,
+              "label": "rpc",
+              "stream": 5,
+              "type": "open"
+            },
+            "hex": "000000050100000008a201000263727063",
+            "result": "close:protocol_error"
+          }
+        ]
+      },
+      {
+        "name": "host_open_skips_an_id",
+        "role": "caller",
+        "steps": [
+          {
+            "frame": {
+              "class": 0,
+              "label": "rpc",
+              "stream": 2,
+              "type": "open"
+            },
+            "hex": "000000020100000008a201000263727063",
+            "result": [
+              "opened:2"
+            ]
+          },
+          {
+            "frame": {
+              "class": 0,
+              "label": "rpc",
+              "stream": 6,
+              "type": "open"
+            },
+            "hex": "000000060100000008a201000263727063",
+            "result": "close:protocol_error"
+          }
+        ]
+      },
+      {
+        "name": "open_repeated",
+        "role": "host",
+        "steps": [
+          {
+            "frame": {
+              "class": 0,
+              "label": "rpc",
+              "stream": 1,
+              "type": "open"
+            },
+            "hex": "000000010100000008a201000263727063",
+            "result": [
+              "opened:1"
+            ]
+          },
+          {
+            "frame": {
+              "class": 0,
+              "label": "rpc",
+              "stream": 1,
+              "type": "open"
+            },
+            "hex": "000000010100000008a201000263727063",
+            "result": "close:protocol_error"
+          }
+        ]
+      },
+      {
+        "name": "open_wrong_parity",
+        "role": "host",
+        "steps": [
+          {
+            "frame": {
+              "class": 0,
+              "label": "rpc",
+              "stream": 2,
+              "type": "open"
+            },
+            "hex": "000000020100000008a201000263727063",
+            "result": "close:protocol_error"
+          }
+        ]
+      },
+      {
+        "name": "data_on_a_never_opened_id",
+        "role": "host",
+        "steps": [
+          {
+            "frame": {
+              "class": 0,
+              "label": "rpc",
+              "stream": 1,
+              "type": "open"
+            },
+            "hex": "000000010100000008a201000263727063",
+            "result": [
+              "opened:1"
+            ]
+          },
+          {
+            "frame": {
+              "payload": "6869",
+              "stream": 3,
+              "type": "data"
+            },
+            "hex": "0000000300000000026869",
+            "result": "close:protocol_error"
+          }
+        ]
+      },
+      {
+        "name": "credit_on_an_own_id_never_opened",
+        "role": "host",
+        "steps": [
+          {
+            "frame": {
+              "increment": 1,
+              "stream": 2,
+              "type": "credit"
+            },
+            "hex": "00000002020000000400000001",
+            "result": "close:protocol_error"
+          }
+        ]
+      },
+      {
+        "name": "frames_on_a_gone_stream_are_ignored",
+        "role": "host",
+        "steps": [
+          {
+            "frame": {
+              "class": 0,
+              "label": "rpc",
+              "stream": 1,
+              "type": "open"
+            },
+            "hex": "000000010100000008a201000263727063",
+            "result": [
+              "opened:1"
+            ]
+          },
+          {
+            "frame": {
+              "payload": "6869",
+              "stream": 1,
+              "type": "data"
+            },
+            "hex": "0000000100000000026869",
+            "result": [
+              "data:1:2"
+            ]
+          },
+          {
+            "frame": {
+              "code": 16,
+              "stream": 1,
+              "type": "reset"
+            },
+            "hex": "0000000104000000020010",
+            "result": [
+              "reset:1:cancelled"
+            ]
+          },
+          {
+            "frame": {
+              "payload": "6869",
+              "stream": 1,
+              "type": "data"
+            },
+            "hex": "0000000100000000026869",
+            "result": []
+          },
+          {
+            "frame": {
+              "increment": 1,
+              "stream": 1,
+              "type": "credit"
+            },
+            "hex": "00000001020000000400000001",
+            "result": []
+          },
+          {
+            "frame": {
+              "stream": 1,
+              "type": "fin"
+            },
+            "hex": "000000010300000000",
+            "result": []
+          },
+          {
+            "frame": {
+              "code": 16,
+              "stream": 1,
+              "type": "reset"
+            },
+            "hex": "0000000104000000020010",
+            "result": []
+          }
+        ]
+      },
+      {
+        "name": "data_after_fin",
+        "role": "host",
+        "steps": [
+          {
+            "frame": {
+              "class": 0,
+              "label": "rpc",
+              "stream": 1,
+              "type": "open"
+            },
+            "hex": "000000010100000008a201000263727063",
+            "result": [
+              "opened:1"
+            ]
+          },
+          {
+            "frame": {
+              "stream": 1,
+              "type": "fin"
+            },
+            "hex": "000000010300000000",
+            "result": [
+              "finished:1"
+            ]
+          },
+          {
+            "frame": {
+              "payload": "6869",
+              "stream": 1,
+              "type": "data"
+            },
+            "hex": "0000000100000000026869",
+            "result": "close:stream_closed"
+          }
+        ]
+      }
+    ],
+    "description": "Stream rules (spec wire.md, \"Streams\") on a mux that receives each step's frame in order. `role` is the receiving side: a host's peer opens odd ids from 1, a caller's peer even ids from 2, in order with no gaps. `result` is the list of events the frame produced (opened:<id>, data:<id>:<bytes>, finished:<id>, reset:<id>:<code>; an empty list means the frame was ignored), or close:<code> (the mux closes and its next frame out is GOAWAY with that code; no later step follows)."
+  },
   "unknown_error_code": {
     "description": "A RESET with a code this build does not know is still a valid frame.",
     "hex": "00000001040000000203e7"
