@@ -87,3 +87,6 @@ impl InvitationKind {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
