@@ -10,9 +10,11 @@
 //! then replays the file's own events and compares every output. Run it with
 //! `MOUSSE_NET_WRITE_VECTORS=1` to rewrite the file.
 
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen_test::wasm_bindgen_test as test;
+
 use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
-use std::path::PathBuf;
 
 use mousse_net_core::authz::{
     CallerGate, CallerTraffic, ConnectionGate, GateState, Traffic, Verdict,
@@ -1403,13 +1405,19 @@ fn replay(flow: &J) {
 
 #[test]
 fn pairing_e2e_vectors() {
-    let path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../spec/vectors/pairing-e2e.json");
     let text = serde_json::to_string_pretty(&document()).expect("json") + "\n";
-    if std::env::var_os("MOUSSE_NET_WRITE_VECTORS").is_some() {
-        std::fs::write(&path, &text).expect("write");
-    }
-    let on_disk = std::fs::read_to_string(&path).expect("read pairing-e2e.json");
+    #[cfg(not(target_arch = "wasm32"))]
+    let on_disk = {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../spec/vectors/pairing-e2e.json");
+        if std::env::var_os("MOUSSE_NET_WRITE_VECTORS").is_some() {
+            std::fs::write(&path, &text).expect("write");
+        }
+        std::fs::read_to_string(&path).expect("read pairing-e2e.json")
+    };
+    // wasm32 has no file system: the file is compiled in.
+    #[cfg(target_arch = "wasm32")]
+    let on_disk = include_str!("../../../spec/vectors/pairing-e2e.json").to_string();
     assert!(
         on_disk == text,
         "pairing-e2e.json differs from the scenarios; rerun with MOUSSE_NET_WRITE_VECTORS=1 and review the diff"
@@ -1420,7 +1428,10 @@ fn pairing_e2e_vectors() {
     }
 }
 
+// `should_panic` rather than `catch_unwind`: wasm32 cannot unwind, and the
+// expected message is the replay's step comparison, so a broken setup fails.
 #[test]
+#[should_panic(expected = "send_link step")]
 fn replay_catches_a_changed_byte() {
     let mut flow = send_link();
     // Flip one bit of msg_b as the joiner receives it: the joiner must
@@ -1439,6 +1450,5 @@ fn replay_catches_a_changed_byte() {
     let last = bytes.len() - 1;
     bytes[last] ^= 0x01;
     step["control"] = json!(hex(&bytes));
-    let result = std::panic::catch_unwind(|| replay(&flow));
-    assert!(result.is_err(), "a tampered msg_b replayed cleanly");
+    replay(&flow);
 }

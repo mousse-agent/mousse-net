@@ -68,6 +68,9 @@ pub(crate) fn decode(input: &str) -> Result<Vec<u8>, Base64Error> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_arch = "wasm32")]
+    use wasm_bindgen_test::wasm_bindgen_test as test;
+
     use super::*;
 
     #[test]

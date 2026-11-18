@@ -45,7 +45,8 @@ command = ["cargo", "test", "-p", "mousse-net-core", "--no-fail-fast"]
 target = "wasm32"
 host = "windows-x86_64"
 command = ["cargo", "test", "-p", "mousse-net-core", "--no-fail-fast", "--target", "wasm32-unknown-unknown"]
-placeholder = "core tests need a wasm32 test runner (wasm-bindgen-test or a node runner) before they can run on wasm32"
+# wasm-bindgen-test-runner 0.2.130 on PATH runs the tests under Node.
+env = { CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER = "wasm-bindgen-test-runner" }
 
 [[check.control]]
 name = "break-session-cert"
@@ -90,7 +91,8 @@ command = ["cargo", "test", "-p", "mousse-net-core", "--no-fail-fast", "--lib", 
 target = "wasm32"
 host = "windows-x86_64"
 command = ["cargo", "test", "-p", "mousse-net-core", "--no-fail-fast", "--lib", "cpace::", "--target", "wasm32-unknown-unknown"]
-placeholder = "core tests need a wasm32 test runner before they can run on wasm32"
+# wasm-bindgen-test-runner 0.2.130 on PATH runs the tests under Node.
+env = { CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER = "wasm-bindgen-test-runner" }
 
 [[check.control]]
 name = "break-cpace-confirm"

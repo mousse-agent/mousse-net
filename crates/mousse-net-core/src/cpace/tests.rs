@@ -1,3 +1,6 @@
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen_test::wasm_bindgen_test as test;
+
 use core::convert::Infallible;
 
 use curve25519_dalek::scalar::Scalar;

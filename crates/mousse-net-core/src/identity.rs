@@ -354,6 +354,9 @@ impl IdentitySigner for SoftwareKey {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_arch = "wasm32")]
+    use wasm_bindgen_test::wasm_bindgen_test as test;
+
     use super::*;
     use rand_chacha::ChaCha20Rng;
     use rand_core::SeedableRng;

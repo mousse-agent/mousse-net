@@ -1,7 +1,8 @@
 //! Checks the files in `spec/vectors/` through the public API only, the way
 //! a second implementation would use them.
 
-use std::path::PathBuf;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen_test::wasm_bindgen_test as test;
 
 use mousse_net_core::authz::{
     CallerGate, CallerGateState, CallerTraffic, ConnectionGate, GateState, Traffic, Verdict,
@@ -23,12 +24,44 @@ use mousse_net_core::{ConnectionId, ErrorCode, Millis, UnixTime};
 use serde_json::Value as J;
 
 fn load(name: &str) -> J {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let text = checked_in(name).unwrap_or_else(|| panic!("no vector file {name}"));
+    serde_json::from_str(&text).expect("valid JSON")
+}
+
+/// A checked-in vector file.
+#[cfg(not(target_arch = "wasm32"))]
+fn checked_in(name: &str) -> Option<String> {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../spec/vectors")
         .join(name);
-    let text =
-        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    serde_json::from_str(&text).expect("valid JSON")
+    std::fs::read_to_string(path).ok()
+}
+
+/// A checked-in vector file. wasm32 has no file system, so there the
+/// files are compiled in.
+#[cfg(target_arch = "wasm32")]
+fn checked_in(name: &str) -> Option<String> {
+    macro_rules! files {
+        ($($file:literal,)*) => {
+            match name {
+                $($file => Some(include_str!(concat!("../../../spec/vectors/", $file)).to_string()),)*
+                _ => None,
+            }
+        };
+    }
+    files!(
+        "authz.json",
+        "cbor.json",
+        "control.json",
+        "der-raw.json",
+        "hello.json",
+        "join-proof.json",
+        "mux.json",
+        "pairing-attempts.json",
+        "session-cert.json",
+        "session-lifecycle.json",
+        "ticket.json",
+    )
 }
 
 fn unhex(v: &J) -> Vec<u8> {

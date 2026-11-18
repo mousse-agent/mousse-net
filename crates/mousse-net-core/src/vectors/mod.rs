@@ -6,6 +6,9 @@
 //! produces; run it with `MOUSSE_NET_WRITE_VECTORS=1` to rewrite them.
 //! `tests/vectors.rs` then checks the files against the public API only.
 
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen_test::wasm_bindgen_test as test;
+
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::path::PathBuf;
@@ -74,6 +77,39 @@ fn session(secret: &[u8; 32]) -> SessionKey {
 
 fn vectors_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../spec/vectors")
+}
+
+/// A checked-in vector file.
+#[cfg(not(target_arch = "wasm32"))]
+fn checked_in(name: &str) -> Option<String> {
+    std::fs::read_to_string(vectors_dir().join(name)).ok()
+}
+
+/// A checked-in vector file. wasm32 has no file system, so there the
+/// files are compiled in.
+#[cfg(target_arch = "wasm32")]
+fn checked_in(name: &str) -> Option<String> {
+    macro_rules! files {
+        ($($file:literal,)*) => {
+            match name {
+                $($file => Some(include_str!(concat!("../../../../spec/vectors/", $file)).to_string()),)*
+                _ => None,
+            }
+        };
+    }
+    files!(
+        "authz.json",
+        "cbor.json",
+        "control.json",
+        "der-raw.json",
+        "hello.json",
+        "join-proof.json",
+        "mux.json",
+        "pairing-attempts.json",
+        "session-cert.json",
+        "session-lifecycle.json",
+        "ticket.json",
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2337,9 +2373,8 @@ fn run_attempt_sequence(seq: &J, listed: Option<&J>) -> J {
 
 #[test]
 fn pairing_attempt_sequences_hold() {
-    let file = vectors_dir().join("pairing-attempts.json");
-    let text = std::fs::read_to_string(&file)
-        .unwrap_or_else(|_| serde_json::to_string(&pairing_attempt_vectors()).expect("json"));
+    let text = checked_in("pairing-attempts.json")
+        .unwrap_or_else(|| serde_json::to_string(&pairing_attempt_vectors()).expect("json"));
     let doc: J = serde_json::from_str(&text).expect("json");
     for seq in doc["sequences"].as_array().expect("sequences") {
         // Replay from the file's own draws: every message must come out
@@ -2380,7 +2415,7 @@ fn vector_files_are_current() {
         if write {
             std::fs::create_dir_all(&dir).expect("create dir");
             std::fs::write(&path, &text).expect("write");
-        } else if std::fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
+        } else if checked_in(name).as_deref() != Some(text.as_str()) {
             stale.push(name);
         }
     }
