@@ -10,3 +10,19 @@ description = "Mousse networking state machines: identity, pairing, grants, sess
 workspace = true
 
 [dependencies]
+p256 = { version = "=0.14.0", default-features = false, features = ["ecdsa", "alloc"] }
+sha2 = { version = "=0.11.1", default-features = false }
+hmac = { version = "=0.13.0", default-features = false }
+hkdf = { version = "=0.13.0", default-features = false }
+rand_core = { version = "=0.10.1", default-features = false }
+subtle = { version = "=2.6.1", default-features = false }
+zeroize = { version = "=1.9.2", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+rand_chacha = "=0.10.0"
+serde_json = "=1.0.154"
+ecdsa = { version = "=0.17.0", features = ["der"] }
+
+[features]
+# A stand-in code exchange for tests and the simulator. Not secure.
+insecure-test-exchange = []
