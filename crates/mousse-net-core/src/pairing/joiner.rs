@@ -30,8 +30,26 @@ use crate::identity::IdentityPublicKey;
 use crate::time::UnixTime;
 use crate::ErrorCode;
 
-/// Code attempts the joiner allows per local code-entry flow.
+/// Code attempts the joiner allows per ticket, by default (wire.md 10.7).
+/// Also the most a stored [`JoinerRecord`] may hold.
 pub const JOINER_ATTEMPTS_PER_FLOW: u8 = 3;
+
+/// The joiner's limits. [`Default`] gives the protocol's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JoinerLimits {
+    /// Code attempts per ticket, across every time it is opened. A stored
+    /// record holds at most [`JOINER_ATTEMPTS_PER_FLOW`], so a larger value
+    /// is cut to that.
+    pub attempts_per_flow: u8,
+}
+
+impl Default for JoinerLimits {
+    fn default() -> Self {
+        Self {
+            attempts_per_flow: JOINER_ATTEMPTS_PER_FLOW,
+        }
+    }
+}
 
 /// What the joiner shows when a code attempt fails. The joiner cannot tell
 /// a mistyped code from a swapped link, so it names both.
@@ -261,11 +279,12 @@ impl JoinerRecord {
 }
 
 impl JoinerRecord {
-    /// The record of a flow that has stored nothing yet.
-    pub fn fresh(ticket_hash: [u8; 32]) -> Self {
+    /// The record of a flow that has stored nothing yet, with
+    /// `attempts` code attempts.
+    pub fn fresh(ticket_hash: [u8; 32], attempts: u8) -> Self {
         Self {
             ticket_hash,
-            attempts_left: JOINER_ATTEMPTS_PER_FLOW,
+            attempts_left: attempts,
             outcome_pending: false,
         }
     }
@@ -284,6 +303,8 @@ pub struct JoinerPairing<F: CodeExchangeFactory> {
     name: String,
     factory: F,
     state: JoinerState,
+    /// Attempts a flow with nothing stored starts with.
+    attempts_per_flow: u8,
     attempts_left: u8,
     attempt: Option<JoinerAttempt<F::Exchange>>,
     exporters: Option<SessionExporters>,
@@ -315,7 +336,8 @@ impl<F: CodeExchangeFactory> JoinerPairing<F> {
     /// Start a flow from a ticket that arrived by `arrival`. `stored` is
     /// the [`JoinerRecord`] kept for this ticket hash by an earlier start,
     /// if any: the flow then goes on with its attempt count and pending
-    /// outcome. Every refusal here happens before dialing.
+    /// outcome. Every refusal here happens before dialing. Uses the default
+    /// [`JoinerLimits`]; see [`JoinerPairing::with_limits`].
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         ticket: Ticket,
@@ -326,6 +348,31 @@ impl<F: CodeExchangeFactory> JoinerPairing<F> {
         stored: Option<&JoinerRecord>,
         now: UnixTime,
     ) -> Result<Self, JoinerError> {
+        Self::with_limits(
+            ticket,
+            arrival,
+            joiner,
+            name,
+            factory,
+            stored,
+            now,
+            JoinerLimits::default(),
+        )
+    }
+
+    /// [`JoinerPairing::new`] with other limits.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_limits(
+        ticket: Ticket,
+        arrival: Arrival,
+        joiner: IdentityPublicKey,
+        name: JoinerName,
+        factory: F,
+        stored: Option<&JoinerRecord>,
+        now: UnixTime,
+        limits: JoinerLimits,
+    ) -> Result<Self, JoinerError> {
+        let attempts_per_flow = limits.attempts_per_flow.min(JOINER_ATTEMPTS_PER_FLOW);
         if ticket.host_identity == joiner {
             return Err(JoinerError::OwnTicket);
         }
@@ -346,10 +393,10 @@ impl<F: CodeExchangeFactory> JoinerPairing<F> {
                 return Err(JoinerError::BadRecord)
             }
             Some(record) => (
-                record.attempts_left.min(JOINER_ATTEMPTS_PER_FLOW),
+                record.attempts_left.min(attempts_per_flow),
                 record.outcome_pending,
             ),
-            None => (JOINER_ATTEMPTS_PER_FLOW, false),
+            None => (attempts_per_flow, false),
         };
         // A pending outcome is learned from step 2, which needs no fresh
         // ticket: a grant outlives its invitation.
@@ -368,6 +415,7 @@ impl<F: CodeExchangeFactory> JoinerPairing<F> {
             name,
             factory,
             state: JoinerState::Connecting,
+            attempts_per_flow,
             attempts_left,
             attempt: None,
             exporters: None,
@@ -467,9 +515,9 @@ impl<F: CodeExchangeFactory> JoinerPairing<F> {
         self.commit(Vec::new())
     }
 
-    /// The host's answer to the join proof did not arrive within
-    /// [`crate::authz::JOIN_PROOF_WAIT_MS`] (wire.md 8.2): the I/O layer
-    /// closes the connection with `NOT_AUTHORIZED`. The flow ends and does
+    /// The host's answer to the join proof did not arrive in time (the
+    /// caller's wait, 10 s by default, wire.md 8.2): the I/O layer closes
+    /// the connection with `NOT_AUTHORIZED`. The flow ends and does
     /// not reconnect on its own, also while it is learning a pending
     /// outcome; the pending mark stays stored, so opening the same ticket
     /// again asks again (wire.md 10.6 rule 7).
@@ -754,7 +802,7 @@ impl<F: CodeExchangeFactory> JoinerPairing<F> {
         let record = self.record();
         let stored = self
             .saved
-            .unwrap_or_else(|| JoinerRecord::fresh(self.ticket_hash));
+            .unwrap_or_else(|| JoinerRecord::fresh(self.ticket_hash, self.attempts_per_flow));
         if record == stored {
             return then;
         }

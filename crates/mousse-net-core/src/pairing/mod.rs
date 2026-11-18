@@ -33,8 +33,8 @@ pub use host::{
     InvitationStatus, HOST_ATTEMPTS_PER_INVITATION,
 };
 pub use joiner::{
-    Arrival, JoinerAction, JoinerError, JoinerName, JoinerPairing, JoinerRecord, JoinerState,
-    PairedHost, CODE_FAILED_MESSAGE, JOINER_ATTEMPTS_PER_FLOW, JOINER_RECORD_DOMAIN,
+    Arrival, JoinerAction, JoinerError, JoinerLimits, JoinerName, JoinerPairing, JoinerRecord,
+    JoinerState, PairedHost, CODE_FAILED_MESSAGE, JOINER_ATTEMPTS_PER_FLOW, JOINER_RECORD_DOMAIN,
 };
 pub use proof::{
     attempt_sid, binding_transcript, join_proof_input, join_proof_mac, verify_join_proof,

@@ -944,6 +944,11 @@ impl CallerDev {
                 match flow.state() {
                     JoinerState::Connecting => {
                         if sim.bug(Bug::JoinerNewFlowOnReconnect) {
+                            // The buggy app ignores its stored record, so
+                            // its writes do not compare against it either.
+                            if let Some(t) = &self.ticket {
+                                self.records.remove(&t.hash());
+                            }
                             if let Some(fresh) = self.new_flow_machine(sim, false) {
                                 sim.say(self.id, format_args!("starts a fresh pairing machine"));
                                 self.mode = Mode::Joining(Box::new(fresh));
