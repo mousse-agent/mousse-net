@@ -120,7 +120,7 @@ impl Endpoint {
         for (k, v) in env {
             cmd.env(format!("MOUSSE_NET_{k}"), v);
         }
-        App::spawn(cmd, self.dir.clone())
+        App::spawn(cmd, self.dir.clone(), name)
     }
 
     pub fn log(&self) -> String {
@@ -226,23 +226,6 @@ impl Drop for Cli {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
-}
-
-/// Pair `peer` with the running host of `host` in person, from the command
-/// line (`invite` reaches the app-mode host over its control channel).
-pub fn pair(host: &Endpoint, peer: &Endpoint, peer_name: &str) {
-    let mut invite = host.cli(&["invite", "--no-qr"], true);
-    let ticket_line = invite.wait_for("TICKET ");
-    let ticket = ticket_line.trim_start_matches("TICKET ").trim().to_owned();
-    let mut join = peer.cli(
-        &["join", &ticket, "--in-person", "--name", peer_name],
-        false,
-    );
-    invite.wait_for("Is the device next to you?");
-    invite.type_line("y\n");
-    let code = join.exit_within(WAIT);
-    assert_eq!(code, Some(0), "join: {}\n{}", join.out(), join.err());
-    invite.wait_for("paired: grant ");
 }
 
 /// What arrived on one stream, helper to app.
@@ -427,12 +410,14 @@ pub struct App {
     stderr: Arc<Mutex<Vec<u8>>>,
     next_id: u64,
     pub dir: PathBuf,
+    /// The device name it was started with.
+    pub name: String,
     /// From the `hello` reply.
     pub identity: String,
 }
 
 impl App {
-    fn spawn(mut cmd: Command, dir: PathBuf) -> Self {
+    fn spawn(mut cmd: Command, dir: PathBuf, name: &str) -> Self {
         let mut child = cmd.spawn().expect("start the helper");
         let stderr = Arc::new(Mutex::new(Vec::new()));
         collect(child.stderr.take().unwrap(), stderr.clone());
@@ -452,6 +437,7 @@ impl App {
             stderr,
             next_id: 1,
             dir,
+            name: name.to_owned(),
             identity: String::new(),
         }
     }
@@ -506,13 +492,24 @@ impl App {
     }
 
     /// A request; returns the reply.
-    pub fn request(&mut self, op: &str, mut fields: Value) -> Value {
+    pub fn request(&mut self, op: &str, fields: Value) -> Value {
+        let id = self.start(op, fields);
+        self.reply(id)
+    }
+
+    /// Send a request without waiting: its id.
+    pub fn start(&mut self, op: &str, mut fields: Value) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         fields["id"] = json!(id);
         fields["op"] = json!(op);
         self.send_json(&fields);
-        self.wait(&format!("the reply to {op}"), WAIT, |st| {
+        id
+    }
+
+    /// The reply to request `id`.
+    pub fn reply(&self, id: u64) -> Value {
+        self.wait(&format!("the reply to request {id}"), WAIT, |st| {
             st.messages
                 .iter()
                 .find(|m| m.get("re") == Some(&json!(id)))
@@ -528,7 +525,8 @@ impl App {
     }
 
     pub fn hello(&mut self) -> Value {
-        let reply = self.call("hello", json!({"proto": [1, 0], "name": "test"}));
+        let name = self.name.clone();
+        let reply = self.call("hello", json!({"proto": [1, 0], "name": name}));
         self.identity = reply["identity"].as_str().unwrap().to_owned();
         reply
     }
@@ -676,6 +674,14 @@ impl App {
     }
 }
 
+impl App {
+    /// Kill the helper, as a crash would: nothing is saved or closed.
+    pub fn kill(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 impl Drop for App {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -695,91 +701,110 @@ pub struct Pair {
     pub b_end: Endpoint,
 }
 
-/// Start A, pair B with it, start B and dial A.
+/// Start A, start B, and pair B with A through the apps. The pairing
+/// connection stays up: it is the pair's connection.
 pub fn pair_up(tag: &str, a_env: &[(&str, &str)], b_env: &[(&str, &str)]) -> Pair {
     let a_end = Endpoint::init(&format!("{tag}a"));
     let b_end = Endpoint::init(&format!("{tag}b"));
     let mut a = a_end.app("hostA", a_env);
     a.hello();
-    pair(&a_end, &b_end, "peerB");
     let mut b = b_end.app("peerB", b_env);
     b.hello();
-    let (a_conn, b_conn) = connect(&mut a, &mut b);
+    let joined = pair_apps(&mut a, &mut b);
     Pair {
         a,
         b,
-        a_conn,
-        b_conn,
+        a_conn: joined.a_conn,
+        b_conn: joined.b_conn,
         a_end,
         b_end,
+    }
+}
+
+/// What pairing two apps gave.
+pub struct Joined {
+    /// The `invite.create` reply on the host.
+    pub invite: Value,
+    /// The `approval` event on the host.
+    pub approval: Value,
+    /// The `enrolled` event on the host.
+    pub enrolled: Value,
+    /// The `join` reply on the joiner.
+    pub join: Value,
+    /// The pairing connection's number on the host (inbound) and on the
+    /// joiner (outbound).
+    pub a_conn: u64,
+    pub b_conn: u64,
+}
+
+/// Pair `b` with `a` in person through the apps: A shows a ticket, B joins
+/// it (`pinned`, as the app does after recording its consent), A says yes.
+pub fn pair_apps(a: &mut App, b: &mut App) -> Joined {
+    let invite = a.call("invite.create", json!({}));
+    let invitation = invite["invitation"].as_str().unwrap().to_owned();
+    let join_id = b.start("join", json!({"ticket": invite["uri"], "pinned": true}));
+    let approval = a.event("approval", |m| m["invitation"] == invitation.as_str());
+    a.call(
+        "approval.answer",
+        json!({"request": approval["request"], "yes": true}),
+    );
+    let join = b.reply(join_id);
+    assert!(join.get("error").is_none(), "join: {join}");
+    let enrolled = a.event("enrolled", |m| m["invitation"] == invitation.as_str());
+    let identity = b.identity.clone();
+    let a_conn = a.wait("the pairing connection on A", WAIT, |st| {
+        st.messages
+            .iter()
+            .rev()
+            .find(|m| {
+                m["ev"] == "conn.up" && m["dir"] == "in" && m["identity"] == identity.as_str()
+            })
+            .map(|m| m["conn"].as_u64().unwrap())
+    });
+    Joined {
+        invite,
+        approval,
+        enrolled,
+        b_conn: join["conn"].as_u64().unwrap(),
+        join,
+        a_conn,
     }
 }
 
 /// Another peer, paired with A and connected to it: its state directory,
 /// its app, and the connection's numbers on A and on it. Bind the result as
 /// `(dir, app, ..)` so the app stops before its directory goes.
-pub fn another_peer(
-    a_end: &Endpoint,
-    a: &mut App,
-    tag: &str,
-    env: &[(&str, &str)],
-) -> (Endpoint, App, u64, u64) {
+pub fn another_peer(a: &mut App, tag: &str, env: &[(&str, &str)]) -> (Endpoint, App, u64, u64) {
     let end = Endpoint::init(tag);
-    pair(a_end, &end, tag);
     let mut app = end.app(tag, env);
     app.hello();
-    let (a_conn, conn) = connect(a, &mut app);
-    (end, app, a_conn, conn)
+    let joined = pair_apps(a, &mut app);
+    (end, app, joined.a_conn, joined.b_conn)
 }
 
-/// The connections A announced for `identity`: all of them, and the ones
-/// that went down.
-fn conns_of(st: &St, identity: &str) -> (Vec<u64>, Vec<u64>) {
-    let mut all = Vec::new();
-    let mut down = Vec::new();
-    for m in &st.messages {
-        if m["identity"] != identity || !m["conn"].is_u64() {
-            continue;
-        }
-        let conn = m["conn"].as_u64().unwrap();
-        if m["ev"] == "conn.down" {
-            down.push(conn);
-        }
-        if (m["ev"] == "conn.up" || m["ev"] == "conn.down") && !all.contains(&conn) {
-            all.push(conn);
-        }
-    }
-    (all, down)
+/// The inbound connections A announced for `identity`.
+fn inbound_of(st: &St, identity: &str) -> Vec<u64> {
+    st.messages
+        .iter()
+        .filter(|m| m["ev"] == "conn.up" && m["dir"] == "in" && m["identity"] == identity)
+        .map(|m| m["conn"].as_u64().unwrap())
+        .collect()
 }
 
-/// B dials A: the connection's numbers on A and B.
-///
-/// Pairing from the command line leaves A one connection from B that
-/// ends when `join` exits (the app sees it come and go). Wait for it to
-/// go first, so it is not taken for the dialled one.
+/// B dials A: the new connection's numbers on A and B.
 pub fn connect(a: &mut App, b: &mut App) -> (u64, u64) {
     let identity = b.identity.clone();
-    let start = Instant::now();
-    let old = loop {
-        let (all, down) = conns_of(&a.st(), &identity);
-        let settled = all.iter().all(|c| down.contains(c));
-        if settled && (!all.is_empty() || start.elapsed() > Duration::from_secs(3)) {
-            break all;
-        }
-        assert!(start.elapsed() < WAIT, "the pairing connection stayed up");
-        std::thread::sleep(Duration::from_millis(25));
-    };
+    let old = inbound_of(&a.st(), &identity);
     let reply = b.call("dial", json!({"identity": a.identity}));
     let b_conn = reply["conn"].as_u64().unwrap();
     let a_conn = a.wait("conn.up on A", WAIT, |st| {
-        st.messages
-            .iter()
-            .filter(|m| m["ev"] == "conn.up" && m["dir"] == "in" && m["identity"] == identity)
-            .map(|m| m["conn"].as_u64().unwrap())
+        inbound_of(st, &identity)
+            .into_iter()
             .find(|c| !old.contains(c))
     });
     (a_conn, b_conn)
 }
+
 /// `n` bytes that differ by position and by `seed`.
 pub fn pattern(n: usize, seed: u8) -> Vec<u8> {
     (0..n)

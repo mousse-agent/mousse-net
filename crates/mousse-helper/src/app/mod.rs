@@ -33,6 +33,7 @@
 mod budget;
 mod frame;
 mod out;
+mod pairing;
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -42,10 +43,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use mousse_net_core::identity::IdentityPublicKey;
 use mousse_net_core::mux::PriorityClass;
 use mousse_net_core::ErrorCode;
-use mousse_net_io::store::{hex, short_id, PeerStore};
+use mousse_net_io::store::{hex, short_id};
 use mousse_net_io::{
-    Caller, CloseReason, Connection, Host, MuxStream, NetError, StreamAdmission, StreamReader,
-    StreamWriter,
+    Caller, CloseReason, Connection, Host, HostEvent, MuxStream, NetError, StreamAdmission,
+    StreamReader, StreamWriter,
 };
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -56,6 +57,7 @@ use self::frame::Frame;
 use self::out::{Meta, Out};
 use crate::applog;
 use crate::limits::HelperLimits;
+use crate::revoke::Removal;
 
 /// The protocol this helper speaks: 1.0.
 const PROTO: (u64, u64) = (1, 0);
@@ -72,6 +74,9 @@ pub const LABELS: [&str; 5] = [
 /// What the app learns in the `hello` reply.
 pub struct AppInfo {
     pub identity: IdentityPublicKey,
+    /// The device name `PAIRED` and joins send until `config.set` (or
+    /// `hello`) names another.
+    pub name: String,
     pub profile: String,
     pub port: u16,
     pub routes: Vec<String>,
@@ -116,7 +121,9 @@ struct Shared {
     ended: watch::Sender<Option<End>>,
     caller: Arc<Caller>,
     host: Host,
+    removal: Arc<Removal>,
     admission: Arc<StreamAdmission>,
+    pairing: Mutex<pairing::State>,
     info: AppInfo,
     limits: HelperLimits,
 }
@@ -139,6 +146,7 @@ enum Rx {
 struct ConnEntry {
     conn: Arc<Connection>,
     identity: IdentityPublicKey,
+    inbound: bool,
 }
 
 struct StreamEntry {
@@ -214,7 +222,7 @@ fn error(id: &Value, error: &str, reason: impl Into<String>) -> Value {
 
 impl App {
     /// Start the channel on stdin and stdout.
-    pub fn start(host: Host, caller: Arc<Caller>, info: AppInfo) -> Self {
+    pub fn start(host: Host, caller: Arc<Caller>, removal: Arc<Removal>, info: AppInfo) -> Self {
         let limits = *crate::limits::helper();
         let (ended, _) = watch::channel(None);
         let shared = Arc::new(Shared {
@@ -240,11 +248,14 @@ impl App {
             admission: host.stream_admission(),
             caller,
             host,
+            removal,
+            pairing: Mutex::new(pairing::State::new(info.name.clone())),
             info,
             limits,
         });
         tokio::spawn(read_stdin(shared.clone()));
         tokio::spawn(write_stdout(shared.clone()));
+        tokio::spawn(pairing::watch_pause(shared.clone()));
         Self { shared }
     }
 
@@ -265,6 +276,10 @@ impl App {
             applog::line(format!("refused {peer}: not live"));
             return;
         }
+        if self.shared.removal.is_paused() {
+            conn.close(ErrorCode::InternalError);
+            return;
+        }
         let grant = self.shared.host.grant_of(conn.id());
         let mut fields = json!({"dir": "in"});
         if let Some(g) = &grant {
@@ -273,6 +288,11 @@ impl App {
         }
         applog::line(format!("connected {peer} (in)"));
         self.shared.add_conn(conn, true, fields);
+    }
+
+    /// An event from the host: pairing, grants, the grant store.
+    pub fn host_event(&self, event: HostEvent) {
+        pairing::host_event(&self.shared, event);
     }
 
     /// Close every connection the channel opened (the host closes its own).
@@ -309,6 +329,13 @@ impl Shared {
         self.queued(core);
     }
 
+    /// Queue an event for the app.
+    fn event(&self, value: Value) {
+        let mut core = lock(&self.core);
+        core.out.json(&value);
+        self.queued(&core);
+    }
+
     fn add_conn(self: &Arc<Self>, conn: Connection, inbound: bool, mut fields: Value) -> u64 {
         let conn = Arc::new(conn);
         let identity = *conn.peer();
@@ -321,6 +348,7 @@ impl Shared {
                 ConnEntry {
                     conn: conn.clone(),
                     identity,
+                    inbound,
                 },
             );
             fields["ev"] = json!("conn.up");
@@ -572,18 +600,9 @@ impl Shared {
                     ),
                 }
             }
-            "dial" => {
-                let identity = map
-                    .get("identity")
-                    .and_then(Value::as_str)
-                    .map(str::to_lowercase);
-                match identity {
-                    Some(identity) => {
-                        drop(core);
-                        tokio::spawn(dial(self.clone(), id, identity));
-                    }
-                    None => self.reply(&mut core, error(&id, "bad_request", "dial needs identity")),
-                }
+            op if pairing::OPS.contains(&op) => {
+                drop(core);
+                pairing::on_request(self, id, op, &map);
             }
             other => {
                 let reason = format!("unknown op {other:?}");
@@ -617,6 +636,11 @@ impl Shared {
                 );
             }
         }
+        if let Some(name) = map.get("name").and_then(Value::as_str) {
+            if let Err(e) = pairing::set_name(self, name) {
+                return error(id, "bad_name", e);
+            }
+        }
         json!({
             "re": id,
             "proto": [PROTO.0, minor.min(PROTO.1)],
@@ -625,6 +649,7 @@ impl Shared {
             "device": short_id(&self.info.identity),
             "port": self.info.port,
             "routes": self.info.routes,
+            "paused": self.removal.paused_reason(),
         })
     }
 
@@ -943,44 +968,6 @@ async fn open_stream(
     core.out.json(&reply);
     core.regrant(&shared.limits);
     shared.queued(&core);
-}
-
-async fn dial(shared: Arc<Shared>, id: Value, identity: String) {
-    let store = PeerStore::in_dir(&shared.info.state_dir);
-    let peer = store.load().ok().and_then(|peers| {
-        peers.into_iter().find(|p| {
-            p.pin()
-                .map(|pin| hex(pin.as_bytes()) == identity)
-                .unwrap_or(false)
-        })
-    });
-    let reply = match peer {
-        None => error(&id, "no_peer", "not paired with that identity"),
-        Some(record) => {
-            let routes = crate::peer::usable_routes(&record.routes_to_try());
-            match record.pin() {
-                Err(e) => error(&id, "no_peer", e.to_string()),
-                Ok(pin) => match shared.caller.dial_candidates(&routes, pin).await {
-                    Ok((conn, used)) => {
-                        let mut kept = record.clone();
-                        kept.last_route = Some(mousse_net_io::pipe::route_uri(&used));
-                        let _ = store.upsert(kept);
-                        applog::line(format!("connected {} (out)", short_id(&pin)));
-                        let no = shared.add_conn(conn, false, json!({"dir": "out"}));
-                        json!({"re": id, "conn": no})
-                    }
-                    Err(e) => json!({
-                        "re": id,
-                        "error": "unreachable",
-                        "reason": crate::peer::describe(&e),
-                        "why": crate::peer::reason_of(&e),
-                    }),
-                },
-            }
-        }
-    };
-    let mut core = lock(&shared.core);
-    shared.reply(&mut core, reply);
 }
 
 /// Engine to app: read only while the app's credit covers what is

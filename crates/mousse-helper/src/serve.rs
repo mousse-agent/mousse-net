@@ -123,6 +123,10 @@ pub async fn run(
     };
     let (host, mut events) =
         Host::new(signer.clone(), config, CpaceExchangeFactory).map_err(|e| e.to_string())?;
+    // Removals that were decided but maybe not saved are applied before
+    // anything is accepted (Phase 1a §5.4). If that fails, networking
+    // starts paused.
+    let removal = crate::revoke::Removal::start(host.clone(), &endpoint.grants_dir());
     let choice = match opts.port {
         None => PortChoice::Kept,
         Some(0) => PortChoice::Auto,
@@ -143,9 +147,16 @@ pub async fn run(
         None
     };
 
-    let mut control = ControlListener::bind(state_dir).await?;
+    // The app channel replaces the control listener in app mode.
+    let mut control = if opts.app {
+        None
+    } else {
+        Some(ControlListener::bind(state_dir).await?)
+    };
     let token = hex(&random_bytes::<32>());
-    ipc::write_control_file(state_dir, control.addr(), &token)?;
+    if let Some(control) = &control {
+        ipc::write_control_file(state_dir, control.addr(), &token)?;
+    }
 
     let state = Arc::new(State {
         host: host.clone(),
@@ -176,12 +187,18 @@ pub async fn run(
         caller.use_stream_admission(host.stream_admission());
         let info = crate::app::AppInfo {
             identity: real_identity,
+            name: opts.name.clone(),
             profile: endpoint.profile_id().to_owned(),
             port,
             routes: routes.clone(),
             state_dir: endpoint.dir().to_path_buf(),
         };
-        Some(crate::app::App::start(host.clone(), Arc::new(caller), info))
+        Some(crate::app::App::start(
+            host.clone(),
+            Arc::new(caller),
+            removal.clone(),
+            info,
+        ))
     } else {
         None
     };
@@ -197,6 +214,11 @@ pub async fn run(
     loop {
         tokio::select! {
             accepted = accept_tcp(&listener) => match accepted {
+                // Paused: nothing is admitted until the removal is saved.
+                Ok((pipe, addr)) if removal.is_paused() => {
+                    print_line(format!("dropped {addr}: networking is paused"));
+                    drop(pipe);
+                }
                 Ok((pipe, addr)) => match &app {
                     Some(app) => {
                         tokio::spawn(app_connection(host.clone(), app.clone(), pipe, addr));
@@ -212,13 +234,16 @@ pub async fn run(
                 ended = Some(end);
                 break;
             }
-            ctl = control.accept() => match ctl {
+            ctl = accept_control(&mut control) => match ctl {
                 Ok(ch) => {
                     tokio::spawn(control_session(state.clone(), ch));
                 }
                 Err(e) => print_line(format!("control channel: {e}")),
             },
-            Some(event) = events.recv() => on_event(&state, event),
+            Some(event) = events.recv() => match &app {
+                Some(app) => app.host_event(event),
+                None => on_event(&state, event),
+            },
             () = state.stop.notified() => break,
             _ = tokio::signal::ctrl_c() => break,
         }
@@ -237,6 +262,14 @@ pub async fn run(
     match ended.and_then(|end| end.error()) {
         Some(e) => Err(e),
         None => Ok(()),
+    }
+}
+
+/// The next control connection; never, in app mode.
+async fn accept_control(control: &mut Option<ControlListener>) -> Result<Channel, String> {
+    match control {
+        Some(control) => control.accept().await,
+        None => std::future::pending().await,
     }
 }
 

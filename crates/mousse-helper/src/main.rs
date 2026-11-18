@@ -11,7 +11,8 @@
         mousse_control = "allow-break-env",
         mousse_control = "read-without-credit",
         mousse_control = "fifo-writer",
-        mousse_control = "fin-overtakes"
+        mousse_control = "fin-overtakes",
+        mousse_control = "no-revoke-journal"
     )
 ))]
 compile_error!("a mousse_control build has a deliberate defect and is for tests only; build it without --release");
@@ -25,7 +26,8 @@ compile_error!("a mousse_control build has a deliberate defect and is for tests 
     mousse_control = "allow-break-env",
     mousse_control = "read-without-credit",
     mousse_control = "fifo-writer",
-    mousse_control = "fin-overtakes"
+    mousse_control = "fin-overtakes",
+    mousse_control = "no-revoke-journal"
 ))]
 const _: () = {
     let profile = env!("MOUSSE_BUILD_PROFILE").as_bytes();
@@ -44,6 +46,7 @@ mod applog;
 mod ipc;
 mod limits;
 mod peer;
+mod revoke;
 
 /// This build: `<commit>[-dirty]+<profile>`, fixed at compile time (see
 /// `build.rs`; `MOUSSE_BUILD_ID` overrides it).

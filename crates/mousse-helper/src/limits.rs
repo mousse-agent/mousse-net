@@ -70,6 +70,8 @@ mousse_net_core::define_limits! {
         app_log_max_bytes = "APP_LOG_MAX_BYTES": 1_048_576, [4_096, 1_073_741_824];
         /// App mode: log files kept, helper.log included.
         app_log_files = "APP_LOG_FILES": 2, [1, 10];
+        /// While networking is paused because a removal could not be saved, how often the save is tried again (Phase 1a §5.4).
+        removal_retry_ms = "REMOVAL_RETRY_MS": 1_000, [10, 60_000];
     }
     agree(h) {
         if h.app_credit_interactive_reserve_bytes >= h.app_credit_budget_bytes {

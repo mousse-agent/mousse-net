@@ -100,7 +100,7 @@ fn the_endpoint_cap_counts_every_connection_and_own_opens_wait_for_a_place() {
         ("STREAMS_PER_ENDPOINT", "6"),
     ];
     let mut p = pair_up("endp", &caps, &[]);
-    let (_c_end, mut c, a_to_c, c_conn) = another_peer(&p.a_end, &mut p.a, "endpc", &[]);
+    let (_c_end, mut c, a_to_c, c_conn) = another_peer(&mut p.a, "endpc", &[]);
     let from_b = open_bulk(&mut p.b, p.b_conn, 5);
     // Four per connection.
     p.a.incoming(p.a_conn, 3);

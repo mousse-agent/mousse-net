@@ -77,7 +77,7 @@ fn stdin_closing_ends_every_connection_cleanly_and_the_helper_exits() {
 #[test]
 fn equal_wire_stream_ids_on_two_connections_get_their_own_handles() {
     let mut p = pair_up("ids", &[], &[]);
-    let (_c_end, mut c, a_to_c, c_conn) = another_peer(&p.a_end, &mut p.a, "idsc", &[]);
+    let (_c_end, mut c, a_to_c, c_conn) = another_peer(&mut p.a, "idsc", &[]);
     assert_ne!(a_to_c, p.a_conn);
 
     // The first stream each caller opens: wire stream ids restart on every
