@@ -1,0 +1,264 @@
+{
+  "build": "b7bdf85+release",
+  "check": "phase0.phone-byte-path",
+  "details": {
+    "breakMode": null,
+    "budgets": {
+      "fileMBps": 10,
+      "terminalP95Ms": 16
+    },
+    "client": "WKWebView page over ws://127.0.0.1",
+    "failures": [],
+    "libTarget": "aarch64-apple-ios-sim",
+    "page": {
+      "burst": {
+        "ms": 239,
+        "n": 5000,
+        "ok": true,
+        "writesPerSec": 20921
+      },
+      "download": {
+        "bytes": 33554432,
+        "mbps": 599.186,
+        "ms": 56,
+        "ok": true
+      },
+      "echo": {
+        "maxMs": 8,
+        "n": 2000,
+        "ok": 2000,
+        "p50Ms": 0,
+        "p95Ms": 1
+      },
+      "errors": [],
+      "origin": "mousse-app://localhost",
+      "timerStepMs": 1,
+      "upload": {
+        "bytes": 33554432,
+        "mbps": 381.3,
+        "ms": 88,
+        "ok": true,
+        "serverUs": 73915
+      },
+      "userAgent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
+      "wrongTokenRefused": true
+    },
+    "pageOrigin": "mousse-app://localhost",
+    "probes": [
+      {
+        "case": "valid",
+        "expectAccept": true,
+        "ok": true,
+        "status": 101
+      },
+      {
+        "case": "wrong-token",
+        "expectAccept": false,
+        "ok": true,
+        "status": 403
+      },
+      {
+        "case": "missing-token",
+        "expectAccept": false,
+        "ok": true,
+        "status": 403
+      },
+      {
+        "case": "wrong-host",
+        "expectAccept": false,
+        "ok": true,
+        "status": 403
+      },
+      {
+        "case": "localhost-host",
+        "expectAccept": false,
+        "ok": true,
+        "status": 403
+      },
+      {
+        "case": "missing-host",
+        "expectAccept": false,
+        "ok": true,
+        "status": 403
+      },
+      {
+        "case": "wrong-origin",
+        "expectAccept": false,
+        "ok": true,
+        "status": 403
+      },
+      {
+        "case": "null-origin",
+        "expectAccept": false,
+        "ok": true,
+        "status": 403
+      },
+      {
+        "case": "missing-origin",
+        "expectAccept": false,
+        "ok": true,
+        "status": 403
+      }
+    ],
+    "server": {
+      "acceptedConnections": 2,
+      "allowedOrigin": "mousse-app://localhost",
+      "refusals": [
+        "bad token",
+        "bad token",
+        "missing token",
+        "bad host",
+        "bad host",
+        "missing host",
+        "bad origin",
+        "bad origin",
+        "missing origin"
+      ],
+      "tokenCheck": true
+    },
+    "steps": {
+      "budget-file-throughput": {
+        "failures": 0,
+        "max": 381.3,
+        "p50": 381.3,
+        "p95": 381.3,
+        "runs": 1
+      },
+      "budget-terminal-p95": {
+        "failures": 0,
+        "max": 1,
+        "p50": 1,
+        "p95": 1,
+        "runs": 1
+      },
+      "file-download": {
+        "failures": 0,
+        "max": 599.186,
+        "p50": 599.186,
+        "p95": 599.186,
+        "runs": 1
+      },
+      "file-upload": {
+        "failures": 0,
+        "max": 381.3,
+        "p50": 381.3,
+        "p95": 381.3,
+        "runs": 1
+      },
+      "page-no-errors": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 1
+      },
+      "page-report": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 1
+      },
+      "page-wrong-token-refused": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 1
+      },
+      "probe-localhost-host": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 1
+      },
+      "probe-missing-host": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 1
+      },
+      "probe-missing-origin": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 1
+      },
+      "probe-missing-token": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 1
+      },
+      "probe-null-origin": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 1
+      },
+      "probe-valid": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 1
+      },
+      "probe-wrong-host": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 1
+      },
+      "probe-wrong-origin": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 1
+      },
+      "probe-wrong-token": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 1
+      },
+      "server-refused-page-wrong-token": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 1
+      },
+      "server-verified-upload": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 1
+      },
+      "terminal-burst": {
+        "failures": 0,
+        "max": 239,
+        "p50": 239,
+        "p95": 239,
+        "runs": 1
+      },
+      "terminal-echo": {
+        "failures": 0,
+        "max": 1,
+        "p50": 1,
+        "p95": 1,
+        "runs": 1
+      }
+    }
+  },
+  "outcome": "PASS",
+  "target": "ios-sim-26.3.1"
+}

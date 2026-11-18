@@ -1,0 +1,221 @@
+{
+  "build": "b7bdf85+release",
+  "check": "phase0.phone-lifecycle",
+  "details": {
+    "bindings": "swift (UniFFI 0.32.2), strict concurrency, Swift 6 mode",
+    "blackholeSkips": [],
+    "breakMode": "cancel",
+    "failures": [
+      {
+        "note": "timedOut",
+        "step": "cancel-pending-dial",
+        "value": 2119.3457918167114
+      },
+      {
+        "note": "timedOut",
+        "step": "task-cancel-resolves",
+        "value": 2120.6951248645782
+      },
+      {
+        "note": "live 2",
+        "step": "no-live-dials-after-cancel",
+        "value": null
+      },
+      {
+        "note": "only the echo listener may remain",
+        "step": "no-task-leak-before-stop",
+        "value": 3
+      },
+      {
+        "note": "started, dialStarted(127.0.0.1:57782), dialConnected(127.0.0.1:57782), echoOk(1024 bytes), dialStarted(10.255.255.1:9), dialStarted(10.255.255.1:9)",
+        "step": "events-expected",
+        "value": null
+      },
+      {
+        "note": "timedOut",
+        "step": "cancel-pending-dial",
+        "value": 2117.8429160118103
+      },
+      {
+        "note": "timedOut",
+        "step": "task-cancel-resolves",
+        "value": 2006.4615831375122
+      },
+      {
+        "note": "live 2",
+        "step": "no-live-dials-after-cancel",
+        "value": null
+      },
+      {
+        "note": "only the echo listener may remain",
+        "step": "no-task-leak-before-stop",
+        "value": 3
+      },
+      {
+        "note": "started, dialStarted(127.0.0.1:57804), dialConnected(127.0.0.1:57804), echoOk(1024 bytes), dialStarted(10.255.255.1:9), dialStarted(10.255.255.1:9)",
+        "step": "events-expected",
+        "value": null
+      },
+      {
+        "note": "timedOut",
+        "step": "cancel-pending-dial",
+        "value": 2004.5703749656677
+      },
+      {
+        "note": "timedOut",
+        "step": "task-cancel-resolves",
+        "value": 2011.1037909984589
+      },
+      {
+        "note": "live 2",
+        "step": "no-live-dials-after-cancel",
+        "value": null
+      },
+      {
+        "note": "only the echo listener may remain",
+        "step": "no-task-leak-before-stop",
+        "value": 3
+      },
+      {
+        "note": "started, dialStarted(127.0.0.1:57830), dialConnected(127.0.0.1:57830), echoOk(1024 bytes), dialStarted(10.255.255.1:9), dialStarted(10.255.255.1:9)",
+        "step": "events-expected",
+        "value": null
+      },
+      {
+        "note": "timedOut",
+        "step": "cancel-pending-dial",
+        "value": 2063.425791978836
+      },
+      {
+        "note": "timedOut",
+        "step": "task-cancel-resolves",
+        "value": 2046.4211249351501
+      },
+      {
+        "note": "live 2",
+        "step": "no-live-dials-after-cancel",
+        "value": null
+      },
+      {
+        "note": "only the echo listener may remain",
+        "step": "no-task-leak-before-stop",
+        "value": 3
+      },
+      {
+        "note": "started, dialStarted(127.0.0.1:57858), dialConnected(127.0.0.1:57858), echoOk(1024 bytes), dialStarted(10.255.255.1:9), dialStarted(10.255.255.1:9)",
+        "step": "events-expected",
+        "value": null
+      }
+    ],
+    "iterations": 5,
+    "libTarget": "aarch64-apple-ios-sim",
+    "promptMs": 250,
+    "socketBaseline": {
+      "count": 0,
+      "waitedMs": 1530
+    },
+    "steps": {
+      "cancel-pending-dial": {
+        "failures": 5,
+        "max": 2123.2235832214355,
+        "p50": 2117.843,
+        "p95": 2123.224,
+        "runs": 5
+      },
+      "dial-after-stop-refused": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 5
+      },
+      "dial-echo": {
+        "failures": 0,
+        "max": 4.247083,
+        "p50": 0.318,
+        "p95": 4.247,
+        "runs": 5
+      },
+      "dial-pending-before-cancel": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 5
+      },
+      "events-bounded-batches": {
+        "failures": 0,
+        "max": 6,
+        "p50": 6,
+        "p95": 6,
+        "runs": 5
+      },
+      "events-expected": {
+        "failures": 5,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 5
+      },
+      "events-overflow-counted": {
+        "failures": 0,
+        "max": 24,
+        "p50": 24,
+        "p95": 24,
+        "runs": 5
+      },
+      "no-live-dials-after-cancel": {
+        "failures": 5,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 5
+      },
+      "no-socket-leak": {
+        "failures": 0,
+        "max": 0,
+        "p50": 0,
+        "p95": 0,
+        "runs": 5
+      },
+      "no-task-leak-before-stop": {
+        "failures": 5,
+        "max": 3,
+        "p50": 3,
+        "p95": 3,
+        "runs": 5
+      },
+      "start": {
+        "failures": 0,
+        "max": 1.2367079257965088,
+        "p50": 0.069,
+        "p95": 1.237,
+        "runs": 5
+      },
+      "stop": {
+        "failures": 0,
+        "max": 0.33379220962524414,
+        "p50": 0.195,
+        "p95": 0.334,
+        "runs": 5
+      },
+      "stop-resolves-pending-dial": {
+        "failures": 0,
+        "max": 0.34708404541015625,
+        "p50": 0.216,
+        "p95": 0.347,
+        "runs": 5
+      },
+      "task-cancel-resolves": {
+        "failures": 5,
+        "max": 2120.6951248645782,
+        "p50": 2011.104,
+        "p95": 2120.695,
+        "runs": 5
+      }
+    },
+    "unroutable": "10.255.255.1:9"
+  },
+  "outcome": "FAIL",
+  "target": "ios-sim-26.3.1"
+}

@@ -336,6 +336,18 @@ impl World {
     }
 
     fn after_step(&mut self) {
+        // Timers due at this same millisecond run before the checks. Another
+        // event at this time may have been taken from the queue first, and
+        // the state is only judged once every device has caught up.
+        for id in 0..self.devs.len() {
+            if self.wake_at[id].is_some_and(|at| at <= self.sim.now) {
+                self.wake_at[id] = None;
+                match &mut self.devs[id] {
+                    Device::Host(h) => h.run_timers(&mut self.sim),
+                    Device::Caller(c) => c.run_timers(&mut self.sim),
+                }
+            }
+        }
         for dev in &mut self.devs {
             match dev {
                 Device::Host(h) => h.flush(&mut self.sim),

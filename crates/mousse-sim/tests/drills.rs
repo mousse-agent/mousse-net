@@ -194,3 +194,20 @@ fn known_core_findings_still_reproduce() {
         );
     }
 }
+
+/// Seed 19126 ends the laptop's grant in the same millisecond as another
+/// event. The checks must wait until the host has run its due timers, or
+/// they see a channel on a grant that is about to close.
+#[cfg(not(feature = "insecure-exchange"))]
+#[test]
+fn a_grant_that_ends_with_another_event_is_closed_before_the_checks() {
+    let o = run(&RunConfig {
+        keep_log: true,
+        ..RunConfig::new(Drill::Handshake, 19_126)
+    });
+    assert!(o.violation.is_none(), "{:?}", o.violation);
+    assert!(
+        o.log.iter().any(|l| l.contains("grant 0 ends")),
+        "the seed no longer ends a grant mid-run"
+    );
+}

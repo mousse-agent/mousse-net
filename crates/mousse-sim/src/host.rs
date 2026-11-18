@@ -137,7 +137,13 @@ impl HostDev {
         );
         match added {
             Ok((id, events)) => {
-                sim.say(self.id, format_args!("grants {name} as grant {}", id.0));
+                match expires_in {
+                    Some(secs) => sim.say(
+                        self.id,
+                        format_args!("grants {name} as grant {} for {secs}s", id.0),
+                    ),
+                    None => sim.say(self.id, format_args!("grants {name} as grant {}", id.0)),
+                }
                 self.note_grant_id(sim, id);
                 let actions = events.into_iter().map(HostAction::Grant).collect();
                 self.apply(sim, actions);

@@ -1,0 +1,120 @@
+{
+  "build": "b7bdf85+release",
+  "check": "phase0.phone-lifecycle",
+  "details": {
+    "bindings": "kotlin (UniFFI 0.32.2), coroutines",
+    "blackholeSkips": [],
+    "breakMode": null,
+    "failures": [],
+    "iterations": 20,
+    "libTarget": "aarch64-linux-android",
+    "promptMs": 250,
+    "socketBaseline": {
+      "count": 11,
+      "waitedMs": 1725
+    },
+    "steps": {
+      "cancel-pending-dial": {
+        "failures": 0,
+        "max": 66.87129199999981,
+        "p50": 0.807,
+        "p95": 2.548,
+        "runs": 20
+      },
+      "dial-after-stop-refused": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 20
+      },
+      "dial-echo": {
+        "failures": 0,
+        "max": 59.476583,
+        "p50": 0.451,
+        "p95": 2.194,
+        "runs": 20
+      },
+      "dial-pending-before-cancel": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 20
+      },
+      "events-bounded-batches": {
+        "failures": 0,
+        "max": 8,
+        "p50": 8,
+        "p95": 8,
+        "runs": 20
+      },
+      "events-expected": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 20
+      },
+      "events-overflow-counted": {
+        "failures": 0,
+        "max": 24,
+        "p50": 24,
+        "p95": 24,
+        "runs": 20
+      },
+      "no-live-dials-after-cancel": {
+        "failures": 0,
+        "max": null,
+        "p50": null,
+        "p95": null,
+        "runs": 20
+      },
+      "no-socket-leak": {
+        "failures": 0,
+        "max": 0,
+        "p50": 0,
+        "p95": 0,
+        "runs": 20
+      },
+      "no-task-leak-before-stop": {
+        "failures": 0,
+        "max": 1,
+        "p50": 1,
+        "p95": 1,
+        "runs": 20
+      },
+      "start": {
+        "failures": 0,
+        "max": 96.06345900000088,
+        "p50": 0.43,
+        "p95": 10.527,
+        "runs": 20
+      },
+      "stop": {
+        "failures": 0,
+        "max": 18.635582999999315,
+        "p50": 0.8,
+        "p95": 3.809,
+        "runs": 20
+      },
+      "stop-resolves-pending-dial": {
+        "failures": 0,
+        "max": 21.38141700000051,
+        "p50": 1.328,
+        "p95": 6.026,
+        "runs": 20
+      },
+      "task-cancel-resolves": {
+        "failures": 0,
+        "max": 0.9709999999977299,
+        "p50": 0.409,
+        "p95": 0.829,
+        "runs": 20
+      }
+    },
+    "unroutable": "10.255.255.1:9"
+  },
+  "outcome": "PASS",
+  "target": "android-emu-35-arm64-v8a"
+}
