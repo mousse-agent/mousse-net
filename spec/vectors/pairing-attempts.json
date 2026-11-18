@@ -1,7 +1,73 @@
 {
-  "description": "Attempt-limit sequences for the send-link flow (spec wire.md, \"Send-link flow and the code\" and \"Attempt limits\"), plus one-enrollment for in person. Each step runs one operation and then the listed expectations hold. Ops: connect (joiner proves the ticket on conn), submit (joiner enters a code; messages flow until both sides stop), submit_first (only the joiner's first message reaches the host), redeliver (that first message reaches the host again on conn), drop (conn closes mid-attempt), approve (host owner taps for conn). Codes: right (the code the host shows now), wrong (any other code), stale (the code the host showed when the previous attempt started). `new_code` says whether the host showed a fresh code during the step. `closed` lists connections the host closed during the step. `reply: code_abort` means the host's only answer was CODE_ABORT for that attempt.",
+  "conventions": {
+    "draws": "`draws` lists each party's random values in the order it takes them. A `bytes` draw fills a request of exactly that length; a `u32` draw answers a request for a 32-bit integer. Host: invitation id (16), ticket secret (16), for send link the first code (u32, drawn again while at least 4294000000); then for each new attempt, after the debit and before reading its first message, the next code (u32, only while attempts are left) and the CPace scalar yb (32). Joiner: for each attempt the attempt id (16) and the CPace scalar ya (32).",
+    "exporters": "On connection n both ends see the join exporter n repeated 32 times and the pair exporter n + 100 repeated 32 times.",
+    "host": {
+      "identity_secret": "1111111111111111111111111111111111111111111111111111111111111111",
+      "name": "Desk"
+    },
+    "invitation": {
+      "authorizing_owner": "51515151515151515151515151515151",
+      "grant_expires_at": null,
+      "role": "owner",
+      "routes": [
+        "tcp://192.168.1.20:7443"
+      ]
+    },
+    "joiners": "Each joiner's identity secret is one byte repeated 32 times: 0x50 for the first joiner a sequence names, 0x51 for the second, and so on. Its name is its letter.",
+    "time": 1790000000
+  },
+  "description": "Attempt-limit and resend sequences for the send-link flow (spec wire.md, \"Send-link flow and the code\" and \"Attempt limits\"), plus one-enrollment for in person. Each step runs one operation and then the listed expectations hold. Ops: connect (the joiner sends its join proof on conn), submit (the joiner enters a code; messages flow until both sides stop), submit_first (only the joiner's first message reaches the host), redeliver (that first message reaches the host again on conn), inject (the joiner's side sends `message` for `attempt`, \"current\" meaning the attempt of its last submit, with `payload`), drop (conn closes), approve (host owner taps for conn). Codes: right (the code the host shows now), wrong (000000, or 000001 if 000000 is shown), stale (the code the host showed when the previous attempt started). `reply`: first_reply (the same messages, byte for byte, as the host's answer to that first message), code_abort (the host's only answer is CODE_ABORT pairing_failed for that attempt), none (no answer). `new_code` says whether the host showed a fresh code during the step. `closed` lists connections the host closed during the step. `out` lists, in order, every control message each side sent during the step (`send`), host closes (`close`) and codes the host showed (`show_code`).",
   "sequences": [
     {
+      "draws": {
+        "a": [
+          {
+            "bytes": "9a9ec1a2a6c152e5b938b4dd05f045ad"
+          },
+          {
+            "bytes": "e11a1b1776dff6485acc5921c49dcdd2b0a8148d9aa75b949e0af167af1766f4"
+          },
+          {
+            "bytes": "84627a34f6c10de28b77f93ea341ef97"
+          },
+          {
+            "bytes": "57826e19f83dc783b05426a652e9730a9b89c79caa62e007a8c5813556064b15"
+          },
+          {
+            "bytes": "014919d49270c47d113de49f6a42639a"
+          },
+          {
+            "bytes": "ef4b9bcb3e22a5d65d52ce1562afd06b94addb084f1a750beafdfdc18546e402"
+          }
+        ],
+        "host": [
+          {
+            "bytes": "f400927857aaf64114f561baacb37970"
+          },
+          {
+            "bytes": "8c79a1dc1476ab573216a4020764bde5"
+          },
+          {
+            "u32": 3678650693
+          },
+          {
+            "u32": 580673721
+          },
+          {
+            "bytes": "ab855d60925a997603d78a3f20d154abd8ddfa6974eedf6b3784290c606b04fd"
+          },
+          {
+            "u32": 291520
+          },
+          {
+            "bytes": "c961e366b6ea14d411fcc53dea4f44c9bb4d7408de0ea89a53f1ecf3f3d0a462"
+          },
+          {
+            "bytes": "fb77d2baf5e0e5dfefb6897bbd7460315e81182ac2be6756184ff1346102aa1a"
+          }
+        ]
+      },
       "kind": "send_link",
       "name": "three_wrong_codes",
       "steps": [
@@ -11,7 +77,26 @@
           "joiner": "a",
           "joiner_attempts_left": 3,
           "joiner_state": "awaiting_code",
-          "op": "connect"
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a400030150f400927857aaf64114f561baacb37970025820e0bb1c0bfede8c1880760e9cb272e5f5562f10f697a5e9626c1ac786520437a1036161",
+                "from": "a"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a200020102",
+                "from": "host"
+              }
+            },
+            {
+              "show_code": "650693"
+            }
+          ]
         },
         {
           "code": "wrong",
@@ -22,7 +107,33 @@
           "joiner_attempts_left": 2,
           "joiner_state": "awaiting_code",
           "new_code": true,
-          "op": "submit"
+          "op": "submit",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02582220dab42ad70b8684111de2f7a0ca3908c2a81b5c2aab69f9211da833a1ccb7e07e00",
+                "from": "a"
+              }
+            },
+            {
+              "show_code": "673721"
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad0258622062f95f725a624ede5e2f3a4fa65687901214c4b7444326b97993a9e5f8b8dc3e00094a92f759421d2c6c2b2152c1a247c7079d808f9337f3019a2f7bf0ab72cf7569c3e7aae44931830e900442907f00ba5a4aecc39cd6ff06cfee70277aee223b",
+                "from": "host"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000501509a9ec1a2a6c152e5b938b4dd05f045ad020a",
+                "from": "a"
+              }
+            }
+          ]
         },
         {
           "code": "wrong",
@@ -33,7 +144,33 @@
           "joiner_attempts_left": 1,
           "joiner_state": "awaiting_code",
           "new_code": true,
-          "op": "submit"
+          "op": "submit",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a30004015084627a34f6c10de28b77f93ea341ef970258222042f2a3872616e83e68e0d56b81b66c9b4e862eaa9b46b9a9ec2803ccf727823800",
+                "from": "a"
+              }
+            },
+            {
+              "show_code": "291520"
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a30004015084627a34f6c10de28b77f93ea341ef9702586220c40a7cede5b825be66c9e645255c5fb14a042017713c100948468cdc0ca20048006547f0b89b47c60d4ab1e53ec2d2dbdcac28e1c6f1a37d833db9d5f1763b28cbf82d43e797ffd9a834856a2e4453b2e5db6b95ee536855573573f6dac3938493",
+                "from": "host"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a30005015084627a34f6c10de28b77f93ea341ef97020a",
+                "from": "a"
+              }
+            }
+          ]
         },
         {
           "closed": [
@@ -50,25 +187,115 @@
           "joiner_attempts_left": 0,
           "joiner_state": "failed:attempts_exhausted",
           "new_code": false,
-          "op": "submit"
+          "op": "submit",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150014919d49270c47d113de49f6a42639a025822207e8c68370adffc7911d6691f8ddaa64ad2375b6767249a7a9d4e3d2e8d37764200",
+                "from": "a"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150014919d49270c47d113de49f6a42639a0258622008d45f6c0bc18f0204378425aadcd6c4b60632c86cb061734b7166db5bb7102d000563c19bc4af37b9a9f3e9c4f18d634265016f12919d3d07e0a5818a9a076978b61167de5f8573a63d7677668841dcf9001c433431fe4e0dc0eca5a7ff94fb22",
+                "from": "host"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300050150014919d49270c47d113de49f6a42639a020a",
+                "from": "a"
+              }
+            },
+            {
+              "close": {
+                "code": "attempts_exhausted",
+                "conn": 1,
+                "from": "host"
+              }
+            }
+          ]
         },
         {
           "code": "right",
           "conn": 1,
           "joiner": "a",
           "op": "submit",
+          "out": [],
           "result": "wrong_state"
         }
-      ]
+      ],
+      "ticket": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450f400927857aaf64114f561baacb3797005508c79a1dc1476ab573216a4020764bde5061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
     },
     {
+      "draws": {
+        "a": [
+          {
+            "bytes": "9a9ec1a2a6c152e5b938b4dd05f045ad"
+          },
+          {
+            "bytes": "e11a1b1776dff6485acc5921c49dcdd2b0a8148d9aa75b949e0af167af1766f4"
+          },
+          {
+            "bytes": "84627a34f6c10de28b77f93ea341ef97"
+          },
+          {
+            "bytes": "57826e19f83dc783b05426a652e9730a9b89c79caa62e007a8c5813556064b15"
+          }
+        ],
+        "host": [
+          {
+            "bytes": "f400927857aaf64114f561baacb37970"
+          },
+          {
+            "bytes": "8c79a1dc1476ab573216a4020764bde5"
+          },
+          {
+            "u32": 3678650693
+          },
+          {
+            "u32": 580673721
+          },
+          {
+            "bytes": "ab855d60925a997603d78a3f20d154abd8ddfa6974eedf6b3784290c606b04fd"
+          },
+          {
+            "u32": 291520
+          },
+          {
+            "bytes": "c961e366b6ea14d411fcc53dea4f44c9bb4d7408de0ea89a53f1ecf3f3d0a462"
+          }
+        ]
+      },
       "kind": "send_link",
       "name": "wrong_then_right",
       "steps": [
         {
           "conn": 1,
           "joiner": "a",
-          "op": "connect"
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a400030150f400927857aaf64114f561baacb37970025820e0bb1c0bfede8c1880760e9cb272e5f5562f10f697a5e9626c1ac786520437a1036161",
+                "from": "a"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a200020102",
+                "from": "host"
+              }
+            },
+            {
+              "show_code": "650693"
+            }
+          ]
         },
         {
           "code": "wrong",
@@ -76,7 +303,33 @@
           "host_attempts_left": 2,
           "joiner": "a",
           "joiner_attempts_left": 2,
-          "op": "submit"
+          "op": "submit",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02582220dab42ad70b8684111de2f7a0ca3908c2a81b5c2aab69f9211da833a1ccb7e07e00",
+                "from": "a"
+              }
+            },
+            {
+              "show_code": "673721"
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad0258622062f95f725a624ede5e2f3a4fa65687901214c4b7444326b97993a9e5f8b8dc3e00094a92f759421d2c6c2b2152c1a247c7079d808f9337f3019a2f7bf0ab72cf7569c3e7aae44931830e900442907f00ba5a4aecc39cd6ff06cfee70277aee223b",
+                "from": "host"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000501509a9ec1a2a6c152e5b938b4dd05f045ad020a",
+                "from": "a"
+              }
+            }
+          ]
         },
         {
           "code": "right",
@@ -86,18 +339,119 @@
           "joiner": "a",
           "joiner_attempts_left": 1,
           "joiner_state": "paired",
-          "op": "submit"
+          "op": "submit",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a30004015084627a34f6c10de28b77f93ea341ef970258222022fc840a9c0963f5b47c846734985da7ec935f21c7b581a90911019d5156143c00",
+                "from": "a"
+              }
+            },
+            {
+              "show_code": "291520"
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a30004015084627a34f6c10de28b77f93ea341ef9702586220c40a7cede5b825be66c9e645255c5fb14a042017713c100948468cdc0ca2004800598dd1bfcd9a318c93dc31a7028077b2929549990feb21834597934237c3a0ec16f1b1be02f7f02b9fcc7d58e14e9ee8c09382c8e55c6606bd3dcae51eab3954",
+                "from": "host"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a30004015084627a34f6c10de28b77f93ea341ef970258402ff480d5745175482159ded7928d20958f560b589379930ebc1aa419fcffb38ec03a2281800c7d56578fdb2c6ef2ebc567b2980bacfbc06c0a52f50ce5b73a19",
+                "from": "a"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000601644465736b02656f776e6572",
+                "from": "host"
+              }
+            }
+          ]
         }
-      ]
+      ],
+      "ticket": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450f400927857aaf64114f561baacb3797005508c79a1dc1476ab573216a4020764bde5061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
     },
     {
+      "draws": {
+        "a": [
+          {
+            "bytes": "9a9ec1a2a6c152e5b938b4dd05f045ad"
+          },
+          {
+            "bytes": "e11a1b1776dff6485acc5921c49dcdd2b0a8148d9aa75b949e0af167af1766f4"
+          },
+          {
+            "bytes": "84627a34f6c10de28b77f93ea341ef97"
+          },
+          {
+            "bytes": "57826e19f83dc783b05426a652e9730a9b89c79caa62e007a8c5813556064b15"
+          },
+          {
+            "bytes": "014919d49270c47d113de49f6a42639a"
+          },
+          {
+            "bytes": "ef4b9bcb3e22a5d65d52ce1562afd06b94addb084f1a750beafdfdc18546e402"
+          }
+        ],
+        "host": [
+          {
+            "bytes": "f400927857aaf64114f561baacb37970"
+          },
+          {
+            "bytes": "8c79a1dc1476ab573216a4020764bde5"
+          },
+          {
+            "u32": 3678650693
+          },
+          {
+            "u32": 580673721
+          },
+          {
+            "bytes": "ab855d60925a997603d78a3f20d154abd8ddfa6974eedf6b3784290c606b04fd"
+          },
+          {
+            "u32": 291520
+          },
+          {
+            "bytes": "c961e366b6ea14d411fcc53dea4f44c9bb4d7408de0ea89a53f1ecf3f3d0a462"
+          },
+          {
+            "bytes": "fb77d2baf5e0e5dfefb6897bbd7460315e81182ac2be6756184ff1346102aa1a"
+          }
+        ]
+      },
       "kind": "send_link",
       "name": "stale_code_is_refused",
       "steps": [
         {
           "conn": 1,
           "joiner": "a",
-          "op": "connect"
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a400030150f400927857aaf64114f561baacb37970025820e0bb1c0bfede8c1880760e9cb272e5f5562f10f697a5e9626c1ac786520437a1036161",
+                "from": "a"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a200020102",
+                "from": "host"
+              }
+            },
+            {
+              "show_code": "650693"
+            }
+          ]
         },
         {
           "code": "wrong",
@@ -105,7 +459,33 @@
           "host_attempts_left": 2,
           "joiner": "a",
           "new_code": true,
-          "op": "submit"
+          "op": "submit",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02582220dab42ad70b8684111de2f7a0ca3908c2a81b5c2aab69f9211da833a1ccb7e07e00",
+                "from": "a"
+              }
+            },
+            {
+              "show_code": "673721"
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad0258622062f95f725a624ede5e2f3a4fa65687901214c4b7444326b97993a9e5f8b8dc3e00094a92f759421d2c6c2b2152c1a247c7079d808f9337f3019a2f7bf0ab72cf7569c3e7aae44931830e900442907f00ba5a4aecc39cd6ff06cfee70277aee223b",
+                "from": "host"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000501509a9ec1a2a6c152e5b938b4dd05f045ad020a",
+                "from": "a"
+              }
+            }
+          ]
         },
         {
           "code": "stale",
@@ -116,7 +496,33 @@
           "joiner_attempts_left": 1,
           "joiner_state": "awaiting_code",
           "new_code": true,
-          "op": "submit"
+          "op": "submit",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a30004015084627a34f6c10de28b77f93ea341ef9702582220680d6ebb6ec8f45d6f54b656abcbed29a66ee3dfd12f849c491e6be18c4de61400",
+                "from": "a"
+              }
+            },
+            {
+              "show_code": "291520"
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a30004015084627a34f6c10de28b77f93ea341ef9702586220c40a7cede5b825be66c9e645255c5fb14a042017713c100948468cdc0ca2004800b3b7cc1ec7b19d5d3225326aa2f92ec9c29676841e36aeff0cc60399265ce0b616ab71e6b480559d3fa0829e8d60bc01780ad588e94712f937498713f50d1d25",
+                "from": "host"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a30005015084627a34f6c10de28b77f93ea341ef97020a",
+                "from": "a"
+              }
+            }
+          ]
         },
         {
           "code": "right",
@@ -126,18 +532,95 @@
           "joiner": "a",
           "joiner_state": "paired",
           "new_code": false,
-          "op": "submit"
+          "op": "submit",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150014919d49270c47d113de49f6a42639a02582220d4fee2581454290dc4f466cdf060738182a68541014324b9fdc122b408e8134000",
+                "from": "a"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150014919d49270c47d113de49f6a42639a0258622008d45f6c0bc18f0204378425aadcd6c4b60632c86cb061734b7166db5bb7102d00d0eb5954654372613dac6ba7c9471f4a9882be875ba363b574758382da87e2fc98469d0ed70cddefda10269ac511c9bf79ba79af948f1f4f3d10a1246acd7416",
+                "from": "host"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150014919d49270c47d113de49f6a42639a025840c59e82c165745bf14f364795549f894eb0ede3fd03400edfc3709028f566c2f72c5dc1d160ad239b7bd3e54abd747b20b88e8125225f7e1d8b6f06171a51a787",
+                "from": "a"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000601644465736b02656f776e6572",
+                "from": "host"
+              }
+            }
+          ]
         }
-      ]
+      ],
+      "ticket": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450f400927857aaf64114f561baacb3797005508c79a1dc1476ab573216a4020764bde5061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
     },
     {
+      "draws": {
+        "a": [
+          {
+            "bytes": "9a9ec1a2a6c152e5b938b4dd05f045ad"
+          },
+          {
+            "bytes": "e11a1b1776dff6485acc5921c49dcdd2b0a8148d9aa75b949e0af167af1766f4"
+          }
+        ],
+        "host": [
+          {
+            "bytes": "f400927857aaf64114f561baacb37970"
+          },
+          {
+            "bytes": "8c79a1dc1476ab573216a4020764bde5"
+          },
+          {
+            "u32": 3678650693
+          },
+          {
+            "u32": 580673721
+          },
+          {
+            "bytes": "ab855d60925a997603d78a3f20d154abd8ddfa6974eedf6b3784290c606b04fd"
+          }
+        ]
+      },
       "kind": "send_link",
       "name": "resend_is_not_a_new_attempt",
       "steps": [
         {
           "conn": 1,
           "joiner": "a",
-          "op": "connect"
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a400030150f400927857aaf64114f561baacb37970025820e0bb1c0bfede8c1880760e9cb272e5f5562f10f697a5e9626c1ac786520437a1036161",
+                "from": "a"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a200020102",
+                "from": "host"
+              }
+            },
+            {
+              "show_code": "650693"
+            }
+          ]
         },
         {
           "code": "right",
@@ -145,7 +628,26 @@
           "host_attempts_left": 2,
           "joiner": "a",
           "joiner_attempts_left": 2,
-          "op": "submit_first"
+          "op": "submit_first",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02582220c295b8339d9905adfcbd09312dcfa1b8dd9b76bb06fa98cc0521cdf3e5d41a6200",
+                "from": "a"
+              }
+            },
+            {
+              "show_code": "673721"
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad0258622062f95f725a624ede5e2f3a4fa65687901214c4b7444326b97993a9e5f8b8dc3e006886875760e1d84b759a5988cc09e0225ca1fc5f067d1c3909a1bf3106eb6a896cd3b6b24107924f46ffdafd4bc89110cf05e8eeae9faa369133ee6729f58efa",
+                "from": "host"
+              }
+            }
+          ]
         },
         {
           "conn": 1,
@@ -153,7 +655,23 @@
           "joiner": "a",
           "new_code": false,
           "op": "redeliver",
-          "same_reply": true
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02582220c295b8339d9905adfcbd09312dcfa1b8dd9b76bb06fa98cc0521cdf3e5d41a6200",
+                "from": "a"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad0258622062f95f725a624ede5e2f3a4fa65687901214c4b7444326b97993a9e5f8b8dc3e006886875760e1d84b759a5988cc09e0225ca1fc5f067d1c3909a1bf3106eb6a896cd3b6b24107924f46ffdafd4bc89110cf05e8eeae9faa369133ee6729f58efa",
+                "from": "host"
+              }
+            }
+          ],
+          "reply": "first_reply"
         },
         {
           "conn": 1,
@@ -161,31 +679,640 @@
           "joiner": "a",
           "new_code": false,
           "op": "redeliver",
-          "same_reply": true
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02582220c295b8339d9905adfcbd09312dcfa1b8dd9b76bb06fa98cc0521cdf3e5d41a6200",
+                "from": "a"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad0258622062f95f725a624ede5e2f3a4fa65687901214c4b7444326b97993a9e5f8b8dc3e006886875760e1d84b759a5988cc09e0225ca1fc5f067d1c3909a1bf3106eb6a896cd3b6b24107924f46ffdafd4bc89110cf05e8eeae9faa369133ee6729f58efa",
+                "from": "host"
+              }
+            }
+          ],
+          "reply": "first_reply"
         }
-      ]
+      ],
+      "ticket": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450f400927857aaf64114f561baacb3797005508c79a1dc1476ab573216a4020764bde5061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
     },
     {
-      "description": "Joiner a's first message is replayed on b's connection. The attempt id was already seen on another connection, so the host refuses it with code_abort before any debit or exchange work, and shows no new code.",
+      "description": "The host answered msg_a; then the joiner aborts the attempt. The abort ends the attempt and keeps its debit, but changes neither kept value: msg_a again gets the same msg_b, byte for byte. A different payload on the ended attempt gets code_abort, with no debit. An abort for an attempt the host does not have is ignored.",
+      "draws": {
+        "a": [
+          {
+            "bytes": "9a9ec1a2a6c152e5b938b4dd05f045ad"
+          },
+          {
+            "bytes": "e11a1b1776dff6485acc5921c49dcdd2b0a8148d9aa75b949e0af167af1766f4"
+          }
+        ],
+        "host": [
+          {
+            "bytes": "f400927857aaf64114f561baacb37970"
+          },
+          {
+            "bytes": "8c79a1dc1476ab573216a4020764bde5"
+          },
+          {
+            "u32": 3678650693
+          },
+          {
+            "u32": 580673721
+          },
+          {
+            "bytes": "ab855d60925a997603d78a3f20d154abd8ddfa6974eedf6b3784290c606b04fd"
+          }
+        ]
+      },
       "kind": "send_link",
-      "name": "attempt_replayed_on_another_connection_is_refused",
+      "name": "resend_after_the_joiner_aborted",
       "steps": [
         {
           "conn": 1,
           "joiner": "a",
-          "op": "connect"
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a400030150f400927857aaf64114f561baacb37970025820e0bb1c0bfede8c1880760e9cb272e5f5562f10f697a5e9626c1ac786520437a1036161",
+                "from": "a"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a200020102",
+                "from": "host"
+              }
+            },
+            {
+              "show_code": "650693"
+            }
+          ]
         },
         {
           "code": "right",
           "conn": 1,
           "host_attempts_left": 2,
           "joiner": "a",
-          "op": "submit_first"
+          "op": "submit_first",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02582220c295b8339d9905adfcbd09312dcfa1b8dd9b76bb06fa98cc0521cdf3e5d41a6200",
+                "from": "a"
+              }
+            },
+            {
+              "show_code": "673721"
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad0258622062f95f725a624ede5e2f3a4fa65687901214c4b7444326b97993a9e5f8b8dc3e006886875760e1d84b759a5988cc09e0225ca1fc5f067d1c3909a1bf3106eb6a896cd3b6b24107924f46ffdafd4bc89110cf05e8eeae9faa369133ee6729f58efa",
+                "from": "host"
+              }
+            }
+          ]
+        },
+        {
+          "attempt": "current",
+          "conn": 1,
+          "host_attempts_left": 2,
+          "host_status": "open",
+          "joiner": "a",
+          "message": "code_abort",
+          "new_code": false,
+          "op": "inject",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000501509a9ec1a2a6c152e5b938b4dd05f045ad020a",
+                "from": "a"
+              }
+            }
+          ],
+          "reply": "none"
+        },
+        {
+          "conn": 1,
+          "host_attempts_left": 2,
+          "joiner": "a",
+          "new_code": false,
+          "op": "redeliver",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02582220c295b8339d9905adfcbd09312dcfa1b8dd9b76bb06fa98cc0521cdf3e5d41a6200",
+                "from": "a"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad0258622062f95f725a624ede5e2f3a4fa65687901214c4b7444326b97993a9e5f8b8dc3e006886875760e1d84b759a5988cc09e0225ca1fc5f067d1c3909a1bf3106eb6a896cd3b6b24107924f46ffdafd4bc89110cf05e8eeae9faa369133ee6729f58efa",
+                "from": "host"
+              }
+            }
+          ],
+          "reply": "first_reply"
+        },
+        {
+          "attempt": "current",
+          "conn": 1,
+          "host_attempts_left": 2,
+          "joiner": "a",
+          "message": "code_exchange",
+          "new_code": false,
+          "op": "inject",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02584000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+                "from": "a"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000501509a9ec1a2a6c152e5b938b4dd05f045ad020a",
+                "from": "host"
+              }
+            }
+          ],
+          "payload": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+          "reply": "code_abort"
+        },
+        {
+          "attempt": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "conn": 1,
+          "host_attempts_left": 2,
+          "host_status": "open",
+          "joiner": "a",
+          "message": "code_abort",
+          "op": "inject",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300050150eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee020a",
+                "from": "a"
+              }
+            }
+          ],
+          "reply": "none"
+        }
+      ],
+      "ticket": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450f400927857aaf64114f561baacb3797005508c79a1dc1476ab573216a4020764bde5061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
+    },
+    {
+      "description": "After msg_a, a different payload on the running attempt is read as msg_c: 64 zero bytes are a wrong confirmation, so the attempt fails with code_abort. The kept payload is now those 64 bytes, so msg_a again is a different payload on an ended attempt: code_abort, with no debit.",
+      "draws": {
+        "a": [
+          {
+            "bytes": "9a9ec1a2a6c152e5b938b4dd05f045ad"
+          },
+          {
+            "bytes": "e11a1b1776dff6485acc5921c49dcdd2b0a8148d9aa75b949e0af167af1766f4"
+          }
+        ],
+        "host": [
+          {
+            "bytes": "f400927857aaf64114f561baacb37970"
+          },
+          {
+            "bytes": "8c79a1dc1476ab573216a4020764bde5"
+          },
+          {
+            "u32": 3678650693
+          },
+          {
+            "u32": 580673721
+          },
+          {
+            "bytes": "ab855d60925a997603d78a3f20d154abd8ddfa6974eedf6b3784290c606b04fd"
+          }
+        ]
+      },
+      "kind": "send_link",
+      "name": "different_payload_on_a_running_attempt_is_the_next_message",
+      "steps": [
+        {
+          "conn": 1,
+          "joiner": "a",
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a400030150f400927857aaf64114f561baacb37970025820e0bb1c0bfede8c1880760e9cb272e5f5562f10f697a5e9626c1ac786520437a1036161",
+                "from": "a"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a200020102",
+                "from": "host"
+              }
+            },
+            {
+              "show_code": "650693"
+            }
+          ]
+        },
+        {
+          "code": "right",
+          "conn": 1,
+          "host_attempts_left": 2,
+          "joiner": "a",
+          "op": "submit_first",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02582220c295b8339d9905adfcbd09312dcfa1b8dd9b76bb06fa98cc0521cdf3e5d41a6200",
+                "from": "a"
+              }
+            },
+            {
+              "show_code": "673721"
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad0258622062f95f725a624ede5e2f3a4fa65687901214c4b7444326b97993a9e5f8b8dc3e006886875760e1d84b759a5988cc09e0225ca1fc5f067d1c3909a1bf3106eb6a896cd3b6b24107924f46ffdafd4bc89110cf05e8eeae9faa369133ee6729f58efa",
+                "from": "host"
+              }
+            }
+          ]
+        },
+        {
+          "attempt": "current",
+          "conn": 1,
+          "host_attempts_left": 2,
+          "host_status": "open",
+          "joiner": "a",
+          "message": "code_exchange",
+          "new_code": false,
+          "op": "inject",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02584000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+                "from": "a"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000501509a9ec1a2a6c152e5b938b4dd05f045ad020a",
+                "from": "host"
+              }
+            }
+          ],
+          "payload": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+          "reply": "code_abort"
+        },
+        {
+          "conn": 1,
+          "host_attempts_left": 2,
+          "joiner": "a",
+          "new_code": false,
+          "op": "redeliver",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02582220c295b8339d9905adfcbd09312dcfa1b8dd9b76bb06fa98cc0521cdf3e5d41a6200",
+                "from": "a"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000501509a9ec1a2a6c152e5b938b4dd05f045ad020a",
+                "from": "host"
+              }
+            }
+          ],
+          "reply": "code_abort"
+        }
+      ],
+      "ticket": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450f400927857aaf64114f561baacb3797005508c79a1dc1476ab573216a4020764bde5061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
+    },
+    {
+      "description": "First messages of two new attempts that fail before any group work: a share that is the identity point, then a share with a wrong length byte. Each is debited and the host draws the next code and the CPace scalar before reading it, then answers code_abort. The right code then pairs. The draws list shows the order.",
+      "draws": {
+        "a": [
+          {
+            "bytes": "9a9ec1a2a6c152e5b938b4dd05f045ad"
+          },
+          {
+            "bytes": "e11a1b1776dff6485acc5921c49dcdd2b0a8148d9aa75b949e0af167af1766f4"
+          }
+        ],
+        "host": [
+          {
+            "bytes": "f400927857aaf64114f561baacb37970"
+          },
+          {
+            "bytes": "8c79a1dc1476ab573216a4020764bde5"
+          },
+          {
+            "u32": 3678650693
+          },
+          {
+            "u32": 580673721
+          },
+          {
+            "bytes": "ab855d60925a997603d78a3f20d154abd8ddfa6974eedf6b3784290c606b04fd"
+          },
+          {
+            "u32": 291520
+          },
+          {
+            "bytes": "c961e366b6ea14d411fcc53dea4f44c9bb4d7408de0ea89a53f1ecf3f3d0a462"
+          },
+          {
+            "bytes": "fb77d2baf5e0e5dfefb6897bbd7460315e81182ac2be6756184ff1346102aa1a"
+          }
+        ]
+      },
+      "kind": "send_link",
+      "name": "bad_first_message_still_uses_the_draws",
+      "steps": [
+        {
+          "conn": 1,
+          "joiner": "a",
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a400030150f400927857aaf64114f561baacb37970025820e0bb1c0bfede8c1880760e9cb272e5f5562f10f697a5e9626c1ac786520437a1036161",
+                "from": "a"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a200020102",
+                "from": "host"
+              }
+            },
+            {
+              "show_code": "650693"
+            }
+          ]
+        },
+        {
+          "attempt": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+          "conn": 1,
+          "host_attempts_left": 2,
+          "joiner": "a",
+          "message": "code_exchange",
+          "new_code": true,
+          "op": "inject",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401500a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a02582220000000000000000000000000000000000000000000000000000000000000000000",
+                "from": "a"
+              }
+            },
+            {
+              "show_code": "673721"
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000501500a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a020a",
+                "from": "host"
+              }
+            }
+          ],
+          "payload": "20000000000000000000000000000000000000000000000000000000000000000000",
+          "reply": "code_abort"
+        },
+        {
+          "attempt": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+          "conn": 1,
+          "host_attempts_left": 1,
+          "joiner": "a",
+          "message": "code_exchange",
+          "new_code": true,
+          "op": "inject",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401500b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b02582221000000000000000000000000000000000000000000000000000000000000000000",
+                "from": "a"
+              }
+            },
+            {
+              "show_code": "291520"
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000501500b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b020a",
+                "from": "host"
+              }
+            }
+          ],
+          "payload": "21000000000000000000000000000000000000000000000000000000000000000000",
+          "reply": "code_abort"
+        },
+        {
+          "attempt": "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+          "conn": 1,
+          "host_attempts_left": 1,
+          "joiner": "a",
+          "message": "code_exchange",
+          "new_code": false,
+          "op": "inject",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401500b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b02582221000000000000000000000000000000000000000000000000000000000000000000",
+                "from": "a"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000501500b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b020a",
+                "from": "host"
+              }
+            }
+          ],
+          "payload": "21000000000000000000000000000000000000000000000000000000000000000000",
+          "reply": "code_abort"
+        },
+        {
+          "code": "right",
+          "conn": 1,
+          "host_attempts_left": 0,
+          "host_status": "consumed",
+          "joiner": "a",
+          "joiner_state": "paired",
+          "new_code": false,
+          "op": "submit",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02582220780a1c0c6ad31f278e0598e16d7dd541317f5a27220e26f1f7b308d8af70767e00",
+                "from": "a"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02586220baf09edf697c1a10f53ad38a8ae0b7d22e772b7e73ec962d5a6446d03ed84c3500602995834745058e58152bc20a09ae5a513e082a4124e3c930cedfea4689e901777abd1119f35defbd65ebfc32cf3c78a28b223e3569dc41db4827aa27eca9fd",
+                "from": "host"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad025840c2e7dfedfee8253d0cc739633827579075f4b28ec68431e8ae413ac7ed2d334da631c4863b5b21078db75605409dfa58869f9e76dcbd0432887c5cc2ee4e3a16",
+                "from": "a"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000601644465736b02656f776e6572",
+                "from": "host"
+              }
+            }
+          ]
+        }
+      ],
+      "ticket": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450f400927857aaf64114f561baacb3797005508c79a1dc1476ab573216a4020764bde5061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
+    },
+    {
+      "description": "Joiner a's first message is replayed on b's connection. The attempt id was already seen on another connection, so the host refuses it with code_abort before any debit or exchange work, and shows no new code.",
+      "draws": {
+        "a": [
+          {
+            "bytes": "9a9ec1a2a6c152e5b938b4dd05f045ad"
+          },
+          {
+            "bytes": "e11a1b1776dff6485acc5921c49dcdd2b0a8148d9aa75b949e0af167af1766f4"
+          }
+        ],
+        "b": [],
+        "host": [
+          {
+            "bytes": "f400927857aaf64114f561baacb37970"
+          },
+          {
+            "bytes": "8c79a1dc1476ab573216a4020764bde5"
+          },
+          {
+            "u32": 3678650693
+          },
+          {
+            "u32": 580673721
+          },
+          {
+            "bytes": "ab855d60925a997603d78a3f20d154abd8ddfa6974eedf6b3784290c606b04fd"
+          }
+        ]
+      },
+      "kind": "send_link",
+      "name": "attempt_replayed_on_another_connection_is_refused",
+      "steps": [
+        {
+          "conn": 1,
+          "joiner": "a",
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a400030150f400927857aaf64114f561baacb37970025820e0bb1c0bfede8c1880760e9cb272e5f5562f10f697a5e9626c1ac786520437a1036161",
+                "from": "a"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a200020102",
+                "from": "host"
+              }
+            },
+            {
+              "show_code": "650693"
+            }
+          ]
+        },
+        {
+          "code": "right",
+          "conn": 1,
+          "host_attempts_left": 2,
+          "joiner": "a",
+          "op": "submit_first",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02582220c295b8339d9905adfcbd09312dcfa1b8dd9b76bb06fa98cc0521cdf3e5d41a6200",
+                "from": "a"
+              }
+            },
+            {
+              "show_code": "673721"
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad0258622062f95f725a624ede5e2f3a4fa65687901214c4b7444326b97993a9e5f8b8dc3e006886875760e1d84b759a5988cc09e0225ca1fc5f067d1c3909a1bf3106eb6a896cd3b6b24107924f46ffdafd4bc89110cf05e8eeae9faa369133ee6729f58efa",
+                "from": "host"
+              }
+            }
+          ]
         },
         {
           "conn": 2,
           "joiner": "b",
-          "op": "connect"
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a400030150f400927857aaf64114f561baacb3797002582014b2be3c080a051af2b1a3153a97ebfa9411b8d66756b65083e13e8de76c3848036162",
+                "from": "b"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a200020102",
+                "from": "host"
+              }
+            },
+            {
+              "show_code": "673721"
+            }
+          ]
         },
         {
           "conn": 2,
@@ -194,13 +1321,30 @@
           "joiner": "a",
           "new_code": false,
           "op": "redeliver",
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02582220c295b8339d9905adfcbd09312dcfa1b8dd9b76bb06fa98cc0521cdf3e5d41a6200",
+                "from": "a"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a3000501509a9ec1a2a6c152e5b938b4dd05f045ad020a",
+                "from": "host"
+              }
+            }
+          ],
           "reply": "code_abort"
         },
         {
           "conn": 1,
           "host_attempts_left": 2,
           "joiner": "a",
-          "op": "drop"
+          "op": "drop",
+          "out": []
         },
         {
           "conn": 2,
@@ -208,42 +1352,220 @@
           "joiner": "a",
           "new_code": false,
           "op": "redeliver",
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02582220c295b8339d9905adfcbd09312dcfa1b8dd9b76bb06fa98cc0521cdf3e5d41a6200",
+                "from": "a"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a3000501509a9ec1a2a6c152e5b938b4dd05f045ad020a",
+                "from": "host"
+              }
+            }
+          ],
           "reply": "code_abort"
         }
-      ]
+      ],
+      "ticket": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450f400927857aaf64114f561baacb3797005508c79a1dc1476ab573216a4020764bde5061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
     },
     {
+      "draws": {
+        "a": [
+          {
+            "bytes": "9a9ec1a2a6c152e5b938b4dd05f045ad"
+          },
+          {
+            "bytes": "e11a1b1776dff6485acc5921c49dcdd2b0a8148d9aa75b949e0af167af1766f4"
+          }
+        ],
+        "b": [
+          {
+            "bytes": "44cfc73c3fe236e7347a6a0449c837a4"
+          },
+          {
+            "bytes": "5ebc7dbe327a090b31e5d09eaa62b82077123f349cfa5852cb6c656771902cb8"
+          }
+        ],
+        "c": [
+          {
+            "bytes": "94bf65c31e9bf71937bc38566c77ceb2"
+          },
+          {
+            "bytes": "1d95311cb0221ca730292b83c82b27b487638bf1cb9c67fc91fe7d028ed33999"
+          }
+        ],
+        "host": [
+          {
+            "bytes": "f400927857aaf64114f561baacb37970"
+          },
+          {
+            "bytes": "8c79a1dc1476ab573216a4020764bde5"
+          },
+          {
+            "u32": 3678650693
+          },
+          {
+            "u32": 580673721
+          },
+          {
+            "bytes": "ab855d60925a997603d78a3f20d154abd8ddfa6974eedf6b3784290c606b04fd"
+          },
+          {
+            "u32": 291520
+          },
+          {
+            "bytes": "c961e366b6ea14d411fcc53dea4f44c9bb4d7408de0ea89a53f1ecf3f3d0a462"
+          },
+          {
+            "bytes": "fb77d2baf5e0e5dfefb6897bbd7460315e81182ac2be6756184ff1346102aa1a"
+          }
+        ]
+      },
       "kind": "send_link",
       "name": "attempts_shared_across_routes",
       "steps": [
         {
           "conn": 1,
           "joiner": "a",
-          "op": "connect"
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a400030150f400927857aaf64114f561baacb37970025820e0bb1c0bfede8c1880760e9cb272e5f5562f10f697a5e9626c1ac786520437a1036161",
+                "from": "a"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a200020102",
+                "from": "host"
+              }
+            },
+            {
+              "show_code": "650693"
+            }
+          ]
         },
         {
           "code": "wrong",
           "conn": 1,
           "host_attempts_left": 2,
           "joiner": "a",
-          "op": "submit"
+          "op": "submit",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02582220dab42ad70b8684111de2f7a0ca3908c2a81b5c2aab69f9211da833a1ccb7e07e00",
+                "from": "a"
+              }
+            },
+            {
+              "show_code": "673721"
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad0258622062f95f725a624ede5e2f3a4fa65687901214c4b7444326b97993a9e5f8b8dc3e00094a92f759421d2c6c2b2152c1a247c7079d808f9337f3019a2f7bf0ab72cf7569c3e7aae44931830e900442907f00ba5a4aecc39cd6ff06cfee70277aee223b",
+                "from": "host"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000501509a9ec1a2a6c152e5b938b4dd05f045ad020a",
+                "from": "a"
+              }
+            }
+          ]
         },
         {
           "conn": 2,
           "joiner": "b",
-          "op": "connect"
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a400030150f400927857aaf64114f561baacb3797002582014b2be3c080a051af2b1a3153a97ebfa9411b8d66756b65083e13e8de76c3848036162",
+                "from": "b"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a200020102",
+                "from": "host"
+              }
+            },
+            {
+              "show_code": "673721"
+            }
+          ]
         },
         {
           "code": "wrong",
           "conn": 2,
           "host_attempts_left": 1,
           "joiner": "b",
-          "op": "submit"
+          "op": "submit",
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a30004015044cfc73c3fe236e7347a6a0449c837a4025822206a9dcd082168bb1d2578bc2aabbbfcb0be5cfbe3cac7f36ba3431233b4ca921a00",
+                "from": "b"
+              }
+            },
+            {
+              "show_code": "291520"
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a30004015044cfc73c3fe236e7347a6a0449c837a402586220a2aa6e6b06680dfc12c22adce54f24dfce24cdced3b2e0cd5f75e1ff6ced430f00a327c3c11bba0bcb2815d787fa35b5ea7200c3ef47626f07ba7c1430d7ad9c1707bab93601d41dde0cdfdafe8ec021d18319cfd8515637df3bd7f4d5f714c34a",
+                "from": "host"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a30005015044cfc73c3fe236e7347a6a0449c837a4020a",
+                "from": "b"
+              }
+            }
+          ]
         },
         {
           "conn": 3,
           "joiner": "c",
-          "op": "connect"
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 3,
+                "control": "a400030150f400927857aaf64114f561baacb3797002582056a1bbe130d34b81bb8e308285c2460b0c76baa0357156fe95f837f504e3d6ba036163",
+                "from": "c"
+              }
+            },
+            {
+              "send": {
+                "conn": 3,
+                "control": "a200020102",
+                "from": "host"
+              }
+            },
+            {
+              "show_code": "291520"
+            }
+          ]
         },
         {
           "closed": [
@@ -265,18 +1587,109 @@
           "host_attempts_left": 0,
           "host_status": "ended:attempts_exhausted",
           "joiner": "c",
-          "op": "submit"
+          "op": "submit",
+          "out": [
+            {
+              "send": {
+                "conn": 3,
+                "control": "a30004015094bf65c31e9bf71937bc38566c77ceb202582220daa31c3043bb6a47580ff194941c7b16cd9d0b9404d9ede2833b08be5b33c74000",
+                "from": "c"
+              }
+            },
+            {
+              "send": {
+                "conn": 3,
+                "control": "a30004015094bf65c31e9bf71937bc38566c77ceb2025862206cf1518faa59bb75ab3fc1c42d2b93f554993425b654e4b57cca25c098225445005fd77374dfc0536fb99ccac3b48620d9de05455e100a10d34b062d3cc6fddc3162258c278a19c1fc17e4e9df3ab0f8b773606a87219926e8886a355d06646a6f",
+                "from": "host"
+              }
+            },
+            {
+              "send": {
+                "conn": 3,
+                "control": "a30005015094bf65c31e9bf71937bc38566c77ceb2020a",
+                "from": "c"
+              }
+            },
+            {
+              "close": {
+                "code": "attempts_exhausted",
+                "conn": 1,
+                "from": "host"
+              }
+            },
+            {
+              "close": {
+                "code": "attempts_exhausted",
+                "conn": 2,
+                "from": "host"
+              }
+            },
+            {
+              "close": {
+                "code": "attempts_exhausted",
+                "conn": 3,
+                "from": "host"
+              }
+            }
+          ]
         }
-      ]
+      ],
+      "ticket": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450f400927857aaf64114f561baacb3797005508c79a1dc1476ab573216a4020764bde5061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
     },
     {
+      "draws": {
+        "a": [
+          {
+            "bytes": "9a9ec1a2a6c152e5b938b4dd05f045ad"
+          },
+          {
+            "bytes": "e11a1b1776dff6485acc5921c49dcdd2b0a8148d9aa75b949e0af167af1766f4"
+          }
+        ],
+        "host": [
+          {
+            "bytes": "f400927857aaf64114f561baacb37970"
+          },
+          {
+            "bytes": "8c79a1dc1476ab573216a4020764bde5"
+          },
+          {
+            "u32": 3678650693
+          },
+          {
+            "u32": 580673721
+          },
+          {
+            "bytes": "ab855d60925a997603d78a3f20d154abd8ddfa6974eedf6b3784290c606b04fd"
+          }
+        ]
+      },
       "kind": "send_link",
       "name": "dropped_attempt_keeps_its_debit",
       "steps": [
         {
           "conn": 1,
           "joiner": "a",
-          "op": "connect"
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a400030150f400927857aaf64114f561baacb37970025820e0bb1c0bfede8c1880760e9cb272e5f5562f10f697a5e9626c1ac786520437a1036161",
+                "from": "a"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a200020102",
+                "from": "host"
+              }
+            },
+            {
+              "show_code": "650693"
+            }
+          ]
         },
         {
           "code": "right",
@@ -284,7 +1697,26 @@
           "host_attempts_left": 2,
           "joiner": "a",
           "joiner_attempts_left": 2,
-          "op": "submit_first"
+          "op": "submit_first",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02582220c295b8339d9905adfcbd09312dcfa1b8dd9b76bb06fa98cc0521cdf3e5d41a6200",
+                "from": "a"
+              }
+            },
+            {
+              "show_code": "673721"
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad0258622062f95f725a624ede5e2f3a4fa65687901214c4b7444326b97993a9e5f8b8dc3e006886875760e1d84b759a5988cc09e0225ca1fc5f067d1c3909a1bf3106eb6a896cd3b6b24107924f46ffdafd4bc89110cf05e8eeae9faa369133ee6729f58efa",
+                "from": "host"
+              }
+            }
+          ]
         },
         {
           "conn": 1,
@@ -293,11 +1725,25 @@
           "joiner": "a",
           "joiner_attempts_left": 2,
           "joiner_state": "connecting",
-          "op": "drop"
+          "op": "drop",
+          "out": []
         }
-      ]
+      ],
+      "ticket": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450f400927857aaf64114f561baacb3797005508c79a1dc1476ab573216a4020764bde5061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
     },
     {
+      "draws": {
+        "a": [],
+        "b": [],
+        "host": [
+          {
+            "bytes": "f400927857aaf64114f561baacb37970"
+          },
+          {
+            "bytes": "8c79a1dc1476ab573216a4020764bde5"
+          }
+        ]
+      },
       "kind": "in_person",
       "name": "two_joiners_one_enrollment",
       "steps": [
@@ -305,13 +1751,45 @@
           "conn": 1,
           "joiner": "a",
           "joiner_state": "awaiting_approval",
-          "op": "connect"
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a400030150f400927857aaf64114f561baacb37970025820e0bb1c0bfede8c1880760e9cb272e5f5562f10f697a5e9626c1ac786520437a1036161",
+                "from": "a"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a200020102",
+                "from": "host"
+              }
+            }
+          ]
         },
         {
           "conn": 2,
           "joiner": "b",
           "joiner_state": "awaiting_approval",
-          "op": "connect"
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a400030150f400927857aaf64114f561baacb3797002582014b2be3c080a051af2b1a3153a97ebfa9411b8d66756b65083e13e8de76c3848036162",
+                "from": "b"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a200020102",
+                "from": "host"
+              }
+            }
+          ]
         },
         {
           "closed": [
@@ -323,14 +1801,32 @@
           "conn": 2,
           "host_status": "consumed",
           "op": "approve",
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a3000601644465736b02656f776e6572",
+                "from": "host"
+              }
+            },
+            {
+              "close": {
+                "code": "invitation_invalid",
+                "conn": 1,
+                "from": "host"
+              }
+            }
+          ],
           "result": "ok"
         },
         {
           "conn": 1,
           "op": "approve",
+          "out": [],
           "result": "not_open"
         }
-      ]
+      ],
+      "ticket": "a701010201035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450f400927857aaf64114f561baacb3797005508c79a1dc1476ab573216a4020764bde5061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
     }
   ]
 }

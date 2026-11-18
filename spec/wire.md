@@ -807,8 +807,14 @@ CPace output `ISK` is not used by pairing in version 1.
 Random draws, in order (vectors depend on it): the host draws the invitation
 id (16 bytes), the secret (16 bytes) and, for "Send link", the first code
 when it creates the invitation; for each new attempt, the next code (if
-attempts are left) and then its CPace scalar. The joiner draws, for each
-attempt, the attempt id (16 bytes) and then its CPace scalar.
+attempts are left) and then its CPace scalar. The host draws both when the
+first message of the new attempt arrives, after the debit and **before** it
+reads that message: a malformed or invalid `msg_a` still uses up the next
+code and the scalar. The joiner draws, for each attempt, the attempt id (16
+bytes) and then its CPace scalar. A code is one 32-bit draw, repeated while
+it is at least 4 294 000 000; a CPace scalar is one 32-byte draw (repeated
+only in the 2^-252 case of zero, [`cpace.md`](cpace.md) 5.2). Vectors:
+`pairing-attempts.json` lists every draw of every sequence.
 
 ### 10.7 Attempt limits
 
@@ -832,11 +838,28 @@ attempt, the attempt id (16 bytes) and then its CPace scalar.
   or a new code, so replays cannot spend the invitation's attempts.
   Vectors: `pairing-attempts.json`
   `attempt_replayed_on_another_connection_is_refused`.
-- **Resends.** A sender may resend only a **byte-identical** message. When the
-  host receives, for an existing attempt, a payload identical to the last one
-  it received, it replies with the same bytes it sent before and does no new
-  work. A different payload on an attempt that already ended gets
-  `CODE_ABORT`. The joiner ignores a repeated identical host message.
+- **Resends and messages after an attempt ends.** The connection's gate
+  (8.1) runs first; the rules below apply only to `CODE_EXCHANGE` and
+  `CODE_ABORT` it allows (join-only). A sender may resend only a
+  **byte-identical** message. For each (TLS session, attempt id) the host
+  keeps two values: the last payload it read as an exchange message (the
+  first message, or one taken under rule 3), and the message it sent in
+  answer to it (its `CODE_EXCHANGE` reply, or the `CODE_ABORT` that failed
+  the attempt). For a `CODE_EXCHANGE` on an attempt it already has:
+  1. a payload identical to the last one received: send the kept message
+     again, byte for byte, and do nothing else (no debit, no draw, no
+     exchange work), whether the attempt is running or ended;
+  2. otherwise, on an attempt that ended (failed, or aborted by the
+     joiner): send `CODE_ABORT {attempt, PAIRING_FAILED}`, with no debit,
+     no other work and no change to the kept values;
+  3. otherwise, on a running attempt: the payload is the next exchange
+     message, and the attempt goes on or fails as 10.5 says.
+
+  A `CODE_ABORT` from the joiner ends a running attempt (its debit stays)
+  and changes neither kept value. A `CODE_ABORT` for an attempt the host
+  does not have on this TLS session is ignored. The joiner ignores a
+  repeated identical host message and any message for an attempt that is
+  not its current one. Vectors: `pairing-attempts.json`.
 
 ### 10.8 Enrollment
 

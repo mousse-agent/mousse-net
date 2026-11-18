@@ -6,11 +6,13 @@
 //! produces; run it with `MOUSSE_NET_WRITE_VECTORS=1` to rewrite them.
 //! `tests/vectors.rs` then checks the files against the public API only.
 
+use std::collections::VecDeque;
+use std::convert::Infallible;
 use std::path::PathBuf;
 
 use hkdf::Hkdf;
 use rand_chacha::ChaCha20Rng;
-use rand_core::SeedableRng;
+use rand_core::{Rng, SeedableRng, TryCryptoRng, TryRng};
 use serde_json::{json, Value as J};
 use sha2::Sha256;
 
@@ -1219,95 +1221,170 @@ fn hello_vectors() -> J {
 // Pairing attempt limits (behavioural sequences)
 // ---------------------------------------------------------------------------
 
+/// An attempt id that no joiner drew, for injected messages.
+const FOREIGN_ATTEMPT: [u8; 16] = [0xee; 16];
+
+/// `msg_a` whose share is the identity element (32 zero bytes), empty AD.
+fn identity_point_msg_a() -> Vec<u8> {
+    let mut m = vec![0x20];
+    m.extend_from_slice(&[0u8; 32]);
+    m.push(0x00);
+    m
+}
+
+/// `msg_a` whose first byte is not the share length 0x20.
+fn malformed_msg_a() -> Vec<u8> {
+    let mut m = identity_point_msg_a();
+    m[0] = 0x21;
+    m
+}
+
+fn attempt_sequences() -> Vec<J> {
+    let identity_share = hex(&identity_point_msg_a());
+    let malformed_share = hex(&malformed_msg_a());
+    let first_foreign = hex(&[0x0a; 16]);
+    let second_foreign = hex(&[0x0b; 16]);
+    let zero_tag = hex(&[0u8; 64]);
+    vec![
+        json!({
+            "name": "three_wrong_codes",
+            "kind": "send_link",
+            "steps": [
+                { "op": "connect", "joiner": "a", "conn": 1, "host_attempts_left": 3, "joiner_attempts_left": 3, "joiner_state": "awaiting_code" },
+                { "op": "submit", "joiner": "a", "conn": 1, "code": "wrong", "host_attempts_left": 2, "joiner_attempts_left": 2, "joiner_state": "awaiting_code", "host_status": "open", "new_code": true },
+                { "op": "submit", "joiner": "a", "conn": 1, "code": "wrong", "host_attempts_left": 1, "joiner_attempts_left": 1, "joiner_state": "awaiting_code", "host_status": "open", "new_code": true },
+                { "op": "submit", "joiner": "a", "conn": 1, "code": "wrong", "host_attempts_left": 0, "joiner_attempts_left": 0, "joiner_state": "failed:attempts_exhausted", "host_status": "ended:attempts_exhausted", "closed": [[1, "attempts_exhausted"]], "new_code": false },
+                { "op": "submit", "joiner": "a", "conn": 1, "code": "right", "result": "wrong_state" },
+            ],
+        }),
+        json!({
+            "name": "wrong_then_right",
+            "kind": "send_link",
+            "steps": [
+                { "op": "connect", "joiner": "a", "conn": 1 },
+                { "op": "submit", "joiner": "a", "conn": 1, "code": "wrong", "host_attempts_left": 2, "joiner_attempts_left": 2 },
+                { "op": "submit", "joiner": "a", "conn": 1, "code": "right", "host_attempts_left": 1, "joiner_attempts_left": 1, "joiner_state": "paired", "host_status": "consumed" },
+            ],
+        }),
+        json!({
+            "name": "stale_code_is_refused",
+            "kind": "send_link",
+            "steps": [
+                { "op": "connect", "joiner": "a", "conn": 1 },
+                { "op": "submit", "joiner": "a", "conn": 1, "code": "wrong", "host_attempts_left": 2, "new_code": true },
+                { "op": "submit", "joiner": "a", "conn": 1, "code": "stale", "host_attempts_left": 1, "joiner_attempts_left": 1, "joiner_state": "awaiting_code", "host_status": "open", "new_code": true },
+                { "op": "submit", "joiner": "a", "conn": 1, "code": "right", "host_attempts_left": 0, "joiner_state": "paired", "host_status": "consumed", "new_code": false },
+            ],
+        }),
+        json!({
+            "name": "resend_is_not_a_new_attempt",
+            "kind": "send_link",
+            "steps": [
+                { "op": "connect", "joiner": "a", "conn": 1 },
+                { "op": "submit_first", "joiner": "a", "conn": 1, "code": "right", "host_attempts_left": 2, "joiner_attempts_left": 2 },
+                { "op": "redeliver", "joiner": "a", "conn": 1, "reply": "first_reply", "host_attempts_left": 2, "new_code": false },
+                { "op": "redeliver", "joiner": "a", "conn": 1, "reply": "first_reply", "host_attempts_left": 2, "new_code": false },
+            ],
+        }),
+        json!({
+            "name": "resend_after_the_joiner_aborted",
+            "description": "The host answered msg_a; then the joiner aborts the attempt. The abort ends the attempt and keeps its debit, but changes neither kept value: msg_a again gets the same msg_b, byte for byte. A different payload on the ended attempt gets code_abort, with no debit. An abort for an attempt the host does not have is ignored.",
+            "kind": "send_link",
+            "steps": [
+                { "op": "connect", "joiner": "a", "conn": 1 },
+                { "op": "submit_first", "joiner": "a", "conn": 1, "code": "right", "host_attempts_left": 2 },
+                { "op": "inject", "joiner": "a", "conn": 1, "message": "code_abort", "attempt": "current", "reply": "none", "host_attempts_left": 2, "host_status": "open", "new_code": false },
+                { "op": "redeliver", "joiner": "a", "conn": 1, "reply": "first_reply", "host_attempts_left": 2, "new_code": false },
+                { "op": "inject", "joiner": "a", "conn": 1, "message": "code_exchange", "attempt": "current", "payload": zero_tag, "reply": "code_abort", "host_attempts_left": 2, "new_code": false },
+                { "op": "inject", "joiner": "a", "conn": 1, "message": "code_abort", "attempt": hex(&FOREIGN_ATTEMPT), "reply": "none", "host_attempts_left": 2, "host_status": "open" },
+            ],
+        }),
+        json!({
+            "name": "different_payload_on_a_running_attempt_is_the_next_message",
+            "description": "After msg_a, a different payload on the running attempt is read as msg_c: 64 zero bytes are a wrong confirmation, so the attempt fails with code_abort. The kept payload is now those 64 bytes, so msg_a again is a different payload on an ended attempt: code_abort, with no debit.",
+            "kind": "send_link",
+            "steps": [
+                { "op": "connect", "joiner": "a", "conn": 1 },
+                { "op": "submit_first", "joiner": "a", "conn": 1, "code": "right", "host_attempts_left": 2 },
+                { "op": "inject", "joiner": "a", "conn": 1, "message": "code_exchange", "attempt": "current", "payload": zero_tag, "reply": "code_abort", "host_attempts_left": 2, "host_status": "open", "new_code": false },
+                { "op": "redeliver", "joiner": "a", "conn": 1, "reply": "code_abort", "host_attempts_left": 2, "new_code": false },
+            ],
+        }),
+        json!({
+            "name": "bad_first_message_still_uses_the_draws",
+            "description": "First messages of two new attempts that fail before any group work: a share that is the identity point, then a share with a wrong length byte. Each is debited and the host draws the next code and the CPace scalar before reading it, then answers code_abort. The right code then pairs. The draws list shows the order.",
+            "kind": "send_link",
+            "steps": [
+                { "op": "connect", "joiner": "a", "conn": 1 },
+                { "op": "inject", "joiner": "a", "conn": 1, "message": "code_exchange", "attempt": first_foreign, "payload": identity_share, "reply": "code_abort", "host_attempts_left": 2, "new_code": true },
+                { "op": "inject", "joiner": "a", "conn": 1, "message": "code_exchange", "attempt": second_foreign, "payload": malformed_share, "reply": "code_abort", "host_attempts_left": 1, "new_code": true },
+                { "op": "inject", "joiner": "a", "conn": 1, "message": "code_exchange", "attempt": second_foreign, "payload": malformed_share, "reply": "code_abort", "host_attempts_left": 1, "new_code": false },
+                { "op": "submit", "joiner": "a", "conn": 1, "code": "right", "host_attempts_left": 0, "joiner_state": "paired", "host_status": "consumed", "new_code": false },
+            ],
+        }),
+        json!({
+            "name": "attempt_replayed_on_another_connection_is_refused",
+            "description": "Joiner a's first message is replayed on b's connection. The attempt id was already seen on another connection, so the host refuses it with code_abort before any debit or exchange work, and shows no new code.",
+            "kind": "send_link",
+            "steps": [
+                { "op": "connect", "joiner": "a", "conn": 1 },
+                { "op": "submit_first", "joiner": "a", "conn": 1, "code": "right", "host_attempts_left": 2 },
+                { "op": "connect", "joiner": "b", "conn": 2 },
+                { "op": "redeliver", "joiner": "a", "conn": 2, "reply": "code_abort", "host_attempts_left": 2, "host_status": "open", "new_code": false },
+                { "op": "drop", "joiner": "a", "conn": 1, "host_attempts_left": 2 },
+                { "op": "redeliver", "joiner": "a", "conn": 2, "reply": "code_abort", "host_attempts_left": 2, "new_code": false },
+            ],
+        }),
+        json!({
+            "name": "attempts_shared_across_routes",
+            "kind": "send_link",
+            "steps": [
+                { "op": "connect", "joiner": "a", "conn": 1 },
+                { "op": "submit", "joiner": "a", "conn": 1, "code": "wrong", "host_attempts_left": 2 },
+                { "op": "connect", "joiner": "b", "conn": 2 },
+                { "op": "submit", "joiner": "b", "conn": 2, "code": "wrong", "host_attempts_left": 1 },
+                { "op": "connect", "joiner": "c", "conn": 3 },
+                { "op": "submit", "joiner": "c", "conn": 3, "code": "wrong", "host_attempts_left": 0, "host_status": "ended:attempts_exhausted", "closed": [[1, "attempts_exhausted"], [2, "attempts_exhausted"], [3, "attempts_exhausted"]] },
+            ],
+        }),
+        json!({
+            "name": "dropped_attempt_keeps_its_debit",
+            "kind": "send_link",
+            "steps": [
+                { "op": "connect", "joiner": "a", "conn": 1 },
+                { "op": "submit_first", "joiner": "a", "conn": 1, "code": "right", "host_attempts_left": 2, "joiner_attempts_left": 2 },
+                { "op": "drop", "joiner": "a", "conn": 1, "host_attempts_left": 2, "joiner_attempts_left": 2, "joiner_state": "connecting", "host_status": "open" },
+            ],
+        }),
+        json!({
+            "name": "two_joiners_one_enrollment",
+            "kind": "in_person",
+            "steps": [
+                { "op": "connect", "joiner": "a", "conn": 1, "joiner_state": "awaiting_approval" },
+                { "op": "connect", "joiner": "b", "conn": 2, "joiner_state": "awaiting_approval" },
+                { "op": "approve", "conn": 2, "result": "ok", "host_status": "consumed", "closed": [[1, "invitation_invalid"]] },
+                { "op": "approve", "conn": 1, "result": "not_open" },
+            ],
+        }),
+    ]
+}
+
 fn pairing_attempt_vectors() -> J {
+    let sequences: Vec<J> = attempt_sequences()
+        .iter()
+        .map(|seq| run_attempt_sequence(seq, None))
+        .collect();
     json!({
-        "description": "Attempt-limit sequences for the send-link flow (spec wire.md, \"Send-link flow and the code\" and \"Attempt limits\"), plus one-enrollment for in person. Each step runs one operation and then the listed expectations hold. Ops: connect (joiner proves the ticket on conn), submit (joiner enters a code; messages flow until both sides stop), submit_first (only the joiner's first message reaches the host), redeliver (that first message reaches the host again on conn), drop (conn closes mid-attempt), approve (host owner taps for conn). Codes: right (the code the host shows now), wrong (any other code), stale (the code the host showed when the previous attempt started). `new_code` says whether the host showed a fresh code during the step. `closed` lists connections the host closed during the step. `reply: code_abort` means the host's only answer was CODE_ABORT for that attempt.",
-        "sequences": [
-            {
-                "name": "three_wrong_codes",
-                "kind": "send_link",
-                "steps": [
-                    { "op": "connect", "joiner": "a", "conn": 1, "host_attempts_left": 3, "joiner_attempts_left": 3, "joiner_state": "awaiting_code" },
-                    { "op": "submit", "joiner": "a", "conn": 1, "code": "wrong", "host_attempts_left": 2, "joiner_attempts_left": 2, "joiner_state": "awaiting_code", "host_status": "open", "new_code": true },
-                    { "op": "submit", "joiner": "a", "conn": 1, "code": "wrong", "host_attempts_left": 1, "joiner_attempts_left": 1, "joiner_state": "awaiting_code", "host_status": "open", "new_code": true },
-                    { "op": "submit", "joiner": "a", "conn": 1, "code": "wrong", "host_attempts_left": 0, "joiner_attempts_left": 0, "joiner_state": "failed:attempts_exhausted", "host_status": "ended:attempts_exhausted", "closed": [[1, "attempts_exhausted"]], "new_code": false },
-                    { "op": "submit", "joiner": "a", "conn": 1, "code": "right", "result": "wrong_state" },
-                ],
-            },
-            {
-                "name": "wrong_then_right",
-                "kind": "send_link",
-                "steps": [
-                    { "op": "connect", "joiner": "a", "conn": 1 },
-                    { "op": "submit", "joiner": "a", "conn": 1, "code": "wrong", "host_attempts_left": 2, "joiner_attempts_left": 2 },
-                    { "op": "submit", "joiner": "a", "conn": 1, "code": "right", "host_attempts_left": 1, "joiner_attempts_left": 1, "joiner_state": "paired", "host_status": "consumed" },
-                ],
-            },
-            {
-                "name": "stale_code_is_refused",
-                "kind": "send_link",
-                "steps": [
-                    { "op": "connect", "joiner": "a", "conn": 1 },
-                    { "op": "submit", "joiner": "a", "conn": 1, "code": "wrong", "host_attempts_left": 2, "new_code": true },
-                    { "op": "submit", "joiner": "a", "conn": 1, "code": "stale", "host_attempts_left": 1, "joiner_attempts_left": 1, "joiner_state": "awaiting_code", "host_status": "open", "new_code": true },
-                    { "op": "submit", "joiner": "a", "conn": 1, "code": "right", "host_attempts_left": 0, "joiner_state": "paired", "host_status": "consumed", "new_code": false },
-                ],
-            },
-            {
-                "name": "resend_is_not_a_new_attempt",
-                "kind": "send_link",
-                "steps": [
-                    { "op": "connect", "joiner": "a", "conn": 1 },
-                    { "op": "submit_first", "joiner": "a", "conn": 1, "code": "right", "host_attempts_left": 2, "joiner_attempts_left": 2 },
-                    { "op": "redeliver", "joiner": "a", "conn": 1, "same_reply": true, "host_attempts_left": 2, "new_code": false },
-                    { "op": "redeliver", "joiner": "a", "conn": 1, "same_reply": true, "host_attempts_left": 2, "new_code": false },
-                ],
-            },
-            {
-                "name": "attempt_replayed_on_another_connection_is_refused",
-                "description": "Joiner a's first message is replayed on b's connection. The attempt id was already seen on another connection, so the host refuses it with code_abort before any debit or exchange work, and shows no new code.",
-                "kind": "send_link",
-                "steps": [
-                    { "op": "connect", "joiner": "a", "conn": 1 },
-                    { "op": "submit_first", "joiner": "a", "conn": 1, "code": "right", "host_attempts_left": 2 },
-                    { "op": "connect", "joiner": "b", "conn": 2 },
-                    { "op": "redeliver", "joiner": "a", "conn": 2, "reply": "code_abort", "host_attempts_left": 2, "host_status": "open", "new_code": false },
-                    { "op": "drop", "joiner": "a", "conn": 1, "host_attempts_left": 2 },
-                    { "op": "redeliver", "joiner": "a", "conn": 2, "reply": "code_abort", "host_attempts_left": 2, "new_code": false },
-                ],
-            },
-            {
-                "name": "attempts_shared_across_routes",
-                "kind": "send_link",
-                "steps": [
-                    { "op": "connect", "joiner": "a", "conn": 1 },
-                    { "op": "submit", "joiner": "a", "conn": 1, "code": "wrong", "host_attempts_left": 2 },
-                    { "op": "connect", "joiner": "b", "conn": 2 },
-                    { "op": "submit", "joiner": "b", "conn": 2, "code": "wrong", "host_attempts_left": 1 },
-                    { "op": "connect", "joiner": "c", "conn": 3 },
-                    { "op": "submit", "joiner": "c", "conn": 3, "code": "wrong", "host_attempts_left": 0, "host_status": "ended:attempts_exhausted", "closed": [[1, "attempts_exhausted"], [2, "attempts_exhausted"], [3, "attempts_exhausted"]] },
-                ],
-            },
-            {
-                "name": "dropped_attempt_keeps_its_debit",
-                "kind": "send_link",
-                "steps": [
-                    { "op": "connect", "joiner": "a", "conn": 1 },
-                    { "op": "submit_first", "joiner": "a", "conn": 1, "code": "right", "host_attempts_left": 2, "joiner_attempts_left": 2 },
-                    { "op": "drop", "joiner": "a", "conn": 1, "host_attempts_left": 2, "joiner_attempts_left": 2, "joiner_state": "connecting", "host_status": "open" },
-                ],
-            },
-            {
-                "name": "two_joiners_one_enrollment",
-                "kind": "in_person",
-                "steps": [
-                    { "op": "connect", "joiner": "a", "conn": 1, "joiner_state": "awaiting_approval" },
-                    { "op": "connect", "joiner": "b", "conn": 2, "joiner_state": "awaiting_approval" },
-                    { "op": "approve", "conn": 2, "result": "ok", "host_status": "consumed", "closed": [[1, "invitation_invalid"]] },
-                    { "op": "approve", "conn": 1, "result": "not_open" },
-                ],
-            },
-        ],
+        "description": "Attempt-limit and resend sequences for the send-link flow (spec wire.md, \"Send-link flow and the code\" and \"Attempt limits\"), plus one-enrollment for in person. Each step runs one operation and then the listed expectations hold. Ops: connect (the joiner sends its join proof on conn), submit (the joiner enters a code; messages flow until both sides stop), submit_first (only the joiner's first message reaches the host), redeliver (that first message reaches the host again on conn), inject (the joiner's side sends `message` for `attempt`, \"current\" meaning the attempt of its last submit, with `payload`), drop (conn closes), approve (host owner taps for conn). Codes: right (the code the host shows now), wrong (000000, or 000001 if 000000 is shown), stale (the code the host showed when the previous attempt started). `reply`: first_reply (the same messages, byte for byte, as the host's answer to that first message), code_abort (the host's only answer is CODE_ABORT pairing_failed for that attempt), none (no answer). `new_code` says whether the host showed a fresh code during the step. `closed` lists connections the host closed during the step. `out` lists, in order, every control message each side sent during the step (`send`), host closes (`close`) and codes the host showed (`show_code`).",
+        "conventions": {
+            "time": T,
+            "host": { "identity_secret": hex(&IDENTITY_A), "name": "Desk" },
+            "invitation": { "role": "owner", "authorizing_owner": hex(&[0x51; 16]), "routes": [ROUTE], "grant_expires_at": null },
+            "joiners": "Each joiner's identity secret is one byte repeated 32 times: 0x50 for the first joiner a sequence names, 0x51 for the second, and so on. Its name is its letter.",
+            "exporters": "On connection n both ends see the join exporter n repeated 32 times and the pair exporter n + 100 repeated 32 times.",
+            "draws": "`draws` lists each party's random values in the order it takes them. A `bytes` draw fills a request of exactly that length; a `u32` draw answers a request for a 32-bit integer. Host: invitation id (16), ticket secret (16), for send link the first code (u32, drawn again while at least 4294000000); then for each new attempt, after the debit and before reading its first message, the next code (u32, only while attempts are left) and the CPace scalar yb (32). Joiner: for each attempt the attempt id (16) and the CPace scalar ya (32).",
+        },
+        "sequences": sequences,
     })
 }
 
@@ -1333,34 +1410,107 @@ fn host_status_name(s: InvitationStatus) -> String {
     }
 }
 
-/// Replays one sequence from `pairing-attempts.json`.
+/// One party's random values: taken from a seeded generator and logged
+/// (when making the file), or handed out from the file's list.
+struct Draws {
+    source: Option<ChaCha20Rng>,
+    script: VecDeque<J>,
+    log: Vec<J>,
+}
+
+impl Draws {
+    fn recording(seed: u8) -> Self {
+        Self {
+            source: Some(ChaCha20Rng::from_seed([seed; 32])),
+            script: VecDeque::new(),
+            log: Vec::new(),
+        }
+    }
+
+    fn scripted(list: &J) -> Self {
+        Self {
+            source: None,
+            script: list
+                .as_array()
+                .map(|a| a.iter().cloned().collect())
+                .unwrap_or_default(),
+            log: Vec::new(),
+        }
+    }
+
+    fn next_listed(&mut self) -> J {
+        self.script
+            .pop_front()
+            .expect("the sequence drew more values than listed")
+    }
+}
+
+impl TryRng for Draws {
+    type Error = Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Infallible> {
+        let value = match self.source.as_mut() {
+            Some(rng) => rng.next_u32(),
+            None => {
+                let d = self.next_listed();
+                let v = d["u32"]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("expected a u32 draw, got {d}"));
+                u32::try_from(v).expect("u32")
+            }
+        };
+        self.log.push(json!({ "u32": value }));
+        Ok(value)
+    }
+
+    fn try_next_u64(&mut self) -> Result<u64, Infallible> {
+        panic!("pairing draws no u64 values")
+    }
+
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Infallible> {
+        match self.source.as_mut() {
+            Some(rng) => rng.fill_bytes(dst),
+            None => {
+                let d = self.next_listed();
+                let bytes = unhex(d["bytes"].as_str().expect("bytes draw"));
+                assert_eq!(bytes.len(), dst.len(), "draw {d}");
+                dst.copy_from_slice(&bytes);
+            }
+        }
+        self.log.push(json!({ "bytes": hex(dst) }));
+        Ok(())
+    }
+}
+
+impl TryCryptoRng for Draws {}
+
+struct ReplayJoiner {
+    name: String,
+    seed: u8,
+    pairing: JoinerPairing<CpaceExchangeFactory>,
+    rng: Draws,
+    /// The first message of its last attempt, and the host's answer to it.
+    first: Option<(ControlMessage, Vec<ControlMessage>)>,
+}
+
+/// Runs one sequence of `pairing-attempts.json`.
 struct Replay {
-    rng: ChaCha20Rng,
-    joiner_rng: ChaCha20Rng,
+    host_rng: Draws,
+    listed: Option<J>,
     host: HostPairing<CpaceExchangeFactory>,
     grants: GrantTable,
     ticket: Ticket,
-    joiners: Vec<(String, u8, JoinerPairing<CpaceExchangeFactory>)>,
-    first: Vec<(String, ControlMessage)>,
-    last_reply: Option<Vec<ControlMessage>>,
+    joiners: Vec<ReplayJoiner>,
     shown_at_last_submit: Option<PairingCode>,
-    new_code: bool,
-}
-
-/// The messages the host sent, without display actions.
-fn sent(actions: &[HostAction]) -> Vec<ControlMessage> {
-    actions
-        .iter()
-        .filter_map(|a| match a {
-            HostAction::Send { message, .. } => Some(message.clone()),
-            _ => None,
-        })
-        .collect()
+    out: Vec<J>,
 }
 
 impl Replay {
-    fn new(kind: InvitationKind) -> Self {
-        let mut rng = ChaCha20Rng::from_seed([7; 32]);
+    fn new(kind: InvitationKind, listed: Option<&J>) -> Self {
+        let mut host_rng = match listed {
+            Some(draws) => Draws::scripted(&draws["host"]),
+            None => Draws::recording(7),
+        };
         let mut host = HostPairing::new(
             identity(&IDENTITY_A).public_key(),
             "Desk".into(),
@@ -1374,28 +1524,26 @@ impl Replay {
             grant_expires_at: None,
         };
         let ticket = host
-            .create(params, UnixTime(T), &mut rng)
+            .create(params, UnixTime(T), &mut host_rng)
             .expect("create")
             .ticket;
         Self {
-            rng,
-            joiner_rng: ChaCha20Rng::from_seed([9; 32]),
+            host_rng,
+            listed: listed.cloned(),
             host,
             grants: GrantTable::new(),
             ticket,
             joiners: Vec::new(),
-            first: Vec::new(),
-            last_reply: None,
             shown_at_last_submit: None,
-            new_code: false,
+            out: Vec::new(),
         }
     }
 
-    fn joiner(&mut self, name: &str) -> &mut JoinerPairing<CpaceExchangeFactory> {
-        if !self.joiners.iter().any(|(n, _, _)| n == name) {
+    fn joiner(&mut self, name: &str) -> &mut ReplayJoiner {
+        if !self.joiners.iter().any(|j| j.name == name) {
             let seed = 0x50 + self.joiners.len() as u8;
             let key = identity(&[seed; 32]).public_key();
-            let j = JoinerPairing::new(
+            let pairing = JoinerPairing::new(
                 self.ticket.clone(),
                 key,
                 name.into(),
@@ -1403,41 +1551,100 @@ impl Replay {
                 UnixTime(T),
             )
             .expect("joiner");
-            self.joiners.push((name.into(), seed, j));
+            let rng = match &self.listed {
+                Some(draws) => Draws::scripted(&draws[name]),
+                None => Draws::recording(0x60 + self.joiners.len() as u8),
+            };
+            self.joiners.push(ReplayJoiner {
+                name: name.into(),
+                seed,
+                pairing,
+                rng,
+                first: None,
+            });
         }
-        let i = self
-            .joiners
-            .iter()
-            .position(|(n, _, _)| n == name)
-            .expect("present");
-        &mut self.joiners[i].2
-    }
-
-    fn joiner_key(&self, name: &str) -> IdentityPublicKey {
-        let seed = self
-            .joiners
-            .iter()
-            .find(|(n, _, _)| n == name)
+        self.joiners
+            .iter_mut()
+            .find(|j| j.name == name)
             .expect("present")
-            .1;
-        identity(&[seed; 32]).public_key()
     }
 
-    fn deliver_to_host(&mut self, conn: u64, m: ControlMessage) -> Vec<HostAction> {
+    fn sent(&mut self, from: &str, conn: u64, m: &ControlMessage) {
+        self.out.push(json!({ "send": { "from": from, "conn": conn, "control": hex(&m.encode()) } }));
+    }
+
+    /// Log the host's actions; return the messages it sent on `conn`.
+    fn host_did(&mut self, actions: &[HostAction], conn: u64) -> Vec<ControlMessage> {
+        let mut on_conn = Vec::new();
+        for a in actions {
+            match a {
+                HostAction::Send { conn: c, message } => {
+                    self.sent("host", c.0, message);
+                    if c.0 == conn {
+                        on_conn.push(message.clone());
+                    }
+                }
+                HostAction::Close { conn: c, code } => {
+                    self.out
+                        .push(json!({ "close": { "from": "host", "conn": c.0, "code": code.name() } }));
+                }
+                HostAction::ShowCode { code, .. } => {
+                    self.out.push(json!({ "show_code": code.as_str() }));
+                }
+                _ => {}
+            }
+        }
+        on_conn
+    }
+
+    fn deliver_to_host(
+        &mut self,
+        who: &str,
+        conn: u64,
+        m: &ControlMessage,
+    ) -> (Vec<HostAction>, Vec<ControlMessage>) {
+        self.sent(who, conn, m);
         let now = UnixTime(T);
-        match m {
+        let actions = match m {
             ControlMessage::CodeExchange { attempt, payload } => self.host.on_code_exchange(
                 ConnectionId(conn),
-                attempt,
-                &payload,
+                *attempt,
+                payload,
                 &mut self.grants,
                 now,
-                &mut self.rng,
+                &mut self.host_rng,
             ),
             ControlMessage::CodeAbort { attempt, .. } => {
-                self.host.on_code_abort(ConnectionId(conn), attempt)
+                self.host.on_code_abort(ConnectionId(conn), *attempt)
             }
             other => panic!("unexpected {other:?}"),
+        };
+        let reply = self.host_did(&actions, conn);
+        (actions, reply)
+    }
+
+    fn check_reply(&self, step: &J, who: &str, attempt: AttemptId, reply: &[ControlMessage]) {
+        match step["reply"].as_str() {
+            None => {}
+            Some("none") => assert!(reply.is_empty(), "expected no answer"),
+            Some("code_abort") => assert_eq!(
+                reply,
+                [ControlMessage::CodeAbort {
+                    attempt,
+                    code: ErrorCode::PairingFailed,
+                }],
+                "refused without work"
+            ),
+            Some("first_reply") => {
+                let first = self
+                    .joiners
+                    .iter()
+                    .find(|j| j.name == who)
+                    .and_then(|j| j.first.as_ref())
+                    .expect("a first message");
+                assert_eq!(reply, first.1.as_slice(), "resend answer differs");
+            }
+            Some(other) => panic!("reply {other}"),
         }
     }
 
@@ -1453,10 +1660,13 @@ impl Replay {
                     join: [conn as u8; 32],
                     pair: [conn as u8 + 100; 32],
                 };
-                let proof = self
-                    .joiner(&who)
+                let j = self.joiner(&who);
+                let seed = j.seed;
+                let proof = j
+                    .pairing
                     .on_connected(exporters, UnixTime(T))
                     .expect("connect");
+                self.sent(&who, conn, &proof);
                 let ControlMessage::JoinProof {
                     invitation,
                     mac,
@@ -1465,7 +1675,7 @@ impl Replay {
                 else {
                     panic!("proof")
                 };
-                let key = self.joiner_key(&who);
+                let key = identity(&[seed; 32]).public_key();
                 let actions = self.host.on_join_proof(
                     ConnectionId(conn),
                     &key,
@@ -1476,11 +1686,14 @@ impl Replay {
                     &self.grants,
                     UnixTime(T),
                 );
+                self.host_did(&actions, conn);
                 if actions
                     .iter()
                     .any(|a| matches!(a, HostAction::AdmittedJoinOnly { .. }))
                 {
-                    self.joiner(&who).on_authorized(AuthorizedState::JoinOnly);
+                    self.joiner(&who)
+                        .pairing
+                        .on_authorized(AuthorizedState::JoinOnly);
                 }
                 host_log.extend(actions);
             }
@@ -1506,10 +1719,8 @@ impl Replay {
                     assert_ne!(shown.as_ref(), Some(&code), "stale code still shown");
                 }
                 self.shown_at_last_submit = shown;
-                let mut rng = self.joiner_rng.clone();
-                let result = self.joiner(&who).submit_code(&code, &mut rng);
-                self.joiner_rng = rng;
-                let actions = match result {
+                let j = self.joiner(&who);
+                let actions = match j.pairing.submit_code(&code, &mut j.rng) {
                     Ok(a) => a,
                     Err(e) => {
                         let name = match e {
@@ -1528,25 +1739,18 @@ impl Replay {
                         _ => None,
                     })
                     .collect();
-                if let Some(m) = to_host.first() {
-                    self.first.retain(|(n, _)| *n != who);
-                    self.first.push((who.clone(), m.clone()));
-                }
+                let mut first = to_host.first().cloned();
                 let mut rounds = 0;
                 while !to_host.is_empty() {
                     rounds += 1;
                     assert!(rounds < 16, "exchange does not settle");
                     let mut to_joiner = Vec::new();
                     for m in std::mem::take(&mut to_host) {
-                        let actions = self.deliver_to_host(conn, m.clone());
-                        self.last_reply = Some(sent(&actions));
-                        for a in &actions {
-                            if let HostAction::Send { conn: c, message } = a {
-                                if c.0 == conn {
-                                    to_joiner.push(message.clone());
-                                }
-                            }
+                        let (actions, reply) = self.deliver_to_host(&who, conn, &m);
+                        if let Some(f) = first.take() {
+                            self.joiner(&who).first = Some((f, reply.clone()));
                         }
+                        to_joiner.extend(reply);
                         host_log.extend(actions);
                     }
                     if op == "submit_first" {
@@ -1556,11 +1760,13 @@ impl Replay {
                         let j = self.joiner(&who);
                         let actions = match m {
                             ControlMessage::CodeExchange { attempt, payload } => {
-                                j.on_code_exchange(attempt, &payload)
+                                j.pairing.on_code_exchange(attempt, &payload)
                             }
-                            ControlMessage::CodeAbort { attempt, .. } => j.on_code_abort(attempt),
+                            ControlMessage::CodeAbort { attempt, .. } => {
+                                j.pairing.on_code_abort(attempt)
+                            }
                             ControlMessage::Paired { host_name, role } => {
-                                j.on_paired(host_name, role)
+                                j.pairing.on_paired(host_name, role)
                             }
                             other => panic!("unexpected {other:?}"),
                         };
@@ -1571,52 +1777,57 @@ impl Replay {
                     }
                 }
                 // Closes reach the joiner as a closed connection.
-                if host_log
-                    .iter()
-                    .any(|a| matches!(a, HostAction::Close { conn: c, .. } if c.0 == conn))
-                {
-                    let code = host_log.iter().find_map(|a| match a {
-                        HostAction::Close { conn: c, code } if c.0 == conn => Some(*code),
-                        _ => None,
-                    });
-                    self.joiner(&who).on_closed(code);
+                let code = host_log.iter().find_map(|a| match a {
+                    HostAction::Close { conn: c, code } if c.0 == conn => Some(*code),
+                    _ => None,
+                });
+                if code.is_some() {
+                    self.joiner(&who).pairing.on_closed(code);
                 }
             }
             "redeliver" => {
                 let m = self
+                    .joiner(&who)
                     .first
-                    .iter()
-                    .find(|(n, _)| *n == who)
+                    .as_ref()
                     .expect("first message")
-                    .1
+                    .0
                     .clone();
-                let before = self.last_reply.clone();
-                let actions = self.deliver_to_host(conn, m.clone());
-                if step["same_reply"] == true {
-                    assert_eq!(Some(sent(&actions)), before, "resend reply differs");
-                }
-                if step["reply"] == "code_abort" {
-                    let ControlMessage::CodeExchange { attempt, .. } = m else {
-                        panic!("first message")
-                    };
-                    assert_eq!(
-                        actions,
-                        vec![HostAction::Send {
-                            conn: ConnectionId(conn),
-                            message: ControlMessage::CodeAbort {
-                                attempt,
-                                code: ErrorCode::PairingFailed,
-                            },
-                        }],
-                        "refused without work"
-                    );
-                }
-                self.last_reply = Some(sent(&actions));
+                let ControlMessage::CodeExchange { attempt, .. } = m else {
+                    panic!("first message")
+                };
+                let (actions, reply) = self.deliver_to_host(&who, conn, &m);
+                self.check_reply(step, &who, attempt, &reply);
+                host_log.extend(actions);
+            }
+            "inject" => {
+                let attempt = match step["attempt"].as_str().expect("attempt") {
+                    "current" => match self.joiner(&who).first.as_ref() {
+                        Some((ControlMessage::CodeExchange { attempt, .. }, _)) => *attempt,
+                        _ => panic!("no current attempt"),
+                    },
+                    id => AttemptId(unhex(id).try_into().expect("16 bytes")),
+                };
+                let m = match step["message"].as_str() {
+                    Some("code_exchange") => ControlMessage::CodeExchange {
+                        attempt,
+                        payload: unhex(step["payload"].as_str().expect("payload")),
+                    },
+                    Some("code_abort") => ControlMessage::CodeAbort {
+                        attempt,
+                        code: ErrorCode::PairingFailed,
+                    },
+                    other => panic!("message {other:?}"),
+                };
+                let (actions, reply) = self.deliver_to_host(&who, conn, &m);
+                self.check_reply(step, &who, attempt, &reply);
                 host_log.extend(actions);
             }
             "drop" => {
-                host_log.extend(self.host.on_connection_closed(ConnectionId(conn)));
-                self.joiner(&who).on_closed(None);
+                let actions = self.host.on_connection_closed(ConnectionId(conn));
+                self.host_did(&actions, conn);
+                host_log.extend(actions);
+                self.joiner(&who).pairing.on_closed(None);
             }
             "approve" => {
                 let invitation = self.ticket.invitation;
@@ -1628,6 +1839,7 @@ impl Replay {
                 ) {
                     Ok(actions) => {
                         assert_eq!(step["result"], "ok");
+                        self.host_did(&actions, conn);
                         host_log.extend(actions);
                     }
                     Err(HostPairingError::NotOpen) => assert_eq!(step["result"], "not_open"),
@@ -1636,9 +1848,12 @@ impl Replay {
             }
             other => panic!("unknown op {other}"),
         }
-        self.new_code = host_log
-            .iter()
-            .any(|a| matches!(a, HostAction::ShowCode { .. }));
+        if let Some(b) = step["new_code"].as_bool() {
+            let shown = host_log
+                .iter()
+                .any(|a| matches!(a, HostAction::ShowCode { .. }));
+            assert_eq!(shown, b, "new_code");
+        }
         host_log
             .iter()
             .filter_map(|a| match a {
@@ -1649,6 +1864,82 @@ impl Replay {
     }
 }
 
+/// Run one sequence and check every expectation in its steps. With
+/// `listed`, the random values come from that list; without, from seeded
+/// generators. Returns the sequence with its ticket, draws and each step's
+/// `out`, as the file holds it.
+fn run_attempt_sequence(seq: &J, listed: Option<&J>) -> J {
+    let name = seq["name"].as_str().expect("name");
+    let kind = match seq["kind"].as_str() {
+        Some("send_link") => InvitationKind::SendLink,
+        Some("in_person") => InvitationKind::InPerson,
+        other => panic!("kind {other:?}"),
+    };
+    let mut r = Replay::new(kind, listed);
+    let mut steps = Vec::new();
+    for (i, step) in seq["steps"].as_array().expect("steps").iter().enumerate() {
+        let ctx = format!("{name} step {i}");
+        r.out.clear();
+        let closed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.step(step)))
+            .unwrap_or_else(|_| panic!("{ctx}"));
+        if let Some(n) = step["host_attempts_left"].as_u64() {
+            assert_eq!(
+                r.host.attempts_left(&r.ticket.invitation).map(u64::from),
+                Some(n),
+                "{ctx}"
+            );
+        }
+        if let Some(who) = step["joiner"].as_str() {
+            if let Some(n) = step["joiner_attempts_left"].as_u64() {
+                assert_eq!(u64::from(r.joiner(who).pairing.attempts_left()), n, "{ctx}");
+            }
+            if let Some(s) = step["joiner_state"].as_str() {
+                assert_eq!(joiner_state_name(r.joiner(who).pairing.state()), s, "{ctx}");
+            }
+        }
+        if let Some(s) = step["host_status"].as_str() {
+            assert_eq!(
+                host_status_name(r.host.status(&r.ticket.invitation).expect("status")),
+                s,
+                "{ctx}"
+            );
+        }
+        let mut expected: Vec<(u64, String)> = step["closed"]
+            .as_array()
+            .map(|list| {
+                list.iter()
+                    .map(|c| {
+                        (
+                            c[0].as_u64().expect("conn"),
+                            c[1].as_str().expect("code").to_owned(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut closed = closed;
+        closed.sort();
+        closed.dedup();
+        expected.sort();
+        assert_eq!(closed, expected, "{ctx}");
+        let mut recorded = step.clone();
+        recorded["out"] = J::Array(std::mem::take(&mut r.out));
+        steps.push(recorded);
+    }
+    let mut draws = serde_json::Map::new();
+    draws.insert("host".into(), J::Array(r.host_rng.log.clone()));
+    assert!(r.host_rng.script.is_empty(), "{name}: unused host draws");
+    for j in &r.joiners {
+        assert!(j.rng.script.is_empty(), "{name}: unused draws of {}", j.name);
+        draws.insert(j.name.clone(), J::Array(j.rng.log.clone()));
+    }
+    let mut out = seq.clone();
+    out["ticket"] = json!(hex(&r.ticket.encode()));
+    out["draws"] = J::Object(draws);
+    out["steps"] = J::Array(steps);
+    out
+}
+
 #[test]
 fn pairing_attempt_sequences_hold() {
     let file = vectors_dir().join("pairing-attempts.json");
@@ -1656,60 +1947,10 @@ fn pairing_attempt_sequences_hold() {
         .unwrap_or_else(|_| serde_json::to_string(&pairing_attempt_vectors()).expect("json"));
     let doc: J = serde_json::from_str(&text).expect("json");
     for seq in doc["sequences"].as_array().expect("sequences") {
-        let name = seq["name"].as_str().expect("name");
-        let kind = match seq["kind"].as_str() {
-            Some("send_link") => InvitationKind::SendLink,
-            Some("in_person") => InvitationKind::InPerson,
-            other => panic!("kind {other:?}"),
-        };
-        let mut r = Replay::new(kind);
-        for (i, step) in seq["steps"].as_array().expect("steps").iter().enumerate() {
-            let ctx = format!("{name} step {i}");
-            let closed = r.step(step);
-            if let Some(n) = step["host_attempts_left"].as_u64() {
-                assert_eq!(
-                    r.host.attempts_left(&r.ticket.invitation).map(u64::from),
-                    Some(n),
-                    "{ctx}"
-                );
-            }
-            if let Some(who) = step["joiner"].as_str() {
-                if let Some(n) = step["joiner_attempts_left"].as_u64() {
-                    assert_eq!(u64::from(r.joiner(who).attempts_left()), n, "{ctx}");
-                }
-                if let Some(s) = step["joiner_state"].as_str() {
-                    assert_eq!(joiner_state_name(r.joiner(who).state()), s, "{ctx}");
-                }
-            }
-            if let Some(b) = step["new_code"].as_bool() {
-                assert_eq!(r.new_code, b, "{ctx}");
-            }
-            if let Some(s) = step["host_status"].as_str() {
-                assert_eq!(
-                    host_status_name(r.host.status(&r.ticket.invitation).expect("status")),
-                    s,
-                    "{ctx}"
-                );
-            }
-            let mut expected: Vec<(u64, String)> = step["closed"]
-                .as_array()
-                .map(|list| {
-                    list.iter()
-                        .map(|c| {
-                            (
-                                c[0].as_u64().expect("conn"),
-                                c[1].as_str().expect("code").to_owned(),
-                            )
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            let mut closed = closed;
-            closed.sort();
-            closed.dedup();
-            expected.sort();
-            assert_eq!(closed, expected, "{ctx}");
-        }
+        // Replay from the file's own draws: every message must come out
+        // byte for byte as listed.
+        let replayed = run_attempt_sequence(seq, Some(&seq["draws"]));
+        assert_eq!(&replayed, seq, "{}", seq["name"]);
     }
 }
 
