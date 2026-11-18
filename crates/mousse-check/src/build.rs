@@ -3,7 +3,10 @@
 //! The source commit is the last commit that changed anything outside
 //! `checks/`. Committing result files, attestations, manifests or the
 //! device list does not change the build, so evidence can be committed
-//! without making itself stale. The dirty flag covers every uncommitted
+//! without making itself stale. A manifest change still makes evidence for
+//! the changed check stale: every run record and signed result carries a
+//! digest of the check's configuration (`Manifest::config_digest`), and
+//! evidence with another digest does not count. The dirty flag covers every uncommitted
 //! change except `checks/results/` and `checks/runs/` (evidence and local
 //! run records): an uncommitted manifest or device-list edit makes the tree
 //! dirty.

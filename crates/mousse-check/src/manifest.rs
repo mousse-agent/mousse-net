@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use serde::Deserialize;
+use sha2::Digest;
 
 /// One phase.
 #[derive(Clone, Debug, Deserialize)]
@@ -79,6 +80,11 @@ pub struct Check {
     /// Profile device results must carry (overrides the phase default).
     #[serde(default)]
     pub profile: Option<String>,
+    /// The cell is one machine dialling another. Each result must name the
+    /// host's build in `extra.host_build`, and both builds must be the
+    /// build under test.
+    #[serde(default)]
+    pub cross_machine: bool,
     /// Not wired yet: every cell is INCOMPLETE with this reason, and
     /// `mousse-check <phase>` does not run it. `run` still does.
     #[serde(default)]
@@ -146,6 +152,11 @@ pub struct Control {
     /// The control does not exist yet. The check is FAIL until it does.
     #[serde(default)]
     pub missing: Option<String>,
+    /// The reason the control must fail with: a `reason=<this>` word on the
+    /// FAIL line of a local run, or `extra.reason` (or `reason=<this>` in
+    /// the details) of a device result. Failing for another reason is FAIL.
+    #[serde(default)]
+    pub expect_reason: Option<String>,
 }
 
 /// Crypto matrix cells: which provider pairs a cell must report.
@@ -202,6 +213,18 @@ impl Check {
         self.local.iter().find(|l| l.target == target)
     }
 
+    /// The local run for `target` on machines of kind `host`, if any.
+    pub fn local_on(&self, target: &str, host: &str) -> Option<&LocalRun> {
+        self.local
+            .iter()
+            .find(|l| l.target == target && l.host == host)
+    }
+
+    /// The control named `name`, if any.
+    pub fn control_named(&self, name: &str) -> Option<&Control> {
+        self.control.iter().find(|k| k.name == name)
+    }
+
     /// Cases a device must report for `target`: the matrix pairs, or one
     /// unnamed case.
     pub fn cases(&self, target: &str) -> Vec<Option<String>> {
@@ -227,6 +250,63 @@ impl Manifest {
 
     pub fn check(&self, id: &str) -> Option<&Check> {
         self.checks.iter().find(|c| c.id == id)
+    }
+
+    /// The profile device results for `c` must carry, if any.
+    pub fn device_profile<'a>(&'a self, c: &'a Check) -> Option<&'a str> {
+        c.profile.as_deref().or(self.profile.as_deref())
+    }
+
+    /// The profile a local run of `c` records (`debug` if none is set).
+    pub fn run_profile(&self, c: &Check) -> String {
+        self.device_profile(c).unwrap_or("debug").to_string()
+    }
+
+    /// Digest of everything that decides what one run of `c` on `target`
+    /// proves: the judge, test minimum, markers, profile, matrix cases, the
+    /// local commands for that target (command, working directory, env) and,
+    /// for a control, its command, args, env and expected reason. Local run
+    /// records and signed results carry it; evidence with another digest
+    /// was produced under another configuration and does not count.
+    pub fn config_digest(&self, c: &Check, target: &str, control: Option<&Control>) -> String {
+        let locals: Vec<serde_json::Value> = c
+            .local
+            .iter()
+            .filter(|l| l.target == target)
+            .map(|l| {
+                serde_json::json!({
+                    "host": l.host,
+                    "command": l.command,
+                    "cwd": l.cwd,
+                    "env": l.env,
+                })
+            })
+            .collect();
+        let control = control.map(|k| {
+            serde_json::json!({
+                "name": k.name,
+                "command": k.command,
+                "args": k.args,
+                "env": k.env,
+                "expect_reason": k.expect_reason,
+            })
+        });
+        let config = serde_json::json!({
+            "format": "mousse-check-config-v1",
+            "check": c.id,
+            "target": target,
+            "judge": format!("{:?}", c.judge),
+            "min_tests": c.min_tests,
+            "pass_marker": c.pass_marker(),
+            "fail_marker": c.fail_marker(),
+            "profile": self.device_profile(c),
+            "cross_machine": c.cross_machine,
+            "cases": c.cases(target),
+            "local": locals,
+            "control": control,
+        });
+        let text = serde_json::to_string(&config).unwrap_or_default();
+        crate::util::to_hex(&sha2::Sha256::digest(text.as_bytes()))
     }
 
     /// Structural rules. Anything that would let a check pass without
@@ -303,6 +383,14 @@ impl Manifest {
                         "{}: control {} runs the same command as the check; it cannot prove anything",
                         c.id, k.name
                     ));
+                }
+                if let Some(r) = &k.expect_reason {
+                    if r.is_empty() || r.contains(|ch: char| ch.is_whitespace() || ch == ';') {
+                        return Err(format!(
+                            "{}: control {} expect_reason must be one word",
+                            c.id, k.name
+                        ));
+                    }
                 }
                 if let Some(cmd) = &k.command {
                     if c.local.iter().any(|l| &l.command == cmd)
