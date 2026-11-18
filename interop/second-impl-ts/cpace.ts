@@ -31,7 +31,13 @@ export const transcriptOC = (ya: Uint8Array, ada: Uint8Array, yb: Uint8Array, ad
   orderedCat(lvCat(ya, ada), lvCat(yb, adb));
 export const sidOutput = (transcript: Uint8Array) => sha512(concat(utf8('CPaceSidOutput'), transcript));
 
-export interface Inputs { prs: Uint8Array; ci: Uint8Array; sid: Uint8Array; ad: Uint8Array }
+export interface Inputs {
+  prs: Uint8Array;
+  ci: Uint8Array;
+  sid: Uint8Array;
+  ad: Uint8Array;
+  requireEmptyPeerAd?: boolean;
+}
 export function generator(prs: Uint8Array, ci: Uint8Array, sid: Uint8Array) {
   const zpad = Math.max(0, hashBlockSize - 1 - prependLen(prs).length - prependLen(DSI).length);
   const input = lvCat(DSI, prs, new Uint8Array(zpad), ci, sid);
@@ -78,7 +84,7 @@ function share(input: Inputs, scalar: Uint8Array): Buffer {
   return lvCat(point.multiply(littleEndian(scalar)).toBytes(), input.ad);
 }
 
-function parseShare(message: Uint8Array, tagLength: number) {
+function parseShare(message: Uint8Array, tagLength: number, requireEmptyAd = false) {
   requireThat(message[0] === 32 && message.length >= 34, 'Malformed');
   let length = message[33];
   let start = 34;
@@ -88,7 +94,7 @@ function parseShare(message: Uint8Array, tagLength: number) {
     length = (length & 127) + next * 128;
   }
   const end = start + length;
-  requireThat(length <= 4096 && message.length === end + tagLength, 'Malformed');
+  requireThat(length <= (requireEmptyAd ? 0 : 4096) && message.length === end + tagLength, 'Malformed');
   return {
     encoded: message.subarray(1, 33),
     ad: message.subarray(start, end),
@@ -138,7 +144,7 @@ export function initiate(inputs: Inputs, draw: DrawBytes) {
     finish(reply: Uint8Array) {
       requireThat(pending, 'WrongState');
       try {
-        const peer = parseShare(reply, 64);
+        const peer = parseShare(reply, 64, inputs.requireEmptyPeerAd);
         const { isk, ta, tb } = confirmation(inputs.sid, scalar, peer.encoded, message, peer.body);
         if (!equalBytes(peer.tag, tb)) {
           isk.fill(0); ta.fill(0); tb.fill(0);
@@ -155,19 +161,19 @@ export function initiate(inputs: Inputs, draw: DrawBytes) {
 
 export function respond(inputs: Inputs, received: Uint8Array, draw: DrawBytes) {
   checkInputs(inputs);
-  const peer = parseShare(received, 0);
-  requireThat(!equalBytes(peer.encoded, identity), 'InvalidPoint');
-  try { Point.fromBytes(peer.encoded); }
-  catch { fail('InvalidPoint'); }
   const scalar = sampleScalar(draw);
   let result;
   try {
+    const peer = parseShare(received, 0, inputs.requireEmptyPeerAd);
+    requireThat(!equalBytes(peer.encoded, identity), 'InvalidPoint');
+    try { Point.fromBytes(peer.encoded); }
+    catch { fail('InvalidPoint'); }
     const body = share(inputs, scalar);
-    result = { body, ...confirmation(inputs.sid, scalar, peer.encoded, peer.body, body) };
+    result = { body, ad: peer.ad, ...confirmation(inputs.sid, scalar, peer.encoded, peer.body, body) };
   } finally {
     scalar.fill(0);
   }
-  const { body, isk, ta, tb } = result;
+  const { body, ad, isk, ta, tb } = result;
   const message = concat(body, tb);
   tb.fill(0);
   let pending = true;
@@ -186,7 +192,7 @@ export function respond(inputs: Inputs, received: Uint8Array, draw: DrawBytes) {
       try {
         requireThat(reply.length === 64, 'Malformed');
         requireThat(equalBytes(ta, reply), 'ConfirmationFailed');
-        return { isk: isk.slice(), ad: peer.ad };
+        return { isk: isk.slice(), ad };
       } finally {
         dispose();
       }

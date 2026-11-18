@@ -3,7 +3,7 @@ import { hex, requireThat, utf8 } from './cbor.ts';
 import { initiate, respond } from './cpace.ts';
 import { Gate, step2 } from './session.ts';
 import type { Traffic } from './session.ts';
-import { attemptSession, bindingTranscript, checkJoinerExpiry, decodeTicket, encodeTicket, errorNumber, hello, joinProof, negotiate, readError } from './wire.ts';
+import { attemptSession, bindingTranscript, checkJoinerExpiry, decodeTicket, encodeTicket, errorNumber, hello, joinProof, negotiate } from './wire.ts';
 import type { Control, ErrorName, Ticket } from './wire.ts';
 
 export interface RandomDraws {
@@ -25,6 +25,7 @@ export type Effect =
   | { enrolled: { conn: number } }
   | { invitation_ended: ErrorName }
   | { paired: { host_identity: string; host_name: string; role: string } }
+  | { already_paired: true }
   | { code_rejected: { attempts_left: number } }
   | { failed: ErrorName }
   | { attempt: { id: string; ci: string; sid: string } }
@@ -76,7 +77,7 @@ function cpaceInputs(ticket: Ticket, binary: Uint8Array, joiner: Uint8Array, pai
   const ci = bindingTranscript(sha256(binary), ticket.kind, ticket.version,
     { host: ticket.hostIdentity, joiner, exporter: pair });
   const { sid } = attemptSession(attempt, pair);
-  return { ci, sid, prs: utf8(code), ad: new Uint8Array() };
+  return { ci, sid, prs: utf8(code), ad: new Uint8Array(), requireEmptyPeerAd: true };
 }
 
 function exchange(conn: number, attempt: Uint8Array, payload: Uint8Array): Effect {
@@ -88,7 +89,7 @@ function abort(conn: number, attempt: Uint8Array): Effect {
 
 interface Attempt {
   responder?: ReturnType<typeof respond>;
-  received?: Uint8Array;
+  received: Uint8Array;
   reply: Effect[];
 }
 
@@ -117,6 +118,7 @@ export class PairingHost {
   readonly grants = new Map<string, Enrollment>();
   readonly denials = new Set<string>();
   private readonly connections = new Map<number, HostConnection>();
+  private readonly seenAttempts = new Set<string>();
   attemptsLeft = 3;
   status: 'open' | 'consumed' | `ended:${ErrorName}` = 'open';
   shownCode: string | null;
@@ -135,11 +137,19 @@ export class PairingHost {
     this.shownCode = kind === 2 ? drawCode(random, 'code') : null;
   }
 
-  connect(conn: number, peer: Uint8Array, exporters: Exporters, mono = 0): Effect[] {
+  connect(conn: number, peer: Uint8Array, exporters: Exporters, now: number, mono = 0): Effect[] {
     requireThat(!this.connections.has(conn), 'connection_reused');
-    const gate = new Gate('host', undefined, mono);
+    const identity = hex(peer);
+    const decision = step2(identity, this.grants.values(), this.denials, now);
+    const gate = new Gate('host', decision, mono);
     this.connections.set(conn, { gate, peer, exporters, attempts: new Map() });
-    return [send(conn, hello)];
+    const output = [send(conn, hello)];
+    if (decision === 'close:not_authorized') output.push(close(conn, gate, 'not_authorized'));
+    if (decision === 'live') {
+      this.grants.get(identity)!.bound_connections.push(conn);
+      output.push(send(conn, { type: 'AUTHORIZED', state: 'live' }));
+    }
+    return output;
   }
 
   private stopAttempts(connection: HostConnection) {
@@ -174,6 +184,8 @@ export class PairingHost {
     if (!connection) return [];
     this.stopAttempts(connection);
     this.connections.delete(conn);
+    const grant = this.grants.get(hex(connection.peer));
+    if (grant) grant.bound_connections = grant.bound_connections.filter(id => id !== conn);
     return this.checkExhausted();
   }
 
@@ -222,7 +234,7 @@ export class PairingHost {
     const connection = this.connections.get(conn);
     if (!connection) return [{ ignored: true }];
     const { gate } = connection;
-    if (gate.state === 'await_join_proof' && connection.version === undefined && msg.type !== 'HELLO') {
+    if (!gate.state.startsWith('closed:') && connection.version === undefined && msg.type !== 'HELLO') {
       return [close(conn, gate, 'protocol_error')];
     }
     const rejected = checked(gate, conn, msg);
@@ -238,16 +250,7 @@ export class PairingHost {
         if (connection.version !== undefined) return [{ ignored: true }];
         try { connection.version = Number(negotiate(hello, msg)); }
         catch { return [close(conn, gate, 'unsupported_version')]; }
-        const identity = hex(connection.peer);
-        const decision = step2(identity, this.grants.values(), this.denials, now);
-        const output: Effect[] = [{ version: connection.version }];
-        if (decision === 'close:not_authorized') output.push(close(conn, gate, 'not_authorized'));
-        if (decision === 'live') {
-          gate.state = 'live';
-          this.grants.get(identity)!.bound_connections.push(conn);
-          output.push(send(conn, { type: 'AUTHORIZED', state: 'live' }));
-        }
-        return output;
+        return [{ version: connection.version }];
       }
       case 'JOIN_PROOF': {
         if (this.status !== 'open' || now >= Number(this.ticket.expiresAt) ||
@@ -265,8 +268,9 @@ export class PairingHost {
       case 'CODE_EXCHANGE': return this.codeExchange(conn, connection, msg, now);
       case 'CODE_ABORT': {
         const attempt = connection.attempts.get(hex(msg.attempt));
-        attempt?.responder?.dispose();
-        if (attempt) attempt.responder = undefined;
+        if (!attempt?.responder) return [];
+        attempt.responder.dispose();
+        attempt.responder = undefined;
         return this.checkExhausted();
       }
       default: return [close(conn, gate, 'protocol_error')];
@@ -280,9 +284,9 @@ export class PairingHost {
     const key = hex(msg.attempt);
     const existing = connection.attempts.get(key);
     if (existing) {
-      if (existing.received && equalBytes(existing.received, msg.payload)) return existing.reply;
+      if (equalBytes(existing.received, msg.payload)) return existing.reply;
       if (!existing.responder) return [abort(conn, msg.attempt)];
-      existing.received = msg.payload.slice();
+      existing.received = Uint8Array.from(msg.payload);
       try {
         existing.responder.finish(msg.payload).isk.fill(0);
       } catch {
@@ -293,19 +297,24 @@ export class PairingHost {
       existing.responder = undefined;
       return this.enroll(conn, connection, now);
     }
-    if (this.attemptsLeft === 0) return [close(conn, connection.gate, 'attempts_exhausted')];
+    if (this.seenAttempts.has(key)) return [abort(conn, msg.attempt)];
+    if (this.attemptsLeft === 0) {
+      this.stopAttempts(connection);
+      return [close(conn, connection.gate, 'attempts_exhausted'), ...this.checkExhausted()];
+    }
+    this.seenAttempts.add(key);
     this.attemptsLeft--;
     const code = this.shownCode!;
     this.shownCode = this.attemptsLeft > 0 ? drawCode(this.random, 'next_code') : null;
     const shown: Effect[] = this.shownCode === null ? [] : [{ show_code: this.shownCode }];
-    const attempt: Attempt = { received: msg.payload.slice(), reply: [] };
+    const attempt: Attempt = { received: Uint8Array.from(msg.payload), reply: [] };
     connection.attempts.set(key, attempt);
     const inputs = cpaceInputs(this.ticket, this.binary, connection.peer, connection.exporters.pair, msg.attempt, code);
     try {
       attempt.responder = respond(inputs, msg.payload, size => this.random.bytes(size, 'cpace_scalar_yb'));
       attempt.reply = [exchange(conn, msg.attempt, attempt.responder.message)];
     } catch (error) {
-      if ((error as Error).message === 'BadRandomDraw') throw error;
+      if (!['Malformed', 'InvalidPoint'].includes((error as Error).message)) throw error;
       attempt.reply = [abort(conn, msg.attempt)];
     } finally { inputs.prs.fill(0); }
     return [...shown, ...attempt.reply, ...this.checkExhausted()];
@@ -323,7 +332,8 @@ export class PairingJoiner {
   state: JoinerState = 'connecting';
   private connection?: { id: number; exporters: Exporters; gate: Gate; version?: number };
   private pending?: { id: Uint8Array; initiator: ReturnType<typeof initiate> };
-  private lastReply?: { id: Uint8Array; payload: Uint8Array };
+  private lastReply?: Uint8Array;
+  private learningOutcome = false;
 
   private readonly endpoint: Endpoint;
   private readonly binary: Uint8Array;
@@ -338,29 +348,26 @@ export class PairingJoiner {
 
   connect(id: number, exporters: Exporters, now: number): Effect[] {
     requireThat(this.state === 'connecting', 'wrong_state');
-    checkJoinerExpiry(this.ticket.expiresAt, now);
+    if (!this.learningOutcome) checkJoinerExpiry(this.ticket.expiresAt, now);
     this.connection = { id, exporters, gate: new Gate('caller') };
-    return [send(id, hello)];
-  }
-
-  private joinProof(): Effect {
-    const { id, exporters } = this.connection!;
-    return send(id, { type: 'JOIN_PROOF', invitation: this.ticket.invitation,
+    const joinProof = send(id, { type: 'JOIN_PROOF', invitation: this.ticket.invitation,
       mac: proof(this.ticket, this.endpoint.identity, exporters.join), name: this.endpoint.name });
+    return [send(id, hello), joinProof];
   }
 
   drop() {
+    this.learningOutcome ||= this.state === 'awaiting_paired';
     this.clearAttempt();
     this.connection = undefined;
-    this.lastReply = undefined;
     if (this.state !== 'paired' && this.state !== 'already_paired' && !this.state.startsWith('failed:')) {
-      this.state = this.attemptsLeft === 0 ? 'failed:attempts_exhausted' : 'connecting';
+      this.state = this.attemptsLeft === 0 && !this.learningOutcome ? 'failed:attempts_exhausted' : 'connecting';
     }
   }
 
   private clearAttempt() {
     this.pending?.initiator.dispose();
     this.pending = undefined;
+    this.lastReply = undefined;
   }
 
   submit(code: string): Effect[] {
@@ -378,6 +385,10 @@ export class PairingJoiner {
   }
 
   goaway(code: ErrorName): Effect[] {
+    if (this.state === 'awaiting_paired') {
+      this.drop();
+      return [];
+    }
     this.clearAttempt();
     this.connection?.gate.close(code);
     if (this.state.startsWith('failed:')) return [];
@@ -400,11 +411,16 @@ export class PairingJoiner {
         if (conn.version !== undefined) return [{ ignored: true }];
         try { conn.version = Number(negotiate(hello, msg)); }
         catch { return [close(conn.id, conn.gate, 'unsupported_version')]; }
-        return [{ version: conn.version }, this.joinProof()];
+        return [{ version: conn.version }];
       }
       case 'AUTHORIZED':
-        this.state = msg.state === 'live' ? 'already_paired' :
-          this.ticket.kind === 1 ? 'awaiting_approval' : 'awaiting_code';
+        this.learningOutcome = false;
+        if (msg.state === 'live') {
+          this.state = 'already_paired';
+          return [{ already_paired: true }];
+        }
+        if (this.attemptsLeft === 0) return this.rejectCode();
+        this.state = this.ticket.kind === 1 ? 'awaiting_approval' : 'awaiting_code';
         return [];
       case 'PAIRED':
         if (this.state !== 'awaiting_approval' && this.state !== 'awaiting_paired') {
@@ -434,12 +450,11 @@ export class PairingJoiner {
   }
 
   private confirm(conn: number, msg: Extract<Control, { type: 'CODE_EXCHANGE' }>): Effect[] {
-    if (this.lastReply && equalBytes(this.lastReply.id, msg.attempt) &&
-      equalBytes(this.lastReply.payload, msg.payload)) return [{ ignored: true }];
     const pending = this.pending;
-    if (!pending || !equalBytes(pending.id, msg.attempt)) return [abort(conn, msg.attempt)];
+    if (!pending || !equalBytes(pending.id, msg.attempt)) return [{ ignored: true }];
+    if (this.lastReply && equalBytes(this.lastReply, msg.payload)) return [{ ignored: true }];
     if (this.state !== 'exchanging') return [abort(conn, msg.attempt), ...this.rejectCode()];
-    this.lastReply = { id: msg.attempt.slice(), payload: msg.payload.slice() };
+    this.lastReply = Uint8Array.from(msg.payload);
     try {
       const result = pending.initiator.finish(msg.payload);
       result.isk.fill(0);

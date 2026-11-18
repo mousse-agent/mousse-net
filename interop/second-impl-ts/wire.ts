@@ -139,6 +139,18 @@ export const checkJoinerExpiry = (expires: UInt, now: UInt) => {
 type Route = { skip: 'malformed' | 'unknown_scheme' | 'reserved' } | { mdns: string } |
   { tcp: { host: { ipv4: string } | { ipv6: string } | { dns: string }; port: number } };
 
+function ipv6Hex(address: string): string {
+  // The URL parser serializes a validated IPv6 host with hex groups, including IPv4 tails.
+  const canonical = new URL(`http://[${address}]/`).hostname.slice(1, -1);
+  const [left, right] = canonical.split('::');
+  const groups = left ? left.split(':') : [];
+  if (right !== undefined) {
+    const suffix = right ? right.split(':') : [];
+    groups.push(...Array<string>(8 - groups.length - suffix.length).fill('0'), ...suffix);
+  }
+  return groups.map(group => group.padStart(4, '0')).join('');
+}
+
 export function routeHint(hint: string): Route {
   const colon = hint.indexOf(':');
   const scheme = colon < 0 ? '' : hint.slice(0, colon);
@@ -154,7 +166,8 @@ export function routeHint(hint: string): Route {
   if (port > 65535) return malformed;
   if (host.startsWith('[') && host.endsWith(']')) {
     const ipv6 = host.slice(1, -1);
-    return !ipv6.includes('%') && isIP(ipv6) === 6 ? { tcp: { host: { ipv6 }, port } } : malformed;
+    if (ipv6.includes('%') || isIP(ipv6) !== 6) return malformed;
+    return { tcp: { host: { ipv6: ipv6Hex(ipv6) }, port } };
   }
   if (/^[0-9.]+$/.test(host)) return isIP(host) === 4 ? { tcp: { host: { ipv4: host }, port } } : malformed;
   const labels = host.split('.');
