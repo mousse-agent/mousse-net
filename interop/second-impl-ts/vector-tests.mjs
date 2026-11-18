@@ -2,13 +2,13 @@ import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
 import { test } from 'node:test';
 import { bytes, decode, encode, hex } from './cbor.ts';
-import { checkRaw, derToRaw, issueCertificate, lanCandidate, publicKey, rawToDer, SessionLifetime,
-  sha256, sign, verify, verifyCertificate } from './certificate.ts';
+import { authenticateNativePeer, checkRaw, derToRaw, issueCertificate, lanCandidate, nativeTlsPolicy, publicKey,
+  rawToDer, SessionLifetime, sha256, signCertificateVerify, verify, verifyCertificate } from './certificate.ts';
 import * as cpace from './cpace.ts';
 import { PairingJoiner } from './pairing.ts';
 import { Gate, step2, Streams } from './session.ts';
 import * as wire from './wire.ts';
-import { replayAttemptSequence, replayEndToEnd } from './pairing-replay.mjs';
+import { memoryFlowStore, replayAttemptSequence, replayEndToEnd } from './pairing-replay.mjs';
 
 const directory = new URL('../../spec/vectors/', import.meta.url);
 const fixtures = new Map(readdirSync(directory).filter(file => file.endsWith('.json'))
@@ -62,15 +62,15 @@ function outcome(expected, fn) {
   add('CertificateVerify-style signatures', () => {
     const { message, signature, wrong_key_signature } = sample.tls_signature;
     const proof = bytes(message);
-    matches(rawToDer(sign(proof, bytes(sample.session_secret))), signature);
-    matches(rawToDer(sign(proof, Buffer.alloc(32, 0x44))), wrong_key_signature);
+    matches(rawToDer(signCertificateVerify(proof, bytes(sample.session_secret))), signature);
+    matches(rawToDer(signCertificateVerify(proof, Buffer.alloc(32, 0x44))), wrong_key_signature);
     assert.ok(verify(derToRaw(bytes(signature)), proof, bytes(sample.session_public)));
     assert.equal(verify(derToRaw(bytes(wrong_key_signature)), proof, bytes(sample.session_public)), false);
   });
   for (const item of v.cases) add(item.name, () => {
     outcome(item.result, () => verifyCertificate(bytes(item.certificate), item.now,
       item.expected_identity === null ? undefined : bytes(item.expected_identity)));
-    if (item.name === 'another_endpoint_on_lan_address') {
+    if (['another_endpoint_on_lan_address', 'precedence_pin_before_window', 'expired_with_no_pin'].includes(item.name)) {
       assert.deepEqual(lanCandidate(item.result), { action: 'try_next', send: false, warn: false, repin: false });
     }
   });
@@ -81,23 +81,25 @@ function outcome(expected, fn) {
   const [v, add] = file('session-lifecycle.json');
   const authenticate = (now = v.authenticated_at) => verifyCertificate(bytes(v.peer_certificate), now, bytes(v.pin));
   const mono = now => (now - v.authenticated_at) * 1000;
+  const lifetime = (now = v.authenticated_at, previous) =>
+    new SessionLifetime(v.local_window, authenticate(now).window, { now, mono: mono(now) }, previous);
   function checkTick(life, conn, item, candidateInProgress = false) {
-    const event = life.tick(item.now, mono(item.now), candidateInProgress);
+    const event = life.tick(item.now, item.mono_ms ?? mono(item.now), candidateInProgress);
     const events = event === null ? [] : event === 'renew_due' ? [{ conn, event }] :
       [{ conn, event: 'close', code: event }];
     assert.deepEqual(events, item.events, `tick ${item.now}`);
   }
   add('renewal and expiration timeline', () => {
-    const life = new SessionLifetime(v.local_window, authenticate().window);
+    const life = lifetime();
     assert.equal(life.deadline, v.deadline);
     assert.equal(life.renewAt, v.renew_at);
     for (const tick of v.ticks) checkTick(life, 1, tick);
   });
   add('switch without renewing keeps pending retries', () => {
-    const life = new SessionLifetime(v.local_window, authenticate().window);
+    const life = lifetime();
     const switchAt = v.switch_without_renewal.switch_at;
     for (const tick of v.ticks.filter(tick => tick.now < switchAt)) checkTick(life, 1, tick);
-    const replacement = new SessionLifetime(v.local_window, authenticate(switchAt).window, life);
+    const replacement = lifetime(switchAt, life);
     for (const tick of v.switch_without_renewal.ticks) checkTick(replacement, 2, tick);
   });
   function checkCandidateSteps(life, steps) {
@@ -118,13 +120,18 @@ function outcome(expected, fn) {
     }
   }
   add('retry_while_candidate', () => {
-    const life = new SessionLifetime(v.local_window, authenticate().window);
+    const life = lifetime();
     for (const tick of v.ticks.filter(tick => tick.now <= v.renew_at)) checkTick(life, 1, tick);
     checkCandidateSteps(life, v.retry_while_candidate.steps);
   });
   add('candidate_at_first_renewal', () => {
-    const life = new SessionLifetime(v.local_window, authenticate().window);
+    const life = lifetime();
     checkCandidateSteps(life, v.candidate_at_first_renewal.steps);
+  });
+  add('clock_rollback', () => {
+    const life = lifetime();
+    assert.equal(life.monoDeadline, v.clock_rollback.mono_deadline_ms);
+    for (const tick of v.clock_rollback.ticks) checkTick(life, 1, tick);
   });
   add('handshake after expiration', () => {
     const item = v.new_connection_after_deadline;
@@ -151,6 +158,7 @@ function outcome(expected, fn) {
     const gate = new Gate('caller');
     for (const step of item.steps) {
       if (step.op === 'promote') gate.promote();
+      else if (step.op === 'sent_join_proof') gate.sentJoinProof(step.mono_ms ?? 0);
       else {
         assert.equal(step.op, 'check');
         assert.equal(gate.check(step.traffic), step.verdict);
@@ -408,14 +416,14 @@ function outcome(expected, fn) {
 
 test('lifecycle checks / a renewed path resets the backoff', () => {
   const window = { not_before: 1000, not_after: 5000 };
-  const life = new SessionLifetime(window, window);
+  const life = new SessionLifetime(window, window, { now: 1000, mono: 0 });
   assert.equal(life.tick(life.renewAt, 0, true), null);
   assert.equal(life.tick(life.renewAt + 30, 30000), 'renew_due');
   assert.equal(life.tick(life.renewAt + 90, 90000), 'renew_due');
   assert.equal(life.tick(life.renewAt + 99, 99000), null);
 
   const renewed = { ...window, not_after: 6000 };
-  const replacement = new SessionLifetime(renewed, renewed, life);
+  const replacement = new SessionLifetime(renewed, renewed, { now: life.renewAt + 100, mono: 100000 }, life);
   assert.equal(replacement.tick(life.renewAt + 210, 210000), null);
   assert.equal(replacement.tick(replacement.renewAt, 1000000), 'renew_due');
   assert.equal(replacement.tick(replacement.renewAt + 30, 1030000), 'renew_due');
@@ -427,8 +435,11 @@ test('lifecycle checks / losing PAIRED on the last attempt permits an expired-ti
   const flow = fixture.flows.find(flow => flow.name === 'outcome_after_lost_paired');
   const ticket = bytes(flow.steps.find(step => step.event === 'start').ticket);
   let draw = 0;
-  const joiner = new PairingJoiner({ name: endpoint.name, identity: bytes(endpoint.identity) },
-    ticket, { bytes: length => Buffer.alloc(length, ++draw) }, time);
+  const store = memoryFlowStore();
+  const options = { arrival: 'link', store };
+  const local = { computerName: endpoint.name, identity: bytes(endpoint.identity) };
+  const draws = { bytes: length => Buffer.alloc(length, ++draw) };
+  const joiner = new PairingJoiner(local, ticket, draws, time, options);
   const exporters = { join: Buffer.alloc(32, 1), pair: Buffer.alloc(32, 2) };
   joiner.connect(1, exporters, time);
   joiner.receive(wire.hello);
@@ -440,21 +451,84 @@ test('lifecycle checks / losing PAIRED on the last attempt permits an expired-ti
     joiner.receive({ type: 'CODE_ABORT', attempt: send.attempt, code: wire.errorNumber('pairing_failed') });
   }
   const [{ attempt: { ci, sid } }, { send: first }] = joiner.submit(code);
+  const ticketHash = hex(sha256(ticket));
+  assert.deepEqual([...decode(store.load(ticketHash)).values()].slice(2), [0n, 0n]);
   const host = cpace.respond({ ci: bytes(ci), sid: bytes(sid), prs: Buffer.from(code), ad: Buffer.alloc(0) },
     first.payload, length => Buffer.alloc(length, 42));
   const [{ send: last }] = joiner.receive({ type: 'CODE_EXCHANGE', attempt: first.attempt, payload: host.message });
   host.finish(last.payload).isk.fill(0);
+  assert.deepEqual([...decode(store.load(ticketHash)).values()].slice(2), [0n, 1n]);
 
-  joiner.drop();
   const retryExporters = { join: Buffer.alloc(32, 3), pair: Buffer.alloc(32, 4) };
-  const messages = joiner.connect(2, retryExporters, Number(joiner.ticket.expiresAt) + 600);
+  const reopenedAt = Number(joiner.ticket.expiresAt) + 600;
+  const restored = new PairingJoiner(local, ticket, draws, reopenedAt, options);
+  const messages = restored.connect(2, retryExporters, reopenedAt);
   assert.deepEqual(messages.map(effect => effect.send.type), ['HELLO', 'JOIN_PROOF']);
+  restored.receive(wire.hello);
+  const live = { type: 'AUTHORIZED', state: 'live' };
+  assert.deepEqual(restored.receive(live), []);
+  assert.deepEqual(restored.receive(live), [{ already_paired: true }]);
+  assert.deepEqual(restored.snapshot(), { attempts_left: 0, live: true, state: 'already_paired' });
+  assert.throws(() => new PairingJoiner(local, ticket, draws, time, options), { message: 'attempts_exhausted' });
+  const wrongRecord = encode(decode(store.load(ticketHash)).set(2n, Buffer.alloc(32)));
+  const mismatchedStore = { ...store, load: () => wrongRecord };
+  assert.throws(() => new PairingJoiner(local, ticket, draws, time, { ...options, store: mismatchedStore }),
+    { message: 'flow_ticket_mismatch' });
+});
+
+test('pairing checks / a repeated host share fails the active attempt', () => {
+  const { conventions, flows } = fixtures.get('pairing-e2e.json');
+  const { time, joiner: endpoint } = conventions;
+  const { ticket } = flows.find(flow => flow.name === 'send_link').steps.find(step => step.event === 'start');
+  const local = { computerName: endpoint.name, profileName: 'Private profile', identity: bytes(endpoint.identity) };
+  const joiner = new PairingJoiner(local, bytes(ticket), { bytes: length => Buffer.alloc(length, 3) }, time,
+    { arrival: 'link', store: memoryFlowStore() });
+  const exporters = { join: Buffer.alloc(32, 1), pair: Buffer.alloc(32, 2) };
+  const [, { send: proof }] = joiner.connect(1, exporters, time);
+  assert.equal(proof.name, local.computerName);
   joiner.receive(wire.hello);
-  assert.deepEqual(joiner.receive({ type: 'AUTHORIZED', state: 'live' }), [{ already_paired: true }]);
-  assert.deepEqual(joiner.snapshot(), { attempts_left: 0, live: true, state: 'already_paired' });
+  joiner.receive({ type: 'AUTHORIZED', state: 'join_only' });
+  const code = '012345';
+  const [{ attempt: { ci, sid } }, { send: first }] = joiner.submit(code);
+  const host = cpace.respond({ ci: bytes(ci), sid: bytes(sid), prs: Buffer.from(code), ad: Buffer.alloc(0) },
+    first.payload, length => Buffer.alloc(length, 42));
+  const share = { type: 'CODE_EXCHANGE', attempt: first.attempt, payload: host.message };
+  const [{ send: last }] = joiner.receive(share);
+  host.finish(last.payload).isk.fill(0);
+  assert.deepEqual(joiner.receive(share), [
+    { conn: 1, send: { type: 'CODE_ABORT', attempt: first.attempt, code: wire.errorNumber('pairing_failed') } },
+    { code_rejected: { attempts_left: 2 } },
+  ]);
 });
 
 test('coverage / all JSON files registered', () => assert.deepEqual([...used].sort(), [...fixtures.keys()].sort()));
+
+test('TLS policy / native transport facts must describe a full hybrid handshake', () => {
+  const { valid } = fixtures.get('session-cert.json');
+  const certificate = bytes(valid.certificate);
+  const pin = bytes(valid.identity_public);
+  const handshake = {
+    version: 'TLSv1.3', alpn: 'mousse/1', group: 'X25519MLKEM768', signatureScheme: 'ecdsa_secp256r1_sha256',
+    mutualCertificates: true, resumed: false, psk: false, earlyData: false,
+  };
+  assert.deepEqual(nativeTlsPolicy.groups, ['X25519MLKEM768', 'X25519']);
+  const authenticate = facts => authenticateNativePeer(facts, certificate, valid.not_before, pin);
+  matches(authenticate(handshake).identity, valid.identity_public);
+  for (const bad of [{ version: 'TLSv1.2' }, { group: 'X25519' }, { signatureScheme: 'ed25519' },
+    { mutualCertificates: false }, { resumed: true }, { psk: true }, { earlyData: true }]) {
+    outcome('tls_policy', () => authenticate({ ...handshake, ...bad }));
+  }
+  outcome('unsupported_version', () => authenticate({ ...handshake, alpn: 'mousse/2' }));
+});
+
+test('authorization checks / the proof timeout starts at send and survives the live notice', () => {
+  const gate = new Gate('caller');
+  gate.sentJoinProof(70);
+  assert.equal(gate.timeout(10069), null);
+  assert.equal(gate.check('authorized_live'), 'allow');
+  assert.equal(gate.timeout(10070), 'not_authorized');
+  assert.equal(gate.check('authorized_live'), 'ignore');
+});
 
 test('flow control / initial credit, replenishment and FIN', () => {
   const streams = new Streams('host');
@@ -490,4 +564,18 @@ test('flow control / peer stream cap and send-credit cap', () => {
   streams.receive({ type: 'credit', stream: 4, increment: 2 ** 30 - 262144 });
   assert.deepEqual(streams.receive({ type: 'credit', stream: 4, increment: 1 }),
     { reply: { type: 'goaway', code: wire.errorNumber('flow_control') } });
+});
+
+test('flow control / only the caller can open the first stream', () => {
+  const host = new Streams('host', new Gate('host', 'live'));
+  const callerGate = new Gate('caller');
+  assert.equal(callerGate.check('authorized_live'), 'allow');
+  const caller = new Streams('caller', callerGate);
+  const hostOpen = { type: 'open', stream: 2, class: 0, label: 'rpc' };
+  const callerOpen = { ...hostOpen, stream: 1 };
+  outcome('protocol_error', () => host.sent(hostOpen));
+  caller.sent(callerOpen);
+  assert.deepEqual(host.receive(callerOpen), { event: callerOpen });
+  host.sent(hostOpen);
+  assert.deepEqual(caller.receive(hostOpen), { event: hostOpen });
 });

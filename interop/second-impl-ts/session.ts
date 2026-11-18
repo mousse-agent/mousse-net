@@ -5,7 +5,8 @@ import type { ErrorName, Frame, Version } from './wire.ts';
 
 export interface Grant { identity: string; expires_at: number | null; role: string }
 type Verdict = 'allow' | 'ignore' | `close:${ErrorName}`;
-type GateState = 'await_join_proof' | 'awaiting_authorization' | 'join_only' | 'live' | `closed:${ErrorName}`;
+type GateState = 'await_join_proof' | 'awaiting_authorization' | 'awaiting_proof_answer' |
+  'join_only' | 'live' | `closed:${ErrorName}`;
 export type Traffic = 'hello' | 'keepalive' | 'goaway' | 'stream' | 'paired' | 'pairing' |
   'join_proof' | 'authorized_live' | 'authorized_join_only' | 'host_only' | 'caller_only';
 
@@ -20,6 +21,10 @@ export class Gate {
   readonly side: 'host' | 'caller';
   private readonly start: number;
   private agreed?: UInt;
+  private proofUsed = false;
+  private proofSentAt?: number;
+  private streamSeen = false;
+  private callerOpened = false;
   constructor(side: 'host' | 'caller', initial?: ReturnType<typeof step2>, start = 0) {
     this.side = side;
     this.start = start;
@@ -46,7 +51,8 @@ export class Gate {
   }
 
   admit() {
-    requireThat(this.state === 'await_join_proof', 'protocol_error');
+    requireThat(this.state === 'await_join_proof' || (this.state === 'live' && this.proofUsed), 'protocol_error');
+    this.proofUsed = true;
     this.state = 'join_only';
   }
 
@@ -56,9 +62,27 @@ export class Gate {
   }
 
   timeout(now: number): ErrorName | null {
-    if (this.state !== 'await_join_proof' || now - this.start < 10000) return null;
+    const since = this.state === 'await_join_proof' ? this.start : this.proofSentAt;
+    if (this.state.startsWith('closed:') || since === undefined || now - since < 10000) return null;
     this.close('not_authorized');
     return 'not_authorized';
+  }
+
+  sentJoinProof(now: number) {
+    requireThat(this.side === 'caller' && !this.proofUsed && !this.streamSeen &&
+      (this.state === 'awaiting_authorization' || this.state === 'live'), 'protocol_error');
+    this.proofUsed = true;
+    this.proofSentAt = now;
+    if (this.state === 'live') this.state = 'awaiting_proof_answer';
+  }
+
+  canOpenStream(side: 'host' | 'caller') {
+    return this.state === 'live' && (side === 'caller' || this.callerOpened);
+  }
+
+  openedStream(side: 'host' | 'caller') {
+    this.streamSeen = true;
+    if (side === 'caller') this.callerOpened = true;
   }
 
   check(traffic: Traffic): Verdict {
@@ -67,10 +91,16 @@ export class Gate {
 
     if (this.side === 'host') {
       switch (traffic) {
-        case 'stream': return this.state === 'live' ? 'allow' : this.close('not_authorized');
+        case 'stream':
+          if (this.state !== 'live') return this.close('not_authorized');
+          this.streamSeen = true;
+          return 'allow';
         case 'join_proof':
-          if (this.state === 'await_join_proof') return 'allow';
-          return this.state === 'live' ? 'ignore' : this.close('protocol_error');
+          if (this.proofUsed || this.streamSeen || (this.state !== 'await_join_proof' && this.state !== 'live')) {
+            return this.close('protocol_error');
+          }
+          this.proofUsed = true;
+          return 'allow';
         case 'pairing':
           if (this.state === 'join_only') return 'allow';
           return this.state === 'live' ? 'ignore' : this.close('not_authorized');
@@ -81,10 +111,20 @@ export class Gate {
     switch (traffic) {
       case 'authorized_live':
       case 'authorized_join_only':
-        if (this.state !== 'awaiting_authorization') return this.close('protocol_error');
+        if (this.state === 'awaiting_authorization' && traffic === 'authorized_live' && this.proofSentAt !== undefined) {
+          this.state = 'awaiting_proof_answer';
+          return 'allow';
+        }
+        if (this.state !== 'awaiting_authorization' && this.state !== 'awaiting_proof_answer') {
+          return this.close('protocol_error');
+        }
+        this.proofSentAt = undefined;
         this.state = traffic === 'authorized_live' ? 'live' : 'join_only';
         return 'allow';
-      case 'stream': return this.state === 'live' ? 'allow' : this.close('protocol_error');
+      case 'stream':
+        if (this.state !== 'live') return this.close('protocol_error');
+        this.streamSeen = true;
+        return 'allow';
       case 'paired': return this.state === 'join_only' ? 'allow' : this.close('protocol_error');
       case 'pairing':
         if (this.state === 'join_only') return 'allow';
@@ -117,7 +157,12 @@ export class Streams {
   private peerCount = 0;
   private closed = false;
   private readonly side: 'host' | 'caller';
-  constructor(side: 'host' | 'caller') { this.side = side; }
+  private readonly gate?: Gate;
+  constructor(side: 'host' | 'caller', gate?: Gate) {
+    requireThat(gate === undefined || gate.side === side, 'protocol_error');
+    this.side = side;
+    this.gate = gate;
+  }
 
   private forget(id: number, stream: Stream) {
     if (stream.peerOpened) this.peerCount--;
@@ -182,10 +227,17 @@ export class Streams {
   receive(frame: Frame): Receipt {
     if (this.closed) return {};
     if ('stream' in frame) {
+      const peer = this.side === 'host' ? 'caller' : 'host';
+      if (this.gate) {
+        const verdict = this.gate.check('stream');
+        if (verdict === 'ignore') return {};
+        if (verdict !== 'allow') return this.protocolClose(verdict.slice(6) as ErrorName);
+        if (frame.type === 'open' && !this.gate.canOpenStream(peer)) return this.protocolClose('protocol_error');
+      }
       const result = this.streamFrame(frame, true);
-      if (!('close' in result)) return result;
-      this.end();
-      return { reply: { type: 'goaway', code: errorNumber(result.close) } };
+      if ('close' in result) return this.protocolClose(result.close);
+      if (result.event?.type === 'open') this.gate?.openedStream(peer);
+      return result;
     }
     if (frame.type === 'ping') return { reply: { type: 'pong', opaque: frame.opaque } };
     if (frame.type === 'goaway') this.end();
@@ -195,10 +247,19 @@ export class Streams {
   sent(frame: Frame): void {
     if (this.closed) return;
     if ('stream' in frame) {
+      requireThat(!this.gate || this.gate.state === 'live', 'not_authorized');
+      if (frame.type === 'open') requireThat(!this.gate || this.gate.canOpenStream(this.side), 'protocol_error');
       const result = this.streamFrame(frame, false);
       if ('close' in result) throw new Error(result.close);
+      if (result.event?.type === 'open') this.gate?.openedStream(this.side);
     }
     if (frame.type === 'goaway') this.end();
+  }
+
+  private protocolClose(code: ErrorName): Receipt {
+    this.gate?.close(code);
+    this.end();
+    return { reply: { type: 'goaway', code: errorNumber(code) } };
   }
 
   private end() {

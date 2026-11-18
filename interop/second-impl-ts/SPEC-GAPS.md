@@ -4,9 +4,9 @@
 
 | Original gap | Spec section and rule |
 | --- | --- |
-| Join proof timing | `wire.md` §8 and §10.3. Send `JOIN_PROOF` immediately after the joiner's `HELLO`. The host runs step 2 at connection start and ignores the proof if it found a live grant. |
-| Messages after an attempt ends | `wire.md` §8.1 and §10.7. Apply the gate first. An identical exchange payload gets the cached reply. `CODE_ABORT` ends the attempt and preserves the cached payload and reply. |
-| Responder draws on a bad first message | `wire.md` §10.6 and `cpace.md` §5.3. Debit the attempt and draw the next code (if needed) and responder scalar before parsing the first message. |
+| Join proof timing | `wire.md` §8 and §10.3. Send `JOIN_PROOF` immediately after the joiner's `HELLO`. A live host gives its step 2 notice and then answers the proof separately. |
+| Messages after an attempt ends | `wire.md` §8.1 and §10.7. Apply the gate first. On the same TLS session, a repeat during an attempt fails the attempt and a message for an ended attempt gets `CODE_ABORT` without another debit. On a different TLS session, that ID represents a new attempt and spends a debit. |
+| Responder draws on a bad first message | `wire.md` §10.6 and `cpace.md` §5.3. The replay follows the harness convention and draws the next code (if needed) and responder scalar before parsing the first message. |
 | Repeated `HELLO` | `wire.md` §2. The first `HELLO` fixes the version. Ignore any later `HELLO`. |
 | Certificate error precedence | `wire.md` §§5.3–5.4. The verifier checks extension lengths at the identity key and raw-signature steps. Malformed self-signature DER fails the profile check. Well-formed out-of-range scalars fail the self-signature check. |
 | Inputs for attempt replays | `wire.md` §10.6 and `pairing-attempts.json` conventions. The fixture supplies the ticket, draws, exporter derivation and expected wire bytes. |
@@ -19,7 +19,14 @@
 
 ## Open
 
-None.
+- `wire.md` §10.3 specifies `<computer> (<profile>)` for an in-app scan.
+  The in-person fixtures supply only a flat name, such as `Phone`. The
+  replay uses the supplied name and the pairing API formats both parts when
+  a profile label is supplied. Send-link proofs use only the computer name.
+- `wire.md` §8.2 specifies a 10-second proof timeout with
+  `NOT_AUTHORIZED`. It leaves retry policy after that timeout while
+  recovering a lost `PAIRED` to the caller. This package treats that
+  timeout as a terminal flow failure.
 
 The browser Worker certificate is pending in `session-cert.json` and
 has no certificate bytes.

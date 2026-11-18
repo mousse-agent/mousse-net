@@ -1,9 +1,22 @@
 import assert from 'node:assert/strict';
-import { bytes, hex } from './cbor.ts';
-import { publicKey, sha256 } from './certificate.ts';
+import { bytes, decode, hex } from './cbor.ts';
+import { equalBytes, publicKey, sha256 } from './certificate.ts';
 import { PairingHost, PairingJoiner } from './pairing.ts';
 import { decodeControl, decodeFrame, decodeTicket, encodeControl, encodeFragment, encodeFrame, errorNumber,
-  readError } from './wire.ts';
+  hello, joinProof, readError } from './wire.ts';
+
+export function memoryFlowStore() {
+  const records = new Map();
+  return {
+    load(hash) { return records.get(hash); },
+    save(hash, next, previous) {
+      const current = records.get(hash);
+      if (current === undefined ? previous !== undefined : !previous || !equalBytes(current, previous)) return false;
+      records.set(hash, Uint8Array.from(next));
+      return true;
+    },
+  };
+}
 
 class ScriptedDraws {
   #offset = 0;
@@ -46,13 +59,14 @@ function onWire(control) {
 export function replayEndToEnd(flow, input) {
   const { time: now, host: hostInput, joiner: joinerInput, invitation } = input;
   const hostEndpoint = { identity: publicKey(bytes(hostInput.identity_secret)), name: hostInput.name };
-  const joinerEndpoint = { identity: publicKey(bytes(joinerInput.identity_secret)), name: joinerInput.name };
+  const joinerEndpoint = { identity: publicKey(bytes(joinerInput.identity_secret)), computerName: joinerInput.name };
   assert.equal(hex(hostEndpoint.identity), hostInput.identity);
   assert.equal(hex(joinerEndpoint.identity), joinerInput.identity);
   const policy = { authorizingOwner: invitation.authorizing_owner, grantExpiresAt: invitation.grant_expires_at,
     role: invitation.role, routes: invitation.routes };
   const hostDraws = new ScriptedDraws(flow.draws.host);
   const joinerDraws = new Map(Object.entries(flow.draws.joiners).map(([name, draws]) => [name, new ScriptedDraws(draws)]));
+  const stores = new Map([...joinerDraws.keys()].map(name => [name, memoryFlowStore()]));
   const joiners = new Map();
   const routes = new Map();
   const parties = new Map();
@@ -111,12 +125,34 @@ export function replayEndToEnd(flow, input) {
         return [{ ticket: { binary: hex(host.binary), fragment: encodeFragment(host.binary),
           hash: hex(sha256(host.binary)), shown_code: host.shownCode } }];
       }
+      case 'grant': {
+        const identity = hex(joinerEndpoint.identity);
+        host.grants.set(identity, { identity, name: step.name, role: policy.role, authorizing_owner: policy.authorizingOwner,
+          expires_at: policy.grantExpiresAt, granted_at: now, bound_connections: [] });
+        return [];
+      }
       case 'start': {
         assert.ok(step.host_pinned === undefined || typeof step.host_pinned === 'boolean');
+        assert.ok(step.identity === undefined || step.identity === 'host');
+        assert.ok(step.arrival === 'in_app_scan' || step.arrival === 'link');
         const ticket = bytes(step.ticket);
         const pinnedHost = step.host_pinned ? decodeTicket(ticket).hostIdentity : undefined;
-        joiners.set(party, new PairingJoiner(joinerEndpoint, ticket, joinerDraws.get(party), now, pinnedHost));
+        const endpoint = step.identity === 'host' ? { ...joinerEndpoint, identity: hostEndpoint.identity } : joinerEndpoint;
+        const store = stores.get(party);
+        if (step.record !== undefined) assert.equal(hex(store.load(hex(sha256(ticket)))), step.record);
+        try {
+          joiners.set(party, new PairingJoiner(endpoint, ticket, joinerDraws.get(party), now,
+            { arrival: step.arrival, store, pinnedHost }));
+        } catch (error) {
+          if (!['in_person_from_link', 'own_ticket', 'attempts_exhausted'].includes(error.message)) throw error;
+          return [{ error: error.message }];
+        }
         return [];
+      }
+      case 'save': {
+        const record = joiner.flowRecord();
+        assert.deepEqual(Buffer.from(record), Buffer.from(stores.get(party).load(hex(decode(record).get(2n)))));
+        return [{ record: hex(record) }];
       }
       case 'connect': {
         const real = step.host !== false;
@@ -208,7 +244,7 @@ export function replayAttemptSequence(sequence, input) {
     function receiveAtHost(id, message, deliver = true) {
       const effects = host.receive(id, onWire(message), now);
       fromHost(effects, deliver);
-      return effects.flatMap(effect => effect.send ? [hex(encodeControl(effect.send))] : []);
+      return effects.flatMap(effect => effect.send ? [effect.send] : []);
     }
 
     function toHost(from, id, message, deliver = true) {
@@ -260,8 +296,10 @@ export function replayAttemptSequence(sequence, input) {
       case 'connect': {
         let endpoint = joiners.get(label)?.endpoint;
         if (!endpoint) {
-          endpoint = { name: label, identity: publicKey(Buffer.alloc(32, 0x50 + joiners.size)) };
-          const joiner = new PairingJoiner(endpoint, host.binary, draws.get(label), now);
+          endpoint = { computerName: label, identity: publicKey(Buffer.alloc(32, 0x50 + joiners.size)) };
+          const arrival = host.ticket.kind === 1 ? 'in_app_scan' : 'link';
+          const joiner = new PairingJoiner(endpoint, host.binary, draws.get(label), now,
+            { arrival, store: memoryFlowStore() });
           joiners.set(label, { endpoint, joiner });
         }
         const { joiner } = joiners.get(label);
@@ -277,6 +315,22 @@ export function replayAttemptSequence(sequence, input) {
         receiveAtHost(conn, proof);
         break;
       }
+      case 'connect_as_host': {
+        const exporters = { join: Buffer.alloc(32, conn), pair: Buffer.alloc(32, conn + 100) };
+        const [{ send: hostHello }, ...hostEffects] = host.connect(conn, hostEndpoint.identity, exporters, now);
+        assert.deepEqual(hostHello, hello);
+        assert.deepEqual(host.receive(conn, onWire(hello), now), [{ version: 0 }]);
+        const { invitation, secret } = host.ticket;
+        const { key, mac } = joinProof(invitation, secret, {
+          host: hostEndpoint.identity, joiner: hostEndpoint.identity, exporter: exporters.join,
+        });
+        key.fill(0);
+        const proof = { type: 'JOIN_PROOF', invitation, mac, name: label };
+        recordSend(label, conn, proof);
+        fromHost(hostEffects);
+        receiveAtHost(conn, proof);
+        break;
+      }
       case 'submit':
       case 'submit_first': {
         const current = host.shownCode;
@@ -286,8 +340,8 @@ export function replayAttemptSequence(sequence, input) {
         const first = submitted.find(effect => effect.send)?.send;
         if (first) {
           lastCode = current;
-          const response = toHost(label, conn, first, op === 'submit');
-          firstMessages.set(label, { first, response });
+          toHost(label, conn, first, op === 'submit');
+          firstMessages.set(label, first);
         } else {
           result = submitted[0]?.error;
         }
@@ -298,9 +352,9 @@ export function replayAttemptSequence(sequence, input) {
         const previous = firstMessages.get(label);
         let message;
         if (op === 'redeliver') {
-          message = previous.first;
+          message = previous;
         } else {
-          const attempt = step.attempt === 'current' ? previous.first.attempt : bytes(step.attempt);
+          const attempt = step.attempt === 'current' ? previous.attempt : bytes(step.attempt);
           if (step.message === 'code_exchange') {
             message = { type: 'CODE_EXCHANGE', attempt, payload: bytes(step.payload) };
           } else {
@@ -311,9 +365,11 @@ export function replayAttemptSequence(sequence, input) {
         const response = toHost(label, conn, message, false);
         const abort = encodeControl({ type: 'CODE_ABORT', attempt: message.attempt, code: errorNumber('pairing_failed') });
         if (!response.length) reply = 'none';
-        else if (op === 'redeliver' && response.length === previous.response.length &&
-          response.every((payload, index) => payload === previous.response[index])) reply = 'first_reply';
-        else if (response.length === 1 && response[0] === hex(abort)) reply = 'code_abort';
+        else if (response.length === 1) {
+          const [answer] = response;
+          if (answer.type === 'CODE_EXCHANGE' && equalBytes(answer.attempt, message.attempt)) reply = 'code_exchange';
+          if (equalBytes(encodeControl(answer), abort)) reply = 'code_abort';
+        }
         break;
       }
       case 'drop':

@@ -102,8 +102,12 @@ export function rawToDer(raw: Uint8Array): Buffer {
   return der(0x30, ...integers);
 }
 
-export function sign(message: Uint8Array, secret: Uint8Array): Uint8Array {
+function sign(message: Uint8Array, secret: Uint8Array): Uint8Array {
   return p256.sign(message, secret, { prehash: true, lowS: false });
+}
+
+export function signCertificateVerify(message: Uint8Array, sessionSecret: Uint8Array): Uint8Array {
+  return sign(message, sessionSecret);
 }
 
 export function verify(signature: Uint8Array, message: Uint8Array, key: Uint8Array): boolean {
@@ -150,6 +154,17 @@ function delegation(spki: Uint8Array, window: Window, version: bigint) {
   return encode(record([1, 'mousse-session-v1'], [2, spki], [3, window.not_before], [4, window.not_after], [5, version]));
 }
 
+class IdentitySigner {
+  readonly #secret: Uint8Array;
+
+  constructor(secret: Uint8Array) { this.#secret = secret; }
+
+  signSession(spki: Uint8Array, window: Window) {
+    const record = delegation(spki, window, 1n);
+    return { record, signature: sign(record, this.#secret) };
+  }
+}
+
 function tbs(spki: Uint8Array, window: Window, serial: Uint8Array, extension: Uint8Array) {
   return der(0x30, versionField, der(2, serial), algorithm, name,
     der(0x30, time(window.not_before), time(window.not_after)), name, spki,
@@ -160,10 +175,10 @@ export function issueCertificate(identitySecret: Uint8Array, sessionSecret: Uint
   requireThat(goodWindow(window), 'window_invalid');
   const identityPublic = publicKey(identitySecret);
   const sessionPublic = publicKey(sessionSecret);
+  requireThat(!equalBytes(identityPublic, sessionPublic), 'session_key_invalid');
   const spki = concat(spkiPrefix, sessionPublic);
   const serial = serialNumber(spki);
-  const record = delegation(spki, window, 1n);
-  const identitySignature = sign(record, identitySecret);
+  const { record, signature: identitySignature } = new IdentitySigner(identitySecret).signSession(spki, window);
   const extensionValue = der(0x30, der(2, Buffer.of(1)), der(4, identityPublic), der(4, identitySignature));
   const body = tbs(spki, window, serial, extensionValue);
   const certificate = der(0x30, body, algorithm, der(3, Buffer.of(0), rawToDer(sign(body, sessionSecret))));
@@ -211,9 +226,9 @@ function parseCertificate(certificate: Uint8Array) {
   return { window, spki, session, identity, version, rawSelf, rawIdentity, body: body.encoded };
 }
 
-export function verifyCertificate(certificate: Uint8Array, now: number, pin?: Uint8Array) {
+export function verifyCertificate(certificate: Uint8Array, now: number, pin?: Uint8Array, alpnMajor = 1n) {
   const c = parseCertificate(certificate);
-  requireThat(c.version === 1n, 'unsupported_version');
+  requireThat(c.version === 1n && c.version === alpnMajor, 'unsupported_version');
   requireThat(validPoint(c.identity), 'identity_key_invalid');
   requireThat(validPoint(c.session), 'session_key_invalid');
   requireThat(c.rawIdentity.length === 64, 'identity_signature_not_raw');
@@ -222,13 +237,46 @@ export function verifyCertificate(certificate: Uint8Array, now: number, pin?: Ui
   if (process.env.MOUSSE_SECOND_BREAK !== 'verifier') {
     requireThat(verify(c.rawIdentity, delegation(c.spki, c.window, c.version), c.identity), 'identity_signature_invalid');
   }
-  requireThat(now >= c.window.not_before - 600 && now <= c.window.not_after + 600, 'outside_window');
   requireThat(!pin || equalBytes(pin, c.identity), 'pin_mismatch');
+  requireThat(now >= c.window.not_before - 600 && now <= c.window.not_after + 600, 'outside_window');
   return { window: c.window, identity: c.identity, session: c.session };
 }
 
 export function lanCandidate(result: string) {
-  return result === 'pin_mismatch' ? { action: 'try_next', send: false, warn: false, repin: false } : null;
+  return result === 'ok' ? null : { action: 'try_next', send: false, warn: false, repin: false };
+}
+
+export const nativeTlsPolicy = Object.freeze({
+  version: 'TLSv1.3',
+  alpn: 'mousse/1',
+  groups: Object.freeze(['X25519MLKEM768', 'X25519']),
+  requiredGroup: 'X25519MLKEM768',
+  signatureScheme: 'ecdsa_secp256r1_sha256',
+  mutualCertificates: true,
+  resumption: false,
+  psk: false,
+  earlyData: false,
+});
+
+interface NativeHandshake {
+  version: string;
+  alpn: string;
+  group: string;
+  signatureScheme: string;
+  mutualCertificates: boolean;
+  resumed: boolean;
+  psk: boolean;
+  earlyData: boolean;
+}
+
+// The transport supplies these facts and verifies CertificateVerify itself.
+export function authenticateNativePeer(handshake: NativeHandshake, certificate: Uint8Array, now: number, pin?: Uint8Array) {
+  const policy = nativeTlsPolicy;
+  requireThat(handshake.alpn === policy.alpn, 'unsupported_version');
+  requireThat(handshake.version === policy.version && handshake.group === policy.requiredGroup &&
+    handshake.signatureScheme === policy.signatureScheme && handshake.mutualCertificates &&
+    !handshake.resumed && !handshake.psk && !handshake.earlyData, 'tls_policy');
+  return verifyCertificate(certificate, now, pin, 1n);
 }
 
 const renewalWaits = [30, 60, 120, 240, 300];
@@ -236,14 +284,16 @@ const renewalWaits = [30, 60, 120, 240, 300];
 export class SessionLifetime {
   readonly renewAt: number;
   readonly deadline: number;
+  readonly monoDeadline: number;
   private nextRetry?: number;
   private retry = 0;
   private closed = false;
 
-  constructor(local: Window, peer: Window, previous?: SessionLifetime) {
+  constructor(local: Window, peer: Window, authenticated: { now: number; mono: number }, previous?: SessionLifetime) {
     const end = Math.min(local.not_after, peer.not_after);
     this.renewAt = Math.max(local.not_before, peer.not_before, end - 1800);
     this.deadline = end + 600;
+    this.monoDeadline = authenticated.mono + (this.deadline + 1 - authenticated.now) * 1000;
     if (previous && this.renewAt <= previous.renewAt) {
       this.nextRetry = previous.nextRetry;
       this.retry = previous.retry;
@@ -252,7 +302,7 @@ export class SessionLifetime {
 
   tick(now: number, mono: number, candidateInProgress = false): 'cert_expired' | 'renew_due' | null {
     if (this.closed) return null;
-    if (now > this.deadline) {
+    if (now > this.deadline || mono >= this.monoDeadline) {
       this.closed = true;
       return 'cert_expired';
     }
