@@ -180,6 +180,25 @@ fn live_path_closes_at_certificate_expiry() {
     session.on_reopened(second).expect("reopened");
     check_ticks(&mut session, &switch["ticks"]);
 
+    // A retry skipped while a candidate comes up still counts.
+    let skipped = &doc["retry_while_candidate"];
+    let mut session = PeerSession::new(pin);
+    session.begin_path(conn);
+    session
+        .on_authenticated(conn, &peer, local, at)
+        .expect("authenticated");
+    session.on_reopened(conn).expect("reopened");
+    assert_eq!(session.tick(path.renew_at).len(), 1);
+    for step in list(&skipped["steps"]) {
+        let id = || ConnectionId(u(&step["conn"]));
+        match s(&step["op"]) {
+            "tick" => check_ticks(&mut session, &J::Array(vec![step.clone()])),
+            "begin_path" => assert!(session.begin_path(id()).is_empty()),
+            "path_closed" => session.on_path_closed(id()),
+            other => panic!("op {other}"),
+        }
+    }
+
     let late = &doc["new_connection_after_deadline"];
     let err = session_cert::verify(
         &unhex(&doc["peer_certificate"]),
