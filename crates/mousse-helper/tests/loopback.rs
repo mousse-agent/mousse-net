@@ -1050,7 +1050,9 @@ fn a_link_being_joined_in_another_process_is_refused_until_that_process_ends() {
     let ticket = invite.wait_for("TICKET ", WAIT)["TICKET ".len()..].to_owned();
 
     let first = phone.spawn_with_stdin(&["join", &ticket]);
-    lines_with(&first, "shown on the host", 1);
+    // The code prompt comes once the host admitted the join, which is
+    // after the join took the link: the banner before it does not.
+    lines_with(&first, "Type the 6-digit code", 1);
     let second = phone.run(&["join", &ticket]);
     assert_eq!(second.code, Some(2), "{}", second.text());
     assert!(
@@ -1063,7 +1065,7 @@ fn a_link_being_joined_in_another_process_is_refused_until_that_process_ends() {
 
     drop(first);
     let mut again = phone.spawn_with_stdin(&["join", &ticket]);
-    lines_with(&again, "shown on the host", 1);
+    lines_with(&again, "Type the 6-digit code", 1);
     let codes = lines_with(&invite, "CODE ", 1);
     let code = codes[codes.len() - 1]
         .split_whitespace()

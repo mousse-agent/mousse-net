@@ -51,7 +51,7 @@ use crate::error::NetError;
 use crate::limits::{ms, Limits};
 use crate::pipe::Pipe;
 use crate::rng::os_rng;
-use crate::store::{GrantStore, WriteFailure};
+use crate::store::{GrantStore, PendingEnrollment, WriteFailure};
 use crate::tls::{self, TlsPolicy};
 use crate::SharedSigner;
 
@@ -246,6 +246,28 @@ where
         }
     }
 
+    /// Save the table holding the enrollments `pending`, so that a restart
+    /// honors them only if this returns `Ok`: they are recorded as pending
+    /// first, then the table is saved, then the record is cleared. Until
+    /// it is cleared a load drops their grants, so a failure at any step,
+    /// and a restart before the table without them is saved, leaves none
+    /// of them in force.
+    fn save_enrollment(&mut self, pending: &[PendingEnrollment]) -> Result<(), WriteFailure> {
+        let Some(store) = self.store.clone() else {
+            return Ok(());
+        };
+        let events = self.events.clone();
+        let failed = move |error: NetError, in_place: bool| {
+            let _ = events.send(HostEvent::StoreFailed(error.to_string()));
+            WriteFailure { error, in_place }
+        };
+        if let Err(e) = store.begin_enrollments(pending) {
+            return Err(failed(e, false));
+        }
+        self.persist_checked()?;
+        store.commit_enrollments().map_err(|e| failed(e, true))
+    }
+
     /// Whether grants may be served: no rolled-back enrollment is waiting
     /// to be saved away.
     fn serving(&self) -> bool {
@@ -319,17 +341,29 @@ where
         before: GrantTable,
         actions: Vec<HostAction>,
     ) -> Vec<HostAction> {
-        let enrolling: Vec<ConnectionId> = actions
+        let (enrolling, pending): (Vec<ConnectionId>, Vec<PendingEnrollment>) = actions
             .iter()
             .filter_map(|a| match a {
-                HostAction::Enrolled { conn, .. } => Some(*conn),
+                HostAction::Enrolled {
+                    invitation,
+                    conn,
+                    grant,
+                    identity,
+                } => Some((
+                    *conn,
+                    PendingEnrollment {
+                        grant: *grant,
+                        identity: *identity,
+                        invitation: *invitation,
+                    },
+                )),
                 _ => None,
             })
-            .collect();
+            .unzip();
         if enrolling.is_empty() {
             return actions;
         }
-        let failure = match self.persist_checked() {
+        let failure = match self.save_enrollment(&pending) {
             Ok(()) => return actions,
             Err(f) => f,
         };
@@ -1256,6 +1290,85 @@ mod tests {
         assert!(within("served again", hosted.accept_stream())
             .await
             .is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Approve an in-person join of `host` while saves fail as `table` and
+    /// `pending` plan, expect the pairing to fail, then restart the host
+    /// from its folder, with the old host's ticker stopped so nothing
+    /// retries the save first.
+    async fn failed_enrollment_then_restart(
+        tag: &str,
+        table: &[crate::private::faults::Fault],
+        pending: &[crate::private::faults::Fault],
+    ) -> (Host, IdentityPublicKey, PathBuf) {
+        let dir = fresh_dir(tag);
+        let (host, mut events) = host_in(Some(dir.clone()));
+        host.shared.ticker_paused.store(true, Ordering::SeqCst);
+        let caller = new_caller();
+        let store = GrantStore::in_dir(&dir);
+        let result = join_in_person(&host, &mut events, &caller, |request| {
+            crate::private::faults::plan_replaces(store.path(), table);
+            crate::private::faults::plan_replaces(store.pending_path(), pending);
+            host.approve(&request).unwrap();
+        })
+        .await;
+        assert!(
+            refused_with(&result, ErrorCode::InternalError),
+            "{:?}",
+            result.err()
+        );
+        assert!(!granted(&host, &caller.identity()));
+        drop(host);
+        let (restarted, _events) = host_in(Some(dir.clone()));
+        (restarted, caller.identity(), dir)
+    }
+
+    /// The enrollment's table landed (its sync failed) and the corrective
+    /// write failed before its rename, so the file still holds the grant
+    /// when the host stops. The restarted host does not honor it.
+    #[tokio::test]
+    async fn a_restart_honors_no_enrollment_whose_corrective_write_failed() {
+        use crate::private::faults::Fault;
+        let (host, identity, dir) = failed_enrollment_then_restart(
+            "restart",
+            &[Fault::AfterRename, Fault::BeforeRename],
+            &[],
+        )
+        .await;
+        assert!(GrantStore::in_dir(&dir)
+            .load()
+            .is_ok_and(|t| t.grants().next().is_none()));
+        assert!(!granted(&host, &identity));
+        assert!(lock(&host.shared).serving());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The table with the grant was saved but clearing the pending record
+    /// failed, and so did the corrective write: the pairing failed, and a
+    /// restart does not honor it either.
+    #[tokio::test]
+    async fn a_restart_honors_no_enrollment_whose_commit_failed() {
+        use crate::private::faults::Fault;
+        let (host, identity, dir) = failed_enrollment_then_restart(
+            "commit",
+            &[Fault::None, Fault::BeforeRename],
+            &[Fault::None, Fault::BeforeRename],
+        )
+        .await;
+        assert!(!granted(&host, &identity));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Recording the enrollment as pending failed: nothing was saved, the
+    /// pairing failed, and the host keeps serving.
+    #[tokio::test]
+    async fn an_enrollment_that_could_not_be_recorded_as_pending_fails_cleanly() {
+        use crate::private::faults::Fault;
+        let (host, identity, dir) =
+            failed_enrollment_then_restart("begin", &[], &[Fault::BeforeRename]).await;
+        assert!(!granted(&host, &identity));
+        assert!(lock(&host.shared).serving());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

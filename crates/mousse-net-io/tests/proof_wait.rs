@@ -1,6 +1,11 @@
 //! The join-proof deadlines on both sides, at their boundary: an answer or
 //! a proof one millisecond before the deadline counts, one at the deadline
 //! does not, even when it arrives before the timer runs.
+//!
+//! The read path alone decides: the endpoints' clocks are frozen and moved
+//! by hand, the tests run on paused tokio time over in-memory pipes, so no
+//! real timer or ticker can fire between moving a clock and the read that
+//! follows it (paused time moves only when every task waits).
 
 mod common;
 
@@ -13,9 +18,8 @@ use mousse_net_core::mux::{Mux, MuxEvent, MuxRole};
 use mousse_net_core::pairing::Arrival;
 use mousse_net_core::ErrorCode;
 use mousse_net_io::certs::CertManager;
-use mousse_net_io::pipe::{connect_tcp, parse_route, Route};
 use mousse_net_io::{tls, Clock, CloseReason, Limits, ManualClock, NetError, NoCode, TlsPolicy};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::sync::{mpsc, oneshot};
 
 const WAIT_MS: u64 = Limits::DEFAULT.io().proof_answer_wait_ms();
@@ -45,21 +49,20 @@ struct FakeHost {
     task: tokio::task::JoinHandle<()>,
 }
 
-/// Start a fake host on loopback; returns it, its route and its identity.
-async fn fake_host() -> (FakeHost, Route, IdentityPublicKey) {
+/// Start a fake host on an in-memory pipe; returns it, the joiner's end of
+/// the pipe and the host's identity.
+fn fake_host() -> (FakeHost, DuplexStream, IdentityPublicKey) {
     let clock = Arc::new(ManualClock::new());
     let cert = CertManager::new(new_signer(), clock.clone())
         .current()
         .unwrap();
     let identity = *cert.identity();
-    let listener = tokio::net::TcpListener::bind((LOOPBACK, 0)).await.unwrap();
-    let route = parse_route(&format!("tcp://{}", listener.local_addr().unwrap())).unwrap();
+    let (hosts, joiners) = tokio::io::duplex(1 << 16);
     let (proof_tx, proof) = oneshot::channel();
     let (say, mut said) = mpsc::unbounded_channel::<Say>();
     let (handled_tx, handled) = mpsc::unbounded_channel();
     let task = tokio::spawn(async move {
-        let (tcp, _) = listener.accept().await.unwrap();
-        let (stream, _) = tls::accept(tcp, &cert, clock.clone(), TlsPolicy::default())
+        let (stream, _) = tls::accept(hosts, &cert, clock.clone(), TlsPolicy::default())
             .await
             .unwrap();
         let (mut rd, mut wr) = tokio::io::split(stream);
@@ -129,7 +132,7 @@ async fn fake_host() -> (FakeHost, Route, IdentityPublicKey) {
             say,
             task,
         },
-        route,
+        joiners,
         identity,
     )
 }
@@ -138,7 +141,7 @@ async fn fake_host() -> (FakeHost, Route, IdentityPublicKey) {
 /// `elapsed` ms after the proof went out when the answer arrives. Returns
 /// how the join ended.
 async fn answer_at(elapsed: u64) -> NetError {
-    let (host, route, identity) = fake_host().await;
+    let (host, pipe, identity) = fake_host();
     let real = TestHost::start(new_signer()).await;
     let mut ticket = real.invite();
     ticket.host_identity = identity;
@@ -147,7 +150,6 @@ async fn answer_at(elapsed: u64) -> NetError {
     let clock = Arc::new(ManualClock::new());
     clock.freeze_mono();
     let caller = new_caller_with_clock(new_signer(), clock.clone());
-    let pipe = connect_tcp(&route).await.unwrap();
     let mut no_code = NoCode;
     let join = caller.join_with_code(pipe, &ticket, Arrival::InAppScan, "laptop", &mut no_code);
     tokio::pin!(join);
@@ -161,8 +163,8 @@ async fn answer_at(elapsed: u64) -> NetError {
         _ = &mut join => panic!("the join ended before its proof was sent"),
         seen = proof => seen.unwrap(),
     }
-    // The joiner's driver now sleeps on the recheck, far past this point:
-    // the answer reaches its read before any timer runs.
+    // The joiner's driver now sleeps on the recheck. Paused time does not
+    // move while the answer is on its way, so it reaches the read first.
     clock.advance_mono(elapsed);
     say.send(Say::Control(ControlMessage::Authorized {
         state: AuthorizedState::JoinOnly,
@@ -170,13 +172,16 @@ async fn answer_at(elapsed: u64) -> NetError {
     .unwrap();
     let err = tokio::select! {
         result = &mut join => result.unwrap_err(),
-        seen = handled.recv() => {
-            seen.unwrap();
+        seen = handled.recv() => match seen {
+            // The joiner hung up, and the fake host saw it first.
+            None => within("join end", join).await.unwrap_err(),
             // The answer counted, so the wait is over for good: past it,
             // the join ends only when the host says no.
-            clock.advance_mono(WAIT_MS);
-            say.send(Say::GoAway(ErrorCode::PairingDeclined)).unwrap();
-            within("join end", join).await.unwrap_err()
+            Some(()) => {
+                clock.advance_mono(WAIT_MS);
+                say.send(Say::GoAway(ErrorCode::PairingDeclined)).unwrap();
+                within("join end", join).await.unwrap_err()
+            }
         }
     };
     task.abort();
@@ -185,7 +190,7 @@ async fn answer_at(elapsed: u64) -> NetError {
 
 /// An answer one millisecond before the wait is over counts: the joiner
 /// waits for the owner and ends only when the host says no.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(start_paused = true)]
 async fn an_answer_just_in_time_counts() {
     let err = answer_at(WAIT_MS - 1).await;
     assert!(
@@ -199,7 +204,7 @@ async fn an_answer_just_in_time_counts() {
 
 /// An answer at the end of the wait does not, even if it is read before
 /// the joiner's timer runs.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(start_paused = true)]
 async fn an_answer_at_the_end_of_the_wait_is_refused() {
     let err = answer_at(WAIT_MS).await;
     assert!(
@@ -218,9 +223,11 @@ async fn proof_at(host: &TestHost, elapsed: u64) -> ErrorCode {
     let cert = CertManager::new(new_signer(), caller_clock.clone())
         .current()
         .unwrap();
-    let tcp = connect_tcp(&host.route()).await.unwrap();
+    let (hosts, callers) = tokio::io::duplex(1 << 16);
+    let accepting = host.host.clone();
+    let accept = tokio::spawn(async move { accepting.accept(hosts).await });
     let (stream, _) = tls::connect(
-        tcp,
+        callers,
         &cert,
         host.identity(),
         caller_clock.clone(),
@@ -255,7 +262,10 @@ async fn proof_at(host: &TestHost, elapsed: u64) -> ErrorCode {
                     };
                     mux.send_control(proof.encode()).unwrap();
                 }
-                MuxEvent::GoAway { code } => return code,
+                MuxEvent::GoAway { code } => {
+                    accept.abort();
+                    return code;
+                }
                 _ => {}
             }
         }
@@ -265,7 +275,7 @@ async fn proof_at(host: &TestHost, elapsed: u64) -> ErrorCode {
 /// A proof one millisecond before the host's wait is over is checked (and
 /// this one is wrong); one at the end of the wait is refused unread, even
 /// before the host's timer or ticker runs.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(start_paused = true)]
 async fn the_host_checks_a_proof_just_in_time_and_refuses_one_at_the_deadline() {
     let host = TestHost::start(new_signer()).await;
     host.clock.freeze_mono();

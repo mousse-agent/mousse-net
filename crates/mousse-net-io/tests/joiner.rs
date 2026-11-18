@@ -231,6 +231,50 @@ async fn a_second_join_of_a_link_in_progress_is_refused() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// Once the pin is stored the link is free again, also while the join's
+/// connection stays open: opening it again asks the host, whose answer is
+/// its receipt for this device.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_settled_link_opens_again_while_its_connection_stays_open() {
+    let dir = temp_dir("settled");
+    let mut host = TestHost::start(new_signer()).await;
+    let ticket = host.invite_kind(InvitationKind::SendLink);
+    let caller = caller_with_records(new_signer(), &dir);
+    let mut shown = None;
+    let (_, result) = link_join(&caller, &mut host, &ticket, &mut shown, |shown| {
+        Some(shown.into())
+    })
+    .await;
+    let (first, outcome) = result.unwrap();
+    assert!(matches!(outcome, JoinOutcome::Paired(_)), "{outcome:?}");
+    caller.pin_stored(&ticket).unwrap();
+    let _echo = open_echo(&first).await;
+
+    let route = host.route();
+    let pipe = connect_tcp(&route).await.unwrap();
+    let mut no_code = NoCode;
+    let (_again, outcome) = within(
+        "join again",
+        caller.join_with_redial(
+            pipe,
+            &ticket,
+            Arrival::Link,
+            "laptop",
+            &mut no_code,
+            true,
+            || connect_tcp(&route),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome, JoinOutcome::Paired(_)), "{outcome:?}");
+    // The first connection was open all along.
+    let mut echo = open_echo(&first).await;
+    assert_echo(&mut echo, b"still").await;
+    host.stop().await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// The outcome-pending mark is stored before this side's confirmation goes
 /// out. If the app dies right after it lands, the confirmation never
 /// leaves and the host enrolls nothing; opening the link again with the

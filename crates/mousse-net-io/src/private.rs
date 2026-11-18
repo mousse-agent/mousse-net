@@ -25,16 +25,19 @@ pub fn make_private_dir(dir: &Path) -> io::Result<()> {
     restrict_contents(dir)
 }
 
-/// [`make_private_dir`] for a folder that may be new, made durable: when
-/// it did not exist, its parent is synced (Unix), so a file saved in it
-/// and reported saved does not vanish with the folder on a power loss.
+/// [`make_private_dir`], made durable: its parent is synced (Unix), so a
+/// file saved in it and reported saved does not vanish with the folder on
+/// a power loss. The parent is synced every time, also when the folder
+/// exists already: another process may have made it without the sync
+/// landing, or an earlier sync here may have failed.
 pub fn make_private_dir_durably(dir: &Path) -> io::Result<()> {
-    let existed = dir.is_dir();
     make_private_dir(dir)?;
-    if !existed {
-        if let Some(parent) = dir.parent() {
-            imp::sync_dir(parent)?;
+    if let Some(parent) = dir.parent() {
+        #[cfg(test)]
+        if faults::take_sync(parent) {
+            return Err(io::Error::other("injected: the folder sync failed"));
         }
+        imp::sync_dir(parent)?;
     }
     Ok(())
 }
@@ -84,40 +87,79 @@ pub fn is_owner_only(path: &Path) -> io::Result<bool> {
 /// new content at `to`, not known to be durable: callers tell the two
 /// cases apart by whether `from` still exists.
 pub fn replace_durably(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    let fault = faults::take(to);
+    #[cfg(test)]
+    if fault == Some(faults::Fault::BeforeRename) {
+        return Err(io::Error::other("injected: the write failed"));
+    }
     imp::replace_durably(from, to)?;
     #[cfg(test)]
-    if faults::take(to) {
+    if fault == Some(faults::Fault::AfterRename) {
         return Err(io::Error::other("injected: the folder sync failed"));
     }
     Ok(())
 }
 
-/// Test faults: make the next durable replaces of a path fail after the
-/// rename, as a failed folder sync does.
+/// Test faults: make the next durable replaces of a path fail before or
+/// after the rename (a failed write, a failed folder sync), and folder
+/// syncs fail.
 #[cfg(test)]
 pub(crate) mod faults {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
-    static AFTER_RENAME: Mutex<Option<HashMap<PathBuf, u32>>> = Mutex::new(None);
-
-    /// The next `count` replaces of `path` fail after their rename.
-    pub fn fail_after_rename(path: &Path, count: u32) {
-        let mut map = AFTER_RENAME.lock().unwrap_or_else(|e| e.into_inner());
-        map.get_or_insert_with(HashMap::new)
-            .insert(path.to_path_buf(), count);
+    /// What the next replace of a path does.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Fault {
+        /// Works.
+        None,
+        /// Fails before the rename: the file stays as it was.
+        BeforeRename,
+        /// Fails after the rename: the new content is in place.
+        AfterRename,
     }
 
-    pub(super) fn take(path: &Path) -> bool {
-        let mut map = AFTER_RENAME.lock().unwrap_or_else(|e| e.into_inner());
-        match map.as_mut().and_then(|m| m.get_mut(path)) {
-            Some(n) if *n > 0 => {
-                *n -= 1;
-                true
-            }
-            _ => false,
-        }
+    type Plans = Mutex<Option<HashMap<PathBuf, VecDeque<Fault>>>>;
+
+    static REPLACES: Plans = Mutex::new(None);
+    static SYNCS: Plans = Mutex::new(None);
+
+    fn plan(plans: &Plans, path: &Path, faults: &[Fault]) {
+        let mut map = plans.lock().unwrap_or_else(|e| e.into_inner());
+        map.get_or_insert_with(HashMap::new)
+            .insert(path.to_path_buf(), faults.iter().copied().collect());
+    }
+
+    fn next(plans: &Plans, path: &Path) -> Option<Fault> {
+        let mut map = plans.lock().unwrap_or_else(|e| e.into_inner());
+        map.as_mut()
+            .and_then(|m| m.get_mut(path))
+            .and_then(VecDeque::pop_front)
+    }
+
+    /// The next replaces of `path` do what `faults` says, in order.
+    pub fn plan_replaces(path: &Path, faults: &[Fault]) {
+        plan(&REPLACES, path, faults);
+    }
+
+    /// The next `count` replaces of `path` fail after their rename.
+    pub fn fail_after_rename(path: &Path, count: usize) {
+        plan_replaces(path, &vec![Fault::AfterRename; count]);
+    }
+
+    /// The next `count` syncs of the folder `dir` fail.
+    pub fn fail_syncs(dir: &Path, count: usize) {
+        plan(&SYNCS, dir, &vec![Fault::AfterRename; count]);
+    }
+
+    pub(super) fn take(path: &Path) -> Option<Fault> {
+        next(&REPLACES, path)
+    }
+
+    pub(super) fn take_sync(dir: &Path) -> bool {
+        next(&SYNCS, dir).is_some_and(|f| f != Fault::None)
     }
 }
 

@@ -173,9 +173,11 @@ struct Flow<F: CodeExchangeFactory> {
     records: Arc<dyn FlowRecords>,
     /// The last write that failed, reported if the join fails.
     save_failed: Option<String>,
-    /// This flow's hold on its ticket, released when the flow is dropped:
-    /// when the join ends, or once the pin is stored.
-    _hold: FlowHold,
+    /// This flow's hold on its ticket. Released as soon as the join is
+    /// settled: when it returns with nothing pending, or once the app has
+    /// stored the pin ([`Caller::pin_stored`]). The live connection keeps
+    /// the flow, but not the hold.
+    hold: Option<FlowHold>,
 }
 
 impl<F: CodeExchangeFactory> Flow<F> {
@@ -271,6 +273,10 @@ where
         let mut flow = lock_joiner(&flow);
         let actions = flow.pairing.on_pin_stored();
         flow.run(actions);
+        // The pin is stored: another join of this ticket can only learn
+        // what is already kept, so the ticket is free again, also while
+        // this join's connection stays open.
+        flow.hold = None;
         match flow.save_failed.take() {
             Some(e) => Err(NetError::Store(format!(
                 "the pairing record could not be saved: {e}"
@@ -613,10 +619,14 @@ where
         // A join of this ticket that ended paired and was never settled
         // gives way: its pending mark stays stored, and this join learns
         // the outcome again.
-        self.settling
+        let unsettled = self
+            .settling
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&ticket.hash());
+        if let Some(unsettled) = unsettled {
+            lock_joiner(&unsettled).hold = None;
+        }
         let hold = self.records.hold(&ticket.hash())?;
         let stored = self.records.load(&ticket.hash())?;
         let mut pairing = JoinerPairing::with_limits(
@@ -640,17 +650,22 @@ where
             pairing,
             records: self.records.clone(),
             save_failed: None,
-            _hold: hold,
+            hold: Some(hold),
         }));
         let result = self
             .join_redialling(pipe, ticket, &joiner, codes, redial)
             .await;
         let mut flow = lock_joiner(&joiner);
         if result.is_ok() && flow.pairing.outcome_pending() {
+            // Held until the app stores the pin.
             self.settling
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(ticket.hash(), joiner.clone());
+        } else {
+            // Nothing for this join to settle: a failed join left its
+            // record as the next one needs it.
+            flow.hold = None;
         }
         match (result, flow.save_failed.take()) {
             (Err(_), Some(e)) => Err(NetError::Store(format!(
