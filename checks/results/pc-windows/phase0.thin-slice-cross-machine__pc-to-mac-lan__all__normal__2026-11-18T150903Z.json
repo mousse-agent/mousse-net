@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "pc-windows",
+  "key": "048ad3ccda2d27fdfc98c131f2fa25bea736ec0a3e8a107dcbfa6b2f5a86b88da452c337f09925646ec76897452505e718f3f397ddf39674e9f5ad64590bc93d57",
+  "payload": "{\"check\":\"phase0.thin-slice-cross-machine\",\"target\":\"pc-to-mac-lan\",\"build\":\"6aa5dd834e690d5a360ddae1b1ca4804d8315820+debug\",\"platform\":\"windows-x86_64\",\"outcome\":\"PASS\",\"details\":\"PASS paired with mac-mini (132a025c7b2e4667) via tcp://192.168.0.59:63128 using X25519MLKEM768; PASS the host runs build 6aa5dd834e690d5a360ddae1b1ca4804d8315820+debug; PASS terminal ran \\\"uname -a\\\": Darwin Avarnics-Mac-mini.local 25.6.0 Darwin Kernel Version 25.6.0: Fri Jul 31 19:11:03 PDT 2026; root:xnu-12377.161.14~5/RELEASE_ARM64_T8132 arm64; PASS removal closed the live terminal with GRANT_REVOKED; PASS a new connection was refused: the host does not know this device (NOT_AUTHORIZED)\",\"time\":\"2026-11-18T15:09:03Z\",\"device\":\"pc-windows\",\"config\":\"8746a7c7aa6cdd570dadb1eb025436995e800bf7c90e9398e7f4d66ee3ee1412\",\"extra\":{\"caller_build\":\"6aa5dd834e690d5a360ddae1b1ca4804d8315820+debug\",\"host_build\":\"6aa5dd834e690d5a360ddae1b1ca4804d8315820+debug\"}}",
+  "signature": "a8b5968c76de0125ee0fcece9ed624188b2d4e67854d780f2845ee277f35a26b92e2f1db26baea8b6a15b83a81505cf2e7a16cc23b14ed1ef8189619b374de50"
+}

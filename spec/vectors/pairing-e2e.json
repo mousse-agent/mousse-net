@@ -1,0 +1,4212 @@
+{
+  "conventions": {
+    "draws": "Each party takes its draws in order. A `bytes` draw fills a request of exactly that length; a `u32` draw answers a request for a 32-bit integer. Host: invitation id (16), ticket secret (16), for send link the code (u32, drawn again while at least 4294000000); then for each new attempt the next code (u32, only while attempts are left after the debit) and the CPace scalar yb (32). Joiner: for each attempt the attempt id (16) and the CPace scalar ya (32). A CPace scalar is the 32 bytes with the top four bits of the last byte cleared, read little-endian.",
+    "events": "host/create: create an invitation of `kind` (with `role` if given, else the conventions' role). host/grant: the host adds a grant named `name` for the joiner's identity (`role` if given, else the conventions' role; authorizing owner as for invitations; no enrollment receipt), as left by an earlier pairing. host/tick: the host's clock reaches `at`; open invitations whose time is up end. <joiner>/start: the joiner opens `ticket` that arrived by `arrival` (in_app_scan: the app's own scanner; link: anything else); `host_pinned`: it already held a pin for the ticket's host from an earlier pairing; `record`: the stored flow record for this ticket, from an earlier save; `identity: host`: the joiner uses the host's identity key. <joiner>/save: output the flow's record as stored. <joiner>/connect: a new TLS connection `conn`; both ends send HELLO, the host runs step 2 at once (a live grant: AUTHORIZED live, and the proof is answered when it arrives with PAIRED if the grant's enrollment receipt names this invitation, else a second AUTHORIZED; no grant: await the join proof, sending nothing) and the joiner sends JOIN_PROOF right after its HELLO without waiting; with `host: false` the far end is scripted. <joiner>/drop: the joiner's connection breaks with no GOAWAY either way. host/receive and <joiner>/receive: a CONTROL message arrives (checked by that end's gate first). <joiner>/goaway: the host's GOAWAY arrives. <joiner>/proof_timeout: no answer to the joiner's proof within 10 s (wire.md 8.2). <joiner>/submit_code: the owner types `code`. A receive with `crash_at_persist`: the app is killed right after the first write it asks for lands; nothing it held goes out, its flow is gone and its connection breaks. host/approve: the host owner approves the device on `conn`.",
+    "exporters": "Stand-in TLS exporter values per connection. Unless `host_exporters` is given, both ends see the same session.",
+    "host": {
+      "identity": "040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794",
+      "identity_secret": "1111111111111111111111111111111111111111111111111111111111111111",
+      "name": "Desk"
+    },
+    "invitation": {
+      "authorizing_owner": "51515151515151515151515151515151",
+      "grant_expires_at": null,
+      "role": "owner",
+      "routes": [
+        "tcp://192.168.1.20:7443"
+      ]
+    },
+    "joiner": {
+      "computer": "Phone",
+      "identity": "04d65a93977caa3d1b081852ff57a79e465f1660577304baead505dd3a48589cf350185e895372df6221ea3a137557e473fddb6755f05bd507c3c533fce9c91285",
+      "identity_secret": "2222222222222222222222222222222222222222222222222222222222222222",
+      "profile": "Work",
+      "proof_name": "`<computer> (<profile>)` (Phone (Work)) with an in-person ticket, `<computer>` (Phone) with a send link (wire.md 10.3)"
+    },
+    "outputs": "send: a control message with its CONTROL frame. close: GOAWAY with its frame. attempt: the CPace inputs of a new attempt (CI is the binding transcript; sid as in wire.md). version: the minor version agreed from a HELLO. record: the joiner's flow record (canonical CBOR, wire.md 10.7; a local format). persist: the joiner asks to store `record` if the store still holds `expected` (null: nothing yet); the harness completes it at once, then the actions that waited for it follow. crashed: the app was killed. paired and already_paired are followed at once by the pin being stored, after which the joiner may clear its pending mark (persist). Others name host or joiner events: show_code, ask_approval, admitted_join_only, enrolled, invitation_ended, paired, code_rejected, failed (the joiner's flow ends with this code: its gate closes, and unless the step was a goaway or a drop, the joiner then closes the connection with GOAWAY of that code after any message listed before it in the step, wire.md 10.6 rule 9; that GOAWAY is not listed as a separate close), error, ignored.",
+    "time": 1790000000
+  },
+  "description": "End-to-end pairing (spec wire.md, sections 8, 10 and 11, and cpace.md). Each flow lists scripted random draws per party, then events in order with every output. Replaying the events with the same draws must give the same outputs byte for byte.",
+  "flows": [
+    {
+      "description": "In-person pairing: ticket, HELLO both ways, join proof, AUTHORIZED join-only, the owner approves, PAIRED, grant.",
+      "draws": {
+        "host": [
+          {
+            "bytes": "f07b80a7fdabf118d44498e0e7e2e93d",
+            "use": "invitation_id"
+          },
+          {
+            "bytes": "8a774b2369c56734b82d0d4f8b36dc4d",
+            "use": "ticket_secret"
+          }
+        ],
+        "joiners": {
+          "a": []
+        }
+      },
+      "end": {
+        "grants": [
+          {
+            "authorizing_owner": "51515151515151515151515151515151",
+            "bound_connections": [
+              1
+            ],
+            "expires_at": null,
+            "granted_at": 1790000000,
+            "identity": "04d65a93977caa3d1b081852ff57a79e465f1660577304baead505dd3a48589cf350185e895372df6221ea3a137557e473fddb6755f05bd507c3c533fce9c91285",
+            "name": "Phone (Work)",
+            "role": "owner"
+          }
+        ],
+        "host": {
+          "attempts_left": 3,
+          "shown_code": null,
+          "status": "consumed"
+        },
+        "joiners": {
+          "a": {
+            "attempts_left": 3,
+            "live": true,
+            "outcome_pending": false,
+            "state": "paired",
+            "stored": null
+          }
+        }
+      },
+      "kind": 1,
+      "name": "in_person",
+      "steps": [
+        {
+          "event": "create",
+          "kind": 1,
+          "out": [
+            {
+              "ticket": {
+                "binary": "a701010201035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450f07b80a7fdabf118d44498e0e7e2e93d05508a774b2369c56734b82d0d4f8b36dc4d061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433",
+                "fragment": "pwEBAgEDWEEEAhfmF_C2RDkoJ4-WmZ5pojpPLBUr321s32bluAKC1O0ZSn3ry5dxLS3aPKhaqHZaVvRfx1hZllLyiXxlMG5XlARQ8HuAp_2r8RjURJjg5-LpPQVQindLI2nFZzS4LQ1PizbcTQYaarE92AeBd3RjcDovLzE5Mi4xNjguMS4yMDo3NDQz",
+                "hash": "0d8b40dceacb5fca5e3c9b82ce53a7d4e33ab690e72e12c69eb77985bbc9ab5b",
+                "shown_code": null
+              }
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "arrival": "in_app_scan",
+          "event": "start",
+          "out": [],
+          "party": "a",
+          "ticket": "a701010201035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450f07b80a7fdabf118d44498e0e7e2e93d05508a774b2369c56734b82d0d4f8b36dc4d061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
+        },
+        {
+          "conn": 1,
+          "event": "connect",
+          "exporters": {
+            "join": "294a396d2613529da2d05babeab57696b8efbf54da6de8f0853fa3879ce9b27c",
+            "pair": "19074e0fd4e78595fdedc905036d965a2fa5a8c7ca1dde3e4aef62edda5cd095"
+          },
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000101010200",
+                "frame": "000000000700000007a3000101010200",
+                "from": "a",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000101010200",
+                "frame": "000000000700000007a3000101010200",
+                "from": "host",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a400030150f07b80a7fdabf118d44498e0e7e2e93d025820c215373310c2068cd77f47f4c06dcfb26c72ffde2cde4294c5ad1e60a85e6c1f036c50686f6e652028576f726b29",
+                "frame": "000000000700000046a400030150f07b80a7fdabf118d44498e0e7e2e93d025820c215373310c2068cd77f47f4c06dcfb26c72ffde2cde4294c5ad1e60a85e6c1f036c50686f6e652028576f726b29",
+                "from": "a",
+                "type": "JOIN_PROOF"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "control": "a3000101010200",
+          "event": "receive",
+          "out": [
+            {
+              "version": 0
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a3000101010200",
+          "event": "receive",
+          "out": [
+            {
+              "version": 0
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "control": "a400030150f07b80a7fdabf118d44498e0e7e2e93d025820c215373310c2068cd77f47f4c06dcfb26c72ffde2cde4294c5ad1e60a85e6c1f036c50686f6e652028576f726b29",
+          "event": "receive",
+          "out": [
+            {
+              "admitted_join_only": 1
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a200020102",
+                "frame": "000000000700000005a200020102",
+                "from": "host",
+                "type": "AUTHORIZED"
+              }
+            },
+            {
+              "ask_approval": {
+                "conn": 1,
+                "name": "Phone (Work)"
+              }
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a200020102",
+          "event": "receive",
+          "out": [],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "event": "approve",
+          "out": [
+            {
+              "enrolled": {
+                "conn": 1
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000601644465736b02656f776e6572",
+                "frame": "000000000700000010a3000601644465736b02656f776e6572",
+                "from": "host",
+                "type": "PAIRED"
+              }
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a3000601644465736b02656f776e6572",
+          "event": "receive",
+          "out": [
+            {
+              "paired": {
+                "host_identity": "040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794",
+                "host_name": "Desk",
+                "role": "owner"
+              }
+            }
+          ],
+          "party": "a"
+        }
+      ]
+    },
+    {
+      "description": "Send-link pairing: ticket, HELLO both ways, join proof, AUTHORIZED join-only, the code shown, one CPace attempt (msg_a, msg_b with the host's confirmation, msg_c with the joiner's), PAIRED, grant. The first code draw is rejected and drawn again.",
+      "draws": {
+        "host": [
+          {
+            "bytes": "c072828da82e5b2e0b54bb6f5fad463e",
+            "use": "invitation_id"
+          },
+          {
+            "bytes": "c2e6311d0ed1c1369c504679da3f518b",
+            "use": "ticket_secret"
+          },
+          {
+            "u32": 4294967295,
+            "use": "code"
+          },
+          {
+            "u32": 4293123456,
+            "use": "code"
+          },
+          {
+            "u32": 654321,
+            "use": "next_code"
+          },
+          {
+            "bytes": "1d4912212e9f6662642929aba64dc14a3fb8189b61b32192aade60a599d22b46",
+            "use": "cpace_scalar_yb"
+          }
+        ],
+        "joiners": {
+          "a": [
+            {
+              "bytes": "7a52e4668ecdd6704ac6129e4088ba28",
+              "use": "attempt_id"
+            },
+            {
+              "bytes": "3f956c01569dd6ac97db642034a40384265ab057cf4de0f23c3e38cef91c3681",
+              "use": "cpace_scalar_ya"
+            }
+          ]
+        }
+      },
+      "end": {
+        "grants": [
+          {
+            "authorizing_owner": "51515151515151515151515151515151",
+            "bound_connections": [
+              1
+            ],
+            "expires_at": null,
+            "granted_at": 1790000000,
+            "identity": "04d65a93977caa3d1b081852ff57a79e465f1660577304baead505dd3a48589cf350185e895372df6221ea3a137557e473fddb6755f05bd507c3c533fce9c91285",
+            "name": "Phone",
+            "role": "owner"
+          }
+        ],
+        "host": {
+          "attempts_left": 2,
+          "shown_code": null,
+          "status": "consumed"
+        },
+        "joiners": {
+          "a": {
+            "attempts_left": 2,
+            "live": true,
+            "outcome_pending": false,
+            "state": "paired",
+            "stored": "a401756d6f757373652d6a6f696e65722d666c6f772d7631025820be94983db8be03f014b5b3abad2c8c26483be12ff84790c8a85115f0aee8a1cc03020400"
+          }
+        }
+      },
+      "kind": 2,
+      "name": "send_link",
+      "steps": [
+        {
+          "event": "create",
+          "kind": 2,
+          "out": [
+            {
+              "ticket": {
+                "binary": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450c072828da82e5b2e0b54bb6f5fad463e0550c2e6311d0ed1c1369c504679da3f518b061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433",
+                "fragment": "pwEBAgIDWEEEAhfmF_C2RDkoJ4-WmZ5pojpPLBUr321s32bluAKC1O0ZSn3ry5dxLS3aPKhaqHZaVvRfx1hZllLyiXxlMG5XlARQwHKCjaguWy4LVLtvX61GPgVQwuYxHQ7RwTacUEZ52j9RiwYaarE92AeBd3RjcDovLzE5Mi4xNjguMS4yMDo3NDQz",
+                "hash": "be94983db8be03f014b5b3abad2c8c26483be12ff84790c8a85115f0aee8a1cc",
+                "shown_code": "123456"
+              }
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "arrival": "link",
+          "event": "start",
+          "out": [],
+          "party": "a",
+          "ticket": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450c072828da82e5b2e0b54bb6f5fad463e0550c2e6311d0ed1c1369c504679da3f518b061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
+        },
+        {
+          "conn": 1,
+          "event": "connect",
+          "exporters": {
+            "join": "ca8a1a9c1492de763a1004266bff7b3195892a24d33d26a8d50bf32485d27b19",
+            "pair": "1570374815bb0c57e664760606923a7dfa3447e2726b11407992e557196cf6d6"
+          },
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000101010200",
+                "frame": "000000000700000007a3000101010200",
+                "from": "a",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000101010200",
+                "frame": "000000000700000007a3000101010200",
+                "from": "host",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a400030150c072828da82e5b2e0b54bb6f5fad463e0258208264efa6f6df2e6bcc47bdd2b07a63a84232879d24d14434156bdf5ac7b83c5e036550686f6e65",
+                "frame": "00000000070000003fa400030150c072828da82e5b2e0b54bb6f5fad463e0258208264efa6f6df2e6bcc47bdd2b07a63a84232879d24d14434156bdf5ac7b83c5e036550686f6e65",
+                "from": "a",
+                "type": "JOIN_PROOF"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "control": "a3000101010200",
+          "event": "receive",
+          "out": [
+            {
+              "version": 0
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a3000101010200",
+          "event": "receive",
+          "out": [
+            {
+              "version": 0
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "control": "a400030150c072828da82e5b2e0b54bb6f5fad463e0258208264efa6f6df2e6bcc47bdd2b07a63a84232879d24d14434156bdf5ac7b83c5e036550686f6e65",
+          "event": "receive",
+          "out": [
+            {
+              "admitted_join_only": 1
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a200020102",
+                "frame": "000000000700000005a200020102",
+                "from": "host",
+                "type": "AUTHORIZED"
+              }
+            },
+            {
+              "show_code": "123456"
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a200020102",
+          "event": "receive",
+          "out": [],
+          "party": "a"
+        },
+        {
+          "code": "123456",
+          "event": "submit_code",
+          "out": [
+            {
+              "attempt": {
+                "ci": "a6016e6d6f757373652d706169722d7631025820be94983db8be03f014b5b3abad2c8c26483be12ff84790c8a85115f0aee8a1cc0302040105828201584104d65a93977caa3d1b081852ff57a79e465f1660577304baead505dd3a48589cf350185e895372df6221ea3a137557e473fddb6755f05bd507c3c533fce9c9128582025841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940658201570374815bb0c57e664760606923a7dfa3447e2726b11407992e557196cf6d6",
+                "id": "7a52e4668ecdd6704ac6129e4088ba28",
+                "sid": "5afdebed60604ccda97adf9fc1acf907183a24a6f563410ff99e4628bb167282"
+              }
+            },
+            {
+              "persist": {
+                "expected": null,
+                "record": "a401756d6f757373652d6a6f696e65722d666c6f772d7631025820be94983db8be03f014b5b3abad2c8c26483be12ff84790c8a85115f0aee8a1cc03020400"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401507a52e4668ecdd6704ac6129e4088ba28025822209c2f2c9cb581408e85d593f9136bd7c2df515f222367d4ee462d6e545de7e81d00",
+                "frame": "00000000070000003aa3000401507a52e4668ecdd6704ac6129e4088ba28025822209c2f2c9cb581408e85d593f9136bd7c2df515f222367d4ee462d6e545de7e81d00",
+                "from": "a",
+                "type": "CODE_EXCHANGE"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "control": "a3000401507a52e4668ecdd6704ac6129e4088ba28025822209c2f2c9cb581408e85d593f9136bd7c2df515f222367d4ee462d6e545de7e81d00",
+          "event": "receive",
+          "out": [
+            {
+              "show_code": "654321"
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401507a52e4668ecdd6704ac6129e4088ba2802586220e4255f9e8e28a4f72ffd9efb167269a1b8566e16c78994cd7e97c3aca0900d430071643bec1a7a4ea4bd02d111b1d05da82b291bd348252772e0bbcbbd71fbef921f54ae6d7aebfb5e41992ba7a4bf9663a6372182bf95a4769bb2a1c9ec2d9929",
+                "frame": "00000000070000007aa3000401507a52e4668ecdd6704ac6129e4088ba2802586220e4255f9e8e28a4f72ffd9efb167269a1b8566e16c78994cd7e97c3aca0900d430071643bec1a7a4ea4bd02d111b1d05da82b291bd348252772e0bbcbbd71fbef921f54ae6d7aebfb5e41992ba7a4bf9663a6372182bf95a4769bb2a1c9ec2d9929",
+                "from": "host",
+                "type": "CODE_EXCHANGE"
+              }
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a3000401507a52e4668ecdd6704ac6129e4088ba2802586220e4255f9e8e28a4f72ffd9efb167269a1b8566e16c78994cd7e97c3aca0900d430071643bec1a7a4ea4bd02d111b1d05da82b291bd348252772e0bbcbbd71fbef921f54ae6d7aebfb5e41992ba7a4bf9663a6372182bf95a4769bb2a1c9ec2d9929",
+          "event": "receive",
+          "out": [
+            {
+              "persist": {
+                "expected": "a401756d6f757373652d6a6f696e65722d666c6f772d7631025820be94983db8be03f014b5b3abad2c8c26483be12ff84790c8a85115f0aee8a1cc03020400",
+                "record": "a401756d6f757373652d6a6f696e65722d666c6f772d7631025820be94983db8be03f014b5b3abad2c8c26483be12ff84790c8a85115f0aee8a1cc03020401"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401507a52e4668ecdd6704ac6129e4088ba28025840aa4325324cd03e8bb03add532cf4922a211a1e4d51961c3993d4487f5c2668f32e4a56431b4be20eea672ae4f2378d37a87b2e11370d47fc4e7ca2361bd1f1c9",
+                "frame": "000000000700000058a3000401507a52e4668ecdd6704ac6129e4088ba28025840aa4325324cd03e8bb03add532cf4922a211a1e4d51961c3993d4487f5c2668f32e4a56431b4be20eea672ae4f2378d37a87b2e11370d47fc4e7ca2361bd1f1c9",
+                "from": "a",
+                "type": "CODE_EXCHANGE"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "control": "a3000401507a52e4668ecdd6704ac6129e4088ba28025840aa4325324cd03e8bb03add532cf4922a211a1e4d51961c3993d4487f5c2668f32e4a56431b4be20eea672ae4f2378d37a87b2e11370d47fc4e7ca2361bd1f1c9",
+          "event": "receive",
+          "out": [
+            {
+              "enrolled": {
+                "conn": 1
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000601644465736b02656f776e6572",
+                "frame": "000000000700000010a3000601644465736b02656f776e6572",
+                "from": "host",
+                "type": "PAIRED"
+              }
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a3000601644465736b02656f776e6572",
+          "event": "receive",
+          "out": [
+            {
+              "paired": {
+                "host_identity": "040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794",
+                "host_name": "Desk",
+                "role": "owner"
+              }
+            },
+            {
+              "persist": {
+                "expected": "a401756d6f757373652d6a6f696e65722d666c6f772d7631025820be94983db8be03f014b5b3abad2c8c26483be12ff84790c8a85115f0aee8a1cc03020401",
+                "record": "a401756d6f757373652d6a6f696e65722d666c6f772d7631025820be94983db8be03f014b5b3abad2c8c26483be12ff84790c8a85115f0aee8a1cc03020400"
+              }
+            }
+          ],
+          "party": "a"
+        }
+      ]
+    },
+    {
+      "description": "Three wrong codes on one connection. Each attempt fails the host's confirmation on the joiner, which aborts it. A fresh code is shown at the start of attempts 1 and 2, none at attempt 3. After the third the invitation ends and the host closes with attempts_exhausted; the joiner's flow is over and refuses a fourth code.",
+      "draws": {
+        "host": [
+          {
+            "bytes": "04eaa52c08a46d84e7a85050223db77c",
+            "use": "invitation_id"
+          },
+          {
+            "bytes": "1f40e4b37aef73c063c226f931b30f45",
+            "use": "ticket_secret"
+          },
+          {
+            "u32": 271828,
+            "use": "code"
+          },
+          {
+            "u32": 314159,
+            "use": "next_code"
+          },
+          {
+            "bytes": "2d277484f2c1d4ced340e2351d85bcf08e7584072aef0bd8a27bd82f4cc82b70",
+            "use": "cpace_scalar_yb"
+          },
+          {
+            "u32": 161803,
+            "use": "next_code"
+          },
+          {
+            "bytes": "74ab2880666edd70ff8651a2379d0189f90140b92f678380320b4162cf6cd162",
+            "use": "cpace_scalar_yb"
+          },
+          {
+            "bytes": "6c9ef5f44b9621025f5ba3565be96441ce335fad7df7a5ba5fb68acbdc713919",
+            "use": "cpace_scalar_yb"
+          }
+        ],
+        "joiners": {
+          "a": [
+            {
+              "bytes": "a5c14bc2d10055cd91e2af77838210e0",
+              "use": "attempt_id"
+            },
+            {
+              "bytes": "441d6e9809b47596e6f682d62b2e206acf50387496c58928ec834e4c16ac5a82",
+              "use": "cpace_scalar_ya"
+            },
+            {
+              "bytes": "7f674930313cf205892bca9a367a88e3",
+              "use": "attempt_id"
+            },
+            {
+              "bytes": "7769e711d0b663ff2d4d68f8acf0c94d1cf932184e32361057a050cd3fcd7193",
+              "use": "cpace_scalar_ya"
+            },
+            {
+              "bytes": "526d63be3041f4a6a7331fbaf5ef2a6a",
+              "use": "attempt_id"
+            },
+            {
+              "bytes": "f45823d6d753cb6b8c7567b5c78359fa7576549d1899b9b509968697a1d6c98b",
+              "use": "cpace_scalar_ya"
+            }
+          ]
+        }
+      },
+      "end": {
+        "grants": [],
+        "host": {
+          "attempts_left": 0,
+          "shown_code": null,
+          "status": "ended:attempts_exhausted"
+        },
+        "joiners": {
+          "a": {
+            "attempts_left": 0,
+            "live": false,
+            "outcome_pending": false,
+            "state": "failed:attempts_exhausted",
+            "stored": "a401756d6f757373652d6a6f696e65722d666c6f772d763102582083e679e776b3c451e92f17cca6df560c65b4b04656c0a04cbed983fd6594b7e803000400"
+          }
+        }
+      },
+      "kind": 2,
+      "name": "wrong_code_three_times",
+      "steps": [
+        {
+          "event": "create",
+          "kind": 2,
+          "out": [
+            {
+              "ticket": {
+                "binary": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794045004eaa52c08a46d84e7a85050223db77c05501f40e4b37aef73c063c226f931b30f45061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433",
+                "fragment": "pwEBAgIDWEEEAhfmF_C2RDkoJ4-WmZ5pojpPLBUr321s32bluAKC1O0ZSn3ry5dxLS3aPKhaqHZaVvRfx1hZllLyiXxlMG5XlARQBOqlLAikbYTnqFBQIj23fAVQH0Dks3rvc8Bjwib5MbMPRQYaarE92AeBd3RjcDovLzE5Mi4xNjguMS4yMDo3NDQz",
+                "hash": "83e679e776b3c451e92f17cca6df560c65b4b04656c0a04cbed983fd6594b7e8",
+                "shown_code": "271828"
+              }
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "arrival": "link",
+          "event": "start",
+          "out": [],
+          "party": "a",
+          "ticket": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794045004eaa52c08a46d84e7a85050223db77c05501f40e4b37aef73c063c226f931b30f45061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
+        },
+        {
+          "conn": 1,
+          "event": "connect",
+          "exporters": {
+            "join": "22f46b42a58d760d2bfbca7a60c5cea5894aa102655751e7f166ca3fe20c3873",
+            "pair": "de201d141b32784d441ea9023139e5f124238131984707a2477c569d7c548309"
+          },
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000101010200",
+                "frame": "000000000700000007a3000101010200",
+                "from": "a",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000101010200",
+                "frame": "000000000700000007a3000101010200",
+                "from": "host",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a40003015004eaa52c08a46d84e7a85050223db77c025820cb0d3af9226592f69248699fad9293c82f0b04afd8bf2250ecbcf6b209d430bb036550686f6e65",
+                "frame": "00000000070000003fa40003015004eaa52c08a46d84e7a85050223db77c025820cb0d3af9226592f69248699fad9293c82f0b04afd8bf2250ecbcf6b209d430bb036550686f6e65",
+                "from": "a",
+                "type": "JOIN_PROOF"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "control": "a3000101010200",
+          "event": "receive",
+          "out": [
+            {
+              "version": 0
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a3000101010200",
+          "event": "receive",
+          "out": [
+            {
+              "version": 0
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "control": "a40003015004eaa52c08a46d84e7a85050223db77c025820cb0d3af9226592f69248699fad9293c82f0b04afd8bf2250ecbcf6b209d430bb036550686f6e65",
+          "event": "receive",
+          "out": [
+            {
+              "admitted_join_only": 1
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a200020102",
+                "frame": "000000000700000005a200020102",
+                "from": "host",
+                "type": "AUTHORIZED"
+              }
+            },
+            {
+              "show_code": "271828"
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a200020102",
+          "event": "receive",
+          "out": [],
+          "party": "a"
+        },
+        {
+          "code": "000000",
+          "event": "submit_code",
+          "out": [
+            {
+              "attempt": {
+                "ci": "a6016e6d6f757373652d706169722d763102582083e679e776b3c451e92f17cca6df560c65b4b04656c0a04cbed983fd6594b7e80302040105828201584104d65a93977caa3d1b081852ff57a79e465f1660577304baead505dd3a48589cf350185e895372df6221ea3a137557e473fddb6755f05bd507c3c533fce9c9128582025841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794065820de201d141b32784d441ea9023139e5f124238131984707a2477c569d7c548309",
+                "id": "a5c14bc2d10055cd91e2af77838210e0",
+                "sid": "2ebdba6847c454808ce658f2c0054f265e93f15c68b029e8484ed7f493d0449e"
+              }
+            },
+            {
+              "persist": {
+                "expected": null,
+                "record": "a401756d6f757373652d6a6f696e65722d666c6f772d763102582083e679e776b3c451e92f17cca6df560c65b4b04656c0a04cbed983fd6594b7e803020400"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150a5c14bc2d10055cd91e2af77838210e002582220f0d8bfc941ba59fc47537e871d338fb6aa3a3dce9c9b23413a37480cb390ce3d00",
+                "frame": "00000000070000003aa300040150a5c14bc2d10055cd91e2af77838210e002582220f0d8bfc941ba59fc47537e871d338fb6aa3a3dce9c9b23413a37480cb390ce3d00",
+                "from": "a",
+                "type": "CODE_EXCHANGE"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "control": "a300040150a5c14bc2d10055cd91e2af77838210e002582220f0d8bfc941ba59fc47537e871d338fb6aa3a3dce9c9b23413a37480cb390ce3d00",
+          "event": "receive",
+          "out": [
+            {
+              "show_code": "314159"
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150a5c14bc2d10055cd91e2af77838210e0025862204e5f4e13e8aa849df1e6b95610857385ca3d8f4236149e67f456757911e8965f00fabe23c2350bf46de59c3d648a968e0c5e12eac9b47dc26aa6955e9e59d941938b21f3a9fb33e68220bdf8315febbf6ddf5927f36d655f5e0f8460e00a6fa968",
+                "frame": "00000000070000007aa300040150a5c14bc2d10055cd91e2af77838210e0025862204e5f4e13e8aa849df1e6b95610857385ca3d8f4236149e67f456757911e8965f00fabe23c2350bf46de59c3d648a968e0c5e12eac9b47dc26aa6955e9e59d941938b21f3a9fb33e68220bdf8315febbf6ddf5927f36d655f5e0f8460e00a6fa968",
+                "from": "host",
+                "type": "CODE_EXCHANGE"
+              }
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a300040150a5c14bc2d10055cd91e2af77838210e0025862204e5f4e13e8aa849df1e6b95610857385ca3d8f4236149e67f456757911e8965f00fabe23c2350bf46de59c3d648a968e0c5e12eac9b47dc26aa6955e9e59d941938b21f3a9fb33e68220bdf8315febbf6ddf5927f36d655f5e0f8460e00a6fa968",
+          "event": "receive",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300050150a5c14bc2d10055cd91e2af77838210e0020a",
+                "frame": "000000000700000017a300050150a5c14bc2d10055cd91e2af77838210e0020a",
+                "from": "a",
+                "type": "CODE_ABORT"
+              }
+            },
+            {
+              "code_rejected": {
+                "attempts_left": 2
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "control": "a300050150a5c14bc2d10055cd91e2af77838210e0020a",
+          "event": "receive",
+          "out": [],
+          "party": "host"
+        },
+        {
+          "code": "000000",
+          "event": "submit_code",
+          "out": [
+            {
+              "attempt": {
+                "ci": "a6016e6d6f757373652d706169722d763102582083e679e776b3c451e92f17cca6df560c65b4b04656c0a04cbed983fd6594b7e80302040105828201584104d65a93977caa3d1b081852ff57a79e465f1660577304baead505dd3a48589cf350185e895372df6221ea3a137557e473fddb6755f05bd507c3c533fce9c9128582025841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794065820de201d141b32784d441ea9023139e5f124238131984707a2477c569d7c548309",
+                "id": "7f674930313cf205892bca9a367a88e3",
+                "sid": "e15f5d782344692d1211248c41fad3b233f3e939b1d995b627bcc98109bcad84"
+              }
+            },
+            {
+              "persist": {
+                "expected": "a401756d6f757373652d6a6f696e65722d666c6f772d763102582083e679e776b3c451e92f17cca6df560c65b4b04656c0a04cbed983fd6594b7e803020400",
+                "record": "a401756d6f757373652d6a6f696e65722d666c6f772d763102582083e679e776b3c451e92f17cca6df560c65b4b04656c0a04cbed983fd6594b7e803010400"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401507f674930313cf205892bca9a367a88e3025822200e7dbb9e2b5ee3db1028de514b7dd0f3548dd4da2000595ee4f575217c7a8c2600",
+                "frame": "00000000070000003aa3000401507f674930313cf205892bca9a367a88e3025822200e7dbb9e2b5ee3db1028de514b7dd0f3548dd4da2000595ee4f575217c7a8c2600",
+                "from": "a",
+                "type": "CODE_EXCHANGE"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "control": "a3000401507f674930313cf205892bca9a367a88e3025822200e7dbb9e2b5ee3db1028de514b7dd0f3548dd4da2000595ee4f575217c7a8c2600",
+          "event": "receive",
+          "out": [
+            {
+              "show_code": "161803"
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401507f674930313cf205892bca9a367a88e3025862205c2a1511e714e636503848e9816bde52a52883b4e2764b99da7e5ea90d09033400e0e60e5bbf70c8e21b8500fc413d0146b7478e9400831bcf40ccb2aab77f40a95ba478bdb97b312bc2fca32fa33cb38bd39ee640c7e63f8b8a1318ca2da06623",
+                "frame": "00000000070000007aa3000401507f674930313cf205892bca9a367a88e3025862205c2a1511e714e636503848e9816bde52a52883b4e2764b99da7e5ea90d09033400e0e60e5bbf70c8e21b8500fc413d0146b7478e9400831bcf40ccb2aab77f40a95ba478bdb97b312bc2fca32fa33cb38bd39ee640c7e63f8b8a1318ca2da06623",
+                "from": "host",
+                "type": "CODE_EXCHANGE"
+              }
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a3000401507f674930313cf205892bca9a367a88e3025862205c2a1511e714e636503848e9816bde52a52883b4e2764b99da7e5ea90d09033400e0e60e5bbf70c8e21b8500fc413d0146b7478e9400831bcf40ccb2aab77f40a95ba478bdb97b312bc2fca32fa33cb38bd39ee640c7e63f8b8a1318ca2da06623",
+          "event": "receive",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000501507f674930313cf205892bca9a367a88e3020a",
+                "frame": "000000000700000017a3000501507f674930313cf205892bca9a367a88e3020a",
+                "from": "a",
+                "type": "CODE_ABORT"
+              }
+            },
+            {
+              "code_rejected": {
+                "attempts_left": 1
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "control": "a3000501507f674930313cf205892bca9a367a88e3020a",
+          "event": "receive",
+          "out": [],
+          "party": "host"
+        },
+        {
+          "code": "000000",
+          "event": "submit_code",
+          "out": [
+            {
+              "attempt": {
+                "ci": "a6016e6d6f757373652d706169722d763102582083e679e776b3c451e92f17cca6df560c65b4b04656c0a04cbed983fd6594b7e80302040105828201584104d65a93977caa3d1b081852ff57a79e465f1660577304baead505dd3a48589cf350185e895372df6221ea3a137557e473fddb6755f05bd507c3c533fce9c9128582025841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794065820de201d141b32784d441ea9023139e5f124238131984707a2477c569d7c548309",
+                "id": "526d63be3041f4a6a7331fbaf5ef2a6a",
+                "sid": "5f54b307529d81e36cba6d4f390ec4b21291eb84bcfe354c6c1a4a579aabb4cb"
+              }
+            },
+            {
+              "persist": {
+                "expected": "a401756d6f757373652d6a6f696e65722d666c6f772d763102582083e679e776b3c451e92f17cca6df560c65b4b04656c0a04cbed983fd6594b7e803010400",
+                "record": "a401756d6f757373652d6a6f696e65722d666c6f772d763102582083e679e776b3c451e92f17cca6df560c65b4b04656c0a04cbed983fd6594b7e803000400"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150526d63be3041f4a6a7331fbaf5ef2a6a025822208c7f15ea0cbcae8eb644800e8c2f3c685c6b42b1915a77531a9b7a3ea62a734600",
+                "frame": "00000000070000003aa300040150526d63be3041f4a6a7331fbaf5ef2a6a025822208c7f15ea0cbcae8eb644800e8c2f3c685c6b42b1915a77531a9b7a3ea62a734600",
+                "from": "a",
+                "type": "CODE_EXCHANGE"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "control": "a300040150526d63be3041f4a6a7331fbaf5ef2a6a025822208c7f15ea0cbcae8eb644800e8c2f3c685c6b42b1915a77531a9b7a3ea62a734600",
+          "event": "receive",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150526d63be3041f4a6a7331fbaf5ef2a6a02586220d01e9b042dd2de3b8fe16adddb61b5307ac92ceeadfe16ff82cbbb30b69fa269002efbaed67c2cff9b253769cb8fd110246c6542f8cffed3e93bd12d9e6a83f948812bd6824d6c117995d50a9f613588cd2b6e8114a6c62726e850e01a6ab84792",
+                "frame": "00000000070000007aa300040150526d63be3041f4a6a7331fbaf5ef2a6a02586220d01e9b042dd2de3b8fe16adddb61b5307ac92ceeadfe16ff82cbbb30b69fa269002efbaed67c2cff9b253769cb8fd110246c6542f8cffed3e93bd12d9e6a83f948812bd6824d6c117995d50a9f613588cd2b6e8114a6c62726e850e01a6ab84792",
+                "from": "host",
+                "type": "CODE_EXCHANGE"
+              }
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a300040150526d63be3041f4a6a7331fbaf5ef2a6a02586220d01e9b042dd2de3b8fe16adddb61b5307ac92ceeadfe16ff82cbbb30b69fa269002efbaed67c2cff9b253769cb8fd110246c6542f8cffed3e93bd12d9e6a83f948812bd6824d6c117995d50a9f613588cd2b6e8114a6c62726e850e01a6ab84792",
+          "event": "receive",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300050150526d63be3041f4a6a7331fbaf5ef2a6a020a",
+                "frame": "000000000700000017a300050150526d63be3041f4a6a7331fbaf5ef2a6a020a",
+                "from": "a",
+                "type": "CODE_ABORT"
+              }
+            },
+            {
+              "failed": "attempts_exhausted"
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "control": "a300050150526d63be3041f4a6a7331fbaf5ef2a6a020a",
+          "event": "receive",
+          "out": [
+            {
+              "close": {
+                "code": "attempts_exhausted",
+                "conn": 1,
+                "frame": "000000000800000002000c",
+                "from": "host"
+              }
+            },
+            {
+              "invitation_ended": "attempts_exhausted"
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "code": "attempts_exhausted",
+          "event": "goaway",
+          "out": [],
+          "party": "a"
+        },
+        {
+          "code": "161803",
+          "event": "submit_code",
+          "out": [
+            {
+              "error": "wrong_state"
+            }
+          ],
+          "party": "a"
+        }
+      ]
+    },
+    {
+      "description": "The joiner talks to a far end that aborts every attempt. The joiner stops after its own 3 attempts and refuses a fourth code; the real host's invitation is untouched.",
+      "draws": {
+        "host": [
+          {
+            "bytes": "0b9ecc4345dc1ad961c879c87b9ee755",
+            "use": "invitation_id"
+          },
+          {
+            "bytes": "12a42e89815fda4570c4807f2352746f",
+            "use": "ticket_secret"
+          },
+          {
+            "u32": 123456,
+            "use": "code"
+          }
+        ],
+        "joiners": {
+          "a": [
+            {
+              "bytes": "266161d2b7b66e214e13839edcc9de09",
+              "use": "attempt_id"
+            },
+            {
+              "bytes": "95bbe8c6bf6b795ec7cf89b6adde7deb1aa98f1fbd0d03405a449213643ecf4e",
+              "use": "cpace_scalar_ya"
+            },
+            {
+              "bytes": "fb45280a297d689b47b163247fff4f52",
+              "use": "attempt_id"
+            },
+            {
+              "bytes": "afb166f982062d683bcaef187498f06aead98dce0f9bd14f106266ece71b9077",
+              "use": "cpace_scalar_ya"
+            },
+            {
+              "bytes": "5535f240c58127b1c2484af450395843",
+              "use": "attempt_id"
+            },
+            {
+              "bytes": "363ec1bd34da59adb7c55ec4ad25b4cb287e36af169cc2cf186c0ba79dbbba7d",
+              "use": "cpace_scalar_ya"
+            }
+          ]
+        }
+      },
+      "end": {
+        "grants": [],
+        "host": {
+          "attempts_left": 3,
+          "shown_code": "123456",
+          "status": "open"
+        },
+        "joiners": {
+          "a": {
+            "attempts_left": 0,
+            "live": false,
+            "outcome_pending": false,
+            "state": "failed:attempts_exhausted",
+            "stored": "a401756d6f757373652d6a6f696e65722d666c6f772d7631025820dfdbd2420468eadfa672910413153a1500a14975090551102c77eb6f281c108903000400"
+          }
+        }
+      },
+      "kind": 2,
+      "name": "joiner_cap_against_fake_host",
+      "steps": [
+        {
+          "event": "create",
+          "kind": 2,
+          "out": [
+            {
+              "ticket": {
+                "binary": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e579404500b9ecc4345dc1ad961c879c87b9ee755055012a42e89815fda4570c4807f2352746f061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433",
+                "fragment": "pwEBAgIDWEEEAhfmF_C2RDkoJ4-WmZ5pojpPLBUr321s32bluAKC1O0ZSn3ry5dxLS3aPKhaqHZaVvRfx1hZllLyiXxlMG5XlARQC57MQ0XcGtlhyHnIe57nVQVQEqQuiYFf2kVwxIB_I1J0bwYaarE92AeBd3RjcDovLzE5Mi4xNjguMS4yMDo3NDQz",
+                "hash": "dfdbd2420468eadfa672910413153a1500a14975090551102c77eb6f281c1089",
+                "shown_code": "123456"
+              }
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "arrival": "link",
+          "event": "start",
+          "out": [],
+          "party": "a",
+          "ticket": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e579404500b9ecc4345dc1ad961c879c87b9ee755055012a42e89815fda4570c4807f2352746f061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
+        },
+        {
+          "conn": 1,
+          "event": "connect",
+          "exporters": {
+            "join": "7f537472caac652a174fe3d52eadb4f8629061c3f7d1082e8684b7b55fdebde5",
+            "pair": "21934a3b33b00d29a053d4551b9e05558172e7226226334289c019b76ee492b3"
+          },
+          "host": false,
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000101010200",
+                "frame": "000000000700000007a3000101010200",
+                "from": "a",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a4000301500b9ecc4345dc1ad961c879c87b9ee755025820202f31c00d277153898438767c2979a88bc7d2d5028da9e339ccb922550bcd51036550686f6e65",
+                "frame": "00000000070000003fa4000301500b9ecc4345dc1ad961c879c87b9ee755025820202f31c00d277153898438767c2979a88bc7d2d5028da9e339ccb922550bcd51036550686f6e65",
+                "from": "a",
+                "type": "JOIN_PROOF"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "control": "a3000101010200",
+          "event": "receive",
+          "out": [
+            {
+              "version": 0
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "control": "a200020102",
+          "event": "receive",
+          "out": [],
+          "party": "a"
+        },
+        {
+          "code": "123456",
+          "event": "submit_code",
+          "out": [
+            {
+              "attempt": {
+                "ci": "a6016e6d6f757373652d706169722d7631025820dfdbd2420468eadfa672910413153a1500a14975090551102c77eb6f281c10890302040105828201584104d65a93977caa3d1b081852ff57a79e465f1660577304baead505dd3a48589cf350185e895372df6221ea3a137557e473fddb6755f05bd507c3c533fce9c9128582025841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e579406582021934a3b33b00d29a053d4551b9e05558172e7226226334289c019b76ee492b3",
+                "id": "266161d2b7b66e214e13839edcc9de09",
+                "sid": "ffe8438bc6f7e253e68dae3493da0beca513448a760c07b2c6d520cfd77fd7c6"
+              }
+            },
+            {
+              "persist": {
+                "expected": null,
+                "record": "a401756d6f757373652d6a6f696e65722d666c6f772d7631025820dfdbd2420468eadfa672910413153a1500a14975090551102c77eb6f281c108903020400"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150266161d2b7b66e214e13839edcc9de090258222046436a7f1d26335edec19f303bc856bbd1c340a6d174dc76dfe435dda8ba8b4600",
+                "frame": "00000000070000003aa300040150266161d2b7b66e214e13839edcc9de090258222046436a7f1d26335edec19f303bc856bbd1c340a6d174dc76dfe435dda8ba8b4600",
+                "from": "a",
+                "type": "CODE_EXCHANGE"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "control": "a300050150266161d2b7b66e214e13839edcc9de09020a",
+          "event": "receive",
+          "out": [
+            {
+              "code_rejected": {
+                "attempts_left": 2
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "code": "123456",
+          "event": "submit_code",
+          "out": [
+            {
+              "attempt": {
+                "ci": "a6016e6d6f757373652d706169722d7631025820dfdbd2420468eadfa672910413153a1500a14975090551102c77eb6f281c10890302040105828201584104d65a93977caa3d1b081852ff57a79e465f1660577304baead505dd3a48589cf350185e895372df6221ea3a137557e473fddb6755f05bd507c3c533fce9c9128582025841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e579406582021934a3b33b00d29a053d4551b9e05558172e7226226334289c019b76ee492b3",
+                "id": "fb45280a297d689b47b163247fff4f52",
+                "sid": "9aa026bf9e63e8eace12b06b8b4120bc330fed611bd540f5d0ffe664fa79cba1"
+              }
+            },
+            {
+              "persist": {
+                "expected": "a401756d6f757373652d6a6f696e65722d666c6f772d7631025820dfdbd2420468eadfa672910413153a1500a14975090551102c77eb6f281c108903020400",
+                "record": "a401756d6f757373652d6a6f696e65722d666c6f772d7631025820dfdbd2420468eadfa672910413153a1500a14975090551102c77eb6f281c108903010400"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150fb45280a297d689b47b163247fff4f5202582220a87c5952a11847655a266e934a88008f60a02894292046dd334988125afdfd5a00",
+                "frame": "00000000070000003aa300040150fb45280a297d689b47b163247fff4f5202582220a87c5952a11847655a266e934a88008f60a02894292046dd334988125afdfd5a00",
+                "from": "a",
+                "type": "CODE_EXCHANGE"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "control": "a300050150fb45280a297d689b47b163247fff4f52020a",
+          "event": "receive",
+          "out": [
+            {
+              "code_rejected": {
+                "attempts_left": 1
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "code": "123456",
+          "event": "submit_code",
+          "out": [
+            {
+              "attempt": {
+                "ci": "a6016e6d6f757373652d706169722d7631025820dfdbd2420468eadfa672910413153a1500a14975090551102c77eb6f281c10890302040105828201584104d65a93977caa3d1b081852ff57a79e465f1660577304baead505dd3a48589cf350185e895372df6221ea3a137557e473fddb6755f05bd507c3c533fce9c9128582025841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e579406582021934a3b33b00d29a053d4551b9e05558172e7226226334289c019b76ee492b3",
+                "id": "5535f240c58127b1c2484af450395843",
+                "sid": "0e125ff53b8904a3c8d8eb9a666a97f1bf684c70504eb464158e1258fc21ebc1"
+              }
+            },
+            {
+              "persist": {
+                "expected": "a401756d6f757373652d6a6f696e65722d666c6f772d7631025820dfdbd2420468eadfa672910413153a1500a14975090551102c77eb6f281c108903010400",
+                "record": "a401756d6f757373652d6a6f696e65722d666c6f772d7631025820dfdbd2420468eadfa672910413153a1500a14975090551102c77eb6f281c108903000400"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401505535f240c58127b1c2484af45039584302582220c2b54200ed8c61964b069cc5bceca5ce2732bd945333063672fbfe781301a25300",
+                "frame": "00000000070000003aa3000401505535f240c58127b1c2484af45039584302582220c2b54200ed8c61964b069cc5bceca5ce2732bd945333063672fbfe781301a25300",
+                "from": "a",
+                "type": "CODE_EXCHANGE"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "control": "a3000501505535f240c58127b1c2484af450395843020a",
+          "event": "receive",
+          "out": [
+            {
+              "failed": "attempts_exhausted"
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "code": "123456",
+          "event": "submit_code",
+          "out": [
+            {
+              "error": "wrong_state"
+            }
+          ],
+          "party": "a"
+        }
+      ]
+    },
+    {
+      "description": "Joiner a holds the ticket with one bit of the secret flipped; joiner b with one bit of the invitation id flipped. The host closes both with invitation_invalid and the invitation stays open.",
+      "draws": {
+        "host": [
+          {
+            "bytes": "d70e59860ae98488123870f5b6f121c8",
+            "use": "invitation_id"
+          },
+          {
+            "bytes": "13191e8dbcfd2a4cb34f56c4768e004a",
+            "use": "ticket_secret"
+          },
+          {
+            "u32": 777777,
+            "use": "code"
+          }
+        ],
+        "joiners": {
+          "a": [],
+          "b": []
+        }
+      },
+      "end": {
+        "grants": [],
+        "host": {
+          "attempts_left": 3,
+          "shown_code": "777777",
+          "status": "open"
+        },
+        "joiners": {
+          "a": {
+            "attempts_left": 3,
+            "live": false,
+            "outcome_pending": false,
+            "state": "failed:invitation_invalid",
+            "stored": null
+          },
+          "b": {
+            "attempts_left": 3,
+            "live": false,
+            "outcome_pending": false,
+            "state": "failed:invitation_invalid",
+            "stored": null
+          }
+        }
+      },
+      "kind": 2,
+      "name": "tampered_tickets",
+      "steps": [
+        {
+          "event": "create",
+          "kind": 2,
+          "out": [
+            {
+              "ticket": {
+                "binary": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450d70e59860ae98488123870f5b6f121c8055013191e8dbcfd2a4cb34f56c4768e004a061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433",
+                "fragment": "pwEBAgIDWEEEAhfmF_C2RDkoJ4-WmZ5pojpPLBUr321s32bluAKC1O0ZSn3ry5dxLS3aPKhaqHZaVvRfx1hZllLyiXxlMG5XlARQ1w5ZhgrphIgSOHD1tvEhyAVQExkejbz9KkyzT1bEdo4ASgYaarE92AeBd3RjcDovLzE5Mi4xNjguMS4yMDo3NDQz",
+                "hash": "300c3ec675787c6d73ff7d784bc7139fe2d3f42601e4c8fac0a15c9a2cf16bd8",
+                "shown_code": "777777"
+              }
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "arrival": "link",
+          "event": "start",
+          "out": [],
+          "party": "a",
+          "ticket": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450d70e59860ae98488123870f5b6f121c8055012191e8dbcfd2a4cb34f56c4768e004a061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
+        },
+        {
+          "arrival": "link",
+          "event": "start",
+          "out": [],
+          "party": "b",
+          "ticket": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450d70e59860ae98488123870f5b6f121c9055013191e8dbcfd2a4cb34f56c4768e004a061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
+        },
+        {
+          "conn": 1,
+          "event": "connect",
+          "exporters": {
+            "join": "a10379ccb657fdbd94ab5d244fc32f94ee5ffcdb2266f7bd5fc0cea0c20d0747",
+            "pair": "f6b95ee7a357ae9d57aa4e5807dffab83f2d14bcd4dec2cc95e09c961e5fcb1e"
+          },
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000101010200",
+                "frame": "000000000700000007a3000101010200",
+                "from": "a",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000101010200",
+                "frame": "000000000700000007a3000101010200",
+                "from": "host",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a400030150d70e59860ae98488123870f5b6f121c8025820d0b241568afa63444c290c225908c0fc983bd073ee4ea1d4b1e62bd19321d930036550686f6e65",
+                "frame": "00000000070000003fa400030150d70e59860ae98488123870f5b6f121c8025820d0b241568afa63444c290c225908c0fc983bd073ee4ea1d4b1e62bd19321d930036550686f6e65",
+                "from": "a",
+                "type": "JOIN_PROOF"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "control": "a3000101010200",
+          "event": "receive",
+          "out": [
+            {
+              "version": 0
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a3000101010200",
+          "event": "receive",
+          "out": [
+            {
+              "version": 0
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "control": "a400030150d70e59860ae98488123870f5b6f121c8025820d0b241568afa63444c290c225908c0fc983bd073ee4ea1d4b1e62bd19321d930036550686f6e65",
+          "event": "receive",
+          "out": [
+            {
+              "close": {
+                "code": "invitation_invalid",
+                "conn": 1,
+                "frame": "000000000800000002000b",
+                "from": "host"
+              }
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "code": "invitation_invalid",
+          "event": "goaway",
+          "out": [
+            {
+              "failed": "invitation_invalid"
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 2,
+          "event": "connect",
+          "exporters": {
+            "join": "75b2bd6b23f7718aad1408f659ee045891a2721eb501b8f2d93f33e6cd10a014",
+            "pair": "34cd24d73a9c22ba8809d6028742417801a27aff793eaaa4aea5b6b523139574"
+          },
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a3000101010200",
+                "frame": "000000000700000007a3000101010200",
+                "from": "b",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a3000101010200",
+                "frame": "000000000700000007a3000101010200",
+                "from": "host",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a400030150d70e59860ae98488123870f5b6f121c9025820eaf45af9726b0a9f844da02f1d3031748abfb8ed4bcdbc743cf529ec21309047036550686f6e65",
+                "frame": "00000000070000003fa400030150d70e59860ae98488123870f5b6f121c9025820eaf45af9726b0a9f844da02f1d3031748abfb8ed4bcdbc743cf529ec21309047036550686f6e65",
+                "from": "b",
+                "type": "JOIN_PROOF"
+              }
+            }
+          ],
+          "party": "b"
+        },
+        {
+          "conn": 2,
+          "control": "a3000101010200",
+          "event": "receive",
+          "out": [
+            {
+              "version": 0
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a3000101010200",
+          "event": "receive",
+          "out": [
+            {
+              "version": 0
+            }
+          ],
+          "party": "b"
+        },
+        {
+          "conn": 2,
+          "control": "a400030150d70e59860ae98488123870f5b6f121c9025820eaf45af9726b0a9f844da02f1d3031748abfb8ed4bcdbc743cf529ec21309047036550686f6e65",
+          "event": "receive",
+          "out": [
+            {
+              "close": {
+                "code": "invitation_invalid",
+                "conn": 2,
+                "frame": "000000000800000002000b",
+                "from": "host"
+              }
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "code": "invitation_invalid",
+          "event": "goaway",
+          "out": [
+            {
+              "failed": "invitation_invalid"
+            }
+          ],
+          "party": "b"
+        }
+      ]
+    },
+    {
+      "description": "The joiner's TLS session is not the one the host sees (a relaying middle device): the join proof was made with another exporter. The host closes with invitation_invalid and the invitation stays open.",
+      "draws": {
+        "host": [
+          {
+            "bytes": "88ebbb28d0acdd463b483deb0bd2c029",
+            "use": "invitation_id"
+          },
+          {
+            "bytes": "ee0811d1eef5da8fd3529bba44c82dd8",
+            "use": "ticket_secret"
+          },
+          {
+            "u32": 424242,
+            "use": "code"
+          }
+        ],
+        "joiners": {
+          "a": []
+        }
+      },
+      "end": {
+        "grants": [],
+        "host": {
+          "attempts_left": 3,
+          "shown_code": "424242",
+          "status": "open"
+        },
+        "joiners": {
+          "a": {
+            "attempts_left": 3,
+            "live": false,
+            "outcome_pending": false,
+            "state": "failed:invitation_invalid",
+            "stored": null
+          }
+        }
+      },
+      "kind": 2,
+      "name": "proof_on_another_session",
+      "steps": [
+        {
+          "event": "create",
+          "kind": 2,
+          "out": [
+            {
+              "ticket": {
+                "binary": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794045088ebbb28d0acdd463b483deb0bd2c0290550ee0811d1eef5da8fd3529bba44c82dd8061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433",
+                "fragment": "pwEBAgIDWEEEAhfmF_C2RDkoJ4-WmZ5pojpPLBUr321s32bluAKC1O0ZSn3ry5dxLS3aPKhaqHZaVvRfx1hZllLyiXxlMG5XlARQiOu7KNCs3UY7SD3rC9LAKQVQ7ggR0e712o_TUpu6RMgt2AYaarE92AeBd3RjcDovLzE5Mi4xNjguMS4yMDo3NDQz",
+                "hash": "7ea99abe70960456272caf740a3816ea4a17e45caab32be022fc4074d3da4413",
+                "shown_code": "424242"
+              }
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "arrival": "link",
+          "event": "start",
+          "out": [],
+          "party": "a",
+          "ticket": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794045088ebbb28d0acdd463b483deb0bd2c0290550ee0811d1eef5da8fd3529bba44c82dd8061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
+        },
+        {
+          "conn": 1,
+          "event": "connect",
+          "exporters": {
+            "join": "eaa5559608c7ae0312afb4a04c21055f5d902b7e551a094a9c32a2e1691ae12f",
+            "pair": "f2626c592e2d8fd838779b16fba02d61b92531cf9fc1be535c1bfb109909c90f"
+          },
+          "host_exporters": {
+            "join": "8f6cc06f82a26056df6789c8be7dcbf62bed245d02cae148d1fd667c833d006c",
+            "pair": "12181727b78cf6486d5940ff95d5e71ac90ef7c98ff8f606de887551b4d7c91b"
+          },
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000101010200",
+                "frame": "000000000700000007a3000101010200",
+                "from": "a",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000101010200",
+                "frame": "000000000700000007a3000101010200",
+                "from": "host",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a40003015088ebbb28d0acdd463b483deb0bd2c0290258207f0e6a1a29e941c3487df1f62c413db21af1dee9fed7186f09a8b612de4a004a036550686f6e65",
+                "frame": "00000000070000003fa40003015088ebbb28d0acdd463b483deb0bd2c0290258207f0e6a1a29e941c3487df1f62c413db21af1dee9fed7186f09a8b612de4a004a036550686f6e65",
+                "from": "a",
+                "type": "JOIN_PROOF"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "control": "a3000101010200",
+          "event": "receive",
+          "out": [
+            {
+              "version": 0
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a3000101010200",
+          "event": "receive",
+          "out": [
+            {
+              "version": 0
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "control": "a40003015088ebbb28d0acdd463b483deb0bd2c0290258207f0e6a1a29e941c3487df1f62c413db21af1dee9fed7186f09a8b612de4a004a036550686f6e65",
+          "event": "receive",
+          "out": [
+            {
+              "close": {
+                "code": "invitation_invalid",
+                "conn": 1,
+                "frame": "000000000800000002000b",
+                "from": "host"
+              }
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "code": "invitation_invalid",
+          "event": "goaway",
+          "out": [
+            {
+              "failed": "invitation_invalid"
+            }
+          ],
+          "party": "a"
+        }
+      ]
+    },
+    {
+      "description": "The host verifies the joiner's confirmation, enrolls it and sends PAIRED, but the connection breaks before PAIRED arrives. The joiner marked its outcome pending (persist) before its confirmation went out; it reconnects with the same ticket and, as on every connection of a pairing flow, sends JOIN_PROOF right after its HELLO without waiting for the host. Step 2 finds the live grant: the host sends AUTHORIZED live at once. It then answers the proof: the grant's enrollment receipt names this invitation, so the answer is PAIRED again, with the invitation's role. The joiner takes the first live as a notice and PAIRED as its outcome: paired. Once the pin is stored it clears the pending mark (persist).",
+      "draws": {
+        "host": [
+          {
+            "bytes": "2c04a9ba2ec8dfe5a32209df5eb96074",
+            "use": "invitation_id"
+          },
+          {
+            "bytes": "7f20de81b2b5e0558807ff7c09f3787c",
+            "use": "ticket_secret"
+          },
+          {
+            "u32": 246810,
+            "use": "code"
+          },
+          {
+            "u32": 135791,
+            "use": "next_code"
+          },
+          {
+            "bytes": "9c788ee418acdf48c9fd99a5276b582dca6d68333f54d2cc1bc196aa29796bd7",
+            "use": "cpace_scalar_yb"
+          }
+        ],
+        "joiners": {
+          "a": [
+            {
+              "bytes": "775bafca3823c88e048fe490c98e95e7",
+              "use": "attempt_id"
+            },
+            {
+              "bytes": "711bfd31473c019cc814f9b9a516e33f2970daeb2b28da02c0b1c1ca7c7a0f8c",
+              "use": "cpace_scalar_ya"
+            }
+          ]
+        }
+      },
+      "end": {
+        "grants": [
+          {
+            "authorizing_owner": "51515151515151515151515151515151",
+            "bound_connections": [
+              2
+            ],
+            "expires_at": null,
+            "granted_at": 1790000000,
+            "identity": "04d65a93977caa3d1b081852ff57a79e465f1660577304baead505dd3a48589cf350185e895372df6221ea3a137557e473fddb6755f05bd507c3c533fce9c91285",
+            "name": "Phone",
+            "role": "owner"
+          }
+        ],
+        "host": {
+          "attempts_left": 2,
+          "shown_code": null,
+          "status": "consumed"
+        },
+        "joiners": {
+          "a": {
+            "attempts_left": 2,
+            "live": true,
+            "outcome_pending": false,
+            "state": "paired",
+            "stored": "a401756d6f757373652d6a6f696e65722d666c6f772d7631025820ea554674b84fcc00df0fc438d8f794e9625ae55400f4ddd592aeafc59eebb33603020400"
+          }
+        }
+      },
+      "kind": 2,
+      "name": "outcome_after_lost_paired",
+      "steps": [
+        {
+          "event": "create",
+          "kind": 2,
+          "out": [
+            {
+              "ticket": {
+                "binary": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e579404502c04a9ba2ec8dfe5a32209df5eb9607405507f20de81b2b5e0558807ff7c09f3787c061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433",
+                "fragment": "pwEBAgIDWEEEAhfmF_C2RDkoJ4-WmZ5pojpPLBUr321s32bluAKC1O0ZSn3ry5dxLS3aPKhaqHZaVvRfx1hZllLyiXxlMG5XlARQLASpui7I3-WjIgnfXrlgdAVQfyDegbK14FWIB_98CfN4fAYaarE92AeBd3RjcDovLzE5Mi4xNjguMS4yMDo3NDQz",
+                "hash": "ea554674b84fcc00df0fc438d8f794e9625ae55400f4ddd592aeafc59eebb336",
+                "shown_code": "246810"
+              }
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "arrival": "link",
+          "event": "start",
+          "out": [],
+          "party": "a",
+          "ticket": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e579404502c04a9ba2ec8dfe5a32209df5eb9607405507f20de81b2b5e0558807ff7c09f3787c061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
+        },
+        {
+          "conn": 1,
+          "event": "connect",
+          "exporters": {
+            "join": "4fcbeb443f4e65a024f2fda5b672d3e0744b7544f6a3e0c690293be6f7d1e0e3",
+            "pair": "f626bc7627320d2c0606ef7f0bf72b657a7293d76556686d60479153c96b48eb"
+          },
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000101010200",
+                "frame": "000000000700000007a3000101010200",
+                "from": "a",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000101010200",
+                "frame": "000000000700000007a3000101010200",
+                "from": "host",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a4000301502c04a9ba2ec8dfe5a32209df5eb96074025820d00c0d2cef272055772827aca83b9c55f3f43a256c65d76fd4dfbf0b68f61160036550686f6e65",
+                "frame": "00000000070000003fa4000301502c04a9ba2ec8dfe5a32209df5eb96074025820d00c0d2cef272055772827aca83b9c55f3f43a256c65d76fd4dfbf0b68f61160036550686f6e65",
+                "from": "a",
+                "type": "JOIN_PROOF"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "control": "a3000101010200",
+          "event": "receive",
+          "out": [
+            {
+              "version": 0
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a3000101010200",
+          "event": "receive",
+          "out": [
+            {
+              "version": 0
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "control": "a4000301502c04a9ba2ec8dfe5a32209df5eb96074025820d00c0d2cef272055772827aca83b9c55f3f43a256c65d76fd4dfbf0b68f61160036550686f6e65",
+          "event": "receive",
+          "out": [
+            {
+              "admitted_join_only": 1
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a200020102",
+                "frame": "000000000700000005a200020102",
+                "from": "host",
+                "type": "AUTHORIZED"
+              }
+            },
+            {
+              "show_code": "246810"
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a200020102",
+          "event": "receive",
+          "out": [],
+          "party": "a"
+        },
+        {
+          "code": "246810",
+          "event": "submit_code",
+          "out": [
+            {
+              "attempt": {
+                "ci": "a6016e6d6f757373652d706169722d7631025820ea554674b84fcc00df0fc438d8f794e9625ae55400f4ddd592aeafc59eebb3360302040105828201584104d65a93977caa3d1b081852ff57a79e465f1660577304baead505dd3a48589cf350185e895372df6221ea3a137557e473fddb6755f05bd507c3c533fce9c9128582025841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794065820f626bc7627320d2c0606ef7f0bf72b657a7293d76556686d60479153c96b48eb",
+                "id": "775bafca3823c88e048fe490c98e95e7",
+                "sid": "c362e8dccf8051a84c3c76c343ca9db6f691d34fdbe95fe78873763ff65a3d55"
+              }
+            },
+            {
+              "persist": {
+                "expected": null,
+                "record": "a401756d6f757373652d6a6f696e65722d666c6f772d7631025820ea554674b84fcc00df0fc438d8f794e9625ae55400f4ddd592aeafc59eebb33603020400"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150775bafca3823c88e048fe490c98e95e702582220cc83bd051f6d3eb5b717d750cc2a10643ffbdaebbb6f8a0a11a343264344a75c00",
+                "frame": "00000000070000003aa300040150775bafca3823c88e048fe490c98e95e702582220cc83bd051f6d3eb5b717d750cc2a10643ffbdaebbb6f8a0a11a343264344a75c00",
+                "from": "a",
+                "type": "CODE_EXCHANGE"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "control": "a300040150775bafca3823c88e048fe490c98e95e702582220cc83bd051f6d3eb5b717d750cc2a10643ffbdaebbb6f8a0a11a343264344a75c00",
+          "event": "receive",
+          "out": [
+            {
+              "show_code": "135791"
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150775bafca3823c88e048fe490c98e95e7025862206a7e69ca9e2bc3df302867cafe45ad86f1aa355c557adad60b9abfb690dc830c00368d676115a04fa4cf1c54424999541c11c6044d1c07cad39e536346d135824c9a0e8f46ba7bd4d4d79d1e7790e68b5bd90ed794deab6d3dbe05e0d5efce2953",
+                "frame": "00000000070000007aa300040150775bafca3823c88e048fe490c98e95e7025862206a7e69ca9e2bc3df302867cafe45ad86f1aa355c557adad60b9abfb690dc830c00368d676115a04fa4cf1c54424999541c11c6044d1c07cad39e536346d135824c9a0e8f46ba7bd4d4d79d1e7790e68b5bd90ed794deab6d3dbe05e0d5efce2953",
+                "from": "host",
+                "type": "CODE_EXCHANGE"
+              }
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a300040150775bafca3823c88e048fe490c98e95e7025862206a7e69ca9e2bc3df302867cafe45ad86f1aa355c557adad60b9abfb690dc830c00368d676115a04fa4cf1c54424999541c11c6044d1c07cad39e536346d135824c9a0e8f46ba7bd4d4d79d1e7790e68b5bd90ed794deab6d3dbe05e0d5efce2953",
+          "event": "receive",
+          "out": [
+            {
+              "persist": {
+                "expected": "a401756d6f757373652d6a6f696e65722d666c6f772d7631025820ea554674b84fcc00df0fc438d8f794e9625ae55400f4ddd592aeafc59eebb33603020400",
+                "record": "a401756d6f757373652d6a6f696e65722d666c6f772d7631025820ea554674b84fcc00df0fc438d8f794e9625ae55400f4ddd592aeafc59eebb33603020401"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150775bafca3823c88e048fe490c98e95e702584084e3f69c8f6dea621ce38d344066f7225afda0cb7b8086f6e0d33f48bfebf2b7d72eb8deac76e3aa7ecfb2afc470ae76f8a6170cf66ed7e11be8cb68dcc379d4",
+                "frame": "000000000700000058a300040150775bafca3823c88e048fe490c98e95e702584084e3f69c8f6dea621ce38d344066f7225afda0cb7b8086f6e0d33f48bfebf2b7d72eb8deac76e3aa7ecfb2afc470ae76f8a6170cf66ed7e11be8cb68dcc379d4",
+                "from": "a",
+                "type": "CODE_EXCHANGE"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "control": "a300040150775bafca3823c88e048fe490c98e95e702584084e3f69c8f6dea621ce38d344066f7225afda0cb7b8086f6e0d33f48bfebf2b7d72eb8deac76e3aa7ecfb2afc470ae76f8a6170cf66ed7e11be8cb68dcc379d4",
+          "event": "receive",
+          "out": [
+            {
+              "enrolled": {
+                "conn": 1
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000601644465736b02656f776e6572",
+                "frame": "000000000700000010a3000601644465736b02656f776e6572",
+                "from": "host",
+                "type": "PAIRED"
+              }
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "event": "drop",
+          "out": [],
+          "party": "a"
+        },
+        {
+          "conn": 2,
+          "event": "connect",
+          "exporters": {
+            "join": "48c57bc0ae1629008cc0a0b5fdb0c804c5f018b44336ba95932dc16e470f41cd",
+            "pair": "02e0325ef418925fdda395d669df9ebbbad2bf6aceaa7c85ab50dd33f436d8b8"
+          },
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a3000101010200",
+                "frame": "000000000700000007a3000101010200",
+                "from": "a",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a3000101010200",
+                "frame": "000000000700000007a3000101010200",
+                "from": "host",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a200020101",
+                "frame": "000000000700000005a200020101",
+                "from": "host",
+                "type": "AUTHORIZED"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a4000301502c04a9ba2ec8dfe5a32209df5eb96074025820f3eec22c21a8dfe77ffc12b40c2c631ae07836c0a0c6a4cbbd9f481811c2671f036550686f6e65",
+                "frame": "00000000070000003fa4000301502c04a9ba2ec8dfe5a32209df5eb96074025820f3eec22c21a8dfe77ffc12b40c2c631ae07836c0a0c6a4cbbd9f481811c2671f036550686f6e65",
+                "from": "a",
+                "type": "JOIN_PROOF"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 2,
+          "control": "a3000101010200",
+          "event": "receive",
+          "out": [
+            {
+              "version": 0
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a3000101010200",
+          "event": "receive",
+          "out": [
+            {
+              "version": 0
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "control": "a200020101",
+          "event": "receive",
+          "out": [],
+          "party": "a"
+        },
+        {
+          "conn": 2,
+          "control": "a4000301502c04a9ba2ec8dfe5a32209df5eb96074025820f3eec22c21a8dfe77ffc12b40c2c631ae07836c0a0c6a4cbbd9f481811c2671f036550686f6e65",
+          "event": "receive",
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a3000601644465736b02656f776e6572",
+                "frame": "000000000700000010a3000601644465736b02656f776e6572",
+                "from": "host",
+                "type": "PAIRED"
+              }
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a3000601644465736b02656f776e6572",
+          "event": "receive",
+          "out": [
+            {
+              "paired": {
+                "host_identity": "040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794",
+                "host_name": "Desk",
+                "role": "owner"
+              }
+            },
+            {
+              "persist": {
+                "expected": "a401756d6f757373652d6a6f696e65722d666c6f772d7631025820ea554674b84fcc00df0fc438d8f794e9625ae55400f4ddd592aeafc59eebb33603020401",
+                "record": "a401756d6f757373652d6a6f696e65722d666c6f772d7631025820ea554674b84fcc00df0fc438d8f794e9625ae55400f4ddd592aeafc59eebb33603020400"
+              }
+            }
+          ],
+          "party": "a"
+        }
+      ]
+    },
+    {
+      "description": "The device already holds an owner grant and a pin for the host. It opens a send link whose invitation would make it a client, and the code exchange runs on its live connection (the proof made it join-only). The joiner verifies the host's confirmation, marks its outcome pending (persist) and sends its own, but the connection breaks before the host reads it, so the host never enrolls it. The invitation then expires. On reconnect step 2 finds the old owner grant (AUTHORIZED live); the proof's invitation is no longer open and the grant's enrollment receipt does not name it (that grant came from elsewhere), so the answer is AUTHORIZED live, not PAIRED. The joiner reports already_paired (the device keeps the access it had; the client role is not in effect), not a completed pairing, and clears the pending mark once the pin is stored. The grant stays owner.",
+      "draws": {
+        "host": [
+          {
+            "bytes": "768e0c4fd145796f65bc6ba2ce32b939",
+            "use": "invitation_id"
+          },
+          {
+            "bytes": "da9272c12ead931aa98be0804e21019a",
+            "use": "ticket_secret"
+          },
+          {
+            "u32": 314271,
+            "use": "code"
+          },
+          {
+            "u32": 662607,
+            "use": "next_code"
+          },
+          {
+            "bytes": "a40b65ecfe6aca4f26ee359e33036c9912dbb3ee7bb063888b42b8601a109e20",
+            "use": "cpace_scalar_yb"
+          }
+        ],
+        "joiners": {
+          "a": [
+            {
+              "bytes": "e9156cd8c0c2ffccec08290ef2959154",
+              "use": "attempt_id"
+            },
+            {
+              "bytes": "6b03c3cc6a2dc31a3b9c3bdd36363534a5d9b4df8ac3f2d7447d27ffae7e8aab",
+              "use": "cpace_scalar_ya"
+            }
+          ]
+        }
+      },
+      "end": {
+        "grants": [
+          {
+            "authorizing_owner": "51515151515151515151515151515151",
+            "bound_connections": [
+              2
+            ],
+            "expires_at": null,
+            "granted_at": 1790000000,
+            "identity": "04d65a93977caa3d1b081852ff57a79e465f1660577304baead505dd3a48589cf350185e895372df6221ea3a137557e473fddb6755f05bd507c3c533fce9c91285",
+            "name": "Phone (Work)",
+            "role": "owner"
+          }
+        ],
+        "host": {
+          "attempts_left": 2,
+          "shown_code": null,
+          "status": "ended:invitation_invalid"
+        },
+        "joiners": {
+          "a": {
+            "attempts_left": 2,
+            "live": true,
+            "outcome_pending": false,
+            "state": "already_paired",
+            "stored": "a401756d6f757373652d6a6f696e65722d666c6f772d76310258202d2080d9750c9cfdfa37362665298332edffa252d0e6740fd32c2841f6e8490d03020400"
+          }
+        }
+      },
+      "kind": 2,
+      "name": "role_change_not_committed",
+      "steps": [
+        {
+          "event": "create",
+          "kind": 2,
+          "out": [
+            {
+              "ticket": {
+                "binary": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450768e0c4fd145796f65bc6ba2ce32b9390550da9272c12ead931aa98be0804e21019a061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433",
+                "fragment": "pwEBAgIDWEEEAhfmF_C2RDkoJ4-WmZ5pojpPLBUr321s32bluAKC1O0ZSn3ry5dxLS3aPKhaqHZaVvRfx1hZllLyiXxlMG5XlARQdo4MT9FFeW9lvGuizjK5OQVQ2pJywS6tkxqpi-CATiEBmgYaarE92AeBd3RjcDovLzE5Mi4xNjguMS4yMDo3NDQz",
+                "hash": "2d2080d9750c9cfdfa37362665298332edffa252d0e6740fd32c2841f6e8490d",
+                "shown_code": "314271"
+              }
+            }
+          ],
+          "party": "host",
+          "role": "client"
+        },
+        {
+          "event": "grant",
+          "name": "Phone (Work)",
+          "out": [],
+          "party": "host",
+          "role": "owner"
+        },
+        {
+          "arrival": "link",
+          "event": "start",
+          "host_pinned": true,
+          "out": [],
+          "party": "a",
+          "ticket": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450768e0c4fd145796f65bc6ba2ce32b9390550da9272c12ead931aa98be0804e21019a061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
+        },
+        {
+          "conn": 1,
+          "event": "connect",
+          "exporters": {
+            "join": "b04844d562bbb30390520f44d6318b828d01bad63cf1125eabe84c66475030bb",
+            "pair": "c6152c71badfab6e1f4f05808d9eb78e143e7e2ecdb5986bcf2b0e9771b677ea"
+          },
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000101010200",
+                "frame": "000000000700000007a3000101010200",
+                "from": "a",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000101010200",
+                "frame": "000000000700000007a3000101010200",
+                "from": "host",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a200020101",
+                "frame": "000000000700000005a200020101",
+                "from": "host",
+                "type": "AUTHORIZED"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a400030150768e0c4fd145796f65bc6ba2ce32b9390258205e999075ef7b0d2f906f272803468c9a45d5a20b39f789330dab8f2409cc9af3036550686f6e65",
+                "frame": "00000000070000003fa400030150768e0c4fd145796f65bc6ba2ce32b9390258205e999075ef7b0d2f906f272803468c9a45d5a20b39f789330dab8f2409cc9af3036550686f6e65",
+                "from": "a",
+                "type": "JOIN_PROOF"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "control": "a3000101010200",
+          "event": "receive",
+          "out": [
+            {
+              "version": 0
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a3000101010200",
+          "event": "receive",
+          "out": [
+            {
+              "version": 0
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "control": "a200020101",
+          "event": "receive",
+          "out": [],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "control": "a400030150768e0c4fd145796f65bc6ba2ce32b9390258205e999075ef7b0d2f906f272803468c9a45d5a20b39f789330dab8f2409cc9af3036550686f6e65",
+          "event": "receive",
+          "out": [
+            {
+              "admitted_join_only": 1
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a200020102",
+                "frame": "000000000700000005a200020102",
+                "from": "host",
+                "type": "AUTHORIZED"
+              }
+            },
+            {
+              "show_code": "314271"
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a200020102",
+          "event": "receive",
+          "out": [],
+          "party": "a"
+        },
+        {
+          "code": "314271",
+          "event": "submit_code",
+          "out": [
+            {
+              "attempt": {
+                "ci": "a6016e6d6f757373652d706169722d76310258202d2080d9750c9cfdfa37362665298332edffa252d0e6740fd32c2841f6e8490d0302040105828201584104d65a93977caa3d1b081852ff57a79e465f1660577304baead505dd3a48589cf350185e895372df6221ea3a137557e473fddb6755f05bd507c3c533fce9c9128582025841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794065820c6152c71badfab6e1f4f05808d9eb78e143e7e2ecdb5986bcf2b0e9771b677ea",
+                "id": "e9156cd8c0c2ffccec08290ef2959154",
+                "sid": "1c4869004b743c9a95dcd58e5aecd734db77708b06cccfab69e5b25657c74c36"
+              }
+            },
+            {
+              "persist": {
+                "expected": null,
+                "record": "a401756d6f757373652d6a6f696e65722d666c6f772d76310258202d2080d9750c9cfdfa37362665298332edffa252d0e6740fd32c2841f6e8490d03020400"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150e9156cd8c0c2ffccec08290ef295915402582220828b4354e915efa50717c7a2d80a6ad718232c1e51b4bbc5412c244752739f3900",
+                "frame": "00000000070000003aa300040150e9156cd8c0c2ffccec08290ef295915402582220828b4354e915efa50717c7a2d80a6ad718232c1e51b4bbc5412c244752739f3900",
+                "from": "a",
+                "type": "CODE_EXCHANGE"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "control": "a300040150e9156cd8c0c2ffccec08290ef295915402582220828b4354e915efa50717c7a2d80a6ad718232c1e51b4bbc5412c244752739f3900",
+          "event": "receive",
+          "out": [
+            {
+              "show_code": "662607"
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150e9156cd8c0c2ffccec08290ef29591540258622088d355970c877a7d36be5497265c97e8521f8ba8b52c1b92ccb420acc3f02e5800e5c60c37c831e46db13834fdcda24a97db2832c3943e99ee283b2a798929634457363c8509c2c6163e6568134fd3b0bf0bca2a2d5c680f512c5d07855677f51b",
+                "frame": "00000000070000007aa300040150e9156cd8c0c2ffccec08290ef29591540258622088d355970c877a7d36be5497265c97e8521f8ba8b52c1b92ccb420acc3f02e5800e5c60c37c831e46db13834fdcda24a97db2832c3943e99ee283b2a798929634457363c8509c2c6163e6568134fd3b0bf0bca2a2d5c680f512c5d07855677f51b",
+                "from": "host",
+                "type": "CODE_EXCHANGE"
+              }
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a300040150e9156cd8c0c2ffccec08290ef29591540258622088d355970c877a7d36be5497265c97e8521f8ba8b52c1b92ccb420acc3f02e5800e5c60c37c831e46db13834fdcda24a97db2832c3943e99ee283b2a798929634457363c8509c2c6163e6568134fd3b0bf0bca2a2d5c680f512c5d07855677f51b",
+          "event": "receive",
+          "out": [
+            {
+              "persist": {
+                "expected": "a401756d6f757373652d6a6f696e65722d666c6f772d76310258202d2080d9750c9cfdfa37362665298332edffa252d0e6740fd32c2841f6e8490d03020400",
+                "record": "a401756d6f757373652d6a6f696e65722d666c6f772d76310258202d2080d9750c9cfdfa37362665298332edffa252d0e6740fd32c2841f6e8490d03020401"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150e9156cd8c0c2ffccec08290ef29591540258403ae176ce90f779bbc443abfbefda84d2e2308a0945c42965500a0091e863ac2cd2af4fc11c6451e253f31d80937bbc40228065eac805b12b40107cc06b366b3e",
+                "frame": "000000000700000058a300040150e9156cd8c0c2ffccec08290ef29591540258403ae176ce90f779bbc443abfbefda84d2e2308a0945c42965500a0091e863ac2cd2af4fc11c6451e253f31d80937bbc40228065eac805b12b40107cc06b366b3e",
+                "from": "a",
+                "type": "CODE_EXCHANGE"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "event": "drop",
+          "out": [],
+          "party": "a"
+        },
+        {
+          "at": 1790000600,
+          "event": "tick",
+          "out": [
+            {
+              "invitation_ended": "invitation_invalid"
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "conn": 2,
+          "event": "connect",
+          "exporters": {
+            "join": "1b310ecf5f5a66ceaa6a3afe4d03653071eb1d10ad493b228686cae7b4e30ce8",
+            "pair": "50bc49487868fcd171066ca6b7130d307b0f0d357d86e1e713ef22d2732225a7"
+          },
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a3000101010200",
+                "frame": "000000000700000007a3000101010200",
+                "from": "a",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a3000101010200",
+                "frame": "000000000700000007a3000101010200",
+                "from": "host",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a200020101",
+                "frame": "000000000700000005a200020101",
+                "from": "host",
+                "type": "AUTHORIZED"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a400030150768e0c4fd145796f65bc6ba2ce32b939025820edc3b38e7ce57610eb94d3715bdfc03fbd6831c97f1ec677afc19b748f4dc8ae036550686f6e65",
+                "frame": "00000000070000003fa400030150768e0c4fd145796f65bc6ba2ce32b939025820edc3b38e7ce57610eb94d3715bdfc03fbd6831c97f1ec677afc19b748f4dc8ae036550686f6e65",
+                "from": "a",
+                "type": "JOIN_PROOF"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 2,
+          "control": "a3000101010200",
+          "event": "receive",
+          "out": [
+            {
+              "version": 0
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a3000101010200",
+          "event": "receive",
+          "out": [
+            {
+              "version": 0
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "control": "a200020101",
+          "event": "receive",
+          "out": [],
+          "party": "a"
+        },
+        {
+          "conn": 2,
+          "control": "a400030150768e0c4fd145796f65bc6ba2ce32b939025820edc3b38e7ce57610eb94d3715bdfc03fbd6831c97f1ec677afc19b748f4dc8ae036550686f6e65",
+          "event": "receive",
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a200020101",
+                "frame": "000000000700000005a200020101",
+                "from": "host",
+                "type": "AUTHORIZED"
+              }
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a200020101",
+          "event": "receive",
+          "out": [
+            {
+              "already_paired": true
+            },
+            {
+              "persist": {
+                "expected": "a401756d6f757373652d6a6f696e65722d666c6f772d76310258202d2080d9750c9cfdfa37362665298332edffa252d0e6740fd32c2841f6e8490d03020401",
+                "record": "a401756d6f757373652d6a6f696e65722d666c6f772d76310258202d2080d9750c9cfdfa37362665298332edffa252d0e6740fd32c2841f6e8490d03020400"
+              }
+            }
+          ],
+          "party": "a"
+        }
+      ]
+    },
+    {
+      "description": "Every write the joiner asks for (persist: a compare-and-swap of its flow record) lands before the actions that wait for it: the debit before msg_a, and the outcome-pending mark after the host's confirmation verified but before msg_c. Here the app is killed right after the pending mark lands, so msg_c never goes out and the host, seeing the connection drop, fails the attempt. Opening the link again with the stored record (2 attempts left, outcome pending) reconnects even though the flow could not know whether the host enrolled it. The host has no grant and the invitation is still open, so it admits the proof join-only: not enrolled. The joiner clears the pending mark (persist) and waits for the current code.",
+      "draws": {
+        "host": [
+          {
+            "bytes": "b9a9b8bf61a8ed4df96d7a355d2d2b06",
+            "use": "invitation_id"
+          },
+          {
+            "bytes": "a57e4c057aa774f154ba2bc6daeed975",
+            "use": "ticket_secret"
+          },
+          {
+            "u32": 141421,
+            "use": "code"
+          },
+          {
+            "u32": 173205,
+            "use": "next_code"
+          },
+          {
+            "bytes": "430338573cb92435d8232e2d34c8e821d284c6e93539b25f473824dbc858e389",
+            "use": "cpace_scalar_yb"
+          }
+        ],
+        "joiners": {
+          "a": [
+            {
+              "bytes": "acc3ef073dbac15a6b8102e776497a30",
+              "use": "attempt_id"
+            },
+            {
+              "bytes": "13100eec298b013b6a5bc54d254043d84a52dfd6dca0da99e490d8bb0887c055",
+              "use": "cpace_scalar_ya"
+            }
+          ]
+        }
+      },
+      "end": {
+        "grants": [],
+        "host": {
+          "attempts_left": 2,
+          "shown_code": "173205",
+          "status": "open"
+        },
+        "joiners": {
+          "a": {
+            "attempts_left": 2,
+            "live": false,
+            "outcome_pending": false,
+            "state": "awaiting_code",
+            "stored": "a401756d6f757373652d6a6f696e65722d666c6f772d7631025820371926f67006bf02af0af715ab56949ae40a65e6f0d3258ff32ca272ef9c30a103020400"
+          }
+        }
+      },
+      "kind": 2,
+      "name": "crash_after_pending_mark",
+      "steps": [
+        {
+          "event": "create",
+          "kind": 2,
+          "out": [
+            {
+              "ticket": {
+                "binary": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b9a9b8bf61a8ed4df96d7a355d2d2b060550a57e4c057aa774f154ba2bc6daeed975061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433",
+                "fragment": "pwEBAgIDWEEEAhfmF_C2RDkoJ4-WmZ5pojpPLBUr321s32bluAKC1O0ZSn3ry5dxLS3aPKhaqHZaVvRfx1hZllLyiXxlMG5XlARQuam4v2Go7U35bXo1XS0rBgVQpX5MBXqndPFUuivG2u7ZdQYaarE92AeBd3RjcDovLzE5Mi4xNjguMS4yMDo3NDQz",
+                "hash": "371926f67006bf02af0af715ab56949ae40a65e6f0d3258ff32ca272ef9c30a1",
+                "shown_code": "141421"
+              }
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "arrival": "link",
+          "event": "start",
+          "out": [],
+          "party": "a",
+          "ticket": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b9a9b8bf61a8ed4df96d7a355d2d2b060550a57e4c057aa774f154ba2bc6daeed975061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
+        },
+        {
+          "conn": 1,
+          "event": "connect",
+          "exporters": {
+            "join": "cfca4f025cda7db1b8c769cea3ab7bafc624e9cf93349e0942dc571d1dad573c",
+            "pair": "7e19afb3ccbe95eacbf9eeee55947d9baacbe81b7b236a8eb96ce869d3030d9d"
+          },
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000101010200",
+                "frame": "000000000700000007a3000101010200",
+                "from": "a",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000101010200",
+                "frame": "000000000700000007a3000101010200",
+                "from": "host",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a400030150b9a9b8bf61a8ed4df96d7a355d2d2b06025820fbe97c803709f9b30c3ba0582a7d07bd55750ec9e3d32c6c9c5c6451f91cabf2036550686f6e65",
+                "frame": "00000000070000003fa400030150b9a9b8bf61a8ed4df96d7a355d2d2b06025820fbe97c803709f9b30c3ba0582a7d07bd55750ec9e3d32c6c9c5c6451f91cabf2036550686f6e65",
+                "from": "a",
+                "type": "JOIN_PROOF"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "control": "a3000101010200",
+          "event": "receive",
+          "out": [
+            {
+              "version": 0
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a3000101010200",
+          "event": "receive",
+          "out": [
+            {
+              "version": 0
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "control": "a400030150b9a9b8bf61a8ed4df96d7a355d2d2b06025820fbe97c803709f9b30c3ba0582a7d07bd55750ec9e3d32c6c9c5c6451f91cabf2036550686f6e65",
+          "event": "receive",
+          "out": [
+            {
+              "admitted_join_only": 1
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a200020102",
+                "frame": "000000000700000005a200020102",
+                "from": "host",
+                "type": "AUTHORIZED"
+              }
+            },
+            {
+              "show_code": "141421"
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a200020102",
+          "event": "receive",
+          "out": [],
+          "party": "a"
+        },
+        {
+          "code": "141421",
+          "event": "submit_code",
+          "out": [
+            {
+              "attempt": {
+                "ci": "a6016e6d6f757373652d706169722d7631025820371926f67006bf02af0af715ab56949ae40a65e6f0d3258ff32ca272ef9c30a10302040105828201584104d65a93977caa3d1b081852ff57a79e465f1660577304baead505dd3a48589cf350185e895372df6221ea3a137557e473fddb6755f05bd507c3c533fce9c9128582025841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940658207e19afb3ccbe95eacbf9eeee55947d9baacbe81b7b236a8eb96ce869d3030d9d",
+                "id": "acc3ef073dbac15a6b8102e776497a30",
+                "sid": "17721e5d15377c3e962421e77725a517dda2822bafc3f5eec2055e17150d7b79"
+              }
+            },
+            {
+              "persist": {
+                "expected": null,
+                "record": "a401756d6f757373652d6a6f696e65722d666c6f772d7631025820371926f67006bf02af0af715ab56949ae40a65e6f0d3258ff32ca272ef9c30a103020400"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150acc3ef073dbac15a6b8102e776497a30025822205af1661339188ef51bbc265b5ae2005392f463e88e9ec68b19d05577de80565100",
+                "frame": "00000000070000003aa300040150acc3ef073dbac15a6b8102e776497a30025822205af1661339188ef51bbc265b5ae2005392f463e88e9ec68b19d05577de80565100",
+                "from": "a",
+                "type": "CODE_EXCHANGE"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "control": "a300040150acc3ef073dbac15a6b8102e776497a30025822205af1661339188ef51bbc265b5ae2005392f463e88e9ec68b19d05577de80565100",
+          "event": "receive",
+          "out": [
+            {
+              "show_code": "173205"
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150acc3ef073dbac15a6b8102e776497a3002586220e8a6373d7e21c88455eeea127f4cf7c31dc56f7da7d5d4ea71eef9bfdcd5df6b007914fdc3392300cb0fb88178916b6d9120d3f4f6f38d04d92713944742827f29f20a7c9c2734f538d39db6b60d5b93c4345983bf09243503fdb6d407041882a5",
+                "frame": "00000000070000007aa300040150acc3ef073dbac15a6b8102e776497a3002586220e8a6373d7e21c88455eeea127f4cf7c31dc56f7da7d5d4ea71eef9bfdcd5df6b007914fdc3392300cb0fb88178916b6d9120d3f4f6f38d04d92713944742827f29f20a7c9c2734f538d39db6b60d5b93c4345983bf09243503fdb6d407041882a5",
+                "from": "host",
+                "type": "CODE_EXCHANGE"
+              }
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a300040150acc3ef073dbac15a6b8102e776497a3002586220e8a6373d7e21c88455eeea127f4cf7c31dc56f7da7d5d4ea71eef9bfdcd5df6b007914fdc3392300cb0fb88178916b6d9120d3f4f6f38d04d92713944742827f29f20a7c9c2734f538d39db6b60d5b93c4345983bf09243503fdb6d407041882a5",
+          "crash_at_persist": true,
+          "event": "receive",
+          "out": [
+            {
+              "persist": {
+                "expected": "a401756d6f757373652d6a6f696e65722d666c6f772d7631025820371926f67006bf02af0af715ab56949ae40a65e6f0d3258ff32ca272ef9c30a103020400",
+                "record": "a401756d6f757373652d6a6f696e65722d666c6f772d7631025820371926f67006bf02af0af715ab56949ae40a65e6f0d3258ff32ca272ef9c30a103020401"
+              }
+            },
+            {
+              "crashed": true
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "arrival": "link",
+          "event": "start",
+          "out": [],
+          "party": "a",
+          "record": "a401756d6f757373652d6a6f696e65722d666c6f772d7631025820371926f67006bf02af0af715ab56949ae40a65e6f0d3258ff32ca272ef9c30a103020401",
+          "ticket": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b9a9b8bf61a8ed4df96d7a355d2d2b060550a57e4c057aa774f154ba2bc6daeed975061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
+        },
+        {
+          "conn": 2,
+          "event": "connect",
+          "exporters": {
+            "join": "9e56d04af10a4c00e865dfbd7607563cc010290ae911aacbc2ae7366d0e899c0",
+            "pair": "82ea02700fb5212c863d57eea93d4a9fea581f39925f6db8d54998eb37e24d3d"
+          },
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a3000101010200",
+                "frame": "000000000700000007a3000101010200",
+                "from": "a",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a3000101010200",
+                "frame": "000000000700000007a3000101010200",
+                "from": "host",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a400030150b9a9b8bf61a8ed4df96d7a355d2d2b06025820f27f0a767bf0ec99301a458f9d72fb1765855c6d622ac4d71f0b0941624ee2bf036550686f6e65",
+                "frame": "00000000070000003fa400030150b9a9b8bf61a8ed4df96d7a355d2d2b06025820f27f0a767bf0ec99301a458f9d72fb1765855c6d622ac4d71f0b0941624ee2bf036550686f6e65",
+                "from": "a",
+                "type": "JOIN_PROOF"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 2,
+          "control": "a3000101010200",
+          "event": "receive",
+          "out": [
+            {
+              "version": 0
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a3000101010200",
+          "event": "receive",
+          "out": [
+            {
+              "version": 0
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 2,
+          "control": "a400030150b9a9b8bf61a8ed4df96d7a355d2d2b06025820f27f0a767bf0ec99301a458f9d72fb1765855c6d622ac4d71f0b0941624ee2bf036550686f6e65",
+          "event": "receive",
+          "out": [
+            {
+              "admitted_join_only": 2
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a200020102",
+                "frame": "000000000700000005a200020102",
+                "from": "host",
+                "type": "AUTHORIZED"
+              }
+            },
+            {
+              "show_code": "173205"
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a200020102",
+          "event": "receive",
+          "out": [
+            {
+              "persist": {
+                "expected": "a401756d6f757373652d6a6f696e65722d666c6f772d7631025820371926f67006bf02af0af715ab56949ae40a65e6f0d3258ff32ca272ef9c30a103020401",
+                "record": "a401756d6f757373652d6a6f696e65722d666c6f772d7631025820371926f67006bf02af0af715ab56949ae40a65e6f0d3258ff32ca272ef9c30a103020400"
+              }
+            }
+          ],
+          "party": "a"
+        }
+      ]
+    },
+    {
+      "description": "PAIRED is lost as in outcome_after_lost_paired. The joiner's next connection gets no answer to its proof within 10 s (proof_timeout): it closes with not_authorized and the flow ends; it does not reconnect on its own. The stored record keeps the outcome pending, so opening the same ticket again (start with the saved record) reconnects, and the host's answer to the proof, PAIRED again for its receipt, gives the outcome.",
+      "draws": {
+        "host": [
+          {
+            "bytes": "26a55829488492ea5606f9fc6538536f",
+            "use": "invitation_id"
+          },
+          {
+            "bytes": "8e6775178c6226f79990dddb6e35ff83",
+            "use": "ticket_secret"
+          },
+          {
+            "u32": 271801,
+            "use": "code"
+          },
+          {
+            "u32": 577215,
+            "use": "next_code"
+          },
+          {
+            "bytes": "8d2bedce8c28aa290f510584093b2990dff320f37de506eff0ed004db0d3efaf",
+            "use": "cpace_scalar_yb"
+          }
+        ],
+        "joiners": {
+          "a": [
+            {
+              "bytes": "459d65bfff51e38cf6740db6b2320c2d",
+              "use": "attempt_id"
+            },
+            {
+              "bytes": "3c2be72d18a00b09673b34b13e4626e65f74ed041b5ba05d22a37f1b6a440601",
+              "use": "cpace_scalar_ya"
+            }
+          ]
+        }
+      },
+      "end": {
+        "grants": [
+          {
+            "authorizing_owner": "51515151515151515151515151515151",
+            "bound_connections": [
+              3
+            ],
+            "expires_at": null,
+            "granted_at": 1790000000,
+            "identity": "04d65a93977caa3d1b081852ff57a79e465f1660577304baead505dd3a48589cf350185e895372df6221ea3a137557e473fddb6755f05bd507c3c533fce9c91285",
+            "name": "Phone",
+            "role": "owner"
+          }
+        ],
+        "host": {
+          "attempts_left": 2,
+          "shown_code": null,
+          "status": "consumed"
+        },
+        "joiners": {
+          "a": {
+            "attempts_left": 2,
+            "live": true,
+            "outcome_pending": false,
+            "state": "paired",
+            "stored": "a401756d6f757373652d6a6f696e65722d666c6f772d76310258208c3e371bf3e923ac943ebd3dd894f887b44a70fe619092f53f5e5df437876acc03020400"
+          }
+        }
+      },
+      "kind": 2,
+      "name": "lost_paired_then_proof_timeout",
+      "steps": [
+        {
+          "event": "create",
+          "kind": 2,
+          "out": [
+            {
+              "ticket": {
+                "binary": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794045026a55829488492ea5606f9fc6538536f05508e6775178c6226f79990dddb6e35ff83061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433",
+                "fragment": "pwEBAgIDWEEEAhfmF_C2RDkoJ4-WmZ5pojpPLBUr321s32bluAKC1O0ZSn3ry5dxLS3aPKhaqHZaVvRfx1hZllLyiXxlMG5XlARQJqVYKUiEkupWBvn8ZThTbwVQjmd1F4xiJveZkN3bbjX_gwYaarE92AeBd3RjcDovLzE5Mi4xNjguMS4yMDo3NDQz",
+                "hash": "8c3e371bf3e923ac943ebd3dd894f887b44a70fe619092f53f5e5df437876acc",
+                "shown_code": "271801"
+              }
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "arrival": "link",
+          "event": "start",
+          "out": [],
+          "party": "a",
+          "ticket": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794045026a55829488492ea5606f9fc6538536f05508e6775178c6226f79990dddb6e35ff83061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
+        },
+        {
+          "conn": 1,
+          "event": "connect",
+          "exporters": {
+            "join": "82ff54ed81cf4ab18a00e5b51481146baafd50da41c6bc20676935d4b16ecdae",
+            "pair": "88ee6e7bce9785ef2d7a495c596e631f079e0ddafcbd5fff3864a08bdc67cc2d"
+          },
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000101010200",
+                "frame": "000000000700000007a3000101010200",
+                "from": "a",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000101010200",
+                "frame": "000000000700000007a3000101010200",
+                "from": "host",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a40003015026a55829488492ea5606f9fc6538536f025820ed7817d5008fdbf6adb675fe8626a0efd97dd9260b41f9037970b30a47fe9a95036550686f6e65",
+                "frame": "00000000070000003fa40003015026a55829488492ea5606f9fc6538536f025820ed7817d5008fdbf6adb675fe8626a0efd97dd9260b41f9037970b30a47fe9a95036550686f6e65",
+                "from": "a",
+                "type": "JOIN_PROOF"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "control": "a3000101010200",
+          "event": "receive",
+          "out": [
+            {
+              "version": 0
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a3000101010200",
+          "event": "receive",
+          "out": [
+            {
+              "version": 0
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "control": "a40003015026a55829488492ea5606f9fc6538536f025820ed7817d5008fdbf6adb675fe8626a0efd97dd9260b41f9037970b30a47fe9a95036550686f6e65",
+          "event": "receive",
+          "out": [
+            {
+              "admitted_join_only": 1
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a200020102",
+                "frame": "000000000700000005a200020102",
+                "from": "host",
+                "type": "AUTHORIZED"
+              }
+            },
+            {
+              "show_code": "271801"
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a200020102",
+          "event": "receive",
+          "out": [],
+          "party": "a"
+        },
+        {
+          "code": "271801",
+          "event": "submit_code",
+          "out": [
+            {
+              "attempt": {
+                "ci": "a6016e6d6f757373652d706169722d76310258208c3e371bf3e923ac943ebd3dd894f887b44a70fe619092f53f5e5df437876acc0302040105828201584104d65a93977caa3d1b081852ff57a79e465f1660577304baead505dd3a48589cf350185e895372df6221ea3a137557e473fddb6755f05bd507c3c533fce9c9128582025841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e579406582088ee6e7bce9785ef2d7a495c596e631f079e0ddafcbd5fff3864a08bdc67cc2d",
+                "id": "459d65bfff51e38cf6740db6b2320c2d",
+                "sid": "a2a1e73043f374763b81a8f87750d1643bb4a0b2d93ae432b07dafc2a59698f7"
+              }
+            },
+            {
+              "persist": {
+                "expected": null,
+                "record": "a401756d6f757373652d6a6f696e65722d666c6f772d76310258208c3e371bf3e923ac943ebd3dd894f887b44a70fe619092f53f5e5df437876acc03020400"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150459d65bfff51e38cf6740db6b2320c2d0258222032d1e2da5a0c540a17e75f934b42938f84bf9a42dfe8771e6856b5345de5345900",
+                "frame": "00000000070000003aa300040150459d65bfff51e38cf6740db6b2320c2d0258222032d1e2da5a0c540a17e75f934b42938f84bf9a42dfe8771e6856b5345de5345900",
+                "from": "a",
+                "type": "CODE_EXCHANGE"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "control": "a300040150459d65bfff51e38cf6740db6b2320c2d0258222032d1e2da5a0c540a17e75f934b42938f84bf9a42dfe8771e6856b5345de5345900",
+          "event": "receive",
+          "out": [
+            {
+              "show_code": "577215"
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150459d65bfff51e38cf6740db6b2320c2d02586220762629c0fc6c1de4ef2e7d7700e9320dc9be29f0ea023807bd5e66bec439fd6200b1d042f6e001ca9833be9aef1acf2422ceeb49bab2634b11f974b6480cb39169331a8d4a9c1bf904ba047d12cafc9e8062c135064856800ea794e9414a4b3dfa",
+                "frame": "00000000070000007aa300040150459d65bfff51e38cf6740db6b2320c2d02586220762629c0fc6c1de4ef2e7d7700e9320dc9be29f0ea023807bd5e66bec439fd6200b1d042f6e001ca9833be9aef1acf2422ceeb49bab2634b11f974b6480cb39169331a8d4a9c1bf904ba047d12cafc9e8062c135064856800ea794e9414a4b3dfa",
+                "from": "host",
+                "type": "CODE_EXCHANGE"
+              }
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a300040150459d65bfff51e38cf6740db6b2320c2d02586220762629c0fc6c1de4ef2e7d7700e9320dc9be29f0ea023807bd5e66bec439fd6200b1d042f6e001ca9833be9aef1acf2422ceeb49bab2634b11f974b6480cb39169331a8d4a9c1bf904ba047d12cafc9e8062c135064856800ea794e9414a4b3dfa",
+          "event": "receive",
+          "out": [
+            {
+              "persist": {
+                "expected": "a401756d6f757373652d6a6f696e65722d666c6f772d76310258208c3e371bf3e923ac943ebd3dd894f887b44a70fe619092f53f5e5df437876acc03020400",
+                "record": "a401756d6f757373652d6a6f696e65722d666c6f772d76310258208c3e371bf3e923ac943ebd3dd894f887b44a70fe619092f53f5e5df437876acc03020401"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150459d65bfff51e38cf6740db6b2320c2d025840575bef061352ca8b967da3e42f22459735acf7d8d9070e556ebccba0d58399985be88914029956a078671d439bb09127efe469e14439d6933c5b67149ee08efa",
+                "frame": "000000000700000058a300040150459d65bfff51e38cf6740db6b2320c2d025840575bef061352ca8b967da3e42f22459735acf7d8d9070e556ebccba0d58399985be88914029956a078671d439bb09127efe469e14439d6933c5b67149ee08efa",
+                "from": "a",
+                "type": "CODE_EXCHANGE"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "control": "a300040150459d65bfff51e38cf6740db6b2320c2d025840575bef061352ca8b967da3e42f22459735acf7d8d9070e556ebccba0d58399985be88914029956a078671d439bb09127efe469e14439d6933c5b67149ee08efa",
+          "event": "receive",
+          "out": [
+            {
+              "enrolled": {
+                "conn": 1
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000601644465736b02656f776e6572",
+                "frame": "000000000700000010a3000601644465736b02656f776e6572",
+                "from": "host",
+                "type": "PAIRED"
+              }
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "event": "drop",
+          "out": [],
+          "party": "a"
+        },
+        {
+          "conn": 2,
+          "event": "connect",
+          "exporters": {
+            "join": "773d4ebbe2895babb5d7b6c961c442cf27e5a248c5d767034bc63d872a2fd61e",
+            "pair": "b9a843df3aa27056ec24d5493f173249f879f83e6cf67b5533903fa887179899"
+          },
+          "host": false,
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a3000101010200",
+                "frame": "000000000700000007a3000101010200",
+                "from": "a",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a40003015026a55829488492ea5606f9fc6538536f0258204c3ba7c55b7b184dbdb4ae0dc5edfff219f97f0859d0fa55f8600cf50240c690036550686f6e65",
+                "frame": "00000000070000003fa40003015026a55829488492ea5606f9fc6538536f0258204c3ba7c55b7b184dbdb4ae0dc5edfff219f97f0859d0fa55f8600cf50240c690036550686f6e65",
+                "from": "a",
+                "type": "JOIN_PROOF"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "event": "proof_timeout",
+          "out": [
+            {
+              "failed": "not_authorized"
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "event": "save",
+          "out": [
+            {
+              "record": "a401756d6f757373652d6a6f696e65722d666c6f772d76310258208c3e371bf3e923ac943ebd3dd894f887b44a70fe619092f53f5e5df437876acc03020401"
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "arrival": "link",
+          "event": "start",
+          "out": [],
+          "party": "a",
+          "record": "a401756d6f757373652d6a6f696e65722d666c6f772d76310258208c3e371bf3e923ac943ebd3dd894f887b44a70fe619092f53f5e5df437876acc03020401",
+          "ticket": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794045026a55829488492ea5606f9fc6538536f05508e6775178c6226f79990dddb6e35ff83061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
+        },
+        {
+          "conn": 3,
+          "event": "connect",
+          "exporters": {
+            "join": "23704e029930b4e4dd14c9cd84c4d5787e7f2148d6d8c006a37c482893c65a0c",
+            "pair": "36277c194995c124df0cf3423ac6cffe42aabead16db602f74fa9f5e091e7cee"
+          },
+          "out": [
+            {
+              "send": {
+                "conn": 3,
+                "control": "a3000101010200",
+                "frame": "000000000700000007a3000101010200",
+                "from": "a",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 3,
+                "control": "a3000101010200",
+                "frame": "000000000700000007a3000101010200",
+                "from": "host",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 3,
+                "control": "a200020101",
+                "frame": "000000000700000005a200020101",
+                "from": "host",
+                "type": "AUTHORIZED"
+              }
+            },
+            {
+              "send": {
+                "conn": 3,
+                "control": "a40003015026a55829488492ea5606f9fc6538536f025820dcf6bf8778d35f9f64151b7c9214545fe4f6b58cb4bcf6a896e8fd91b77e9c60036550686f6e65",
+                "frame": "00000000070000003fa40003015026a55829488492ea5606f9fc6538536f025820dcf6bf8778d35f9f64151b7c9214545fe4f6b58cb4bcf6a896e8fd91b77e9c60036550686f6e65",
+                "from": "a",
+                "type": "JOIN_PROOF"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 3,
+          "control": "a3000101010200",
+          "event": "receive",
+          "out": [
+            {
+              "version": 0
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a3000101010200",
+          "event": "receive",
+          "out": [
+            {
+              "version": 0
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "control": "a200020101",
+          "event": "receive",
+          "out": [],
+          "party": "a"
+        },
+        {
+          "conn": 3,
+          "control": "a40003015026a55829488492ea5606f9fc6538536f025820dcf6bf8778d35f9f64151b7c9214545fe4f6b58cb4bcf6a896e8fd91b77e9c60036550686f6e65",
+          "event": "receive",
+          "out": [
+            {
+              "send": {
+                "conn": 3,
+                "control": "a3000601644465736b02656f776e6572",
+                "frame": "000000000700000010a3000601644465736b02656f776e6572",
+                "from": "host",
+                "type": "PAIRED"
+              }
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a3000601644465736b02656f776e6572",
+          "event": "receive",
+          "out": [
+            {
+              "paired": {
+                "host_identity": "040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794",
+                "host_name": "Desk",
+                "role": "owner"
+              }
+            },
+            {
+              "persist": {
+                "expected": "a401756d6f757373652d6a6f696e65722d666c6f772d76310258208c3e371bf3e923ac943ebd3dd894f887b44a70fe619092f53f5e5df437876acc03020401",
+                "record": "a401756d6f757373652d6a6f696e65722d666c6f772d76310258208c3e371bf3e923ac943ebd3dd894f887b44a70fe619092f53f5e5df437876acc03020400"
+              }
+            }
+          ],
+          "party": "a"
+        }
+      ]
+    },
+    {
+      "description": "A send link can be swapped in transit for one that names another key; step 1 then passes against whoever holds that key, and it answers AUTHORIZED live from step 2 and AUTHORIZED live again as its answer to the proof. Joiner a has no pin for that key from before: on the answer it does not end already paired, fails with pairing_failed and pins nothing. Joiner b held a pin for the ticket's host before this flow (start with host_pinned): it ends already paired. A joiner learning the outcome of its own lost PAIRED is outcome_after_lost_paired.",
+      "draws": {
+        "host": [
+          {
+            "bytes": "7a833c4afd5dc592f9fee8cf0ea073e7",
+            "use": "invitation_id"
+          },
+          {
+            "bytes": "3b49b89ffb3b5866007e5ba24d151c33",
+            "use": "ticket_secret"
+          },
+          {
+            "u32": 112358,
+            "use": "code"
+          }
+        ],
+        "joiners": {
+          "a": [],
+          "b": []
+        }
+      },
+      "end": {
+        "grants": [],
+        "host": {
+          "attempts_left": 3,
+          "shown_code": "112358",
+          "status": "open"
+        },
+        "joiners": {
+          "a": {
+            "attempts_left": 3,
+            "live": false,
+            "outcome_pending": false,
+            "state": "failed:pairing_failed",
+            "stored": null
+          },
+          "b": {
+            "attempts_left": 3,
+            "live": true,
+            "outcome_pending": false,
+            "state": "already_paired",
+            "stored": null
+          }
+        }
+      },
+      "kind": 2,
+      "name": "send_link_live_needs_a_pin",
+      "steps": [
+        {
+          "event": "create",
+          "kind": 2,
+          "out": [
+            {
+              "ticket": {
+                "binary": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e579404507a833c4afd5dc592f9fee8cf0ea073e705503b49b89ffb3b5866007e5ba24d151c33061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433",
+                "fragment": "pwEBAgIDWEEEAhfmF_C2RDkoJ4-WmZ5pojpPLBUr321s32bluAKC1O0ZSn3ry5dxLS3aPKhaqHZaVvRfx1hZllLyiXxlMG5XlARQeoM8Sv1dxZL5_ujPDqBz5wVQO0m4n_s7WGYAfluiTRUcMwYaarE92AeBd3RjcDovLzE5Mi4xNjguMS4yMDo3NDQz",
+                "hash": "85231634dee754688ba2c00f18dd3819a877af22504cdff8b0268f558c954b6a",
+                "shown_code": "112358"
+              }
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "arrival": "link",
+          "event": "start",
+          "out": [],
+          "party": "a",
+          "ticket": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e579404507a833c4afd5dc592f9fee8cf0ea073e705503b49b89ffb3b5866007e5ba24d151c33061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
+        },
+        {
+          "arrival": "link",
+          "event": "start",
+          "host_pinned": true,
+          "out": [],
+          "party": "b",
+          "ticket": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e579404507a833c4afd5dc592f9fee8cf0ea073e705503b49b89ffb3b5866007e5ba24d151c33061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
+        },
+        {
+          "conn": 1,
+          "event": "connect",
+          "exporters": {
+            "join": "5c204b0031f56c01fd42d293174d38c0284f8ac18052af6b5614a7348b8d290a",
+            "pair": "02a96ed33f448dae293418eb942d2096a5ff13cb712b0768d87cc71e5e7f9b6c"
+          },
+          "host": false,
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000101010200",
+                "frame": "000000000700000007a3000101010200",
+                "from": "a",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a4000301507a833c4afd5dc592f9fee8cf0ea073e7025820ad21ddd334e3fc4206de008c7d93185fc503092d1ea769649297e1c5abc6454a036550686f6e65",
+                "frame": "00000000070000003fa4000301507a833c4afd5dc592f9fee8cf0ea073e7025820ad21ddd334e3fc4206de008c7d93185fc503092d1ea769649297e1c5abc6454a036550686f6e65",
+                "from": "a",
+                "type": "JOIN_PROOF"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "control": "a3000101010200",
+          "event": "receive",
+          "out": [
+            {
+              "version": 0
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "control": "a200020101",
+          "event": "receive",
+          "out": [],
+          "party": "a"
+        },
+        {
+          "control": "a200020101",
+          "event": "receive",
+          "out": [
+            {
+              "failed": "pairing_failed"
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 2,
+          "event": "connect",
+          "exporters": {
+            "join": "defc0ad5e125834ee35276a971d55d1592469b6b06a0ee337530ed5398622bbc",
+            "pair": "bf6dd17cc29a9a249a45300f58b40273e0d10f3af1a95f8b0aedde975b2f2c2d"
+          },
+          "host": false,
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a3000101010200",
+                "frame": "000000000700000007a3000101010200",
+                "from": "b",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a4000301507a833c4afd5dc592f9fee8cf0ea073e7025820dd6c9b39b7e779202baa20d63646591048bfb54db1b9e8dd769450bae8521912036550686f6e65",
+                "frame": "00000000070000003fa4000301507a833c4afd5dc592f9fee8cf0ea073e7025820dd6c9b39b7e779202baa20d63646591048bfb54db1b9e8dd769450bae8521912036550686f6e65",
+                "from": "b",
+                "type": "JOIN_PROOF"
+              }
+            }
+          ],
+          "party": "b"
+        },
+        {
+          "control": "a3000101010200",
+          "event": "receive",
+          "out": [
+            {
+              "version": 0
+            }
+          ],
+          "party": "b"
+        },
+        {
+          "control": "a200020101",
+          "event": "receive",
+          "out": [],
+          "party": "b"
+        },
+        {
+          "control": "a200020101",
+          "event": "receive",
+          "out": [
+            {
+              "already_paired": true
+            }
+          ],
+          "party": "b"
+        }
+      ]
+    },
+    {
+      "description": "The host still holds a grant for the joiner from an earlier pairing, but the joiner has lost its pin (no host_pinned). It opens a new send link. Step 2 finds the grant: the host binds the connection to it and sends AUTHORIZED live. The joiner takes that as a notice only, since it sent a proof. The proof is valid for an open invitation, so the host answers AUTHORIZED join_only (the connection is now pairing only) and shows the code. A normal code exchange follows; enrollment replaces the old grant (wire.md 7), and the connection becomes live under the new one.",
+      "draws": {
+        "host": [
+          {
+            "bytes": "412f7dd802493a6451aab8afafe013f5",
+            "use": "invitation_id"
+          },
+          {
+            "bytes": "829356fe645dcad56a3e560fcf396439",
+            "use": "ticket_secret"
+          },
+          {
+            "u32": 202611,
+            "use": "code"
+          },
+          {
+            "u32": 777001,
+            "use": "next_code"
+          },
+          {
+            "bytes": "abb4fa51382c003b8932b43686232635c97b058cf634653ca391e4e3067f128a",
+            "use": "cpace_scalar_yb"
+          }
+        ],
+        "joiners": {
+          "a": [
+            {
+              "bytes": "fb6241354f66f719fc180623bc725d87",
+              "use": "attempt_id"
+            },
+            {
+              "bytes": "d4d8460119ccc82347c440cffca548055dd7546bb0deb48715699d371ab01bdf",
+              "use": "cpace_scalar_ya"
+            }
+          ]
+        }
+      },
+      "end": {
+        "grants": [
+          {
+            "authorizing_owner": "51515151515151515151515151515151",
+            "bound_connections": [
+              1
+            ],
+            "expires_at": null,
+            "granted_at": 1790000000,
+            "identity": "04d65a93977caa3d1b081852ff57a79e465f1660577304baead505dd3a48589cf350185e895372df6221ea3a137557e473fddb6755f05bd507c3c533fce9c91285",
+            "name": "Phone",
+            "role": "owner"
+          }
+        ],
+        "host": {
+          "attempts_left": 2,
+          "shown_code": null,
+          "status": "consumed"
+        },
+        "joiners": {
+          "a": {
+            "attempts_left": 2,
+            "live": true,
+            "outcome_pending": false,
+            "state": "paired",
+            "stored": "a401756d6f757373652d6a6f696e65722d666c6f772d7631025820f29a9fa164b43fd37e939c853aa1886dd31267f8dc1f4fcc41cc7725c1f5ac2f03020400"
+          }
+        }
+      },
+      "kind": 2,
+      "name": "re_pair_while_granted",
+      "steps": [
+        {
+          "event": "create",
+          "kind": 2,
+          "out": [
+            {
+              "ticket": {
+                "binary": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450412f7dd802493a6451aab8afafe013f50550829356fe645dcad56a3e560fcf396439061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433",
+                "fragment": "pwEBAgIDWEEEAhfmF_C2RDkoJ4-WmZ5pojpPLBUr321s32bluAKC1O0ZSn3ry5dxLS3aPKhaqHZaVvRfx1hZllLyiXxlMG5XlARQQS992AJJOmRRqrivr-AT9QVQgpNW_mRdytVqPlYPzzlkOQYaarE92AeBd3RjcDovLzE5Mi4xNjguMS4yMDo3NDQz",
+                "hash": "f29a9fa164b43fd37e939c853aa1886dd31267f8dc1f4fcc41cc7725c1f5ac2f",
+                "shown_code": "202611"
+              }
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "event": "grant",
+          "name": "Old phone",
+          "out": [],
+          "party": "host"
+        },
+        {
+          "arrival": "link",
+          "event": "start",
+          "out": [],
+          "party": "a",
+          "ticket": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450412f7dd802493a6451aab8afafe013f50550829356fe645dcad56a3e560fcf396439061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
+        },
+        {
+          "conn": 1,
+          "event": "connect",
+          "exporters": {
+            "join": "5c7a2899af59dfe3fac6e61cd69982554b7a0e0a8d915b4ea8bf08f346c15cc8",
+            "pair": "51cdef42e5ea22bbb6c97b760d3fa78556c3c0f2799f6bccf91d3bcb556b72e3"
+          },
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000101010200",
+                "frame": "000000000700000007a3000101010200",
+                "from": "a",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000101010200",
+                "frame": "000000000700000007a3000101010200",
+                "from": "host",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a200020101",
+                "frame": "000000000700000005a200020101",
+                "from": "host",
+                "type": "AUTHORIZED"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a400030150412f7dd802493a6451aab8afafe013f5025820580f779d23c8480070b8941cff35b99d266fc62c06287f3216e2089d483fe7fc036550686f6e65",
+                "frame": "00000000070000003fa400030150412f7dd802493a6451aab8afafe013f5025820580f779d23c8480070b8941cff35b99d266fc62c06287f3216e2089d483fe7fc036550686f6e65",
+                "from": "a",
+                "type": "JOIN_PROOF"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "control": "a3000101010200",
+          "event": "receive",
+          "out": [
+            {
+              "version": 0
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a3000101010200",
+          "event": "receive",
+          "out": [
+            {
+              "version": 0
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "control": "a200020101",
+          "event": "receive",
+          "out": [],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "control": "a400030150412f7dd802493a6451aab8afafe013f5025820580f779d23c8480070b8941cff35b99d266fc62c06287f3216e2089d483fe7fc036550686f6e65",
+          "event": "receive",
+          "out": [
+            {
+              "admitted_join_only": 1
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a200020102",
+                "frame": "000000000700000005a200020102",
+                "from": "host",
+                "type": "AUTHORIZED"
+              }
+            },
+            {
+              "show_code": "202611"
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a200020102",
+          "event": "receive",
+          "out": [],
+          "party": "a"
+        },
+        {
+          "code": "202611",
+          "event": "submit_code",
+          "out": [
+            {
+              "attempt": {
+                "ci": "a6016e6d6f757373652d706169722d7631025820f29a9fa164b43fd37e939c853aa1886dd31267f8dc1f4fcc41cc7725c1f5ac2f0302040105828201584104d65a93977caa3d1b081852ff57a79e465f1660577304baead505dd3a48589cf350185e895372df6221ea3a137557e473fddb6755f05bd507c3c533fce9c9128582025841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e579406582051cdef42e5ea22bbb6c97b760d3fa78556c3c0f2799f6bccf91d3bcb556b72e3",
+                "id": "fb6241354f66f719fc180623bc725d87",
+                "sid": "fdd3a59abdb1a2f42b754a386d7589a255e0f28456822c8fd1dc82b185354595"
+              }
+            },
+            {
+              "persist": {
+                "expected": null,
+                "record": "a401756d6f757373652d6a6f696e65722d666c6f772d7631025820f29a9fa164b43fd37e939c853aa1886dd31267f8dc1f4fcc41cc7725c1f5ac2f03020400"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150fb6241354f66f719fc180623bc725d870258222044ef15a5baff4261f2c8df821b94185b568db18cd19f1fce310c443dc7f4770300",
+                "frame": "00000000070000003aa300040150fb6241354f66f719fc180623bc725d870258222044ef15a5baff4261f2c8df821b94185b568db18cd19f1fce310c443dc7f4770300",
+                "from": "a",
+                "type": "CODE_EXCHANGE"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "control": "a300040150fb6241354f66f719fc180623bc725d870258222044ef15a5baff4261f2c8df821b94185b568db18cd19f1fce310c443dc7f4770300",
+          "event": "receive",
+          "out": [
+            {
+              "show_code": "777001"
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150fb6241354f66f719fc180623bc725d87025862200860ad6d8b995d62133d6ac2672993e3efb1503a482e647599425f5828e3f26a00f2e823765c506764e37445bcd7e22e9daa3ca2154fdf37dc0a2701c1f7c69da0ca18570cb7f1bd45cfd6a06904b862a7d2910d57e0a0c81101326f4a36c2449a",
+                "frame": "00000000070000007aa300040150fb6241354f66f719fc180623bc725d87025862200860ad6d8b995d62133d6ac2672993e3efb1503a482e647599425f5828e3f26a00f2e823765c506764e37445bcd7e22e9daa3ca2154fdf37dc0a2701c1f7c69da0ca18570cb7f1bd45cfd6a06904b862a7d2910d57e0a0c81101326f4a36c2449a",
+                "from": "host",
+                "type": "CODE_EXCHANGE"
+              }
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a300040150fb6241354f66f719fc180623bc725d87025862200860ad6d8b995d62133d6ac2672993e3efb1503a482e647599425f5828e3f26a00f2e823765c506764e37445bcd7e22e9daa3ca2154fdf37dc0a2701c1f7c69da0ca18570cb7f1bd45cfd6a06904b862a7d2910d57e0a0c81101326f4a36c2449a",
+          "event": "receive",
+          "out": [
+            {
+              "persist": {
+                "expected": "a401756d6f757373652d6a6f696e65722d666c6f772d7631025820f29a9fa164b43fd37e939c853aa1886dd31267f8dc1f4fcc41cc7725c1f5ac2f03020400",
+                "record": "a401756d6f757373652d6a6f696e65722d666c6f772d7631025820f29a9fa164b43fd37e939c853aa1886dd31267f8dc1f4fcc41cc7725c1f5ac2f03020401"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150fb6241354f66f719fc180623bc725d87025840fe761392d5ae469a9b4ffdaa3339d6777fe61ed72aac7e60124fce1322b6845ebeebe052c51a2543064b33867ed9d48b3fa584737a5b2b648b904d7bb9f1f413",
+                "frame": "000000000700000058a300040150fb6241354f66f719fc180623bc725d87025840fe761392d5ae469a9b4ffdaa3339d6777fe61ed72aac7e60124fce1322b6845ebeebe052c51a2543064b33867ed9d48b3fa584737a5b2b648b904d7bb9f1f413",
+                "from": "a",
+                "type": "CODE_EXCHANGE"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "control": "a300040150fb6241354f66f719fc180623bc725d87025840fe761392d5ae469a9b4ffdaa3339d6777fe61ed72aac7e60124fce1322b6845ebeebe052c51a2543064b33867ed9d48b3fa584737a5b2b648b904d7bb9f1f413",
+          "event": "receive",
+          "out": [
+            {
+              "enrolled": {
+                "conn": 1
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000601644465736b02656f776e6572",
+                "frame": "000000000700000010a3000601644465736b02656f776e6572",
+                "from": "host",
+                "type": "PAIRED"
+              }
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a3000601644465736b02656f776e6572",
+          "event": "receive",
+          "out": [
+            {
+              "paired": {
+                "host_identity": "040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794",
+                "host_name": "Desk",
+                "role": "owner"
+              }
+            },
+            {
+              "persist": {
+                "expected": "a401756d6f757373652d6a6f696e65722d666c6f772d7631025820f29a9fa164b43fd37e939c853aa1886dd31267f8dc1f4fcc41cc7725c1f5ac2f03020401",
+                "record": "a401756d6f757373652d6a6f696e65722d666c6f772d7631025820f29a9fa164b43fd37e939c853aa1886dd31267f8dc1f4fcc41cc7725c1f5ac2f03020400"
+              }
+            }
+          ],
+          "party": "a"
+        }
+      ]
+    },
+    {
+      "description": "A link is swapped in transit for an in-person ticket that names another key. In person skips the code, so such a ticket is accepted only from the app's own scanner. Joiner a opens it as a link: the flow is refused before dialing (in_person_from_link, reported as pairing_failed), so the far end can neither say AUTHORIZED live (already paired) nor send PAIRED after a fake approval, and nothing is pinned. Joiner b, which already holds a pin for that key, is refused the same way: the arrival decides, not the pin.",
+      "draws": {
+        "host": [
+          {
+            "bytes": "8adbea6b37cd9a8dc978bbeaf048c9bc",
+            "use": "invitation_id"
+          },
+          {
+            "bytes": "8ff9ee4260da1b3356cefa5754439cd0",
+            "use": "ticket_secret"
+          }
+        ],
+        "joiners": {
+          "a": [],
+          "b": []
+        }
+      },
+      "end": {
+        "grants": [],
+        "host": {
+          "attempts_left": 3,
+          "shown_code": null,
+          "status": "open"
+        },
+        "joiners": {}
+      },
+      "kind": 1,
+      "name": "swapped_in_person_link",
+      "steps": [
+        {
+          "event": "create",
+          "kind": 1,
+          "out": [
+            {
+              "ticket": {
+                "binary": "a701010201035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e579404508adbea6b37cd9a8dc978bbeaf048c9bc05508ff9ee4260da1b3356cefa5754439cd0061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433",
+                "fragment": "pwEBAgEDWEEEAhfmF_C2RDkoJ4-WmZ5pojpPLBUr321s32bluAKC1O0ZSn3ry5dxLS3aPKhaqHZaVvRfx1hZllLyiXxlMG5XlARQitvqazfNmo3JeLvq8EjJvAVQj_nuQmDaGzNWzvpXVEOc0AYaarE92AeBd3RjcDovLzE5Mi4xNjguMS4yMDo3NDQz",
+                "hash": "b31ce8f51225f04d5c50e03834656e70e6d3f378f690634afa85d55ae6c95a21",
+                "shown_code": null
+              }
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "arrival": "link",
+          "event": "start",
+          "out": [
+            {
+              "error": "in_person_from_link"
+            }
+          ],
+          "party": "a",
+          "ticket": "a701010201035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e579404508adbea6b37cd9a8dc978bbeaf048c9bc05508ff9ee4260da1b3356cefa5754439cd0061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
+        },
+        {
+          "arrival": "link",
+          "event": "start",
+          "host_pinned": true,
+          "out": [
+            {
+              "error": "in_person_from_link"
+            }
+          ],
+          "party": "b",
+          "ticket": "a701010201035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e579404508adbea6b37cd9a8dc978bbeaf048c9bc05508ff9ee4260da1b3356cefa5754439cd0061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
+        }
+      ]
+    },
+    {
+      "description": "A device scans its own invitation: the ticket's host identity is its own identity. The flow is refused before dialing (own_ticket, reported as pairing_failed). A host that receives a join proof from its own identity closes with not_authorized (pairing-attempts.json, sequence join_proof_from_own_identity).",
+      "draws": {
+        "host": [
+          {
+            "bytes": "79f0ba23872473a71439416e13ef9d96",
+            "use": "invitation_id"
+          },
+          {
+            "bytes": "7e9c7e46a7596d1d21e8718dc44d64ae",
+            "use": "ticket_secret"
+          }
+        ],
+        "joiners": {
+          "a": []
+        }
+      },
+      "end": {
+        "grants": [],
+        "host": {
+          "attempts_left": 3,
+          "shown_code": null,
+          "status": "open"
+        },
+        "joiners": {}
+      },
+      "kind": 1,
+      "name": "own_ticket",
+      "steps": [
+        {
+          "event": "create",
+          "kind": 1,
+          "out": [
+            {
+              "ticket": {
+                "binary": "a701010201035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794045079f0ba23872473a71439416e13ef9d9605507e9c7e46a7596d1d21e8718dc44d64ae061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433",
+                "fragment": "pwEBAgEDWEEEAhfmF_C2RDkoJ4-WmZ5pojpPLBUr321s32bluAKC1O0ZSn3ry5dxLS3aPKhaqHZaVvRfx1hZllLyiXxlMG5XlARQefC6I4ckc6cUOUFuE--dlgVQfpx-RqdZbR0h6HGNxE1krgYaarE92AeBd3RjcDovLzE5Mi4xNjguMS4yMDo3NDQz",
+                "hash": "7c36fd1ca8f78ee9f75c4662a47a332d2cc21f397d7e22ac3449c1ed8e5a428e",
+                "shown_code": null
+              }
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "arrival": "in_app_scan",
+          "event": "start",
+          "identity": "host",
+          "out": [
+            {
+              "error": "own_ticket"
+            }
+          ],
+          "party": "a",
+          "ticket": "a701010201035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794045079f0ba23872473a71439416e13ef9d9605507e9c7e46a7596d1d21e8718dc44d64ae061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
+        }
+      ]
+    },
+    {
+      "description": "The joiner's 3 attempts are kept per ticket hash in a stored record, so neither killing the app nor opening the link again resets them. Against a far end that aborts every attempt, the joiner spends 2 attempts, saves its record and the connection drops. Opening the link again with that record leaves 1 attempt; it is spent, the flow fails with attempts_exhausted, and a further start with the saved record is refused at once.",
+      "draws": {
+        "host": [
+          {
+            "bytes": "955d9bbe3c5330f2ade33721d4bcabbd",
+            "use": "invitation_id"
+          },
+          {
+            "bytes": "a89864f1782d7951ecb6969c2be0c357",
+            "use": "ticket_secret"
+          },
+          {
+            "u32": 535353,
+            "use": "code"
+          }
+        ],
+        "joiners": {
+          "a": [
+            {
+              "bytes": "32bcd05851bb556f980d5b4b995c3b00",
+              "use": "attempt_id"
+            },
+            {
+              "bytes": "ac97fc87ae737b696d4ccac55864b33a03ebf316c49e15681386935822b875c6",
+              "use": "cpace_scalar_ya"
+            },
+            {
+              "bytes": "2e300d777c6ab790408d78de27e1c63f",
+              "use": "attempt_id"
+            },
+            {
+              "bytes": "c7c56b6d6b411ec3117f91542e656fbee707fab8500cfb302806acd17f4d27ca",
+              "use": "cpace_scalar_ya"
+            },
+            {
+              "bytes": "86d2e564fdbd5ebd610e7d3c7df731c3",
+              "use": "attempt_id"
+            },
+            {
+              "bytes": "97053049678cd040341449490563379442c4cbde4369180e927b4b6d44e79faf",
+              "use": "cpace_scalar_ya"
+            }
+          ]
+        }
+      },
+      "end": {
+        "grants": [],
+        "host": {
+          "attempts_left": 3,
+          "shown_code": "535353",
+          "status": "open"
+        },
+        "joiners": {
+          "a": {
+            "attempts_left": 0,
+            "live": false,
+            "outcome_pending": false,
+            "state": "failed:attempts_exhausted",
+            "stored": "a401756d6f757373652d6a6f696e65722d666c6f772d763102582002eaefadc6e7b7576319a73aeb84bde9cdab9a3aef750ece4df4b863008bfa4803000400"
+          }
+        }
+      },
+      "kind": 2,
+      "name": "joiner_cap_survives_reopening",
+      "steps": [
+        {
+          "event": "create",
+          "kind": 2,
+          "out": [
+            {
+              "ticket": {
+                "binary": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450955d9bbe3c5330f2ade33721d4bcabbd0550a89864f1782d7951ecb6969c2be0c357061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433",
+                "fragment": "pwEBAgIDWEEEAhfmF_C2RDkoJ4-WmZ5pojpPLBUr321s32bluAKC1O0ZSn3ry5dxLS3aPKhaqHZaVvRfx1hZllLyiXxlMG5XlARQlV2bvjxTMPKt4zch1LyrvQVQqJhk8XgteVHstpacK-DDVwYaarE92AeBd3RjcDovLzE5Mi4xNjguMS4yMDo3NDQz",
+                "hash": "02eaefadc6e7b7576319a73aeb84bde9cdab9a3aef750ece4df4b863008bfa48",
+                "shown_code": "535353"
+              }
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "arrival": "link",
+          "event": "start",
+          "out": [],
+          "party": "a",
+          "ticket": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450955d9bbe3c5330f2ade33721d4bcabbd0550a89864f1782d7951ecb6969c2be0c357061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
+        },
+        {
+          "conn": 1,
+          "event": "connect",
+          "exporters": {
+            "join": "5837d0291f29c22ffadc9134d6a37c5d9a4d784d03f68cd60517121d458f8431",
+            "pair": "070904d8c1ac10b5cf9c4adaac9c8c6162942600f896472b8dac64ecfcb01e56"
+          },
+          "host": false,
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000101010200",
+                "frame": "000000000700000007a3000101010200",
+                "from": "a",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a400030150955d9bbe3c5330f2ade33721d4bcabbd025820b63954c361bf95d2a927bd500d9036c0376137362f7ce0041c4c45e14109f969036550686f6e65",
+                "frame": "00000000070000003fa400030150955d9bbe3c5330f2ade33721d4bcabbd025820b63954c361bf95d2a927bd500d9036c0376137362f7ce0041c4c45e14109f969036550686f6e65",
+                "from": "a",
+                "type": "JOIN_PROOF"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "control": "a3000101010200",
+          "event": "receive",
+          "out": [
+            {
+              "version": 0
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "control": "a200020102",
+          "event": "receive",
+          "out": [],
+          "party": "a"
+        },
+        {
+          "code": "535353",
+          "event": "submit_code",
+          "out": [
+            {
+              "attempt": {
+                "ci": "a6016e6d6f757373652d706169722d763102582002eaefadc6e7b7576319a73aeb84bde9cdab9a3aef750ece4df4b863008bfa480302040105828201584104d65a93977caa3d1b081852ff57a79e465f1660577304baead505dd3a48589cf350185e895372df6221ea3a137557e473fddb6755f05bd507c3c533fce9c9128582025841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794065820070904d8c1ac10b5cf9c4adaac9c8c6162942600f896472b8dac64ecfcb01e56",
+                "id": "32bcd05851bb556f980d5b4b995c3b00",
+                "sid": "c93167799b512bb1ca26627932af90e2e6cb0e155370f3f967cfaaa254a9942a"
+              }
+            },
+            {
+              "persist": {
+                "expected": null,
+                "record": "a401756d6f757373652d6a6f696e65722d666c6f772d763102582002eaefadc6e7b7576319a73aeb84bde9cdab9a3aef750ece4df4b863008bfa4803020400"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a30004015032bcd05851bb556f980d5b4b995c3b00025822203a0701cba222e603e70147492cdf72bab9c503e4d4258c3c8396e5450523b40200",
+                "frame": "00000000070000003aa30004015032bcd05851bb556f980d5b4b995c3b00025822203a0701cba222e603e70147492cdf72bab9c503e4d4258c3c8396e5450523b40200",
+                "from": "a",
+                "type": "CODE_EXCHANGE"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "control": "a30005015032bcd05851bb556f980d5b4b995c3b00020a",
+          "event": "receive",
+          "out": [
+            {
+              "code_rejected": {
+                "attempts_left": 2
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "code": "535353",
+          "event": "submit_code",
+          "out": [
+            {
+              "attempt": {
+                "ci": "a6016e6d6f757373652d706169722d763102582002eaefadc6e7b7576319a73aeb84bde9cdab9a3aef750ece4df4b863008bfa480302040105828201584104d65a93977caa3d1b081852ff57a79e465f1660577304baead505dd3a48589cf350185e895372df6221ea3a137557e473fddb6755f05bd507c3c533fce9c9128582025841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794065820070904d8c1ac10b5cf9c4adaac9c8c6162942600f896472b8dac64ecfcb01e56",
+                "id": "2e300d777c6ab790408d78de27e1c63f",
+                "sid": "d48303284ff420c4f6d3c7fb92c43db5039798f307b0f7d8533d85be14cb9a53"
+              }
+            },
+            {
+              "persist": {
+                "expected": "a401756d6f757373652d6a6f696e65722d666c6f772d763102582002eaefadc6e7b7576319a73aeb84bde9cdab9a3aef750ece4df4b863008bfa4803020400",
+                "record": "a401756d6f757373652d6a6f696e65722d666c6f772d763102582002eaefadc6e7b7576319a73aeb84bde9cdab9a3aef750ece4df4b863008bfa4803010400"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401502e300d777c6ab790408d78de27e1c63f0258222006cf9cdb79521396391288e39994a16e3b2b8820afb967dfe3889db9c76b401900",
+                "frame": "00000000070000003aa3000401502e300d777c6ab790408d78de27e1c63f0258222006cf9cdb79521396391288e39994a16e3b2b8820afb967dfe3889db9c76b401900",
+                "from": "a",
+                "type": "CODE_EXCHANGE"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "control": "a3000501502e300d777c6ab790408d78de27e1c63f020a",
+          "event": "receive",
+          "out": [
+            {
+              "code_rejected": {
+                "attempts_left": 1
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "event": "save",
+          "out": [
+            {
+              "record": "a401756d6f757373652d6a6f696e65722d666c6f772d763102582002eaefadc6e7b7576319a73aeb84bde9cdab9a3aef750ece4df4b863008bfa4803010400"
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "event": "drop",
+          "out": [],
+          "party": "a"
+        },
+        {
+          "arrival": "link",
+          "event": "start",
+          "out": [],
+          "party": "a",
+          "record": "a401756d6f757373652d6a6f696e65722d666c6f772d763102582002eaefadc6e7b7576319a73aeb84bde9cdab9a3aef750ece4df4b863008bfa4803010400",
+          "ticket": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450955d9bbe3c5330f2ade33721d4bcabbd0550a89864f1782d7951ecb6969c2be0c357061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
+        },
+        {
+          "conn": 2,
+          "event": "connect",
+          "exporters": {
+            "join": "2c5304e19fe3291bdab177440f91e7a03818d99a2c13eb075898fbc6f39959fe",
+            "pair": "69d0d1d778484180650b4f62b37f6e99c793a502857ab5b8381f76e8adb3113f"
+          },
+          "host": false,
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a3000101010200",
+                "frame": "000000000700000007a3000101010200",
+                "from": "a",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a400030150955d9bbe3c5330f2ade33721d4bcabbd025820c22afb98a51ff06479aa9562b64d9015f08618d96a0d5eb5d68edb8eb9e7ccac036550686f6e65",
+                "frame": "00000000070000003fa400030150955d9bbe3c5330f2ade33721d4bcabbd025820c22afb98a51ff06479aa9562b64d9015f08618d96a0d5eb5d68edb8eb9e7ccac036550686f6e65",
+                "from": "a",
+                "type": "JOIN_PROOF"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "control": "a3000101010200",
+          "event": "receive",
+          "out": [
+            {
+              "version": 0
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "control": "a200020102",
+          "event": "receive",
+          "out": [],
+          "party": "a"
+        },
+        {
+          "code": "535353",
+          "event": "submit_code",
+          "out": [
+            {
+              "attempt": {
+                "ci": "a6016e6d6f757373652d706169722d763102582002eaefadc6e7b7576319a73aeb84bde9cdab9a3aef750ece4df4b863008bfa480302040105828201584104d65a93977caa3d1b081852ff57a79e465f1660577304baead505dd3a48589cf350185e895372df6221ea3a137557e473fddb6755f05bd507c3c533fce9c9128582025841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e579406582069d0d1d778484180650b4f62b37f6e99c793a502857ab5b8381f76e8adb3113f",
+                "id": "86d2e564fdbd5ebd610e7d3c7df731c3",
+                "sid": "eecd71ffe70b4888566d8991befda518e097320502824b793ff741bb963918cc"
+              }
+            },
+            {
+              "persist": {
+                "expected": "a401756d6f757373652d6a6f696e65722d666c6f772d763102582002eaefadc6e7b7576319a73aeb84bde9cdab9a3aef750ece4df4b863008bfa4803010400",
+                "record": "a401756d6f757373652d6a6f696e65722d666c6f772d763102582002eaefadc6e7b7576319a73aeb84bde9cdab9a3aef750ece4df4b863008bfa4803000400"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a30004015086d2e564fdbd5ebd610e7d3c7df731c302582220828f5750b19000203cb56c6438247efcb9b0b966a403e2729875bdd1c7c3b50d00",
+                "frame": "00000000070000003aa30004015086d2e564fdbd5ebd610e7d3c7df731c302582220828f5750b19000203cb56c6438247efcb9b0b966a403e2729875bdd1c7c3b50d00",
+                "from": "a",
+                "type": "CODE_EXCHANGE"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "control": "a30005015086d2e564fdbd5ebd610e7d3c7df731c3020a",
+          "event": "receive",
+          "out": [
+            {
+              "failed": "attempts_exhausted"
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "event": "save",
+          "out": [
+            {
+              "record": "a401756d6f757373652d6a6f696e65722d666c6f772d763102582002eaefadc6e7b7576319a73aeb84bde9cdab9a3aef750ece4df4b863008bfa4803000400"
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "arrival": "link",
+          "event": "start",
+          "out": [
+            {
+              "error": "attempts_exhausted"
+            }
+          ],
+          "party": "a",
+          "record": "a401756d6f757373652d6a6f696e65722d666c6f772d763102582002eaefadc6e7b7576319a73aeb84bde9cdab9a3aef750ece4df4b863008bfa4803000400",
+          "ticket": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450955d9bbe3c5330f2ade33721d4bcabbd0550a89864f1782d7951ecb6969c2be0c357061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
+        }
+      ]
+    }
+  ]
+}

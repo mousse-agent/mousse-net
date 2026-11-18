@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "pc-windows",
+  "key": "048ad3ccda2d27fdfc98c131f2fa25bea736ec0a3e8a107dcbfa6b2f5a86b88da452c337f09925646ec76897452505e718f3f397ddf39674e9f5ad64590bc93d57",
+  "payload": "{\"check\":\"phase0.crypto-matrix\",\"target\":\"x86_64-pc-windows-msvc\",\"control\":\"break-pin\",\"build\":\"533f154f903c679edd572142bf0e8e1b09f0e775+release\",\"platform\":\"windows-x86_64\",\"outcome\":\"FAIL\",\"details\":\"printed \\\"FAIL phase0.crypto-matrix\\\"\",\"time\":\"2026-11-18T15:08:02Z\",\"device\":\"pc-windows\",\"config\":\"8777998b9c0d020333e13addf47f7c888ca46713748113dfb81075558b0932bc\"}",
+  "signature": "8e344330e133a005346f55e8e662ed179d97846b0234011e1fdf1899ca0b106a32449506cb3436ef7085ec58bc5dee00436ca49fbf5a456ac38e8e6588421258"
+}

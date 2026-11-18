@@ -1,0 +1,452 @@
+# Phase 0: thin slice, spikes and the simulator (docs/PLAN.md, "Phase 0").
+#
+# Owner check: `mousse-check phase0` shows PASS in every target cell, with
+# DEFERRED only where [defer] allows it, and no INCOMPLETE.
+# Format: checks/README.md.
+
+phase = "phase0"
+title = "Thin slice, spikes and the simulator"
+plan = "docs/PLAN.md#phase-0-thin-slice-spikes-and-the-simulator"
+
+# The only checks this phase may end DEFERRED.
+[defer]
+"phase0.cpace-vectors" = "PLAN Phase 0 exit: CPace may be DEFERRED; Phase 1b \"Send link\" and Phase 5 browser pairing stay gated on it"
+"phase0.cpace-review" = "PLAN Phase 0 exit: CPace may be DEFERRED (its design review goes with it)"
+"phase0.browser-relay-profile" = "Owner decision 2026-11-18: browser work beyond the certificate check (spike 2) is deferred"
+
+# ---------------------------------------------------------------------------
+# Core and its vectors
+
+[[check]]
+id = "phase0.core-vectors"
+title = "Core passes every spec vector, including the rejection vectors"
+plan = "PLAN §1 \"Required test vectors\"; spec/vectors; Phase 0 exit (every vector, on every target)"
+targets = ["windows-x64", "macos-arm64", "linux-x64", "wasm32"]
+judge = "cargo-test"
+min_tests = 120
+device_steps = "on that machine: mousse-check run phase0.core-vectors --sign-with <key>, then the same with --control"
+
+[[check.local]]
+target = "windows-x64"
+host = "windows-x86_64"
+command = ["cargo", "test", "-p", "mousse-net-core", "--no-fail-fast"]
+
+[[check.local]]
+target = "macos-arm64"
+host = "macos-aarch64"
+command = ["cargo", "test", "-p", "mousse-net-core", "--no-fail-fast"]
+
+[[check.local]]
+target = "linux-x64"
+host = "linux-x86_64"
+command = ["cargo", "test", "-p", "mousse-net-core", "--no-fail-fast"]
+
+[[check.local]]
+target = "wasm32"
+host = "windows-x86_64"
+command = ["cargo", "test", "-p", "mousse-net-core", "--no-fail-fast", "--target", "wasm32-unknown-unknown"]
+# wasm-bindgen-test-runner 0.2.130 on PATH runs the tests under Node.
+env = { CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER = "wasm-bindgen-test-runner" }
+
+[[check.control]]
+name = "break-session-cert"
+breaks = "the session certificate verifier skips the identity signature check"
+env = { RUSTFLAGS = '--cfg mousse_control="break-session-cert"' }
+
+[[check.control]]
+name = "break-authz"
+breaks = "the step 2 gate lets RPC through on a connection with no live grant"
+env = { RUSTFLAGS = '--cfg mousse_control="break-authz"' }
+
+[[check.control]]
+name = "break-raw-signature"
+breaks = "raw signature parsing accepts a DER signature where raw r||s is required"
+env = { RUSTFLAGS = '--cfg mousse_control="break-raw-signature"' }
+
+[[check]]
+id = "phase0.cpace-vectors"
+title = "CPace (ristretto255, SHA-512) passes the draft-irtf-cfrg-cpace-21 vectors and the Mousse vectors"
+plan = "Phase 0 spike 5; PLAN §3 \"Code exchange\""
+targets = ["windows-x64", "macos-arm64", "linux-x64", "wasm32"]
+judge = "cargo-test"
+min_tests = 20
+device_steps = "on that machine: mousse-check run phase0.cpace-vectors --sign-with <key>, then the same with --control"
+
+[[check.local]]
+target = "windows-x64"
+host = "windows-x86_64"
+command = ["cargo", "test", "-p", "mousse-net-core", "--no-fail-fast", "--lib", "cpace::"]
+
+[[check.local]]
+target = "macos-arm64"
+host = "macos-aarch64"
+command = ["cargo", "test", "-p", "mousse-net-core", "--no-fail-fast", "--lib", "cpace::"]
+
+[[check.local]]
+target = "linux-x64"
+host = "linux-x86_64"
+command = ["cargo", "test", "-p", "mousse-net-core", "--no-fail-fast", "--lib", "cpace::"]
+
+[[check.local]]
+target = "wasm32"
+host = "windows-x86_64"
+command = ["cargo", "test", "-p", "mousse-net-core", "--no-fail-fast", "--lib", "cpace::", "--target", "wasm32-unknown-unknown"]
+# wasm-bindgen-test-runner 0.2.130 on PATH runs the tests under Node.
+env = { CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER = "wasm-bindgen-test-runner" }
+
+[[check.control]]
+name = "break-cpace-confirm"
+breaks = "the CPace confirmation compare always passes, so a wrong code, channel identifier, session id or tampered message is accepted"
+env = { RUSTFLAGS = '--cfg mousse_control="break-cpace-confirm"' }
+
+[[check.control]]
+name = "break-cpace-sid"
+breaks = "CPace leaves the session id out of the generator, so the draft vectors no longer match and two sessions with the same code share a generator"
+env = { RUSTFLAGS = '--cfg mousse_control="break-cpace-sid"' }
+
+[[check]]
+id = "phase0.cpace-review"
+title = "Design review of CPace and its confirmation binding"
+plan = "Phase 0 spike 5 (\"then gets a design review\"); Phase 0 \"Design review\""
+targets = ["cpace-binding"]
+manual = true
+steps = "review CPace in core and its binding (ticket hash, mode, version, ordered identities and roles, peer session exporter); attest with the reviewer and the review link"
+
+[[check]]
+id = "phase0.design-review"
+title = "Design review of the session certificate and relay admission before they freeze"
+plan = "Phase 0 \"Design review\""
+targets = ["session-cert", "relay-admission"]
+manual = true
+steps = "review the design against PLAN §1 / §5 and spec/; attest with the reviewer and the review link"
+
+# ---------------------------------------------------------------------------
+# Spike 1: crypto matrix. One cell per Rust target; every ordered provider
+# pair must be reported, signed. Format: spec/matrix/targets.md.
+#
+# The unsigned files in spec/matrix/results/ are shown but never counted:
+# anyone can edit an unsigned file, and they were built from an older commit.
+# The kit re-runs the Windows cell itself; other machines run
+# `mousse-check run phase0.crypto-matrix --sign-with <key>` (and --control),
+# or sign the spike's output with `mousse-check sign`.
+
+[[check]]
+id = "phase0.crypto-matrix"
+title = "Real TLS 1.3 handshakes and rejections for every provider pair on all nine target groups"
+plan = "Phase 0 spike 1; spec/matrix/targets.md"
+judge = "matrix"
+pass_marker = "PASS phase0.crypto-matrix"
+fail_marker = "FAIL phase0.crypto-matrix"
+profile = "release"
+targets = [
+  "x86_64-pc-windows-msvc",
+  "aarch64-pc-windows-msvc",
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "aarch64-apple-ios",
+  "aarch64-linux-android",
+  "x86_64-linux-android",
+  "wasm32-unknown-unknown@worker-chromium",
+  "wasm32-unknown-unknown@worker-firefox",
+  "wasm32-unknown-unknown@worker-safari",
+  "wasm32-unknown-unknown@worker-safari-ios",
+  "wasm32-unknown-unknown@worker-chrome-android",
+]
+device_steps = "before each run, record its configuration with `mousse-check config-digest phase0.crypto-matrix --target <cell>` (add --control <name> for a control run) and sign the result with --config <that digest>; spec/matrix/targets.md \"Commands\" for that group, then mousse-check sign; the control is the same run with MOUSSE_MATRIX_BREAK=1 --same-only, signed with --control break-pin"
+
+[check.matrix]
+providers = ["aws-lc-rs", "ring", "rustcrypto", "ring+pq", "rustcrypto+pq"]
+legacy_results = "spec/matrix/results"
+
+[check.matrix.providers_for]
+"wasm32-unknown-unknown@worker-chromium" = ["ring", "rustcrypto", "ring+pq", "rustcrypto+pq"]
+"wasm32-unknown-unknown@worker-firefox" = ["ring", "rustcrypto", "ring+pq", "rustcrypto+pq"]
+"wasm32-unknown-unknown@worker-safari" = ["ring", "rustcrypto", "ring+pq", "rustcrypto+pq"]
+"wasm32-unknown-unknown@worker-safari-ios" = ["ring", "rustcrypto", "ring+pq", "rustcrypto+pq"]
+"wasm32-unknown-unknown@worker-chrome-android" = ["ring", "rustcrypto", "ring+pq", "rustcrypto+pq"]
+
+[[check.local]]
+target = "x86_64-pc-windows-msvc"
+host = "windows-x86_64"
+cwd = "spikes/tls-matrix"
+command = ["cargo", "+stable-x86_64-pc-windows-msvc", "run", "--release", "-p", "tls-matrix", "--", "--out", "{out}"]
+
+[[check.local]]
+target = "aarch64-pc-windows-msvc"
+host = "windows-aarch64"
+cwd = "spikes/tls-matrix"
+command = ["cargo", "run", "--release", "-p", "tls-matrix", "--", "--out", "{out}"]
+
+[[check.local]]
+target = "aarch64-apple-darwin"
+host = "macos-aarch64"
+cwd = "spikes/tls-matrix"
+command = ["cargo", "run", "--release", "-p", "tls-matrix", "--", "--out", "{out}"]
+
+[[check.local]]
+target = "x86_64-apple-darwin"
+host = "macos-aarch64"
+cwd = "spikes/tls-matrix"
+command = ["cargo", "run", "--release", "--target", "x86_64-apple-darwin", "-p", "tls-matrix", "--", "--out", "{out}"]
+
+[[check.local]]
+target = "x86_64-unknown-linux-gnu"
+host = "linux-x86_64"
+cwd = "spikes/tls-matrix"
+command = ["cargo", "run", "--release", "-p", "tls-matrix", "--", "--out", "{out}"]
+
+[[check.local]]
+target = "aarch64-unknown-linux-gnu"
+host = "linux-aarch64"
+cwd = "spikes/tls-matrix"
+command = ["cargo", "run", "--release", "-p", "tls-matrix", "--", "--out", "{out}"]
+
+[[check.control]]
+name = "break-pin"
+breaks = "the client pins the wrong server key in the mutual case, so every pair must fail"
+env = { MOUSSE_MATRIX_BREAK = "1" }
+args = ["--same-only"]
+
+# ---------------------------------------------------------------------------
+# mousse-sim: the first seeds (handshake, pairing attempt limits, endpoints
+# that share a computer). Convention: the drill prints `PASS sim <drill>` or
+# `FAIL sim <drill>` last and exits 0 or 1. `--bug <name>` plants a bug in the
+# simulated devices (a run-time switch of the simulator, which never ships);
+# the verdict then counts only the invariant that bug must break, so the
+# control prints FAIL exactly when the drill caught it.
+# `mousse-sim list` shows every drill, invariant and planted bug.
+
+[[check]]
+id = "phase0.sim-handshake"
+title = "Simulator: handshake drill over many seeds"
+plan = "Phase 0 \"mousse-sim\": the first seeds cover the handshake"
+targets = ["windows-x64"]
+judge = "marker"
+pass_marker = "PASS sim handshake"
+fail_marker = "FAIL sim handshake"
+
+[[check.local]]
+target = "windows-x64"
+host = "windows-x86_64"
+command = ["cargo", "run", "--release", "-p", "mousse-sim", "--", "run", "handshake", "--seeds", "1000"]
+
+[[check.control]]
+name = "no-pin-on-reconnect"
+breaks = "the simulated client verifies the host without its pin on reconnects and path switches"
+args = ["--bug", "no-pin-on-reconnect"]
+
+[[check.control]]
+name = "accept-expired-cert"
+breaks = "the simulated verifier ignores the session certificate's validity window"
+args = ["--bug", "accept-expired-cert"]
+
+[[check.control]]
+name = "skip-deadline"
+breaks = "the simulated devices never run the session deadline, so traffic outlives the certificates"
+args = ["--bug", "skip-deadline"]
+
+[[check.control]]
+name = "keep-channel-after-removal"
+breaks = "the simulated host ignores the grant table's close-channels event after a removal"
+args = ["--bug", "keep-channel-after-removal"]
+
+[[check.control]]
+name = "host-ignore-gate"
+breaks = "the simulated host hands stream traffic to the application without asking the gate"
+args = ["--bug", "host-ignore-gate"]
+
+[[check]]
+id = "phase0.sim-pairing-attempts"
+title = "Simulator: pairing attempt limits over many seeds"
+plan = "Phase 0 \"mousse-sim\": the first seeds cover the pairing attempt limits; PLAN §3 \"Attempt limits\""
+targets = ["windows-x64"]
+judge = "marker"
+pass_marker = "PASS sim pairing-limits"
+fail_marker = "FAIL sim pairing-limits"
+
+[[check.local]]
+target = "windows-x64"
+host = "windows-x86_64"
+command = ["cargo", "run", "--release", "-p", "mousse-sim", "--", "run", "pairing-limits", "--seeds", "1000"]
+
+[[check.control]]
+name = "host-work-before-debit"
+breaks = "the simulated host starts CPace work before the attempt is debited"
+args = ["--bug", "host-work-before-debit"]
+
+[[check.control]]
+name = "joiner-work-before-debit"
+breaks = "the simulated joiner starts CPace work before the attempt is debited"
+args = ["--bug", "joiner-work-before-debit"]
+
+[[check.control]]
+name = "new-session-retry-free"
+breaks = "the simulated joiner starts a fresh attempt counter on every new TLS session, so retries are free"
+args = ["--bug", "joiner-new-flow-on-reconnect"]
+
+[[check]]
+id = "phase0.sim-shared-endpoints"
+title = "Simulator: two endpoints on one computer stay independent"
+plan = "docs/PLAN.md §1 \"Endpoint\": a profile's endpoint has its own key and grant table; a local denial never reaches another endpoint"
+targets = ["windows-x64"]
+judge = "marker"
+pass_marker = "PASS sim shared-endpoints"
+fail_marker = "FAIL sim shared-endpoints"
+
+[[check.local]]
+target = "windows-x64"
+host = "windows-x86_64"
+command = ["cargo", "run", "--release", "-p", "mousse-sim", "--", "run", "shared-endpoints", "--seeds", "1000"]
+
+[[check.control]]
+name = "shared-grant-table"
+breaks = "the two endpoints on the computer share one grant table"
+args = ["--bug", "shared-grant-table"]
+
+# ---------------------------------------------------------------------------
+# Thin slice: two desktop processes pair (in person or by send link), open a
+# terminal channel, then remove the grant.
+
+[[check]]
+id = "phase0.thin-slice-loopback"
+title = "Thin slice on one machine: pair in person and by send link, terminal channel, remove the grant, two endpoints on one computer"
+plan = "Phase 0 \"Slice\"; docs/PLAN.md §1 \"Endpoint\""
+targets = ["windows-x64"]
+judge = "cargo-test"
+min_tests = 5
+
+[[check.local]]
+target = "windows-x64"
+host = "windows-x86_64"
+command = ["cargo", "test", "-p", "mousse-helper", "--features", "test-in-person", "--test", "loopback", "--no-fail-fast"]
+
+[[check.control]]
+name = "skip-pin-check"
+breaks = "the dialler accepts a host whose identity does not match its stored pin"
+env = { RUSTFLAGS = '--cfg mousse_control="skip-pin-check"' }
+
+[[check.control]]
+name = "keep-removed-grant"
+breaks = "removing a grant reports success and leaves the grant and its channels in force"
+env = { RUSTFLAGS = '--cfg mousse_control="keep-removed-grant"' }
+
+[[check.control]]
+name = "shared-endpoint-state"
+breaks = "every endpoint on the computer uses one identity key and one grant table"
+env = { RUSTFLAGS = '--cfg mousse_control="shared-endpoint-state"' }
+
+[[check]]
+id = "phase0.thin-slice-cross-machine"
+title = "Thin slice across machines: the PC dials the Mac over the LAN"
+plan = "Phase 0 \"Slice\" (two desktops)"
+targets = ["pc-to-mac-lan"]
+cross_machine = true
+device_steps = "before the run the PC records the configuration with `mousse-check config-digest phase0.thin-slice-cross-machine` (and `--control wrong-identity` before the control run); the Mac runs `mousse-helper serve --listen-ip 0.0.0.0` and `invite` (answering y when asked about the PC); the PC runs a test build of the helper (`cargo build -p mousse-helper --features test-in-person`, whose `--in-person` stands in for the app's scanner) as `mousse-helper slice-check --in-person --ticket <ticket> --route tcp://<mac>:<port> --host-build <build from the Mac ready line> --out <file> -- uname -a` (pair, the host reports its build, terminal, removal closes it, reconnect refused) and the result file is signed with `mousse-check sign --config <digest>`. Control: the Mac serves a build with --cfg mousse_control=\"allow-break-env\" and MOUSSE_HELPER_BREAK=wrong-identity; the PC runs slice-check with --control wrong-identity and must print RESULT FAIL"
+
+[[check.control]]
+name = "wrong-identity"
+breaks = "the Mac listener presents a different identity than the pinned one; the PC must refuse, so the run prints FAIL"
+env = { MOUSSE_HELPER_BREAK = "wrong-identity" }
+expect_reason = "pin_mismatch"
+
+# ---------------------------------------------------------------------------
+# Second implementation of the handshake (plus CPace confirmation unless
+# DEFERRED), written independently from the spec alone.
+
+[[check]]
+id = "phase0.second-implementation"
+title = "An independent second implementation passes every vector, including the rejection vectors"
+plan = "Phase 0 exit: second implementation"
+targets = ["windows-x64"]
+judge = "marker"
+pass_marker = "PASS second-impl"
+fail_marker = "FAIL second-impl"
+
+# Needs `npm ci` once in interop/second-impl-ts.
+[[check.local]]
+target = "windows-x64"
+host = "windows-x86_64"
+cwd = "interop/second-impl-ts"
+command = ["node", "--disable-warning=ExperimentalWarning", "test.mjs"]
+
+[[check.control]]
+name = "break-verifier"
+breaks = "the second implementation's certificate verifier skips the identity signature check"
+env = { MOUSSE_SECOND_BREAK = "verifier" }
+
+# ---------------------------------------------------------------------------
+# Spike 2: browser Worker signs a session certificate.
+
+[[check]]
+id = "phase0.browser-worker-cert"
+title = "A browser Worker signs a P-256 session certificate that a native verifier accepts; the key survives a Worker restart"
+plan = "Phase 0 spike 2; PLAN §1 required vector \"a certificate made in a browser Worker and checked by a native verifier\""
+targets = [
+  "wasm32-unknown-unknown@worker-chromium",
+  "wasm32-unknown-unknown@worker-firefox",
+  "wasm32-unknown-unknown@worker-safari",
+]
+device_steps = "before each run, record its configuration with `mousse-check config-digest phase0.browser-worker-cert --target <cell>` (add --control <name> for a control run) and sign the result with --config <that digest>; the Mac runs the Worker page in each browser, checks the certificate with the native verifier, restarts the Worker and checks again, then signs the result"
+
+[[check.control]]
+name = "tampered-cert"
+breaks = "the Worker signs its identity signature over a different SPKI; the native verifier must refuse"
+env = { MOUSSE_BROWSER_SPIKE_BREAK = "tampered-cert" }
+
+[[check.control]]
+name = "fresh-key-after-restart"
+breaks = "the Worker makes a new key after the restart; the persistence step must fail"
+env = { MOUSSE_BROWSER_SPIKE_BREAK = "fresh-key" }
+
+# ---------------------------------------------------------------------------
+# Spikes 3 and 4: phones (physical iOS 15 phone, Android phone).
+
+[[check]]
+id = "phase0.phone-byte-path"
+title = "Phone byte path: terminal and file throughput over the loopback WebSocket"
+plan = "Phase 0 spike 3; PLAN §8 \"Phone\""
+targets = ["ios15-iphone", "android-arm64"]
+device_steps = "before each run, record its configuration with `mousse-check config-digest phase0.phone-byte-path --target <cell>` (add --control <name> for a control run) and sign the result with --config <that digest>; run the byte-path spike on the phone; the Mac (iPhone) or the PC/Mac with adb (Android) signs the result with throughput in details"
+
+[[check.control]]
+name = "corrupt-byte"
+breaks = "the byte path flips one byte; the end-to-end checksum must fail"
+env = { MOUSSE_BYTEPATH_BREAK = "corrupt-byte" }
+
+[[check.control]]
+name = "wrong-token"
+breaks = "the client sends a wrong per-launch token; the loopback server must refuse"
+env = { MOUSSE_BYTEPATH_BREAK = "wrong-token" }
+
+[[check]]
+id = "phase0.phone-lifecycle"
+title = "Phone lifecycle: UniFFI start, stop, cancel, and cancelling a pending dial"
+plan = "Phase 0 spike 4 (sets the Android minimum API and ABIs)"
+targets = ["ios15-iphone", "android-arm64"]
+device_steps = "before each run, record its configuration with `mousse-check config-digest phase0.phone-lifecycle --target <cell>` (add --control <name> for a control run) and sign the result with --config <that digest>; run the lifecycle spike on the physical phone and sign the result; put the Android API level and ABI in details"
+
+[[check.control]]
+name = "ignore-cancel"
+breaks = "cancel(id) is ignored; the cancel and pending-dial steps must fail"
+env = { MOUSSE_LIFECYCLE_BREAK = "ignore-cancel" }
+
+# ---------------------------------------------------------------------------
+# Spike 6: browser relay profile (deferred by the owner).
+
+[[check]]
+id = "phase0.browser-relay-profile"
+title = "Browser relay profile: WSS with Web PKI at a manifest-listed origin; an unlisted origin is refused"
+plan = "Phase 0 spike 6; PLAN §5 \"Relay identity\""
+targets = [
+  "wasm32-unknown-unknown@worker-chromium",
+  "wasm32-unknown-unknown@worker-firefox",
+  "wasm32-unknown-unknown@worker-safari",
+]
+deferred = true
+
+[[check.control]]
+name = "unlisted-origin-allowed"
+breaks = "the client skips the manifest origin check; a valid certificate at an unlisted origin must then connect, so the refusal step fails"
+env = { MOUSSE_RELAY_SPIKE_BREAK = "skip-origin-check" }

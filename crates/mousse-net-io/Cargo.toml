@@ -1,0 +1,40 @@
+[package]
+name = "mousse-net-io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+description = "tokio adapters for mousse-net-core: TLS sessions, pipes, the session driver, keystores and discovery."
+
+[lints]
+workspace = true
+
+[dependencies]
+mousse-net-core = { path = "../mousse-net-core" }
+tokio = { version = "=1.54.1", features = ["rt", "net", "io-util", "macros", "sync", "time"] }
+tokio-rustls = { version = "=0.26.6", default-features = false, features = ["logging", "aws_lc_rs"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["std", "logging", "aws_lc_rs", "prefer-post-quantum"] }
+rand_core = { version = "=0.10.1", default-features = false }
+getrandom = { version = "=0.4.3", features = ["sys_rng"] }
+zeroize = { version = "=1.9.2", default-features = false, features = ["alloc"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+mdns-sd = { version = "=0.22.0", default-features = false, features = ["async"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.191"
+
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "=3.6.3", features = ["windows-native"] }
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_Storage_FileSystem", "Win32_System_WindowsProgramming"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "=3.6.3", features = ["apple-native"] }
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+keyring = { version = "=3.6.3", features = ["sync-secret-service", "crypto-rust"] }
+
+[dev-dependencies]
+tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
+rand_chacha = "=0.10.0"

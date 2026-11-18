@@ -1,0 +1,206 @@
+{
+  "cases": [
+    {
+      "local": {
+        "major": 1,
+        "minor": 0,
+        "oldest_minor": 0
+      },
+      "name": "same_version",
+      "peer": {
+        "major": 1,
+        "minor": 0
+      },
+      "result": 0
+    },
+    {
+      "local": {
+        "major": 1,
+        "minor": 0,
+        "oldest_minor": 0
+      },
+      "name": "peer_newer_minor",
+      "peer": {
+        "major": 1,
+        "minor": 7
+      },
+      "result": 0
+    },
+    {
+      "local": {
+        "major": 1,
+        "minor": 0,
+        "oldest_minor": 0
+      },
+      "name": "peer_major_2",
+      "peer": {
+        "major": 2,
+        "minor": 0
+      },
+      "result": "close:unsupported_version"
+    },
+    {
+      "local": {
+        "major": 1,
+        "minor": 0,
+        "oldest_minor": 0
+      },
+      "name": "peer_major_0",
+      "peer": {
+        "major": 0,
+        "minor": 0
+      },
+      "result": "close:unsupported_version"
+    },
+    {
+      "local": {
+        "major": 1,
+        "minor": 4,
+        "oldest_minor": 3
+      },
+      "name": "lower_minor_taken",
+      "peer": {
+        "major": 1,
+        "minor": 9
+      },
+      "result": 4
+    },
+    {
+      "local": {
+        "major": 1,
+        "minor": 4,
+        "oldest_minor": 3
+      },
+      "name": "previous_minor_supported",
+      "peer": {
+        "major": 1,
+        "minor": 3
+      },
+      "result": 3
+    },
+    {
+      "local": {
+        "major": 1,
+        "minor": 4,
+        "oldest_minor": 3
+      },
+      "name": "minor_too_old",
+      "peer": {
+        "major": 1,
+        "minor": 2
+      },
+      "result": "close:unsupported_version"
+    },
+    {
+      "local": {
+        "major": 1,
+        "minor": 4,
+        "oldest_minor": 3
+      },
+      "name": "minor_zero_too_old",
+      "peer": {
+        "major": 1,
+        "minor": 0
+      },
+      "result": "close:unsupported_version"
+    },
+    {
+      "local": {
+        "major": 1,
+        "minor": 4,
+        "oldest_minor": 3
+      },
+      "name": "major_checked_before_minor",
+      "peer": {
+        "major": 2,
+        "minor": 4
+      },
+      "result": "close:unsupported_version"
+    }
+  ],
+  "description": "HELLO version negotiation (spec wire.md, \"Versions\"). `local` is what the receiving side speaks (its newest and oldest minor version), `peer` is the HELLO it received. `result` is the minor version both sides use, or the close code. `this_build` is what mousse-net-core version 1.0 speaks; `hello` is its HELLO. `repeated`: several HELLOs arrive on one connection, as control-message bytes, in order. Only the first counts; each later one is `ignored`, whatever it holds. `agreed` is the connection's minor version at the end (null if the first HELLO closed it).",
+  "hello": "a3000101010200",
+  "repeated": [
+    {
+      "agreed": 0,
+      "hellos": [
+        {
+          "control": "a3000101010200",
+          "result": 0
+        },
+        {
+          "control": "a3000101010200",
+          "result": "ignored"
+        }
+      ],
+      "local": {
+        "major": 1,
+        "minor": 0,
+        "oldest_minor": 0
+      },
+      "name": "second_hello_same"
+    },
+    {
+      "agreed": 3,
+      "hellos": [
+        {
+          "control": "a3000101010203",
+          "result": 3
+        },
+        {
+          "control": "a3000101010209",
+          "result": "ignored"
+        }
+      ],
+      "local": {
+        "major": 1,
+        "minor": 4,
+        "oldest_minor": 3
+      },
+      "name": "second_hello_other_minor"
+    },
+    {
+      "agreed": 0,
+      "hellos": [
+        {
+          "control": "a3000101010200",
+          "result": 0
+        },
+        {
+          "control": "a3000101020200",
+          "result": "ignored"
+        }
+      ],
+      "local": {
+        "major": 1,
+        "minor": 0,
+        "oldest_minor": 0
+      },
+      "name": "second_hello_other_major"
+    },
+    {
+      "agreed": null,
+      "hellos": [
+        {
+          "control": "a3000101020200",
+          "result": "close:unsupported_version"
+        },
+        {
+          "control": "a3000101010200",
+          "result": "ignored"
+        }
+      ],
+      "local": {
+        "major": 1,
+        "minor": 0,
+        "oldest_minor": 0
+      },
+      "name": "first_hello_refused"
+    }
+  ],
+  "this_build": {
+    "major": 1,
+    "minor": 0,
+    "oldest_minor": 0
+  }
+}

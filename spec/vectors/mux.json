@@ -1,0 +1,503 @@
+{
+  "description": "Mux frames (spec wire.md, \"Mux framing\"). `valid` frames decode to `frame` and re-encode to `hex`. `invalid` inputs give the decode result: need_more (wait for bytes), or an error that closes the connection (too_large -> frame_too_large, others -> protocol_error).",
+  "invalid": [
+    {
+      "hex": "0000000100000000",
+      "name": "header_incomplete",
+      "result": "need_more"
+    },
+    {
+      "hex": "0000000100000000036869",
+      "name": "payload_incomplete",
+      "result": "need_more"
+    },
+    {
+      "hex": "000000010900000000",
+      "name": "unknown_type",
+      "result": "unknown_type"
+    },
+    {
+      "hex": "000000010000010001",
+      "name": "data_over_limit",
+      "result": "too_large"
+    },
+    {
+      "hex": "000000000700004001",
+      "name": "control_over_limit",
+      "result": "too_large"
+    },
+    {
+      "hex": "000000010100000101",
+      "name": "open_over_limit",
+      "result": "too_large"
+    },
+    {
+      "hex": "00000000000000000178",
+      "name": "data_on_stream_0",
+      "result": "bad_stream"
+    },
+    {
+      "hex": "000000010700000001a0",
+      "name": "control_on_stream_1",
+      "result": "bad_stream"
+    },
+    {
+      "hex": "0000000105000000080000000000000000",
+      "name": "ping_on_stream_1",
+      "result": "bad_stream"
+    },
+    {
+      "hex": "0000000108000000020000",
+      "name": "goaway_on_stream_1",
+      "result": "bad_stream"
+    },
+    {
+      "hex": "000000000100000008a201000263727063",
+      "name": "open_on_stream_0",
+      "result": "bad_stream"
+    },
+    {
+      "hex": "000000010000000000",
+      "name": "empty_data",
+      "result": "bad_payload"
+    },
+    {
+      "hex": "000000000700000000",
+      "name": "empty_control",
+      "result": "bad_payload"
+    },
+    {
+      "hex": "00000000050000000700000000000000",
+      "name": "ping_7_bytes",
+      "result": "bad_payload"
+    },
+    {
+      "hex": "00000001020000000400000000",
+      "name": "credit_zero",
+      "result": "bad_payload"
+    },
+    {
+      "hex": "000000010200000003000001",
+      "name": "credit_3_bytes",
+      "result": "bad_payload"
+    },
+    {
+      "hex": "00000001030000000100",
+      "name": "fin_with_payload",
+      "result": "bad_payload"
+    },
+    {
+      "hex": "00000001040000000100",
+      "name": "reset_1_byte",
+      "result": "bad_payload"
+    },
+    {
+      "hex": "000000010100000005a201000260",
+      "name": "open_empty_label",
+      "result": "bad_payload"
+    },
+    {
+      "hex": "000000010100000047a201000278416c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c",
+      "name": "open_label_65_bytes",
+      "result": "bad_payload"
+    },
+    {
+      "hex": "000000010100000008a201020263727063",
+      "name": "open_class_2",
+      "result": "bad_payload"
+    },
+    {
+      "hex": "000000010100000007a2011800026178",
+      "name": "open_non_canonical",
+      "result": "bad_payload"
+    }
+  ],
+  "streams": {
+    "cases": [
+      {
+        "name": "open_in_order",
+        "role": "host",
+        "steps": [
+          {
+            "frame": {
+              "class": 0,
+              "label": "rpc",
+              "stream": 1,
+              "type": "open"
+            },
+            "hex": "000000010100000008a201000263727063",
+            "result": [
+              "opened:1"
+            ]
+          },
+          {
+            "frame": {
+              "class": 0,
+              "label": "rpc",
+              "stream": 3,
+              "type": "open"
+            },
+            "hex": "000000030100000008a201000263727063",
+            "result": [
+              "opened:3"
+            ]
+          }
+        ]
+      },
+      {
+        "name": "first_open_skips_an_id",
+        "role": "host",
+        "steps": [
+          {
+            "frame": {
+              "class": 0,
+              "label": "rpc",
+              "stream": 3,
+              "type": "open"
+            },
+            "hex": "000000030100000008a201000263727063",
+            "result": "close:protocol_error"
+          }
+        ]
+      },
+      {
+        "name": "open_skips_an_id",
+        "role": "host",
+        "steps": [
+          {
+            "frame": {
+              "class": 0,
+              "label": "rpc",
+              "stream": 1,
+              "type": "open"
+            },
+            "hex": "000000010100000008a201000263727063",
+            "result": [
+              "opened:1"
+            ]
+          },
+          {
+            "frame": {
+              "class": 0,
+              "label": "rpc",
+              "stream": 5,
+              "type": "open"
+            },
+            "hex": "000000050100000008a201000263727063",
+            "result": "close:protocol_error"
+          }
+        ]
+      },
+      {
+        "name": "host_open_skips_an_id",
+        "role": "caller",
+        "steps": [
+          {
+            "frame": {
+              "class": 0,
+              "label": "rpc",
+              "stream": 2,
+              "type": "open"
+            },
+            "hex": "000000020100000008a201000263727063",
+            "result": [
+              "opened:2"
+            ]
+          },
+          {
+            "frame": {
+              "class": 0,
+              "label": "rpc",
+              "stream": 6,
+              "type": "open"
+            },
+            "hex": "000000060100000008a201000263727063",
+            "result": "close:protocol_error"
+          }
+        ]
+      },
+      {
+        "name": "open_repeated",
+        "role": "host",
+        "steps": [
+          {
+            "frame": {
+              "class": 0,
+              "label": "rpc",
+              "stream": 1,
+              "type": "open"
+            },
+            "hex": "000000010100000008a201000263727063",
+            "result": [
+              "opened:1"
+            ]
+          },
+          {
+            "frame": {
+              "class": 0,
+              "label": "rpc",
+              "stream": 1,
+              "type": "open"
+            },
+            "hex": "000000010100000008a201000263727063",
+            "result": "close:protocol_error"
+          }
+        ]
+      },
+      {
+        "name": "open_wrong_parity",
+        "role": "host",
+        "steps": [
+          {
+            "frame": {
+              "class": 0,
+              "label": "rpc",
+              "stream": 2,
+              "type": "open"
+            },
+            "hex": "000000020100000008a201000263727063",
+            "result": "close:protocol_error"
+          }
+        ]
+      },
+      {
+        "name": "data_on_a_never_opened_id",
+        "role": "host",
+        "steps": [
+          {
+            "frame": {
+              "class": 0,
+              "label": "rpc",
+              "stream": 1,
+              "type": "open"
+            },
+            "hex": "000000010100000008a201000263727063",
+            "result": [
+              "opened:1"
+            ]
+          },
+          {
+            "frame": {
+              "payload": "6869",
+              "stream": 3,
+              "type": "data"
+            },
+            "hex": "0000000300000000026869",
+            "result": "close:protocol_error"
+          }
+        ]
+      },
+      {
+        "name": "credit_on_an_own_id_never_opened",
+        "role": "host",
+        "steps": [
+          {
+            "frame": {
+              "increment": 1,
+              "stream": 2,
+              "type": "credit"
+            },
+            "hex": "00000002020000000400000001",
+            "result": "close:protocol_error"
+          }
+        ]
+      },
+      {
+        "name": "frames_on_a_gone_stream_are_ignored",
+        "role": "host",
+        "steps": [
+          {
+            "frame": {
+              "class": 0,
+              "label": "rpc",
+              "stream": 1,
+              "type": "open"
+            },
+            "hex": "000000010100000008a201000263727063",
+            "result": [
+              "opened:1"
+            ]
+          },
+          {
+            "frame": {
+              "payload": "6869",
+              "stream": 1,
+              "type": "data"
+            },
+            "hex": "0000000100000000026869",
+            "result": [
+              "data:1:2"
+            ]
+          },
+          {
+            "frame": {
+              "code": 16,
+              "stream": 1,
+              "type": "reset"
+            },
+            "hex": "0000000104000000020010",
+            "result": [
+              "reset:1:cancelled"
+            ]
+          },
+          {
+            "frame": {
+              "payload": "6869",
+              "stream": 1,
+              "type": "data"
+            },
+            "hex": "0000000100000000026869",
+            "result": []
+          },
+          {
+            "frame": {
+              "increment": 1,
+              "stream": 1,
+              "type": "credit"
+            },
+            "hex": "00000001020000000400000001",
+            "result": []
+          },
+          {
+            "frame": {
+              "stream": 1,
+              "type": "fin"
+            },
+            "hex": "000000010300000000",
+            "result": []
+          },
+          {
+            "frame": {
+              "code": 16,
+              "stream": 1,
+              "type": "reset"
+            },
+            "hex": "0000000104000000020010",
+            "result": []
+          }
+        ]
+      },
+      {
+        "name": "data_after_fin",
+        "role": "host",
+        "steps": [
+          {
+            "frame": {
+              "class": 0,
+              "label": "rpc",
+              "stream": 1,
+              "type": "open"
+            },
+            "hex": "000000010100000008a201000263727063",
+            "result": [
+              "opened:1"
+            ]
+          },
+          {
+            "frame": {
+              "stream": 1,
+              "type": "fin"
+            },
+            "hex": "000000010300000000",
+            "result": [
+              "finished:1"
+            ]
+          },
+          {
+            "frame": {
+              "payload": "6869",
+              "stream": 1,
+              "type": "data"
+            },
+            "hex": "0000000100000000026869",
+            "result": "close:stream_closed"
+          }
+        ]
+      }
+    ],
+    "description": "Stream rules (spec wire.md, \"Streams\") on a mux that receives each step's frame in order. `role` is the receiving side: a host's peer opens odd ids from 1, a caller's peer even ids from 2, in order with no gaps. `result` is the list of events the frame produced (opened:<id>, data:<id>:<bytes>, finished:<id>, reset:<id>:<code>; an empty list means the frame was ignored), or close:<code> (the mux closes and its next frame out is GOAWAY with that code; no later step follows)."
+  },
+  "unknown_error_code": {
+    "description": "A RESET with a code this build does not know is still a valid frame.",
+    "hex": "00000001040000000203e7"
+  },
+  "valid": [
+    {
+      "frame": {
+        "payload": "6869",
+        "stream": 1,
+        "type": "data"
+      },
+      "hex": "0000000100000000026869"
+    },
+    {
+      "frame": {
+        "class": 0,
+        "label": "rpc",
+        "stream": 1,
+        "type": "open"
+      },
+      "hex": "000000010100000008a201000263727063"
+    },
+    {
+      "frame": {
+        "class": 1,
+        "label": "files",
+        "stream": 2,
+        "type": "open"
+      },
+      "hex": "00000002010000000aa20101026566696c6573"
+    },
+    {
+      "frame": {
+        "increment": 65536,
+        "stream": 3,
+        "type": "credit"
+      },
+      "hex": "00000003020000000400010000"
+    },
+    {
+      "frame": {
+        "stream": 5,
+        "type": "fin"
+      },
+      "hex": "000000050300000000"
+    },
+    {
+      "frame": {
+        "code": 16,
+        "stream": 7,
+        "type": "reset"
+      },
+      "hex": "0000000704000000020010"
+    },
+    {
+      "frame": {
+        "opaque": "0102030405060708",
+        "type": "ping"
+      },
+      "hex": "0000000005000000080102030405060708"
+    },
+    {
+      "frame": {
+        "opaque": "0102030405060708",
+        "type": "pong"
+      },
+      "hex": "0000000006000000080102030405060708"
+    },
+    {
+      "frame": {
+        "payload": "a3000101010200",
+        "type": "control"
+      },
+      "hex": "000000000700000007a3000101010200"
+    },
+    {
+      "frame": {
+        "code": 5,
+        "type": "goaway"
+      },
+      "hex": "0000000008000000020005"
+    }
+  ]
+}

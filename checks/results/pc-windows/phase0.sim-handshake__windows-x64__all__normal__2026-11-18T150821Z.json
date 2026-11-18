@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "pc-windows",
+  "key": "048ad3ccda2d27fdfc98c131f2fa25bea736ec0a3e8a107dcbfa6b2f5a86b88da452c337f09925646ec76897452505e718f3f397ddf39674e9f5ad64590bc93d57",
+  "payload": "{\"check\":\"phase0.sim-handshake\",\"target\":\"windows-x64\",\"build\":\"533f154f903c679edd572142bf0e8e1b09f0e775+release\",\"platform\":\"windows-x86_64\",\"outcome\":\"PASS\",\"details\":\"printed \\\"PASS sim handshake\\\"\",\"time\":\"2026-11-18T15:08:21Z\",\"device\":\"pc-windows\",\"config\":\"515c1e41e227de1732bff065f000a6c7b0c097dcc156c80e62861b802fe32bb8\"}",
+  "signature": "a028f5264749d99c4779ddcad8a4ed26258d969c73481f3895c72a76269a1abd017f45a5a3280974f60cfe8448e5be472e211e6a732af076dfd964bcb70c3caf"
+}

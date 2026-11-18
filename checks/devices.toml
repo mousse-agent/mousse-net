@@ -1,0 +1,28 @@
+# Devices whose signed results mousse-check trusts.
+#
+# Add one with:
+#   mousse-check device keygen --out <key file>        (on the device)
+#   mousse-check device add --name <name> --key <public key hex> --targets <cells>
+# and commit this file. `targets` limits which cells a device may report.
+# The secret key file stays on the device and is never committed.
+
+[[device]]
+name = "pc-windows"
+key = "048ad3ccda2d27fdfc98c131f2fa25bea736ec0a3e8a107dcbfa6b2f5a86b88da452c337f09925646ec76897452505e718f3f397ddf39674e9f5ad64590bc93d57"
+platform = "Windows 11 x86_64 PC"
+targets = ["windows-x64", "x86_64-pc-windows-msvc", "pc-to-mac-lan", "wasm32", "wasm32-unknown-unknown@worker-chromium", "wasm32-unknown-unknown@worker-firefox"]
+added = "2026-11-18T15:03:32Z"
+
+[[device]]
+name = "mac-mini"
+key = "04d63225e01c2fd84d8a4588702b08561c26da25295387d39876ea36c7f2deee75ec54bd53c9d5b09712f13f737f0ece0038931c8226886a42d77430c7c4e486ee"
+platform = "Mac mini, Apple silicon, macOS"
+targets = ["macos-arm64", "aarch64-apple-darwin", "x86_64-apple-darwin", "aarch64-linux-android"]
+added = "2026-11-18T15:03:32Z"
+
+[[device]]
+name = "wsl-linux"
+key = "042f0974403d57624956aebbe7cd72f01b86773fdee66ffba37429d70a320ccb692f06069a9174535d971428932d86132cc89eef54954c5f9c5c6ed605fea234bb"
+platform = "Ubuntu 24.04 x86_64 under WSL 2 on the PC"
+targets = ["linux-x64", "x86_64-unknown-linux-gnu"]
+added = "2026-11-18T15:03:32Z"
