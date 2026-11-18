@@ -145,7 +145,6 @@ struct Inner<F: CodeExchangeFactory> {
     store: Option<GrantStore>,
     /// The last save failed; the ticker retries it.
     unsaved: bool,
-    approve_next: bool,
     events: mpsc::UnboundedSender<HostEvent>,
 }
 
@@ -319,7 +318,7 @@ where
             .collect()
     }
 
-    fn apply(&mut self, actions: Vec<HostAction>, clock: &dyn Clock) {
+    fn apply(&mut self, actions: Vec<HostAction>) {
         let mut queue: VecDeque<HostAction> = actions.into();
         let mut persist = false;
         while let Some(action) = queue.pop_front() {
@@ -338,26 +337,14 @@ where
                     joiner,
                     name,
                 } => {
-                    if self.approve_next {
-                        self.approve_next = false;
-                        let before = self.grants.clone();
-                        if let Ok(more) =
-                            self.pairing
-                                .approve(&invitation, conn, &mut self.grants, clock.now())
-                        {
-                            let more = self.commit_enrollment(before, more);
-                            queue.extend(more);
-                        }
-                    } else {
-                        let _ = self
-                            .events
-                            .send(HostEvent::ApprovalRequested(ApprovalRequest {
-                                invitation,
-                                conn,
-                                joiner,
-                                name,
-                            }));
-                    }
+                    let _ = self
+                        .events
+                        .send(HostEvent::ApprovalRequested(ApprovalRequest {
+                            invitation,
+                            conn,
+                            joiner,
+                            name,
+                        }));
                 }
                 HostAction::ShowCode { invitation, code } => {
                     let _ = self.events.send(HostEvent::ShowCode { invitation, code });
@@ -432,7 +419,6 @@ where
                 conns: HashMap::new(),
                 store,
                 unsaved: false,
-                approve_next: false,
                 events,
             }),
             certs: CertManager::new(signer, config.clock.clone()),
@@ -483,6 +469,7 @@ where
             conn,
             peer,
             exporters: handshake.exporters,
+            caller_opened: false,
         };
         Ok(conn::spawn(
             conn::Start {
@@ -541,7 +528,7 @@ where
             )
             .map_err(|e| NetError::Refused(e.to_string()))?;
         let actions = inner.commit_enrollment(before, actions);
-        inner.apply(actions, &*self.shared.clock);
+        inner.apply(actions);
         Ok(())
     }
 
@@ -549,19 +536,14 @@ where
     pub fn decline(&self, invitation: &InvitationId) {
         let mut inner = lock(&self.shared);
         let actions = inner.pairing.decline(invitation);
-        inner.apply(actions, &*self.shared.clock);
+        inner.apply(actions);
     }
 
     /// Cancel an open invitation.
     pub fn cancel(&self, invitation: &InvitationId) {
         let mut inner = lock(&self.shared);
         let actions = inner.pairing.cancel(invitation);
-        inner.apply(actions, &*self.shared.clock);
-    }
-
-    /// Approve the next in-person request without asking (scripted runs).
-    pub fn set_approve_next(&self, on: bool) {
-        lock(&self.shared).approve_next = on;
+        inner.apply(actions);
     }
 
     /// All grants.
@@ -658,7 +640,7 @@ async fn ticker<F: CodeExchangeFactory>(shared: Weak<Shared<F>>) {
         let mut inner = lock(&shared);
         inner.expire_grants(now);
         let actions = inner.pairing.tick(now);
-        inner.apply(actions, &*shared.clock);
+        inner.apply(actions);
         let overdue: Vec<(ConnectionId, ErrorCode)> = inner
             .gates
             .iter_mut()
@@ -675,6 +657,9 @@ struct HostRole<F: CodeExchangeFactory> {
     conn: ConnectionId,
     peer: IdentityPublicKey,
     exporters: SessionExporters,
+    /// The caller has opened a stream (a stream frame passed the gate).
+    /// The host opens none before that (wire.md 8, step 4).
+    caller_opened: bool,
 }
 
 impl<F> ConnRole for HostRole<F>
@@ -707,10 +692,14 @@ where
                 return Verdict::Close(*code);
             }
         }
-        match inner.gates.get_mut(&self.conn) {
+        let verdict = match inner.gates.get_mut(&self.conn) {
             Some(gate) => gate.check(traffic),
             None => Verdict::Close(ErrorCode::InternalError),
+        };
+        if verdict == Verdict::Allow && matches!(traffic, Traffic::Stream) {
+            self.caller_opened = true;
         }
+        verdict
     }
 
     fn on_control(&mut self, message: ControlMessage, _out: &mut Outbox) {
@@ -750,10 +739,13 @@ where
             _ => Vec::new(),
         };
         let actions = inner.commit_enrollment(before, actions);
-        inner.apply(actions, clock);
+        inner.apply(actions);
     }
 
     fn may_open(&self) -> bool {
+        if !self.caller_opened {
+            return false;
+        }
         let now = self.shared.clock.now();
         lock(&self.shared).live_now(self.conn, now)
     }
@@ -765,7 +757,7 @@ where
         inner.conns.remove(&self.conn);
         inner.grants.unbind(self.conn);
         let actions = inner.pairing.on_connection_closed(self.conn);
-        inner.apply(actions, &*shared.clock);
+        inner.apply(actions);
     }
 }
 
@@ -880,9 +872,45 @@ mod tests {
         assert!(live.host.grants().is_empty());
     }
 
+    impl Live {
+        /// The caller opens a stream and the host takes it.
+        async fn caller_opens_one(&self) {
+            let stream = self
+                .dialled
+                .open_stream(PriorityClass::Interactive, "terminal")
+                .await
+                .unwrap();
+            stream.writer.write(b"first").await.unwrap();
+            assert!(within("the caller's stream", self.hosted.accept_stream())
+                .await
+                .is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn the_host_opens_no_stream_before_the_caller_opened_one() {
+        let live = live().await;
+        assert!(live
+            .hosted
+            .open_stream(PriorityClass::Interactive, "terminal")
+            .await
+            .is_err());
+        live.caller_opens_one().await;
+        let stream = live
+            .hosted
+            .open_stream(PriorityClass::Interactive, "terminal")
+            .await
+            .unwrap();
+        stream.writer.write(b"from the host").await.unwrap();
+        assert!(within("the host's stream", live.dialled.accept_stream())
+            .await
+            .is_some());
+    }
+
     #[tokio::test]
     async fn the_host_opens_no_stream_under_an_expired_grant() {
         let live = live().await;
+        live.caller_opens_one().await;
         live.expire_without_the_ticker();
         assert!(live
             .hosted

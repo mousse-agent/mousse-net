@@ -279,6 +279,11 @@ impl Endpoint {
         private_state_dir(&self.dir)
     }
 
+    /// Where this endpoint keeps its joiner flow records (owner-only).
+    pub fn flow_records(&self) -> crate::store::FlowRecordStore {
+        crate::store::FlowRecordStore::in_dir(&private_state_dir(&self.dir))
+    }
+
     /// This endpoint's random id (hex). Names its keystore entry.
     pub fn endpoint_id(&self) -> &str {
         &self.file.endpoint_id

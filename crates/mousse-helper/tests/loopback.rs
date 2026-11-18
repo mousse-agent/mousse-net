@@ -59,7 +59,17 @@ fn temp_dir(tag: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    std::env::temp_dir().join(format!("mousse-helper-it-{tag}-{}-{n}", std::process::id()))
+    // On Unix the control socket goes in this folder, and a socket path
+    // must stay short (104 bytes on macOS).
+    if cfg!(windows) {
+        std::env::temp_dir().join(format!("mousse-helper-it-{tag}-{}-{n}", std::process::id()))
+    } else {
+        PathBuf::from("/tmp").join(format!(
+            "mh-{tag}-{}-{}",
+            std::process::id(),
+            n % 1_000_000_000
+        ))
+    }
 }
 
 /// A command that prints `hello-<tag>` on the host.
@@ -284,15 +294,21 @@ fn stop(host: &Endpoint, mut server: Server) {
 /// Pair `peer` with the running host of `host` in person. Returns the
 /// grant id the host made.
 fn pair(host: &Endpoint, peer: &Endpoint, peer_name: &str) -> (u64, String) {
-    let invite = host.spawn(&["invite", "--approve-next", "--no-qr"]);
+    let mut invite = host.spawn_with_stdin(&["invite", "--no-qr"]);
     let ticket_line = invite.wait_for("TICKET ", WAIT);
     let ticket = ticket_line.trim_start_matches("TICKET ").trim().to_owned();
-    let joined = peer.run(&["join", &ticket, "--name", peer_name]);
+    let join = peer.spawn(&["join", &ticket, "--in-person", "--name", peer_name]);
+    invite.wait_for("Is the device next to you?", WAIT);
+    invite.type_line("y\n");
+    let joined = join.finish(WAIT);
     assert!(joined.ok(), "join: {}", joined.text());
     let paired = invite.wait_for("paired: grant ", WAIT);
+    // The line may follow the question's prompt: the answer typed into
+    // a pipe is not echoed.
     let grant = paired
-        .split_whitespace()
-        .nth(2)
+        .split("paired: grant ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
         .and_then(|g| g.parse().ok())
         .unwrap_or_else(|| panic!("no grant in {paired:?}"));
     (grant, ticket)
@@ -397,7 +413,7 @@ fn rejections_wrong_identity_used_ticket_and_declined_pairing() {
     let (_, ticket) = pair(&host, &peer, "laptop");
 
     // The used ticket does not pair a second device.
-    let replay = other.run(&["join", &ticket, "--name", "intruder"]);
+    let replay = other.run(&["join", &ticket, "--in-person", "--name", "intruder"]);
     assert_eq!(replay.code, Some(2), "{}", replay.text());
     assert!(
         replay.stderr.contains("INVITATION_INVALID"),
@@ -409,7 +425,18 @@ fn rejections_wrong_identity_used_ticket_and_declined_pairing() {
     let mut invite = host.spawn_with_stdin(&["invite", "--no-qr"]);
     let ticket_line = invite.wait_for("TICKET ", WAIT);
     let fresh = ticket_line.trim_start_matches("TICKET ").trim().to_owned();
-    let mut join = other.spawn(&["join", &fresh, "--name", "intruder"]);
+    // Pasted, not scanned: an in-person ticket does not pair, and the
+    // owner is not asked.
+    let pasted = other.run(&["join", &fresh, "--name", "intruder"]);
+    assert_eq!(pasted.code, Some(2), "{}", pasted.text());
+    assert!(
+        pasted.stderr.contains("PAIRING_FAILED"),
+        "{}",
+        pasted.text()
+    );
+    assert!(!invite.out().contains("Is the device next to you?"));
+
+    let mut join = other.spawn(&["join", &fresh, "--in-person", "--name", "intruder"]);
     invite.wait_for("Is the device next to you?", WAIT);
     invite.type_line("n\n");
     assert_eq!(join.exit_within(WAIT), Some(2));
@@ -588,6 +615,9 @@ fn send_link_right_code_pairs_and_three_wrong_codes_end_the_invitation() {
     let mut shown = Vec::new();
     for attempt in 1..=3 {
         lines_with(&join, "shown on the host", attempt);
+        if attempt > 1 {
+            lines_with(&join, "That code didn't work.", attempt - 1);
+        }
         let code = shown_code(&invite, attempt);
         join.type_line(&format!("{}\n", wrong_code(&code)));
         shown.push(code);
@@ -607,21 +637,42 @@ fn send_link_right_code_pairs_and_three_wrong_codes_end_the_invitation() {
         "{}",
         invite.err()
     );
+    // One grant, the phone's, named after its computer: a send link sends
+    // no other name, so `--name phone` never reached the host.
     let listed = host.run(&["grants"]);
-    assert!(listed.stdout.contains("phone"), "{}", listed.text());
-    assert!(!listed.stdout.contains("stranger"), "{}", listed.text());
+    assert_eq!(
+        listed.stdout.matches("connections").count(),
+        1,
+        "{}",
+        listed.text()
+    );
+    assert!(
+        refused.stdout.contains("--name is not used"),
+        "{}",
+        refused.text()
+    );
+    assert!(!listed.stdout.contains("phone"), "{}", listed.text());
 
-    // The ended ticket does not work again.
-    let again = stranger.run(&["join", &ticket, "--name", "stranger"]);
+    // Opened again on the same device, the link has no tries left; on
+    // another device the ended ticket is refused by the host.
+    let again = stranger.run(&["join", &ticket]);
     assert!(!again.ok(), "{}", again.text());
     assert!(
-        again.stderr.contains("INVITATION_INVALID"),
+        again.stderr.contains("ATTEMPTS_EXHAUSTED"),
         "{}",
         again.text()
     );
+    let late = Endpoint::init("link-late");
+    let refused = late.run(&["join", &ticket]);
+    assert!(!refused.ok(), "{}", refused.text());
+    assert!(
+        refused.stderr.contains("INVITATION_INVALID"),
+        "{}",
+        refused.text()
+    );
 
     stop(&host, server);
-    cleanup(&[&host, &phone, &stranger]);
+    cleanup(&[&host, &phone, &stranger, &late]);
 }
 
 #[test]
@@ -695,9 +746,9 @@ fn an_approval_answer_applies_only_to_the_request_it_names() {
     // about the first; the second asks while that question is open.
     let mut invite = host.spawn_with_stdin(&["invite", "--no-qr"]);
     let ticket = invite.wait_for("TICKET ", WAIT)["TICKET ".len()..].to_owned();
-    let mut join_first = first.spawn(&["join", &ticket, "--name", "first"]);
+    let mut join_first = first.spawn(&["join", &ticket, "--in-person", "--name", "first"]);
     invite.wait_for("\"first\"", WAIT);
-    let mut join_second = second.spawn(&["join", &ticket, "--name", "second"]);
+    let mut join_second = second.spawn(&["join", &ticket, "--in-person", "--name", "second"]);
     server.proc.wait_for("approval requested for second", WAIT);
 
     // "Yes" to the question about the first device pairs that device only.
@@ -740,6 +791,13 @@ fn the_state_folder_control_file_and_control_channel_are_owner_only() {
         // A named pipe that allows the current user alone.
         assert!(addr.starts_with(r"\\.\pipe\"), "{addr}");
         assert!(is_owner_only(std::path::Path::new(&addr)).unwrap(), "pipe");
+    } else {
+        // A Unix socket in the owner-only state folder, owner-only itself.
+        assert_eq!(addr, "unix:control.sock");
+        assert!(
+            is_owner_only(&host.dir.join("control.sock")).unwrap(),
+            "control.sock"
+        );
     }
     // The control channel still works for the owner.
     let status = host.run(&["id"]);
@@ -804,7 +862,7 @@ fn the_slice_check_runs_on_loopback_and_peer_names_print_escaped() {
     let host = Endpoint::init("slice-host");
     let peer = Endpoint::init("slice-peer");
     let server = host.serve(host_name, &[]);
-    let invite = host.spawn(&["invite", "--approve-next", "--no-qr"]);
+    let mut invite = host.spawn_with_stdin(&["invite", "--no-qr"]);
     let ticket_line = invite.wait_for("TICKET ", WAIT);
     let ticket = ticket_line.trim_start_matches("TICKET ").trim().to_owned();
 
@@ -815,6 +873,7 @@ fn the_slice_check_runs_on_loopback_and_peer_names_print_escaped() {
         "slice-check",
         "--ticket",
         &ticket,
+        "--in-person",
         "--name",
         device_name,
         "--removal-timeout",
@@ -825,9 +884,16 @@ fn the_slice_check_runs_on_loopback_and_peer_names_print_escaped() {
     ];
     args.extend(command.iter().map(String::as_str));
     let check = peer.spawn(&args);
+    invite.wait_for("Is the device next to you?", WAIT);
+    invite.type_line("y\n");
     check.wait_for("WAITING ", WAIT);
     let paired = invite.wait_for("paired: grant ", WAIT);
-    let grant = paired.split_whitespace().nth(2).unwrap().to_owned();
+    let grant = paired
+        .split("paired: grant ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap()
+        .to_owned();
 
     let listed = host.run(&["grants"]);
     assert!(

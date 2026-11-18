@@ -35,7 +35,6 @@ pub struct ServeOptions {
     pub name: String,
     pub listen_ip: IpAddr,
     pub port: Option<u16>,
-    pub approve_next: bool,
     pub mdns: bool,
 }
 
@@ -120,9 +119,6 @@ pub async fn run(
     };
     let (host, mut events) =
         Host::new(signer, config, CpaceExchangeFactory).map_err(|e| e.to_string())?;
-    if opts.approve_next {
-        host.set_approve_next(true);
-    }
     let choice = match opts.port {
         None => PortChoice::Kept,
         Some(0) => PortChoice::Auto,
@@ -140,7 +136,7 @@ pub async fn run(
         None
     };
 
-    let mut control = ControlListener::bind().await?;
+    let mut control = ControlListener::bind(state_dir).await?;
     let token = hex(&random_bytes::<32>());
     ipc::write_control_file(state_dir, control.addr(), &token)?;
 

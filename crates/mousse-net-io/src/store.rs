@@ -1,15 +1,19 @@
-//! Local state files: the host's grant table and the caller's paired hosts.
+//! Local state files: the host's grant table, the caller's paired hosts and
+//! the joiner's flow records.
 //!
 //! Every write goes to a temporary file in the same directory, is flushed to
 //! disk, then renamed over the old file, so a crash leaves either the old or
 //! the new contents. On Unix the files are readable by the owner only.
 
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use mousse_net_core::grants::{Denial, Grant, GrantId, GrantSource, GrantTable, OwnerRef, Role};
 use mousse_net_core::identity::IdentityPublicKey;
+use mousse_net_core::pairing::JoinerRecord;
 use mousse_net_core::UnixTime;
 use serde::{Deserialize, Serialize};
 
@@ -319,6 +323,80 @@ impl PeerStore {
     }
 }
 
+/// Where a joiner keeps its flow records (wire.md 10.7): per ticket hash,
+/// the code attempts left and whether an outcome is pending. Reopening a
+/// link or restarting the app loads them, so neither resets the count.
+pub trait FlowRecords: Send + Sync {
+    /// The record kept for `ticket_hash`, if any. One that cannot be read
+    /// is an error, never "none", which would reset the count.
+    fn load(&self, ticket_hash: &[u8; 32]) -> Result<Option<JoinerRecord>, NetError>;
+    /// Keep `record` in place of the one for its ticket hash.
+    fn save(&self, record: &JoinerRecord) -> Result<(), NetError>;
+}
+
+/// Flow records kept in memory, for as long as the process runs.
+#[derive(Debug, Default)]
+pub struct MemoryFlowRecords(Mutex<HashMap<[u8; 32], JoinerRecord>>);
+
+impl FlowRecords for MemoryFlowRecords {
+    fn load(&self, ticket_hash: &[u8; 32]) -> Result<Option<JoinerRecord>, NetError> {
+        let map = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(map.get(ticket_hash).copied())
+    }
+
+    fn save(&self, record: &JoinerRecord) -> Result<(), NetError> {
+        let mut map = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        map.insert(record.ticket_hash, *record);
+        Ok(())
+    }
+}
+
+/// Flow records on disk: one canonical CBOR file per ticket hash in a
+/// `joins` folder that only the owner can read, each written atomically.
+#[derive(Clone, Debug)]
+pub struct FlowRecordStore {
+    dir: PathBuf,
+}
+
+impl FlowRecordStore {
+    /// The `joins` folder in `dir`.
+    pub fn in_dir(dir: &Path) -> Self {
+        Self {
+            dir: dir.join("joins"),
+        }
+    }
+
+    /// The file for `ticket_hash`.
+    pub fn path(&self, ticket_hash: &[u8; 32]) -> PathBuf {
+        self.dir.join(format!("{}.cbor", hex(ticket_hash)))
+    }
+}
+
+impl FlowRecords for FlowRecordStore {
+    fn load(&self, ticket_hash: &[u8; 32]) -> Result<Option<JoinerRecord>, NetError> {
+        let path = self.path(ticket_hash);
+        let Some(bytes) = read_optional(&path)? else {
+            return Ok(None);
+        };
+        let record = JoinerRecord::from_bytes(&bytes)
+            .map_err(|e| NetError::Store(format!("{}: {e}", path.display())))?;
+        if record.ticket_hash != *ticket_hash {
+            return Err(NetError::Store(format!(
+                "{}: the record is for another ticket",
+                path.display()
+            )));
+        }
+        Ok(Some(record))
+    }
+
+    fn save(&self, record: &JoinerRecord) -> Result<(), NetError> {
+        if !self.dir.exists() {
+            crate::private::make_private_dir(&self.dir).map_err(|e| store_err(&self.dir, e))?;
+        }
+        write_atomic(&self.path(&record.ticket_hash), &record.to_bytes())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,6 +409,30 @@ mod tests {
             std::env::temp_dir().join(format!("mousse-net-io-{tag}-{}", hex(&random_bytes::<6>())));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn a_flow_record_is_kept_owner_only_and_never_read_for_another_ticket() {
+        let dir = temp_dir("joins");
+        let store = FlowRecordStore::in_dir(&dir);
+        let record = JoinerRecord {
+            ticket_hash: [3; 32],
+            attempts_left: 1,
+            outcome_pending: true,
+        };
+        assert_eq!(store.load(&[3; 32]).unwrap(), None);
+        store.save(&record).unwrap();
+        assert_eq!(store.load(&[3; 32]).unwrap(), Some(record));
+        assert!(crate::private::is_owner_only(&store.path(&[3; 32])).unwrap());
+        assert!(crate::private::is_owner_only(&dir.join("joins")).unwrap());
+
+        // A record filed under another ticket's name is refused, and so is
+        // one that does not parse: neither reads as "no record".
+        fs::copy(store.path(&[3; 32]), store.path(&[4; 32])).unwrap();
+        assert!(store.load(&[4; 32]).is_err());
+        fs::write(store.path(&[5; 32]), b"junk").unwrap();
+        assert!(store.load(&[5; 32]).is_err());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

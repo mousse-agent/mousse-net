@@ -34,7 +34,7 @@ pub mod rng;
 pub mod store;
 pub mod tls;
 
-pub use caller::{Caller, CodeEntry, JoinOutcome, NoCode, PathEvent};
+pub use caller::{Caller, CodeEntry, JoinOutcome, NoCode, PathEvent, Step1Failures};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use conn::{CloseReason, ConnStatus, Connection, MuxStream, StreamReader, StreamWriter};
 pub use endpoint::{Endpoint, PortChoice};

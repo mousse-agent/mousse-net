@@ -99,9 +99,6 @@ enum Command {
         /// Without it, the port picked at the first start is kept.
         #[arg(long)]
         port: Option<u16>,
-        /// Approve the next in-person join without asking.
-        #[arg(long)]
-        approve_next: bool,
         /// Don't advertise on mDNS (it is off anyway on loopback).
         #[arg(long)]
         no_mdns: bool,
@@ -111,15 +108,13 @@ enum Command {
     },
     /// Make an invitation on the running host and print the ticket and a QR
     /// code. In person (the default), answer "Is the device next to you?";
-    /// with --link, show the code to type on the joining device.
+    /// with --link, show the code to type on the joining device. Every
+    /// in-person request is put to the owner; none is approved unseen.
     Invite {
         /// A send link: the joining device types a 6-digit code shown here,
         /// a fresh one for each attempt.
         #[arg(long)]
         link: bool,
-        /// Answer yes without asking (in person).
-        #[arg(long)]
-        approve_next: bool,
         /// Print only the ticket line, no QR code.
         #[arg(long)]
         no_qr: bool,
@@ -128,7 +123,13 @@ enum Command {
     Join {
         /// The ticket (the fragment, or a link containing `#`).
         ticket: String,
-        /// The name the host sees (default: this computer's name).
+        /// The ticket was scanned from the host's screen. An in-person
+        /// ticket pairs only this way; without the flag a ticket counts as
+        /// sent (pasted or opened as a link).
+        #[arg(long)]
+        in_person: bool,
+        /// The name the host sees in person (default: this computer's
+        /// name). A send link sends the computer name only.
         #[arg(long)]
         name: Option<String>,
         /// Address to use instead of the ticket's, as tcp://host:port.
@@ -167,7 +168,13 @@ enum Command {
         /// The host's ticket.
         #[arg(long)]
         ticket: String,
-        /// The name the host sees.
+        /// The ticket was scanned from the host's screen. An in-person
+        /// ticket pairs only this way; without the flag a ticket counts as
+        /// sent (pasted or opened as a link).
+        #[arg(long)]
+        in_person: bool,
+        /// The name the host sees in person. A send link sends the
+        /// computer name only.
         #[arg(long)]
         name: Option<String>,
         /// Address to use instead of the ticket's.
@@ -194,6 +201,16 @@ enum Command {
         #[arg(last = true)]
         command: Vec<String>,
     },
+}
+
+/// How a ticket reached this device: `--in-person` for a scan of the
+/// host's screen, anything else counts as sent.
+fn arrival(in_person: bool) -> mousse_net_core::pairing::Arrival {
+    if in_person {
+        mousse_net_core::pairing::Arrival::InAppScan
+    } else {
+        mousse_net_core::pairing::Arrival::Link
+    }
 }
 
 fn computer_name() -> String {
@@ -341,7 +358,7 @@ fn ask_yes_no(question: &str) -> bool {
     matches!(line.trim(), "y" | "Y" | "yes" | "Yes")
 }
 
-async fn invite(dir: &Path, link: bool, approve_next: bool, no_qr: bool) -> Result<(), String> {
+async fn invite(dir: &Path, link: bool, no_qr: bool) -> Result<(), String> {
     let mut ch = ipc::request(dir, json!({"cmd": "invite", "link": link}))
         .await?
         .ok_or("no host is running for this endpoint (start `serve` first)")?;
@@ -381,12 +398,6 @@ async fn invite(dir: &Path, link: bool, approve_next: bool, no_qr: bool) -> Resu
     loop {
         if asking.is_none() {
             if let Some((request, question)) = queued.pop_front() {
-                if approve_next {
-                    println!("{question} [y/N] y (--approve-next)");
-                    ch.send(&json!({"answer": true, "request": request}))
-                        .await?;
-                    continue;
-                }
                 let ask = tokio::task::spawn_blocking(move || ask_yes_no(&question));
                 asking = Some((request, ask));
             }
@@ -495,7 +506,6 @@ async fn run(cli: Cli) -> Result<i32, String> {
         Command::Serve {
             listen_ip,
             port,
-            approve_next,
             no_mdns,
             name,
         } => {
@@ -503,25 +513,22 @@ async fn run(cli: Cli) -> Result<i32, String> {
                 name: name.unwrap_or_else(computer_name),
                 listen_ip,
                 port,
-                approve_next,
                 mdns: !no_mdns,
             };
             serve::run(&dir, insecure, opts).await?;
         }
-        Command::Invite {
-            link,
-            approve_next,
-            no_qr,
-        } => invite(&dir, link, approve_next, no_qr).await?,
+        Command::Invite { link, no_qr } => invite(&dir, link, no_qr).await?,
         Command::Join {
             ticket,
+            in_person,
             name,
             routes,
         } => {
             let ticket = peer::parse_ticket(&ticket)?;
             let side = peer::CallerSide::open(&dir, insecure)?;
+            let name = peer::join_name(&ticket, name, computer_name());
             let (_conn, record) =
-                peer::join(&side, &ticket, &name.unwrap_or_else(computer_name), &routes).await?;
+                peer::join(&side, &ticket, arrival(in_person), &name, &routes).await?;
             println!(
                 "paired with {} ({})",
                 printable(&record.name),
@@ -556,6 +563,7 @@ async fn run(cli: Cli) -> Result<i32, String> {
         }
         Command::SliceCheck {
             ticket,
+            in_person,
             name,
             routes,
             removal_timeout,
@@ -573,7 +581,8 @@ async fn run(cli: Cli) -> Result<i32, String> {
             };
             let opts = peer::SliceCheck {
                 ticket,
-                name: name.unwrap_or_else(computer_name),
+                arrival: arrival(in_person),
+                name,
                 routes,
                 command,
                 removal_timeout: Duration::from_secs(removal_timeout),
