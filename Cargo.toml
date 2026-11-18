@@ -6,6 +6,7 @@ members = [
   "crates/mousse-net-io",
   "crates/mousse-helper",
   "crates/mousse-check",
+  "spikes/tls-matrix",
 ]
 
 [workspace.package]
