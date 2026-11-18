@@ -40,7 +40,7 @@ Each `[[check]]`:
 | `judge` | `cargo-test` (default), `marker`, or `matrix` |
 | `min_tests` | `cargo-test`: the normal run must pass at least this many tests |
 | `pass_marker`, `fail_marker` | default `PASS <id>` / `FAIL <id>`; must be a whole line |
-| `profile` | profile results must carry; local runs record it (default `debug`) and records with another profile do not count |
+| `profile` | profile results must carry. A local run records the profile its command actually builds with, read from the cargo command (`--release`, `-r`, `--profile <name>`; none means `debug`; `unknown` for a command that is not `cargo build`, `run`, `test` or `bench`). With `profile` set, every local command and control must be a cargo command with that profile, or the manifest is refused |
 | `cross_machine` | one machine dials another: each result must name the host's build in `extra.host_build`, and both builds must be the build under test |
 | `placeholder` | not wired yet: cells are INCOMPLETE and the phase run skips it (`run` still runs it) |
 | `deferred` | deferred; only counts if `[defer]` lists it |
@@ -65,7 +65,7 @@ A control with `expect_reason` must also show that reason. A local run must prin
 
 ## Results from other machines
 
-Device results are JSON payloads `{check, target, case?, control?, build, platform, outcome, details, time, device, config, extra?}` signed with the device's P-256 key (ECDSA/SHA-256, raw r‖s, over `"mousse-check-result-v1\0" ‖ payload`). The file keeps the exact signed payload text. The kit checks the key is in `devices.toml`, the payload names that device, the device is trusted for that target, the build is the build under test and `config` matches the check's current configuration. `run --sign-with` fills `config` from the run; `sign` takes it from the result file or, if absent, from the signing checkout's manifest, so the signer vouches that the run used the check as configured there.
+Device results are JSON payloads `{check, target, case?, control?, build, platform, outcome, details, time, device, config, extra?}` signed with the device's P-256 key (ECDSA/SHA-256, raw r‖s, over `"mousse-check-result-v1\0" ‖ payload`). The file keeps the exact signed payload text. The kit checks the key is in `devices.toml`, the payload names that device, the device is trusted for that target, the build is the build under test and `config` matches the check's current configuration. The digest is recorded when the result is produced, never when it is signed. `run --sign-with` records it from the run. A device that produces results any other way (the helper's slice check, matrix logs, a phone) first runs `mousse-check config-digest <check> --target <cell> [--control <name>]`, then passes the printed digest as a `config` field in the result file or as `sign --config <digest>`. `sign` refuses a result without one, refuses one `--config` for results from more than one run, and warns when the digest differs from this checkout's manifest (such a result counts only for that configuration).
 
 `sign` also keeps these top-level fields of a result file in `extra`: `reason`, `host_build` and `caller_build` (and `reason` inside an object `details`). For a `cross_machine` check, `build` is the caller's build and `extra.host_build` the host's; both, and `extra.caller_build` if present, must be the build under test. A result without `extra.host_build` does not count.
 
@@ -80,9 +80,12 @@ A cell from devices passes when, for this build, every case (one, or every matri
     mousse-check run phase0.crypto-matrix --target aarch64-apple-darwin --sign-with ~/.mousse/device.key
     mousse-check run phase0.crypto-matrix --target aarch64-apple-darwin --sign-with ~/.mousse/device.key --control
 
-    # output produced elsewhere (a phone, a browser page): result JSON, matrix files or MATRIX_RESULT logs
-    mousse-check sign --device-key ~/.mousse/device.key phone-run.log
-    mousse-check sign --device-key ~/.mousse/device.key --control break-pin phone-control.log
+    # output produced elsewhere (a phone, a browser page): result JSON, matrix files or MATRIX_RESULT logs.
+    # Record the configuration before each run, sign with it after.
+    mousse-check config-digest phase0.crypto-matrix --target aarch64-apple-ios            # prints <digest>
+    mousse-check config-digest phase0.crypto-matrix --target aarch64-apple-ios --control break-pin
+    mousse-check sign --device-key ~/.mousse/device.key --config <digest> phone-run.log
+    mousse-check sign --device-key ~/.mousse/device.key --config <control digest> --control break-pin phone-control.log
 
 Signed files go to `checks/results/<device>/`; commit them.
 

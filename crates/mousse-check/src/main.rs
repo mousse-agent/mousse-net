@@ -29,9 +29,17 @@ USAGE
       also write signed results, for a machine whose results another machine
       evaluates.
   mousse-check sign --device-key <key file> [--device <name>] [--check <id>] [--target <cell>]
-                    [--control <name>] [--platform <text>] [--profile <p>] [--out <dir>] <file>...
+                    [--control <name>] [--platform <text>] [--profile <p>] [--out <dir>]
+                    [--config <digest>] <file>...
       Sign result files a device produced (result JSON, crypto matrix files,
-      or logs of MATRIX_RESULT lines). Writes into checks/results/<device>/.
+      or logs of MATRIX_RESULT lines). Each result needs the configuration
+      digest recorded before the run: a `config` field, or --config.
+      Writes into checks/results/<device>/.
+  mousse-check config-digest <check-id> [--target <cell>] [--control <name>]
+      Print the configuration digest of one run of a check, from this
+      checkout's manifest. A device that produces results outside
+      `mousse-check run` runs this before the run and passes the digest to
+      `sign --config`.
   mousse-check attest <check-id> --note <text> [--target <cell>] [--by <name>]
       Record a manual step. Shown as ATTESTED, never PASS.
   mousse-check device keygen --out <key file>
@@ -76,6 +84,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--name",
     "--key",
     "--targets",
+    "--config",
 ];
 
 impl Args {
@@ -136,7 +145,7 @@ fn real_main(raw: Vec<String>) -> Result<ExitCode, String> {
         return Ok(ExitCode::from(2));
     };
     let rest = raw[1..].to_vec();
-    let a = Args::parse(rest, cmd == "sign")?;
+    let a = Args::parse(rest, matches!(cmd.as_str(), "sign" | "config-digest"))?;
     if matches!(cmd.as_str(), "help" | "--help" | "-h") {
         print!("{HELP}");
         return Ok(ExitCode::SUCCESS);
@@ -146,6 +155,7 @@ fn real_main(raw: Vec<String>) -> Result<ExitCode, String> {
         "run" => cmd_run(&kit, &a),
         "sign" => cmd_sign(&kit, &a),
         "attest" => cmd_attest(&kit, &a),
+        "config-digest" => cmd_config_digest(&kit, &a),
         "device" => cmd_device(&kit, &a),
         "report" => cmd_report(&kit, &a, None),
         phase if kit.has_phase(phase) => cmd_report(&kit, &a, Some(phase)),
@@ -301,7 +311,19 @@ fn cmd_sign(kit: &Kit, a: &Args) -> Result<ExitCode, String> {
         "--platform",
         "--profile",
         "--out",
+        "--config",
     ])?;
+    if let Some(d) = a.get("--config") {
+        if d.len() != 64
+            || !d
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(format!(
+                "--config {d:?} is not a digest from `mousse-check config-digest`"
+            ));
+        }
+    }
     let key_path = a.get("--device-key").ok_or("sign needs --device-key")?;
     if a.positional.is_empty() {
         return Err("sign needs at least one result file".into());
@@ -322,26 +344,78 @@ fn cmd_sign(kit: &Kit, a: &Args) -> Result<ExitCode, String> {
         control: a.get("--control"),
         platform: a.get("--platform"),
         default_build,
+        config: a.get("--config"),
         device: &device,
     };
-    let mut n = 0;
+    let mut payloads = Vec::new();
+    let mut given = std::collections::BTreeSet::new();
     for file in &a.positional {
         for v in read_unsigned(Path::new(file))? {
-            let mut p = payload_from(&v, &sa).map_err(|e| format!("{file}: {e}"))?;
-            if p.config.is_none() {
-                p.config = Some(config_for(kit, &p.check, &p.target, p.control.as_deref())?);
+            let p = payload_from(&v, &sa).map_err(|e| format!("{file}: {e}"))?;
+            let id = format!(
+                "{} @ {} [{}]",
+                p.check,
+                p.target,
+                p.control.as_deref().unwrap_or("normal")
+            );
+            match (&p.config, v.get("config")) {
+                (None, _) => {
+                    return Err(format!(
+                        "{file}: {id} has no configuration digest. Before producing a result outside `mousse-check run`, run `mousse-check config-digest {} --target {}{}` and pass its output to sign --config",
+                        p.check,
+                        p.target,
+                        p.control.as_ref().map(|c| format!(" --control {c}")).unwrap_or_default()
+                    ))
+                }
+                (Some(_), None) => {
+                    given.insert(id.clone());
+                }
+                (Some(_), Some(_)) => {}
             }
-            let path = write_signed(&out_dir, &p, &key)?;
-            println!("signed {}", path.display());
-            n += 1;
+            payloads.push((id, p));
         }
     }
-    eprintln!("{n} result(s) signed as {device}");
+    if given.len() > 1 {
+        return Err(format!(
+            "--config is the digest of one run, but these results are from {} runs ({}); sign each run separately",
+            given.len(),
+            given.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    for (id, p) in &payloads {
+        let now = config_for(kit, &p.check, &p.target, p.control.as_deref())?;
+        if p.config.as_deref() != Some(now.as_str()) {
+            eprintln!(
+                "note: {id} was produced under another configuration than this checkout's manifest; it will count only for that configuration"
+            );
+        }
+    }
+    for (_, p) in &payloads {
+        let path = write_signed(&out_dir, p, &key)?;
+        println!("signed {}", path.display());
+    }
+    eprintln!("{} result(s) signed as {device}", payloads.len());
     Ok(ExitCode::SUCCESS)
 }
 
-/// The configuration digest of one run, from this checkout's manifest: the
-/// signer vouches that the run used the check as configured here.
+/// `config-digest`: the digest a device records before producing a result.
+fn cmd_config_digest(kit: &Kit, a: &Args) -> Result<ExitCode, String> {
+    a.only_known(&["--target", "--control"])?;
+    let id = a
+        .positional
+        .first()
+        .ok_or("config-digest needs a check id")?;
+    let (_, c) = kit.find_check(id)?;
+    let target = match (a.get("--target"), c.targets.as_slice()) {
+        (Some(t), _) => t.to_string(),
+        (None, [only]) => only.clone(),
+        (None, many) => return Err(format!("which target? ({})", many.join(", "))),
+    };
+    println!("{}", config_for(kit, id, &target, a.get("--control"))?);
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The configuration digest of one run, from this checkout's manifest.
 fn config_for(
     kit: &Kit,
     check: &str,

@@ -152,7 +152,7 @@ targets = [
   "wasm32-unknown-unknown@worker-safari-ios",
   "wasm32-unknown-unknown@worker-chrome-android",
 ]
-device_steps = "spec/matrix/targets.md \"Commands\" for that group, then mousse-check sign; the control is the same run with MOUSSE_MATRIX_BREAK=1 --same-only, signed with --control break-pin"
+device_steps = "before each run, record its configuration with `mousse-check config-digest phase0.crypto-matrix --target <cell>` (add --control <name> for a control run) and sign the result with --config <that digest>; spec/matrix/targets.md \"Commands\" for that group, then mousse-check sign; the control is the same run with MOUSSE_MATRIX_BREAK=1 --same-only, signed with --control break-pin"
 
 [check.matrix]
 providers = ["aws-lc-rs", "ring", "rustcrypto", "ring+pq", "rustcrypto+pq"]
@@ -341,7 +341,7 @@ title = "Thin slice across machines: the PC dials the Mac over the LAN"
 plan = "Phase 0 \"Slice\" (two desktops)"
 targets = ["pc-to-mac-lan"]
 cross_machine = true
-device_steps = "the Mac runs `mousse-helper serve --listen-ip 0.0.0.0` and `invite`; the PC runs `mousse-helper slice-check --ticket <ticket> --route tcp://<mac>:<port> --host-build <build from the Mac ready line> --out <file> -- uname -a` (pair, the host reports its build, terminal, removal closes it, reconnect refused) and the result file is signed. Control: the Mac serves a build with --cfg mousse_control=\"allow-break-env\" and MOUSSE_HELPER_BREAK=wrong-identity; the PC runs slice-check with --control wrong-identity and must print RESULT FAIL"
+device_steps = "before the run the PC records the configuration with `mousse-check config-digest phase0.thin-slice-cross-machine` (and `--control wrong-identity` before the control run); the Mac runs `mousse-helper serve --listen-ip 0.0.0.0` and `invite`; the PC runs `mousse-helper slice-check --ticket <ticket> --route tcp://<mac>:<port> --host-build <build from the Mac ready line> --out <file> -- uname -a` (pair, the host reports its build, terminal, removal closes it, reconnect refused) and the result file is signed with `mousse-check sign --config <digest>`. Control: the Mac serves a build with --cfg mousse_control=\"allow-break-env\" and MOUSSE_HELPER_BREAK=wrong-identity; the PC runs slice-check with --control wrong-identity and must print RESULT FAIL"
 
 [[check.control]]
 name = "wrong-identity"
@@ -386,7 +386,7 @@ targets = [
   "wasm32-unknown-unknown@worker-firefox",
   "wasm32-unknown-unknown@worker-safari",
 ]
-device_steps = "the Mac runs the Worker page in each browser, checks the certificate with the native verifier, restarts the Worker and checks again, then signs the result"
+device_steps = "before each run, record its configuration with `mousse-check config-digest phase0.browser-worker-cert --target <cell>` (add --control <name> for a control run) and sign the result with --config <that digest>; the Mac runs the Worker page in each browser, checks the certificate with the native verifier, restarts the Worker and checks again, then signs the result"
 
 [[check.control]]
 name = "tampered-cert"
@@ -406,7 +406,7 @@ id = "phase0.phone-byte-path"
 title = "Phone byte path: terminal and file throughput over the loopback WebSocket"
 plan = "Phase 0 spike 3; PLAN §8 \"Phone\""
 targets = ["ios15-iphone", "android-arm64"]
-device_steps = "run the byte-path spike on the phone; the Mac (iPhone) or the PC/Mac with adb (Android) signs the result with throughput in details"
+device_steps = "before each run, record its configuration with `mousse-check config-digest phase0.phone-byte-path --target <cell>` (add --control <name> for a control run) and sign the result with --config <that digest>; run the byte-path spike on the phone; the Mac (iPhone) or the PC/Mac with adb (Android) signs the result with throughput in details"
 
 [[check.control]]
 name = "corrupt-byte"
@@ -423,7 +423,7 @@ id = "phase0.phone-lifecycle"
 title = "Phone lifecycle: UniFFI start, stop, cancel, and cancelling a pending dial"
 plan = "Phase 0 spike 4 (sets the Android minimum API and ABIs)"
 targets = ["ios15-iphone", "android-arm64"]
-device_steps = "run the lifecycle spike on the physical phone and sign the result; put the Android API level and ABI in details"
+device_steps = "before each run, record its configuration with `mousse-check config-digest phase0.phone-lifecycle --target <cell>` (add --control <name> for a control run) and sign the result with --config <that digest>; run the lifecycle spike on the physical phone and sign the result; put the Android API level and ABI in details"
 
 [[check.control]]
 name = "ignore-cancel"
