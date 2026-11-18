@@ -1,13 +1,14 @@
 # Phase 1b design: user routes, the CLI and "Send link"
 
-Status: **frozen** after review round 3 (2026-11-18), pending one final
-review. Scope: PLAN
+Status: **frozen** after the final review (2026-11-18). No more review
+rounds; implementation follows §15. Scope: PLAN
 "Phase 1b" (`tcp` to a tailnet or port forward, `ssh-stdio`, `ws` through a
 user tunnel, the CLI and remaining RPC, "Send link" with CPace).
 
 - **Engine base:** `phase-1a` at `aba51a4`. Line references are against it.
 - **App base:** Mousse `net-engine-1a` at `2aea454c6` (M6), plus M5b and M7
-  when they land. 1b builds on 1a's §5 pairing, §7 UI and §9 kit.
+  when they land. 1b builds on 1a's §5 pairing, §7 UI and §9 kit. App
+  line references are against M5b (`5b3e78f74`).
 - **One PR per repo.** The slices in §15 are commit series on `phase-1b`
   (engine) and `net-engine-1b` (app). Each repo's phase lands as one PR.
 
@@ -18,112 +19,6 @@ check.
 
 CPace passed its Phase 0 review (`checks/reviews/phase0-design-review.md`,
 part B), so "Send link" is in scope and its checks are not DEFERRED.
-
-## Changes since round 3
-
-Reviews: `r3/sol.md` (Sol 1–5) and `r3/fable.md` (Fable 1–7). Each
-finding was checked against the code at the bases above. The design is
-frozen after these edits.
-
-| Finding | Resolution | Where |
-|---|---|---|
-| Sol 1 — the completion record restored the pin but not the routes and approvals | The record holds the full peer record and the approvals the join writes. `join.status` replays the `peers.json` and `approvals.json` writes, then the pin, before it answers `done`. Tested with a crash before `peers.json` is saved and WSS as the only route, with a control. | §5.4, §14 |
-| Sol 2 — no resume branch for the request's own row, and `existing: true` failed the cached-reply check | Step 4 has explicit branches: the request's own `ssh_granting` row resumes; a preserved row is recorded as `existing` with its grant id. The exact grant id is stored on the request and on the serving row, and a retry checks that same grant is live on that row. Tests cover a lost `existing: true` reply and a crash between writing the row and storing the grant id, each with a control. | §3.4, §3.6, §14 |
-| Sol 3, Fable 7 — `pair-both-ways` over SSH and the chat-link pairback had no return path | The SSH case runs `pair-both-ways` with two separately configured loopback SSH routes, one per direction. Cross-machine SSH cells, and the real SSH add, assert one direction. The chat-link check's Mac → PC direction uses a kit relay on the Mac, reached by one outbound PC connection; the PC still never listens off loopback. | §14 |
-| Fable 1 — a Send link on a `source: "ssh"` row stayed at "Finishing pairing…" | A ticket join on a `source: "ssh"` row first converts it: `source` is cleared, the SSH address kept, and the `consented` fields written. The host side converts its row the same way. `ssh-add-app` gains the test and a control. | §3.6, §5.3, §14 |
-| Sol 4, Sol 5, Fable 2–6 | Settled while building; short notes in §16. | §16 |
-
-**Cut in this revision:** "Resolve again". Removing and adding the SSH
-route again resolves it and asks for the key when the host or port
-changed.
-
-## Changes since round 2
-
-Reviews: `r2/sol.md` (Sol 1–7) and `r2/fable.md` (Fable 1–12). Each
-finding was checked against the code at the bases above.
-
-| Finding | Resolution | Where |
-|---|---|---|
-| Sol 1 — kind-2 recovery promoted a row on any matching pin | A row moves to `joined` only on a durable completion record keyed by that ticket's hash. Without one, the helper resumes the proof from the pending record, or the row reads "Pairing didn't finish". A pin from an earlier pairing (an SSH add, say) promotes nothing. Crash control with a pre-existing pin and an unfinished ticket. | §5.4, §14 |
-| Sol 2 — SSH retry could skip writes or report a revoked grant | B journals the immutable request (16 random bytes, hex) before creating anything. Each step is recorded, including the grant id, and resumes. Requests are serialized against removal. A request whose grant is gone answers `removed`. A repeats `prepare` automatically only before its row first reaches `connected`. Stored replies are kept for a bounded time. An existing 1a row for A on B is never overwritten. Controls: removal survives A's retries, and a crash at each boundary. | §3.4 |
-| Sol 3 — no durable route-approval provenance | The helper keeps `approvals.json`: per peer and canonical destination, with its source. `last_route`, renewals and every search are filtered through it. On upgrade, existing `peers.json` routes count only under 1a's automatic rule. The `consented` row stores its approved list. The SSH reverse grant that sent routes through `peer.add` is cut. | §1.3, §1.4, §5.3, §7 |
-| Sol 4 — fence gap between admission and gate; IPC handoff; pipe end | The removal fence is checked at gate registration and at enrollment inside `Host`, for every transport. The control races pause against TLS completion. The IPC handoff passes on buffered bytes. When the helper closes, the remote `pipe` exits even with SSH stdin still open. Invitation expiry bounds a join-only slot. | §3.3, §6.2 |
-| Sol 5 — tailnet-only mode bound every interface; tunnel changes | The listener binds only the selected interfaces, never `0.0.0.0` with LAN off. Adding or removing the last tunnel restarts the helper. | §1.5, §4.1 |
-| Sol 6 — one blanket delivery assertion; exhaustion controls | Each probe case has its own wire and app assertions; the editor-off case expects delivery, then refusal. Exhaustion has separate controls for host reconnect, joiner restart and a surviving invitation. Reopening an exhausted link fails on both sides. | §6.3, §14 |
-| Sol 7 — `routes-cross` satisfiable by one route; reverse fixtures; egress | `routes-cross` reports one signed result per route case (`cases`, new in the kit), with per-case controls. The reverse direction is explained per check, and nowhere does the PC listen off loopback. Runtime egress denial runs beside the Plus recorder. The chat handoff uses an account-free fixture. | §14 |
-| Fable 1 — SSH rows reused `granted`, which drives pairback | SSH rows use their own states (`ssh_requested`, `ssh_granted`, `ssh_granting`). Every 1a skip is keyed on `source: "ssh"`. B's row reaches `connected` on A's first live inbound connection. The reverse grant is cut, so SSH add is one way only. | §3.4, §3.6 |
-| Fable 2 — `NOT_AUTHORIZED` loop or silent re-grant | As Sol 2. The request id is 16 random bytes in hex, so it parses as a receipt. | §3.4 |
-| Fable 3 — the build smoke could not pair | Pairing is cut from the smoke. It runs `--version`, starts `serve` and points `mousse-check probe` at the release listener over `tcp` and `ws`. | §14 |
-| Fable 4 — two `link-app` controls could not fail as claimed | The tamper control is now a helper control (`link-accepts-kind1`). The joiner-side control (`joiner-records-in-memory`) is back, plus one where the invitation survives the third failure. | §14 |
-| Fable 5 — `ssh.trust` fetched the key again | The helper keeps the probe's key bytes and writes them when the fingerprint matches. The connection window is keyed by resolved host and port. | §3.1, §3.2 |
-| Fable 6 — `-F` dropped needed options | The listed algorithm, address-family and PKCS#11 options from `ssh -G` are kept. "Resolve again" handles a changed user config (cut in round 3); a new host or port needs a new key confirmation. | §3.1 |
-| Fable 7 — `peer.add` with owner routes | With the reverse grant cut, B never adds A as a peer. A uses `peer.add` without routes, then `peer.addresses.set`. | §3.4 |
-| Fable 8 — LAN reachable with LAN off | As Sol 5: only selected interfaces are bound. A port forward binds the LAN address it points at, and the UI says so. | §1.5 |
-| Fable 9 — `consented` row lacked the approved list | As Sol 3. | §5.3 |
-| Fable 10 — standalone `pipe --state` over SSH | Cut. SSH reaches only app-run profiles through their selector. | §3.3, §8 |
-| Fable 11 — editor instances lived inside v1's `NetService` | The engine service owns its own `EditorTunnels` and `EditorEndpoint`, which work with v1 off. `net/editor/` is marked as kept in Phase 2. | §9.2 |
-| Fable 12 — argv activation could reach the running Mousse | Activation in checks uses an isolated user-data folder, so the single-instance lock is the test app's own. | §14 |
-
-**Cut in this revision:**
-
-- the optional SSH reverse grant ("Also let <B> use this computer");
-- custom remote launcher paths (the Advanced folder field);
-- standalone `pipe --state` over SSH;
-- pairing in the build smoke.
-
-**Settled from round 2's questions:**
-
-- `windows-arm64` counts as `hosted` only when the kit verifies a native
-  packaged-app smoke and its must-fail control against both pinned
-  commits and the artifact digest. It is shown as `hosted`.
-- Pairback discloses only private LAN literals by default. The joiner
-  ticks any tailnet or public route to disclose. The receiving owner still
-  approves before dialling them.
-
-## Changes since round 1
-
-Reviews: `r1-sol.md` (Sol 1–8) and `r1-fable.md` (Fable 1–15). Each
-finding was checked against the code at the bases above.
-
-| Finding | Resolution | Where |
-|---|---|---|
-| Sol 1 — SSH add sent ticket and code together, against wire 10.6.2 | SSH add no longer uses an invitation or CPace. The verified SSH session is its own bootstrap: after consent on A, B journals a one-way row, then an idempotent grant keyed by a request id. A pins B from the verified reply and confirms over a normal engine session. Either side can lose the reply and retry. | D4, §3.4, §3.6 |
-| Sol 2 — editor tunnel spliced to OS SSH and skipped the `editor` switch | The engine branch reuses `EditorTunnels` and `EditorEndpoint` (`net/editor/`) with an engine refusal that checks the switch, as `NetService.deviceRefusal` does. Every rights change runs `reconcile()`. Tests: refused with the switch off; turning it off closes an open tunnel. | §9.2, §14 |
-| Sol 3 — tickets and peers triggered DNS, TCP and WS before the pin | 1a's automatic private-literal `tcp` policy is kept. Other ticket hints are listed in the join dialog and approved by Connect. Any other public, DNS or tunnel destination needs the owner's approval before first use. The resolved address is classified and dialled as is. | §1.2, §1.3 |
-| Sol 4 — probe, trust, setup and pipe could resolve different SSH targets | One constrained ssh config per route (`-F`, `HostKeyAlias`, Mousse's known-hosts file only) serves every call. Rotation replaces the pin atomically. Remote profiles are named by an opaque selector. S1 covers spaces in paths, long macOS socket paths and Windows logon contexts. | §3.1–§3.3, S1 |
-| Sol 5 — WS budget after header parse; unbounded IPC line read | Capacity is taken at accept, before any preread. The ws upgrade and IPC lines have byte and time caps. The slot lasts through join-only. The removal-pause fence covers every admission. All are named tighten-only limits, each with a saturation control. | §6.2, §13.3, §14 |
-| Sol 6 — kind 2 could still take the consented path; §5.4 was wrong about the store | §5.4 corrected: app mode already uses the durable flow store (`serve.rs`). Kind 2 never takes the consented path or its fabricated pending outcome. Late recovery needs that ticket's genuine pending record. Tests cover fresh and expired swapped links and two crash points. One-way rows stay out of `grantBack` and reconciliation. | §5.4, §3.6 |
-| Sol 7 — unbounded candidates, stale renewal routes, unserved hints | Candidates, concurrency and time are bounded, and mDNS has a defined place. Renewals read the current list, and edits clear the cache. Only served addresses are advertised. Spikes S1 and S2 come before any app slice and before the app revision pin. | §1.4, §1.5, §15 |
-| Sol 8 — exit evidence gaps | Route selection is asserted. The same 1a cases (private-streams and shared-computer included) and controls run on every route. Only the Mac listens off loopback. An observing Plus stand-in denies egress. Wire rejection and app delivery are asserted separately. Deep link, code, tamper and exhaustion are automated, with new controls. The chat client is a short attestation. | §6.3, §14 |
-| Fable 1 — the invitation added machinery but no security | As Sol 1. `expect`, `join {via, code}`, the `expect-ignored` control and old open question 4 are gone. | §3.4 |
-| Fable 2 — plain `ws://` hints made joiners send HTTP GETs | Plain `ws` is an owner address on a loopback hop only. Tickets and peers take `wss` only, and every ws path ends in `/mousse-net/1`. | §1.1, §1.3, §4.2 |
-| Fable 3 — a one-way grant became "Finishing pairing…" on B | B writes the row, marked one-way, before the grant exists. Recovery skips one-way rows. `prepare` grants role `owner`. | §3.6 |
-| Fable 4 — login-shell output corrupts stdout | `pipe` and `net-engine ssh` print a fixed marker line first. A discards up to it under `SSH_PREAMBLE_MAX_BYTES`, else `remote_failed`. | §3.3 |
-| Fable 5 — `net-engine ssh` would autostart the daemon | It connects with `disableAutoStart` and answers `remote_not_running`. A headless Linux server is not covered by SSH add in 1b. | §3.4, §8 |
-| Fable 6 — launchers and scheme shared by every install and test home | Launchers live under `MOUSSE_HOME`. The scheme is registered only by packaged builds and never in checks. `pipe --profile <selector>` replaces `--state <path>`. | §3.3, §5.2 |
-| Fable 7 — one pre-auth pool for all listeners | Separate pools per listener kind, so the pipe's share is reserved. The upgrade read is bounded. IPv6 sources count per /64. | §6.2 |
-| Fable 8 — missing controls and a macOS cell | Controls for exhaustion, tamper and the budget; macOS cells on the probe and route checks; the probe opens `mousse.tunnel`. `desktop-builds` uses the owner `ws` loopback hop, which §1.3 allows in release. | §6.3, §14 |
-| Fable 9 — five SSH sessions per add | Shell probe and `profiles` share one session. An add makes at most three logins plus a key fetch when the key is new. One per-target window covers setup and dials. | §3.1, §3.4 |
-| Fable 10 — `ssh` option and grammar gaps | `RemoteCommand=none`, `--` before the target, users starting with `-` refused, and `_` allowed in aliases. S1 covers a space in `UserKnownHostsFile` on Windows. | §1.1, §3.1, S1 |
-| Fable 11 — `classify` gaps | The classifier is an allowlist; anything unlisted is `forbidden`. The classified address is dialled with no second lookup. | §1.2 |
-| Fable 12 — uncapped `routes` on hello | Moot: hello route updates are cut. Pairback routes keep 1a's limit. | §1.5 |
-| Fable 13 — `routes.test` without NAT hairpin | A failure reads "Couldn't confirm from this network" and never blocks saving. | §1.5, §11 |
-| Fable 14 — a dead `wss` route delays `ssh` | When the last working route was `ssh`, it starts after the head start. The fast tiers are bounded in time. | §1.4 |
-| Fable 15 — tamper row, stand-ins, test root | `expires_at` tamper row added. Tailnet and Funnel are stand-ins only. The `wss` test root is a debug-only extra root, never installed in the OS store. | §5.5, §14 |
-
-**Cut in this revision:**
-
-- the invitation-based SSH add and `expect`;
-- plain `ws://` from tickets and peers;
-- `routes` on `mousse.hello`, `routes.changed` and `peer.routes.set` (owner
-  routes are explicit);
-- live listener rebinding (a change of what is listened on restarts the
-  helper);
-- 1b-owned login registration (the existing startup entry is reused, §10);
-- `grant.remove {deny}`, `denials.list` and `deny.remove` (no 1b screen
-  uses them);
-- "Use port N" in Settings (`routes --port` covers it);
-- `shell: powershell` and the `.cmd` launcher unless S1 is clean.
 
 ## Decisions
 
@@ -330,8 +225,7 @@ The helper reads `<state>/routes.json`, which `routes.config` writes:
   - none of them: `127.0.0.1` only.
 
   mDNS runs only with `lan`. The ws listener runs while `tunnels` is not
-  empty (§4.1). With `lan` off, the interface watcher (`watch.rs`) reports
-  a change in the selected addresses, and the app restarts the helper.
+  empty (§4.1).
 - **What is advertised** in tickets and pairback routes: only addresses the
   listener serves.
   - `lan`: the interface's private IPv4 addresses (1a);
@@ -341,15 +235,20 @@ The helper reads `<state>/routes.json`, which `routes.config` writes:
   IPv6 addresses are not advertised, since the listener does not serve
   them. With nothing set, the profile advertises nothing and is reachable
   only over `ssh` (§3.4).
-- **No live rebind.** These return `restart_needed: true`:
-  - a change to `lan`, `tailnet` or `port`;
-  - `public` becoming empty or non-empty, or its forwarded-to address
-    changing;
-  - adding the first tunnel or removing the last, which starts or stops
-    the ws listener.
-
-  The app then restarts that profile's helper, about a second offline.
-  Other list changes take effect in the next ticket.
+- **Listener lifecycle (the one rule).** Settings changes restart; network
+  changes do not.
+  - **Settings:** these return `restart_needed: true`, and the app
+    restarts that profile's helper, about a second offline: a change to
+    `lan`, `tailnet` or `port`; `public` becoming empty or non-empty, or
+    its forwarded-to address changing; adding the first tunnel or removing
+    the last, which starts or stops the ws listener. Other list changes
+    take effect in the next ticket.
+  - **Network:** with `lan` off, when the interface watcher (`watch.rs`)
+    sees a selected address appear or go (a tailnet flap, a new DHCP
+    lease), the helper opens or closes only that socket. Closing a socket
+    also closes the connections it accepted. Nothing else drops.
+  - **At start:** the helper starts with the sockets that bind and lists
+    the rest in `hello` as `unbound`. The watcher retries them.
 - **No live updates to peers.** Routes reach peers only in tickets,
   pairback routes or the owner's own entry on the other computer. A peer
   that has the old address needs Add address (§11).
@@ -637,6 +536,7 @@ needs Connect on A again, with a new `request_id`.
 | B's reply lost (session dropped) | A's row is still `ssh_requested`. A repeats `prepare`. B resumes, or returns the stored reply. |
 | B crashed after step 1, 2, 3, 4 or 5 | The repeat resumes at the next step. The profile tag, the stored grant id and the idempotent `grant.add` keep each step single. |
 | B crashed between writing its row and storing the grant id | The repeat finds the row with this `request_id` and no grant id, resumes at step 5, and gets the same grant. |
+| B crashed after the helper saved the grant, before its id was stored; B's owner then removed A, and A never retried | The removal finds no grant id, so it removes A's live grant by identity and `request_id` first (§3.6). After B restarts, B has no grant, no row and no `awaiting_pairback` row for A, and A's dial gets `NOT_AUTHORIZED`. |
 | B's `existing: true` reply lost | A repeats. The request is `done` with `row: existing`, and the preserved row still holds the stored grant id, so B returns the stored reply with `already: true`. |
 | A crashed after the reply | A's recovery repeats `prepare` (the row was never `connected`), gets `already: true`, and continues at step 5. |
 | B's owner removed A before A connected | The request is `removed`. A's row reads "<B> removed access", with Add again (a new request) and Remove. A stops repeating. |
@@ -670,13 +570,28 @@ on A: A holds B's pin and is granted, so it only stores the route.
 
 - **One way only.** A's row reads "Uses <B>". B's row reads "<A> uses this
   computer". A later Send link between the two adds the other direction.
-- **A ticket join converts an SSH row.** 1a's `join` reuses the row for the
-  host (`pairing.ts:131`, `peers.byEndpoint`), so a join on a `source:
-  "ssh"` row would stay skipped. Connect on such a row first clears
-  `source`, keeps the SSH address, and writes the `consented` fields
-  (kind, ticket hash, `approved`, `share`). The host converts its row for
-  the joiner the same way when the request arrives. From then on 1a's
-  pairing runs as usual.
+- **Existing access is not authority to grant back.** After A adds B
+  over SSH, A holds B's pin and B grants A. A link naming B, damaged or
+  not, then meets a live grant. The host answers an invalid proof on a
+  live connection with `AUTHORIZED {state: live}` (`spec/wire.md:520`),
+  and the caller reports that as "already paired" (`caller.rs:913`). For
+  kind 2 that outcome means only "existing access". It writes no
+  completion record, moves no row to `joined`, and never runs `grantBack`
+  (`pairing.ts:218`). The dialog reads "This link didn't work. Ask for a
+  new one." Only a `PAIRED` for this ticket gives authority to grant
+  back: one after the code exchange, or one answered from a grant whose
+  receipt names this ticket's invitation, which only this ticket's
+  enrollment writes.
+- **A Send link between SSH-added computers.** 1a's `join` reuses the row
+  for the host (`pairing.ts:131`, `peers.byEndpoint`). Connect on a
+  `source: "ssh"` row keeps the row as it is (state, `source`, SSH
+  address) and stores the kind-2 fields (ticket hash, `approved`,
+  `share`) beside them as a pending link. The row converts (`source`
+  cleared, the SSH address kept, state `joined`) only when the helper
+  reports a `PAIRED` for that ticket as above. Any other ending drops the
+  pending link and leaves the SSH row unchanged. The host converts its row
+  for the joiner only at enrollment, never when the request arrives.
+  From then on 1a's pairing runs as usual.
 - **SSH rows have their own states:** `ssh_requested`, `ssh_granting` and
   `ssh_granted`, then `connected`. 1a's code does not know the `ssh_*`
   states, and every 1a path also skips rows with `source: "ssh"`:
@@ -687,6 +602,18 @@ on A: A holds B's pin and is granted, so it only stores the route.
   - host recovery (`pairing.ts:309-335, 380`), which turns a live owner
     grant with no row into `awaiting_pairback`. B writes its row before
     the grant exists, so that case never arises.
+- **Removal and expiry reconcile the grant first.** B can stop after the
+  helper saved the grant (step 5) but before the request or the row holds
+  its id. 1a's removal skips `grant.remove` when the row's `grant` is
+  empty (`pairing.ts:511`), and `reconcileGrants` (`pairing.ts:345`) would
+  then turn the leftover live grant into an `awaiting_pairback` row. So,
+  under the removal lock, before a removal or the expiry rule below
+  discards an SSH row or request with no grant id, B lists the helper's
+  grants and removes every live grant for A's identity whose receipt is
+  the request's `request_id`. Only then is the row or request discarded.
+  `reconcileGrants` also skips a grant whose receipt names a request in
+  `net_engine_ssh_requests`: an open request attaches it to its row, and a
+  `removed` or expired one removes it.
 - **Recovery of SSH rows** is its own: A repeats `prepare` under the rule
   above. On B, a `ssh_granting` row whose request holds a live grant id
   gets that id on the row and moves to `ssh_granted`. One with no grant id
@@ -734,7 +661,7 @@ on A: A holds B's pin and is granted, so it only stores the route.
   from browsers, which always send `Origin`.
 - **After the upgrade:**
   - binary messages only; a text message closes with 1003;
-  - at most 65 536 bytes per message, a fixed constant;
+  - at most `WS_MESSAGE_MAX_BYTES` per message (65 536, tighten-only);
   - no permessage-deflate;
   - library pings are answered.
 
@@ -823,9 +750,9 @@ on A: A holds B's pin and is granted, so it only stores the route.
      which pairback sends only if ticked.
 
    Connect writes the 1a `consented` row with `kind: 2`, the ticket hash,
-   the `approved` list and the `share` list. A row added over SSH is
-   converted first (§3.6). A repeated join after a
-   restart reuses both lists from the row.
+   the `approved` list and the `share` list. A row added over SSH keeps its
+   state and holds these as a pending link until the ticket's `PAIRED`
+   (§3.6). A repeated join after a restart reuses both lists from the row.
 3. **Join:** `join {ticket, arrival: "link", approved}`. The helper dials
    (§1.4), sends `JOIN_PROOF` and gets `join_only`. Then:
    - **Code needed:** `join.code_needed {invitation, attempts_left}`. The
@@ -850,8 +777,7 @@ on A: A holds B's pin and is granted, so it only stores the route.
 - **The store is already durable.** App mode installs the file-backed
   store: `caller.use_flow_records(Arc::new(endpoint.flow_records()))` in
   `serve.rs`'s app branch. The debit, the pending mark and the
-  one-join-per-ticket hold survive a crash today. (Round 0 said otherwise;
-  that was wrong.)
+  one-join-per-ticket hold survive a crash today.
 - **The consented path.** `peer.rs:285` sets `pinned = consented || <pin in
   peers.json>`. A consented join goes to `join_pinned_with_redial`, which
   calls `mark_outcome_pending_if_expired` (`caller.rs:~793`) and makes up a
@@ -863,22 +789,35 @@ on A: A holds B's pin and is granted, so it only stores the route.
 - **Late recovery** (wire 10.6.7) runs only when the flow store holds a
   genuine pending record for that ticket's hash, written when the
   confirmation was sent. With none, an expired ticket ends with `expired`.
-- **Completion record (new).** When a kind-2 flow ends `PAIRED`, or
-  "already paired" with a pin held before the flow, the helper writes
+- **Completion record (new).** When a kind-2 flow ends with a `PAIRED`
+  for this ticket (§3.6: after the code exchange, or from a grant whose
+  receipt names this invitation), the helper writes
   `<state>/joins/<ticket hash>.done` before it saves the pin. The record
   is `{ticket_hash, host_identity, outcome, peer, approvals, at}`, written
   with `write_atomic`. `peer` is the full `PeerRecord` the join writes
   (name, role, `routes`, `last_route`; `peer.rs:322-346`), and `approvals`
   are the `approvals.json` entries for the approved destinations.
   - The join then writes `peers.json`, `approvals.json` and the flow
-    store's pin mark (`pin_stored`), in that order.
+    store's pin mark, in that order.
+  - **The pin mark is settled on disk.** Today `pin_stored`
+    (`caller.rs:279`) returns `Ok` when the flow is not in memory, so
+    after a restart the durable pending mark would stay. Both the join and
+    the replay call a new `settle_stored(ticket_hash)`, which takes the
+    ticket's lock in the file-backed flow store and clears the durable
+    mark whether or not the flow is in memory.
   - If the helper stops anywhere after the record, the next `join.status`
     replays all three writes, each idempotent and merged as the join
     merges them, before it answers `done`. A replayed peer never lacks
     its routes or approvals.
+  - **Replay only for the current pairing.** A removal of the host's
+    identity (`peer.forget`, or a grant removal for it) deletes every
+    completion record naming that identity, under the peers lock. Replay
+    takes the same lock and checks the record still exists before it
+    writes. A removal after completion is therefore never undone, and
+    `join.status` then answers `done: null, pending: false`.
   - The record is deleted when the app sends `join.ack {ticket_hash}`
-    after its row reaches `joined`, or `JOIN_DONE_KEEP_SECS` after the
-    ticket expires.
+    after its row reaches `joined` and the mark is settled, or
+    `JOIN_DONE_KEEP_SECS` after the ticket expires.
   - It lives beside the flow records and does not change the
     `JoinerRecord` format of wire 10.7.
 - **`join.status {ticket_hash}`** → `{done: {identity, name, role} | null,
@@ -891,9 +830,10 @@ on A: A holds B's pin and is granted, so it only stores the route.
   - otherwise: "Pairing didn't finish", with Retry while the ticket is
     valid, and Remove.
 
-  A pin the helper already holds promotes nothing. A one-way SSH add, for
-  example, leaves B's pin on A, and a crash after Connect on a swapped or
-  unfinished link to B must not run `grantBack`.
+  A pin the helper already holds promotes nothing, and neither does
+  "already paired" (§3.6). A one-way SSH add, for example, leaves B's pin
+  on A, and a crash after Connect on a swapped or unfinished link to B
+  must not run `grantBack`.
 - **Tests** (`app_link`, `phase1b.link-app`):
   - a fresh swapped link (another key, valid expiry) gets the swapped-link
     text and never ends "already paired";
@@ -906,7 +846,15 @@ on A: A holds B's pin and is granted, so it only stores the route.
     row reaches `joined`, then reconnects and sends pairback over that WSS
     route;
   - a crash after Connect, with B's pin already held from an SSH add and
-    the ticket unfinished, ends "Pairing didn't finish" and grants nothing.
+    the ticket unfinished, ends "Pairing didn't finish" and grants nothing;
+  - a damaged link after a real one-way SSH add ends "This link didn't
+    work". The check reads the grant tables on both sides: B still grants
+    A once, under the SSH grant id; A grants nothing to B; both rows keep
+    `source: "ssh"`;
+  - completion replay after a restart clears the durable pending mark, so
+    opening the ticket again does not ask the host again;
+  - completion replay after the host was removed restores no peer and no
+    approval, and `join.status` answers `done: null`.
 
 ### 5.5 Tampered links (what each change does)
 
@@ -914,7 +862,7 @@ on A: A holds B's pin and is granted, so it only stores the route.
 |---|---|
 | bad base64 or CBOR | refused before dialling (`encoding`, `cbor`, `field`) |
 | kind 2 → 1 | refused before dialling: kind 1 needs an in-app scan (`PAIRING_FAILED`) |
-| secret or invitation id | host closes with `INVITATION_INVALID`; no attempt spent |
+| secret or invitation id | host closes with `INVITATION_INVALID`; no attempt spent. If the host already grants the joiner (an SSH add), it answers `AUTHORIZED {state: live}` instead: "This link didn't work", and no grant changes on either side (§3.6) |
 | host key | no address answers as that key, or a fake host does. The fake host's code exchange fails with the swapped-link text, and the real invitation is untouched |
 | a route hint | the ticket hash differs, so CPace fails: `PAIRING_FAILED`, one attempt spent on each side |
 | `expires_at` | the same as a route hint; a past value is refused before dialling (`expired`) |
@@ -952,6 +900,14 @@ on A: A holds B's pin and is granted, so it only stores the route.
     expires, is cancelled or runs out of attempts, so the invitation's
     expiry (`TICKET_LIFETIME_SECS`) bounds the slot. Only a holder of the
     ticket's secret reaches join-only.
+- **Re-pairing on a live connection.** A slot is released at `live`, but a
+  granted device's valid proof moves a live connection back to join-only
+  (wire §10 step 3; `AdmittedJoinOnly`, `host.rs:428`). That transition
+  takes a new slot from the connection's kind pool and checks the
+  admission fence, both under the host lock. With the pool full or the
+  fence set, the proof opens nothing: the connection stays live under its
+  grant, and the host answers `AUTHORIZED {state: live}`, as for any proof
+  that opens nothing. The slot then lasts as for any join-only connection.
 - **Reads before TLS:**
   - ws upgrade: `WS_UPGRADE_WAIT_MS` and `WS_HEADER_MAX_BYTES` (§4.1);
   - IPC: every line at most `IPC_LINE_MAX_BYTES`. The first line must
@@ -1201,6 +1157,7 @@ written.
 | Send link opened twice, or in two windows | The flow-record hold refuses the second (`busy`). Attempts are shared through the record. |
 | App killed mid-code | The debit is already stored. Reopening the link resumes with the attempts left, or learns the outcome from the pending record. |
 | Removal saving while a link join is in flight | The pause fence refuses the proof and closes join-only connections. |
+| A granted peer re-pairs while the pool is full or removal is paused | The proof opens nothing; the connection stays live under its grant (§6.2). |
 | Wrong clock | 1a's neutral message, on every route. |
 
 ## 12. Threat model and privacy updates
@@ -1307,6 +1264,7 @@ written.
 | `MOUSSE_NET_PREAUTH_PER_SOURCE` | 8 | 1 to 8 (tighten) | TCP, per IPv4 address or IPv6 /64 |
 | `MOUSSE_NET_WS_UPGRADE_WAIT_MS` | 5000 | 100 to 5000 (tighten) | Time for the whole upgrade request |
 | `MOUSSE_NET_WS_HEADER_MAX_BYTES` | 8192 | 1024 to 8192 (tighten) | Upgrade request size |
+| `MOUSSE_NET_WS_MESSAGE_MAX_BYTES` | 65536 | tighten only; the floor is set while building (§15) | One received ws message |
 | `MOUSSE_NET_IPC_LINE_MAX_BYTES` | 65536 | 1024 to 65536 (tighten) | One IPC line |
 | `MOUSSE_NET_IPC_FIRST_LINE_WAIT_MS` | 2000 | 100 to 2000 (tighten) | Time for the first IPC line |
 | `MOUSSE_NET_TIER_HEAD_START_MS` | 500 | 0 to 10000 | Wait before `ws` candidates start |
@@ -1439,7 +1397,7 @@ control = [
 
 [[check]]
 id = "phase1b.admission"
-title = "Per-kind pre-auth pools taken at accept; ws upgrade and IPC line caps; slot held through join-only until the invitation ends; the fence at gate registration and enrollment on every transport, raced against TLS completion; buffer-keeping IPC handoff; IPv6 per /64; tighten-only overrides"
+title = "Per-kind pre-auth pools taken at accept; ws upgrade and IPC line caps; slot held through join-only until the invitation ends; a re-pair from live takes a slot and meets the fence; the fence at gate registration and enrollment on every transport, raced against TLS completion; buffer-keeping IPC handoff; IPv6 per /64; tighten-only overrides"
 targets = ["windows-x64", "macos-arm64", "linux-x64"]
 min_tests = 18
 local = [
@@ -1458,6 +1416,8 @@ control = [
   { name = "fence-at-accept-only", breaks = "the fence is checked at accept but not at gate registration, so a handshake finishing during the pause gets in", env = { RUSTFLAGS = '--cfg mousse_control="fence-at-accept-only"' } },
   { name = "fence-tcp-only", breaks = "the fence covers TCP but not ws and pipe", env = { RUSTFLAGS = '--cfg mousse_control="fence-tcp-only"' } },
   { name = "enroll-while-paused", breaks = "enrollment commits a grant while paused", env = { RUSTFLAGS = '--cfg mousse_control="enroll-while-paused"' } },
+  { name = "repair-skips-slot", breaks = "an already-granted peer's re-pair proof goes join-only with that kind's pool full", env = { RUSTFLAGS = '--cfg mousse_control="repair-skips-slot"' } },
+  { name = "repair-skips-fence", breaks = "an already-granted peer's re-pair proof goes join-only while removal is paused", env = { RUSTFLAGS = '--cfg mousse_control="repair-skips-fence"' } },
   { name = "limits-raise", breaks = "an override may raise a tighten-only limit", env = { RUSTFLAGS = '--cfg mousse_control="limits-raise"' } },
 ]
 
@@ -1561,7 +1521,7 @@ control = [
 
 [[check]]
 id = "phase1b.link-app"
-title = "Link pairing through the daemon's methods: argv activation in an isolated user-data folder into the selected profile, destinations approved and stored, code typed, Connected both ways; three wrong codes end both dialogs and reopening fails on both sides; restart mid-code keeps the count; every §5.5 tamper refused; a pre-existing pin promotes nothing; a crash before peers.json is saved, with WSS the only route, is replayed with routes and approvals"
+title = "Link pairing through the daemon's methods: argv activation in an isolated user-data folder into the selected profile, destinations approved and stored, code typed, Connected both ways; three wrong codes end both dialogs and reopening fails on both sides; restart mid-code keeps the count; every §5.5 tamper refused; a pre-existing pin promotes nothing; a crash before peers.json is saved, with WSS the only route, is replayed with routes and approvals; replay settles the on-disk mark after a restart and restores nothing after a removal; a damaged link after a one-way SSH add changes no grant on either side"
 targets = ["windows-x64", "macos-arm64", "linux-x64"]
 judge = "marker"
 app = true
@@ -1573,6 +1533,9 @@ local = [
 control = [
   { name = "link-pinned-journal", expect_reason = "swapped_link_trusted", breaks = "the app passes pinned for send-link joins and the helper honours it", env = { MOUSSE_NET_ENGINE_CONTROL = "link-pinned-journal", RUSTFLAGS = '--cfg mousse_control="journal-pins-link"' } },
   { name = "done-pin-only", expect_reason = "no_route_after_recovery", breaks = "completion recovery saves the pin but not the peer's routes and approvals", env = { RUSTFLAGS = '--cfg mousse_control="done-pin-only"' } },
+  { name = "pin-stored-memory-only", expect_reason = "pending_after_done", breaks = "replay after a restart settles only the in-memory flow, so the durable pending mark stays", env = { RUSTFLAGS = '--cfg mousse_control="pin-stored-memory-only"' } },
+  { name = "replay-after-removal", expect_reason = "removed_peer_restored", breaks = "removal leaves completion records, so a later join.status restores the removed host", env = { RUSTFLAGS = '--cfg mousse_control="replay-after-removal"' } },
+  { name = "already-grants-back", expect_reason = "grant_without_code", breaks = "a kind-2 already-paired outcome counts as done and runs grantBack", env = { MOUSSE_NET_ENGINE_CONTROL = "already-grants-back" } },
   { name = "pin-promotes-kind2", expect_reason = "promoted_without_completion", breaks = "app recovery moves a consented kind-2 row to joined on any held pin", env = { MOUSSE_NET_ENGINE_CONTROL = "pin-promotes-kind2" } },
   { name = "link-host-reset", expect_reason = "attempts_reset", breaks = "a reconnect gives the host three tries again", env = { RUSTFLAGS = '--cfg mousse_control="host-attempts-reset-on-reconnect"' } },
   { name = "link-joiner-reset", expect_reason = "attempts_reset", breaks = "an app restart mid-code gives the joiner three tries again", env = { RUSTFLAGS = '--cfg mousse_control="joiner-records-in-memory"' } },
@@ -1585,7 +1548,7 @@ control = [
 
 [[check]]
 id = "phase1b.ssh-add-app"
-title = "Add over SSH (test server, second Mousse home): existing profile, a profile paired elsewhere, a new one; never refused; one way only; B's row connected on A's first inbound; a crash at each prepare step resumes with one profile and one grant; a removal on B survives A's retries; an existing 1a row is kept and a lost existing reply is returned again; a crash between the row and its grant id resumes; a later Send link converts the rows and ends connected both ways; no daemon autostart"
+title = "Add over SSH (test server, second Mousse home): existing profile, a profile paired elsewhere, a new one; never refused; one way only; B's row connected on A's first inbound; a crash at each prepare step resumes with one profile and one grant; a removal on B survives A's retries; an existing 1a row is kept and a lost existing reply is returned again; a crash between the row and its grant id resumes; a crash after the grant is saved, then a removal, then a restart with no retry leaves no grant and no row; a later Send link converts the rows and ends connected both ways; no daemon autostart"
 targets = ["windows-x64", "macos-arm64", "linux-x64"]
 judge = "marker"
 app = true
@@ -1603,7 +1566,8 @@ control = [
   { name = "overwrite-1a-row", expect_reason = "1a_row_lost", breaks = "prepare overwrites an existing row for A", env = { MOUSSE_NET_ENGINE_CONTROL = "overwrite-1a-row" } },
   { name = "own-row-not-resumed", expect_reason = "stuck_granting", breaks = "a repeat after a crash treats the request's own ssh_granting row as another pairing's", env = { MOUSSE_NET_ENGINE_CONTROL = "own-row-not-resumed" } },
   { name = "existing-reply-not-kept", expect_reason = "existing_reply_lost", breaks = "a repeat after a lost existing reply answers removed", env = { MOUSSE_NET_ENGINE_CONTROL = "existing-reply-not-kept" } },
-  { name = "ssh-row-not-converted", expect_reason = "stuck_finishing", breaks = "a ticket join keeps source ssh on the row, so pairing never finishes", env = { MOUSSE_NET_ENGINE_CONTROL = "ssh-row-not-converted" } },
+  { name = "removal-skips-unsaved-grant", expect_reason = "grant_survived_removal", breaks = "removal of a row with no grant id leaves the helper's grant, which reconciliation turns into a pairing", env = { MOUSSE_NET_ENGINE_CONTROL = "removal-skips-unsaved-grant" } },
+  { name = "ssh-row-not-converted", expect_reason = "stuck_finishing", breaks = "a code-confirmed ticket join keeps source ssh on the row, so pairing never finishes", env = { MOUSSE_NET_ENGINE_CONTROL = "ssh-row-not-converted" } },
   { name = "remote-autostart", expect_reason = "daemon_started", breaks = "net-engine ssh starts the daemon", env = { MOUSSE_NET_ENGINE_CONTROL = "remote-autostart" } },
 ]
 
@@ -1675,51 +1639,40 @@ E = engine repo (`phase-1b`), M = Mousse (`net-engine-1b`).
 | E7 | E | Route kinds and the `wss` grammar (spec and vectors); allowlist `classify`; the §1.3 source and approval policy (`join {approved}`, `approvals.json`, the upgrade rule, `approvals.list`); resolve-then-dial; the bounded tiered dial filtered by approvals, `last_route` included; the route cache generation; pipe-generic joins; `routes.json` read at start, per-address binding and `restart_needed`; `routes.test` | `phase1b.routes`; `ticket.json` vectors; `phase1a.discovery` still passing with its `public-routes` control |
 | E8 | E | `WsPipe` client and server, the loopback listener, `--ws-port`, `--tunnel`; the debug-only extra root; the tunnel stand-in | `phase1b.ws` |
 | E9 | E | `SshPipe`; `ssh.resolve`, `ssh.probe` with kept key bytes, `ssh.trust`, `ssh.run`, `ssh.forget`; the constrained config with the kept `ssh -G` options, and atomic rotation; marker and preamble; the window per resolved host and port; the remote `pipe --profile`, the buffer-keeping handoff and ending when the helper closes; the app-mode IPC listener (pipe and status); the `russh` test server | `phase1b.ssh` |
-| E10 | E | Admission: per-kind pools at accept, the bounded IPC reader, ws upgrade caps, slots through join-only until the invitation ends, the admission fence in `Host` at gate registration and enrollment, tighten-only limits | `phase1b.admission` |
-| E11 | E | Send link in app mode: `invite.create {kind: link}`, `invite.code`, `join` arrival, `approved` and code, the code channel, kind 2 off the consented path and late recovery only from a genuine pending record; completion records with the full peer and approval writes, replayed by `join.status`; `join.ack`; protocol 1.1 | `phase1b.send-link`; Phase 0 `pairing_e2e` unchanged |
+| E10 | E | Admission: per-kind pools at accept, the slot and fence on a re-pair from live, the bounded IPC reader, ws upgrade caps, slots through join-only until the invitation ends, the admission fence in `Host` at gate registration and enrollment, tighten-only limits | `phase1b.admission` |
+| E11 | E | Send link in app mode: `invite.create {kind: link}`, `invite.code`, `join` arrival, `approved` and code, the code channel, kind 2 off the consented path and late recovery only from a genuine pending record; completion records only for a `PAIRED` of the ticket, with the full peer and approval writes, replayed by `join.status` under the peers lock and dropped on removal; `settle_stored` on disk; `join.ack`; protocol 1.1 | `phase1b.send-link`; Phase 0 `pairing_e2e` unchanged |
 | E12 | E | Kit: `mousse-check probe` (with `mousse.tunnel`, admission cases and per-case app assertions), the Plus recorder and the egress guards, `cases` in the manifest, `run.mjs --route` and the route assertion, cross-machine pairing fixtures, two loopback SSH routes for the `ssh` case, the Mac relay, the loopback chat page, `tools/build-smoke.mjs` (version, start, probe), the hosted `windows-11-arm` job and its verification, `checks/phase1b.toml`; spec, threat model, privacy and limits docs | kit self-tests; every control prints FAIL |
-| M8 | M | Protocol 1.1 client; `ReachSection` and helper restart on `restart_needed` and on selected-address changes; owner addresses for every kind; destinations and "Also share" in the join dialog; "Addresses <B> offered"; route labels on rows | unit tests; `phase1b.routes-app` over `tcp` |
-| M9 | M | Send link: host tab, Enter link, the `mousse://` scheme (packaged only), profile choice on activation, code entry, the `consented` row's `approved` and `share` lists, conversion of a `source: "ssh"` row, kind-2 recovery through `join.status` only | `phase1b.link-app`; component tests; real-app captures |
-| M10 | M | SSH add (one way): dialog, fingerprint confirmation, profile choice; `mousse-cli net-engine ssh` (`profiles`, `prepare`, no autostart); the `net_engine_ssh_requests` journal with resumable steps (own-row and `existing` branches), the removal lock, the grant id on the request and the row, checked on retry, and retention; the `ssh_*` states and `source: "ssh"` skips; B's row connected on A's first inbound; launchers and `endpoints.json` under `MOUSSE_HOME` | `phase1b.ssh-add-app`; `phase1b.routes-app` over `ssh` |
+| M8 | M | Protocol 1.1 client; `ReachSection` and helper restart on `restart_needed` (§1.5's one rule); owner addresses for every kind; destinations and "Also share" in the join dialog; "Addresses <B> offered"; route labels on rows | unit tests; `phase1b.routes-app` over `tcp` |
+| M9 | M | Send link: host tab, Enter link, the `mousse://` scheme (packaged only), profile choice on activation, code entry, the `consented` row's `approved` and `share` lists, the pending link on a `source: "ssh"` row, converted only on the ticket's `PAIRED`; no `grantBack` on "already paired"; kind-2 recovery through `join.status` only | `phase1b.link-app`; component tests; real-app captures |
+| M10 | M | SSH add (one way): dialog, fingerprint confirmation, profile choice; `mousse-cli net-engine ssh` (`profiles`, `prepare`, no autostart); the `net_engine_ssh_requests` journal with resumable steps (own-row and `existing` branches), the removal lock, the grant id on the request and the row, checked on retry, grant reconciliation by identity and `request_id` before removal or expiry, and retention; the `ssh_*` states and `source: "ssh"` skips; B's row connected on A's first inbound; launchers and `endpoints.json` under `MOUSSE_HOME` | `phase1b.ssh-add-app`; `phase1b.routes-app` over `ssh` |
 | M11 | M | Tunnel UI and `routes.test` wording | `phase1b.routes-app` over `ws` |
 | M12 | M | `mousse-cli net-engine` | CLI tests through the daemon's local methods |
 | M13 | M | Remaining RPC (§9): the engine's own `EditorTunnels` and `EditorEndpoint` with an engine `TunnelLink`; `net/editor/` marked as kept; `engineEditorRefusal`, `reconcile()` on engine changes; editor rows; `bridge.access.mine`; `bridge.dispatch` with Hub `prepare`; the Hub local methods' engine branch | `phase1b.editor-app`; allowlist test; Hub tests with v1 unchanged; `phase1b.no-rpc-without-grant` |
 | M14 | M | The startup question (existing entry); six-target packaging | startup tests; `phase1b.desktop-builds`; `phase1b.login-start` (attested) |
 
-**Changes from round 0's slices:**
+**Settle while building** (on the slices named):
 
-- S2 is new, and both spikes now come before any M slice and before the
-  app revision pin.
-- E10 is new (admission, split out of E7).
-- Round 0's E10 (Send link) is now E11. It drops the deny ops and the
-  `FlowRecordStore` switch, and gains the kind-2 path fix.
-- Round 0's E11 (kit) is now E12.
-- E7 drops `routes.changed`, `peer.routes.set` and listener rebinding.
-- E9 drops `expect` and gains the constrained config, marker and window.
-- M8 drops `routes` on hello.
-- M10's SSH add is the bootstrap, not an invitation.
-- M13 reuses the editor endpoint.
-- M14 drops login registration.
-
-**Changes from round 1's slices:** no slice is added or removed.
-
-- E7 gains stored approvals, the upgrade rule and per-address binding.
-- E9 gains kept key bytes, the kept `ssh -G` options, the buffer-keeping
-  handoff and the pipe ending. It loses `pipe --state` over SSH.
-- E10 moves the fence into `Host` (registration and enrollment).
-- E11 gains completion records, `join.status` and `join.ack`.
-- E12 gains `cases`, the egress guards, per-case probe assertions, the
-  cross-machine fixtures and the chat page. The build smoke loses pairing.
-- M9 recovers kind 2 through `join.status` only.
-- M10 is one way only, with the request journal. The reverse grant and the
-  custom remote folder are gone.
-- M13 builds the engine's own editor instances.
+- **E12, M8 — reverse WSS fixture.** It asserts three steps: nothing is
+  disclosed before the joiner ticks "Also share", nothing is dialled
+  before the receiving owner taps Use, then the reverse connection works.
+- **E12 — `route-leak`.** The control makes the wrong route win (offered
+  first, and answering), so the route assertion has something to catch.
+  Adding a candidate alone can leave every connection correct.
+- **M10, E12 — `retry-after-connected`.** Judged by an unexpected
+  `prepare` arriving at B, not by B's answer, since B's removal journal
+  would refuse it anyway and hide the faulty retry.
+- **E8 — ws message cap.** The 65 536-byte cap becomes
+  `WS_MESSAGE_MAX_BYTES`, a named tighten-only override (§13.3).
+- **Order.** S1 and S2 first. E10 lands before E8's and E9's listeners are
+  switched on. The CLI, remaining RPC and the six-build smoke keep their
+  scope.
 
 **Order:**
 
 1. S1 and S2.
 2. E7.
-3. E8, E9, E10 and E11 in parallel.
+3. E8, E9, E10 and E11 in parallel; E8's and E9's listeners stay off until
+   E10 lands.
 4. E12.
 5. M8 to M14, with M8 first and M13 independent of the route slices.
 6. Pin `app/MOUSSE_REVISION`.
@@ -1755,30 +1708,26 @@ E = engine repo (`phase-1b`), M = Mousse (`net-engine-1b`).
    folder.** Headless servers and custom remote folders wait for later
    phases.
 
-**Settle while building** (round 3 notes, no design change)
+**Settle while building**
 
-- **Probe results (Sol 4).** The kit judges the wire observation and the
+- **Probe results.** The kit judges the wire observation and the
   app observation separately, so `tunnel-ignores-editor` fails with its
   own reason, not whichever comes first.
-- **Port-forward bind address (Sol 5).** `routes.config` and the CLI take
+- **Port-forward bind address.** `routes.config` and the CLI take
   the local address the router forwards to, checked against this
   computer's interfaces.
-- **Address changes (Fable 2).** A change in the selected addresses opens
-  or closes only that socket. Only a `port` change restarts the helper.
-- **Addresses that can't bind (Fable 3).** The helper starts with what
-  binds and lists the rest in `hello`.
-- **Egress on Windows (Fable 4).** The test app also starts with a
+- **Egress on Windows.** The test app also starts with a
   resolver rule or a dead loopback proxy, so Electron's own network stack
   is covered. The guard is a kit preload, never daemon code.
-- **Scheme handler (Fable 5).** The attested chat-link check ends by
+- **Scheme handler.** The attested chat-link check ends by
   restoring the installed Mousse as the `mousse://` handler.
-- **Clock skew (Fable 6).** An `expired` answer to a request A just made
+- **Clock skew.** An `expired` answer to a request A just made
   shows 1a's wrong-clock message.
 
-**Settled (round 1 answers)**
+**Settled**
 
-1. **SSH add direction:** one way only in 1b (round 2 cut the optional
-   reverse grant). A Send link can add the other direction (§3.6).
+1. **SSH add direction:** one way only in 1b. A Send link can add the other
+   direction once its code exchange succeeds (§3.6).
 2. **ProxyJump and ProxyCommand:** refused in 1b (§3.1).
 3. **Destinations:** 1a's automatic private-literal rule; explicit
    approval for everything else (§1.3).
@@ -1800,17 +1749,15 @@ E = engine repo (`phase-1b`), M = Mousse (`net-engine-1b`).
 14. **Outer `wss`:** the platform verifier, a debug-only extra root for
     tests, and plain `ws` only on a tunnel's loopback hop (§4.2).
 
+15. **Hosted result:** accepted as `hosted`, under the verification in
+    risk 6.
+16. **Pairback disclosure:** only private LAN literals by default. The
+    joiner ticks any tailnet or public route to disclose, and the
+    receiving owner still approves before dialling it (§1.3, §5.3).
+
 Also settled: remote `pipe` over owner IPC, not `ssh -W` (§3.3); spaces,
 chats and bots stay out of 1b (§9).
 
-**Settled (round 2 answers)**
-
-1. **Hosted result:** accepted as `hosted`, under the verification in
-   risk 6.
-2. **Pairback disclosure:** only private LAN literals by default. The
-   joiner ticks any tailnet or public route to disclose, and the receiving
-   owner still approves before dialling it (§1.3, §5.3).
-
 **Open questions**
 
-None. The design is frozen, pending one final review.
+None.
