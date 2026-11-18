@@ -21,7 +21,7 @@
       "identity_secret": "2222222222222222222222222222222222222222222222222222222222222222",
       "name": "Phone"
     },
-    "outputs": "send: a control message with its CONTROL frame. close: GOAWAY with its frame. attempt: the CPace inputs of a new attempt (CI is the binding transcript; sid as in wire.md). version: the minor version agreed from a HELLO. Others name host or joiner events: show_code, ask_approval, admitted_join_only, enrolled, invitation_ended, paired, code_rejected, failed (the joiner's gate closes with it), error, ignored.",
+    "outputs": "send: a control message with its CONTROL frame. close: GOAWAY with its frame. attempt: the CPace inputs of a new attempt (CI is the binding transcript; sid as in wire.md). version: the minor version agreed from a HELLO. Others name host or joiner events: show_code, ask_approval, admitted_join_only, enrolled, invitation_ended, paired, code_rejected, failed (the joiner's flow ends with this code: its gate closes, and unless the step was a goaway or a drop, the joiner then closes the connection with GOAWAY of that code after any message listed before it in the step, wire.md 10.6 rule 9; that GOAWAY is not listed as a separate close), error, ignored.",
     "time": 1790000000
   },
   "description": "End-to-end pairing (spec wire.md, sections 8, 10 and 11, and cpace.md). Each flow lists scripted random draws per party, then events in order with every output. Replaying the events with the same draws must give the same outputs byte for byte.",

@@ -180,22 +180,29 @@ fn live_path_closes_at_certificate_expiry() {
     session.on_reopened(second).expect("reopened");
     check_ticks(&mut session, &switch["ticks"]);
 
-    // A retry skipped while a candidate comes up still counts.
-    let skipped = &doc["retry_while_candidate"];
-    let mut session = PeerSession::new(pin);
-    session.begin_path(conn);
-    session
-        .on_authenticated(conn, &peer, local, at)
-        .expect("authenticated");
-    session.on_reopened(conn).expect("reopened");
-    assert_eq!(session.tick(path.renew_at).len(), 1);
-    for step in list(&skipped["steps"]) {
-        let id = || ConnectionId(u(&step["conn"]));
-        match s(&step["op"]) {
-            "tick" => check_ticks(&mut session, &J::Array(vec![step.clone()])),
-            "begin_path" => assert!(session.begin_path(id()).is_empty()),
-            "path_closed" => session.on_path_closed(id()),
-            other => panic!("op {other}"),
+    // A retry skipped while a candidate comes up still counts, also the
+    // first request at the renewal time.
+    for (name, first_tick) in [
+        ("retry_while_candidate", true),
+        ("candidate_at_first_renewal", false),
+    ] {
+        let mut session = PeerSession::new(pin);
+        session.begin_path(conn);
+        session
+            .on_authenticated(conn, &peer, local, at)
+            .expect("authenticated");
+        session.on_reopened(conn).expect("reopened");
+        if first_tick {
+            assert_eq!(session.tick(path.renew_at).len(), 1);
+        }
+        for step in list(&doc[name]["steps"]) {
+            let id = || ConnectionId(u(&step["conn"]));
+            match s(&step["op"]) {
+                "tick" => check_ticks(&mut session, &J::Array(vec![step.clone()])),
+                "begin_path" => assert!(session.begin_path(id()).is_empty()),
+                "path_closed" => session.on_path_closed(id()),
+                other => panic!("op {other}"),
+            }
         }
     }
 

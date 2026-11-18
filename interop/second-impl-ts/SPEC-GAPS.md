@@ -14,17 +14,12 @@
 | Draft-only CPace outputs | `cpace.md` §§2 and 7. Ordered concatenation, its derived values and the CPace sid output are informative. Mousse pairing uses the initiator-responder transcript and the supplied sid. The vector runner also verifies the informative draft values. |
 | Renewal retry timing | `wire.md` §6 and `session-lifecycle.json` (`retry_while_candidate`). Each wait starts when its retry actually runs. A retry that falls due while a candidate is coming up is skipped but counts as run: the next wait starts then and doubles, and the skipped retry is not made up when the candidate fails. |
 | Attempt replay logging | `wire.md` §8 step 1 and the `pairing-attempts.json` description. `out` leaves out both HELLOs; a replay over real connections exchanges them and compares from `JOIN_PROOF`. For `submit_first`, `redeliver` and `inject`, the host's reply is recorded but not delivered. Each side keeps its own send order; on connect the joiner's sends are listed before the host's. |
+| First renewal tick with a candidate pending | `wire.md` §6 and `session-lifecycle.json` (`candidate_at_first_renewal`). The first request at the renewal time follows the skipped-retry rule: it is skipped but counts, and the 30-second wait starts at that tick. |
+| Transport close on a failed flow | `wire.md` §10.6 rule 9 and the `pairing-e2e.json` and `pairing-attempts.json` conventions. When the joiner's flow fails with code C, it sends any message the same step produced, then one `GOAWAY(C)`, unless the host already closed the connection or it broke. The vectors do not list that `GOAWAY`; the `failed` output stands for it. A failed attempt sends only `CODE_ABORT` and keeps the connection. |
 
 ## Open
 
-- `wire.md` §6 specifies how to count a skipped retry. It leaves the first
-  renewal tick with a candidate already pending implicit. The implementation
-  consumes that tick and starts the initial 30-second wait.
-- `wire.md` §10.6 rule 8 requires the joiner to close the connection on
-  `PAIRING_FAILED`. The failure step in `pairing-e2e.json` lists only
-  `failed: pairing_failed` and says the gate closes with it. The replay
-  closes the gate and records the failure. Whether a transport also sends a
-  `GOAWAY` for this failure is unspecified.
+None.
 
 The browser Worker certificate is pending in `session-cert.json` and
 has no certificate bytes.
