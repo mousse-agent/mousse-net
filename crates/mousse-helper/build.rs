@@ -31,6 +31,13 @@ fn main() {
         .contains("mousse_control");
     let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".into());
     println!("cargo:rustc-env=MOUSSE_BUILD_PROFILE={profile}");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_TEST_IN_PERSON");
+    if profile == "release" && std::env::var_os("CARGO_FEATURE_TEST_IN_PERSON").is_some() {
+        eprintln!(
+            "error: test-in-person lets a typed ticket count as scanned; it is not allowed in release builds"
+        );
+        std::process::exit(1);
+    }
     if profile == "release" && (from_cfg.is_some() || from_flags) {
         eprintln!(
             "error: mousse_control ({}) plants a bug for tests; it is not allowed in release builds",

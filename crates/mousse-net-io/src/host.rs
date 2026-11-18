@@ -51,7 +51,7 @@ use crate::error::NetError;
 use crate::limits::{ms, Limits};
 use crate::pipe::Pipe;
 use crate::rng::os_rng;
-use crate::store::{GrantStore, PendingEnrollment, WriteFailure};
+use crate::store::{EnrollmentSaveError, GrantStore, PendingEnrollment};
 use crate::tls::{self, TlsPolicy};
 use crate::SharedSigner;
 
@@ -156,10 +156,9 @@ struct Inner<F: CodeExchangeFactory> {
     store: Option<GrantStore>,
     /// The last save failed; the ticker retries it.
     unsaved: bool,
-    /// An enrollment was rolled back after its save renamed the file into
-    /// place, and the table without it is not saved yet: a restart could
-    /// honor a grant this host reported as failed. No grant is served until
-    /// a save works.
+    /// An enrollment is in force but its save could not be made durable
+    /// (see [`EnrollmentSaveError::Unsettled`]). No grant is served until a
+    /// save works.
     reconcile: bool,
     events: mpsc::UnboundedSender<HostEvent>,
 }
@@ -221,51 +220,21 @@ where
     /// Save the grant table. On failure the change stays in effect in
     /// memory, the host reports [`HostEvent::StoreFailed`] and retries.
     fn persist(&mut self) -> Result<(), NetError> {
-        self.persist_checked().map_err(|f| f.error)
-    }
-
-    /// [`Inner::persist`], telling whether a failure may have left the
-    /// table in place on disk.
-    fn persist_checked(&mut self) -> Result<(), WriteFailure> {
         let Some(store) = &self.store else {
             return Ok(());
         };
-        match store.save_checked(&self.grants) {
+        match store.save(&self.grants) {
             Ok(()) => {
                 self.unsaved = false;
                 self.reconcile = false;
                 Ok(())
             }
-            Err(f) => {
+            Err(e) => {
                 self.unsaved = true;
-                let _ = self
-                    .events
-                    .send(HostEvent::StoreFailed(f.error.to_string()));
-                Err(f)
+                let _ = self.events.send(HostEvent::StoreFailed(e.to_string()));
+                Err(e)
             }
         }
-    }
-
-    /// Save the table holding the enrollments `pending`, so that a restart
-    /// honors them only if this returns `Ok`: they are recorded as pending
-    /// first, then the table is saved, then the record is cleared. Until
-    /// it is cleared a load drops their grants, so a failure at any step,
-    /// and a restart before the table without them is saved, leaves none
-    /// of them in force.
-    fn save_enrollment(&mut self, pending: &[PendingEnrollment]) -> Result<(), WriteFailure> {
-        let Some(store) = self.store.clone() else {
-            return Ok(());
-        };
-        let events = self.events.clone();
-        let failed = move |error: NetError, in_place: bool| {
-            let _ = events.send(HostEvent::StoreFailed(error.to_string()));
-            WriteFailure { error, in_place }
-        };
-        if let Err(e) = store.begin_enrollments(pending) {
-            return Err(failed(e, false));
-        }
-        self.persist_checked()?;
-        store.commit_enrollments().map_err(|e| failed(e, true))
     }
 
     /// Whether grants may be served: no rolled-back enrollment is waiting
@@ -333,9 +302,15 @@ where
     /// pairing call that ran on the grant table as it was in `before`. When
     /// they enroll a device, the new grant is saved first, so the gate is
     /// promoted and `PAIRED` sent only for a grant that survives a restart.
-    /// If the save fails the table goes back to `before` and the pairing
-    /// fails: the enrolling connection closes with `INTERNAL_ERROR`, no
-    /// `PAIRED` is sent and the invitation ends.
+    ///
+    /// If the save fails with `before` in force (on disk too), the table
+    /// goes back to it and the pairing fails: the enrolling connection
+    /// closes with `INTERNAL_ERROR`, no `PAIRED` is sent and the invitation
+    /// ends. If it fails with the enrollment in force but not durable, the
+    /// host keeps it, as a restart would: it reports the enrollment, sends
+    /// no `PAIRED` (the device learns the outcome when it reconnects),
+    /// closes every connection with `INTERNAL_ERROR` and serves nothing
+    /// until a save works.
     fn commit_enrollment(
         &mut self,
         before: GrantTable,
@@ -363,20 +338,51 @@ where
         if enrolling.is_empty() {
             return actions;
         }
-        let failure = match self.save_enrollment(&pending) {
+        let Some(store) = self.store.clone() else {
+            return actions;
+        };
+        let failure = match store.save_enrollment(&before, &self.grants, &pending) {
             Ok(()) => return actions,
             Err(f) => f,
         };
-        self.grants = before;
-        if failure.in_place && self.persist().is_err() {
-            // The file may hold the grant just refused. Serve nothing until
-            // the table without it is saved; the ticker retries.
+        let _ = self
+            .events
+            .send(HostEvent::StoreFailed(failure.error().to_string()));
+        if let EnrollmentSaveError::Unsettled(_) = failure {
+            self.unsaved = true;
             self.reconcile = true;
             let conns: Vec<ConnectionId> = self.conns.keys().copied().collect();
             for conn in conns {
                 self.close_conn(conn, ErrorCode::InternalError);
             }
+            return actions
+                .into_iter()
+                .filter_map(|action| match action {
+                    HostAction::Enrolled {
+                        invitation,
+                        conn,
+                        grant,
+                        identity,
+                    } => {
+                        let _ = self.events.send(HostEvent::Enrolled {
+                            invitation,
+                            grant,
+                            identity,
+                        });
+                        Some(HostAction::Close {
+                            conn,
+                            code: ErrorCode::InternalError,
+                        })
+                    }
+                    HostAction::Send {
+                        conn,
+                        message: ControlMessage::Paired { .. },
+                    } if enrolling.contains(&conn) => None,
+                    other => Some(other),
+                })
+                .collect();
         }
+        self.grants = before;
         actions
             .into_iter()
             .flat_map(|action| match action {
@@ -1212,55 +1218,98 @@ mod tests {
         matches!(result, Err(NetError::Closed(CloseReason::Peer(c))) if *c == code)
     }
 
-    /// The enrollment's save renamed the table into place and then failed
-    /// (the folder sync): the host reports the pairing failed, so it writes
-    /// the table without the grant again at once. A restart finds no grant.
-    #[tokio::test]
-    async fn a_save_that_failed_after_its_rename_is_saved_away_at_once() {
-        let dir = fresh_dir("rename");
-        let (host, mut events) = host_in(Some(dir.clone()));
+    /// Approve an in-person join of `host` while saves fail as `table` and
+    /// `pending` plan, with the host's ticker stopped so nothing retries a
+    /// save. Returns how the join ended and the joining device.
+    async fn enroll_failing(
+        host: &Host,
+        events: &mut mpsc::UnboundedReceiver<HostEvent>,
+        dir: &std::path::Path,
+        table: &[crate::private::faults::Fault],
+        pending: &[crate::private::faults::Fault],
+    ) -> (Joined, IdentityPublicKey) {
+        host.shared.ticker_paused.store(true, Ordering::SeqCst);
         let caller = new_caller();
-        let store = GrantStore::in_dir(&dir);
-        let result = join_in_person(&host, &mut events, &caller, |request| {
-            crate::private::faults::fail_after_rename(store.path(), 1);
+        let store = GrantStore::in_dir(dir);
+        let result = join_in_person(host, events, &caller, |request| {
+            crate::private::faults::plan_replaces(store.path(), table);
+            crate::private::faults::plan_replaces(store.pending_path(), pending);
             host.approve(&request).unwrap();
         })
         .await;
-        assert!(
-            refused_with(&result, ErrorCode::InternalError),
-            "{:?}",
-            result.err()
-        );
-        assert!(!granted(&host, &caller.identity()));
-        assert!(store.load().unwrap().grants().next().is_none());
-        assert!(lock(&host.shared).serving());
-        assert!(!host.has_unsaved_changes());
-        let _ = std::fs::remove_dir_all(&dir);
+        (result, caller.identity())
     }
 
-    /// When writing the table again fails too, the host serves no grant
-    /// until a save works: a granted device is refused, then served again
-    /// once the ticker saved the table without the failed enrollment.
+    /// A device granted earlier and saved.
+    fn saved_grant(host: &Host) -> IdentityPublicKey {
+        let other = SoftwareKey::generate(&mut os_rng()).public_key();
+        grant(host, other);
+        lock(&host.shared).persist().unwrap();
+        other
+    }
+
+    /// The enrollment's save fails with the table before it in force: the
+    /// record not written, or landed without its sync; the table not
+    /// written, or landed without its sync; the clear not written. The
+    /// pairing fails, the host keeps serving the grants it had, and a
+    /// restart honors none of the failed enrollment.
     #[tokio::test]
-    async fn the_host_serves_no_grant_until_the_failed_enrollment_is_saved_away() {
-        let dir = fresh_dir("reconcile");
+    async fn a_failed_enrollment_is_honored_neither_now_nor_after_a_restart() {
+        use crate::private::faults::Fault;
+        let cases: [(&[Fault], &[Fault]); 5] = [
+            (&[Fault::BeforeRename], &[]),
+            (&[Fault::AfterRename], &[]),
+            (&[Fault::None], &[Fault::BeforeRename]),
+            (&[Fault::None], &[Fault::AfterRename]),
+            (&[Fault::None, Fault::BeforeRename], &[]),
+        ];
+        for (pending, table) in cases {
+            let dir = fresh_dir("failed");
+            let (host, mut events) = host_in(Some(dir.clone()));
+            let other = saved_grant(&host);
+            let (result, identity) = enroll_failing(&host, &mut events, &dir, table, pending).await;
+            assert!(
+                refused_with(&result, ErrorCode::InternalError),
+                "{pending:?} {table:?}: {:?}",
+                result.err()
+            );
+            assert!(!granted(&host, &identity));
+            assert!(lock(&host.shared).serving());
+            drop(host);
+            let (host, _events) = host_in(Some(dir.clone()));
+            assert!(!granted(&host, &identity), "{pending:?} {table:?}");
+            assert!(granted(&host, &other));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// The clear landed but its sync failed: the enrollment is in force, as
+    /// it would be after a restart, so the host keeps it but sends no
+    /// `PAIRED` and serves nothing until a save works. Once the ticker
+    /// saved, it serves again, and a restart keeps the enrollment.
+    #[tokio::test]
+    async fn an_unsettled_enrollment_is_kept_and_served_once_saved() {
+        use crate::private::faults::Fault;
+        let dir = fresh_dir("unsettled");
         let (host, mut events) = host_in(Some(dir.clone()));
         let other = new_caller();
         grant(&host, other.identity());
-        let caller = new_caller();
-        let store = GrantStore::in_dir(&dir);
-        let result = join_in_person(&host, &mut events, &caller, |request| {
-            crate::private::faults::fail_after_rename(store.path(), 2);
-            host.approve(&request).unwrap();
-        })
+        lock(&host.shared).persist().unwrap();
+        let (result, identity) = enroll_failing(
+            &host,
+            &mut events,
+            &dir,
+            &[],
+            &[Fault::None, Fault::AfterRename],
+        )
         .await;
         assert!(
             refused_with(&result, ErrorCode::InternalError),
             "{:?}",
             result.err()
         );
+        assert!(granted(&host, &identity));
         assert!(!lock(&host.shared).serving());
-
         let (a, b) = tokio::io::duplex(1 << 16);
         let (hosted, _dialled) = tokio::join!(host.accept(a), other.dial(b, host.identity()));
         assert_eq!(
@@ -1268,6 +1317,7 @@ mod tests {
             CloseReason::Local(ErrorCode::InternalError)
         );
 
+        host.shared.ticker_paused.store(false, Ordering::SeqCst);
         within("saved", async {
             while host.has_unsaved_changes() {
                 tokio::time::sleep(ms(Limits::DEFAULT.io().clock_recheck_ms())).await;
@@ -1275,10 +1325,6 @@ mod tests {
         })
         .await;
         assert!(lock(&host.shared).serving());
-        let saved = store.load().unwrap();
-        assert!(saved.grants().all(|g| g.identity != caller.identity()));
-        assert!(saved.grants().any(|g| g.identity == other.identity()));
-
         let (a, b) = tokio::io::duplex(1 << 16);
         let (hosted, dialled) = tokio::join!(host.accept(a), other.dial(b, host.identity()));
         let (hosted, dialled) = (hosted.unwrap(), dialled.unwrap());
@@ -1290,84 +1336,36 @@ mod tests {
         assert!(within("served again", hosted.accept_stream())
             .await
             .is_some());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
-    /// Approve an in-person join of `host` while saves fail as `table` and
-    /// `pending` plan, expect the pairing to fail, then restart the host
-    /// from its folder, with the old host's ticker stopped so nothing
-    /// retries the save first.
-    async fn failed_enrollment_then_restart(
-        tag: &str,
-        table: &[crate::private::faults::Fault],
-        pending: &[crate::private::faults::Fault],
-    ) -> (Host, IdentityPublicKey, PathBuf) {
-        let dir = fresh_dir(tag);
-        let (host, mut events) = host_in(Some(dir.clone()));
-        host.shared.ticker_paused.store(true, Ordering::SeqCst);
-        let caller = new_caller();
-        let store = GrantStore::in_dir(&dir);
-        let result = join_in_person(&host, &mut events, &caller, |request| {
-            crate::private::faults::plan_replaces(store.path(), table);
-            crate::private::faults::plan_replaces(store.pending_path(), pending);
-            host.approve(&request).unwrap();
-        })
-        .await;
-        assert!(
-            refused_with(&result, ErrorCode::InternalError),
-            "{:?}",
-            result.err()
-        );
-        assert!(!granted(&host, &caller.identity()));
+        drop((hosted, dialled, stream));
         drop(host);
-        let (restarted, _events) = host_in(Some(dir.clone()));
-        (restarted, caller.identity(), dir)
-    }
-
-    /// The enrollment's table landed (its sync failed) and the corrective
-    /// write failed before its rename, so the file still holds the grant
-    /// when the host stops. The restarted host does not honor it.
-    #[tokio::test]
-    async fn a_restart_honors_no_enrollment_whose_corrective_write_failed() {
-        use crate::private::faults::Fault;
-        let (host, identity, dir) = failed_enrollment_then_restart(
-            "restart",
-            &[Fault::AfterRename, Fault::BeforeRename],
-            &[],
-        )
-        .await;
-        assert!(GrantStore::in_dir(&dir)
-            .load()
-            .is_ok_and(|t| t.grants().next().is_none()));
-        assert!(!granted(&host, &identity));
-        assert!(lock(&host.shared).serving());
+        let (host, _events) = host_in(Some(dir.clone()));
+        assert!(granted(&host, &identity));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The table with the grant was saved but clearing the pending record
-    /// failed, and so did the corrective write: the pairing failed, and a
-    /// restart does not honor it either.
+    /// The clear landed unsynced and the host stopped before any save
+    /// worked: the restarted host has the enrollment, as the stopped one
+    /// did, and serves.
     #[tokio::test]
-    async fn a_restart_honors_no_enrollment_whose_commit_failed() {
+    async fn an_unsettled_enrollment_is_in_force_after_a_restart() {
         use crate::private::faults::Fault;
-        let (host, identity, dir) = failed_enrollment_then_restart(
-            "commit",
+        let dir = fresh_dir("unsettled-restart");
+        let (host, mut events) = host_in(Some(dir.clone()));
+        let (_, identity) = enroll_failing(
+            &host,
+            &mut events,
+            &dir,
             &[Fault::None, Fault::BeforeRename],
-            &[Fault::None, Fault::BeforeRename],
+            &[Fault::None, Fault::AfterRename],
         )
         .await;
-        assert!(!granted(&host, &identity));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Recording the enrollment as pending failed: nothing was saved, the
-    /// pairing failed, and the host keeps serving.
-    #[tokio::test]
-    async fn an_enrollment_that_could_not_be_recorded_as_pending_fails_cleanly() {
-        use crate::private::faults::Fault;
-        let (host, identity, dir) =
-            failed_enrollment_then_restart("begin", &[], &[Fault::BeforeRename]).await;
-        assert!(!granted(&host, &identity));
+        assert!(granted(&host, &identity));
+        // The retry fails too.
+        assert!(lock(&host.shared).persist().is_err());
+        drop(host);
+        let (host, _events) = host_in(Some(dir.clone()));
+        assert!(granted(&host, &identity));
         assert!(lock(&host.shared).serving());
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -320,7 +320,7 @@ min_tests = 5
 [[check.local]]
 target = "windows-x64"
 host = "windows-x86_64"
-command = ["cargo", "test", "-p", "mousse-helper", "--test", "loopback", "--no-fail-fast"]
+command = ["cargo", "test", "-p", "mousse-helper", "--features", "test-in-person", "--test", "loopback", "--no-fail-fast"]
 
 [[check.control]]
 name = "skip-pin-check"
@@ -343,7 +343,7 @@ title = "Thin slice across machines: the PC dials the Mac over the LAN"
 plan = "Phase 0 \"Slice\" (two desktops)"
 targets = ["pc-to-mac-lan"]
 cross_machine = true
-device_steps = "before the run the PC records the configuration with `mousse-check config-digest phase0.thin-slice-cross-machine` (and `--control wrong-identity` before the control run); the Mac runs `mousse-helper serve --listen-ip 0.0.0.0` and `invite` (answering y when asked about the PC); the PC runs `mousse-helper slice-check --in-person --ticket <ticket> --route tcp://<mac>:<port> --host-build <build from the Mac ready line> --out <file> -- uname -a` (pair, the host reports its build, terminal, removal closes it, reconnect refused) and the result file is signed with `mousse-check sign --config <digest>`. Control: the Mac serves a build with --cfg mousse_control=\"allow-break-env\" and MOUSSE_HELPER_BREAK=wrong-identity; the PC runs slice-check with --control wrong-identity and must print RESULT FAIL"
+device_steps = "before the run the PC records the configuration with `mousse-check config-digest phase0.thin-slice-cross-machine` (and `--control wrong-identity` before the control run); the Mac runs `mousse-helper serve --listen-ip 0.0.0.0` and `invite` (answering y when asked about the PC); the PC runs a test build of the helper (`cargo build -p mousse-helper --features test-in-person`, whose `--in-person` stands in for the app's scanner) as `mousse-helper slice-check --in-person --ticket <ticket> --route tcp://<mac>:<port> --host-build <build from the Mac ready line> --out <file> -- uname -a` (pair, the host reports its build, terminal, removal closes it, reconnect refused) and the result file is signed with `mousse-check sign --config <digest>`. Control: the Mac serves a build with --cfg mousse_control=\"allow-break-env\" and MOUSSE_HELPER_BREAK=wrong-identity; the PC runs slice-check with --control wrong-identity and must print RESULT FAIL"
 
 [[check.control]]
 name = "wrong-identity"

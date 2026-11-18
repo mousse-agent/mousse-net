@@ -33,13 +33,18 @@ pub fn make_private_dir(dir: &Path) -> io::Result<()> {
 pub fn make_private_dir_durably(dir: &Path) -> io::Result<()> {
     make_private_dir(dir)?;
     if let Some(parent) = dir.parent() {
-        #[cfg(test)]
-        if faults::take_sync(parent) {
-            return Err(io::Error::other("injected: the folder sync failed"));
-        }
-        imp::sync_dir(parent)?;
+        sync_dir(parent)?;
     }
     Ok(())
+}
+
+/// Make the entries of `dir` durable (Unix; nothing to do on Windows).
+pub fn sync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if faults::take_sync(dir) {
+        return Err(io::Error::other("injected: the folder sync failed"));
+    }
+    imp::sync_dir(dir)
 }
 
 fn restrict_contents(dir: &Path) -> io::Result<()> {
@@ -142,11 +147,6 @@ pub(crate) mod faults {
     /// The next replaces of `path` do what `faults` says, in order.
     pub fn plan_replaces(path: &Path, faults: &[Fault]) {
         plan(&REPLACES, path, faults);
-    }
-
-    /// The next `count` replaces of `path` fail after their rename.
-    pub fn fail_after_rename(path: &Path, count: usize) {
-        plan_replaces(path, &vec![Fault::AfterRename; count]);
     }
 
     /// The next `count` syncs of the folder `dir` fail.

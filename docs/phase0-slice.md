@@ -18,10 +18,16 @@ set to.
 ## Joining
 
 - How the ticket arrived matters. An in-person ticket pairs only when it
-  was scanned from the host's screen: `join --in-person` (and
-  `slice-check --in-person`) says so. Without the flag a ticket counts as
-  sent (pasted or opened as a link), and an in-person one is refused with
-  `PAIRING_FAILED` before anything is sent.
+  was scanned from the host's screen, and only the app's own scanner can
+  say so. A ticket given to `join` or `slice-check` counts as sent (pasted
+  or opened as a link), and an in-person one is refused with
+  `PAIRING_FAILED` before anything is sent. Test builds of the helper
+  (`--features test-in-person`, refused in release builds) take
+  `--in-person` to stand in for the scanner; the loopback tests and the
+  cross-machine run use it.
+- When the host answers that this device already has access (a grant this
+  ticket did not make), `join` prints `already paired with <host> (<id>):
+  access as before; the role is not confirmed` instead of `paired with`.
 - The name in the join proof: in person `--name` or this computer's name;
   with a send link the computer name only, since the far end has not yet
   shown it is the real host (`--name` is not used).
@@ -62,7 +68,10 @@ set to.
   the monotonic clock from when it started, whichever comes first. Both
   are read again at least once a second, so a device that slept past either
   closes as soon as it resumes, and setting the clock back never extends a
-  connection.
+  connection. The monotonic clock keeps counting during sleep
+  (`CLOCK_BOOTTIME` on Linux and Android, `mach_continuous_time` on Apple
+  systems, `QueryInterruptTime` on Windows), so a sleep followed by setting
+  the wall clock back cannot stretch the cap either.
 - The host opens no stream on a connection before the caller has opened
   one.
 
@@ -70,7 +79,7 @@ set to.
 
 ```
 cargo test -p mousse-net-io
-cargo test -p mousse-helper --test loopback --no-fail-fast
+cargo test -p mousse-helper --features test-in-person --test loopback --no-fail-fast
 ```
 
 `mousse-helper/tests/loopback.rs` drives the real binary over loopback TCP:
@@ -143,13 +152,19 @@ A removal or denial ends access at once. If saving the grant table fails,
 `remove` reports it; the host retries the save every second, and if it
 stops before a retry works the grant is back after a restart.
 
-A new grant is saved before the joiner is told it is paired. If that save
-fails, the pairing fails with `INTERNAL_ERROR` and the host keeps no grant,
-so no device holds a pin for a host that would forget it on restart. A
-save can fail after the file was replaced (the folder sync): the host then
-writes the table without the grant again at once, and until a save works
-it serves no grant, so a restart cannot bring back a pairing that was
-reported failed.
+A new grant is saved before the joiner is told it is paired, in three
+steps: `grants-pending.json` records the enrollment with the table in
+force before it, `grants.json` is replaced, and the record is cleared.
+While the record is there, a load returns the table it holds. So if any
+step fails before the clear lands, the pairing fails with
+`INTERNAL_ERROR`, the host keeps no grant, and a restart does not bring
+it back; a grant the pairing replaced (the same device paired again)
+stays. No device holds a pin for a host that would forget it on restart.
+If the clear landed but its folder sync failed, the enrollment is in
+force, as every reader of the folder sees it: the host keeps it, sends
+no `PAIRED` (the device learns the outcome when it reconnects), and
+serves nothing until a save works. Loading the table syncs the folder,
+so what a restart loads stays.
 
 The owner's approval and each pairing message act only if the device's
 connection still waits for them: a removal or denial that closed it first
@@ -166,7 +181,7 @@ mousse-check phase0 --only phase0.thin-slice-loopback
 Each control is a compile-time cfg and only builds with debug assertions:
 
 ```
-RUSTFLAGS='--cfg mousse_control="skip-pin-check"' cargo test -p mousse-helper --test loopback --no-fail-fast
+RUSTFLAGS='--cfg mousse_control="skip-pin-check"' cargo test -p mousse-helper --features test-in-person --test loopback --no-fail-fast
 ```
 
 | Control | Breaks | Tests that fail (of 10) |
@@ -201,9 +216,11 @@ mousse-helper --state ./mac-state --insecure-file-key invite --no-qr
 `invite` asks "Is the device next to you?" when the PC joins; answer `y`.
 A scripted run feeds the answer on its standard input.
 
-PC (Windows):
+PC (Windows), with a test build of the helper, whose `--in-person` stands
+in for the app's scanner:
 
 ```
+cargo build -p mousse-helper --features test-in-person
 mousse-helper --state J:\...\pc-state --insecure-file-key init
 mousse-helper --state J:\...\pc-state --insecure-file-key slice-check --in-person --name pc ^
   --route tcp://192.168.0.59:58505 --ticket <TICKET> --host-build <MAC BUILD> ^

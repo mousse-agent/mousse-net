@@ -178,6 +178,36 @@ pub fn join_name(ticket: &Ticket, chosen: Option<String>, computer: String) -> S
     }
 }
 
+/// A finished join.
+pub struct Joined {
+    /// The connection the join ended on.
+    pub conn: Connection,
+    /// The host as stored.
+    pub record: PeerRecord,
+    /// The host answered that this device already had access, which this
+    /// ticket did not give: the role stored is the one from before (or
+    /// `unknown`), not confirmed by this join.
+    pub already_paired: bool,
+}
+
+/// The line `join` prints for `joined`.
+pub fn joined_line(joined: &Joined, host: &mousse_net_core::identity::IdentityPublicKey) -> String {
+    outcome_line(&joined.record.name, joined.already_paired, host)
+}
+
+fn outcome_line(
+    name: &str,
+    already_paired: bool,
+    host: &mousse_net_core::identity::IdentityPublicKey,
+) -> String {
+    let who = format!("{} ({})", crate::printable(name), short_id(host));
+    if already_paired {
+        format!("already paired with {who}: access as before; the role is not confirmed")
+    } else {
+        format!("paired with {who}")
+    }
+}
+
 /// Pair with the host in `ticket`, trying `routes` (default: the ticket's).
 /// `arrival` says how the ticket reached this device: an in-person ticket
 /// pairs only from a scan of the host's screen. Stores the host's pin on
@@ -188,11 +218,11 @@ pub async fn join(
     arrival: Arrival,
     name: &str,
     routes: &[String],
-) -> Result<(Connection, PeerRecord), Failure> {
+) -> Result<Joined, Failure> {
     if ticket.kind == InvitationKind::InPerson && arrival == Arrival::Link {
         return Err(Failure::new(
-            "this is an in-person ticket: scan it from the host's screen (pass --in-person \
-             only when you did); a ticket sent another way cannot pair (PAIRING_FAILED)",
+            "this is an in-person ticket: it pairs only when scanned from the host's screen \
+             in the app; a ticket given here counts as sent and cannot pair (PAIRING_FAILED)",
             "pairing_failed",
         ));
     }
@@ -239,6 +269,7 @@ pub async fn join(
             .await
         {
             Ok((conn, outcome)) => {
+                let already_paired = matches!(outcome, JoinOutcome::AlreadyPaired);
                 // Built from the stored record as it is under the lock, so
                 // a write by another process meanwhile is not undone.
                 let mut stored = None;
@@ -274,7 +305,11 @@ pub async fn join(
                     .map_err(|e| Failure::new(e.to_string(), "store"))?;
                 side.caller
                     .remember_routes(ticket.host_identity, vec![route.clone()]);
-                return Ok((conn, record));
+                return Ok(Joined {
+                    conn,
+                    record,
+                    already_paired,
+                });
             }
             // Another endpoint at this address: try the next one.
             Err(NetError::PeerCertificate(CertError::PinMismatch)) => {
@@ -540,17 +575,19 @@ async fn run_slice(side: &CallerSide, opts: &SliceCheck, steps: &mut Steps) {
         _ => "pair in person",
     };
     let name = join_name(&ticket, opts.name.clone(), crate::computer_name());
-    let (conn, peer) = match join(side, &ticket, opts.arrival, &name, &opts.routes).await {
+    let joined = match join(side, &ticket, opts.arrival, &name, &opts.routes).await {
         Ok(v) => v,
         Err(e) => return steps.fail(format!("{what}: {}", e.text), &e.reason),
     };
     steps.pass(format!(
-        "paired with {} ({}) via {} using {}",
-        crate::printable(&peer.name),
-        short_id(&ticket.host_identity),
-        peer.last_route.clone().unwrap_or_default(),
-        conn.kx_group()
+        "{} via {} using {}",
+        joined_line(&joined, &ticket.host_identity),
+        joined.record.last_route.clone().unwrap_or_default(),
+        joined.conn.kx_group()
     ));
+    let Joined {
+        conn, record: peer, ..
+    } = joined;
     match host_build(&conn).await {
         Ok(build) => {
             steps.pass(format!("the host runs build {}", crate::printable(&build)));
@@ -738,4 +775,107 @@ async fn capture(conn: &Connection, argv: Vec<String>) -> Result<(i32, String), 
         )
     })??;
     Ok((code, String::from_utf8_lossy(&output).into_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use mousse_net_core::grants::OwnerRef;
+    use mousse_net_core::identity::SoftwareKey;
+    use mousse_net_core::pairing::CpaceExchangeFactory;
+    use mousse_net_io::keystore::KeyStorage;
+    use mousse_net_io::rng::{os_rng, random_bytes};
+    use mousse_net_io::{Host, HostConfig, HostEvent, Limits};
+
+    use super::*;
+
+    /// A host on loopback that says yes to every in-person join; returns
+    /// it and its route.
+    async fn approving_host() -> (Host, String) {
+        let config = HostConfig {
+            name: "desk".into(),
+            state_dir: None,
+            owner: OwnerRef::from_bytes([1; OwnerRef::LEN]),
+            limits: Limits::DEFAULT,
+            clock: Arc::new(SystemClock::new()),
+            ticket_identity: None,
+        };
+        let key = Arc::new(SoftwareKey::generate(&mut os_rng()));
+        let (host, mut events) = Host::new(key, config, CpaceExchangeFactory).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let route = format!("tcp://{}", listener.local_addr().unwrap());
+        let accepting = host.clone();
+        tokio::spawn(async move {
+            // The connections stay open while their tasks are held.
+            let mut held = Vec::new();
+            while let Ok((tcp, _)) = listener.accept().await {
+                let host = accepting.clone();
+                held.push(tokio::spawn(async move { host.accept(tcp).await }));
+            }
+        });
+        let approving = host.clone();
+        tokio::spawn(async move {
+            while let Some(event) = events.recv().await {
+                if let HostEvent::ApprovalRequested(request) = event {
+                    let _ = approving.approve(&request);
+                }
+            }
+        });
+        (host, route)
+    }
+
+    /// An "already paired" answer is not reported as a pairing, and says
+    /// the role was not confirmed.
+    #[test]
+    fn already_paired_prints_as_access_from_before() {
+        let host = SoftwareKey::generate(&mut os_rng()).public_key();
+        let id = short_id(&host);
+        assert_eq!(
+            outcome_line("desk", false, &host),
+            format!("paired with desk ({id})")
+        );
+        assert_eq!(
+            outcome_line("desk", true, &host),
+            format!("already paired with desk ({id}): access as before; the role is not confirmed")
+        );
+    }
+
+    /// `term` read the host's record, then the host was paired again (a
+    /// new name and role) before the dial noted the route it used: the
+    /// re-pair stays, and the route is noted on it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dial_keeps_a_re_pair_that_landed_after_the_record_was_read() {
+        let dir =
+            std::env::temp_dir().join(format!("mousse-helper-dial-{}", hex(&random_bytes::<6>())));
+        Endpoint::create(&dir, None, KeyStorage::InsecureFile).unwrap();
+        let side = CallerSide::open(&dir, true).unwrap();
+        let (host, route) = approving_host().await;
+        let created = host
+            .invite(InvitationKind::InPerson, vec![route.clone()])
+            .unwrap();
+        let ticket = Ticket::from_fragment(&created.fragment).unwrap();
+        let Ok(joined) = join(&side, &ticket, Arrival::InAppScan, "laptop", &[]).await else {
+            panic!("the join failed");
+        };
+        drop(joined);
+
+        let read = side.peers().load().unwrap().remove(0);
+        let mut again = read.clone();
+        again.name = "desk again".into();
+        again.role = "Member".into();
+        again.last_route = None;
+        side.peers().upsert(again).unwrap();
+
+        let Ok(_conn) = dial(&side, &read, &[]).await else {
+            panic!("the dial failed");
+        };
+        let now = side.peers().load().unwrap();
+        assert_eq!(now.len(), 1);
+        assert_eq!(
+            (now[0].name.as_str(), now[0].role.as_str()),
+            ("desk again", "Member")
+        );
+        assert_eq!(now[0].last_route.as_deref(), Some(route.as_str()));
+        drop(side);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
