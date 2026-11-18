@@ -1354,7 +1354,10 @@ mod tests {
         stream.writer.write(b"after").await.unwrap();
         assert!(within("data", peer.read_until(|f| matches!(f, Frame::Data { .. }))).await);
         assert!(
-            !peer.frames.iter().any(|f| matches!(f, Frame::GoAway { .. })),
+            !peer
+                .frames
+                .iter()
+                .any(|f| matches!(f, Frame::GoAway { .. })),
             "{:?}",
             peer.frames
         );
