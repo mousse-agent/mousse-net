@@ -90,11 +90,11 @@ Each control is a compile-time cfg and only builds with debug assertions:
 RUSTFLAGS='--cfg mousse_control="skip-pin-check"' cargo test -p mousse-helper --test loopback --no-fail-fast
 ```
 
-| Control | Breaks | Tests that fail (of 8) |
+| Control | Breaks | Tests that fail (of 10) |
 |---|---|---|
 | `skip-pin-check` | the dialler accepts a host whose identity does not match the pin | 2 |
-| `keep-removed-grant` | removing a grant leaves it in force | 3 |
-| `shared-endpoint-state` | every endpoint on the machine uses one key and one grant table | 3 |
+| `keep-removed-grant` | removing a grant leaves it in force | 4 |
+| `shared-endpoint-state` | every endpoint on the machine uses one key and one grant table | 3 or more (5 in the last run: endpoints of tests running at the same time collide) |
 | `allow-break-env` | lets `serve` read `MOUSSE_HELPER_BREAK` (cross-machine control) | none on its own |
 
 Use a separate `CARGO_TARGET_DIR` for control builds.
