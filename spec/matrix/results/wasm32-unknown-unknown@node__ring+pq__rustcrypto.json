@@ -1,0 +1,10 @@
+{
+  "check": "phase0.crypto-matrix",
+  "target": "wasm32-unknown-unknown@node",
+  "provider": "ring+pq>rustcrypto",
+  "outcome": "PASS",
+  "kx_group": "X25519",
+  "suite": "TLS13_AES_256_GCM_SHA384",
+  "build": "7fca58b75+release",
+  "details": "client ring+pq offers [\"X25519MLKEM768\", \"X25519\", \"secp256r1\", \"secp384r1\"]; server rustcrypto accepts [\"X25519\", \"secp256r1\", \"secp384r1\"] | pipe/mutual: PASS kx=X25519 suite=TLS13_AES_256_GCM_SHA384 handshake=Full exporter equal on both sides (32 bytes) | pipe/wrong-server-pin: PASS refused by client: client=InvalidCertificate(ApplicationVerificationFailure) server=AlertReceived(AccessDenied) | pipe/wrong-client-pin: PASS refused by server: client=AlertReceived(AccessDenied) server=InvalidCertificate(ApplicationVerificationFailure) | pipe/missing-client-cert: PASS refused by server: client=AlertReceived(CertificateRequired) server=NoCertificatesPresented | pipe/tls12-only: PASS refused by server: client=AlertReceived(ProtocolVersion) server=PeerIncompatible(Tls12NotOfferedOrEnabled) | host clock 1794983873040 ms; user agent: Node.js/24"
+}

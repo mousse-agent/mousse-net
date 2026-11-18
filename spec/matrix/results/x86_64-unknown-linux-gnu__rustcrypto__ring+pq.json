@@ -1,0 +1,10 @@
+{
+  "check": "phase0.crypto-matrix",
+  "target": "x86_64-unknown-linux-gnu",
+  "provider": "rustcrypto>ring+pq",
+  "outcome": "PASS",
+  "kx_group": "X25519",
+  "suite": "TLS13_AES_128_GCM_SHA256",
+  "build": "7fca58b75+release",
+  "details": "client rustcrypto offers [\"X25519\", \"secp256r1\", \"secp384r1\"]; server ring+pq accepts [\"X25519MLKEM768\", \"X25519\", \"secp256r1\", \"secp384r1\"] | pipe/mutual: PASS kx=X25519 suite=TLS13_AES_128_GCM_SHA256 handshake=Full exporter equal on both sides (32 bytes) | pipe/wrong-server-pin: PASS refused by client: client=InvalidCertificate(ApplicationVerificationFailure) server=AlertReceived(AccessDenied) | pipe/wrong-client-pin: PASS refused by server: client=AlertReceived(AccessDenied) server=InvalidCertificate(ApplicationVerificationFailure) | pipe/missing-client-cert: PASS refused by server: client=AlertReceived(CertificateRequired) server=NoCertificatesPresented | pipe/tls12-only: PASS refused by server: client=AlertReceived(ProtocolVersion) server=PeerIncompatible(Tls12NotOfferedOrEnabled) | tcp/mutual: PASS kx=X25519 suite=TLS13_AES_128_GCM_SHA256 handshake=Full exporter equal on both sides (32 bytes) | tcp/wrong-server-pin: PASS refused by client: client=InvalidCertificate(ApplicationVerificationFailure) server=AlertReceived(AccessDenied) | tcp/wrong-client-pin: PASS refused by server: client=AlertReceived(AccessDenied) server=InvalidCertificate(ApplicationVerificationFailure) | tcp/missing-client-cert: PASS refused by server: client=AlertReceived(CertificateRequired) server=NoCertificatesPresented | tcp/tls12-only: PASS refused by server: client=AlertReceived(ProtocolVersion) server=PeerIncompatible(Tls12NotOfferedOrEnabled)"
+}

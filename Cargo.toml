@@ -7,6 +7,7 @@ members = [
   "crates/mousse-helper",
   "crates/mousse-check",
 ]
+exclude = ["spikes"]
 
 [workspace.package]
 version = "0.1.0"

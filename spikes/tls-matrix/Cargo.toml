@@ -1,0 +1,50 @@
+[package]
+name = "tls-matrix"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+rust-version = "1.96"
+description = "Phase 0 spike: mutual TLS 1.3 with pinned P-256 keys across rustls crypto providers and targets."
+
+# Its own workspace: this spike needs C toolchains (aws-lc, ring) that the engine crates must not.
+[workspace]
+
+[lints.rust]
+unsafe_code = "deny"
+
+[features]
+default = ["aws-lc", "ring", "rustcrypto", "pq-pure"]
+# aws-lc-rs with the hybrid post-quantum group preferred. Native only.
+aws-lc = ["dep:aws-lc-rs", "rustls/aws_lc_rs", "rustls/prefer-post-quantum"]
+# ring. Native, and wasm32 when clang is available.
+ring = ["dep:ring", "rustls/ring"]
+# Pure-Rust provider (RustCrypto). Native and wasm32 without a C compiler.
+rustcrypto = ["dep:rustls-rustcrypto"]
+# wasm32-unknown-unknown in a JS host (Node or a browser Worker).
+wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:pki-types", "getrandom/wasm_js", "ring?/wasm32_unknown_unknown_js"]
+# Experimental: X25519MLKEM768 for rustcrypto and ring, built from pure-Rust ml-kem
+# and x25519-dalek. Lets wasm32 negotiate the hybrid group.
+pq-pure = ["dep:ml-kem", "dep:x25519-dalek"]
+# Builds the browser Worker test. Needs a browser and a WebDriver.
+browser-worker = ["wasm"]
+
+[dependencies]
+rustls = { version = "=0.23.46", default-features = false, features = ["std", "tls12", "logging"] }
+aws-lc-rs = { version = "=1.19.0", optional = true, default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
+ring = { version = "=0.17.14", optional = true, default-features = false }
+rustls-rustcrypto = { version = "=0.1.0-pre.0", optional = true }
+rcgen = { version = "=0.14.10", default-features = false }
+p256 = { version = "=0.14.0", default-features = false, features = ["ecdsa", "pkcs8", "alloc"] }
+getrandom = { version = "=0.4.3" }
+ml-kem = { version = "=0.3.4", optional = true, features = ["getrandom", "zeroize"] }
+x25519-dalek = { version = "=3.0.0", optional = true, default-features = false, features = ["static_secrets", "zeroize"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wasm-bindgen = { version = "=0.2.130", optional = true }
+js-sys = { version = "0.3", optional = true }
+# On wasm32-unknown-unknown, rustls with `std` needs the `web` clock from pki-types.
+pki-types = { package = "rustls-pki-types", version = "=1.16.0", optional = true, features = ["web"] }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "=0.3.80"
