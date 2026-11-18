@@ -1,6 +1,11 @@
 //! The joining device's pairing state machine. One value is one local
 //! code-entry flow: it allows [`JOINER_ATTEMPTS_PER_FLOW`] code attempts,
 //! across reconnects, so a fake host cannot make it try codes forever.
+//!
+//! The flow's durable part is a [`JoinerRecord`], keyed by the ticket hash.
+//! The I/O layer stores it and passes it back when the same ticket is opened
+//! again, so neither killing the app nor reopening the link resets the
+//! attempt count or forgets a pending outcome.
 
 use std::fmt;
 
@@ -10,6 +15,7 @@ use super::exchange::{CodeExchange, CodeExchangeFactory, ExchangeRole, PairingCo
 use super::proof::{attempt_sid, binding_transcript, join_proof_mac, SessionExporters};
 use super::ticket::Ticket;
 use super::{AttemptId, InvitationKind};
+use crate::cbor::{self, Fields, Value};
 use crate::control::{AuthorizedState, ControlMessage};
 use crate::grants::{validate_name, Role};
 use crate::identity::IdentityPublicKey;
@@ -18,6 +24,27 @@ use crate::ErrorCode;
 
 /// Code attempts the joiner allows per local code-entry flow.
 pub const JOINER_ATTEMPTS_PER_FLOW: u8 = 3;
+
+/// What the joiner shows when a code attempt fails. The joiner cannot tell
+/// a mistyped code from a swapped link, so it names both.
+pub const CODE_FAILED_MESSAGE: &str = "That code didn't work. If you typed it exactly as shown on the other device, the link may have been swapped; get a new one another way.";
+
+/// Domain string at key 1 of a stored [`JoinerRecord`].
+pub const JOINER_RECORD_DOMAIN: &str = "mousse-joiner-flow-v1";
+
+/// How the ticket reached this device. The joiner believes a ticket's kind
+/// only as far as its arrival supports it: an "in person" ticket skips the
+/// code, so it is accepted only from the app's own scanner, pointed at the
+/// host's screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Arrival {
+    /// Scanned with Mousse's own in-app scanner.
+    InAppScan,
+    /// Any other way: a URL opened from another app or the browser, a
+    /// paste, or a QR code opened by the system camera. Anyone along the
+    /// way may have swapped it.
+    Link,
+}
 
 /// Where the joiner stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,6 +114,27 @@ pub enum JoinerError {
     Expired,
     /// The device name is empty or too long.
     InvalidName,
+    /// An "in person" ticket that did not come from the in-app scanner
+    /// ([`Arrival::Link`]). Refused before dialing: `PAIRING_FAILED`.
+    InPersonFromLink,
+    /// The ticket names this device's own identity as the host.
+    OwnTicket,
+    /// The stored record is for another ticket, or does not parse.
+    BadRecord,
+}
+
+impl JoinerError {
+    /// The error code the app reports when this error ends the flow.
+    pub fn code(self) -> Option<ErrorCode> {
+        match self {
+            JoinerError::InPersonFromLink | JoinerError::OwnTicket => {
+                Some(ErrorCode::PairingFailed)
+            }
+            JoinerError::AttemptsExhausted => Some(ErrorCode::AttemptsExhausted),
+            JoinerError::Expired => Some(ErrorCode::InvitationInvalid),
+            JoinerError::WrongState | JoinerError::InvalidName | JoinerError::BadRecord => None,
+        }
+    }
 }
 
 impl fmt::Display for JoinerError {
@@ -96,17 +144,71 @@ impl fmt::Display for JoinerError {
             JoinerError::AttemptsExhausted => "no code attempts left",
             JoinerError::Expired => "pairing ticket has expired",
             JoinerError::InvalidName => "invalid device name",
+            JoinerError::InPersonFromLink => {
+                "an in-person ticket must be scanned with the app's own scanner"
+            }
+            JoinerError::OwnTicket => "this ticket is this device's own invitation",
+            JoinerError::BadRecord => "the stored pairing record is not for this ticket",
         })
     }
 }
 
 impl std::error::Error for JoinerError {}
 
+/// The durable part of a flow: what must survive the app being killed and
+/// the link being opened again. Keyed by the ticket hash; the storage is
+/// local, and [`JoinerRecord::to_bytes`] is one way to keep it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JoinerRecord {
+    /// The ticket hash (wire.md 10.2) this record belongs to.
+    pub ticket_hash: [u8; 32],
+    /// Code attempts left.
+    pub attempts_left: u8,
+    /// This side sent its confirmation and has not learned the outcome.
+    pub outcome_pending: bool,
+}
+
+impl JoinerRecord {
+    /// Canonical CBOR: `{1: "mousse-joiner-flow-v1", 2: ticket hash,
+    /// 3: attempts left, 4: 1 if an outcome is pending else 0}`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        cbor::encode(&Value::Map(vec![
+            (1, Value::Text(JOINER_RECORD_DOMAIN.to_owned())),
+            (2, Value::Bytes(self.ticket_hash.to_vec())),
+            (3, Value::Uint(u64::from(self.attempts_left))),
+            (4, Value::Uint(u64::from(self.outcome_pending))),
+        ]))
+    }
+
+    /// Parse [`JoinerRecord::to_bytes`] output.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, JoinerError> {
+        let bad = |_| JoinerError::BadRecord;
+        let mut f = Fields::decode(bytes).map_err(bad)?;
+        if f.text(1).map_err(bad)? != JOINER_RECORD_DOMAIN {
+            return Err(JoinerError::BadRecord);
+        }
+        let ticket_hash = f.fixed::<32>(2).map_err(bad)?;
+        let attempts_left = match f.uint(3).map_err(bad)? {
+            n if n <= u64::from(JOINER_ATTEMPTS_PER_FLOW) => n as u8,
+            _ => return Err(JoinerError::BadRecord),
+        };
+        let outcome_pending = match f.uint(4).map_err(bad)? {
+            0 => false,
+            1 => true,
+            _ => return Err(JoinerError::BadRecord),
+        };
+        f.finish().map_err(bad)?;
+        Ok(Self {
+            ticket_hash,
+            attempts_left,
+            outcome_pending,
+        })
+    }
+}
+
 struct JoinerAttempt<E> {
     id: AttemptId,
     exchange: Option<E>,
-    last_sent: ControlMessage,
-    last_received: Option<Vec<u8>>,
 }
 
 /// The joiner side of pairing.
@@ -128,34 +230,83 @@ pub struct JoinerPairing<F: CodeExchangeFactory> {
     /// flow started (it paired with that host earlier, not through this
     /// ticket).
     host_pinned: bool,
+    /// On this connection the host has already said `AUTHORIZED {live}`
+    /// once, from step 2 before it read the proof. The answer to the proof
+    /// is the next `AUTHORIZED`.
+    live_before_answer: bool,
 }
 
 impl<F: CodeExchangeFactory> JoinerPairing<F> {
-    /// Start a flow from a scanned or opened ticket.
+    /// Start a flow from a ticket that arrived by `arrival`. `stored` is
+    /// the [`JoinerRecord`] kept for this ticket hash by an earlier start,
+    /// if any: the flow then goes on with its attempt count and pending
+    /// outcome. Every refusal here happens before dialing.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         ticket: Ticket,
+        arrival: Arrival,
         joiner: IdentityPublicKey,
         name: String,
         factory: F,
+        stored: Option<&JoinerRecord>,
         now: UnixTime,
     ) -> Result<Self, JoinerError> {
-        ticket
-            .check_fresh_for_joiner(now)
-            .map_err(|_| JoinerError::Expired)?;
+        if ticket.host_identity == joiner {
+            return Err(JoinerError::OwnTicket);
+        }
+        // The kind is believed only as far as the arrival supports it: a
+        // swapped link must not skip the code by claiming "in person".
+        if ticket.kind == InvitationKind::InPerson && arrival != Arrival::InAppScan {
+            return Err(JoinerError::InPersonFromLink);
+        }
         validate_name(&name).map_err(|_| JoinerError::InvalidName)?;
+        let ticket_hash = ticket.hash();
+        let (attempts_left, outcome_pending) = match stored {
+            Some(record) if record.ticket_hash != ticket_hash => {
+                return Err(JoinerError::BadRecord)
+            }
+            Some(record) => (
+                record.attempts_left.min(JOINER_ATTEMPTS_PER_FLOW),
+                record.outcome_pending,
+            ),
+            None => (JOINER_ATTEMPTS_PER_FLOW, false),
+        };
+        // A pending outcome is learned from step 2, which needs no fresh
+        // ticket: a grant outlives its invitation.
+        if !outcome_pending {
+            ticket
+                .check_fresh_for_joiner(now)
+                .map_err(|_| JoinerError::Expired)?;
+            if ticket.kind == InvitationKind::SendLink && attempts_left == 0 {
+                return Err(JoinerError::AttemptsExhausted);
+            }
+        }
         Ok(Self {
-            ticket_hash: ticket.hash(),
+            ticket_hash,
             ticket,
             joiner,
             name,
             factory,
             state: JoinerState::Connecting,
-            attempts_left: JOINER_ATTEMPTS_PER_FLOW,
+            attempts_left,
             attempt: None,
             exporters: None,
-            outcome_pending: false,
+            outcome_pending,
             host_pinned: false,
+            live_before_answer: false,
         })
+    }
+
+    /// The flow's durable part. Store it, keyed by the ticket hash,
+    /// whenever it changes: before sending the first message of an attempt
+    /// ([`JoinerPairing::submit_code`] debits first), and after
+    /// [`JoinerPairing::on_closed`] or any call that ends the flow.
+    pub fn record(&self) -> JoinerRecord {
+        JoinerRecord {
+            ticket_hash: self.ticket_hash,
+            attempts_left: self.attempts_left,
+            outcome_pending: self.outcome_pending,
+        }
     }
 
     /// Say whether this device already holds a pin for the ticket's host
@@ -216,6 +367,7 @@ impl<F: CodeExchangeFactory> JoinerPairing<F> {
         }
         self.attempt = None;
         self.exporters = Some(exporters);
+        self.live_before_answer = false;
         self.state = JoinerState::AwaitingAdmission;
         let mac = join_proof_mac(
             &self.ticket.secret,
@@ -232,9 +384,20 @@ impl<F: CodeExchangeFactory> JoinerPairing<F> {
     }
 
     /// The host sent `AUTHORIZED`.
+    ///
+    /// A host whose grant table already holds this device says
+    /// `AUTHORIZED {live}` from step 2, before it reads the proof, and then
+    /// answers the proof with a second `AUTHORIZED`: `join_only` when the
+    /// proof opens a pairing (which will replace the grant), `live` when it
+    /// does not. The first `live` is therefore only a notice; the flow acts
+    /// on the answer.
     pub fn on_authorized(&mut self, state: AuthorizedState) -> Vec<JoinerAction> {
         if self.state != JoinerState::AwaitingAdmission {
             return self.fail(ErrorCode::ProtocolError);
+        }
+        if state == AuthorizedState::Live && !self.live_before_answer {
+            self.live_before_answer = true;
+            return Vec::new();
         }
         match state {
             AuthorizedState::JoinOnly => {
@@ -307,8 +470,6 @@ impl<F: CodeExchangeFactory> JoinerPairing<F> {
                 self.attempt = Some(JoinerAttempt {
                     id: attempt,
                     exchange: Some(exchange),
-                    last_sent: message.clone(),
-                    last_received: None,
                 });
                 self.state = JoinerState::Exchanging;
                 Ok(vec![JoinerAction::Send(message)])
@@ -317,18 +478,8 @@ impl<F: CodeExchangeFactory> JoinerPairing<F> {
         }
     }
 
-    /// The last message of the current attempt, byte-identical, for a resend
-    /// on the same connection.
-    pub fn resend(&self) -> Option<ControlMessage> {
-        match self.state {
-            JoinerState::Exchanging | JoinerState::AwaitingPaired => {
-                self.attempt.as_ref().map(|a| a.last_sent.clone())
-            }
-            _ => None,
-        }
-    }
-
-    /// The host sent `CODE_EXCHANGE`.
+    /// The host sent `CODE_EXCHANGE`. A message that does not fit the
+    /// attempt's next step, including a repeat, fails the attempt.
     pub fn on_code_exchange(&mut self, attempt: AttemptId, payload: &[u8]) -> Vec<JoinerAction> {
         if self.state != JoinerState::Exchanging {
             return Vec::new();
@@ -339,10 +490,6 @@ impl<F: CodeExchangeFactory> JoinerPairing<F> {
         if current.id != attempt {
             return Vec::new(); // a late message for an abandoned attempt
         }
-        if current.last_received.as_deref() == Some(payload) {
-            return Vec::new(); // the host repeated itself; we already answered
-        }
-        current.last_received = Some(payload.to_vec());
         let Some(exchange) = current.exchange.as_mut() else {
             return Vec::new();
         };
@@ -350,9 +497,10 @@ impl<F: CodeExchangeFactory> JoinerPairing<F> {
             Ok(step) => {
                 let mut actions = Vec::new();
                 if let Some(payload) = step.send {
-                    let message = ControlMessage::CodeExchange { attempt, payload };
-                    current.last_sent = message.clone();
-                    actions.push(JoinerAction::Send(message));
+                    actions.push(JoinerAction::Send(ControlMessage::CodeExchange {
+                        attempt,
+                        payload,
+                    }));
                 }
                 if step.peer_confirmed {
                     current.exchange = None;

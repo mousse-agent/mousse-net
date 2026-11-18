@@ -27,6 +27,28 @@ phases must add. Each later phase updates this document before it ships.
 - **Grants and denials** stay on the host. No list of paired devices leaves
   it.
 
+## What the far end of a connection learns
+
+- **The identity key is a stable identifier.** It never changes for an
+  endpoint, so anyone who learns it can recognise that endpoint again. A
+  host sends its certificate to every caller that reaches its port, so an
+  active prober on the network learns the host's identity key and can tell
+  later that it is the same host. A caller sends its certificate only after
+  the host's certificate passed step 1 against the caller's pin, so a caller
+  reveals its identity key only to the endpoint its pin (or ticket) names.
+- **A fake host learns who is joining.** A swapped "Send link" names the
+  fake host's key, so step 1 passes against it, and the joiner sends its
+  identity key and its `JOIN_PROOF` name before the code exchange has shown
+  that the far end is the real host. The code exchange then fails, but the
+  fake host keeps what it learned. To keep that small, a "Send link" joiner
+  sends only the computer name in `JOIN_PROOF`, never its profile label
+  ([`wire.md`](wire.md) 10.3). The label is meant to follow only after the
+  host's confirmation verified; version 1 has no message for that yet, so a
+  send-link grant is named after the computer.
+- An in-person ticket is accepted only from the app's own scanner
+  ([`wire.md`](wire.md) 10.1), so a swapped link cannot make the joiner send
+  its full name to a fake host that way.
+
 ## To be filled in by later phases
 
 These headings come from the plan. Each must say what each party can see and

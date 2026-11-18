@@ -706,14 +706,41 @@ async fn a_lost_paired_is_settled_by_reconnecting_with_the_same_join() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_send_link_ends_already_paired_only_for_a_host_pinned_before() {
+async fn a_granted_device_pairs_again_by_link_and_already_paired_needs_a_pin() {
     let mut host = TestHost::start(new_signer()).await;
-    let caller = new_caller(new_signer());
+    let caller = Arc::new(new_caller(new_signer()));
     drop(pair(&caller, &mut host, "laptop").await);
+    let old = host.grant_of(&caller.identity()).unwrap();
 
-    // The device has a grant, but does not claim to know this host: a send
-    // link must not skip the code exchange on the host's word alone.
+    // The device has a grant but no pin: an open send link starts a normal
+    // code exchange on the live connection, and enrollment replaces the
+    // grant.
     let ticket = host.invite_kind(InvitationKind::SendLink);
+    let (type_tx, typed) = mpsc::unbounded_channel();
+    let (asks, mut asks_rx) = mpsc::unbounded_channel();
+    let join = {
+        let (caller, ticket, route) = (caller.clone(), ticket.clone(), host.route());
+        tokio::spawn(async move {
+            let pipe = connect_tcp(&route).await?;
+            let mut codes = TypedCodes { asks, typed };
+            caller
+                .join_with_code(pipe, &ticket, "laptop", &mut codes)
+                .await
+        })
+    };
+    let code = host.next_code().await;
+    assert_eq!(within("ask", asks_rx.recv()).await, Some(None));
+    type_tx.send(code).unwrap();
+    let (conn, outcome) = within("join", join).await.unwrap().unwrap();
+    assert!(matches!(outcome, JoinOutcome::Paired(_)), "{outcome:?}");
+    let new = host.grant_of(&caller.identity()).unwrap();
+    assert_ne!(new, old);
+    open_echo(&conn).await;
+    drop(conn);
+
+    // The invitation is consumed now, so a proof opens nothing and the host
+    // answers live. Without a pin from before, a send link must not end
+    // "already paired" on the host's word alone.
     let pipe = connect_tcp(&host.route()).await.unwrap();
     let err = within(
         "join",

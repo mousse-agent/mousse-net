@@ -20,14 +20,14 @@ use mousse_net_core::authz::{
 use mousse_net_core::control::{
     negotiate_version, AuthorizedState, ControlMessage, VersionSupport,
 };
-use mousse_net_core::grants::{GrantTable, OwnerRef, Role};
+use mousse_net_core::grants::{GrantTable, NewGrant, OwnerRef, Role};
 use mousse_net_core::identity::{IdentityPublicKey, SoftwareKey};
 use mousse_net_core::mux::Frame;
 use mousse_net_core::pairing::{
-    attempt_sid, binding_transcript, AttemptId, CpaceExchangeFactory, HostAction, HostPairing,
-    HostPairingError, InvitationId, InvitationKind, InvitationParams, InvitationStatus,
-    JoinerAction, JoinerError, JoinerPairing, JoinerState, PairingCode, SessionExporters, Ticket,
-    TicketSecret,
+    attempt_sid, binding_transcript, Arrival, AttemptId, CpaceExchangeFactory, HostAction,
+    HostPairing, HostPairingError, InvitationId, InvitationKind, InvitationParams,
+    InvitationStatus, JoinerAction, JoinerError, JoinerPairing, JoinerRecord, JoinerState,
+    PairingCode, SessionExporters, Ticket, TicketSecret,
 };
 use mousse_net_core::{ConnectionId, ErrorCode, Millis, UnixTime};
 use rand_core::{TryCryptoRng, TryRng};
@@ -141,6 +141,9 @@ fn joiner_error_name(e: JoinerError) -> &'static str {
         JoinerError::AttemptsExhausted => "attempts_exhausted",
         JoinerError::Expired => "expired",
         JoinerError::InvalidName => "invalid_name",
+        JoinerError::InPersonFromLink => "in_person_from_link",
+        JoinerError::OwnTicket => "own_ticket",
+        JoinerError::BadRecord => "bad_record",
     }
 }
 
@@ -367,6 +370,25 @@ impl World {
                 };
                 self.host_actions(actions)
             }
+            ("host", "grant") => {
+                // The host already grants the joiner, from an earlier
+                // pairing whose pin the joiner has since lost.
+                let (_, events) = self
+                    .grants
+                    .add(
+                        NewGrant {
+                            identity: joiner_key(),
+                            name: s(&step["name"]).into(),
+                            role: Role::new(ROLE).expect("role"),
+                            authorizing_owner: OwnerRef::from_bytes(AUTHORIZING_OWNER),
+                            expires_at: None,
+                        },
+                        now,
+                    )
+                    .expect("grant");
+                assert!(events.is_empty());
+                Vec::new()
+            }
             ("host", "approve") => {
                 let conn = u(&step["conn"]);
                 let invitation = self.invitation.expect("created");
@@ -380,11 +402,26 @@ impl World {
             }
             (name, "start") => {
                 let ticket = Ticket::decode(&unhex(&step["ticket"])).expect("ticket");
+                let arrival = match s(&step["arrival"]) {
+                    "in_app_scan" => Arrival::InAppScan,
+                    "link" => Arrival::Link,
+                    other => panic!("arrival {other}"),
+                };
+                let identity = match step.get("identity").map(s) {
+                    None => joiner_key(),
+                    Some("host") => host_key(),
+                    Some(other) => panic!("identity {other}"),
+                };
+                let stored = step
+                    .get("record")
+                    .map(|r| JoinerRecord::from_bytes(&unhex(r)).expect("record"));
                 let pairing = JoinerPairing::new(
                     ticket,
-                    joiner_key(),
+                    arrival,
+                    identity,
                     JOINER_NAME.into(),
                     CpaceExchangeFactory,
+                    stored.as_ref(),
                     now,
                 );
                 match pairing {
@@ -431,10 +468,22 @@ impl World {
                 j.gate = CallerGate::new();
                 let proof = j.pairing.as_mut().expect("started").on_connected(exp, now);
                 match proof {
-                    Ok(m) => out.push(send(name, conn, &m)),
+                    Ok(m) => {
+                        j.gate.sent_join_proof();
+                        out.push(send(name, conn, &m));
+                    }
                     Err(e) => out.push(json!({ "error": joiner_error_name(e) })),
                 }
                 out
+            }
+            (name, "save") => {
+                let record = self
+                    .joiner(name)
+                    .pairing
+                    .as_ref()
+                    .expect("started")
+                    .record();
+                vec![json!({ "record": hex(&record.to_bytes()) })]
             }
             (name, "receive") => {
                 let bytes = unhex(&step["control"]);
@@ -794,8 +843,15 @@ fn create(kind: u64) -> J {
     json!({ "party": "host", "event": "create", "kind": kind })
 }
 
+/// The joiner opens a send link (or anything else that is not the in-app
+/// scanner).
 fn start(ticket: &J) -> J {
-    json!({ "party": "a", "event": "start", "ticket": ticket })
+    json!({ "party": "a", "event": "start", "ticket": ticket, "arrival": "link" })
+}
+
+/// The joiner scans the ticket with the app's own scanner.
+fn scan(ticket: &J) -> J {
+    json!({ "party": "a", "event": "start", "ticket": ticket, "arrival": "in_app_scan" })
 }
 
 fn connect(name: &str, conn: u64, exporters: J) -> J {
@@ -810,7 +866,7 @@ fn in_person() -> J {
     let mut r = Recorder::new(json!({ "host": ticket_draws("in_person"), "joiners": { "a": [] } }));
     r.event(create(1));
     let t = r.ticket();
-    r.event(start(&t));
+    r.event(scan(&t));
     r.event(connect("a", 1, exporter_pair("in_person/conn1")));
     r.event(json!({ "party": "host", "event": "approve", "conn": 1 }));
     r.finish(
@@ -919,8 +975,8 @@ fn tampered_tickets() -> J {
     wrong_secret.secret = TicketSecret::from_bytes(secret);
     let mut wrong_invitation = real.clone();
     wrong_invitation.invitation.0[15] ^= 0x01;
-    r.event(json!({ "party": "a", "event": "start", "ticket": hex(&wrong_secret.encode()) }));
-    r.event(json!({ "party": "b", "event": "start", "ticket": hex(&wrong_invitation.encode()) }));
+    r.event(json!({ "party": "a", "event": "start", "ticket": hex(&wrong_secret.encode()), "arrival": "link" }));
+    r.event(json!({ "party": "b", "event": "start", "ticket": hex(&wrong_invitation.encode()), "arrival": "link" }));
     r.event(connect("a", 1, exporter_pair("tampered/conn1")));
     r.event(connect("b", 2, exporter_pair("tampered/conn2")));
     r.finish(
@@ -983,7 +1039,7 @@ fn outcome_after_lost_paired() -> J {
     r.event(connect("a", 2, exporter_pair("lost_paired/conn2")));
     r.finish(
         "outcome_after_lost_paired",
-        "The host verifies the joiner's confirmation, enrolls it and sends PAIRED, but the connection breaks before PAIRED arrives. The joiner keeps its outcome pending, reconnects with the same ticket and, as on every connection of a pairing flow, sends JOIN_PROOF right after its HELLO without waiting for the host. Step 2 finds the live grant: the host sends AUTHORIZED live and ignores the proof. The joiner ends already paired.",
+        "The host verifies the joiner's confirmation, enrolls it and sends PAIRED, but the connection breaks before PAIRED arrives. The joiner keeps its outcome pending, reconnects with the same ticket and, as on every connection of a pairing flow, sends JOIN_PROOF right after its HELLO without waiting for the host. Step 2 finds the live grant: the host sends AUTHORIZED live at once. It then answers the proof: the invitation is consumed, so it opens nothing and the answer is AUTHORIZED live again (current access). The joiner takes the first live as a notice and the answer as its outcome: already paired.",
         2,
     )
 }
@@ -996,7 +1052,7 @@ fn send_link_live_needs_a_pin() -> J {
     r.event(create(2));
     let t = r.ticket();
     r.event(start(&t));
-    r.event(json!({ "party": "b", "event": "start", "ticket": t, "host_pinned": true }));
+    r.event(json!({ "party": "b", "event": "start", "ticket": t, "arrival": "link", "host_pinned": true }));
     // The far end is whoever the swapped link names: it answers from a
     // script.
     r.pump = false;
@@ -1006,13 +1062,119 @@ fn send_link_live_needs_a_pin() -> J {
         r.event(c);
         let from_fake = |m: ControlMessage| json!({ "party": name, "event": "receive", "control": hex(&m.encode()) });
         r.event(from_fake(ControlMessage::hello()));
-        r.event(from_fake(ControlMessage::Authorized {
-            state: AuthorizedState::Live,
-        }));
+        // Step 2's notice, then the answer to the proof.
+        for _ in 0..2 {
+            r.event(from_fake(ControlMessage::Authorized {
+                state: AuthorizedState::Live,
+            }));
+        }
     }
     r.finish(
         "send_link_live_needs_a_pin",
-        "A send link can be swapped in transit for one that names another key; step 1 then passes against whoever holds that key, and it answers AUTHORIZED live at once. Joiner a has no pin for that key from before: it does not end already paired, fails with pairing_failed and pins nothing. Joiner b held a pin for the ticket's host before this flow (start with host_pinned): it ends already paired. A joiner learning the outcome of its own lost PAIRED is outcome_after_lost_paired.",
+        "A send link can be swapped in transit for one that names another key; step 1 then passes against whoever holds that key, and it answers AUTHORIZED live from step 2 and AUTHORIZED live again as its answer to the proof. Joiner a has no pin for that key from before: on the answer it does not end already paired, fails with pairing_failed and pins nothing. Joiner b held a pin for the ticket's host before this flow (start with host_pinned): it ends already paired. A joiner learning the outcome of its own lost PAIRED is outcome_after_lost_paired.",
+        2,
+    )
+}
+
+fn re_pair_while_granted() -> J {
+    let flow = "re_pair";
+    let mut host = ticket_draws(flow);
+    host.push(u32_draw("code", 202_611));
+    host.push(u32_draw("next_code", 777_001));
+    host.push(bytes_draw("cpace_scalar_yb", "re_pair/yb1", 32));
+    let mut r = Recorder::new(json!({ "host": host, "joiners": { "a": attempt_draws(flow, 1) } }));
+    r.event(create(2));
+    r.event(json!({ "party": "host", "event": "grant", "name": "Old phone" }));
+    let t = r.ticket();
+    r.event(start(&t));
+    r.event(connect("a", 1, exporter_pair("re_pair/conn1")));
+    r.event(submit("202611"));
+    r.finish(
+        "re_pair_while_granted",
+        "The host still holds a grant for the joiner from an earlier pairing, but the joiner has lost its pin (no host_pinned). It opens a new send link. Step 2 finds the grant: the host binds the connection to it and sends AUTHORIZED live. The joiner takes that as a notice only, since it sent a proof. The proof is valid for an open invitation, so the host answers AUTHORIZED join_only (the connection is now pairing only) and shows the code. A normal code exchange follows; enrollment replaces the old grant (wire.md 7), and the connection becomes live under the new one.",
+        2,
+    )
+}
+
+fn swapped_in_person_link() -> J {
+    // The ticket comes from whoever swapped the link (here the world's host
+    // plays that part): it says "in person", which would skip the code.
+    let mut r = Recorder::new(
+        json!({ "host": ticket_draws("swapped_in_person"), "joiners": { "a": [], "b": [] } }),
+    );
+    r.event(create(1));
+    let t = r.ticket();
+    r.event(start(&t));
+    r.event(json!({ "party": "b", "event": "start", "ticket": t, "arrival": "link", "host_pinned": true }));
+    r.finish(
+        "swapped_in_person_link",
+        "A link is swapped in transit for an in-person ticket that names another key. In person skips the code, so such a ticket is accepted only from the app's own scanner. Joiner a opens it as a link: the flow is refused before dialing (in_person_from_link, reported as pairing_failed), so the far end can neither say AUTHORIZED live (already paired) nor send PAIRED after a fake approval, and nothing is pinned. Joiner b, which already holds a pin for that key, is refused the same way: the arrival decides, not the pin.",
+        1,
+    )
+}
+
+fn own_ticket() -> J {
+    let mut r =
+        Recorder::new(json!({ "host": ticket_draws("own_ticket"), "joiners": { "a": [] } }));
+    r.event(create(1));
+    let t = r.ticket();
+    r.event(json!({ "party": "a", "event": "start", "ticket": t, "arrival": "in_app_scan", "identity": "host" }));
+    r.finish(
+        "own_ticket",
+        "A device scans its own invitation: the ticket's host identity is its own identity. The flow is refused before dialing (own_ticket, reported as pairing_failed). A host that receives a join proof from its own identity closes with not_authorized (pairing-attempts.json, sequence join_proof_from_own_identity).",
+        1,
+    )
+}
+
+fn joiner_cap_survives_reopening() -> J {
+    let flow = "cap_reopen";
+    let mut host = ticket_draws(flow);
+    host.push(u32_draw("code", 535_353));
+    let joiner: Vec<J> = (1..=3).flat_map(|n| attempt_draws(flow, n)).collect();
+    let mut r = Recorder::new(json!({ "host": host, "joiners": { "a": joiner } }));
+    r.event(create(2));
+    let t = r.ticket();
+    r.event(start(&t));
+    r.pump = false;
+    let from_fake = |m: ControlMessage| json!({ "party": "a", "event": "receive", "control": hex(&m.encode()) });
+    let mut record = J::Null;
+    for (conn, codes) in [(1, 2), (2, 1)] {
+        if conn == 2 {
+            // The app was killed and the link opened again: the flow starts
+            // from the stored record.
+            r.event(json!({ "party": "a", "event": "start", "ticket": t, "arrival": "link", "record": record }));
+        }
+        let mut c = connect("a", conn, exporter_pair(&format!("{flow}/conn{conn}")));
+        c["host"] = json!(false);
+        r.event(c);
+        r.event(from_fake(ControlMessage::hello()));
+        r.event(from_fake(ControlMessage::Authorized {
+            state: AuthorizedState::JoinOnly,
+        }));
+        for _ in 0..codes {
+            let out = r.event(submit("535353"));
+            let attempt = out
+                .iter()
+                .find_map(|o| o.get("attempt"))
+                .map(|a| AttemptId(unhex(&a["id"]).try_into().expect("16 bytes")))
+                .expect("attempt started");
+            r.event(from_fake(ControlMessage::CodeAbort {
+                attempt,
+                code: ErrorCode::PairingFailed,
+            }));
+        }
+        let out = r.event(json!({ "party": "a", "event": "save" }));
+        record = out[0]["record"].clone();
+        if conn == 1 {
+            r.event(json!({ "party": "a", "event": "drop" }));
+        }
+    }
+    r.event(
+        json!({ "party": "a", "event": "start", "ticket": t, "arrival": "link", "record": record }),
+    );
+    r.finish(
+        "joiner_cap_survives_reopening",
+        "The joiner's 3 attempts are kept per ticket hash in a stored record, so neither killing the app nor opening the link again resets them. Against a far end that aborts every attempt, the joiner spends 2 attempts, saves its record and the connection drops. Opening the link again with that record leaves 1 attempt; it is spent, the flow fails with attempts_exhausted, and a further start with the saved record is refused at once.",
         2,
     )
 }
@@ -1027,8 +1189,8 @@ fn document() -> J {
             "invitation": { "role": ROLE, "authorizing_owner": hex(&AUTHORIZING_OWNER), "routes": [ROUTE], "grant_expires_at": null },
             "draws": "Each party takes its draws in order. A `bytes` draw fills a request of exactly that length; a `u32` draw answers a request for a 32-bit integer. Host: invitation id (16), ticket secret (16), for send link the code (u32, drawn again while at least 4294000000); then for each new attempt the next code (u32, only while attempts are left after the debit) and the CPace scalar yb (32). Joiner: for each attempt the attempt id (16) and the CPace scalar ya (32). A CPace scalar is the 32 bytes with the top four bits of the last byte cleared, read little-endian.",
             "exporters": "Stand-in TLS exporter values per connection. Unless `host_exporters` is given, both ends see the same session.",
-            "events": "host/create: create an invitation of `kind`. <joiner>/start: the joiner opens `ticket`; `host_pinned`: it already held a pin for the ticket's host from an earlier pairing. <joiner>/connect: a new TLS connection `conn`; both ends send HELLO, the host runs step 2 at once (a live grant: AUTHORIZED live; no grant: await the join proof, sending nothing) and the joiner sends JOIN_PROOF right after its HELLO without waiting; with `host: false` the far end is scripted. <joiner>/drop: the joiner's connection breaks with no GOAWAY either way. host/receive and <joiner>/receive: a CONTROL message arrives (checked by that end's gate first). <joiner>/goaway: the host's GOAWAY arrives. <joiner>/submit_code: the owner types `code`. host/approve: the host owner approves the device on `conn`.",
-            "outputs": "send: a control message with its CONTROL frame. close: GOAWAY with its frame. attempt: the CPace inputs of a new attempt (CI is the binding transcript; sid as in wire.md). version: the minor version agreed from a HELLO. Others name host or joiner events: show_code, ask_approval, admitted_join_only, enrolled, invitation_ended, paired, code_rejected, failed (the joiner's flow ends with this code: its gate closes, and unless the step was a goaway or a drop, the joiner then closes the connection with GOAWAY of that code after any message listed before it in the step, wire.md 10.6 rule 9; that GOAWAY is not listed as a separate close), error, ignored.",
+            "events": "host/create: create an invitation of `kind`. host/grant: the host adds a grant named `name` for the joiner's identity (role and authorizing owner as for invitations), as left by an earlier pairing. <joiner>/start: the joiner opens `ticket` that arrived by `arrival` (in_app_scan: the app's own scanner; link: anything else); `host_pinned`: it already held a pin for the ticket's host from an earlier pairing; `record`: the stored flow record for this ticket, from an earlier save; `identity: host`: the joiner uses the host's identity key. <joiner>/save: output the flow's record as stored. <joiner>/connect: a new TLS connection `conn`; both ends send HELLO, the host runs step 2 at once (a live grant: AUTHORIZED live, and the proof is answered with a second AUTHORIZED when it arrives; no grant: await the join proof, sending nothing) and the joiner sends JOIN_PROOF right after its HELLO without waiting; with `host: false` the far end is scripted. <joiner>/drop: the joiner's connection breaks with no GOAWAY either way. host/receive and <joiner>/receive: a CONTROL message arrives (checked by that end's gate first). <joiner>/goaway: the host's GOAWAY arrives. <joiner>/submit_code: the owner types `code`. host/approve: the host owner approves the device on `conn`.",
+            "outputs": "send: a control message with its CONTROL frame. close: GOAWAY with its frame. attempt: the CPace inputs of a new attempt (CI is the binding transcript; sid as in wire.md). version: the minor version agreed from a HELLO. record: the joiner's stored flow record (canonical CBOR, wire.md 10.7; a local format). Others name host or joiner events: show_code, ask_approval, admitted_join_only, enrolled, invitation_ended, paired, code_rejected, failed (the joiner's flow ends with this code: its gate closes, and unless the step was a goaway or a drop, the joiner then closes the connection with GOAWAY of that code after any message listed before it in the step, wire.md 10.6 rule 9; that GOAWAY is not listed as a separate close), error, ignored.",
         },
         "flows": [
             in_person(),
@@ -1039,6 +1201,10 @@ fn document() -> J {
             proof_on_another_session(),
             outcome_after_lost_paired(),
             send_link_live_needs_a_pin(),
+            re_pair_while_granted(),
+            swapped_in_person_link(),
+            own_ticket(),
+            joiner_cap_survives_reopening(),
         ],
     })
 }

@@ -177,8 +177,6 @@ enum AttemptState {
 
 struct HostAttempt<E> {
     exchange: Option<E>,
-    last_received: Vec<u8>,
-    last_reply: Option<ControlMessage>,
     state: AttemptState,
 }
 
@@ -332,7 +330,15 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
             .min()
     }
 
-    /// A `JOIN_PROOF` arrived on a connection whose peer had no live grant.
+    /// A `JOIN_PROOF` arrived.
+    ///
+    /// On a connection waiting for a proof, a valid proof for an open
+    /// invitation admits it (join-only); anything else closes it. On a
+    /// **live** connection (bound to the peer's grant in `grants`), the host
+    /// already said `AUTHORIZED {live}` and now answers the proof with one
+    /// more `AUTHORIZED`: `join_only` if the proof is valid for an open
+    /// invitation (the pairing that follows replaces the grant), else
+    /// `live` again. Either way a live connection is never closed here.
     #[allow(clippy::too_many_arguments)]
     pub fn on_join_proof(
         &mut self,
@@ -349,11 +355,29 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
         if self.by_conn.contains_key(&conn) {
             return close(ErrorCode::ProtocolError);
         }
-        if grants.is_denied(joiner) {
+        // A device never pairs with itself.
+        if grants.is_denied(joiner) || *joiner == self.host_identity {
             return close(ErrorCode::NotAuthorized);
         }
+        let live = grants.binding(conn).is_some();
+        let refuse = || {
+            if live {
+                // Current access stands; the proof opened nothing.
+                vec![HostAction::Send {
+                    conn,
+                    message: ControlMessage::Authorized {
+                        state: AuthorizedState::Live,
+                    },
+                }]
+            } else {
+                vec![HostAction::Close {
+                    conn,
+                    code: ErrorCode::InvitationInvalid,
+                }]
+            }
+        };
         let Some(inv) = self.invitations.get_mut(invitation) else {
-            return close(ErrorCode::InvitationInvalid);
+            return refuse();
         };
         if !inv.is_open(now)
             || !verify_join_proof(
@@ -365,7 +389,7 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
                 mac,
             )
         {
-            return close(ErrorCode::InvitationInvalid);
+            return refuse();
         }
         inv.joiners.insert(
             conn,
@@ -388,12 +412,18 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
                 },
             },
         ];
-        match (&inv.code, inv.params.kind) {
-            (Some(code), InvitationKind::SendLink) => actions.push(HostAction::ShowCode {
-                invitation: *invitation,
-                code: code.clone(),
-            }),
-            _ => actions.push(HostAction::AskApproval {
+        match inv.params.kind {
+            InvitationKind::SendLink => {
+                // The code is already on screen; show it again for this
+                // joiner. A send-link invitation never asks for approval.
+                if let Some(code) = &inv.code {
+                    actions.push(HostAction::ShowCode {
+                        invitation: *invitation,
+                        code: code.clone(),
+                    });
+                }
+            }
+            InvitationKind::InPerson => actions.push(HostAction::AskApproval {
                 invitation: *invitation,
                 conn,
                 joiner: *joiner,
@@ -462,18 +492,9 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
         let key = (conn, attempt);
         let mut actions = Vec::new();
         if let Some(existing) = inv.attempts.get(&key) {
-            if existing.last_received == payload {
-                // A byte-identical resend on the same attempt and session:
-                // answer with the same bytes, do no new work.
-                return existing
-                    .last_reply
-                    .iter()
-                    .map(|m| HostAction::Send {
-                        conn,
-                        message: m.clone(),
-                    })
-                    .collect();
-            }
+            // A message for an attempt that already ended, including a
+            // repeat, gets an abort and no work. A repeat while it runs
+            // does not fit the next step and fails it below.
             if existing.state != AttemptState::Running {
                 return vec![HostAction::Send {
                     conn,
@@ -484,19 +505,9 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
                 }];
             }
         } else {
-            // An attempt id already seen on another connection is a replay:
-            // its binding holds the old session's exporter, so it can never
-            // succeed. Refuse it before the debit, with no exchange work, so
-            // replays cannot spend the invitation's attempts.
-            if inv.attempts.keys().any(|(_, seen)| *seen == attempt) {
-                return vec![HostAction::Send {
-                    conn,
-                    message: ControlMessage::CodeAbort {
-                        attempt,
-                        code: ErrorCode::PairingFailed,
-                    },
-                }];
-            }
+            // A new attempt on this connection. (An id seen on another
+            // connection is new here: its binding holds the other session's
+            // exporter, so it is debited and then fails.)
             if inv.attempts_left == 0 {
                 return vec![HostAction::Close {
                     conn,
@@ -538,8 +549,6 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
                 key,
                 HostAttempt {
                     exchange: Some(exchange),
-                    last_received: Vec::new(),
-                    last_reply: None,
                     state: AttemptState::Running,
                 },
             );
@@ -548,22 +557,16 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
         let Some(record) = inv.attempts.get_mut(&key) else {
             return actions;
         };
-        record.last_received = payload.to_vec();
         let result = match record.exchange.as_mut() {
             Some(exchange) => exchange.step(Some(payload)),
             None => return actions,
         };
         match result {
             Ok(step) => {
-                let reply = step
-                    .send
-                    .map(|payload| ControlMessage::CodeExchange { attempt, payload });
-                record.last_reply = reply.clone();
-                actions.extend(
-                    reply
-                        .into_iter()
-                        .map(|message| HostAction::Send { conn, message }),
-                );
+                actions.extend(step.send.map(|payload| HostAction::Send {
+                    conn,
+                    message: ControlMessage::CodeExchange { attempt, payload },
+                }));
                 if step.peer_confirmed {
                     record.state = AttemptState::Succeeded;
                     record.exchange = None;
@@ -578,7 +581,6 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
                 };
                 record.state = AttemptState::Failed;
                 record.exchange = None;
-                record.last_reply = Some(abort.clone());
                 actions.push(HostAction::Send {
                     conn,
                     message: abort,
@@ -644,6 +646,10 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
         let Some(joiner) = inv.joiners.remove(&conn) else {
             return Vec::new();
         };
+        // A pairing on a connection that was live under the device's old
+        // grant: the new grant replaces the old one (section 7), whose other
+        // connections close, while this one moves to the new grant.
+        grants.unbind(conn);
         let new_grant = NewGrant {
             identity: joiner.identity,
             name: joiner.name,

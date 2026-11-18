@@ -37,8 +37,8 @@ use mousse_net_core::control::{AuthorizedState, ControlMessage};
 use mousse_net_core::identity::IdentityPublicKey;
 use mousse_net_core::mux::MuxRole;
 use mousse_net_core::pairing::{
-    CodeExchangeFactory, CpaceExchangeFactory, InvitationKind, JoinerAction, JoinerPairing,
-    JoinerState, PairedHost, PairingCode, Ticket,
+    Arrival, CodeExchangeFactory, CpaceExchangeFactory, InvitationKind, JoinerAction,
+    JoinerPairing, JoinerState, PairedHost, PairingCode, Ticket,
 };
 use mousse_net_core::session::{PeerSession, SessionEvent};
 use mousse_net_core::session_cert::CertError;
@@ -276,6 +276,7 @@ where
                     &handshake.peer,
                     handshake.local_window,
                     self.clock.now(),
+                    self.clock.mono(),
                 ) {
                     Ok(events) => paths.run(events),
                     // The control build lets a different identity through.
@@ -485,11 +486,20 @@ where
         D: FnMut() -> Fut,
         Fut: Future<Output = Result<P, NetError>>,
     {
+        // How the ticket arrived and its stored flow record are not passed
+        // in yet: an in-person ticket is taken as scanned in the app, and
+        // each join starts with no record.
+        let arrival = match ticket.kind {
+            InvitationKind::InPerson => Arrival::InAppScan,
+            InvitationKind::SendLink => Arrival::Link,
+        };
         let mut joiner = JoinerPairing::new(
             ticket.clone(),
+            arrival,
             self.identity(),
             name.to_owned(),
             self.factory.clone(),
+            None,
             self.clock.now(),
         )
         .map_err(|e| NetError::Ticket(e.to_string()))?;
@@ -612,12 +622,13 @@ where
             return;
         }
         let now = caller.clock.now();
+        let mono = caller.clock.mono();
         let due: Vec<(IdentityPublicKey, ConnectionId)> = {
             let mut paths = lock(&caller.paths);
             let mut due = Vec::new();
             let mut other = Vec::new();
             for (pin, session) in paths.sessions.iter_mut() {
-                for event in session.tick(now) {
+                for event in session.tick(now, mono) {
                     match event {
                         SessionEvent::RenewDue { conn } => due.push((*pin, conn)),
                         event => other.push(event),
@@ -687,6 +698,7 @@ where
     fn on_start(&mut self, out: &mut Outbox) {
         if let Some(proof) = self.proof.take() {
             out.control.push(proof);
+            self.gate.sent_join_proof();
         }
     }
 

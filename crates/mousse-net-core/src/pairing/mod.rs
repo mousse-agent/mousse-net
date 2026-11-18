@@ -11,7 +11,7 @@
 //! The code exchange itself sits behind [`CodeExchange`]; the real one is
 //! CPace ([`CpaceExchangeFactory`]), with the joiner as initiator and the host
 //! as responder. This module owns the binding transcript and session id it
-//! must use, attempt limits, resends and atomic one-enrollment consumption.
+//! must use, attempt limits and atomic one-enrollment consumption.
 
 mod exchange;
 mod host;
@@ -33,7 +33,8 @@ pub use host::{
     InvitationStatus, HOST_ATTEMPTS_PER_INVITATION,
 };
 pub use joiner::{
-    JoinerAction, JoinerError, JoinerPairing, JoinerState, PairedHost, JOINER_ATTEMPTS_PER_FLOW,
+    Arrival, JoinerAction, JoinerError, JoinerPairing, JoinerRecord, JoinerState, PairedHost,
+    CODE_FAILED_MESSAGE, JOINER_ATTEMPTS_PER_FLOW, JOINER_RECORD_DOMAIN,
 };
 pub use proof::{
     attempt_sid, binding_transcript, join_proof_input, join_proof_mac, verify_join_proof,

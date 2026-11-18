@@ -25,8 +25,8 @@ use crate::identity::{IdentityPublicKey, RawSignature, SoftwareKey};
 use crate::mux::{Frame, PriorityClass, StreamId};
 use crate::pairing::CpaceExchangeFactory;
 use crate::pairing::{
-    attempt_sid, binding_transcript, join_proof_input, join_proof_mac, AttemptId, HostAction,
-    HostPairing, HostPairingError, InvitationId, InvitationKind, InvitationParams,
+    attempt_sid, binding_transcript, join_proof_input, join_proof_mac, Arrival, AttemptId,
+    HostAction, HostPairing, HostPairingError, InvitationId, InvitationKind, InvitationParams,
     InvitationStatus, JoinerAction, JoinerPairing, JoinerState, PairingCode, Route, RouteHost,
     SessionExporters, Ticket, TicketSecret, JOIN_PROOF_KEY_INFO, SID_DOMAIN, TICKET_VERSION,
 };
@@ -122,7 +122,7 @@ fn session_cert_vectors() -> J {
     let window = ValidityWindow::new(UnixTime(nb), UnixTime(na)).expect("window");
 
     let pending = PendingCertificate::new(session(&SESSION_1), window);
-    let record = pending.record().to_vec();
+    let record = pending.record().as_bytes().to_vec();
     let identity_signature = a.sign_raw(&record);
     let cert = pending
         .finish(a.public_key(), identity_signature)
@@ -309,6 +309,8 @@ fn session_cert_vectors() -> J {
         cert_case("precedence_version_before_identity_key", "Version 2 and an off-curve identity key: check 2 comes before check 3.", &version_2_off_curve, T + 60, Some(&pin_a), "unsupported_version"),
         cert_case("precedence_signature_form_before_window", "A 63-byte identity signature and an empty window: check 5 comes before check 6.", &short_signature_empty_window, T, Some(&pin_a), "identity_signature_not_raw"),
         cert_case("precedence_window_before_self_signature", "An empty window and a changed self-signature: check 6 comes before check 7.", &empty_window_bad_self, T, Some(&pin_a), "window_invalid"),
+        cert_case("precedence_pin_before_window", "Dialling a candidate address for endpoint A, endpoint B answers with a certificate that is also a day past its window. Check 9 (the pin) comes before check 10 (the window): the caller reads \"not this peer\" and tries the next candidate, not a clock error.", &other_endpoint, na + DAY, Some(&pin_a), "pin_mismatch"),
+        cert_case("expired_with_no_pin", "An expired certificate with no pin given: check 10.", &der, na + DAY, None, "outside_window"),
     ];
 
     json!({
@@ -358,7 +360,7 @@ fn session_lifecycle_vectors() -> J {
     let deadline = local_na + SKEW;
     let renew_at = local_na - crate::session::RENEW_LEAD_SECS;
     json!({
-        "description": "A live path closes with cert_expired at the first second after the effective deadline (earlier not_after + 600). Renewal is due 1800 s before the earlier not_after; while no new path with a later renewal time is current it is asked for again after 30 s, then 60, 120, 240 and every 300 s, until the deadline. Replay: begin_path(1), on_authenticated(1, verify(peer_certificate, authenticated_at, pin), local window, authenticated_at), on_reopened(1), then tick at each `now`.",
+        "description": "A live path closes with cert_expired at the first second after the effective deadline (earlier not_after + 600). Renewal is due 1800 s before the earlier not_after; while no new path with a later renewal time is current it is asked for again after 30 s, then 60, 120, 240 and every 300 s, until the deadline. Replay: begin_path(1), on_authenticated(1, verify(peer_certificate, authenticated_at, pin), local window, authenticated_at, monotonic 0 ms), on_reopened(1), then tick at each `now`. Monotonic clock: a tick (or a later on_authenticated) without `mono_ms` reads (now - authenticated_at) x 1000 ms, as if no one touched the wall clock.",
         "peer_certificate": hex(&peer),
         "pin": hex(a.public_key().as_bytes()),
         "local_window": { "not_before": local_nb, "not_after": local_na },
@@ -422,6 +424,16 @@ fn session_lifecycle_vectors() -> J {
                 { "op": "tick", "now": renew_at + 90, "events": [{ "event": "renew_due", "conn": 1 }] },
             ],
         },
+        "clock_rollback": {
+            "description": "A fresh replay of the same path. The wall clock is set back to just after authentication and stays there, while the monotonic clock keeps running. The path still closes when the monotonic time left at authentication runs out: at (deadline + 1 - authenticated_at) x 1000 ms. Replay: begin_path(1), on_authenticated(1, ...), on_reopened(1) as above, then tick at each `now` and `mono_ms`.",
+            "mono_deadline_ms": (deadline + 1 - (local_nb + 60)) * 1000,
+            "ticks": [
+                { "now": local_nb + 61, "mono_ms": (deadline - (local_nb + 60)) * 1000, "events": [] },
+                { "now": local_nb + 61, "mono_ms": (deadline + 1 - (local_nb + 60)) * 1000 - 1, "events": [] },
+                { "now": local_nb + 61, "mono_ms": (deadline + 1 - (local_nb + 60)) * 1000, "events": [{ "event": "close", "conn": 1, "code": "cert_expired" }] },
+                { "now": local_nb + 62, "mono_ms": (deadline + 2 - (local_nb + 60)) * 1000, "events": [] },
+            ],
+        },
         "new_connection_after_deadline": {
             "description": "A new connection with the same peer certificate after its own not_after + 600 fails step 1.",
             "now": T + DAY + SKEW + 1,
@@ -439,7 +451,7 @@ fn authz_vectors() -> J {
     let b = hex(identity(&IDENTITY_B).public_key().as_bytes());
     let now = T + 60;
     json!({
-        "description": "Step 2 on the host after step 1 passed (`cases`), and the caller's gate (`caller_cases`). Host cases: `grants` and `denied` set up the table (grants added in order, then denials), the gate opens at wall time `now` and monotonic time 0 ms, then `steps` run in order. Caller cases: the gate starts awaiting AUTHORIZED; `promote` means the joiner accepted PAIRED; `state` is the gate state after the step. Verdicts: allow, ignore, close:<code>.",
+        "description": "Step 2 on the host after step 1 passed (`cases`), and the caller's gate (`caller_cases`). Host cases: `grants` and `denied` set up the table (grants added in order, then denials), the gate opens at wall time `now` and monotonic time 0 ms, then `steps` run in order. Caller cases: the gate starts awaiting AUTHORIZED; `sent_join_proof` means this side queued a JOIN_PROOF; `promote` means the joiner accepted PAIRED; `state` is the gate state after the step. Verdicts: allow, ignore, close:<code>.",
         "identities": { "a": a, "b": b },
         "cases": [
             {
@@ -496,9 +508,39 @@ fn authz_vectors() -> J {
                 "step2": "live",
                 "steps": [
                     { "op": "check", "traffic": "stream", "verdict": "allow" },
-                    { "op": "check", "traffic": "join_proof", "verdict": "ignore" },
                     { "op": "check", "traffic": "pairing", "verdict": "ignore" },
                     { "op": "check", "traffic": "host_only", "verdict": "close:protocol_error" },
+                ],
+            },
+            {
+                "name": "live_grant_one_proof",
+                "description": "A granted device may send one JOIN_PROOF, before any stream; the host answers it (wire.md 8). A second proof closes the connection.",
+                "grants": [{ "identity": "a", "role": "owner", "expires_at": null }], "denied": [], "peer": "a", "now": now,
+                "step2": "live",
+                "steps": [
+                    { "op": "check", "traffic": "join_proof", "verdict": "allow" },
+                    { "op": "check", "traffic": "join_proof", "verdict": "close:protocol_error" },
+                ],
+            },
+            {
+                "name": "live_grant_proof_after_stream",
+                "grants": [{ "identity": "a", "role": "owner", "expires_at": null }], "denied": [], "peer": "a", "now": now,
+                "step2": "live",
+                "steps": [
+                    { "op": "check", "traffic": "stream", "verdict": "allow" },
+                    { "op": "check", "traffic": "join_proof", "verdict": "close:protocol_error" },
+                ],
+            },
+            {
+                "name": "live_grant_pairs_again",
+                "description": "The proof was valid for an open invitation: the live connection becomes pairing only until enrollment replaces the grant.",
+                "grants": [{ "identity": "a", "role": "owner", "expires_at": null }], "denied": [], "peer": "a", "now": now,
+                "step2": "live",
+                "steps": [
+                    { "op": "check", "traffic": "join_proof", "verdict": "allow" },
+                    { "op": "admit_join_only" },
+                    { "op": "check", "traffic": "pairing", "verdict": "allow" },
+                    { "op": "check", "traffic": "stream", "verdict": "close:not_authorized" },
                 ],
             },
             {
@@ -578,6 +620,41 @@ fn authz_vectors() -> J {
                 "steps": [
                     { "op": "check", "traffic": "authorized_join_only", "verdict": "allow", "state": "join_only" },
                     { "op": "check", "traffic": "authorized_live", "verdict": "close:protocol_error", "state": "closed:protocol_error" },
+                ],
+            },
+            {
+                "name": "proof_answer_after_live_notice",
+                "description": "This side sent a JOIN_PROOF. The host's first AUTHORIZED live is step 2's notice; the next AUTHORIZED answers the proof.",
+                "steps": [
+                    { "op": "sent_join_proof", "state": "awaiting_authorization" },
+                    { "op": "check", "traffic": "authorized_live", "verdict": "allow", "state": "awaiting_proof_answer" },
+                    { "op": "check", "traffic": "authorized_join_only", "verdict": "allow", "state": "join_only" },
+                    { "op": "check", "traffic": "pairing", "verdict": "allow", "state": "join_only" },
+                ],
+            },
+            {
+                "name": "proof_answered_live",
+                "steps": [
+                    { "op": "sent_join_proof", "state": "awaiting_authorization" },
+                    { "op": "check", "traffic": "authorized_live", "verdict": "allow", "state": "awaiting_proof_answer" },
+                    { "op": "check", "traffic": "authorized_live", "verdict": "allow", "state": "live" },
+                    { "op": "check", "traffic": "stream", "verdict": "allow", "state": "live" },
+                ],
+            },
+            {
+                "name": "live_notice_read_before_the_proof_went_out",
+                "steps": [
+                    { "op": "check", "traffic": "authorized_live", "verdict": "allow", "state": "live" },
+                    { "op": "sent_join_proof", "state": "awaiting_proof_answer" },
+                ],
+            },
+            {
+                "name": "host_stream_before_the_proof_answer",
+                "description": "A host opens no stream before the caller has; here before its answer to the proof.",
+                "steps": [
+                    { "op": "sent_join_proof", "state": "awaiting_authorization" },
+                    { "op": "check", "traffic": "authorized_live", "verdict": "allow", "state": "awaiting_proof_answer" },
+                    { "op": "check", "traffic": "stream", "verdict": "close:protocol_error", "state": "closed:protocol_error" },
                 ],
             },
             {
@@ -1401,31 +1478,32 @@ fn attempt_sequences() -> Vec<J> {
             ],
         }),
         json!({
-            "name": "resend_is_not_a_new_attempt",
+            "name": "a_repeated_message_fails_the_attempt",
+            "description": "The joiner's msg_a reaches the host twice on the same connection. The second copy does not fit the attempt's next step, so the attempt fails with code_abort and no new debit. Anything more for the ended attempt gets code_abort and no work.",
             "kind": "send_link",
             "steps": [
                 { "op": "connect", "joiner": "a", "conn": 1 },
                 { "op": "submit_first", "joiner": "a", "conn": 1, "code": "right", "host_attempts_left": 2, "joiner_attempts_left": 2 },
-                { "op": "redeliver", "joiner": "a", "conn": 1, "reply": "first_reply", "host_attempts_left": 2, "new_code": false },
-                { "op": "redeliver", "joiner": "a", "conn": 1, "reply": "first_reply", "host_attempts_left": 2, "new_code": false },
+                { "op": "redeliver", "joiner": "a", "conn": 1, "reply": "code_abort", "host_attempts_left": 2, "new_code": false },
+                { "op": "redeliver", "joiner": "a", "conn": 1, "reply": "code_abort", "host_attempts_left": 2, "new_code": false },
             ],
         }),
         json!({
-            "name": "resend_after_the_joiner_aborted",
-            "description": "The host answered msg_a; then the joiner aborts the attempt. The abort ends the attempt and keeps its debit, but changes neither kept value: msg_a again gets the same msg_b, byte for byte. A different payload on the ended attempt gets code_abort, with no debit. An abort for an attempt the host does not have is ignored.",
+            "name": "messages_after_the_joiner_aborted",
+            "description": "The host answered msg_a; then the joiner aborts the attempt. The abort ends the attempt and keeps its debit. msg_a again, or any other payload, on the ended attempt gets code_abort, with no debit. An abort for an attempt the host does not have is ignored.",
             "kind": "send_link",
             "steps": [
                 { "op": "connect", "joiner": "a", "conn": 1 },
                 { "op": "submit_first", "joiner": "a", "conn": 1, "code": "right", "host_attempts_left": 2 },
                 { "op": "inject", "joiner": "a", "conn": 1, "message": "code_abort", "attempt": "current", "reply": "none", "host_attempts_left": 2, "host_status": "open", "new_code": false },
-                { "op": "redeliver", "joiner": "a", "conn": 1, "reply": "first_reply", "host_attempts_left": 2, "new_code": false },
+                { "op": "redeliver", "joiner": "a", "conn": 1, "reply": "code_abort", "host_attempts_left": 2, "new_code": false },
                 { "op": "inject", "joiner": "a", "conn": 1, "message": "code_exchange", "attempt": "current", "payload": zero_tag, "reply": "code_abort", "host_attempts_left": 2, "new_code": false },
                 { "op": "inject", "joiner": "a", "conn": 1, "message": "code_abort", "attempt": hex(&FOREIGN_ATTEMPT), "reply": "none", "host_attempts_left": 2, "host_status": "open" },
             ],
         }),
         json!({
             "name": "different_payload_on_a_running_attempt_is_the_next_message",
-            "description": "After msg_a, a different payload on the running attempt is read as msg_c: 64 zero bytes are a wrong confirmation, so the attempt fails with code_abort. The kept payload is now those 64 bytes, so msg_a again is a different payload on an ended attempt: code_abort, with no debit.",
+            "description": "After msg_a, a different payload on the running attempt is read as msg_c: 64 zero bytes are a wrong confirmation, so the attempt fails with code_abort. msg_a again, on the ended attempt: code_abort, with no debit.",
             "kind": "send_link",
             "steps": [
                 { "op": "connect", "joiner": "a", "conn": 1 },
@@ -1447,16 +1525,23 @@ fn attempt_sequences() -> Vec<J> {
             ],
         }),
         json!({
-            "name": "attempt_replayed_on_another_connection_is_refused",
-            "description": "Joiner a's first message is replayed on b's connection. The attempt id was already seen on another connection, so the host refuses it with code_abort before any debit or exchange work, and shows no new code.",
+            "name": "attempt_replayed_on_another_connection_is_debited",
+            "description": "Joiner a's first message is replayed on b's connection. Attempts are kept per connection, so there it is a new attempt: debited first, a fresh code is shown, and the host answers msg_b. It can never succeed: its binding holds b's identity and b's session exporter. Dropping b's connection ends it; the debit stays.",
             "kind": "send_link",
             "steps": [
                 { "op": "connect", "joiner": "a", "conn": 1 },
                 { "op": "submit_first", "joiner": "a", "conn": 1, "code": "right", "host_attempts_left": 2 },
                 { "op": "connect", "joiner": "b", "conn": 2 },
-                { "op": "redeliver", "joiner": "a", "conn": 2, "reply": "code_abort", "host_attempts_left": 2, "host_status": "open", "new_code": false },
-                { "op": "drop", "joiner": "a", "conn": 1, "host_attempts_left": 2 },
-                { "op": "redeliver", "joiner": "a", "conn": 2, "reply": "code_abort", "host_attempts_left": 2, "new_code": false },
+                { "op": "redeliver", "joiner": "a", "conn": 2, "reply": "code_exchange", "host_attempts_left": 1, "host_status": "open", "new_code": true },
+                { "op": "drop", "joiner": "b", "conn": 2, "host_attempts_left": 1, "host_status": "open" },
+            ],
+        }),
+        json!({
+            "name": "join_proof_from_own_identity",
+            "description": "A join proof made with the host's own identity key, valid for the open invitation: a device never pairs with itself, so the host closes with not_authorized and the invitation stays open (wire.md 10.3).",
+            "kind": "send_link",
+            "steps": [
+                { "op": "connect_as_host", "joiner": "a", "conn": 1, "closed": [[1, "not_authorized"]], "host_status": "open", "host_attempts_left": 3, "new_code": false },
             ],
         }),
         json!({
@@ -1499,7 +1584,7 @@ fn pairing_attempt_vectors() -> J {
         .map(|seq| run_attempt_sequence(seq, None))
         .collect();
     json!({
-        "description": "Attempt-limit and resend sequences for the send-link flow (spec wire.md, \"Send-link flow and the code\" and \"Attempt limits\"), plus one-enrollment for in person. Each step runs one operation and then the listed expectations hold. Ops: connect (the connection starts; after the two HELLO messages the joiner sends its join proof on conn and the host's AUTHORIZED, if any, reaches the joiner), submit (the joiner enters a code; messages flow until both sides stop), submit_first (only the joiner's first message reaches the host; the host's reply is recorded in `out` but not delivered to the joiner), redeliver (that first message reaches the host again on conn; the reply is recorded, not delivered), inject (the joiner's side sends `message` for `attempt`, \"current\" meaning the attempt of its last submit, with `payload`; the reply is recorded, not delivered), drop (conn closes), approve (host owner taps for conn). Codes: right (the code the host shows now), wrong (000000, or 000001 if 000000 is shown), stale (the code the host showed when the previous attempt started). `reply`: first_reply (the same messages, byte for byte, as the host's answer to that first message), code_abort (the host's only answer is CODE_ABORT pairing_failed for that attempt), none (no answer). `new_code` says whether the host showed a fresh code during the step. `closed` lists connections the host closed during the step. When `joiner_state` becomes failed with a code, the joiner also closes the connection with GOAWAY of that code after its listed messages, unless the host had already closed it (wire.md 10.6 rule 9); that close is not listed. `out` lists, in order, every control message each side sent during the step (`send`), host closes (`close`) and codes the host showed (`show_code`), except the HELLO each side sends first on every connection (wire.md, \"Connection start and step 2\"): a replay over real connections exchanges both HELLOs, checks the agreed version and starts comparing at JOIN_PROOF. Each side's sends keep their own order; on connect the two sides send independently, and `out` lists the joiner's before the host's.",
+        "description": "Attempt-limit and repeat sequences for the send-link flow (spec wire.md, \"Send-link flow and the code\" and \"Attempt limits\"), plus one-enrollment for in person. Each step runs one operation and then the listed expectations hold. Ops: connect (the connection starts; after the two HELLO messages the joiner sends its join proof on conn and the host's AUTHORIZED, if any, reaches the joiner), submit (the joiner enters a code; messages flow until both sides stop), submit_first (only the joiner's first message reaches the host; the host's reply is recorded in `out` but not delivered to the joiner), redeliver (the joiner's last first message reaches the host again on conn, as a repeat or a replay; the reply is recorded, not delivered), connect_as_host (like connect, but the join proof is made with the host's own identity key), inject (the joiner's side sends `message` for `attempt`, \"current\" meaning the attempt of its last submit, with `payload`; the reply is recorded, not delivered), drop (conn closes), approve (host owner taps for conn). Codes: right (the code the host shows now), wrong (000000, or 000001 if 000000 is shown), stale (the code the host showed when the previous attempt started). `reply`: code_exchange (the host's only answer is one CODE_EXCHANGE for that attempt), code_abort (the host's only answer is CODE_ABORT pairing_failed for that attempt), none (no answer). `new_code` says whether the host showed a fresh code during the step. `closed` lists connections the host closed during the step. When `joiner_state` becomes failed with a code, the joiner also closes the connection with GOAWAY of that code after its listed messages, unless the host had already closed it (wire.md 10.6 rule 9); that close is not listed. `out` lists, in order, every control message each side sent during the step (`send`), host closes (`close`) and codes the host showed (`show_code`), except the HELLO each side sends first on every connection (wire.md, \"Connection start and step 2\"): a replay over real connections exchanges both HELLOs, checks the agreed version and starts comparing at JOIN_PROOF. Each side's sends keep their own order; on connect the two sides send independently, and `out` lists the joiner's before the host's.",
         "conventions": {
             "time": T,
             "host": { "identity_secret": hex(&IDENTITY_A), "name": "Desk" },
@@ -1613,8 +1698,8 @@ struct ReplayJoiner {
     seed: u8,
     pairing: JoinerPairing<CpaceExchangeFactory>,
     rng: Draws,
-    /// The first message of its last attempt, and the host's answer to it.
-    first: Option<(ControlMessage, Vec<ControlMessage>)>,
+    /// The first message of its last attempt.
+    first: Option<ControlMessage>,
 }
 
 /// Runs one sequence of `pairing-attempts.json`.
@@ -1667,11 +1752,17 @@ impl Replay {
         if !self.joiners.iter().any(|j| j.name == name) {
             let seed = 0x50 + self.joiners.len() as u8;
             let key = identity(&[seed; 32]).public_key();
+            let arrival = match self.ticket.kind {
+                InvitationKind::InPerson => Arrival::InAppScan,
+                InvitationKind::SendLink => Arrival::Link,
+            };
             let pairing = JoinerPairing::new(
                 self.ticket.clone(),
+                arrival,
                 key,
                 name.into(),
                 CpaceExchangeFactory,
+                None,
                 UnixTime(T),
             )
             .expect("joiner");
@@ -1761,15 +1852,13 @@ impl Replay {
                 }],
                 "refused without work"
             ),
-            Some("first_reply") => {
-                let first = self
-                    .joiners
-                    .iter()
-                    .find(|j| j.name == who)
-                    .and_then(|j| j.first.as_ref())
-                    .expect("a first message");
-                assert_eq!(reply, first.1.as_slice(), "resend answer differs");
-            }
+            Some("code_exchange") => assert!(
+                matches!(
+                    reply,
+                    [ControlMessage::CodeExchange { attempt: a, .. }] if *a == attempt
+                ),
+                "expected one CODE_EXCHANGE for {who}'s attempt"
+            ),
             Some(other) => panic!("reply {other}"),
         }
     }
@@ -1823,6 +1912,40 @@ impl Replay {
                 }
                 host_log.extend(actions);
             }
+            "connect_as_host" => {
+                // A join proof made with the host's own identity key.
+                let exporters = SessionExporters {
+                    join: [conn as u8; 32],
+                    pair: [conn as u8 + 100; 32],
+                };
+                let host_key = identity(&IDENTITY_A).public_key();
+                let invitation = self.ticket.invitation;
+                let mac = join_proof_mac(
+                    &self.ticket.secret,
+                    &invitation,
+                    &host_key,
+                    &host_key,
+                    &exporters.join,
+                );
+                let proof = ControlMessage::JoinProof {
+                    invitation,
+                    mac,
+                    name: who.clone(),
+                };
+                self.sent(&who, conn, &proof);
+                let actions = self.host.on_join_proof(
+                    ConnectionId(conn),
+                    &host_key,
+                    &exporters,
+                    &invitation,
+                    &mac,
+                    &who,
+                    &self.grants,
+                    UnixTime(T),
+                );
+                self.host_did(&actions, conn);
+                host_log.extend(actions);
+            }
             "submit" | "submit_first" => {
                 let shown = self.host.code(&self.ticket.invitation).cloned();
                 let fallback = PairingCode::parse("000000").expect("code");
@@ -1874,7 +1997,7 @@ impl Replay {
                     for m in std::mem::take(&mut to_host) {
                         let (actions, reply) = self.deliver_to_host(&who, conn, &m);
                         if let Some(f) = first.take() {
-                            self.joiner(&who).first = Some((f, reply.clone()));
+                            self.joiner(&who).first = Some(f);
                         }
                         to_joiner.extend(reply);
                         host_log.extend(actions);
@@ -1917,7 +2040,6 @@ impl Replay {
                     .first
                     .as_ref()
                     .expect("first message")
-                    .0
                     .clone();
                 let ControlMessage::CodeExchange { attempt, .. } = m else {
                     panic!("first message")
@@ -1929,7 +2051,7 @@ impl Replay {
             "inject" => {
                 let attempt = match step["attempt"].as_str().expect("attempt") {
                     "current" => match self.joiner(&who).first.as_ref() {
-                        Some((ControlMessage::CodeExchange { attempt, .. }, _)) => *attempt,
+                        Some(ControlMessage::CodeExchange { attempt, .. }) => *attempt,
                         _ => panic!("no current attempt"),
                     },
                     id => AttemptId(unhex(id).try_into().expect("16 bytes")),

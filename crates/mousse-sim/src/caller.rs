@@ -11,8 +11,8 @@ use mousse_net_core::control::{
 use mousse_net_core::identity::IdentityPublicKey;
 use mousse_net_core::mux::{MuxEvent, PriorityClass, StreamId};
 use mousse_net_core::pairing::{
-    CodeExchangeFactory, ExchangeRole, JoinerAction, JoinerPairing, JoinerState, PairedHost,
-    PairingCode, Ticket,
+    Arrival, CodeExchangeFactory, ExchangeRole, InvitationKind, JoinerAction, JoinerPairing,
+    JoinerRecord, JoinerState, PairedHost, PairingCode, Ticket,
 };
 use mousse_net_core::session::{PeerSession, SessionEvent, RENEW_LEAD_SECS};
 use mousse_net_core::session_cert::SessionCertificate;
@@ -64,7 +64,9 @@ pub(crate) struct Typist {
     pub wrong_first: u8,
     /// Delay before typing, ms.
     pub delay: (u64, u64),
-    /// Chance (per mille) of an impatient byte-identical resend.
+    /// Chance (per mille) that the joiner sends its last exchange message
+    /// again. The protocol has no resends: the repeat fails the attempt and
+    /// is never a new debit.
     pub resend_permille: u32,
     /// Chance (per mille) of dropping the connection mid-attempt.
     pub abort_permille: u32,
@@ -114,6 +116,9 @@ pub(crate) struct CallerDev {
     /// message of the previous connection.
     pub dup_permille: u32,
     last_exchange_msg: Option<ControlMessage>,
+    /// The stored flow record for each ticket hash (survives restarts and
+    /// reopening the link).
+    records: BTreeMap<[u8; 32], JoinerRecord>,
     not_authorized: u32,
     /// Terminal bytes the host echoed back.
     pub echoed: u64,
@@ -160,6 +165,7 @@ impl CallerDev {
             last_renew_dial: None,
             dup_permille: 0,
             last_exchange_msg: None,
+            records: BTreeMap::new(),
             not_authorized: 0,
             echoed: 0,
         }
@@ -173,15 +179,32 @@ impl CallerDev {
         }
     }
 
-    fn new_flow_machine(&mut self, sim: &mut Sim) -> Option<JoinerPairing<CountingFactory>> {
+    fn new_flow_machine(
+        &mut self,
+        sim: &mut Sim,
+        resume: bool,
+    ) -> Option<JoinerPairing<CountingFactory>> {
         let ticket = self.ticket.clone()?;
         self.instance += 1;
-        let factory = CountingFactory::new(self.id, self.instance, self.flow, sim.work.clone());
+        let factory = CountingFactory::new(self.id, self.instance, sim.work.clone());
+        // The sim's owner scans in-person codes with the app and opens
+        // send links.
+        let arrival = match ticket.kind {
+            InvitationKind::InPerson => Arrival::InAppScan,
+            InvitationKind::SendLink => Arrival::Link,
+        };
+        let stored = if resume {
+            self.records.get(&ticket.hash()).copied()
+        } else {
+            None
+        };
         match JoinerPairing::new(
             ticket,
+            arrival,
             self.identity,
             self.label.to_owned(),
             factory,
+            stored.as_ref(),
             sim.wall(self.id),
         ) {
             Ok(flow) => Some(flow),
@@ -200,7 +223,7 @@ impl CallerDev {
         }
         self.flow += 1;
         self.typing_scheduled = false;
-        match self.new_flow_machine(sim) {
+        match self.new_flow_machine(sim, true) {
             Some(flow) => {
                 sim.say(
                     self.id,
@@ -356,7 +379,7 @@ impl CallerDev {
         let mut own_session = PeerSession::new(peer);
         own_session.begin_path(conn);
         let own_ok = own_session
-            .on_authenticated(conn, &ep.auth.peer, ep.auth.local_window, wall)
+            .on_authenticated(conn, &ep.auth.peer, ep.auth.local_window, wall, sim.mono())
             .is_ok();
         let _ = own_session.on_reopened(conn);
         let mut cc = CallerConn {
@@ -380,6 +403,7 @@ impl CallerDev {
                 Ok(proof) => {
                     sim.say(self.id, format_args!("conn {}: sends {proof:?}", conn.0));
                     cc.ep.send(&proof);
+                    cc.gate.sent_join_proof();
                     self.active = Some(conn);
                     if let Some(old) = self.last_exchange_msg.clone() {
                         if sim.chance(self.dup_permille) {
@@ -410,6 +434,7 @@ impl CallerDev {
                     &cc.ep.auth.peer,
                     cc.ep.auth.local_window,
                     wall,
+                    sim.mono(),
                 ) {
                     Ok(events) => {
                         if self.eager_streams {
@@ -607,7 +632,16 @@ impl CallerDev {
         }
     }
 
+    /// Store the flow's record, as the app would after every change.
+    fn save_record(&mut self) {
+        if let Mode::Joining(flow) = &self.mode {
+            let record = flow.record();
+            self.records.insert(record.ticket_hash, record);
+        }
+    }
+
     fn apply(&mut self, sim: &mut Sim, conn: ConnectionId, actions: Vec<JoinerAction>) {
+        self.save_record();
         for action in actions {
             match action {
                 JoinerAction::Send(msg) => {
@@ -672,7 +706,13 @@ impl CallerDev {
         if let Some(cc) = self.conns.get_mut(&conn) {
             session.begin_path(conn);
             if session
-                .on_authenticated(conn, &cc.ep.auth.peer, cc.ep.auth.local_window, wall)
+                .on_authenticated(
+                    conn,
+                    &cc.ep.auth.peer,
+                    cc.ep.auth.local_window,
+                    wall,
+                    sim.mono(),
+                )
                 .is_ok()
             {
                 let _ = session.on_reopened(conn);
@@ -730,7 +770,7 @@ impl CallerDev {
         );
         if sim.bug(Bug::JoinerWorkBeforeDebit) {
             // Planted bug: warm up the exchange before submitting the code.
-            let factory = CountingFactory::new(self.id, self.instance, self.flow, sim.work.clone());
+            let factory = CountingFactory::new(self.id, self.instance, sim.work.clone());
             if let Some(hc) = self.conns.get(&conn) {
                 let ticket = flow.ticket();
                 let binding = mousse_net_core::pairing::binding_transcript(
@@ -752,12 +792,14 @@ impl CallerDev {
         self.maybe_schedule_typing(sim);
     }
 
+    /// The network delivers the last code-exchange message again. The
+    /// protocol has no resend: the repeat fails the attempt.
     pub(crate) fn resend(&mut self, sim: &mut Sim) {
-        let (Mode::Joining(flow), Some(conn)) = (&self.mode, self.active) else {
+        let (Mode::Joining(_), Some(conn)) = (&self.mode, self.active) else {
             return;
         };
-        if let (Some(msg), Some(cc)) = (flow.resend(), self.conns.get_mut(&conn)) {
-            sim.say(self.id, format_args!("conn {}: resends {msg:?}", conn.0));
+        if let (Some(msg), Some(cc)) = (self.last_exchange_msg.clone(), self.conns.get_mut(&conn)) {
+            sim.say(self.id, format_args!("conn {}: repeats {msg:?}", conn.0));
             cc.ep.send(&msg);
         }
     }
@@ -855,6 +897,8 @@ impl CallerDev {
             Mode::Joining(flow) if was_active => {
                 self.active = None;
                 let actions = flow.on_closed(code);
+                let record = flow.record();
+                self.records.insert(record.ticket_hash, record);
                 for a in &actions {
                     if let JoinerAction::Failed(c) = a {
                         sim.say(self.id, format_args!("pairing failed: {c:?}"));
@@ -863,7 +907,7 @@ impl CallerDev {
                 match flow.state() {
                     JoinerState::Connecting => {
                         if sim.bug(Bug::JoinerNewFlowOnReconnect) {
-                            if let Some(fresh) = self.new_flow_machine(sim) {
+                            if let Some(fresh) = self.new_flow_machine(sim, false) {
                                 sim.say(self.id, format_args!("starts a fresh pairing machine"));
                                 self.mode = Mode::Joining(Box::new(fresh));
                             }
@@ -930,7 +974,7 @@ impl CallerDev {
         let skip_deadline = sim.bug(Bug::SkipDeadline);
         if !skip_deadline {
             if let Mode::Paired(session) = &mut self.mode {
-                let events = session.tick(wall);
+                let events = session.tick(wall, mono);
                 self.on_session_events(sim, events);
             }
         }
@@ -945,7 +989,7 @@ impl CallerDev {
             let mut close = None;
             if !skip_deadline {
                 if let Some(s) = cc.own_session.as_mut() {
-                    for ev in s.tick(wall) {
+                    for ev in s.tick(wall, mono) {
                         if let SessionEvent::Close { code, .. } = ev {
                             close = Some(code);
                         }
@@ -1018,6 +1062,9 @@ impl CallerDev {
                 }
                 take(t);
             }
+            if let Some(m) = s.next_mono_deadline() {
+                take(m.ms().max(sim.now + 1));
+            }
         }
         for cc in self.conns.values() {
             if cc.ep.ended {
@@ -1026,6 +1073,9 @@ impl CallerDev {
             if let (Some(s), false) = (&cc.own_session, skip_deadline) {
                 if let Some(w) = s.next_deadline() {
                     take(sim.due_ms(self.id, w));
+                }
+                if let Some(m) = s.next_mono_deadline() {
+                    take(m.ms().max(sim.now + 1));
                 }
             }
             if let Some(m) = cc.ep.mux.poll_timeout() {
@@ -1072,11 +1122,9 @@ impl CallerDev {
             .filter(mine)
             .filter(|w| w.instance == self.instance)
             .count();
-        let in_flow = work
-            .iter()
-            .filter(mine)
-            .filter(|w| w.flow == self.flow)
-            .count();
+        // The cap holds per ticket, across every time the link is opened
+        // (each device in the sim gets one ticket).
+        let in_flow = work.iter().filter(mine).count();
         let debited = usize::from(3 - flow.attempts_left().min(3));
         if in_machine > debited {
             sim.fail(
@@ -1091,7 +1139,7 @@ impl CallerDev {
             sim.fail(
                 Invariant::AttemptCap,
                 format!(
-                    "{} ran {in_flow} code attempts in flow {}",
+                    "{} ran {in_flow} code attempts for its ticket (flow {})",
                     self.label, self.flow
                 ),
             );
