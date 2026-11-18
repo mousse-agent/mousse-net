@@ -4,9 +4,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
+description = "Seeded, deterministic simulator that drives the mousse-net core state machines through drills."
 
 [lints]
 workspace = true
 
+[[bin]]
+name = "mousse-sim"
+path = "src/main.rs"
+
 [dependencies]
-mousse-net-core = { path = "../mousse-net-core" }
+mousse-net-core = { path = "../mousse-net-core", features = ["insecure-test-exchange"] }
+rand_core = { version = "=0.10.1", default-features = false }
+rand_chacha = { version = "=0.10.0", default-features = false }
+sha2 = { version = "=0.11.1", default-features = false }
