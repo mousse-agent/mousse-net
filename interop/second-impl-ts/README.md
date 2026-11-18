@@ -14,11 +14,12 @@ npm run check
 npm test
 ```
 
-The tests count every runnable JSON case and print `PASS second-impl` or
-`FAIL second-impl` on the last line. They replay seven pairing flows and
+The tests print case counts by vector file and end with `PASS second-impl` or
+`FAIL second-impl`. They replay eight pairing flows and
 eleven attempt sequences with the supplied random draws, and compare
 the resulting messages byte for byte. The suite also checks retry
-scheduling, reconnect after ticket expiry, and stream limits.
+scheduling with a candidate path, reconnect after ticket expiry, and mux
+stream ordering, closure, and limits.
 
 Run the same tests with the identity-signature check deliberately disabled.
 

@@ -17,7 +17,14 @@
 
 ## Open
 
-None.
+- `wire.md` §6 specifies how to count a skipped retry. It leaves the first
+  renewal tick with a candidate already pending implicit. The implementation
+  consumes that tick and starts the initial 30-second wait.
+- `wire.md` §10.6 rule 8 requires the joiner to close the connection on
+  `PAIRING_FAILED`. The failure step in `pairing-e2e.json` lists only
+  `failed: pairing_failed` and says the gate closes with it. The replay
+  closes the gate and records the failure. Whether a transport also sends a
+  `GOAWAY` for this failure is unspecified.
 
 The browser Worker certificate is pending in `session-cert.json` and
 has no certificate bytes.

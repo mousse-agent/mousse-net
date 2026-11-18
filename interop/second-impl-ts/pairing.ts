@@ -338,11 +338,13 @@ export class PairingJoiner {
   private readonly endpoint: Endpoint;
   private readonly binary: Uint8Array;
   private readonly random: RandomDraws;
-  constructor(endpoint: Endpoint, binary: Uint8Array, random: RandomDraws, now: number) {
+  private readonly hostPinned: boolean;
+  constructor(endpoint: Endpoint, binary: Uint8Array, random: RandomDraws, now: number, pinnedHost?: Uint8Array) {
     this.endpoint = endpoint;
     this.binary = binary;
     this.random = random;
     this.ticket = decodeTicket(binary);
+    this.hostPinned = pinnedHost !== undefined && equalBytes(pinnedHost, this.ticket.hostIdentity);
     checkJoinerExpiry(this.ticket.expiresAt, now);
   }
 
@@ -389,9 +391,14 @@ export class PairingJoiner {
       this.drop();
       return [];
     }
+    return this.fail(code);
+  }
+
+  private fail(code: ErrorName): Effect[] {
+    if (this.state.startsWith('failed:')) return [];
+    this.learningOutcome = false;
     this.clearAttempt();
     this.connection?.gate.close(code);
-    if (this.state.startsWith('failed:')) return [];
     this.state = `failed:${code}`;
     return [{ failed: code }];
   }
@@ -414,6 +421,9 @@ export class PairingJoiner {
         return [{ version: conn.version }];
       }
       case 'AUTHORIZED':
+        if (msg.state === 'live' && this.ticket.kind === 2 && !this.hostPinned && !this.learningOutcome) {
+          return this.fail('pairing_failed');
+        }
         this.learningOutcome = false;
         if (msg.state === 'live') {
           this.state = 'already_paired';
@@ -440,11 +450,8 @@ export class PairingJoiner {
   }
 
   private rejectCode(): Effect[] {
+    if (this.attemptsLeft === 0) return this.fail('attempts_exhausted');
     this.clearAttempt();
-    if (this.attemptsLeft === 0) {
-      this.state = 'failed:attempts_exhausted';
-      return [{ failed: 'attempts_exhausted' }];
-    }
     this.state = 'awaiting_code';
     return [{ code_rejected: { attempts_left: this.attemptsLeft } }];
   }

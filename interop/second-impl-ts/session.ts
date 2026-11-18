@@ -91,12 +91,16 @@ interface Stream {
   consumed: number;
 }
 
+type StreamEvent = Extract<Frame, { type: 'open' | 'data' | 'fin' | 'reset' }>;
+type Receipt = { event?: StreamEvent; reply?: Frame };
+type StreamResult = Receipt | { close: ErrorName };
+
 export class Streams {
   private readonly active = new Map<number, Stream>();
-  private readonly opened = new Set<number>();
   private highestPeer = 0;
   private highestLocal = 0;
   private peerCount = 0;
+  private closed = false;
   private readonly side: 'host' | 'caller';
   constructor(side: 'host' | 'caller') { this.side = side; }
 
@@ -105,13 +109,19 @@ export class Streams {
     this.active.delete(id);
   }
 
-  private open(id: number, peer: boolean): Frame | undefined {
-    const parity = (this.side === 'caller') !== peer ? 1 : 0;
-    requireThat(id > (peer ? this.highestPeer : this.highestLocal) && id % 2 === parity, 'protocol_error');
+  private open(frame: Extract<Frame, { type: 'open' }>, peer: boolean): StreamResult {
+    const id = frame.stream;
+    const first = (this.side === 'caller') !== peer ? 1 : 2;
+    const highest = peer ? this.highestPeer : this.highestLocal;
+    const expected = highest === 0 ? first : highest + 2;
+    if (id !== expected || id > 0xffffffff) {
+      return { close: 'protocol_error' };
+    }
     if (peer) this.highestPeer = id;
     else this.highestLocal = id;
-    this.opened.add(id);
-    if (peer && this.peerCount === 1024) return { type: 'reset', stream: id, code: errorNumber('refused_stream') };
+    if (peer && this.peerCount === 1024) {
+      return { reply: { type: 'reset', stream: id, code: errorNumber('refused_stream') } };
+    }
     if (peer) this.peerCount++;
     this.active.set(id, {
       peerOpened: peer,
@@ -119,44 +129,66 @@ export class Streams {
       receive: { remaining: initialCredit, finished: false },
       unread: 0, consumed: 0,
     });
+    return { event: frame };
   }
 
-  private streamFrame(frame: Extract<Frame, { stream: number }>, incoming: boolean): Frame | undefined {
-    if (frame.type === 'open') return this.open(frame.stream, incoming);
-    requireThat(this.opened.has(frame.stream), 'protocol_error');
+  private streamFrame(frame: Extract<Frame, { stream: number }>, incoming: boolean): StreamResult {
+    if (frame.type === 'open') return this.open(frame, incoming);
     const stream = this.active.get(frame.stream);
-    if (!stream) return;
+    if (!stream) {
+      const openedByCaller = frame.stream % 2 === 1;
+      const highest = openedByCaller === (this.side === 'caller') ? this.highestLocal : this.highestPeer;
+      return frame.stream > 0 && frame.stream <= highest ? {} : { close: 'protocol_error' };
+    }
     const same = incoming ? stream.receive : stream.send;
     const opposite = incoming ? stream.send : stream.receive;
     switch (frame.type) {
       case 'data':
-        requireThat(!same.finished, 'stream_closed');
-        requireThat(frame.payload.length <= same.remaining, 'flow_control');
+        if (same.finished) return { close: 'stream_closed' };
+        if (frame.payload.length > same.remaining) return { close: 'flow_control' };
         same.remaining -= frame.payload.length;
         if (incoming) stream.unread += frame.payload.length;
-        break;
+        return { event: frame };
       case 'fin':
-        requireThat(!same.finished, 'stream_closed');
+        if (same.finished) return { close: 'stream_closed' };
         same.finished = true;
         if (opposite.finished) this.forget(frame.stream, stream);
-        break;
+        return { event: frame };
       case 'reset':
         this.forget(frame.stream, stream);
-        break;
+        return { event: frame };
       case 'credit':
-        requireThat(opposite.remaining + frame.increment <= maximumCredit, 'flow_control');
+        if (opposite.remaining + frame.increment > maximumCredit) return { close: 'flow_control' };
         opposite.remaining += frame.increment;
-        break;
+        return {};
     }
   }
 
-  receive(frame: Frame): Frame | undefined {
-    if ('stream' in frame) return this.streamFrame(frame, true);
-    if (frame.type === 'ping') return { type: 'pong', opaque: frame.opaque };
+  receive(frame: Frame): Receipt {
+    if (this.closed) return {};
+    if ('stream' in frame) {
+      const result = this.streamFrame(frame, true);
+      if (!('close' in result)) return result;
+      this.end();
+      return { reply: { type: 'goaway', code: errorNumber(result.close) } };
+    }
+    if (frame.type === 'ping') return { reply: { type: 'pong', opaque: frame.opaque } };
+    if (frame.type === 'goaway') this.end();
+    return {};
   }
 
   sent(frame: Frame): void {
-    if ('stream' in frame) this.streamFrame(frame, false);
+    if (this.closed) return;
+    if ('stream' in frame) {
+      const result = this.streamFrame(frame, false);
+      if ('close' in result) throw new Error(result.close);
+    }
+    if (frame.type === 'goaway') this.end();
+  }
+
+  private end() {
+    this.closed = true;
+    this.active.clear();
   }
 
   consume(id: number, count: number): Frame | undefined {

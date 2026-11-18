@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { bytes, hex } from './cbor.ts';
 import { publicKey, sha256 } from './certificate.ts';
 import { PairingHost, PairingJoiner } from './pairing.ts';
-import { decodeControl, decodeFrame, encodeControl, encodeFragment, encodeFrame, errorNumber,
+import { decodeControl, decodeFrame, decodeTicket, encodeControl, encodeFragment, encodeFrame, errorNumber,
   readError } from './wire.ts';
 
 class ScriptedDraws {
@@ -108,9 +108,13 @@ export function replayEndToEnd(flow, input) {
         return [{ ticket: { binary: hex(host.binary), fragment: encodeFragment(host.binary),
           hash: hex(sha256(host.binary)), shown_code: host.shownCode } }];
       }
-      case 'start':
-        joiners.set(party, new PairingJoiner(joinerEndpoint, bytes(step.ticket), joinerDraws.get(party), now));
+      case 'start': {
+        assert.ok(step.host_pinned === undefined || typeof step.host_pinned === 'boolean');
+        const ticket = bytes(step.ticket);
+        const pinnedHost = step.host_pinned ? decodeTicket(ticket).hostIdentity : undefined;
+        joiners.set(party, new PairingJoiner(joinerEndpoint, ticket, joinerDraws.get(party), now, pinnedHost));
         return [];
+      }
       case 'connect': {
         const real = step.host !== false;
         routes.set(conn, { party, real });
@@ -149,7 +153,13 @@ export function replayEndToEnd(flow, input) {
   }
 
   for (const [index, step] of flow.steps.entries()) {
-    assert.deepEqual(run(step), step.out, `step ${index + 1} ${step.party}/${step.event}`);
+    const effects = run(step);
+    const label = `step ${index + 1} ${step.party}/${step.event}`;
+    assert.deepEqual(effects, step.out, label);
+    if (effects.some(effect => 'failed' in effect)) {
+      const message = onWire({ type: 'AUTHORIZED', state: 'live' });
+      assert.deepEqual(joiners.get(step.party).receive(message), [{ ignored: true }], `${label}: gate after failure`);
+    }
   }
   for (const pending of frames.values()) assert.equal(pending.length, 0, 'undelivered frame');
   hostDraws.done();
@@ -184,11 +194,15 @@ export function replayAttemptSequence(sequence, input) {
       out.push({ send: { conn: id, from, control: hex(encodeControl(message)) } });
     };
 
-    function toHost(from, id, message, deliver = true) {
-      recordSend(from, id, message);
+    function receiveAtHost(id, message, deliver = true) {
       const effects = host.receive(id, onWire(message), now);
       fromHost(effects, deliver);
       return effects.flatMap(effect => effect.send ? [hex(encodeControl(effect.send))] : []);
+    }
+
+    function toHost(from, id, message, deliver = true) {
+      recordSend(from, id, message);
+      return receiveAtHost(id, message, deliver);
     }
 
     function fromHost(effects, deliver = true) {
@@ -230,8 +244,9 @@ export function replayAttemptSequence(sequence, input) {
         // The attempt fixture starts its message log at JOIN_PROOF.
         assert.deepEqual(host.receive(conn, onWire(callerHello), now), [{ version: 0 }]);
         assert.deepEqual(joiner.receive(onWire(hostHello)), [{ version: 0 }]);
+        recordSend(label, conn, proof);
         fromHost(hostEffects);
-        toHost(label, conn, proof);
+        receiveAtHost(conn, proof);
         break;
       }
       case 'submit':

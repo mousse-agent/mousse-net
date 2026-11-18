@@ -81,26 +81,43 @@ function outcome(expected, fn) {
   const [v, add] = file('session-lifecycle.json');
   const authenticate = (now = v.authenticated_at) => verifyCertificate(bytes(v.peer_certificate), now, bytes(v.pin));
   const mono = now => (now - v.authenticated_at) * 1000;
-  function checkTimeline(life, conn, ticks) {
-    for (const item of ticks) {
-      const event = life.tick(item.now, mono(item.now));
-      const events = event === null ? [] : event === 'renew_due' ? [{ conn, event }] :
-        [{ conn, event: 'close', code: event }];
-      assert.deepEqual(events, item.events, `tick ${item.now}`);
-    }
+  function checkTick(life, conn, item, candidateInProgress = false) {
+    const event = life.tick(item.now, mono(item.now), candidateInProgress);
+    const events = event === null ? [] : event === 'renew_due' ? [{ conn, event }] :
+      [{ conn, event: 'close', code: event }];
+    assert.deepEqual(events, item.events, `tick ${item.now}`);
   }
   add('renewal and expiration timeline', () => {
     const life = new SessionLifetime(v.local_window, authenticate().window);
     assert.equal(life.deadline, v.deadline);
     assert.equal(life.renewAt, v.renew_at);
-    checkTimeline(life, 1, v.ticks);
+    for (const tick of v.ticks) checkTick(life, 1, tick);
   });
   add('switch without renewing keeps pending retries', () => {
     const life = new SessionLifetime(v.local_window, authenticate().window);
     const switchAt = v.switch_without_renewal.switch_at;
-    checkTimeline(life, 1, v.ticks.filter(tick => tick.now < switchAt));
+    for (const tick of v.ticks.filter(tick => tick.now < switchAt)) checkTick(life, 1, tick);
     const replacement = new SessionLifetime(v.local_window, authenticate(switchAt).window, life);
-    checkTimeline(replacement, 2, v.switch_without_renewal.ticks);
+    for (const tick of v.switch_without_renewal.ticks) checkTick(replacement, 2, tick);
+  });
+  add('retry_while_candidate', () => {
+    const life = new SessionLifetime(v.local_window, authenticate().window);
+    for (const tick of v.ticks.filter(tick => tick.now <= v.renew_at)) checkTick(life, 1, tick);
+    let candidate;
+    for (const step of v.retry_while_candidate.steps) {
+      switch (step.op) {
+        case 'tick': checkTick(life, 1, step, candidate !== undefined); break;
+        case 'begin_path':
+          assert.equal(candidate, undefined);
+          candidate = step.conn;
+          break;
+        case 'path_closed':
+          assert.equal(candidate, step.conn);
+          candidate = undefined;
+          break;
+        default: assert.fail(`unknown lifecycle step ${step.op}`);
+      }
+    }
   });
   add('handshake after expiration', () => {
     const item = v.new_connection_after_deadline;
@@ -220,6 +237,41 @@ function outcome(expected, fn) {
     const { frame } = wire.decodeFrame(bytes(v.unknown_error_code.hex));
     assert.deepEqual(frame, { type: 'reset', stream: 1, code: wire.errorNumber('internal_error') });
   });
+  for (const item of v.streams.cases) add(item.name, () => {
+    assert.ok(item.role === 'host' || item.role === 'caller');
+    const streams = new Streams(item.role);
+    for (const [index, step] of item.steps.entries()) {
+      const { frame, read } = wire.decodeFrame(bytes(step.hex));
+      assert.equal(read, step.hex.length / 2);
+      assert.deepEqual(wire.frameResult(frame), step.frame);
+      matches(wire.encodeFrame(frame), step.hex);
+
+      const { event, reply } = streams.receive(frame);
+      if (typeof step.result === 'string') {
+        assert.equal(event, undefined);
+        assert.equal(reply?.type, 'goaway');
+        const { frame: goaway } = wire.decodeFrame(wire.encodeFrame(reply));
+        assert.equal(`close:${wire.readError(goaway.code)}`, step.result);
+        assert.equal(index, item.steps.length - 1, 'close must end the sequence');
+        assert.deepEqual(streams.receive({ type: 'ping', opaque: Buffer.alloc(8) }), {});
+        continue;
+      }
+
+      assert.equal(reply, undefined);
+      const events = [];
+      if (event) {
+        const { stream } = event;
+        switch (event.type) {
+          case 'open': events.push(`opened:${stream}`); break;
+          case 'data': events.push(`data:${stream}:${event.payload.length}`); break;
+          case 'fin': events.push(`finished:${stream}`); break;
+          case 'reset': events.push(`reset:${stream}:${wire.readError(event.code)}`); break;
+          default: assert.fail(`unexpected mux event ${event.type}`);
+        }
+      }
+      assert.deepEqual(events, step.result);
+    }
+  });
 }
 
 {
@@ -333,17 +385,17 @@ function outcome(expected, fn) {
   for (const sequence of v.sequences) add(sequence.name, () => replayAttemptSequence(sequence, v.conventions));
 }
 
-test('lifecycle checks / a pending candidate defers a retry and a later path resets the backoff', () => {
+test('lifecycle checks / a renewed path resets the backoff', () => {
   const window = { not_before: 1000, not_after: 5000 };
   const life = new SessionLifetime(window, window);
-  assert.equal(life.tick(life.renewAt, 0), 'renew_due');
-  assert.equal(life.tick(life.renewAt + 30, 30000, true), null);
-  assert.equal(life.tick(life.renewAt + 40, 40000), 'renew_due');
+  assert.equal(life.tick(life.renewAt, 0, true), null);
+  assert.equal(life.tick(life.renewAt + 30, 30000), 'renew_due');
+  assert.equal(life.tick(life.renewAt + 90, 90000), 'renew_due');
   assert.equal(life.tick(life.renewAt + 99, 99000), null);
 
   const renewed = { ...window, not_after: 6000 };
   const replacement = new SessionLifetime(renewed, renewed, life);
-  assert.equal(replacement.tick(life.renewAt + 100, 100000), null);
+  assert.equal(replacement.tick(life.renewAt + 210, 210000), null);
   assert.equal(replacement.tick(replacement.renewAt, 1000000), 'renew_due');
   assert.equal(replacement.tick(replacement.renewAt + 30, 1030000), 'renew_due');
 });
@@ -388,24 +440,33 @@ test('flow control / initial credit, replenishment and FIN', () => {
   streams.receive({ type: 'open', stream: 1, class: 0, label: 'rpc' });
   const data = { type: 'data', stream: 1, payload: new Uint8Array(65536) };
   for (let i = 0; i < 4; i++) streams.receive(data);
-  outcome('flow_control', () => streams.receive(data));
   assert.equal(streams.consume(1, 65535), undefined);
   assert.deepEqual(streams.consume(1, 1), { type: 'credit', stream: 1, increment: 65536 });
   streams.receive(data);
   streams.receive({ type: 'fin', stream: 1 });
   assert.equal(streams.consume(1, 65536), undefined);
-  outcome('stream_closed', () => streams.receive(data));
   streams.sent({ type: 'fin', stream: 1 });
-  assert.equal(streams.receive(data), undefined);
-  outcome('protocol_error', () => streams.receive({ ...data, stream: 3 }));
+  assert.deepEqual(streams.receive(data), {});
 });
 
-test('flow control / peer stream cap, parity and send-credit cap', () => {
+test('flow control / exceeding receive credit closes the mux', () => {
+  const streams = new Streams('host');
+  streams.receive({ type: 'open', stream: 1, class: 0, label: 'rpc' });
+  const data = { type: 'data', stream: 1, payload: new Uint8Array(65536) };
+  for (let i = 0; i < 4; i++) streams.receive(data);
+  assert.deepEqual(streams.receive(data), { reply: { type: 'goaway', code: wire.errorNumber('flow_control') } });
+});
+
+test('flow control / peer stream cap and send-credit cap', () => {
   const streams = new Streams('caller');
-  outcome('protocol_error', () => streams.receive({ type: 'open', stream: 1, class: 0, label: 'rpc' }));
   for (let i = 1; i <= 1024; i++) streams.receive({ type: 'open', stream: i * 2, class: 0, label: 'rpc' });
-  assert.deepEqual(streams.receive({ type: 'open', stream: 2050, class: 0, label: 'rpc' }),
-    { type: 'reset', stream: 2050, code: wire.errorNumber('refused_stream') });
-  streams.receive({ type: 'credit', stream: 2, increment: 2 ** 30 - 262144 });
-  outcome('flow_control', () => streams.receive({ type: 'credit', stream: 2, increment: 1 }));
+  const refused = { type: 'open', stream: 2050, class: 0, label: 'rpc' };
+  assert.deepEqual(streams.receive(refused),
+    { reply: { type: 'reset', stream: 2050, code: wire.errorNumber('refused_stream') } });
+  streams.receive({ type: 'reset', stream: 2, code: wire.errorNumber('cancelled') });
+  const next = { ...refused, stream: 2052 };
+  assert.deepEqual(streams.receive(next), { event: next });
+  streams.receive({ type: 'credit', stream: 4, increment: 2 ** 30 - 262144 });
+  assert.deepEqual(streams.receive({ type: 'credit', stream: 4, increment: 1 }),
+    { reply: { type: 'goaway', code: wire.errorNumber('flow_control') } });
 });

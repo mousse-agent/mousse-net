@@ -257,10 +257,10 @@ export class SessionLifetime {
       return 'cert_expired';
     }
     const due = this.nextRetry === undefined ? now >= this.renewAt : mono >= this.nextRetry;
-    if (due && !candidateInProgress) {
+    if (due) {
       this.nextRetry = mono + renewalWaits[this.retry] * 1000;
       this.retry = Math.min(this.retry + 1, renewalWaits.length - 1);
-      return 'renew_due';
+      if (!candidateInProgress) return 'renew_due';
     }
     return null;
   }
