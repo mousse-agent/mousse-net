@@ -380,7 +380,7 @@ where
         let params = InvitationParams {
             kind,
             role: Role::owner(),
-            authorizing_owner: self.shared.owner.clone(),
+            authorizing_owner: self.shared.owner,
             routes,
             grant_expires_at: None,
         };

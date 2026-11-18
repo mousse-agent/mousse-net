@@ -279,6 +279,8 @@ async fn a_paired_caller_finds_the_host_after_a_port_change() {
 
 /// Start a send-link join in the background. Returns the code channel, the
 /// asks the joiner makes, and the join result.
+type JoinTask = tokio::task::JoinHandle<Result<(mousse_net_io::Connection, JoinOutcome), NetError>>;
+
 fn start_link_join(
     caller: Arc<Caller>,
     host: &TestHost,
@@ -286,7 +288,7 @@ fn start_link_join(
 ) -> (
     mpsc::UnboundedSender<String>,
     mpsc::UnboundedReceiver<Option<u8>>,
-    tokio::task::JoinHandle<Result<(mousse_net_io::Connection, JoinOutcome), NetError>>,
+    JoinTask,
 ) {
     let (type_tx, typed) = mpsc::unbounded_channel();
     let (asks, asks_rx) = mpsc::unbounded_channel();
