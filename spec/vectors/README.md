@@ -23,7 +23,7 @@ conforming implementation passes every case, including every rejection.
 
 | File | wire.md | What it checks |
 |---|---|---|
-| `session-cert.json` | 5 | `valid`: every intermediate value of one certificate (keys, SPKI, serial, session record, identity signature, extension value, certificate) and a `CertificateVerify`-style signature with a wrong-key counterpart. `cases`: verify `certificate` at `now` with `expected_identity` (null = no pin) and compare the result. Covers the skew edges, an expired certificate, a pin mismatch on reconnect, another endpoint answering on the expected LAN address (`pin_mismatch`; no data is sent and the caller tries the next candidate), an identity signature over another TLS key, a DER identity signature, window errors, a bad self-signature, an unsupported version, an off-curve identity key and malformed DER. The pin is checked before the window, so a certificate that breaks both is `pin_mismatch` (`precedence_pin_before_window`), and an expired certificate with no pin is `outside_window`. Error precedence: a self-signature that is not strict DER (`malformed`) against well-formed out-of-range scalars (`self_signature_invalid`), extension field lengths judged by checks 3 and 5, and `precedence_*` certificates that break two checks at once. `pending` lists vectors that will be added later. |
+| `session-cert.json` | 5 | `valid`: every intermediate value of one certificate (keys, SPKI, serial, session record, identity signature, extension value, certificate) and a `CertificateVerify`-style signature with a wrong-key counterpart. `cases`: verify `certificate` at `now` with `expected_identity` (null = no pin) and compare the result. Covers the skew edges, an expired certificate, a pin mismatch on reconnect, another endpoint answering on the expected LAN address (`pin_mismatch`; no data is sent and the caller tries the next candidate), an identity signature over another TLS key, a DER identity signature, window errors, a bad self-signature, an unsupported version, an off-curve identity key and malformed DER. The pin is checked before the window, so a certificate that breaks both is `pin_mismatch` (`precedence_pin_before_window`), and an expired certificate with no pin is `outside_window`. Error precedence: a self-signature that is not strict DER (`malformed`) against well-formed out-of-range scalars (`self_signature_invalid`), extension field lengths judged by checks 3 and 5, and `precedence_*` certificates that break two checks at once. `browser_worker`: certificates made in real browser Workers (Chromium and Firefox) by `spikes/browser-worker`, with a non-extractable WebCrypto identity key; each has an `ok` case of the same name in `cases`. Their bytes are recorded, not generated. |
 | `session-lifecycle.json` | 6 | A live path: renewal time, renewal retries on their backoff while no new path with a later renewal time is current, the effective deadline, and the tick at which it closes with `cert_expired`; a switch to a new path that carries the same certificates keeps the retry schedule; a new connection after the deadline fails step 1. `clock_rollback`: the wall clock is set back after authentication, and the path still closes when the monotonic cap is reached (6). |
 | `authz.json` | 7, 8 | `cases`: step 2 and the host's traffic table (8.1). Includes a valid identity with no grant attempting RPC (closed with `not_authorized`), the 10 s proof deadline, join-only limits, one `JOIN_PROOF` on a live connection (before any stream) that can make it join-only, grant expiry edges and a local denial. `caller_cases`: the caller's gate (8.2), including a host that opens a stream before `AUTHORIZED`, `PAIRED` out of place, a second `AUTHORIZED`, a caller that sent a proof waiting for the host's answer after step 2's live notice, `PAIRED` as that answer (`proof_answered_with_paired`), and what a host-opened stream may do, read from the caller's own grants (`host_stream` steps with `local_grants`, `host_opened_stream_needs_the_callers_grant`). |
 | `hello.json` | 2, 11 | This build's versions and `HELLO` bytes; negotiation cases with the agreed minor version or `close:unsupported_version`; `repeated`: several `HELLO`s on one connection, where only the first counts. |
@@ -64,18 +64,13 @@ inherits it) even with debug assertions on: each build script passes the
 profile to its crate, which checks it at compile time, so flags given to one
 crate alone (`cargo rustc -- --cfg ...`) are caught too.
 
-## Pending
-
-- **Browser Worker certificate:** a session certificate issued in a browser
-  Worker with a WebCrypto identity key, checked by a native verifier. Added
-  with the browser spike; listed under `pending` in `session-cert.json`.
-
 ## How they are made
 
 `crates/mousse-net-core/src/vectors/mod.rs` generates every file here
 (except the code-exchange ones and `pairing-e2e.json`) from the fixed keys
-above. `crates/mousse-net-core/tests/pairing_e2e.rs` generates
-`pairing-e2e.json`. Each test fails if a file differs from what it
+above. The browser Worker certificates in `session-cert.json` are recorded
+from `spikes/browser-worker` runs; the generator only checks them.
+`crates/mousse-net-core/tests/pairing_e2e.rs` generates `pairing-e2e.json`. Each test fails if a file differs from what it
 generates. To regenerate after a deliberate change:
 
 ```

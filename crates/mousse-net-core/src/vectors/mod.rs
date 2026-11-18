@@ -114,6 +114,93 @@ fn cert_case(
     })
 }
 
+/// A session certificate made in a real browser by `spikes/browser-worker`
+/// (Phase 0 spike 2). A dedicated Worker's non-extractable WebCrypto P-256
+/// identity key signed the session record, and `mousse-net-core` compiled to
+/// wasm32 assembled the certificate. The bytes are recorded from those runs,
+/// not generated; the generator only checks them.
+struct BrowserWorkerCert {
+    name: &'static str,
+    browser: &'static str,
+    not_before: u64,
+    certificate: &'static str,
+    identity_public: &'static str,
+    record: &'static str,
+    identity_signature: &'static str,
+}
+
+const BROWSER_WORKER_CERTS: [BrowserWorkerCert; 2] = [
+    BrowserWorkerCert {
+        name: "browser_worker_certificate_chromium",
+        browser: "Microsoft Edge 157.0.4341.60 (Chromium), headless, Windows 11 x64",
+        not_before: 1795014973,
+        certificate: "308201da30820180a00302010202104434f5908f439d36d5a2736296ed6d42300a06082a8648ce3d04030230193117301506035504030c0e6d6f757373652d73657373696f6e301e170d3236313131383135313631335a170d3236313131393135313631335a30193117301506035504030c0e6d6f757373652d73657373696f6e3059301306072a8648ce3d020106082a8648ce3d030107034200043059996ffeeee681a898907e2e84eb716984f517e12727b2d0ff8de55832fa08875f61f4536d44032a6d137f9ebd82a4466d0c316c5a902b600d96c7786b7ef5a381a93081a63081a3061369e595e3c0fbf68a84f595c9dabef4e2f7be0504818b3081880201010441049ed06f5dc71a53935e534ba0a96af5bf208714df62fc2bfdcc46d932b7494058ea60d6dbfdf40745d735b3d6aff516da744c0c85ce4ede9cf3e2ad14e7323778044078a099bb3c1d2788043a174d8db8c97698059a3f6877aa04cb96d2823f750335f197b4f899a91c54b36d4602945509a04362cd1232710661a8922f7ca5687120300a06082a8648ce3d040302034800304502205e17492a1c12ada778b3355c29e3100e64f62d1f3c3fc25bfe46ee4253c1ac8e022100e166eb662360849963c26e94e0c669e19738e7b3e7101feb6a328ed8f6e0d48b",
+        identity_public: "049ed06f5dc71a53935e534ba0a96af5bf208714df62fc2bfdcc46d932b7494058ea60d6dbfdf40745d735b3d6aff516da744c0c85ce4ede9cf3e2ad14e7323778",
+        record: "a501716d6f757373652d73657373696f6e2d763102585b3059301306072a8648ce3d020106082a8648ce3d030107034200043059996ffeeee681a898907e2e84eb716984f517e12727b2d0ff8de55832fa08875f61f4536d44032a6d137f9ebd82a4466d0c316c5a902b600d96c7786b7ef5031a6afdc13d041a6aff12bd0501",
+        identity_signature: "78a099bb3c1d2788043a174d8db8c97698059a3f6877aa04cb96d2823f750335f197b4f899a91c54b36d4602945509a04362cd1232710661a8922f7ca5687120",
+    },
+    BrowserWorkerCert {
+        name: "browser_worker_certificate_firefox",
+        browser: "Firefox 159.0, headless, Windows 11 x64",
+        not_before: 1795014979,
+        certificate: "308201da30820180a00302010202106681f50ce9834a70ee6ff79252337954300a06082a8648ce3d04030230193117301506035504030c0e6d6f757373652d73657373696f6e301e170d3236313131383135313631395a170d3236313131393135313631395a30193117301506035504030c0e6d6f757373652d73657373696f6e3059301306072a8648ce3d020106082a8648ce3d03010703420004fdd095f1701a9cfaf34141ce09588b4aca8a9f7eed57a0d5af7a3e7cf587e2a66f5d9552e5074e6c918d74c4911558e97b93a3f38ca3a10c9fe6e500a592d41ca381a93081a63081a3061369e595e3c0fbf68a84f595c9dabef4e2f7be0504818b3081880201010441040ec807c0051448c20c037c3d2e1bd9b942e973bbaa2b238954a887cf78eb4d8b67050ed3e84ab370a643687a2cf23fcb0fb9aba4a0db3935100fea97b566ef8504408944a4081a29b509a1d6c2e7d1137f6bd222dd8ebca9ceaaf5f1db71fddf7d0e74148a9b4b6c46a74755b9dc5eecaef3ab00f6b7b6116d2148f611decbde8106300a06082a8648ce3d0403020348003045022100cfc448dc685624712eaff7179ce59b58e9558603b08e91aae453d762ce6f36030220065947cdc6ba375ecf6902b229bc8c5a31a7985c19dba1ebc7ee314176da561c",
+        identity_public: "040ec807c0051448c20c037c3d2e1bd9b942e973bbaa2b238954a887cf78eb4d8b67050ed3e84ab370a643687a2cf23fcb0fb9aba4a0db3935100fea97b566ef85",
+        record: "a501716d6f757373652d73657373696f6e2d763102585b3059301306072a8648ce3d020106082a8648ce3d03010703420004fdd095f1701a9cfaf34141ce09588b4aca8a9f7eed57a0d5af7a3e7cf587e2a66f5d9552e5074e6c918d74c4911558e97b93a3f38ca3a10c9fe6e500a592d41c031a6afdc143041a6aff12c30501",
+        identity_signature: "8944a4081a29b509a1d6c2e7d1137f6bd222dd8ebca9ceaaf5f1db71fddf7d0e74148a9b4b6c46a74755b9dc5eecaef3ab00f6b7b6116d2148f611decbde8106",
+    },
+];
+
+/// Check each browser-made certificate with the native verifier and return
+/// the `browser_worker` entries and their verification cases.
+fn browser_worker_vectors() -> (Vec<J>, Vec<J>) {
+    let mut entries = Vec::new();
+    let mut cases = Vec::new();
+    for c in &BROWSER_WORKER_CERTS {
+        let der = unhex(c.certificate);
+        let identity =
+            IdentityPublicKey::from_sec1(&unhex(c.identity_public)).expect("browser identity key");
+        let now = c.not_before + 60;
+        let verified = session_cert::verify(&der, UnixTime(now), Some(&identity))
+            .expect("the native verifier accepts the browser certificate");
+        assert_eq!(verified.window.not_before().0, c.not_before, "{}", c.name);
+        let record = session_cert::session_record(
+            &verified.spki_der,
+            verified.window.not_before(),
+            verified.window.not_after(),
+            verified.version,
+        );
+        assert_eq!(hex(&record), c.record, "{}: session record", c.name);
+        let signature =
+            RawSignature::from_slice(&unhex(c.identity_signature)).expect("raw identity signature");
+        identity
+            .verify(&record, &signature)
+            .expect("the WebCrypto identity signature verifies");
+        cases.push(cert_case(
+            c.name,
+            &format!(
+                "A certificate made in a browser Worker ({}): the identity signature is from a non-extractable WebCrypto key. It verifies exactly like `valid`.",
+                c.browser
+            ),
+            &der,
+            now,
+            Some(&identity),
+            "ok",
+        ));
+        entries.push(json!({
+            "name": c.name,
+            "browser": c.browser,
+            "certificate": c.certificate,
+            "identity_public": c.identity_public,
+            "spki": hex(&verified.spki_der),
+            "not_before": c.not_before,
+            "not_after": verified.window.not_after().0,
+            "record": c.record,
+            "identity_signature": c.identity_signature,
+        }));
+    }
+    (entries, cases)
+}
+
 fn session_cert_vectors() -> J {
     let a = identity(&IDENTITY_A);
     let b = identity(&IDENTITY_B);
@@ -281,7 +368,7 @@ fn session_cert_vectors() -> J {
         c
     };
 
-    let cases = vec![
+    let mut cases = vec![
         cert_case("valid", "Valid certificate, pinned identity matches.", &der, T + 60, Some(&pin_a), "ok"),
         cert_case("valid_first_contact", "Valid certificate, no pin given (host before step 2).", &der, T + 60, None, "ok"),
         cert_case("skew_before_edge", "now = not_before - 600: still accepted.", &der, nb - SKEW, Some(&pin_a), "ok"),
@@ -313,6 +400,8 @@ fn session_cert_vectors() -> J {
         cert_case("precedence_pin_before_window", "Dialling a candidate address for endpoint A, endpoint B answers with a certificate that is also a day past its window. Check 9 (the pin) comes before check 10 (the window): the caller reads \"not this peer\" and tries the next candidate, not a clock error.", &other_endpoint, na + DAY, Some(&pin_a), "pin_mismatch"),
         cert_case("expired_with_no_pin", "An expired certificate with no pin given: check 10.", &der, na + DAY, None, "outside_window"),
     ];
+    let (browser_worker, browser_cases) = browser_worker_vectors();
+    cases.extend(browser_cases);
 
     json!({
         "description": "Session certificates (spec wire.md, \"Session certificate\"). Verify each case with `now` and `expected_identity` (null = no pin) and compare the result: \"ok\" or the rejection name.",
@@ -339,13 +428,7 @@ fn session_cert_vectors() -> J {
         },
         "other_identity_public": hex(pin_b.as_bytes()),
         "cases": cases,
-        "pending": [
-            {
-                "name": "browser_worker_certificate",
-                "status": "pending",
-                "note": "A certificate issued in a browser Worker with a WebCrypto identity key. Added when the web client lands; it must verify exactly like `valid`.",
-            }
-        ],
+        "browser_worker": browser_worker,
     })
 }
 

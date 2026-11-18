@@ -135,7 +135,38 @@ fn session_certificates() {
         };
         assert_eq!(got, s(&case["result"]), "case {}", s(&case["name"]));
     }
-    assert_eq!(s(&doc["pending"][0]["status"]), "pending");
+
+    // Certificates made in browser Workers with WebCrypto identity keys: the
+    // native verifier accepts them, and their parts check out.
+    let browser = list(&doc["browser_worker"]);
+    assert!(!browser.is_empty());
+    for item in browser {
+        let name = s(&item["name"]);
+        let identity = key(&item["identity_public"]);
+        let (nb, na) = (
+            UnixTime(u(&item["not_before"])),
+            UnixTime(u(&item["not_after"])),
+        );
+        let verified =
+            session_cert::verify(&unhex(&item["certificate"]), nb.plus(60), Some(&identity))
+                .unwrap_or_else(|e| panic!("{name}: {}", e.code()));
+        assert_eq!(verified.spki_der, unhex(&item["spki"]), "{name}");
+        assert_eq!(
+            verified.window,
+            ValidityWindow::new(nb, na).expect("window")
+        );
+        let record = session_cert::session_record(&verified.spki_der, nb, na, verified.version);
+        assert_eq!(record, unhex(&item["record"]), "{name}");
+        let sig = RawSignature::from_slice(&unhex(&item["identity_signature"])).expect("raw");
+        identity.verify(&record, &sig).expect("identity signature");
+        assert!(
+            cases
+                .iter()
+                .any(|c| s(&c["name"]) == name && s(&c["result"]) == "ok"),
+            "{name} has an ok case"
+        );
+    }
+    assert!(doc.get("pending").is_none());
 }
 
 #[test]
