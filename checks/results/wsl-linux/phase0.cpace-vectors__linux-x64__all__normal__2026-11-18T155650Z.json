@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "wsl-linux",
+  "key": "042f0974403d57624956aebbe7cd72f01b86773fdee66ffba37429d70a320ccb692f06069a9174535d971428932d86132cc89eef54954c5f9c5c6ed605fea234bb",
+  "payload": "{\"check\":\"phase0.cpace-vectors\",\"target\":\"linux-x64\",\"build\":\"ffcf57b7d75e283d1d25c5717e3ee0beabc56f0e+debug\",\"platform\":\"linux-x86_64\",\"outcome\":\"PASS\",\"details\":\"23 tests passed\",\"time\":\"2026-11-18T15:56:50Z\",\"device\":\"wsl-linux\",\"config\":\"7453dbf2aeb7c711654cb562ae9aa1182e5080d74110b11cfadf1d8994b1472d\"}",
+  "signature": "e7c5e464379f8c02d2c7d1be1d2cf09509390f729c320f101abd3807f7f6ffd803c537a00064ce16b1af84a31c2e36653f93b7a18e996e69870b48305f21473f"
+}

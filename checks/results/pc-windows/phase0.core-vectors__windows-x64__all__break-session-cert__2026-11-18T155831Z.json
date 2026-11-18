@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "pc-windows",
+  "key": "048ad3ccda2d27fdfc98c131f2fa25bea736ec0a3e8a107dcbfa6b2f5a86b88da452c337f09925646ec76897452505e718f3f397ddf39674e9f5ad64590bc93d57",
+  "payload": "{\"check\":\"phase0.core-vectors\",\"target\":\"windows-x64\",\"control\":\"break-session-cert\",\"build\":\"ffcf57b7d75e283d1d25c5717e3ee0beabc56f0e+debug\",\"platform\":\"windows-x86_64\",\"outcome\":\"FAIL\",\"details\":\"2 of 175 tests failed\",\"time\":\"2026-11-18T15:58:31Z\",\"device\":\"pc-windows\",\"config\":\"1f8d0f61e67cd229db1eceba57ff3a92b8154e18180568137de573eeefff633c\"}",
+  "signature": "f5a691cf064e8569944ef99b153e52149f81f79fcb6ee7ef6446d637144ee89fb51e2f42bf23c4cf47f12fc4e5156c88717154122d8dd5230a74aa9e68f52a3b"
+}
