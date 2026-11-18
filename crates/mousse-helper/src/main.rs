@@ -12,7 +12,10 @@
         mousse_control = "read-without-credit",
         mousse_control = "fifo-writer",
         mousse_control = "fin-overtakes",
-        mousse_control = "no-revoke-journal"
+        mousse_control = "no-revoke-journal",
+        mousse_control = "stop-on-mismatch",
+        mousse_control = "public-routes",
+        mousse_control = "no-rediscovery"
     )
 ))]
 compile_error!("a mousse_control build has a deliberate defect and is for tests only; build it without --release");
@@ -27,7 +30,10 @@ compile_error!("a mousse_control build has a deliberate defect and is for tests 
     mousse_control = "read-without-credit",
     mousse_control = "fifo-writer",
     mousse_control = "fin-overtakes",
-    mousse_control = "no-revoke-journal"
+    mousse_control = "no-revoke-journal",
+    mousse_control = "stop-on-mismatch",
+    mousse_control = "public-routes",
+    mousse_control = "no-rediscovery"
 ))]
 const _: () = {
     let profile = env!("MOUSSE_BUILD_PROFILE").as_bytes();

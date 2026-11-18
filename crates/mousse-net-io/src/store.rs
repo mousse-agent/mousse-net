@@ -426,10 +426,14 @@ pub struct PeerRecord {
     pub identity: String,
     /// The role the host granted.
     pub role: String,
-    /// Route hints from the ticket.
+    /// Route hints from the ticket, or from the host when it paired back.
     pub routes: Vec<String>,
     /// The route that last worked.
     pub last_route: Option<String>,
+    /// Addresses the owner added for this host (Phase 1a
+    /// `peer.addresses.set`), tried before the hints.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub addresses: Vec<String>,
     /// When pairing finished (local clock).
     pub paired_at: u64,
 }
@@ -440,10 +444,11 @@ impl PeerRecord {
         identity_from_hex(&self.identity)
     }
 
-    /// Routes to try, the last working one first.
+    /// Routes to try: the last working one, then the addresses the owner
+    /// added, then the hints (Phase 1a §6).
     pub fn routes_to_try(&self) -> Vec<String> {
         let mut out: Vec<String> = self.last_route.iter().cloned().collect();
-        for r in &self.routes {
+        for r in self.addresses.iter().chain(&self.routes) {
             if !out.contains(r) {
                 out.push(r.clone());
             }
@@ -891,6 +896,7 @@ mod tests {
                             role: "owner".into(),
                             routes: Vec::new(),
                             last_route: None,
+                            addresses: Vec::new(),
                             paired_at: 1,
                         })
                         .unwrap();
@@ -917,6 +923,7 @@ mod tests {
             role: role.into(),
             routes: vec!["tcp://10.0.0.2:7443".into()],
             last_route: None,
+            addresses: Vec::new(),
             paired_at: 1,
         }
     }
@@ -1051,6 +1058,7 @@ mod tests {
             role: "owner".into(),
             routes: vec!["tcp://10.0.0.2:7443".into()],
             last_route: None,
+            addresses: Vec::new(),
             paired_at: 1,
         };
         store.upsert(record.clone()).unwrap();

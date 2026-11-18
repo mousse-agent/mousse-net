@@ -72,6 +72,10 @@ mousse_net_core::define_limits! {
         app_log_files = "APP_LOG_FILES": 2, [1, 10];
         /// While networking is paused because a removal could not be saved, how often the save is tried again (Phase 1a §5.4).
         removal_retry_ms = "REMOVAL_RETRY_MS": 1_000, [10, 60_000];
+        /// Keep connected: wait before redialling a paired host that could not be reached; each next wait doubles (Phase 1a §6).
+        keep_retry_first_ms = "KEEP_RETRY_FIRST_MS": 1_000, [10, 60_000];
+        /// Keep connected: longest wait between redials of a host that could not be reached; not below the first wait.
+        keep_retry_max_ms = "KEEP_RETRY_MAX_MS": 60_000, [10, 3_600_000];
     }
     agree(h) {
         if h.app_credit_interactive_reserve_bytes >= h.app_credit_budget_bytes {
@@ -87,6 +91,12 @@ mousse_net_core::define_limits! {
                 h.app_stream_credit_bytes,
                 h.app_credit_budget_bytes,
                 h.app_credit_interactive_reserve_bytes
+            )));
+        }
+        if h.keep_retry_max_ms < h.keep_retry_first_ms {
+            return Err(LimitError::Conflict(format!(
+                "KEEP_RETRY_MAX_MS ({}) is below KEEP_RETRY_FIRST_MS ({})",
+                h.keep_retry_max_ms, h.keep_retry_first_ms
             )));
         }
     }

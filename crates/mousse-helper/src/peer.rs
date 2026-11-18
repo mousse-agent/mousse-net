@@ -303,6 +303,7 @@ pub(crate) async fn join_routes<C: CodeEntry>(
                             role,
                             routes: ticket.routes.clone(),
                             last_route: Some(hint.clone()),
+                            addresses: existing.map(|p| p.addresses.clone()).unwrap_or_default(),
                             paired_at: now_secs(),
                         };
                         peers.retain(|p| p.pin().ok() != Some(ticket.host_identity));

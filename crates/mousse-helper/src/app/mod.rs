@@ -34,6 +34,9 @@ mod budget;
 mod frame;
 mod out;
 mod pairing;
+mod paths;
+
+pub use paths::browse_source;
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -81,6 +84,8 @@ pub struct AppInfo {
     pub port: u16,
     pub routes: Vec<String>,
     pub state_dir: PathBuf,
+    /// Where to look for paired hosts that moved (Phase 1a §6).
+    pub browse: Option<Arc<mousse_net_io::discovery::CachedBrowse>>,
 }
 
 /// Why the channel ended.
@@ -124,6 +129,7 @@ struct Shared {
     removal: Arc<Removal>,
     admission: Arc<StreamAdmission>,
     pairing: Mutex<pairing::State>,
+    keep: paths::Keep,
     info: AppInfo,
     limits: HelperLimits,
 }
@@ -250,12 +256,14 @@ impl App {
             host,
             removal,
             pairing: Mutex::new(pairing::State::new(info.name.clone())),
+            keep: paths::Keep::default(),
             info,
             limits,
         });
         tokio::spawn(read_stdin(shared.clone()));
         tokio::spawn(write_stdout(shared.clone()));
         tokio::spawn(pairing::watch_pause(shared.clone()));
+        tokio::spawn(paths::keep_connected(shared.clone()));
         Self { shared }
     }
 
@@ -387,6 +395,10 @@ impl Shared {
         });
         core.out.conn_event(no, &event);
         self.queued(&core);
+        drop(core);
+        if !entry.inbound {
+            self.keep.kick(paths::Kick::Look);
+        }
         applog::line(format!("closed {}: {reason}", short_id(&entry.identity)));
     }
 
@@ -509,8 +521,10 @@ impl Shared {
         match op {
             "hello" => {
                 let reply = self.hello(&id, &map);
-                if reply.get("error").is_none() {
+                if reply.get("error").is_none() && !core.hello {
                     core.hello = true;
+                    // Keep paired hosts connected from now on.
+                    self.keep.kick(paths::Kick::Reset(None));
                 }
                 self.reply(&mut core, reply);
             }

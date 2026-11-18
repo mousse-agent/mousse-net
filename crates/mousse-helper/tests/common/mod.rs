@@ -115,10 +115,35 @@ impl Endpoint {
 
     /// Start `serve --app` with `MOUSSE_NET_<name>` overrides.
     pub fn app(&self, name: &str, env: &[(&str, &str)]) -> App {
-        let mut cmd = self.command(&["serve", "--app", "--no-mdns", "--port", "0", "--name", name]);
+        self.app_with(name, env, 0, None)
+    }
+
+    /// Start `serve --app` on `port` (0: any), with `MOUSSE_NET_<name>`
+    /// overrides, reading hosts from `browse` (`MOUSSE_HELPER_BROWSE_FILE`)
+    /// if given.
+    pub fn app_with(
+        &self,
+        name: &str,
+        env: &[(&str, &str)],
+        port: u16,
+        browse: Option<&Path>,
+    ) -> App {
+        let port = port.to_string();
+        let mut cmd = self.command(&[
+            "serve",
+            "--app",
+            "--no-mdns",
+            "--port",
+            &port,
+            "--name",
+            name,
+        ]);
         cmd.stdin(Stdio::piped());
         for (k, v) in env {
             cmd.env(format!("MOUSSE_NET_{k}"), v);
+        }
+        if let Some(file) = browse {
+            cmd.env("MOUSSE_HELPER_BROWSE_FILE", file);
         }
         App::spawn(cmd, self.dir.clone(), name)
     }

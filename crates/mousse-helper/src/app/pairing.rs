@@ -10,8 +10,9 @@
 //! - **Grants:** `grants.list`, `grant.add` (idempotent), `grant.remove`
 //!   (journaled, see [`crate::revoke`]); events `grant.closed`,
 //!   `store.failed`, `net.paused` and `net.resumed`.
-//! - **Peers:** `peers.list`, `peer.add` (idempotent), `peer.forget`, and
-//!   `dial`, whose `conn.up` carries the role the peer gave this device.
+//! - **Peers:** `peers.list`, `peer.add` (idempotent), `peer.forget`,
+//!   `peer.addresses.set`, and `dial`, whose `conn.up` carries the role the
+//!   peer gave this device (see [`super::paths`]).
 //! - **Session:** `config.set {name}`.
 
 use std::collections::HashMap;
@@ -20,7 +21,6 @@ use std::sync::{Arc, MutexGuard};
 use mousse_net_core::grants::{Grant, GrantId};
 use mousse_net_core::pairing::{Arrival, InvitationId, InvitationKind, Route, Ticket};
 use mousse_net_core::ErrorCode;
-use mousse_net_io::pipe::route_uri;
 use mousse_net_io::store::{hex, identity_from_hex, short_id, unhex, PeerRecord, PeerStore};
 use mousse_net_io::{ApprovalRequest, HostEvent, NetError, NoCode};
 use serde_json::{json, Map, Value};
@@ -31,7 +31,7 @@ use crate::applog;
 use crate::revoke::Removed;
 
 /// The requests this module answers.
-pub const OPS: [&str; 13] = [
+pub const OPS: [&str; 14] = [
     "config.set",
     "invite.create",
     "invite.cancel",
@@ -44,6 +44,7 @@ pub const OPS: [&str; 13] = [
     "peers.list",
     "peer.add",
     "peer.forget",
+    "peer.addresses.set",
     "dial",
 ];
 
@@ -84,7 +85,7 @@ pub fn set_name(shared: &Shared, name: &str) -> Result<(), String> {
 }
 
 /// A role as stored: older records hold its debug form (`Role("owner")`).
-fn role_text(stored: &str) -> String {
+pub(super) fn role_text(stored: &str) -> String {
     stored
         .strip_prefix("Role(\"")
         .and_then(|r| r.strip_suffix("\")"))
@@ -127,6 +128,7 @@ fn peer_json(p: &PeerRecord) -> Value {
         "name": p.name,
         "role": role_text(&p.role),
         "routes": p.routes,
+        "addresses": p.addresses,
         "last_route": p.last_route,
         "paired_at": p.paired_at,
     })
@@ -181,10 +183,15 @@ pub fn on_request(shared: &Arc<Shared>, id: Value, op: &str, map: &Map<String, V
         },
         "peer.add" => add_peer(shared, &id, map),
         "peer.forget" => forget_peer(shared, &id, map),
+        "peer.addresses.set" => super::paths::set_addresses(shared, &id, map),
         "dial" => match str_field(map, "identity") {
             Some(_) if shared.removal.is_paused() => paused(shared, &id),
             Some(identity) => {
-                tokio::spawn(dial(shared.clone(), id, identity.to_lowercase()));
+                tokio::spawn(super::paths::dial_op(
+                    shared.clone(),
+                    id,
+                    identity.to_lowercase(),
+                ));
                 return;
             }
             None => error(&id, "bad_request", "dial needs identity"),
@@ -194,7 +201,7 @@ pub fn on_request(shared: &Arc<Shared>, id: Value, op: &str, map: &Map<String, V
     shared.event(reply);
 }
 
-fn paused(shared: &Shared, id: &Value) -> Value {
+pub(super) fn paused(shared: &Shared, id: &Value) -> Value {
     let why = shared.removal.paused_reason().unwrap_or_default();
     error(
         id,
@@ -284,10 +291,11 @@ async fn join(
     pinned: bool,
     name: String,
 ) {
-    let candidates: Vec<Route> = crate::peer::usable_routes(&ticket.routes);
+    // Only private-range hints are dialled (§5.3).
+    let candidates: Vec<Route> = super::paths::ticket_routes(&ticket.routes);
     let result = if candidates.is_empty() {
         Err(crate::peer::Failure {
-            text: "the ticket has no usable address".into(),
+            text: "the ticket has no usable private-range address".into(),
             reason: "no_route".into(),
         })
     } else {
@@ -403,19 +411,10 @@ fn add_peer(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
     let Some(name) = str_field(map, "name") else {
         return error(id, "bad_request", "peer.add needs name");
     };
-    let routes: Vec<String> = match map.get("routes") {
-        None | Some(Value::Null) => Vec::new(),
-        Some(Value::Array(list)) => {
-            let mut out = Vec::new();
-            for r in list {
-                match r.as_str().map(Route::parse) {
-                    Some(Ok(route)) => out.push(route_uri(&route)),
-                    _ => return error(id, "bad_route", format!("not a route: {r}")),
-                }
-            }
-            out
-        }
-        Some(_) => return error(id, "bad_request", "routes is a list"),
+    // The routes a host sends when it pairs back: private ranges only.
+    let routes = match super::paths::parse_routes(map.get("routes")) {
+        Ok(routes) => routes,
+        Err(e) => return error(id, "bad_route", e),
     };
     // 1a grants are owner grants (`grant.add` makes no other).
     let role = str_field(map, "role").unwrap_or("owner").to_owned();
@@ -439,12 +438,16 @@ fn add_peer(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
                 role: role.clone(),
                 routes: routes.clone(),
                 last_route: None,
+                addresses: Vec::new(),
                 paired_at: crate::peer::now_secs(),
             }),
         }
     });
     match updated {
-        Ok(()) => json!({"re": id, "already": already}),
+        Ok(()) => {
+            shared.keep.kick(super::paths::Kick::Reset(Some(identity)));
+            json!({"re": id, "already": already})
+        }
         Err(e) => error(id, "store_failed", e.to_string()),
     }
 }
@@ -472,40 +475,6 @@ fn forget_peer(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
         }
     }
     json!({"re": id, "forgotten": forgotten})
-}
-
-/// Dial a stored peer at its routes, the last working one first.
-async fn dial(shared: Arc<Shared>, id: Value, identity: String) {
-    let store = peers(&shared);
-    let peer = store
-        .load()
-        .ok()
-        .and_then(|list| list.into_iter().find(|p| p.identity == identity));
-    let reply = match peer {
-        None => error(&id, "no_peer", "not paired with that identity"),
-        Some(record) => {
-            let routes = crate::peer::usable_routes(&record.routes_to_try());
-            match record.pin() {
-                Err(e) => error(&id, "no_peer", e.to_string()),
-                Ok(pin) => match shared.caller.dial_candidates(&routes, pin).await {
-                    Ok((conn, used)) => {
-                        let _ = store.note_route(&pin, route_uri(&used));
-                        applog::line(format!("connected {} (out)", short_id(&pin)));
-                        let role = role_text(&record.role);
-                        let no = shared.add_conn(conn, false, json!({"dir": "out", "role": role}));
-                        json!({"re": id, "conn": no})
-                    }
-                    Err(e) => json!({
-                        "re": id,
-                        "error": "unreachable",
-                        "reason": crate::peer::describe(&e),
-                        "why": crate::peer::reason_of(&e),
-                    }),
-                },
-            }
-        }
-    };
-    shared.event(reply);
 }
 
 /// A host event, as app events.
@@ -592,7 +561,10 @@ pub async fn watch_pause(shared: Arc<Shared>) {
                 }
                 shared.event(json!({"ev": "net.paused", "reason": reason}));
             }
-            None => shared.event(json!({"ev": "net.resumed"})),
+            None => {
+                shared.event(json!({"ev": "net.resumed"}));
+                shared.keep.kick(super::paths::Kick::Reset(None));
+            }
         }
     }
 }

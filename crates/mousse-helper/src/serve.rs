@@ -15,7 +15,7 @@ use mousse_net_core::grants::GrantId;
 use mousse_net_core::identity::{IdentityPublicKey, SoftwareKey};
 use mousse_net_core::pairing::{CpaceExchangeFactory, InvitationId, InvitationKind};
 use mousse_net_core::ErrorCode;
-use mousse_net_io::discovery::Advertiser;
+use mousse_net_io::discovery::{Advertiser, CachedBrowse};
 use mousse_net_io::pipe::{accept_tcp, route_from_addr, route_uri};
 use mousse_net_io::rng::{os_rng, random_bytes};
 use mousse_net_io::store::{hex, short_id};
@@ -192,6 +192,17 @@ pub async fn run(
             port,
             routes: routes.clone(),
             state_dir: endpoint.dir().to_path_buf(),
+            // mDNS only where the helper advertises too (never on
+            // loopback); debug builds may read a browse file instead.
+            browse: crate::app::browse_source(opts.mdns && !opts.listen_ip.is_loopback()).map(
+                |source| {
+                    Arc::new(CachedBrowse::new(
+                        source,
+                        clock.clone(),
+                        crate::limits::get().net.io(),
+                    ))
+                },
+            ),
         };
         Some(crate::app::App::start(
             host.clone(),
