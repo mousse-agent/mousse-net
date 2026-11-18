@@ -361,8 +361,10 @@ includes both identity keys.
   it never fires twice to catch up). A retry that falls due while a
   candidate path is still being brought up is skipped, but it still counts:
   the next wait starts then and grows as if the retry had run, and the
-  skipped retry is not made up when the candidate fails. Vectors:
-  `session-lifecycle.json`.
+  skipped retry is not made up when the candidate fails. The first request
+  at the renewal time follows the same rule: if a candidate is already being
+  brought up then, the request is skipped but counts, and the 30 s wait
+  starts at that tick. Vectors: `session-lifecycle.json`.
 - **Path switch:** open a new connection to the same peer, run step 1 with
   the **same pin**, reopen channels on it (the application resumes from its
   own cursors), then close the old connection with `PATH_REPLACED`. If the
@@ -829,10 +831,19 @@ CPace output `ISK` is not used by pairing in version 1.
    when it already held a pin for the ticket's host identity before this
    flow started (an earlier pairing, not this ticket), or while it is
    learning the outcome of its own lost `PAIRED` (7). Otherwise the flow
-   ends with `PAIRING_FAILED`, the joiner closes the connection, and
-   nothing is pinned. An in-person ticket is read off the host's own
-   screen, so this does not apply to it. Vectors: `pairing-e2e.json`
+   ends with `PAIRING_FAILED`, the joiner closes the connection with it
+   (9), and nothing is pinned. An in-person ticket is read off the host's
+   own screen, so this does not apply to it. Vectors: `pairing-e2e.json`
    `send_link_live_needs_a_pin`.
+9. **A failed flow closes the connection.** When the joiner's flow ends
+   with an error code C (for example `PAIRING_FAILED` under 8, or
+   `ATTEMPTS_EXHAUSTED` after its third failed attempt), the joiner first
+   sends any message the same step produced (such as its `CODE_ABORT`),
+   then closes the connection with C: one `GOAWAY(C)` (section 1), with no
+   `CODE_ABORT` of its own for the flow. If the flow ended because the
+   host closed the connection or the connection broke, the joiner sends
+   nothing more. A failed attempt (6) is not a failed flow: it sends only
+   `CODE_ABORT` and the connection stays up.
 
 Random draws, in order (vectors depend on it): the host draws the invitation
 id (16 bytes), the secret (16 bytes) and, for "Send link", the first code

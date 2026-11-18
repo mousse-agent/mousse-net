@@ -408,6 +408,20 @@ fn session_lifecycle_vectors() -> J {
                 { "op": "tick", "now": renew_at + 490, "events": [{ "event": "renew_due", "conn": 1 }] },
             ],
         },
+        "candidate_at_first_renewal": {
+            "description": "A fresh replay of the same path, with a candidate already being brought up when renewal first falls due. That first request is skipped but counts as run: the 30 s wait starts at that tick. Replay: begin_path(1), on_authenticated(1, ...), on_reopened(1) as above, then apply each step in order, as in `retry_while_candidate` (here with no tick at renew_at first).",
+            "steps": [
+                { "op": "begin_path", "conn": 2 },
+                { "op": "tick", "now": renew_at - 1, "events": [] },
+                { "op": "tick", "now": renew_at, "events": [] },
+                { "op": "path_closed", "conn": 2 },
+                { "op": "tick", "now": renew_at + 1, "events": [] },
+                { "op": "tick", "now": renew_at + 29, "events": [] },
+                { "op": "tick", "now": renew_at + 30, "events": [{ "event": "renew_due", "conn": 1 }] },
+                { "op": "tick", "now": renew_at + 89, "events": [] },
+                { "op": "tick", "now": renew_at + 90, "events": [{ "event": "renew_due", "conn": 1 }] },
+            ],
+        },
         "new_connection_after_deadline": {
             "description": "A new connection with the same peer certificate after its own not_after + 600 fails step 1.",
             "now": T + DAY + SKEW + 1,
@@ -1485,7 +1499,7 @@ fn pairing_attempt_vectors() -> J {
         .map(|seq| run_attempt_sequence(seq, None))
         .collect();
     json!({
-        "description": "Attempt-limit and resend sequences for the send-link flow (spec wire.md, \"Send-link flow and the code\" and \"Attempt limits\"), plus one-enrollment for in person. Each step runs one operation and then the listed expectations hold. Ops: connect (the connection starts; after the two HELLO messages the joiner sends its join proof on conn and the host's AUTHORIZED, if any, reaches the joiner), submit (the joiner enters a code; messages flow until both sides stop), submit_first (only the joiner's first message reaches the host; the host's reply is recorded in `out` but not delivered to the joiner), redeliver (that first message reaches the host again on conn; the reply is recorded, not delivered), inject (the joiner's side sends `message` for `attempt`, \"current\" meaning the attempt of its last submit, with `payload`; the reply is recorded, not delivered), drop (conn closes), approve (host owner taps for conn). Codes: right (the code the host shows now), wrong (000000, or 000001 if 000000 is shown), stale (the code the host showed when the previous attempt started). `reply`: first_reply (the same messages, byte for byte, as the host's answer to that first message), code_abort (the host's only answer is CODE_ABORT pairing_failed for that attempt), none (no answer). `new_code` says whether the host showed a fresh code during the step. `closed` lists connections the host closed during the step. `out` lists, in order, every control message each side sent during the step (`send`), host closes (`close`) and codes the host showed (`show_code`), except the HELLO each side sends first on every connection (wire.md, \"Connection start and step 2\"): a replay over real connections exchanges both HELLOs, checks the agreed version and starts comparing at JOIN_PROOF. Each side's sends keep their own order; on connect the two sides send independently, and `out` lists the joiner's before the host's.",
+        "description": "Attempt-limit and resend sequences for the send-link flow (spec wire.md, \"Send-link flow and the code\" and \"Attempt limits\"), plus one-enrollment for in person. Each step runs one operation and then the listed expectations hold. Ops: connect (the connection starts; after the two HELLO messages the joiner sends its join proof on conn and the host's AUTHORIZED, if any, reaches the joiner), submit (the joiner enters a code; messages flow until both sides stop), submit_first (only the joiner's first message reaches the host; the host's reply is recorded in `out` but not delivered to the joiner), redeliver (that first message reaches the host again on conn; the reply is recorded, not delivered), inject (the joiner's side sends `message` for `attempt`, \"current\" meaning the attempt of its last submit, with `payload`; the reply is recorded, not delivered), drop (conn closes), approve (host owner taps for conn). Codes: right (the code the host shows now), wrong (000000, or 000001 if 000000 is shown), stale (the code the host showed when the previous attempt started). `reply`: first_reply (the same messages, byte for byte, as the host's answer to that first message), code_abort (the host's only answer is CODE_ABORT pairing_failed for that attempt), none (no answer). `new_code` says whether the host showed a fresh code during the step. `closed` lists connections the host closed during the step. When `joiner_state` becomes failed with a code, the joiner also closes the connection with GOAWAY of that code after its listed messages, unless the host had already closed it (wire.md 10.6 rule 9); that close is not listed. `out` lists, in order, every control message each side sent during the step (`send`), host closes (`close`) and codes the host showed (`show_code`), except the HELLO each side sends first on every connection (wire.md, \"Connection start and step 2\"): a replay over real connections exchanges both HELLOs, checks the agreed version and starts comparing at JOIN_PROOF. Each side's sends keep their own order; on connect the two sides send independently, and `out` lists the joiner's before the host's.",
         "conventions": {
             "time": T,
             "host": { "identity_secret": hex(&IDENTITY_A), "name": "Desk" },

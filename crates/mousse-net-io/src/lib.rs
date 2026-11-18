@@ -60,6 +60,26 @@ pub type SharedSigner = Arc<dyn IdentitySigner + Send + Sync>;
 ))]
 compile_error!("a mousse_control build has a deliberate defect and is for tests only; build it without --release");
 
+// The same controls in a release-profile build, even with debug assertions
+// on. `build.rs` passes the profile in `MOUSSE_BUILD_PROFILE`.
+#[cfg(any(
+    mousse_control = "skip-pin-check",
+    mousse_control = "keep-removed-grant",
+    mousse_control = "shared-endpoint-state",
+    mousse_control = "allow-break-env"
+))]
+const _: () = {
+    let profile = env!("MOUSSE_BUILD_PROFILE").as_bytes();
+    let release = b"release";
+    let mut same = profile.len() == release.len();
+    let mut i = 0;
+    while same && i < profile.len() {
+        same = profile[i] == release[i];
+        i += 1;
+    }
+    assert!(!same, "a mousse_control build has a deliberate defect and is for tests only; build it without --release");
+};
+
 /// The must-fail control compiled into this build, if any. Control builds
 /// carry one deliberate defect so a test kit can check that the tests
 /// catch it. Release builds never have one.
