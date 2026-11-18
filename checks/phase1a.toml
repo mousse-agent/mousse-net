@@ -56,3 +56,53 @@ control = [
   { name = "stop-on-mismatch", breaks = "the caller gives up at the first candidate with another identity", env = { RUSTFLAGS = '--cfg mousse_control="stop-on-mismatch"' } },
   { name = "public-routes", breaks = "pairback and peer.addresses.set accept public addresses", env = { RUSTFLAGS = '--cfg mousse_control="public-routes"' } },
 ]
+
+# App checks (`app = true`): run the Mousse app at the revision in
+# app/MOUSSE_REVISION, from the clean checkout named by MOUSSE_APP_DIR,
+# against the helper built from this checkout (tools/app-check/run.mjs).
+
+[[check]]
+id = "phase1a.picker-v1-off"
+title = "Fresh profiles with no net.db, v1 off: terminal access set through bridge.policy, then a remote thread and terminal through the daemon's picker methods, also at +8 and +40 days"
+plan = "docs/phase1a-design.md §4 and §10 (M4)"
+targets = ["windows-x64", "macos-arm64"]
+judge = "marker"
+app = true
+local = [
+  { target = "windows-x64", host = "windows-x86_64", command = ["node", "{root}/tools/app-check/run.mjs", "phase1a.picker-v1-off", "--out", "{out}"] },
+  { target = "macos-arm64", host = "macos-aarch64", command = ["node", "{root}/tools/app-check/run.mjs", "phase1a.picker-v1-off", "--out", "{out}"] },
+]
+control = [
+  { name = "roster-only-directory", expect_reason = "not_listed", breaks = "the peer directory reads only the v1 roster", env = { MOUSSE_NET_ENGINE_CONTROL = "roster-only-directory" } },
+  { name = "no-renewal", expect_reason = "bad_delegation", breaks = "the engine service does not renew the self-delegation", env = { MOUSSE_NET_ENGINE_CONTROL = "no-renewal" } },
+]
+
+[[check]]
+id = "phase1a.private-streams"
+title = "A second paired caller cannot read, fetch blobs from or write to the first caller's private streams or artifacts, before or after the first is removed"
+plan = "docs/phase1a-design.md §4.4 and §10 (M3)"
+targets = ["windows-x64", "linux-x64"]
+judge = "marker"
+app = true
+local = [
+  { target = "windows-x64", host = "windows-x86_64", command = ["node", "{root}/tools/app-check/run.mjs", "phase1a.private-streams", "--out", "{out}"] },
+  { target = "linux-x64", host = "linux-x86_64", command = ["node", "{root}/tools/app-check/run.mjs", "phase1a.private-streams", "--out", "{out}"] },
+]
+control = [
+  { name = "second-reader", expect_reason = "foreign_read", breaks = "engine delivery serves a stream with no explicit binding to this caller", env = { MOUSSE_NET_ENGINE_CONTROL = "second-reader" } },
+]
+
+[[check]]
+id = "phase1a.once-or-unknown"
+title = "Reply dropped after the host effect, caller helper killed: effect once or outcome unknown"
+plan = "docs/phase1a-design.md §4 and §10 (M3)"
+targets = ["windows-x64", "linux-x64"]
+judge = "marker"
+app = true
+local = [
+  { target = "windows-x64", host = "windows-x86_64", command = ["node", "{root}/tools/app-check/run.mjs", "phase1a.once-or-unknown", "--out", "{out}"] },
+  { target = "linux-x64", host = "linux-x86_64", command = ["node", "{root}/tools/app-check/run.mjs", "phase1a.once-or-unknown", "--out", "{out}"] },
+]
+control = [
+  { name = "no-host-dedupe", expect_reason = "duplicate_effect", breaks = "the host runs a repeated call id or input sequence again", env = { MOUSSE_NET_ENGINE_CONTROL = "no-host-dedupe" } },
+]

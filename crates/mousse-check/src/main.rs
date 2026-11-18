@@ -40,6 +40,9 @@ USAGE
       checkout's manifest. A device that produces results outside
       `mousse-check run` runs this before the run and passes the digest to
       `sign --config`.
+  mousse-check control-env <check-id> --control <name>
+      Print, as one JSON object, the environment a control adds to a run.
+      tools/app-check/run.mjs reads it for --control on a device run.
   mousse-check attest <check-id> --note <text> [--target <cell>] [--by <name>]
       Record a manual step. Shown as ATTESTED, never PASS.
   mousse-check device keygen --out <key file>
@@ -49,6 +52,8 @@ USAGE
       Print the table from stored runs and results without running anything.
 
 Global: --root <dir> (default: the git checkout containing the current folder).
+App checks (app = true) run only with MOUSSE_APP_DIR set to a clean checkout of
+the app at the revision in app/MOUSSE_REVISION.
 ";
 
 fn main() -> ExitCode {
@@ -145,7 +150,10 @@ fn real_main(raw: Vec<String>) -> Result<ExitCode, String> {
         return Ok(ExitCode::from(2));
     };
     let rest = raw[1..].to_vec();
-    let a = Args::parse(rest, matches!(cmd.as_str(), "sign" | "config-digest"))?;
+    let a = Args::parse(
+        rest,
+        matches!(cmd.as_str(), "sign" | "config-digest" | "control-env"),
+    )?;
     if matches!(cmd.as_str(), "help" | "--help" | "-h") {
         print!("{HELP}");
         return Ok(ExitCode::SUCCESS);
@@ -156,6 +164,7 @@ fn real_main(raw: Vec<String>) -> Result<ExitCode, String> {
         "sign" => cmd_sign(&kit, &a),
         "attest" => cmd_attest(&kit, &a),
         "config-digest" => cmd_config_digest(&kit, &a),
+        "control-env" => cmd_control_env(&kit, &a),
         "device" => cmd_device(&kit, &a),
         "report" => cmd_report(&kit, &a, None),
         phase if kit.has_phase(phase) => cmd_report(&kit, &a, Some(phase)),
@@ -382,8 +391,23 @@ fn cmd_sign(kit: &Kit, a: &Args) -> Result<ExitCode, String> {
             given.into_iter().collect::<Vec<_>>().join(", ")
         ));
     }
+    let app_revision = mousse_check::app::read_revision(kit.root()).ok();
     for (id, p) in &payloads {
         let now = config_for(kit, &p.check, &p.target, p.control.as_deref())?;
+        let (_, c) = kit.find_check(&p.check)?;
+        if c.app {
+            let mut claims = vec![("", p.extra_str("app_build"))];
+            if c.cross_machine {
+                claims.push(("host: ", p.extra_str("host_app_build")));
+            }
+            for (side, claimed) in claims {
+                if let Err(why) =
+                    mousse_check::app::app_build_counts(claimed, app_revision.as_deref())
+                {
+                    eprintln!("note: {id} is an app check; {side}{why}, so it will not count");
+                }
+            }
+        }
         if p.config.as_deref() != Some(now.as_str()) {
             eprintln!(
                 "note: {id} was produced under another configuration than this checkout's manifest; it will count only for that configuration"
@@ -434,6 +458,33 @@ fn config_for(
         ),
     };
     Ok(m.config_digest(&c, target, control))
+}
+
+/// `control-env`: what a control adds to the environment, for runs made
+/// outside `mousse-check run`.
+fn cmd_control_env(kit: &Kit, a: &Args) -> Result<ExitCode, String> {
+    a.only_known(&["--control"])?;
+    let id = a.positional.first().ok_or("control-env needs a check id")?;
+    let name = a
+        .get("--control")
+        .ok_or("control-env needs --control <name>")?;
+    let (_, c) = kit.find_check(id)?;
+    let k = c
+        .control_named(name)
+        .ok_or_else(|| format!("{id} has no control {name}"))?;
+    if let Some(why) = &k.missing {
+        return Err(format!("control {name} does not exist yet: {why}"));
+    }
+    if k.command.is_some() || !k.args.is_empty() {
+        return Err(format!(
+            "control {name} changes the command, not only the environment; run it with `mousse-check run {id} --control`"
+        ));
+    }
+    println!(
+        "{}",
+        serde_json::to_string(&k.env).map_err(|e| e.to_string())?
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 fn cmd_attest(kit: &Kit, a: &Args) -> Result<ExitCode, String> {
