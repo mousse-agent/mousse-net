@@ -100,11 +100,9 @@ function outcome(expected, fn) {
     const replacement = new SessionLifetime(v.local_window, authenticate(switchAt).window, life);
     for (const tick of v.switch_without_renewal.ticks) checkTick(replacement, 2, tick);
   });
-  add('retry_while_candidate', () => {
-    const life = new SessionLifetime(v.local_window, authenticate().window);
-    for (const tick of v.ticks.filter(tick => tick.now <= v.renew_at)) checkTick(life, 1, tick);
+  function checkCandidateSteps(life, steps) {
     let candidate;
-    for (const step of v.retry_while_candidate.steps) {
+    for (const step of steps) {
       switch (step.op) {
         case 'tick': checkTick(life, 1, step, candidate !== undefined); break;
         case 'begin_path':
@@ -118,6 +116,15 @@ function outcome(expected, fn) {
         default: assert.fail(`unknown lifecycle step ${step.op}`);
       }
     }
+  }
+  add('retry_while_candidate', () => {
+    const life = new SessionLifetime(v.local_window, authenticate().window);
+    for (const tick of v.ticks.filter(tick => tick.now <= v.renew_at)) checkTick(life, 1, tick);
+    checkCandidateSteps(life, v.retry_while_candidate.steps);
+  });
+  add('candidate_at_first_renewal', () => {
+    const life = new SessionLifetime(v.local_window, authenticate().window);
+    checkCandidateSteps(life, v.candidate_at_first_renewal.steps);
   });
   add('handshake after expiration', () => {
     const item = v.new_connection_after_deadline;

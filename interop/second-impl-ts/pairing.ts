@@ -392,16 +392,21 @@ export class PairingJoiner {
       this.drop();
       return [];
     }
-    return this.fail(code);
+    return this.fail(code, false);
   }
 
-  private fail(code: ErrorName): Effect[] {
+  private fail(code: ErrorName, notifyPeer = true): Effect[] {
     if (this.state.startsWith('failed:')) return [];
     this.learningOutcome = false;
     this.clearAttempt();
-    this.connection?.gate.close(code);
     this.state = `failed:${code}`;
-    return [{ failed: code }];
+    const effects: Effect[] = [{ failed: code }];
+    const conn = this.connection;
+    if (conn) {
+      const closing = close(conn.id, conn.gate, code);
+      if (notifyPeer) effects.push(closing);
+    }
+    return effects;
   }
 
   receive(msg: Control): Effect[] {

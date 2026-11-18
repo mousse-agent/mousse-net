@@ -30,6 +30,7 @@ class ScriptedDraws {
 }
 
 const parseExporters = ({ join, pair }) => ({ join: bytes(join), pair: bytes(pair) });
+const goawayFrame = code => encodeFrame({ type: 'goaway', code: errorNumber(code) });
 
 function incoming(frame) {
   const { frame: decoded, read } = decodeFrame(frame);
@@ -69,6 +70,7 @@ export function replayEndToEnd(flow, input) {
   }
 
   function project(effects, from) {
+    const failed = effects.some(effect => 'failed' in effect);
     return effects.map(effect => {
       if ('send' in effect) {
         const { conn, send } = effect;
@@ -79,8 +81,9 @@ export function replayEndToEnd(flow, input) {
       }
       if ('close' in effect) {
         const { close: code, conn } = effect;
-        const frame = encodeFrame({ type: 'goaway', code: errorNumber(code) });
-        queue(from, conn, frame);
+        const frame = goawayFrame(code);
+        // The fixture implies the joiner's final GOAWAY and scripts no receipt of it.
+        if (!failed) queue(from, conn, frame);
         return { close: { code, conn, frame: hex(frame), from } };
       }
       return effect;
@@ -155,8 +158,15 @@ export function replayEndToEnd(flow, input) {
   for (const [index, step] of flow.steps.entries()) {
     const effects = run(step);
     const label = `step ${index + 1} ${step.party}/${step.event}`;
-    assert.deepEqual(effects, step.out, label);
-    if (effects.some(effect => 'failed' in effect)) {
+    const failure = step.out.find(effect => 'failed' in effect);
+    const expected = [...step.out];
+    if (failure && step.event !== 'goaway' && step.event !== 'drop') {
+      const code = failure.failed;
+      const conn = step.conn ?? parties.get(step.party);
+      expected.push({ close: { code, conn, frame: hex(goawayFrame(code)), from: step.party } });
+    }
+    assert.deepEqual(effects, expected, label);
+    if (failure) {
       const message = onWire({ type: 'AUTHORIZED', state: 'live' });
       assert.deepEqual(joiners.get(step.party).receive(message), [{ ignored: true }], `${label}: gate after failure`);
     }
@@ -190,6 +200,7 @@ export function replayAttemptSequence(sequence, input) {
     const closed = [];
     let result;
     let reply;
+    const joinerFailures = new Map();
     const recordSend = (from, id, message) => {
       out.push({ send: { conn: id, from, control: hex(encodeControl(message)) } });
     };
@@ -205,22 +216,39 @@ export function replayAttemptSequence(sequence, input) {
       return receiveAtHost(id, message, deliver);
     }
 
+    function fromJoiner(id, effects, notifyPeer) {
+      const { label } = connections.get(id);
+      const failure = effects.find(effect => 'failed' in effect);
+      const terminal = failure && notifyPeer ? [{ conn: id, close: failure.failed }] : [];
+      assert.deepEqual(effects.filter(effect => 'close' in effect), terminal, 'joiner GOAWAY');
+      if (terminal.length) assert.deepEqual(effects.at(-1), terminal[0], 'joiner GOAWAY must be last');
+      if (failure) joinerFailures.set(label, failure.failed);
+
+      for (const effect of effects) {
+        if (effect.send) toHost(label, id, effect.send);
+        if ('close' in effect) {
+          const frame = incoming(goawayFrame(effect.close));
+          assert.deepEqual(frame, { type: 'goaway', code: errorNumber(failure.failed) });
+          if (!closed.some(([conn]) => conn === id)) fromHost(host.drop(id));
+        }
+      }
+    }
+
     function fromHost(effects, deliver = true) {
       for (const effect of effects) {
         if (effect.send) {
           const { conn: id, send } = effect;
           recordSend('host', id, send);
           if (deliver) {
-            const { label, joiner } = connections.get(id);
-            for (const response of joiner.receive(onWire(send))) {
-              if (response.send) toHost(label, id, response.send);
-            }
+            const { joiner } = connections.get(id);
+            fromJoiner(id, joiner.receive(onWire(send)), true);
           }
         }
         if (effect.close) {
           closed.push([effect.conn, effect.close]);
           out.push({ close: { conn: effect.conn, code: effect.close, from: 'host' } });
-          connections.get(effect.conn)?.joiner.goaway(effect.close);
+          const joiner = connections.get(effect.conn)?.joiner;
+          if (joiner) fromJoiner(effect.conn, joiner.goaway(effect.close), false);
         }
         if (effect.show_code) out.push({ show_code: effect.show_code });
         if (effect.error) result = effect.error;
@@ -300,12 +328,17 @@ export function replayAttemptSequence(sequence, input) {
         assert.fail(`unknown operation ${op}`);
     }
 
-    return { out, closed, result, reply, new_code: out.some(effect => 'show_code' in effect) };
+    const joinerFailure = joinerFailures.get(label ?? 'a');
+    return { out, closed, result, reply, joinerFailure, new_code: out.some(effect => 'show_code' in effect) };
   }
 
   for (const [index, step] of sequence.steps.entries()) {
+    const previousState = joiners.get(step.joiner ?? 'a')?.joiner.state;
     const actual = apply(step);
     const joiner = joiners.get(step.joiner ?? 'a')?.joiner;
+    if (step.joiner_state?.startsWith('failed:') && step.joiner_state !== previousState && step.op !== 'drop') {
+      assert.equal(actual.joinerFailure, step.joiner_state.slice('failed:'.length), `step ${index + 1} failure`);
+    }
     Object.assign(actual, {
       host_attempts_left: host.attemptsLeft,
       host_status: host.status,
