@@ -1,0 +1,14 @@
+{
+  "name": "browser-worker-spike",
+  "private": true,
+  "license": "MIT",
+  "description": "Runs the browser Worker session-certificate spike headless in Chromium, WebKit and Firefox.",
+  "type": "module",
+  "scripts": {
+    "browsers": "playwright install chromium webkit firefox",
+    "run": "node run.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.64.1"
+  }
+}
