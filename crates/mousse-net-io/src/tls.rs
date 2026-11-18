@@ -5,11 +5,11 @@
 //! - Both verifiers call [`session_cert::verify`]. The caller passes the
 //!   stored pin (or, on first contact, the ticket's host identity) on every
 //!   connection. The host passes no pin; step 2 decides what the peer may do.
-//! - No session resumption and no tickets, so every connection runs the
-//!   verifier again.
-//! - Key exchange is X25519MLKEM768 or X25519 (aws-lc-rs). With
-//!   [`TlsPolicy::require_hybrid`] a connection that did not negotiate the
-//!   hybrid group is closed after the handshake.
+//! - No session resumption, no tickets, no PSK and no early data, so every
+//!   connection runs a full handshake and the verifier again.
+//! - Key exchange offers X25519MLKEM768 first and X25519 second (aws-lc-rs),
+//!   and a connection that did not negotiate X25519MLKEM768 is closed
+//!   before any application data (wire.md 5.4).
 
 use std::fmt;
 use std::sync::Arc;
@@ -45,28 +45,25 @@ pub const SCHEME: SignatureScheme = SignatureScheme::ECDSA_NISTP256_SHA256;
 /// How long a TLS handshake may take.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Session policy knobs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The TLS policy. Wire.md 5.4 makes every part of it a requirement, so
+/// there is nothing to choose; the type stays so callers name it in one
+/// place.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TlsPolicy {
-    /// Close a connection that did not negotiate X25519MLKEM768. Native
-    /// peers always offer it, so this catches a build that lost it.
-    pub require_hybrid: bool,
+    _fixed: (),
 }
 
-impl Default for TlsPolicy {
-    fn default() -> Self {
-        Self {
-            require_hybrid: true,
-        }
-    }
-}
+/// The groups a native endpoint offers, in order.
+pub const KX_GROUPS: [NamedGroup; 2] = [NamedGroup::X25519MLKEM768, NamedGroup::X25519];
 
-/// The aws-lc-rs provider with the hybrid group preferred, trimmed to
-/// X25519MLKEM768 and X25519.
+/// The aws-lc-rs provider offering exactly [`KX_GROUPS`], in that order.
 pub fn provider() -> Arc<CryptoProvider> {
     let mut p = rustls::crypto::aws_lc_rs::default_provider();
-    p.kx_groups
-        .retain(|g| matches!(g.name(), NamedGroup::X25519MLKEM768 | NamedGroup::X25519));
+    let all = std::mem::take(&mut p.kx_groups);
+    p.kx_groups = KX_GROUPS
+        .iter()
+        .filter_map(|name| all.iter().find(|g| g.name() == *name).copied())
+        .collect();
     Arc::new(p)
 }
 
@@ -297,8 +294,17 @@ pub fn client_config(
     pin: IdentityPublicKey,
     clock: Arc<dyn Clock>,
 ) -> Result<Arc<ClientConfig>, NetError> {
+    client_config_on(provider(), own, pin, clock)
+}
+
+fn client_config_on(
+    provider: Arc<CryptoProvider>,
+    own: &SessionCertificate,
+    pin: IdentityPublicKey,
+    clock: Arc<dyn Clock>,
+) -> Result<Arc<ClientConfig>, NetError> {
     let mut config =
-        ClientConfig::builder_with_details(provider(), Arc::new(ClockTime(clock.clone())))
+        ClientConfig::builder_with_details(provider, Arc::new(ClockTime(clock.clone())))
             .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(|e| NetError::Tls(e.to_string()))?
             .dangerous()
@@ -306,6 +312,7 @@ pub fn client_config(
             .with_client_cert_resolver(Arc::new(OwnCert(certified_key(own))));
     config.alpn_protocols = vec![ALPN.to_vec()];
     config.resumption = Resumption::disabled();
+    config.enable_early_data = false;
     config.enable_sni = false;
     Ok(Arc::new(config))
 }
@@ -324,6 +331,8 @@ pub fn server_config(
     config.alpn_protocols = vec![ALPN.to_vec()];
     config.session_storage = Arc::new(NoServerSessionStorage {});
     config.send_tls13_tickets = 0;
+    config.max_early_data_size = 0;
+    config.send_half_rtt_data = false;
     Ok(Arc::new(config))
 }
 
@@ -376,7 +385,8 @@ fn finish(
         .negotiated_key_exchange_group()
         .map(|g| g.name())
         .ok_or_else(|| NetError::Tls("no key exchange group".into()))?;
-    if policy.require_hybrid && group != NamedGroup::X25519MLKEM768 {
+    let _ = policy;
+    if group != NamedGroup::X25519MLKEM768 {
         return Err(NetError::Tls(format!(
             "key exchange {group:?} is not the hybrid group"
         )));
@@ -437,4 +447,63 @@ pub async fn accept<P: Pipe>(
         exporters(|label| conn.export_keying_material([0u8; 32], label.as_bytes(), None))?;
     let handshake = finish(conn, exporters, &*clock, None, own.window(), policy)?;
     Ok((TlsStream::Server(stream), handshake))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::certs::CertManager;
+    use crate::clock::ManualClock;
+    use crate::rng::os_rng;
+    use mousse_net_core::identity::SoftwareKey;
+
+    fn cert(clock: Arc<ManualClock>) -> SessionCertificate {
+        CertManager::new(Arc::new(SoftwareKey::generate(&mut os_rng())), clock)
+            .current()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_native_endpoint_offers_the_hybrid_group_then_x25519_and_no_other() {
+        let names: Vec<NamedGroup> = provider().kx_groups.iter().map(|g| g.name()).collect();
+        assert_eq!(names, KX_GROUPS.to_vec());
+    }
+
+    /// A caller that offers X25519 alone completes the TLS handshake, and
+    /// the host closes it before any application data.
+    #[tokio::test]
+    async fn a_connection_without_the_hybrid_group_is_refused() {
+        let clock = Arc::new(ManualClock::new());
+        let (caller, host) = (cert(clock.clone()), cert(clock.clone()));
+        let mut classical = rustls::crypto::aws_lc_rs::default_provider();
+        classical
+            .kx_groups
+            .retain(|g| g.name() == NamedGroup::X25519);
+        let config = client_config_on(
+            Arc::new(classical),
+            &caller,
+            *host.identity(),
+            clock.clone(),
+        )
+        .unwrap();
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let name = ServerName::try_from("mousse-session").unwrap();
+        let (dialled, accepted) = tokio::join!(
+            TlsConnector::from(config).connect(name, a),
+            accept(b, &host, clock.clone(), TlsPolicy::default()),
+        );
+        let dialled = dialled.unwrap();
+        assert_eq!(
+            dialled
+                .get_ref()
+                .1
+                .negotiated_key_exchange_group()
+                .map(|g| g.name()),
+            Some(NamedGroup::X25519)
+        );
+        match accepted {
+            Err(NetError::Tls(e)) => assert!(e.contains("hybrid"), "{e}"),
+            other => panic!("accepted a classical-only connection: {:?}", other.err()),
+        }
+    }
 }
