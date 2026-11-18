@@ -69,7 +69,7 @@ All commands run from `spikes/tls-matrix` (the spike is its own Cargo workspace)
     cargo +stable-x86_64-pc-windows-msvc run --release -p tls-matrix -- --out ../../spec/matrix/results
     cargo +stable-x86_64-pc-windows-msvc test -p tls-matrix
 
-The gnu toolchain needs a MinGW C compiler and `dlltool` (for `getrandom` 0.4). The PC has neither, so a portable llvm-mingw (`J:\ryspa\mousse\tools\llvm-mingw-20261104-ucrt-x86_64`) was used, with the toolchain's own linker:
+The gnu toolchain needs a MinGW C compiler and `dlltool` (for `getrandom` 0.4). The PC has neither, so a portable llvm-mingw (release 20261104, ucrt, x86_64) was used, with the toolchain's own linker:
 
     LM=<llvm-mingw folder>/bin
     SC=$(rustc +stable-x86_64-pc-windows-gnu --print sysroot)/lib/rustlib/x86_64-pc-windows-gnu/bin/self-contained
@@ -91,7 +91,7 @@ Rust was installed for one user into a private folder (no system packages); gcc 
 
 ### wasm32 under Node (done on the PC)
 
-ring needs clang with the wasm32 backend. A portable LLVM 23.1.6 (only `clang.exe`, `llvm-ar.exe` and the clang headers, 144 MB) was unpacked to `J:\ryspa\mousse\tools\llvm-23.1.6`. wasm-bindgen 0.2.130 (prebuilt, checksum checked) is in `J:\ryspa\mousse\tools\wasm-bindgen-0.2.130`. Nothing was installed system-wide.
+ring needs clang with the wasm32 backend. A portable LLVM 23.1.6 (only `clang.exe`, `llvm-ar.exe` and the clang headers, 144 MB) was unpacked into a local tools folder (`<tools>` below), with wasm-bindgen 0.2.130 (prebuilt, checksum checked) beside it. Nothing was installed system-wide.
 
     export CC_wasm32_unknown_unknown=<tools>/llvm-23.1.6/bin/clang.exe
     export AR_wasm32_unknown_unknown=<tools>/llvm-23.1.6/bin/llvm-ar.exe
