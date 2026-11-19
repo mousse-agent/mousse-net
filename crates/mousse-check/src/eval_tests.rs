@@ -115,6 +115,7 @@ fn rec(part: &str, verdict: RunVerdict, total: Option<u64>) -> RunRecord {
         runner: AUTO.into(),
         config: AUTO.into(),
         reason: None,
+        app_build: None,
     }
 }
 
@@ -161,6 +162,7 @@ struct Case {
     records: Vec<RunRecord>,
     evidence: Evidence,
     rejected: Vec<(PathBuf, String, bool)>,
+    app_revision: Option<String>,
 }
 
 impl Case {
@@ -177,6 +179,7 @@ impl Case {
             ],
             evidence: Evidence::default(),
             rejected: vec![],
+            app_revision: Some(APP_REV.into()),
         }
     }
 
@@ -236,6 +239,7 @@ impl Case {
             evidence: &evidence,
             rejected_paths: &self.rejected,
             legacy: &legacy,
+            app_revision: self.app_revision.as_deref(),
         })
     }
 
@@ -806,4 +810,110 @@ fn a_cross_machine_cell_needs_the_host_build_under_test_too() {
     ];
     let c = case.cell("phase9.slice");
     assert_eq!(c.status, Status::Pass, "{}", c.details);
+}
+
+// --- App checks: the pinned app build ---
+
+/// The app revision `app/MOUSSE_REVISION` pins in these tests.
+const APP_REV: &str = "4444444444444444444444444444444444444444";
+
+const APP_CHECK: &str = r#"
+[[check]]
+id = "phase9.app"
+title = "app check"
+plan = "item 6"
+targets = ["pc"]
+judge = "marker"
+app = true
+[[check.local]]
+target = "pc"
+host = "windows-x86_64"
+command = ["cargo", "run", "--release", "-p", "app-check"]
+[[check.control]]
+name = "break-app"
+breaks = "the app's deliberate defect"
+env = { MOUSSE_NET_ENGINE_CONTROL = "break-app" }
+"#;
+
+fn app_case(app_build: Option<&str>) -> Case {
+    let mut case = Case::new(APP_CHECK);
+    for (part, verdict) in [
+        ("normal", RunVerdict::Pass),
+        ("break-app", RunVerdict::FailedAsRequired),
+    ] {
+        case.records.push(RunRecord {
+            app_build: app_build.map(str::to_string),
+            ..rec_for("phase9.app", "pc", part, verdict)
+        });
+    }
+    case
+}
+
+#[test]
+fn app_runs_count_only_with_the_pinned_clean_app_build() {
+    let c = app_case(Some(APP_REV)).cell("phase9.app");
+    assert_eq!(c.status, Status::Pass, "{}", c.details);
+
+    let dirty = format!("{APP_REV}-dirty");
+    let other = "5".repeat(40);
+    for (claimed, why) in [
+        (None, "app_build"),
+        (Some(dirty.as_str()), "dirty"),
+        (Some(other.as_str()), "pins"),
+    ] {
+        let c = app_case(claimed).cell("phase9.app");
+        assert_eq!(c.status, Status::Incomplete, "{claimed:?}: {}", c.details);
+        assert!(c.details.contains(why), "{claimed:?}: {}", c.details);
+    }
+    // Only the normal run names the app build: the control does not count.
+    let mut case = app_case(Some(APP_REV));
+    case.records.last_mut().unwrap().app_build = None;
+    assert_eq!(case.cell("phase9.app").status, Status::Incomplete);
+    // No pin: no app check can pass.
+    let mut case = app_case(Some(APP_REV));
+    case.app_revision = None;
+    let c = case.cell("phase9.app");
+    assert_eq!(c.status, Status::Incomplete, "{}", c.details);
+    assert!(c.details.contains("MOUSSE_REVISION"), "{}", c.details);
+    // Checks that are not app checks do not need the pin.
+    assert_eq!(case.cell("phase9.local").status, Status::Pass);
+}
+
+#[test]
+fn app_device_results_need_the_pinned_app_build_on_both_machines() {
+    let app_slice = PIN_CHECK.replace(
+        "cross_machine = true\n",
+        "cross_machine = true\napp = true\n",
+    );
+    let host = release(HEAD);
+    let control = slice(
+        Some("wrong-identity"),
+        "FAIL",
+        serde_json::json!({
+            "host_build": host, "reason": "pin_mismatch",
+            "app_build": APP_REV, "host_app_build": APP_REV,
+        }),
+    );
+    let normal = |extra: serde_json::Value| slice(None, "PASS", extra);
+    let mut case = Case::new(&app_slice);
+    case.evidence.results = vec![
+        normal(serde_json::json!({
+            "host_build": host, "app_build": APP_REV, "host_app_build": APP_REV,
+        })),
+        control.clone(),
+    ];
+    let c = case.cell("phase9.slice");
+    assert_eq!(c.status, Status::Pass, "{}", c.details);
+
+    let other = "5".repeat(40);
+    for extra in [
+        serde_json::json!({ "host_build": host, "app_build": APP_REV }),
+        serde_json::json!({ "host_build": host, "host_app_build": APP_REV }),
+        serde_json::json!({ "host_build": host, "app_build": APP_REV, "host_app_build": other }),
+        serde_json::json!({ "host_build": host, "app_build": other, "host_app_build": APP_REV }),
+    ] {
+        case.evidence.results = vec![normal(extra.clone()), control.clone()];
+        let c = case.cell("phase9.slice");
+        assert_eq!(c.status, Status::Incomplete, "{extra}: {}", c.details);
+    }
 }

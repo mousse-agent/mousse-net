@@ -1245,6 +1245,7 @@ name = "mousse-net-io"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.4.3",
+ "if-addrs",
  "keyring",
  "libc",
  "mdns-sd",

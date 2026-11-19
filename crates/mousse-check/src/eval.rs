@@ -15,7 +15,8 @@
 //!    `[[check.local]]` entry for this machine's host, and only if that entry
 //!    produced them with the check's profile. Every other cell needs signed
 //!    device results. Cross-machine cells also need the host's build to be
-//!    the build under test. Any FAIL, any control that did not fail, printed
+//!    the build under test. App checks also need the app build pinned in
+//!    `app/MOUSSE_REVISION` (and, cross-machine, the host's app build). Any FAIL, any control that did not fail, printed
 //!    no FAIL line or failed for another reason than its `expect_reason` is
 //!    FAIL. Missing parts are INCOMPLETE.
 //! 6. On a dirty tree, PASS becomes INCOMPLETE unless `--allow-dirty`.
@@ -30,6 +31,7 @@ use std::path::PathBuf;
 
 use serde::Serialize;
 
+use crate::app::app_build_counts;
 use crate::build::{check_build, BuildState, Commits};
 use crate::evidence::{Attestation, Evidence, ResultPayload};
 use crate::manifest::{Check, Judge, LocalRun, Manifest};
@@ -111,6 +113,9 @@ pub struct Inputs<'a> {
     pub rejected_paths: &'a [(PathBuf, String, bool)],
     /// Notes about old unsigned results, keyed by (check, target).
     pub legacy: &'a BTreeMap<(String, String), String>,
+    /// The app revision pinned in `app/MOUSSE_REVISION`; `None` if the file
+    /// is missing or unreadable, which leaves every app check INCOMPLETE.
+    pub app_revision: Option<&'a str>,
 }
 
 struct Outcome {
@@ -313,6 +318,15 @@ fn eval_automated(inp: &Inputs<'_>, check: &Check, target: &str) -> Outcome {
     if let Some(why) = &check.placeholder {
         return out(Status::Incomplete, format!("not wired yet: {why}"));
     }
+    if check.app && inp.app_revision.is_none() {
+        return out(
+            Status::Incomplete,
+            format!(
+                "an app check, but {} is missing or not a full commit",
+                crate::app::REVISION_FILE
+            ),
+        );
+    }
     let local = check.local_for(target);
     if let Some(why) = local.and_then(|l| l.placeholder.as_ref()) {
         return out(
@@ -400,6 +414,9 @@ fn eval_local(inp: &Inputs<'_>, check: &Check, target: &str, local: &LocalRun) -
         check_build(inp.commits, inp.build, &r.build, profile, inp.allow_dirty)?;
         if r.config != inp.manifest.config_digest(check, target, control) {
             return Err(CONFIG_CHANGED.into());
+        }
+        if check.app {
+            app_build_counts(r.app_build.as_deref(), inp.app_revision)?;
         }
         Ok(())
     };
@@ -621,7 +638,8 @@ fn eval_device(inp: &Inputs<'_>, check: &Check, target: &str) -> Outcome {
 
 /// Why a verified device result does not count for this cell: another
 /// build (the caller's, and for a cross-machine cell the host's), another
-/// check configuration, or an unknown control.
+/// check configuration, an unknown control, or for an app check another app
+/// build than the pinned one (on both machines for a cross-machine cell).
 fn device_result_counts(
     inp: &Inputs<'_>,
     check: &Check,
@@ -654,6 +672,13 @@ fn device_result_counts(
         build(host).map_err(|why| format!("host: {why}"))?;
         if let Some(caller) = r.extra_str("caller_build") {
             build(caller).map_err(|why| format!("caller: {why}"))?;
+        }
+    }
+    if check.app {
+        app_build_counts(r.extra_str("app_build"), inp.app_revision)?;
+        if check.cross_machine {
+            app_build_counts(r.extra_str("host_app_build"), inp.app_revision)
+                .map_err(|why| format!("host: {why}"))?;
         }
     }
     Ok(())

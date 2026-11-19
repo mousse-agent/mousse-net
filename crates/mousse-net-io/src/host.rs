@@ -32,7 +32,9 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use mousse_net_core::authz::{ConnectionGate, GateState, Traffic, Verdict};
 use mousse_net_core::control::{AuthorizedState, ControlMessage};
-use mousse_net_core::grants::{Denial, Grant, GrantEvent, GrantId, GrantTable, OwnerRef, Role};
+use mousse_net_core::grants::{
+    validate_name, Denial, Grant, GrantEvent, GrantId, GrantTable, NewGrant, OwnerRef, Role,
+};
 use mousse_net_core::identity::IdentityPublicKey;
 use mousse_net_core::mux::MuxRole;
 use mousse_net_core::pairing::{
@@ -43,6 +45,7 @@ use mousse_net_core::pairing::{
 use mousse_net_core::{ConnectionId, ErrorCode, Millis, UnixTime};
 use tokio::sync::mpsc;
 
+use crate::admission::StreamAdmission;
 use crate::certs::CertManager;
 use crate::clock::Clock;
 use crate::conn::{self, CloseReason, Cmd, ConnStatus, Connection, Outbox, Role as ConnRole};
@@ -73,6 +76,9 @@ pub struct HostConfig {
     /// identity TLS presents. Only the `allow-break-env` control build (tests
     /// only) may set it; [`Host::new`] refuses it otherwise.
     pub ticket_identity: Option<IdentityPublicKey>,
+    /// The endpoint's stream places, when a caller of the same endpoint
+    /// shares them. `None` gives the host its own, from `limits`.
+    pub streams: Option<Arc<StreamAdmission>>,
 }
 
 impl HostConfig {
@@ -90,6 +96,7 @@ impl HostConfig {
             limits: Limits::DEFAULT,
             clock,
             ticket_identity: None,
+            streams: None,
         })
     }
 }
@@ -160,6 +167,8 @@ struct Inner<F: CodeExchangeFactory> {
     /// (see [`EnrollmentSaveError::Unsettled`]). No grant is served until a
     /// save works.
     reconcile: bool,
+    /// [`Host::pause`]: no connection is served until [`Host::resume`].
+    paused: bool,
     events: mpsc::UnboundedSender<HostEvent>,
 }
 
@@ -171,6 +180,7 @@ struct Shared<F: CodeExchangeFactory> {
     limits: Limits,
     owner: OwnerRef,
     next_conn: AtomicU64,
+    streams: Arc<StreamAdmission>,
     /// Tests stop the ticker to show what holds without it.
     #[cfg(test)]
     ticker_paused: std::sync::atomic::AtomicBool,
@@ -237,10 +247,10 @@ where
         }
     }
 
-    /// Whether grants may be served: no rolled-back enrollment is waiting
-    /// to be saved away.
+    /// Whether grants may be served: not paused, and no rolled-back
+    /// enrollment is waiting to be saved away.
     fn serving(&self) -> bool {
-        !self.reconcile
+        !self.reconcile && !self.paused
     }
 
     /// Remove the grants past their expiry, close their connections and
@@ -517,11 +527,15 @@ where
                 store,
                 unsaved: false,
                 reconcile: false,
+                paused: false,
                 events,
             }),
             certs: CertManager::with_limits(signer, config.clock.clone(), &config.limits),
             clock: config.clock,
             policy: TlsPolicy::from_limits(&config.limits),
+            streams: config
+                .streams
+                .unwrap_or_else(|| StreamAdmission::new(&config.limits)),
             limits: config.limits,
             owner: config.owner,
             next_conn: AtomicU64::new(1),
@@ -587,6 +601,7 @@ where
                 deadline,
                 clock: self.shared.clock.clone(),
                 limits: self.shared.limits,
+                streams: self.shared.streams.clone(),
             },
             Box::new(role),
             cmd_tx,
@@ -664,6 +679,21 @@ where
         inner.apply(actions);
     }
 
+    /// This host's stream places (shared with a caller of the same
+    /// endpoint when [`HostConfig::streams`] named one).
+    pub fn stream_admission(&self) -> Arc<StreamAdmission> {
+        self.shared.streams.clone()
+    }
+
+    /// The grant `conn` is live under, if it is live.
+    pub fn grant_of(&self, conn: ConnectionId) -> Option<Grant> {
+        let inner = lock(&self.shared);
+        match inner.gates.get(&conn).map(|g| g.state()) {
+            Some(GateState::Live { grant }) => inner.grants.get(*grant).cloned(),
+            _ => None,
+        }
+    }
+
     /// All grants.
     pub fn grants(&self) -> Vec<Grant> {
         lock(&self.shared).grants.grants().cloned().collect()
@@ -725,9 +755,86 @@ where
         Ok(lifted)
     }
 
+    /// Grant `identity` the owner role on this endpoint, named `name`, as
+    /// the joiner's half of pairing both ways (Phase 1a §5.1). `receipt` is
+    /// the invitation of the pairing this answers, kept as the grant's
+    /// enrollment receipt.
+    ///
+    /// Idempotent: if the identity already holds a live grant, that grant
+    /// is returned with `true` and nothing changes (its connections stay
+    /// up), apart from saving a table whose last save failed. An error
+    /// after the grant was added means it is in effect now but was not
+    /// saved: the host keeps retrying, and the caller may repeat the call.
+    pub fn add_grant(
+        &self,
+        identity: IdentityPublicKey,
+        name: String,
+        receipt: Option<InvitationId>,
+    ) -> Result<(Grant, bool), NetError> {
+        let now = self.shared.clock.now();
+        let mut inner = lock(&self.shared);
+        if let Some(grant) = inner.grants.live_grant(&identity, now).cloned() {
+            if inner.unsaved {
+                inner.persist()?;
+            }
+            return Ok((grant, true));
+        }
+        let new = NewGrant {
+            identity,
+            name,
+            role: Role::owner(),
+            authorizing_owner: self.shared.owner,
+            expires_at: None,
+            enrolled_by: receipt,
+        };
+        let (id, events) = inner
+            .grants
+            .add(new, now)
+            .map_err(|e| NetError::Refused(e.to_string()))?;
+        inner.apply_grant_events(events);
+        let grant = inner
+            .grants
+            .get(id)
+            .cloned()
+            .ok_or_else(|| NetError::Refused("the new grant is missing".into()))?;
+        inner.persist()?;
+        Ok((grant, false))
+    }
+
+    /// Save the grant table now. A failure is reported as
+    /// [`HostEvent::StoreFailed`] too.
+    pub fn save(&self) -> Result<(), NetError> {
+        lock(&self.shared).persist()
+    }
+
+    /// The name `PAIRED` sends from now on (1 to 128 bytes).
+    pub fn set_name(&self, name: &str) -> Result<(), NetError> {
+        validate_name(name).map_err(|e| NetError::Refused(e.to_string()))?;
+        lock(&self.shared).pairing.set_host_name(name.to_owned());
+        Ok(())
+    }
+
     /// Whether the grant table has changes that are not saved yet.
     pub fn has_unsaved_changes(&self) -> bool {
         lock(&self.shared).unsaved
+    }
+
+    /// Stop serving: close every connection with `code`, and close every
+    /// connection that registers until [`Host::resume`], also one whose
+    /// handshake began before. Both happen under the lock connections
+    /// register under, so none slips between them.
+    pub fn pause(&self, code: ErrorCode) {
+        let mut inner = lock(&self.shared);
+        inner.paused = true;
+        let conns: Vec<ConnectionId> = inner.conns.keys().copied().collect();
+        for conn in conns {
+            inner.close_conn(conn, code);
+        }
+    }
+
+    /// Serve again after [`Host::pause`].
+    pub fn resume(&self) {
+        lock(&self.shared).paused = false;
     }
 
     /// Close every connection with `code`.
@@ -998,6 +1105,7 @@ mod tests {
             limits: Limits::DEFAULT,
             clock: clock.clone(),
             ticket_identity: None,
+            streams: None,
         };
         let key = Arc::new(SoftwareKey::generate(&mut os_rng()));
         let (host, _events) = Host::new(key, config, CpaceExchangeFactory).unwrap();
@@ -1134,6 +1242,7 @@ mod tests {
             limits: Limits::DEFAULT,
             clock: Arc::new(ManualClock::new()),
             ticket_identity: None,
+            streams: None,
         };
         let key = Arc::new(SoftwareKey::generate(&mut os_rng()));
         Host::new(key, config, CpaceExchangeFactory).unwrap()

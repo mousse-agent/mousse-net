@@ -199,6 +199,7 @@ impl Kit {
         let records = self.records();
         let legacy = self.legacy_notes(m);
         let here = host();
+        let app_revision = crate::app::read_revision(self.root()).ok();
         Ok(evaluate(&Inputs {
             manifest: m,
             host: &here,
@@ -209,6 +210,7 @@ impl Kit {
             evidence: &ev,
             rejected_paths: &rejected,
             legacy: &legacy,
+            app_revision: app_revision.as_deref(),
         }))
     }
 
@@ -249,6 +251,13 @@ impl Kit {
                     "  note: {} is a placeholder ({why}); running it anyway",
                     c.id
                 );
+            }
+            if c.app {
+                if let Err(why) = self.app_ready() {
+                    eprintln!("  {} @ {}: not run: {why}", c.id, local.target);
+                    all_ok = false;
+                    continue;
+                }
             }
             let timeout = Duration::from_secs(c.timeout_secs);
             let mut jobs: Vec<Option<&crate::manifest::Control>> = Vec::new();
@@ -329,6 +338,10 @@ impl Kit {
                     runner: runner_id(local),
                     config: m.config_digest(c, &local.target, k),
                     reason: k.and_then(|_| fail_reason(c, &output.text)),
+                    app_build: c
+                        .app
+                        .then(|| crate::app::line_value(&output.text, "app_build"))
+                        .flatten(),
                 };
                 let path = self.runs_dir().join(format!("{stem}.json"));
                 std::fs::create_dir_all(self.runs_dir()).map_err(|e| e.to_string())?;
@@ -354,6 +367,19 @@ impl Kit {
             all_ok = false;
         }
         Ok(all_ok)
+    }
+
+    /// Why app checks cannot run here: `MOUSSE_APP_DIR` must be a clean
+    /// checkout of the app at the revision in `app/MOUSSE_REVISION`.
+    pub fn app_ready(&self) -> Result<(), String> {
+        let revision = crate::app::read_revision(self.root())?;
+        let dir = std::env::var_os(crate::app::APP_DIR_ENV).ok_or_else(|| {
+            format!(
+                "an app check needs {} set to a clean checkout of the app at {revision}",
+                crate::app::APP_DIR_ENV
+            )
+        })?;
+        crate::app::check_checkout(Path::new(&dir), &revision)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -384,9 +410,19 @@ impl Kit {
             time: rec.time.clone(),
             device: s.device.clone(),
             config: Some(rec.config.clone()),
-            extra: match &rec.reason {
-                Some(r) => serde_json::json!({ "reason": r }),
-                None => Value::Null,
+            extra: {
+                let mut extra = serde_json::Map::new();
+                if let Some(r) = &rec.reason {
+                    extra.insert("reason".into(), Value::String(r.clone()));
+                }
+                if let Some(a) = &rec.app_build {
+                    extra.insert("app_build".into(), Value::String(a.clone()));
+                }
+                if extra.is_empty() {
+                    Value::Null
+                } else {
+                    Value::Object(extra)
+                }
             },
         };
         let mut payloads = Vec::new();
@@ -532,6 +568,8 @@ pub fn payload_from(v: &Value, a: &SignArgs<'_>) -> Result<ResultPayload, String
         ),
         ("host_build", s("host_build")),
         ("caller_build", s("caller_build")),
+        ("app_build", s("app_build")),
+        ("host_app_build", s("host_app_build")),
     ];
     if let Value::Object(o) = &mut extra {
         for (key, value) in lifted {
@@ -585,7 +623,7 @@ mod tests {
     }
 
     #[test]
-    fn a_result_files_reason_and_host_build_are_kept_where_the_kit_reads_them() {
+    fn a_result_files_reason_and_host_and_app_builds_are_kept_where_the_kit_reads_them() {
         let v = serde_json::json!({
             "check": "phase0.thin-slice-cross-machine",
             "target": "pc-to-mac-lan",
@@ -595,11 +633,21 @@ mod tests {
             "build": "1111111+release",
             "host_build": "1111111+debug",
             "reason": "pin_mismatch",
+            "app_build": "14912a18a2915bc53178597cbc2e9c08441d8fab",
+            "host_app_build": "24912a18a2915bc53178597cbc2e9c08441d8fab",
         });
         let p = payload_from(&v, &args()).unwrap();
         assert_eq!(p.reason().as_deref(), Some("pin_mismatch"));
         assert_eq!(p.extra_str("host_build"), Some("1111111+debug"));
         assert_eq!(p.control.as_deref(), Some("wrong-identity"));
+        assert_eq!(
+            p.extra_str("app_build"),
+            Some("14912a18a2915bc53178597cbc2e9c08441d8fab")
+        );
+        assert_eq!(
+            p.extra_str("host_app_build"),
+            Some("24912a18a2915bc53178597cbc2e9c08441d8fab")
+        );
 
         // An object `details` with a reason inside it.
         let mut v = v;

@@ -67,6 +67,7 @@ impl TestHost {
             limits: Limits::DEFAULT,
             clock: clock.clone(),
             ticket_identity: None,
+            streams: None,
         };
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         Self::run(signer, config, clock, listener)
@@ -272,7 +273,7 @@ pub async fn dial(
     pin: IdentityPublicKey,
 ) -> Result<Connection, NetError> {
     let pipe = connect_tcp(route).await?;
-    caller.dial(pipe, pin).await
+    within("dial", caller.dial(pipe, pin)).await
 }
 
 /// Open a terminal-like interactive stream and check one round trip.
