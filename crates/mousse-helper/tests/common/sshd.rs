@@ -107,12 +107,19 @@ pub struct TestSshd {
 
 impl TestSshd {
     pub fn start(config: Config) -> Self {
+        Self::start_on(config, 0)
+    }
+
+    /// [`TestSshd::start`] on `127.0.0.1:<port>` (0 picks one).
+    pub fn start_on(config: Config, port: u16) -> Self {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
             .expect("sshd runtime");
-        let (addr, host_key, stop) = rt.block_on(serve(config)).expect("start the test sshd");
+        let (addr, host_key, stop) = rt
+            .block_on(serve(config, port))
+            .expect("start the test sshd");
         Self {
             addr,
             host_key,
@@ -149,8 +156,9 @@ impl Drop for TestSshd {
 
 async fn serve(
     config: Config,
+    port: u16,
 ) -> std::io::Result<(SocketAddr, PublicKey, server::RunningServerHandle)> {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let listener = TcpListener::bind(("127.0.0.1", port)).await?;
     let addr = listener.local_addr()?;
     let host_key = config.host_key.public_key().clone();
     let russh_config = Arc::new(server::Config {

@@ -157,6 +157,20 @@ Phase 1b §6.3: traffic that must never reach RPC, sent to a real host on one ro
 - Output: `PASS|FAIL <marker> <route>:<case> ...` per case, then `PASS <marker>` or `FAIL <marker> reason=<word>`.
 - Limits come from the host's own variables (`MOUSSE_NET_JOIN_PROOF_WAIT_MS`, `MOUSSE_NET_PREAUTH_TCP`, `_WS`, `_PER_SOURCE`, `MOUSSE_NET_WS_UPGRADE_WAIT_MS`, `MOUSSE_NET_WS_HEADER_MAX_BYTES`, `MOUSSE_NET_HANDSHAKE_TIMEOUT_MS`), so a check that tightens one for the host tightens it for the probe. The probe's own waits: `MOUSSE_CHECK_PROBE_CONNECT_MS` (5000), `MOUSSE_CHECK_PROBE_CLOSE_MS` (5000), `MOUSSE_CHECK_PROBE_SETTLE_MS` (1000).
 
+## The SSH test server (`test-sshd`)
+
+App checks that need a real `ssh` route on loopback (the `ssh` case, SSH add) use the engine's test SSH server as a program. It is a dev-only example of `mousse-helper`, never part of a release package:
+
+    cargo run -p mousse-helper --example test-sshd -- --port <n> --keys <dir> [--home <dir>] [--mousse-home <dir>] [--launcher <name>=<path>]... [--preamble <text>]
+
+- `--port <n>`: listens on `127.0.0.1:<n>` only (0 picks one).
+- `--keys <dir>`: throwaway keys, made on the first run and reused after: `host_ed25519` (host key) and `client_ed25519` (`.pub` beside it), the only client key accepted. It writes `ssh_config` there, a `Host mousse-test-sshd` entry for this server with that identity, no agent and `known_hosts` in the same folder (empty; the app probes and pins the host key). Debug helpers read it through `MOUSSE_NET_TEST_SSH_CONFIG`.
+- `--home <dir>`: the remote user's home: `HOME` (and `USERPROFILE` on Windows) and the working directory; `MOUSSE_HOME` is `<home>/.mousse` unless `--mousse-home` names another folder.
+- Commands run as the current user. On Unix they run through `/bin/sh -c`, so `<home>/.mousse/bin` must hold the real launchers. Windows remotes are not supported in 1b, so on the PC `--launcher <name>=<program>` stands in for `~/.mousse/bin/<name>` (`--launcher mousse-cli=echo` is the built-in stand-in that writes the marker and echoes stdin).
+- `--preamble <text>`: printed before the command's output, as a login shell's rc files might.
+
+It prints `ready port <port> host_key <SHA256:...> config <path>` and serves until its stdin closes or it is stopped.
+
 ## Manual steps
 
     mousse-check attest phase0.design-review --target session-cert --note "reviewed by X, link"
