@@ -115,7 +115,7 @@ fn stored_candidates(record: &PeerRecord) -> Vec<Route> {
 /// How a dial reached its host.
 enum Reached {
     Direct(Route),
-    Relay(mousse_net_core::relay_wire::RelayRoute),
+    Relay(mousse_net_core::relay_endpoint::RelayRoute),
 }
 
 /// Reach `record`'s host: direct routes and browse first, then its relay

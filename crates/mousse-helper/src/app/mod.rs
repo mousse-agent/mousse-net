@@ -177,7 +177,7 @@ struct ConnEntry {
     /// Inbound: the caller has opened a stream, so the host may open one.
     caller_opened: bool,
     /// Outbound through a relay: the route, for its bulk companion.
-    via: Option<mousse_net_core::relay_wire::RelayRoute>,
+    via: Option<mousse_net_core::relay_endpoint::RelayRoute>,
 }
 
 struct StreamEntry {
@@ -428,7 +428,7 @@ impl Shared {
     }
 
     /// Note that outbound connection `no` runs through a relay route.
-    fn set_via(&self, no: u64, route: mousse_net_core::relay_wire::RelayRoute) {
+    fn set_via(&self, no: u64, route: mousse_net_core::relay_endpoint::RelayRoute) {
         if let Some(entry) = lock(&self.core).conns.get_mut(&no) {
             entry.via = Some(route);
         }

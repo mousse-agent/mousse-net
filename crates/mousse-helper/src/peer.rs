@@ -88,7 +88,7 @@ pub(crate) fn usable_routes(hints: &[String]) -> Vec<Route> {
 pub(crate) enum JoinRoute {
     Tcp(Route),
     Relay {
-        route: mousse_net_core::relay_wire::RelayRoute,
+        route: mousse_net_core::relay_endpoint::RelayRoute,
         tag: [u8; 32],
     },
 }

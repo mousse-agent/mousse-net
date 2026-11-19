@@ -1,5 +1,6 @@
 //! E-R3: the helper as a relay target and a relay caller, through the app
-//! channel, against the loopback test relay (Phase 3 §B.4 to §B.12). The
+//! channel, against a real `mousse-relay` on loopback (Phase 3 §B.4 to
+//! §B.12). The
 //! check cell `phase3.relay-routes` runs this file.
 //!
 //! A host reached only through a relay is made by restarting it on a new
@@ -7,50 +8,16 @@
 //! source.
 
 mod common;
+#[path = "common/relay.rs"]
+mod relay_fixture;
 
 use std::time::{Duration, Instant};
 
 use common::*;
 use mousse_net_core::pairing::Ticket;
-use mousse_net_core::relay_wire::RelayRoute;
-use mousse_net_io::relay::test_relay::{TestRelay, TestRelayConfig, TestRelayCounts};
+use mousse_net_core::relay_endpoint::RelayRoute;
+use relay_fixture::{caller_key_of, TestRelay as Relay};
 use serde_json::{json, Value};
-
-/// A test relay on loopback, in its own runtime.
-struct Relay {
-    rt: tokio::runtime::Runtime,
-    relay: TestRelay,
-}
-
-impl Relay {
-    fn start() -> Self {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let relay = rt.block_on(TestRelay::start(TestRelayConfig::default()));
-        Self { rt, relay }
-    }
-
-    fn link(&self) -> String {
-        let _rt = self.rt.enter();
-        self.relay.enrollment_link().to_text()
-    }
-
-    fn destination(&self) -> String {
-        format!("relay://{}", self.relay.addr())
-    }
-
-    fn counts(&self) -> TestRelayCounts {
-        self.relay.counts()
-    }
-
-    fn stop(&self) {
-        let _rt = self.rt.enter();
-        self.relay.stop();
-    }
-}
 
 /// Fast re-registration and redials.
 const FAST: [(&str, &str); 3] = [
@@ -209,18 +176,19 @@ fn app_cases_run_over_a_relay_route_with_bulk_on_its_own_connection_and_removal_
     );
 
     // Interactive on the relay connection itself.
-    let calls = relay.counts().calls;
+    let calls = relay.connections();
     let a_in = carry(&mut b, b_conn, &mut a, "interactive", &pattern(10_000, 1));
     let a_up = a.event("conn.up", |m| m["conn"] == a_in);
     assert_eq!(a_up["route"]["kind"], "relay");
-    assert_eq!(relay.counts().calls, calls);
+    assert_eq!(relay.connections(), calls);
     // Bulk goes over a second call of class bulk: another outer
-    // connection and peer session, seen on A as its own connection.
+    // connection (and A's accept leg for it) and peer session, seen on A
+    // as its own connection.
     let a_bulk = carry(&mut b, b_conn, &mut a, "bulk", &pattern(300_000, 2));
     assert_ne!(a_bulk, a_in);
     let bulk_up = a.event("conn.up", |m| m["conn"] == a_bulk);
     assert_eq!(bulk_up["route"]["class"], "relay_bulk");
-    assert_eq!(relay.counts().calls, calls + 1);
+    assert_eq!(relay.connections(), calls + 2);
 
     // Remove C: its relay circuit closes at once, B's stays.
     let c_grant = a.call("grants.list", json!({}))["grants"]
@@ -268,7 +236,7 @@ fn caller_keys_are_per_pairing() {
 
 #[test]
 fn a_relay_route_is_dialled_only_once_its_destination_is_approved() {
-    let one = Relay::start();
+    let mut one = Relay::start();
     let two = Relay::start();
     let a_end = Endpoint::init("raa");
     let b_end = Endpoint::init("rab");
@@ -291,10 +259,12 @@ fn a_relay_route_is_dialled_only_once_its_destination_is_approved() {
 
     restart(&mut a, &a_end, "hostA", &FAST);
     wait_registered(&mut a);
-    // Nothing approved: no relay is dialled.
+    // Nothing approved: no relay is dialled. (A's own registrations are
+    // the connections there so far.)
+    let base = (one.connections(), two.connections());
     let reply = b.request("dial", json!({"identity": a.identity}));
     assert_eq!(reply["error"], "unreachable", "{reply}");
-    assert_eq!((one.counts().calls, two.counts().calls), (0, 0));
+    assert_eq!((one.connections(), two.connections()), base);
 
     // One approved, and down: the other destination is not tried.
     b.call(
@@ -305,8 +275,8 @@ fn a_relay_route_is_dialled_only_once_its_destination_is_approved() {
     let reply = b.request("dial", json!({"identity": a.identity}));
     assert_eq!(reply["error"], "unreachable", "{reply}");
     assert_eq!(
-        two.counts().calls,
-        0,
+        two.connections(),
+        base.1,
         "an unapproved destination was dialled"
     );
 
@@ -329,12 +299,12 @@ fn a_relay_route_is_dialled_only_once_its_destination_is_approved() {
         "peer.relay.disallow",
         json!({"identity": a.identity, "destination": two.destination()}),
     );
-    let before = two.counts().calls;
+    let before = two.connections();
     let conn = up["conn"].as_u64().unwrap();
     a.kill();
     b.event("conn.down", |m| m["conn"] == conn);
     std::thread::sleep(Duration::from_millis(1_500));
-    assert_eq!(two.counts().calls, before);
+    assert_eq!(two.connections(), before);
 }
 
 /// A ticket with only its relay hints: the joiner can reach the host only
@@ -504,6 +474,14 @@ fn removals_reach_the_relay_after_a_restart_too() {
     b.hello();
     pair_apps(&mut a, &mut b);
     wait_listed(&mut a, &b.identity.clone());
+    let handle = relay.handle_of(&a_end.dir);
+    let b_key = caller_key_of(&b_end.dir, &a.identity);
+    // B's caller key is listed: the relay splices its call.
+    let start = Instant::now();
+    while relay.call(handle, &b_key).is_err() {
+        assert!(start.elapsed() < WAIT, "B's key never listed");
+        std::thread::sleep(Duration::from_millis(100));
+    }
     let grant = a.call("grants.list", json!({}))["grants"][0]["grant"].clone();
     // A crash right after the removal was journaled: the replay at start
     // runs before any registration, so the relay never lists B again.
@@ -516,8 +494,5 @@ fn removals_reach_the_relay_after_a_restart_too() {
     let mut a = a_end.app("hostA", &FAST);
     a.hello();
     wait_registered(&mut a);
-    let handles = relay.relay.handles();
-    assert_eq!(handles.len(), 1);
-    let set = relay.relay.allow_set(&handles[0]).unwrap();
-    assert!(set.callers.is_empty(), "{set:?}");
+    assert_eq!(relay.call(handle, &b_key), Err("relay_refused"));
 }

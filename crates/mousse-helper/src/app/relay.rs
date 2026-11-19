@@ -44,16 +44,19 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use mousse_net_core::identity::{IdentityPublicKey, IdentityRecord, PublicKey, SoftwareKey};
-use mousse_net_core::manifest::{Manifest, ManifestRoute, MANIFEST_ROUTES_MAX};
+use mousse_net_core::identity::{IdentityPublicKey, IdentityRecord, PublicKey};
+use mousse_net_core::manifest::{Envelope, Manifest, ManifestRoute, MANIFEST_ROUTES_MAX};
 use mousse_net_core::mux::PriorityClass;
 use mousse_net_core::pairing::{InvitationId, Ticket};
-use mousse_net_core::relay_wire::{
+use mousse_net_core::relay::msg::{
+    InvitationEntry, ALLOW_CALLERS_MAX, ALLOW_INVITATIONS_MAX, RELAY_MESSAGE_MAX,
+};
+use mousse_net_core::relay::proof::{invitation_tag, tag_hash};
+use mousse_net_core::relay::{Class, EnrollmentLink, RelayClientKey, RelayId};
+use mousse_net_core::relay_endpoint::{
     decode_keys_answer, decode_keys_request, derive_key, derive_secret, encode_keys_answer,
-    encode_keys_request, handle, invitation_tag, relay_id, tag_hash, AllowedInvitation, CircuitId,
-    Class, EnrollmentLink, Envelope, IncomingKind, RelayEndpoint, RelayId, RelayRoute,
-    ALLOW_CALLERS_MAX, ALLOW_INVITATIONS_MAX, CALLER_KEY_INFO, PAIR_SECRET_INFO,
-    REGISTRATION_KEY_INFO, RELAY_MESSAGE_MAX,
+    encode_keys_request, RelayEndpoint, RelayRoute, CALLER_KEY_INFO, PAIR_SECRET_INFO,
+    REGISTRATION_KEY_INFO,
 };
 use mousse_net_core::{ConnectionId, ErrorCode};
 use mousse_net_io::relay::{
@@ -127,7 +130,7 @@ pub struct State {
     invites: Mutex<Vec<OpenInvite>>,
     /// Inbound connections that came on a join circuit: the relay, the
     /// registration's salt and the circuit (for `PROMOTE`).
-    join_circuits: Mutex<HashMap<ConnectionId, (String, String, CircuitId)>>,
+    join_circuits: Mutex<HashMap<ConnectionId, (String, String, [u8; 16])>>,
     /// This host's current signed manifest.
     manifest: Mutex<Option<(Manifest, Envelope)>>,
     /// Inbound connections (by number) that got the current manifest.
@@ -186,10 +189,10 @@ impl State {
         self.seed.as_ref().map(|s| &**s).map_err(Clone::clone)
     }
 
-    fn key(&self, info: &str, salt: &str) -> Result<Arc<SoftwareKey>, String> {
+    fn key(&self, info: &str, salt: &str) -> Result<Arc<RelayClientKey>, String> {
         let salt = unhex(salt).map_err(|e| e.to_string())?;
         derive_key(self.seed()?, info, &salt)
-            .map(Arc::new)
+            .map(|k| Arc::new(RelayClientKey::new(k)))
             .map_err(|e| e.to_string())
     }
 }
@@ -263,7 +266,7 @@ pub fn dialable(ip: IpAddr) -> bool {
 /// Resolve an endpoint once; `all`: every address, else the dialable ones.
 async fn resolve(endpoint: &RelayEndpoint, all: bool) -> Result<Vec<RelayAddr>, RelayError> {
     let name = match &endpoint.host {
-        mousse_net_core::relay_wire::EndpointHost::Dns(name) => Some(name.clone()),
+        mousse_net_core::relay_endpoint::EndpointHost::Dns(name) => Some(name.clone()),
         _ => None,
     };
     let addrs: Vec<SocketAddr> = match &name {
@@ -493,14 +496,14 @@ async fn registration(
     shared: Arc<Shared>,
     relay: OwnRelay,
     salt: String,
-    key: Arc<SoftwareKey>,
+    key: Arc<RelayClientKey>,
     mut first: Option<TargetLink>,
     mut commands: mpsc::UnboundedReceiver<TargetCommand>,
 ) {
     let Some(endpoint) = RelayEndpoint::parse(&relay.endpoint) else {
         return;
     };
-    let Some(id) = fixed::<32>(&relay.relay) else {
+    let Some(id) = fixed::<32>(&relay.relay).map(RelayId) else {
         return;
     };
     // Only the current key's registration reports the relay's state.
@@ -577,7 +580,7 @@ async fn registration(
 async fn register(
     endpoint: &RelayEndpoint,
     id: RelayId,
-    key: Arc<SoftwareKey>,
+    key: Arc<RelayClientKey>,
 ) -> Result<TargetLink, RelayError> {
     // The owner pasted this endpoint: any class it resolves to is theirs.
     let addrs = resolve(endpoint, true).await?;
@@ -617,13 +620,13 @@ async fn hold(
                 let _ = cmd_tx.send(cmd);
             }
             Some(event) = events.recv() => match event {
-                TargetEvent::Incoming { circuit, kind, class, pipe, .. } => {
+                TargetEvent::Incoming { circuit, class, caller, pipe } => {
                     tokio::spawn(accept_incoming(
                         shared.clone(),
                         relay.to_owned(),
                         salt.to_owned(),
                         circuit,
-                        kind,
+                        caller.is_none(),
                         class,
                         pipe,
                     ));
@@ -668,8 +671,8 @@ async fn accept_incoming(
     shared: Arc<Shared>,
     relay: String,
     salt: String,
-    circuit: CircuitId,
-    kind: IncomingKind,
+    circuit: [u8; 16],
+    join: bool,
     class: Class,
     pipe: Box<WsPipe>,
 ) {
@@ -680,7 +683,7 @@ async fn accept_incoming(
             return;
         }
     };
-    if kind == IncomingKind::Join {
+    if join {
         guard(&shared.relay.join_circuits).insert(conn.id(), (relay.clone(), salt, circuit));
         let status = conn.settled(true).await;
         if matches!(status, ConnStatus::Live) && !recovery_allows(&shared, &conn) {
@@ -797,10 +800,10 @@ pub fn grant_status(shared: &Shared, grant: u64) -> &'static str {
 fn compute_allow(shared: &Shared) -> AllowSet {
     let (listed, _) = listed_callers(shared);
     let t = now();
-    let mut invitations: Vec<AllowedInvitation> = guard(&shared.relay.invites)
+    let mut invitations: Vec<InvitationEntry> = guard(&shared.relay.invites)
         .iter()
         .filter(|i| i.expires_at > t)
-        .map(|i| AllowedInvitation {
+        .map(|i| InvitationEntry {
             tag_hash: i.tag_hash,
             expires_at: i.expires_at,
         })
@@ -811,7 +814,7 @@ fn compute_allow(shared: &Shared) -> AllowSet {
         for r in shared.relay.files.grants().unwrap_or_default().recovery {
             if r.expires_at > t && grants.contains(&r.grant) && !keyed.contains(&r.grant) {
                 if let Some(tag_hash) = fixed::<32>(&r.tag_hash) {
-                    invitations.push(AllowedInvitation {
+                    invitations.push(InvitationEntry {
                         tag_hash,
                         expires_at: r.expires_at,
                     });
@@ -877,13 +880,13 @@ pub fn ticket_hints(shared: &Shared) -> Vec<String> {
         .filter(|r| st.get(&r.relay).is_some_and(|s| s.state == "registered"))
         .filter_map(|r| {
             let endpoint = RelayEndpoint::parse(&r.endpoint)?;
-            let relay = fixed::<32>(&r.relay)?;
+            let relay = RelayId(fixed::<32>(&r.relay)?);
             let key = shared.relay.key(REGISTRATION_KEY_INFO, &r.salt).ok()?;
             Some(
                 RelayRoute {
                     endpoint,
                     relay,
-                    handle: handle(&relay, &key.public_key()),
+                    handle: key.handle(&relay),
                 }
                 .to_hint(),
             )
@@ -1080,7 +1083,7 @@ fn update_peer(
 }
 
 /// This device's caller key for the host `pin` (one per pairing).
-fn caller_key(shared: &Shared, pin: &IdentityPublicKey) -> Result<Arc<SoftwareKey>, String> {
+fn caller_key(shared: &Shared, pin: &IdentityPublicKey) -> Result<Arc<RelayClientKey>, String> {
     if cfg!(mousse_control = "shared-caller-key") {
         // The control build uses one caller key for every host.
         return shared.relay.key(CALLER_KEY_INFO, "");
@@ -1222,7 +1225,7 @@ fn manifest_routes(shared: &Shared) -> Vec<ManifestRoute> {
         ) else {
             continue;
         };
-        let id = relay_id(&key);
+        let id = RelayId::of(&key);
         let mut salts = vec![r.salt.clone()];
         if !cfg!(mousse_control = "no-overlap") {
             salts.extend(r.old.iter().filter(|o| o.until > t).map(|o| o.salt.clone()));
@@ -1234,7 +1237,7 @@ fn manifest_routes(shared: &Shared) -> Vec<ManifestRoute> {
             routes.push(ManifestRoute {
                 relay_key: key,
                 endpoints: vec![endpoint.clone()],
-                handle: handle(&id, &reg.public_key()),
+                handle: reg.handle(&id),
                 region: String::new(),
             });
         }
@@ -1503,7 +1506,7 @@ pub fn route_json(route: &RelayRoute, bulk: bool) -> Value {
         "kind": "relay",
         "class": if bulk { "relay_bulk" } else { "relay" },
         "destination": route.endpoint.destination(),
-        "relay": hex(&route.relay),
+        "relay": hex(&route.relay.0),
     })
 }
 
@@ -1631,7 +1634,7 @@ pub fn peer_json(shared: &Shared, pin: &IdentityPublicKey) -> Value {
             .map(|a| a.source.clone());
         routes.push(json!({
             "destination": destination,
-            "relay": hex(relay),
+            "relay": hex(&relay.0),
             "from": from,
             "approved": approved(shared, pin, &destination),
             "source": source,
@@ -1668,7 +1671,7 @@ fn str_field<'a>(map: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
 pub fn on_request(shared: &Arc<Shared>, id: Value, op: &str, map: &Map<String, Value>) {
     let reply = match op {
         "relay.enroll" => match str_field(map, "link").map(EnrollmentLink::parse) {
-            Some(Some(link)) => {
+            Some(Ok(link)) => {
                 tokio::spawn(enroll(shared.clone(), id, link));
                 return;
             }
@@ -1754,7 +1757,8 @@ async fn enroll_inner(
     if shared.relay.seed().is_err() {
         return Err(("unavailable", "Relays need the keystore".into()));
     }
-    let relay_hex = hex(&link.relay);
+    let relay_hex = hex(&link.relay.0);
+    let endpoint = RelayEndpoint::from_route_host(link.host.clone(), link.port);
     if shared
         .relay
         .files
@@ -1768,7 +1772,7 @@ async fn enroll_inner(
         .relay
         .key(REGISTRATION_KEY_INFO, &salt)
         .map_err(|e| ("store_failed", e))?;
-    let addrs = resolve(&link.endpoint, true)
+    let addrs = resolve(&endpoint, true)
         .await
         .map_err(|e| (e.word(), e.to_string()))?;
     let mut last = RelayError::Unreachable;
@@ -1794,7 +1798,7 @@ async fn enroll_inner(
         return Err((last.word(), last.to_string()));
     };
     let relay = OwnRelay {
-        endpoint: link.endpoint.to_string(),
+        endpoint: endpoint.to_string(),
         relay: relay_hex,
         relay_key: target.relay_key().map(|k| hex(k.as_bytes())),
         salt: salt.clone(),
@@ -1817,7 +1821,7 @@ async fn enroll_inner(
             .map_err(|e| ("store_failed", e))?;
     }
     let me = hex(shared.info.identity.as_bytes());
-    let _ = add_approval(shared, &me, &link.endpoint.destination(), "owner");
+    let _ = add_approval(shared, &me, &endpoint.destination(), "owner");
     guard(&shared.relay.status).insert(
         relay.relay.clone(),
         Status {

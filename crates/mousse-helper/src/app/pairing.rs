@@ -368,7 +368,7 @@ async fn join(
             let via = record
                 .last_route
                 .as_deref()
-                .and_then(mousse_net_core::relay_wire::RelayRoute::parse_hint);
+                .and_then(mousse_net_core::relay_endpoint::RelayRoute::parse_hint);
             if let Some(route) = &via {
                 if let Some((_, tag)) = relays.iter().find(|(r, _)| r == route) {
                     super::relay::after_join(&shared, &ticket, route, *tag);

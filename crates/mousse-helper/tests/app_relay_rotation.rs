@@ -1,53 +1,17 @@
 //! E-R4: manifests, stale-manifest dialling and manual key rotation
-//! through the app channel, against the loopback test relay (Phase 3
+//! through the app channel, against a real `mousse-relay` on loopback (Phase 3
 //! §B.4 and §B.11). The check cell `phase3.relay-rotation` runs this file.
 
 mod common;
+#[path = "common/relay.rs"]
+mod relay_fixture;
 
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use common::*;
-use mousse_net_io::relay::test_relay::{TestRelay, TestRelayConfig};
+use relay_fixture::TestRelay as Relay;
 use serde_json::{json, Value};
-
-struct Relay {
-    rt: tokio::runtime::Runtime,
-    relay: TestRelay,
-}
-
-impl Relay {
-    fn start() -> Self {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let relay = rt.block_on(TestRelay::start(TestRelayConfig::default()));
-        Self { rt, relay }
-    }
-
-    fn link(&self) -> String {
-        let _rt = self.rt.enter();
-        self.relay.enrollment_link().to_text()
-    }
-
-    fn destination(&self) -> String {
-        format!("relay://{}", self.relay.addr())
-    }
-
-    fn wait_handles(&self, n: usize) {
-        let start = Instant::now();
-        while self.relay.handles().len() != n {
-            assert!(
-                start.elapsed() < WAIT,
-                "{} registrations, not {n}",
-                self.relay.handles().len()
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-}
 
 const FAST: [(&str, &str); 4] = [
     ("VIA_RELAY_RETRY_FIRST_MS", "100"),
@@ -166,7 +130,7 @@ fn a_manual_rotation_asks_nothing_and_an_offline_caller_comes_back_through_the_o
     let offered = b.events("peer.relay.offered").len();
     let rotated = a.call("relay.rotate", json!({"relay": id}));
     assert!(rotated["relay"]["rotating_until"].is_u64(), "{rotated}");
-    relay.wait_handles(2);
+    relay.wait_live(2);
     // B, online, gets the new manifest at once and is asked nothing: the
     // destination is the same.
     wait_sequence_above(&mut b, &host, seq_b);
@@ -178,7 +142,6 @@ fn a_manual_rotation_asks_nothing_and_an_offline_caller_comes_back_through_the_o
     let mut a = a_end.app("hostA", &FAST);
     a.hello();
     wait_registered(&mut a);
-    relay.wait_handles(2);
     let up = dial_up(&mut b, &host);
     assert_eq!(up["route"]["kind"], "relay");
 
@@ -239,11 +202,11 @@ fn the_old_key_leaves_after_the_overlap() {
     let mut a = a_end.app_raw("hostA", &FAST, 0, &manual_clock());
     a.hello();
     let id = enroll(&mut a, &relay);
-    relay.wait_handles(1);
+    relay.wait_live(1);
     a.call("relay.rotate", json!({"relay": id}));
-    relay.wait_handles(2);
+    relay.wait_live(2);
     a.call("test.clock", json!({"advance_secs": 604_800 + 1}));
-    relay.wait_handles(1);
+    relay.wait_live(1);
     let list = a.call("relay.list", json!({}));
     assert!(list["relays"][0]["rotating_until"].is_null(), "{list}");
 }
