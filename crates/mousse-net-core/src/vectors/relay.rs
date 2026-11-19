@@ -1013,7 +1013,7 @@ fn successor_unauthorized_current() -> J {
     let (target, new, other) = (key(&TARGET), key(&NEW_TARGET), key(&STRANGER_TARGET));
     let mut s = Sim::new(
         "successor_unauthorized_current",
-        "A SUCCESSOR proved by both keys authorizes the new key and supersedes the current one (no answer). The superseded key, still registered, cannot vouch for another successor. The new key registers on its own connection.",
+        "A SUCCESSOR proved by both keys authorizes the new key and supersedes the current one (no answer). The superseded key, still registered, cannot vouch for another successor. The new key registers on its own connection, and cannot name a key already on the list (the superseded one) as its successor.",
         Setup { authorized: &listed(&[TARGET]), ..PLAIN },
     );
     s.register(0, 1, 1, &target);
@@ -1039,6 +1039,8 @@ fn successor_unauthorized_current() -> J {
     s.hello(40, 3, 1);
     let msg = s.register_msg(3, &other);
     expect(&s.send(40, 3, &msg), &["send 3 REFUSED", "close 3 1000"]);
+    let msg = successor_msg(&s, 2, &target, &new);
+    expect(&s.send(50, 2, &msg), &["send 2 REFUSED", "close 2 1000"]);
     s.finish()
 }
 

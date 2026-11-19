@@ -11,7 +11,7 @@ crate::define_limits! {
     pub struct RelayLimits {
         /// Open outer connections (capacity).
         max_connections = "RELAY_MAX_CONNECTIONS": 4_096, [1, 65_536];
-        /// Control connections (callers', joiners' and targets', and connections that have not sent their first message) per IPv4 address or IPv6 /64; accept legs not counted (tighten only).
+        /// Open connections per IPv4 address or IPv6 /64, except accept legs once their ACCEPT is accepted (tighten only).
         connections_per_ip = "RELAY_CONNECTIONS_PER_IP": 256, [1, 256];
         /// Open accept legs per handle (tighten only).
         accept_legs_per_handle = "RELAY_ACCEPT_LEGS_PER_HANDLE": 64, [1, 64];
