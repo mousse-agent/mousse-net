@@ -34,6 +34,8 @@ mousse_net_core::define_limits! {
         write_high_water_bytes = "WRITE_HIGH_WATER_BYTES": 262_144, [16_384, 67_108_864];
         /// Bytes read from the pipe at a time.
         read_buffer_bytes = "READ_BUFFER_BYTES": 32_768, [1_024, 1_048_576];
+        /// Size of the buffers received DATA frames share until read: a peer's tiny frames fill one buffer instead of an allocation each.
+        rx_chunk_bytes = "RX_CHUNK_BYTES": 16_384, [1_024, 65_536];
         /// How long a TLS handshake may take.
         handshake_timeout_ms = "HANDSHAKE_TIMEOUT_MS": 10_000, [1_000, 60_000];
         /// How long a TCP connect may take.

@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "pc-windows",
+  "key": "048ad3ccda2d27fdfc98c131f2fa25bea736ec0a3e8a107dcbfa6b2f5a86b88da452c337f09925646ec76897452505e718f3f397ddf39674e9f5ad64590bc93d57",
+  "payload": "{\"check\":\"phase1a.reconnect\",\"target\":\"windows-x64\",\"control\":\"no-rediscovery\",\"build\":\"47af3a64125fc21917db67bfcea9c220132b33ce+unknown\",\"platform\":\"windows-x86_64\",\"outcome\":\"FAIL\",\"details\":\"printed \\\"FAIL phase1a.reconnect\\\" (reason=unreachable)\",\"time\":\"2026-11-18T21:28:31Z\",\"device\":\"pc-windows\",\"config\":\"0b05aaf8dad069d005137d8ed9ab7caa0c04aca15c68bccd52d13705a39b3dcf\",\"extra\":{\"app_build\":\"c684b4217ae5812c419949517bad90126c81abf6\",\"reason\":\"unreachable\"}}",
+  "signature": "b56d8319cf3df9a79ade9af55174093fe59e5bbf0b72aaee9da88c7a536de29252a1338229c83ff029cf3134d11c4c0f22f8dedc005af68dc767ba780e4f333e"
+}

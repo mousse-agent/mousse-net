@@ -6,6 +6,7 @@
 mod common;
 
 use std::path::Path;
+use std::time::Duration;
 
 use common::*;
 use serde_json::{json, Value};
@@ -331,6 +332,44 @@ fn a_removal_that_cannot_be_saved_pauses_networking_until_it_is() {
     p.a = p.a_end.app("hostA", &[]);
     p.a.hello();
     assert!(grant_of(&mut p.a, &b_identity).is_none());
+}
+
+/// A path still opening when networking pauses never comes up: the dial
+/// that opened it ends `paused`, and nothing is published after the pause
+/// closed what was up.
+#[test]
+fn a_path_still_opening_when_networking_pauses_never_comes_up() {
+    let mut p = pair_up("pauseop", &[], &[]);
+    let h_end = Endpoint::init("pauseoph");
+    let mut h = h_end.app("hostH", &[]);
+    h.hello();
+    let gate = gate_to(&route_of(&mut h));
+    // A pairs with H as its caller, through the relay that holds the dial.
+    trust(&mut h, &mut p.a, &[&gate.route]);
+    gate.wait_accepted();
+
+    let b_identity = p.b.identity.clone();
+    let grant = grant_of(&mut p.a, &b_identity).unwrap()["grant"].clone();
+    let _table = block_grant_saves(&p.a_end.dir);
+    let removed = p.a.call("grant.remove", json!({"grant": grant}));
+    assert_eq!(removed["paused"], true);
+    p.a.event("net.paused", |_| true);
+
+    // The dial passes step 1 after the pause.
+    gate.open();
+    h.event("conn.up", |m| m["identity"] == p.a.identity.as_str());
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        outbound_ups(&p.a, &h.identity),
+        0,
+        "{:?}",
+        p.a.events("conn.up")
+    );
+    assert!(
+        p.a_end.log().contains("networking is paused"),
+        "{}",
+        p.a_end.log()
+    );
 }
 
 #[test]

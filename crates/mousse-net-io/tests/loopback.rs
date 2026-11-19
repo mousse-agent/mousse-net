@@ -475,6 +475,31 @@ async fn a_removal_that_cannot_be_saved_reports_it_and_still_ends_access_at_once
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// A pause closes every connection, and also one whose handshake began
+/// before the pause and ends after it: the pause and the registration of
+/// connections take the same lock. After a resume the host serves again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pause_also_closes_a_connection_whose_handshake_ends_after_it() {
+    let mut host = TestHost::start(new_signer()).await;
+    let caller = new_caller(new_signer());
+    let conn = pair(&caller, &mut host, "laptop").await;
+    // Connected before the pause; the host waits for its TLS handshake.
+    let pipe = connect_tcp(&host.route()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    host.host.pause(ErrorCode::InternalError);
+    assert_eq!(close_code(&conn).await, Some(ErrorCode::InternalError));
+
+    match within("the late handshake", caller.dial(pipe, host.identity())).await {
+        Ok(late) => assert_eq!(close_code(&late).await, Some(ErrorCode::InternalError)),
+        Err(e) => assert!(closed_with(&e, ErrorCode::InternalError), "{e:?}"),
+    }
+
+    host.host.resume();
+    let again = dial(&caller, &host.route(), host.identity()).await.unwrap();
+    open_echo(&again).await;
+    host.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_enrollment_that_cannot_be_saved_fails_the_pairing() {
     let dir = temp_dir("unsaved-enroll");

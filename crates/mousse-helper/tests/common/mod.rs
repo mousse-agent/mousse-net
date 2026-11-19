@@ -60,7 +60,7 @@ pub fn bin() -> &'static Path {
     })
 }
 
-fn temp_dir(tag: &str) -> PathBuf {
+pub fn temp_dir(tag: &str) -> PathBuf {
     let n = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -92,7 +92,8 @@ impl Endpoint {
         endpoint
     }
 
-    fn command(&self, args: &[&str]) -> Command {
+    /// The helper with this state directory; stdin closed, output piped.
+    pub fn command(&self, args: &[&str]) -> Command {
         let mut cmd = Command::new(bin());
         cmd.arg("--state")
             .arg(&self.dir)
@@ -102,6 +103,16 @@ impl Endpoint {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         cmd
+    }
+
+    /// A command-line run of the helper with stdin piped and `env` set.
+    pub fn cli_env(&self, args: &[&str], env: &[(&str, &str)]) -> Cli {
+        let mut cmd = self.command(args);
+        cmd.stdin(Stdio::piped());
+        for (name, value) in env {
+            cmd.env(name, value);
+        }
+        Cli::spawn(cmd)
     }
 
     /// A command-line run of the helper.
@@ -238,6 +249,11 @@ impl Cli {
             );
             std::thread::sleep(Duration::from_millis(25));
         }
+    }
+
+    /// Close the helper's stdin, as an app that is gone does.
+    pub fn end_stdin(&mut self) {
+        self.stdin.take();
     }
 
     pub fn type_line(&mut self, text: &str) {
@@ -901,4 +917,73 @@ pub fn wait_outbound(app: &App, identity: &str, seen: usize) {
             .count();
         (n > seen).then_some(())
     });
+}
+
+/// A loopback relay to `target` that takes connections at once but passes
+/// them on only once opened: a dial that is still on its way.
+pub struct Gate {
+    pub route: String,
+    open: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    pub accepted: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+pub fn gate_to(target: &str) -> Gate {
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::Ordering;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let route = format!("tcp://{}", listener.local_addr().unwrap());
+    let target = target.trim_start_matches("tcp://").to_owned();
+    let open = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (gate, count) = (open.clone(), accepted.clone());
+    std::thread::spawn(move || {
+        for inbound in listener.incoming().flatten() {
+            count.fetch_add(1, Ordering::SeqCst);
+            let (gate, target) = (gate.clone(), target.clone());
+            std::thread::spawn(move || {
+                let (lock, cv) = &*gate;
+                let mut opened = lock.lock().unwrap();
+                while !*opened {
+                    opened = cv.wait(opened).unwrap();
+                }
+                drop(opened);
+                let Ok(outbound) = TcpStream::connect(&target) else {
+                    return;
+                };
+                let (mut in_r, mut out_w) =
+                    (inbound.try_clone().unwrap(), outbound.try_clone().unwrap());
+                std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut in_r, &mut out_w);
+                    let _ = out_w.shutdown(std::net::Shutdown::Write);
+                });
+                let (mut out_r, mut in_w) = (outbound, inbound);
+                let _ = std::io::copy(&mut out_r, &mut in_w);
+                let _ = in_w.shutdown(std::net::Shutdown::Write);
+            });
+        }
+    });
+    Gate {
+        route,
+        open,
+        accepted,
+    }
+}
+
+impl Gate {
+    pub fn open(&self) {
+        let (lock, cv) = &*self.open;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+    }
+}
+
+impl Gate {
+    /// Wait until the relay took a connection.
+    pub fn wait_accepted(&self) {
+        let start = Instant::now();
+        while self.accepted.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(start.elapsed() < WAIT, "nothing dialled the relay");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 }

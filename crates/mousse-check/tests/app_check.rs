@@ -38,6 +38,21 @@ if (flag('--role') === 'caller') {
   console.log(`host_app_build=${head}`)
 }
 const control = process.env.MOUSSE_NET_ENGINE_CONTROL
+// FAKE_ENDING: how a broken check script might end instead.
+const ending = process.env.FAKE_ENDING
+if (ending === 'fail-exit-0') {
+  console.log(`FAIL ${id} reason=${control}`)
+  process.exit(0)
+}
+if (ending === 'both-exit-1') {
+  console.log(`PASS ${id}`)
+  console.log(`FAIL ${id} reason=${control}`)
+  process.exit(1)
+}
+if (ending === 'pass-exit-1') {
+  console.log(`PASS ${id}`)
+  process.exit(1)
+}
 if (control) {
   console.log(`FAIL ${id} reason=${control}`)
   process.exit(1)
@@ -84,6 +99,10 @@ fn fake_app(name: &str) -> (Dir, String) {
 }
 
 fn run_mjs(app: Option<&Path>, args: &[&str]) -> Output {
+    run_mjs_ending(app, args, None)
+}
+
+fn run_mjs_ending(app: Option<&Path>, args: &[&str], ending: Option<&str>) -> Output {
     let mut cmd = Command::new("node");
     cmd.arg(root().join("tools/app-check/run.mjs"))
         .args(args)
@@ -100,6 +119,10 @@ fn run_mjs(app: Option<&Path>, args: &[&str]) -> Output {
     if let Some(a) = app {
         cmd.env("MOUSSE_APP_DIR", a);
     }
+    match ending {
+        Some(e) => cmd.env("FAKE_ENDING", e),
+        None => cmd.env_remove("FAKE_ENDING"),
+    };
     cmd.output().expect("node runs")
 }
 
@@ -228,4 +251,48 @@ fn without_an_app_checkout_nothing_runs() {
     assert_eq!(o.status.code(), Some(2), "{out}");
     assert!(out.contains("MOUSSE_APP_DIR"), "{out}");
     assert!(!out.contains("helper_build="), "{out}");
+}
+
+/// A device result is judged as the kit judges a local run: a control counts
+/// as failing only with a nonzero exit, its FAIL line and no PASS line, and a
+/// normal run passes only with exit 0, its PASS line and no FAIL line.
+#[test]
+fn a_device_result_is_judged_like_a_local_run() {
+    let (app, _head) = fake_app("judge");
+    // (ending, control?, outcome the signed result must carry)
+    let rows: [(Option<&str>, bool, &str); 7] = [
+        (None, true, "FAIL"),
+        (Some("fail-exit-0"), true, "DID_NOT_FAIL"),
+        (Some("both-exit-1"), true, "DID_NOT_FAIL"),
+        (Some("pass-exit-1"), true, "DID_NOT_FAIL"),
+        (None, false, "PASS"),
+        (Some("pass-exit-1"), false, "FAIL"),
+        (Some("both-exit-1"), false, "FAIL"),
+    ];
+    for (i, (ending, control, want)) in rows.iter().enumerate() {
+        let result = app.0.with_extension(format!("judge-{i}.json"));
+        let mut args = vec!["phase1a.private-streams", "--target", "linux-x64"];
+        if *control {
+            args.extend(["--control", "second-reader"]);
+        }
+        let r = result.to_str().unwrap().to_string();
+        args.extend(["--result", r.as_str()]);
+        let o = run_mjs_ending(Some(&app.0), &args, *ending);
+        let out = text(&o);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&result).unwrap_or_else(|_| {
+                panic!(
+                    "no result for {ending:?}:
+{out}"
+                )
+            }))
+            .unwrap();
+        let p = payload_from(&v, &sign_args()).unwrap();
+        assert_eq!(
+            p.outcome, *want,
+            "ending {ending:?}, control {control}:
+{out}"
+        );
+        let _ = std::fs::remove_file(&result);
+    }
 }

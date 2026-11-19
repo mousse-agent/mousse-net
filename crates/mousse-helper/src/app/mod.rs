@@ -159,6 +159,11 @@ struct ConnEntry {
     conn: Arc<Connection>,
     identity: IdentityPublicKey,
     inbound: bool,
+    /// An outbound path the caller holds as its host's candidate, not yet
+    /// reopened: announced by `path.reopen` (a renewal) or by `conn.up`
+    /// while another path to the host was up (a dial). The only handles
+    /// `path.reopened` accepts.
+    reopen: bool,
 }
 
 struct StreamEntry {
@@ -199,6 +204,19 @@ struct Core {
     peak_buffered: u64,
     /// Shutdown: end once everything queued is written.
     ending: Option<End>,
+    /// Per peer, how often `peer.forget` removed it. A dial or a renewal
+    /// reads it before it starts and publishes its path only if it has not
+    /// changed, so no path to a forgotten peer comes up after the forget.
+    peer_gen: HashMap<IdentityPublicKey, u64>,
+}
+
+/// Why a connection that finished opening was closed instead of published.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stale {
+    /// Networking paused meanwhile.
+    Paused,
+    /// Its peer was forgotten meanwhile.
+    Forgotten,
 }
 
 fn lock(core: &Mutex<Core>) -> MutexGuard<'_, Core> {
@@ -254,6 +272,7 @@ impl App {
                 buffered: 0,
                 peak_buffered: 0,
                 ending: None,
+                peer_gen: HashMap::new(),
             }),
             wake_writer: Notify::new(),
             ended,
@@ -291,18 +310,15 @@ impl App {
             applog::line(format!("refused {peer}: not live"));
             return;
         }
-        if self.shared.removal.is_paused() {
-            conn.close(ErrorCode::InternalError);
-            return;
-        }
         let grant = self.shared.host.grant_of(conn.id());
         let mut fields = json!({"dir": "in"});
         if let Some(g) = &grant {
             fields["grant"] = json!(g.id.0);
             fields["role"] = json!(g.role.as_str());
         }
-        applog::line(format!("connected {peer} (in)"));
-        self.shared.add_conn(conn, true, fields);
+        if self.shared.add_conn(conn, true, fields).is_ok() {
+            applog::line(format!("connected {peer} (in)"));
+        }
     }
 
     /// The network changed (an interface, or a wake): check every
@@ -357,11 +373,70 @@ impl Shared {
         self.queued(&core);
     }
 
-    fn add_conn(self: &Arc<Self>, conn: Connection, inbound: bool, mut fields: Value) -> u64 {
-        let conn = Arc::new(conn);
+    /// Publish a connection: `conn.up`. While networking is paused it is
+    /// closed instead.
+    fn add_conn(
+        self: &Arc<Self>,
+        conn: Connection,
+        inbound: bool,
+        fields: Value,
+    ) -> Result<u64, Stale> {
+        self.publish(conn, inbound, None, fields)
+    }
+
+    /// The generation of `pin` (see `Core::peer_gen`).
+    fn peer_gen(&self, pin: &IdentityPublicKey) -> u64 {
+        lock(&self.core).peer_gen.get(pin).copied().unwrap_or(0)
+    }
+
+    /// Publish an outbound path to a peer whose generation was `gen` when
+    /// the work that opened it started. If the peer was forgotten since,
+    /// the path is closed instead and `None` is returned.
+    fn add_outbound(
+        self: &Arc<Self>,
+        conn: Connection,
+        gen: u64,
+        fields: Value,
+    ) -> Result<u64, Stale> {
+        self.publish(conn, false, Some(gen), fields)
+    }
+
+    fn publish(
+        self: &Arc<Self>,
+        conn: Connection,
+        inbound: bool,
+        gen: Option<u64>,
+        mut fields: Value,
+    ) -> Result<u64, Stale> {
         let identity = *conn.peer();
         let no = {
             let mut core = lock(&self.core);
+            // Checked under the lock `watch_pause` closes connections
+            // under: a pause either sees this connection or is seen here.
+            if self.removal.is_paused() {
+                drop(core);
+                conn.close(ErrorCode::InternalError);
+                applog::line(format!(
+                    "closed a new path with {}: networking is paused",
+                    short_id(&identity)
+                ));
+                return Err(Stale::Paused);
+            }
+            if let Some(gen) = gen {
+                if core.peer_gen.get(&identity).copied().unwrap_or(0) != gen {
+                    drop(core);
+                    conn.close(ErrorCode::Cancelled);
+                    applog::line(format!(
+                        "closed a new path to {}: forgotten meanwhile",
+                        short_id(&identity)
+                    ));
+                    return Err(Stale::Forgotten);
+                }
+            }
+            // Under the core lock `path.reopened` takes, so the app can
+            // reopen this path as soon as it sees `conn.up`.
+            let reopen = !inbound && self.caller.is_reopening(&conn);
+            let conn = Arc::new(conn);
             let no = core.next_conn;
             core.next_conn += 1;
             core.conns.insert(
@@ -370,6 +445,7 @@ impl Shared {
                     conn: conn.clone(),
                     identity,
                     inbound,
+                    reopen,
                 },
             );
             fields["ev"] = json!("conn.up");
@@ -378,10 +454,10 @@ impl Shared {
             fields["deadline"] = json!(conn.deadline().secs());
             core.out.conn_event(no, &fields);
             self.queued(&core);
+            tokio::spawn(conn_task(self.clone(), no, conn, inbound));
             no
         };
-        tokio::spawn(conn_task(self.clone(), no, conn, inbound));
-        no
+        Ok(no)
     }
 
     /// The connection ended: its streams end with it (`conn.down` says so).
@@ -553,6 +629,8 @@ impl Shared {
                     "open_streams": a.open_streams(),
                     "queued_bytes": a.queued_bytes(),
                     "peak_queued_bytes": a.peak_queued_bytes(),
+                    "held_bytes": a.held_bytes(),
+                    "peak_held_bytes": a.peak_held_bytes(),
                     "refused_streams": a.refused_streams(),
                     "handles": core.streams.len(),
                     "conns": core.conns.len(),
@@ -628,7 +706,7 @@ impl Shared {
                 }
             }
             "path.reopened" => {
-                let reply = changes::reopened(self, &core, &id, &map);
+                let reply = changes::reopened(self, &mut core, &id, &map);
                 self.reply(&mut core, reply);
             }
             #[cfg(debug_assertions)]

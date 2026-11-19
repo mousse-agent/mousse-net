@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "wsl-linux",
+  "key": "042f0974403d57624956aebbe7cd72f01b86773fdee66ffba37429d70a320ccb692f06069a9174535d971428932d86132cc89eef54954c5f9c5c6ed605fea234bb",
+  "payload": "{\"check\":\"phase0.core-vectors\",\"target\":\"linux-x64\",\"control\":\"break-authz\",\"build\":\"0e745a7398c0b2f6f0ab62909a343cf8145b5f01+debug\",\"platform\":\"linux-x86_64\",\"outcome\":\"FAIL\",\"details\":\"2 of 176 tests failed\",\"time\":\"2026-11-19T06:03:32Z\",\"device\":\"wsl-linux\",\"config\":\"550d7a90f47be7f7e3d207881f06e3e134dc3101f906b78038c50a6feb45e2c7\"}",
+  "signature": "63f966d58d22415257a829ca7318a2631bdb763db1521c75ee837e30d188ca07915dbf8c734ff1de3ea5c7aab27921ffa45f65af1115f731afc58245df8a1be1"
+}
