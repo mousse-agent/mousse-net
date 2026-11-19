@@ -34,37 +34,37 @@ use report::ReportQueue;
 
 crate::define_limits! {
     /// The hosted relay's limits (§H.1). The relay reads each from
-    /// `MOUSSE_NET_RELAY_<NAME>`.
+    /// `MOUSSE_NET_<NAME>`; every name starts with `RELAY_`.
     pub struct HostedLimits {
         /// A paused class waits this long for a LEASE before its circuits close with 4001; with the longest peer keepalive (15 s) it stays below the shortest peer idle timeout (30 s), so tighten only.
-        refill_wait_ms = "REFILL_WAIT_MS": 10_000, [1_000, 10_000];
+        refill_wait_ms = "RELAY_REFILL_WAIT_MS": 10_000, [1_000, 10_000];
         /// Snapshot interval; below Plus's boot silence time (120 s by default).
-        report_ms = "REPORT_MS": 10_000, [1_000, 60_000];
+        report_ms = "RELAY_REPORT_MS": 10_000, [1_000, 60_000];
         /// Longest delay from a final to its snapshot, and the shortest gap between snapshots; below REPORT_MS.
-        report_min_ms = "REPORT_MIN_MS": 1_000, [100, 5_000];
+        report_min_ms = "RELAY_REPORT_MIN_MS": 1_000, [100, 5_000];
         /// On a graceful stop, how long to wait for the stopping snapshot to be stored.
-        final_report_wait_ms = "FINAL_REPORT_WAIT_MS": 5_000, [0, 60_000];
+        final_report_wait_ms = "RELAY_FINAL_REPORT_WAIT_MS": 5_000, [0, 60_000];
         /// One call to Plus.
-        plus_timeout_ms = "PLUS_TIMEOUT_MS": 10_000, [1_000, 60_000];
+        plus_timeout_ms = "RELAY_PLUS_TIMEOUT_MS": 10_000, [1_000, 60_000];
         /// Longest round trip whose Plus answer may set the Plus clock; a longer one only ends leases earlier.
-        clock_rtt_ms = "CLOCK_RTT_MS": 2_000, [100, 10_000];
+        clock_rtt_ms = "RELAY_CLOCK_RTT_MS": 2_000, [100, 10_000];
         /// First wait before sending a boot announcement or report part again after a failed call.
-        plus_retry_first_ms = "PLUS_RETRY_FIRST_MS": 1_000, [100, 60_000];
+        plus_retry_first_ms = "RELAY_PLUS_RETRY_FIRST_MS": 1_000, [100, 60_000];
         /// Longest such wait; not below the first.
-        plus_retry_max_ms = "PLUS_RETRY_MAX_MS": 30_000, [1_000, 600_000];
+        plus_retry_max_ms = "RELAY_PLUS_RETRY_MAX_MS": 30_000, [1_000, 600_000];
         /// Largest Plus answer read.
-        plus_answer_max_bytes = "PLUS_ANSWER_MAX_BYTES": 65_536, [16_384, 1_048_576];
+        plus_answer_max_bytes = "RELAY_PLUS_ANSWER_MAX_BYTES": 65_536, [16_384, 1_048_576];
     }
     agree(l) {
         if l.report_min_ms >= l.report_ms {
             return Err(crate::limits::LimitError::Conflict(format!(
-                "REPORT_MIN_MS ({}) is not below REPORT_MS ({})",
+                "RELAY_REPORT_MIN_MS ({}) is not below RELAY_REPORT_MS ({})",
                 l.report_min_ms, l.report_ms
             )));
         }
         if l.plus_retry_max_ms < l.plus_retry_first_ms {
             return Err(crate::limits::LimitError::Conflict(format!(
-                "PLUS_RETRY_MAX_MS ({}) is below PLUS_RETRY_FIRST_MS ({})",
+                "RELAY_PLUS_RETRY_MAX_MS ({}) is below RELAY_PLUS_RETRY_FIRST_MS ({})",
                 l.plus_retry_max_ms, l.plus_retry_first_ms
             )));
         }

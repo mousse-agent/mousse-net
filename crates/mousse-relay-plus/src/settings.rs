@@ -2,8 +2,8 @@
 //! (`docs/limits.md`, "Relay").
 //!
 //! `MOUSSE_NET_RELAY_PLUS_URL` is a setting, not a limit: the Plus base URL.
-//! Limits are `MOUSSE_NET_RELAY_<NAME>` for every row of
-//! [`HostedLimits::SPECS`]. Both are read once at startup; a bad value stops
+//! Limits are `MOUSSE_NET_<NAME>` for every row of [`HostedLimits::SPECS`];
+//! each name starts with `RELAY_`, as the relay's other limits do. Both are read once at startup; a bad value stops
 //! startup with a message naming the variable.
 
 use std::ffi::OsString;
@@ -12,8 +12,9 @@ use std::net::IpAddr;
 use mousse_net_core::limits::LimitError;
 use mousse_net_core::relay_hosted::HostedLimits;
 
-/// The prefix of every relay variable.
-pub const ENV_PREFIX: &str = "MOUSSE_NET_RELAY_";
+/// The prefix of every limit variable; the relay's names then start with
+/// `RELAY_`.
+pub const ENV_PREFIX: &str = "MOUSSE_NET_";
 
 /// The Plus base URL setting.
 pub const PLUS_URL_VAR: &str = "MOUSSE_NET_RELAY_PLUS_URL";
@@ -132,7 +133,7 @@ impl PlusUrl {
 pub struct HostedSettings {
     /// `MOUSSE_NET_RELAY_PLUS_URL`.
     pub plus_url: PlusUrl,
-    /// `MOUSSE_NET_RELAY_<NAME>` for [`HostedLimits`].
+    /// The `MOUSSE_NET_RELAY_*` limits of [`HostedLimits`].
     pub limits: HostedLimits,
 }
 
@@ -144,7 +145,7 @@ fn parse_whole(text: &str) -> Option<u64> {
     text.parse().ok()
 }
 
-/// The hosted limits from `MOUSSE_NET_RELAY_<NAME>` variables that `var`
+/// The hosted limits from the `MOUSSE_NET_RELAY_*` variables that `var`
 /// returns. Errors name the variable and its range.
 pub fn limits_from_vars(var: &impl Fn(&str) -> Option<OsString>) -> Result<HostedLimits, String> {
     let mut overrides = Vec::new();
@@ -192,8 +193,8 @@ pub fn from_vars(var: impl Fn(&str) -> Option<OsString>) -> Result<HostedSetting
     })
 }
 
-/// Whether `name` (without the prefix) is a hosted limit or setting, for
-/// the relay's unknown-variable check.
+/// Whether the variable `name` is a hosted limit or setting, for the
+/// relay's unknown-variable check.
 pub fn is_known(name: &str) -> bool {
     SETTINGS.contains(&name)
         || name

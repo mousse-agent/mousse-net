@@ -28,12 +28,12 @@ const H1: [u8; 32] = [0x31; 32];
 fn limits() -> HostedLimits {
     HostedLimits::DEFAULT
         .with_overrides(&[
-            ("REPORT_MS", 1_000),
-            ("REPORT_MIN_MS", 100),
-            ("PLUS_RETRY_FIRST_MS", 100),
-            ("PLUS_RETRY_MAX_MS", 1_000),
-            ("FINAL_REPORT_WAIT_MS", 2_000),
-            ("PLUS_TIMEOUT_MS", 2_000),
+            ("RELAY_REPORT_MS", 1_000),
+            ("RELAY_REPORT_MIN_MS", 100),
+            ("RELAY_PLUS_RETRY_FIRST_MS", 100),
+            ("RELAY_PLUS_RETRY_MAX_MS", 1_000),
+            ("RELAY_FINAL_REPORT_WAIT_MS", 2_000),
+            ("RELAY_PLUS_TIMEOUT_MS", 2_000),
         ])
         .unwrap()
 }
@@ -288,7 +288,7 @@ async fn a_stop_reports_every_lease_final_in_a_stopping_snapshot() {
 async fn a_stop_waits_no_longer_than_the_final_report_wait_when_plus_is_down() {
     let plus = TestIssuerStandIn::start(7).await;
     let lim = limits()
-        .with_overrides(&[("FINAL_REPORT_WAIT_MS", 300)])
+        .with_overrides(&[("RELAY_FINAL_REPORT_WAIT_MS", 300)])
         .unwrap();
     let r = start(&plus, lim, 1);
     wait_for("boot", || r.rt.with(|h, _| h.clock().is_set())).await;
@@ -310,7 +310,9 @@ async fn a_stop_waits_no_longer_than_the_final_report_wait_when_plus_is_down() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slow_answer_sets_no_clock_and_no_lease_is_taken_until_a_quick_one() {
     let plus = TestIssuerStandIn::start(8).await;
-    let lim = limits().with_overrides(&[("CLOCK_RTT_MS", 100)]).unwrap();
+    let lim = limits()
+        .with_overrides(&[("RELAY_CLOCK_RTT_MS", 100)])
+        .unwrap();
     plus.set_delay_ms(300);
     let r = start(&plus, lim, 1);
     wait_for("boot acknowledged", || {

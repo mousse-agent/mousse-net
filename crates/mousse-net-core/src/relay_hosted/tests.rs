@@ -1079,12 +1079,15 @@ fn a_report_answer_sets_the_plus_clock_only_from_a_quick_round_trip() {
 #[test]
 fn limits_agree() {
     assert!(HostedLimits::DEFAULT
-        .with_overrides(&[("REPORT_MIN_MS", 5_000), ("REPORT_MS", 5_000)])
+        .with_overrides(&[("RELAY_REPORT_MIN_MS", 5_000), ("RELAY_REPORT_MS", 5_000)])
         .is_err());
     assert!(HostedLimits::DEFAULT
-        .with_overrides(&[("REFILL_WAIT_MS", 10_001)])
+        .with_overrides(&[("RELAY_REFILL_WAIT_MS", 10_001)])
         .is_err());
     assert!(HostedLimits::DEFAULT
-        .with_overrides(&[("PLUS_RETRY_FIRST_MS", 2_000), ("PLUS_RETRY_MAX_MS", 1_000)])
+        .with_overrides(&[
+            ("RELAY_PLUS_RETRY_FIRST_MS", 2_000),
+            ("RELAY_PLUS_RETRY_MAX_MS", 1_000)
+        ])
         .is_err());
 }

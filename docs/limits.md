@@ -80,8 +80,9 @@ spec's value: it can only be tightened.
 
 ## Relay, hosted mode
 
-`mousse-relay` reads only names that start with `MOUSSE_NET_RELAY_`, once
-at startup, with the same rules as the helper. These rows are the hosted
+`mousse-relay` reads only names that start with `MOUSSE_NET_RELAY_` (the
+limit names in the code start with `RELAY_`), once at startup, with the
+same rules as the helper. These rows are the hosted
 mode's (`docs/phase34-design.md` §H.1); the self-hosted relay's rows join
 them with the relay itself (E-R2). `HostedLimits` in
 `crates/mousse-net-core/src/relay_hosted/mod.rs` holds them, and
