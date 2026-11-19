@@ -15,7 +15,20 @@
         mousse_control = "no-revoke-journal",
         mousse_control = "stop-on-mismatch",
         mousse_control = "public-routes",
-        mousse_control = "no-rediscovery"
+        mousse_control = "no-rediscovery",
+        mousse_control = "no-preauth-budget",
+        mousse_control = "shared-preauth-pool",
+        mousse_control = "ws-slot-after-headers",
+        mousse_control = "ipc-unbounded-line",
+        mousse_control = "ipc-handoff-drops-buffer",
+        mousse_control = "join-only-frees-slot",
+        mousse_control = "join-only-outlives-invitation",
+        mousse_control = "fence-at-accept-only",
+        mousse_control = "fence-tcp-only",
+        mousse_control = "enroll-while-paused",
+        mousse_control = "repair-skips-slot",
+        mousse_control = "repair-skips-fence",
+        mousse_control = "limits-raise"
     )
 ))]
 compile_error!("a mousse_control build has a deliberate defect and is for tests only; build it without --release");
@@ -38,6 +51,19 @@ compile_error!("test-in-person lets a typed ticket count as scanned from the hos
     mousse_control = "stop-on-mismatch",
     mousse_control = "public-routes",
     mousse_control = "no-rediscovery",
+    mousse_control = "no-preauth-budget",
+    mousse_control = "shared-preauth-pool",
+    mousse_control = "ws-slot-after-headers",
+    mousse_control = "ipc-unbounded-line",
+    mousse_control = "ipc-handoff-drops-buffer",
+    mousse_control = "join-only-frees-slot",
+    mousse_control = "join-only-outlives-invitation",
+    mousse_control = "fence-at-accept-only",
+    mousse_control = "fence-tcp-only",
+    mousse_control = "enroll-while-paused",
+    mousse_control = "repair-skips-slot",
+    mousse_control = "repair-skips-fence",
+    mousse_control = "limits-raise",
     feature = "test-in-person"
 ))]
 const _: () = {
