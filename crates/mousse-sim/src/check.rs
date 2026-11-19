@@ -40,11 +40,26 @@ pub enum Invariant {
     /// A dial that reaches the wrong endpoint fails the pin and moves no
     /// data.
     WrongEndpointNoData,
+    /// The relay admits a call only for a caller in the target's current
+    /// allow-set with a valid proof, and a join only with a live invitation
+    /// tag.
+    RelayAllowSetOnly,
+    /// Every refused call or join is answered exactly at its refusal
+    /// deadline; an admitted one never before it.
+    RelayOneAnswer,
+    /// Once the relay accepts an allow-set, no call circuit of a caller it
+    /// no longer lists is open.
+    RelayRemovalCloses,
+    /// An unpromoted join circuit forwards at most the pre-accept budget
+    /// each way.
+    RelayPreacceptBudget,
+    /// The relay registers only keys on the operator's list.
+    RelayRegisterAuthorized,
 }
 
 impl Invariant {
     /// Every invariant.
-    pub const ALL: [Invariant; 12] = [
+    pub const ALL: [Invariant; 17] = [
         Invariant::SingleEnrollment,
         Invariant::DebitBeforeWork,
         Invariant::AttemptCap,
@@ -57,6 +72,11 @@ impl Invariant {
         Invariant::GrantIdsUnique,
         Invariant::EndpointIsolation,
         Invariant::WrongEndpointNoData,
+        Invariant::RelayAllowSetOnly,
+        Invariant::RelayOneAnswer,
+        Invariant::RelayRemovalCloses,
+        Invariant::RelayPreacceptBudget,
+        Invariant::RelayRegisterAuthorized,
     ];
 
     /// Short kebab-case name.
@@ -74,6 +94,11 @@ impl Invariant {
             Invariant::GrantIdsUnique => "grant-ids-unique",
             Invariant::EndpointIsolation => "endpoint-isolation",
             Invariant::WrongEndpointNoData => "wrong-endpoint-no-data",
+            Invariant::RelayAllowSetOnly => "relay-allow-set-only",
+            Invariant::RelayOneAnswer => "relay-one-answer",
+            Invariant::RelayRemovalCloses => "relay-removal-closes",
+            Invariant::RelayPreacceptBudget => "relay-preaccept-budget",
+            Invariant::RelayRegisterAuthorized => "relay-register-authorized",
         }
     }
 }
