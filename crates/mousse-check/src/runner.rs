@@ -403,12 +403,19 @@ pub struct Vars<'a> {
     pub root: &'a Path,
     pub out: &'a Path,
     pub build: &'a str,
+    /// The named case this run is for (`{case}`), if the check has cases.
+    pub case: Option<&'a str>,
 }
 
 fn subst(text: &str, vars: &Vars<'_>) -> String {
-    text.replace("{root}", &vars.root.display().to_string())
+    let text = text
+        .replace("{root}", &vars.root.display().to_string())
         .replace("{out}", &vars.out.display().to_string())
-        .replace("{build}", vars.build)
+        .replace("{build}", vars.build);
+    match vars.case {
+        Some(case) => text.replace("{case}", case),
+        None => text,
+    }
 }
 
 /// The command line for a normal run or one control.
@@ -446,6 +453,9 @@ pub fn execute(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env("MOUSSE_BUILD_ID", vars.build);
+    if let Some(case) = vars.case {
+        command.env("MOUSSE_CHECK_CASE", case);
+    }
     for (k, v) in env {
         command.env(k, subst(v, vars));
     }
@@ -530,6 +540,9 @@ pub struct RunRecord {
     pub target: String,
     /// `normal` or the control's name.
     pub part: String,
+    /// The named case the run was for, if the check has cases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub case: Option<String>,
     pub build: String,
     pub time: String,
     pub verdict: RunVerdict,
@@ -549,6 +562,9 @@ pub struct RunRecord {
     /// The `reason=` word on a control's FAIL line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// For an app check: the `app_build=` line the run printed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_build: Option<String>,
 }
 
 /// Names one `[[check.local]]` entry: `local:<target>@<host>:<digest>`,

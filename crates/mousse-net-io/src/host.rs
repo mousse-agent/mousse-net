@@ -19,6 +19,15 @@
 //! table without it again at once, and until such a save works it serves no
 //! grant at all (every connection closes with `INTERNAL_ERROR`).
 //!
+//! Pre-auth admission (Phase 1b §6.2): a listener takes a place in its
+//! kind's pool at accept ([`Host::admit`]) and hands it to
+//! [`Host::accept_admitted`]; the host holds it until the connection is
+//! live or closed, through join-only until the invitation ends. A granted
+//! device's re-pair proof on a live connection takes a new place. The
+//! admission fence ([`Host::set_fence`]) is checked under the lock at gate
+//! registration, at enrollment and at a re-pair; setting it closes every
+//! connection that is not live.
+//!
 //! A pairing message and the owner's approval act only if the connection's
 //! gate still admits them under the same lock as the pairing step, so a
 //! removal or denial that closed the connection in between wins. Deadlines
@@ -26,13 +35,16 @@
 //! after the join-proof wait is refused even before the ticker runs.
 
 use std::collections::{HashMap, VecDeque};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use mousse_net_core::authz::{ConnectionGate, GateState, Traffic, Verdict};
 use mousse_net_core::control::{AuthorizedState, ControlMessage};
-use mousse_net_core::grants::{Denial, Grant, GrantEvent, GrantId, GrantTable, OwnerRef, Role};
+use mousse_net_core::grants::{
+    validate_name, Denial, Grant, GrantEvent, GrantId, GrantTable, NewGrant, OwnerRef, Role,
+};
 use mousse_net_core::identity::IdentityPublicKey;
 use mousse_net_core::mux::MuxRole;
 use mousse_net_core::pairing::{
@@ -43,6 +55,7 @@ use mousse_net_core::pairing::{
 use mousse_net_core::{ConnectionId, ErrorCode, Millis, UnixTime};
 use tokio::sync::mpsc;
 
+use crate::admission::StreamAdmission;
 use crate::certs::CertManager;
 use crate::clock::Clock;
 use crate::conn::{self, CloseReason, Cmd, ConnStatus, Connection, Outbox, Role as ConnRole};
@@ -50,6 +63,7 @@ use crate::endpoint::Endpoint;
 use crate::error::NetError;
 use crate::limits::{ms, Limits};
 use crate::pipe::Pipe;
+use crate::preauth::{ListenerKind, PreAuth, PreAuthFull, PreAuthSlot, PreAuthStats};
 use crate::rng::os_rng;
 use crate::store::{EnrollmentSaveError, GrantStore, PendingEnrollment};
 use crate::tls::{self, TlsPolicy};
@@ -73,6 +87,9 @@ pub struct HostConfig {
     /// identity TLS presents. Only the `allow-break-env` control build (tests
     /// only) may set it; [`Host::new`] refuses it otherwise.
     pub ticket_identity: Option<IdentityPublicKey>,
+    /// The endpoint's stream places, when a caller of the same endpoint
+    /// shares them. `None` gives the host its own, from `limits`.
+    pub streams: Option<Arc<StreamAdmission>>,
 }
 
 impl HostConfig {
@@ -90,6 +107,7 @@ impl HostConfig {
             limits: Limits::DEFAULT,
             clock,
             ticket_identity: None,
+            streams: None,
         })
     }
 }
@@ -148,6 +166,24 @@ pub enum HostEvent {
     StoreFailed(String),
 }
 
+/// Why [`Host::admit`] gave no place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// The admission fence is set.
+    Fenced,
+    /// The pool or the source's share is full.
+    Full(PreAuthFull),
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fenced => f.write_str("networking is paused"),
+            Self::Full(full) => full.fmt(f),
+        }
+    }
+}
+
 struct Inner<F: CodeExchangeFactory> {
     grants: GrantTable,
     pairing: HostPairing<F>,
@@ -160,6 +196,13 @@ struct Inner<F: CodeExchangeFactory> {
     /// (see [`EnrollmentSaveError::Unsettled`]). No grant is served until a
     /// save works.
     reconcile: bool,
+    /// The admission fence ([`Host::set_fence`]): nothing new is admitted,
+    /// enrolled or re-paired until it is cleared.
+    paused: bool,
+    /// Pre-auth places held by connections that are not live yet.
+    slots: HashMap<ConnectionId, PreAuthSlot>,
+    /// The listener kind of every registered connection.
+    kinds: HashMap<ConnectionId, ListenerKind>,
     events: mpsc::UnboundedSender<HostEvent>,
 }
 
@@ -171,6 +214,8 @@ struct Shared<F: CodeExchangeFactory> {
     limits: Limits,
     owner: OwnerRef,
     next_conn: AtomicU64,
+    streams: Arc<StreamAdmission>,
+    preauth: Arc<PreAuth>,
     /// Tests stop the ticker to show what holds without it.
     #[cfg(test)]
     ticker_paused: std::sync::atomic::AtomicBool,
@@ -241,6 +286,16 @@ where
     /// to be saved away.
     fn serving(&self) -> bool {
         !self.reconcile
+    }
+
+    /// Whether the admission fence stops connections of `kind`.
+    fn fenced(&self, kind: ListenerKind) -> bool {
+        // Control (tests only): the fence covers TCP alone.
+        self.paused && !(cfg!(mousse_control = "fence-tcp-only") && kind != ListenerKind::Tcp)
+    }
+
+    fn kind_of(&self, conn: ConnectionId) -> ListenerKind {
+        self.kinds.get(&conn).copied().unwrap_or(ListenerKind::Tcp)
     }
 
     /// Remove the grants past their expiry, close their connections and
@@ -410,16 +465,62 @@ where
             .collect()
     }
 
+    fn set_fence(&mut self, on: bool) {
+        self.paused = on;
+        if !on {
+            return;
+        }
+        let waiting: Vec<ConnectionId> = self
+            .gates
+            .iter()
+            .filter(|(_, gate)| match gate.state() {
+                GateState::Live { .. } | GateState::Closed(_) => false,
+                // Control (tests only): join-only connections stay, so
+                // only the check at enrollment could stop them.
+                GateState::JoinOnly { .. } => !cfg!(mousse_control = "enroll-while-paused"),
+                _ => true,
+            })
+            .map(|(conn, _)| *conn)
+            .collect();
+        for conn in waiting {
+            self.close_conn(conn, ErrorCode::InternalError);
+        }
+    }
+
     fn apply(&mut self, actions: Vec<HostAction>) {
         let mut queue: VecDeque<HostAction> = actions.into();
         let mut persist = false;
         while let Some(action) = queue.pop_front() {
             match action {
                 HostAction::Send { conn, message } => self.send(conn, Cmd::Control(message)),
-                HostAction::Close { conn, code } => self.close_conn(conn, code),
+                HostAction::Close { conn, code } => {
+                    // Control (tests only): a join-only connection stays
+                    // when its invitation ends.
+                    let ended = matches!(
+                        code,
+                        ErrorCode::Cancelled
+                            | ErrorCode::PairingDeclined
+                            | ErrorCode::InvitationInvalid
+                            | ErrorCode::AttemptsExhausted
+                    );
+                    let join_only = matches!(
+                        self.gates.get(&conn).map(|g| g.state()),
+                        Some(GateState::JoinOnly { .. })
+                    );
+                    if !(cfg!(mousse_control = "join-only-outlives-invitation")
+                        && ended
+                        && join_only)
+                    {
+                        self.close_conn(conn, code);
+                    }
+                }
                 HostAction::AdmittedJoinOnly { conn, invitation } => {
                     if let Some(gate) = self.gates.get_mut(&conn) {
                         gate.admit_join_only(invitation);
+                    }
+                    if cfg!(mousse_control = "join-only-frees-slot") {
+                        // Control (tests only): the place goes at join-only.
+                        self.slots.remove(&conn);
                     }
                     self.send(conn, Cmd::Status(ConnStatus::JoinOnly));
                 }
@@ -451,6 +552,8 @@ where
                     if let Some(gate) = self.gates.get_mut(&conn) {
                         gate.promote(grant);
                     }
+                    // Live: its pre-auth place is free again.
+                    self.slots.remove(&conn);
                     self.send(conn, Cmd::Status(ConnStatus::Live));
                     let _ = self.events.send(HostEvent::Enrolled {
                         invitation,
@@ -517,11 +620,18 @@ where
                 store,
                 unsaved: false,
                 reconcile: false,
+                paused: false,
+                slots: HashMap::new(),
+                kinds: HashMap::new(),
                 events,
             }),
             certs: CertManager::with_limits(signer, config.clock.clone(), &config.limits),
             clock: config.clock,
             policy: TlsPolicy::from_limits(&config.limits),
+            streams: config
+                .streams
+                .unwrap_or_else(|| StreamAdmission::new(&config.limits)),
+            preauth: PreAuth::new(config.limits.io()),
             limits: config.limits,
             owner: config.owner,
             next_conn: AtomicU64::new(1),
@@ -539,9 +649,55 @@ where
         self.shared.certs.identity()
     }
 
+    /// A pre-auth place for a connection a listener of `kind` just
+    /// accepted, before anything is read from it; `source` is the peer's
+    /// address on TCP. Refused while the admission fence is set or the
+    /// pool (or the source's share) is full.
+    pub fn admit(
+        &self,
+        kind: ListenerKind,
+        source: Option<IpAddr>,
+    ) -> Result<PreAuthSlot, Refusal> {
+        if lock(&self.shared).fenced(kind) {
+            return Err(Refusal::Fenced);
+        }
+        self.shared
+            .preauth
+            .try_take(kind, source)
+            .map_err(Refusal::Full)
+    }
+
+    /// Pre-auth places held and refused, per listener kind.
+    pub fn preauth_stats(&self) -> PreAuthStats {
+        self.shared.preauth.stats()
+    }
+
     /// Run step 1 and step 2 on a new pipe and start its driver. A peer
-    /// without a grant gets a connection that waits for a join proof.
+    /// without a grant gets a connection that waits for a join proof. The
+    /// connection counts as TCP and holds no pre-auth place; listeners use
+    /// [`Host::accept_admitted`].
     pub async fn accept<P: Pipe>(&self, pipe: P) -> Result<Connection, NetError> {
+        self.register(pipe, ListenerKind::Tcp, None).await
+    }
+
+    /// [`Host::accept`] for a connection that holds `slot`, taken by
+    /// [`Host::admit`]. The place is held until the connection is live or
+    /// closed.
+    pub async fn accept_admitted<P: Pipe>(
+        &self,
+        pipe: P,
+        slot: PreAuthSlot,
+    ) -> Result<Connection, NetError> {
+        let kind = slot.kind();
+        self.register(pipe, kind, Some(slot)).await
+    }
+
+    async fn register<P: Pipe>(
+        &self,
+        pipe: P,
+        kind: ListenerKind,
+        slot: Option<PreAuthSlot>,
+    ) -> Result<Connection, NetError> {
         let own = self.shared.certs.current()?;
         let (stream, handshake) =
             tls::accept(pipe, &own, self.shared.clock.clone(), self.shared.policy).await?;
@@ -559,9 +715,22 @@ where
                 self.shared.clock.mono(),
                 self.shared.limits.core(),
             );
-            if !inner.serving() {
+            // The fence at gate registration: a handshake that finished
+            // after the fence was set is closed here, whenever its
+            // listener let it in. Control (tests only): the listener's
+            // check at accept is the only one.
+            let fenced = inner.fenced(kind) && !cfg!(mousse_control = "fence-at-accept-only");
+            if !inner.serving() || fenced {
                 gate.close(ErrorCode::InternalError);
             }
+            // A live connection's place is free at once; any other holds
+            // it until it is live or closed.
+            if let Some(slot) = slot {
+                if !matches!(gate.state(), GateState::Live { .. }) {
+                    inner.slots.insert(conn, slot);
+                }
+            }
+            inner.kinds.insert(conn, kind);
             inner.gates.insert(conn, gate);
             inner.conns.insert(conn, cmd_tx.clone());
         }
@@ -587,6 +756,7 @@ where
                 deadline,
                 clock: self.shared.clock.clone(),
                 limits: self.shared.limits,
+                streams: self.shared.streams.clone(),
             },
             Box::new(role),
             cmd_tx,
@@ -630,7 +800,10 @@ where
             inner.gates.get(&request.conn).map(|g| g.state()),
             Some(GateState::JoinOnly { invitation }) if *invitation == request.invitation
         );
-        if !waiting || !inner.serving() {
+        // The fence at enrollment. Control (tests only): not checked.
+        let fenced = inner.fenced(inner.kind_of(request.conn))
+            && !cfg!(mousse_control = "enroll-while-paused");
+        if !waiting || !inner.serving() || fenced {
             return Err(NetError::Refused(
                 "the device's connection is no longer waiting for an answer".into(),
             ));
@@ -662,6 +835,21 @@ where
         let mut inner = lock(&self.shared);
         let actions = inner.pairing.cancel(invitation);
         inner.apply(actions);
+    }
+
+    /// This host's stream places (shared with a caller of the same
+    /// endpoint when [`HostConfig::streams`] named one).
+    pub fn stream_admission(&self) -> Arc<StreamAdmission> {
+        self.shared.streams.clone()
+    }
+
+    /// The grant `conn` is live under, if it is live.
+    pub fn grant_of(&self, conn: ConnectionId) -> Option<Grant> {
+        let inner = lock(&self.shared);
+        match inner.gates.get(&conn).map(|g| g.state()) {
+            Some(GateState::Live { grant }) => inner.grants.get(*grant).cloned(),
+            _ => None,
+        }
     }
 
     /// All grants.
@@ -725,9 +913,100 @@ where
         Ok(lifted)
     }
 
+    /// Grant `identity` the owner role on this endpoint, named `name`, as
+    /// the joiner's half of pairing both ways (Phase 1a §5.1). `receipt` is
+    /// the invitation of the pairing this answers, kept as the grant's
+    /// enrollment receipt.
+    ///
+    /// Idempotent: if the identity already holds a live grant, that grant
+    /// is returned with `true` and nothing changes (its connections stay
+    /// up), apart from saving a table whose last save failed. An error
+    /// after the grant was added means it is in effect now but was not
+    /// saved: the host keeps retrying, and the caller may repeat the call.
+    pub fn add_grant(
+        &self,
+        identity: IdentityPublicKey,
+        name: String,
+        receipt: Option<InvitationId>,
+    ) -> Result<(Grant, bool), NetError> {
+        let now = self.shared.clock.now();
+        let mut inner = lock(&self.shared);
+        if let Some(grant) = inner.grants.live_grant(&identity, now).cloned() {
+            if inner.unsaved {
+                inner.persist()?;
+            }
+            return Ok((grant, true));
+        }
+        let new = NewGrant {
+            identity,
+            name,
+            role: Role::owner(),
+            authorizing_owner: self.shared.owner,
+            expires_at: None,
+            enrolled_by: receipt,
+        };
+        let (id, events) = inner
+            .grants
+            .add(new, now)
+            .map_err(|e| NetError::Refused(e.to_string()))?;
+        inner.apply_grant_events(events);
+        let grant = inner
+            .grants
+            .get(id)
+            .cloned()
+            .ok_or_else(|| NetError::Refused("the new grant is missing".into()))?;
+        inner.persist()?;
+        Ok((grant, false))
+    }
+
+    /// Save the grant table now. A failure is reported as
+    /// [`HostEvent::StoreFailed`] too.
+    pub fn save(&self) -> Result<(), NetError> {
+        lock(&self.shared).persist()
+    }
+
+    /// The name `PAIRED` sends from now on (1 to 128 bytes).
+    pub fn set_name(&self, name: &str) -> Result<(), NetError> {
+        validate_name(name).map_err(|e| NetError::Refused(e.to_string()))?;
+        lock(&self.shared).pairing.set_host_name(name.to_owned());
+        Ok(())
+    }
+
     /// Whether the grant table has changes that are not saved yet.
     pub fn has_unsaved_changes(&self) -> bool {
         lock(&self.shared).unsaved
+    }
+
+    /// Set or clear the admission fence. While it is set, listeners get no
+    /// place ([`Host::admit`]), a connection registering after its
+    /// handshake is closed, no grant is enrolled and no live connection
+    /// re-pairs. Setting it closes every registered connection that is not
+    /// live, join-only ones included, under the lock connections register
+    /// under, so none slips between. Live connections stay.
+    pub fn set_fence(&self, on: bool) {
+        let mut inner = lock(&self.shared);
+        inner.set_fence(on);
+    }
+
+    /// Whether the admission fence is set.
+    pub fn fence_set(&self) -> bool {
+        lock(&self.shared).paused
+    }
+
+    /// Stop serving: set the admission fence and close every connection
+    /// with `code`, under one lock.
+    pub fn pause(&self, code: ErrorCode) {
+        let mut inner = lock(&self.shared);
+        inner.set_fence(true);
+        let conns: Vec<ConnectionId> = inner.conns.keys().copied().collect();
+        for conn in conns {
+            inner.close_conn(conn, code);
+        }
+    }
+
+    /// Serve again after [`Host::pause`]: clear the fence.
+    pub fn resume(&self) {
+        self.set_fence(false);
     }
 
     /// Close every connection with `code`.
@@ -886,6 +1165,50 @@ where
         if !admitted || !inner.serving() {
             return;
         }
+        let kind = inner.kind_of(self.conn);
+        let from_live = matches!(
+            inner.gates.get(&self.conn).map(|g| g.state()),
+            Some(GateState::Live { .. })
+        );
+        let mut repair_slot = None;
+        match &message {
+            // A re-pair from live (§6.2): the fence, then a new place from
+            // the kind's pool. Without either the proof opens nothing and
+            // the connection stays live under its grant.
+            ControlMessage::JoinProof { .. } if from_live => {
+                let fenced = inner.fenced(kind) && !cfg!(mousse_control = "repair-skips-fence");
+                let slot = if fenced {
+                    None
+                } else if cfg!(mousse_control = "repair-skips-slot") {
+                    Some(None)
+                } else {
+                    self.shared.preauth.try_take_again(kind).ok().map(Some)
+                };
+                match slot {
+                    Some(slot) => repair_slot = slot,
+                    None => {
+                        inner.send(
+                            self.conn,
+                            Cmd::Control(ControlMessage::Authorized {
+                                state: AuthorizedState::Live,
+                            }),
+                        );
+                        return;
+                    }
+                }
+            }
+            // A connection still waiting for its proof was closed when the
+            // fence was set; this covers one that was not.
+            ControlMessage::JoinProof { .. } if inner.fenced(kind) => return,
+            // A finished code exchange enrolls: the fence at enrollment.
+            // Control (tests only): not checked.
+            ControlMessage::CodeExchange { .. }
+                if inner.fenced(kind) && !cfg!(mousse_control = "enroll-while-paused") =>
+            {
+                return
+            }
+            _ => {}
+        }
         let before = inner.grants.clone();
         let actions = match message {
             ControlMessage::JoinProof {
@@ -918,6 +1241,14 @@ where
             _ => Vec::new(),
         };
         let actions = inner.commit_enrollment(before, actions);
+        if let Some(slot) = repair_slot {
+            let admitted = actions.iter().any(
+                |a| matches!(a, HostAction::AdmittedJoinOnly { conn, .. } if *conn == self.conn),
+            );
+            if admitted {
+                inner.slots.insert(self.conn, slot);
+            }
+        }
         inner.apply(actions);
     }
 
@@ -955,6 +1286,8 @@ where
         let mut inner = lock(&shared);
         inner.gates.remove(&self.conn);
         inner.conns.remove(&self.conn);
+        inner.slots.remove(&self.conn);
+        inner.kinds.remove(&self.conn);
         inner.grants.unbind(self.conn);
         let actions = inner.pairing.on_connection_closed(self.conn);
         inner.apply(actions);
@@ -998,6 +1331,7 @@ mod tests {
             limits: Limits::DEFAULT,
             clock: clock.clone(),
             ticket_identity: None,
+            streams: None,
         };
         let key = Arc::new(SoftwareKey::generate(&mut os_rng()));
         let (host, _events) = Host::new(key, config, CpaceExchangeFactory).unwrap();
@@ -1134,6 +1468,7 @@ mod tests {
             limits: Limits::DEFAULT,
             clock: Arc::new(ManualClock::new()),
             ticket_identity: None,
+            streams: None,
         };
         let key = Arc::new(SoftwareKey::generate(&mut os_rng()));
         Host::new(key, config, CpaceExchangeFactory).unwrap()

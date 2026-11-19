@@ -15,12 +15,13 @@ use mousse_net_core::grants::GrantId;
 use mousse_net_core::identity::{IdentityPublicKey, SoftwareKey};
 use mousse_net_core::pairing::{CpaceExchangeFactory, InvitationId, InvitationKind};
 use mousse_net_core::ErrorCode;
-use mousse_net_io::discovery::Advertiser;
+use mousse_net_io::discovery::{Advertiser, CachedBrowse};
 use mousse_net_io::pipe::{accept_tcp, route_from_addr, route_uri};
 use mousse_net_io::rng::{os_rng, random_bytes};
 use mousse_net_io::store::{hex, short_id};
 use mousse_net_io::{
-    ApprovalRequest, Clock, Host, HostConfig, HostEvent, PortChoice, SharedSigner, SystemClock,
+    ApprovalRequest, Caller, Host, HostConfig, HostEvent, ListenerKind, PortChoice, PreAuthSlot,
+    SharedSigner,
 };
 use serde_json::{json, Value};
 use tokio::net::TcpStream;
@@ -35,6 +36,8 @@ pub struct ServeOptions {
     pub listen_ip: IpAddr,
     pub port: Option<u16>,
     pub mdns: bool,
+    /// `--app`: the app channel on stdin and stdout.
+    pub app: bool,
 }
 
 /// A deliberate defect for the cross-machine must-fail control, read from
@@ -86,10 +89,29 @@ pub fn route_hints(ip: IpAddr, port: u16) -> Vec<String> {
 }
 
 fn print_line(line: impl AsRef<str>) {
-    use std::io::Write;
-    let mut out = std::io::stdout();
-    let _ = writeln!(out, "{}", line.as_ref());
-    let _ = out.flush();
+    crate::applog::line(line);
+}
+
+/// Run step 1 and step 2 on an inbound pipe that holds `slot`; the host
+/// keeps the place until the connection is live or closed. `None` if it
+/// was refused.
+async fn accept_holding(
+    host: &Host,
+    pipe: TcpStream,
+    addr: SocketAddr,
+    slot: PreAuthSlot,
+) -> Option<mousse_net_io::Connection> {
+    let conn = match host.accept_admitted(pipe, slot).await {
+        Ok(conn) => conn,
+        Err(e) => {
+            print_line(format!("refused {addr}: {e}"));
+            return None;
+        }
+    };
+    // Bounded: the handshake by HANDSHAKE_TIMEOUT_MS, step 2 by
+    // JOIN_PROOF_WAIT_MS and the invitation's own limits.
+    let _ = conn.settled(true).await;
+    Some(conn)
 }
 
 /// Run until stopped (Ctrl-C or the `stop` control request).
@@ -99,11 +121,15 @@ pub async fn run(
     opts: ServeOptions,
 ) -> Result<(), String> {
     let mut endpoint = crate::open_endpoint(state_dir, false)?;
+    if opts.app {
+        // stdout carries only app-channel frames from here on.
+        crate::applog::to_file(state_dir)?;
+    }
     let key = endpoint
         .load_identity(insecure_file_key)
         .map_err(|e| e.to_string())?;
     let real_identity = endpoint.identity();
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+    let (clock, manual_clock) = crate::app::clock();
     let mut config = HostConfig::for_endpoint(&endpoint, opts.name.clone(), clock.clone())
         .map_err(|e| e.to_string())?;
     config.limits = crate::limits::get().net;
@@ -118,7 +144,11 @@ pub async fn run(
         _ => Arc::new(key),
     };
     let (host, mut events) =
-        Host::new(signer, config, CpaceExchangeFactory).map_err(|e| e.to_string())?;
+        Host::new(signer.clone(), config, CpaceExchangeFactory).map_err(|e| e.to_string())?;
+    // Removals that were decided but maybe not saved are applied before
+    // anything is accepted (Phase 1a §5.4). If that fails, networking
+    // starts paused.
+    let removal = crate::revoke::Removal::start(host.clone(), &endpoint.grants_dir());
     let choice = match opts.port {
         None => PortChoice::Kept,
         Some(0) => PortChoice::Auto,
@@ -139,9 +169,16 @@ pub async fn run(
         None
     };
 
-    let mut control = ControlListener::bind(state_dir).await?;
+    // The app channel replaces the control listener in app mode.
+    let mut control = if opts.app {
+        None
+    } else {
+        Some(ControlListener::bind(state_dir).await?)
+    };
     let token = hex(&random_bytes::<32>());
-    ipc::write_control_file(state_dir, control.addr(), &token)?;
+    if let Some(control) = &control {
+        ipc::write_control_file(state_dir, control.addr(), &token)?;
+    }
 
     let state = Arc::new(State {
         host: host.clone(),
@@ -164,24 +201,108 @@ pub async fn run(
         }
     ));
 
+    // Interface changes and wakes: announce the mDNS record again, and in
+    // app mode check every connection and redial (Phase 1a §8).
+    let mut net_changes = mousse_net_io::watch::watch(
+        clock.clone(),
+        crate::app::interface_source(),
+        crate::limits::get().net.io(),
+    );
+
+    let app = if opts.app {
+        // Outbound connections for the app: the same key, flow records and
+        // stream places as the host.
+        let mut caller = Caller::new(signer.clone(), clock.clone(), crate::limits::get().net);
+        caller.use_flow_records(Arc::new(endpoint.flow_records()));
+        caller.use_stream_admission(host.stream_admission());
+        let info = crate::app::AppInfo {
+            identity: real_identity,
+            name: opts.name.clone(),
+            profile: endpoint.profile_id().to_owned(),
+            port,
+            routes: routes.clone(),
+            state_dir: endpoint.dir().to_path_buf(),
+            // mDNS only where the helper advertises too (never on
+            // loopback); debug builds may read a browse file instead.
+            browse: crate::app::browse_source(opts.mdns && !opts.listen_ip.is_loopback()).map(
+                |source| {
+                    Arc::new(CachedBrowse::new(
+                        source,
+                        clock.clone(),
+                        crate::limits::get().net.io(),
+                    ))
+                },
+            ),
+            manual_clock,
+        };
+        Some(crate::app::App::start(
+            host.clone(),
+            Arc::new(caller),
+            removal.clone(),
+            info,
+        ))
+    } else {
+        None
+    };
+    let app_end = async {
+        match &app {
+            Some(app) => app.ended().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(app_end);
+    let mut ended = None;
+
     loop {
         tokio::select! {
             accepted = accept_tcp(&listener) => match accepted {
-                Ok((pipe, addr)) => {
-                    tokio::spawn(handle_connection(host.clone(), pipe, addr));
-                }
+                // A place in the TCP pool before anything is read; none
+                // while paused (the removal is not saved yet).
+                Ok((pipe, addr)) => match host.admit(ListenerKind::Tcp, Some(addr.ip())) {
+                    Err(why) => {
+                        print_line(format!("dropped {addr}: {why}"));
+                        drop(pipe);
+                    }
+                    Ok(slot) => match &app {
+                        Some(app) => {
+                            tokio::spawn(app_connection(host.clone(), app.clone(), pipe, addr, slot));
+                        }
+                        None => {
+                            tokio::spawn(handle_connection(host.clone(), pipe, addr, slot));
+                        }
+                    },
+                },
                 Err(e) => print_line(format!("accept failed: {e}")),
             },
-            ctl = control.accept() => match ctl {
+            end = &mut app_end => {
+                print_line(format!("app channel ended: {end:?}"));
+                ended = Some(end);
+                break;
+            }
+            ctl = accept_control(&mut control) => match ctl {
                 Ok(ch) => {
                     tokio::spawn(control_session(state.clone(), ch));
                 }
                 Err(e) => print_line(format!("control channel: {e}")),
             },
-            Some(event) = events.recv() => on_event(&state, event),
+            Some(change) = net_changes.recv() => {
+                if let Some(advertiser) = &advertiser {
+                    advertiser.refresh();
+                }
+                if let Some(app) = &app {
+                    app.net_change(change);
+                }
+            }
+            Some(event) = events.recv() => match &app {
+                Some(app) => app.host_event(event),
+                None => on_event(&state, event),
+            },
             () = state.stop.notified() => break,
             _ = tokio::signal::ctrl_c() => break,
         }
+    }
+    if let Some(app) = &app {
+        app.close_all();
     }
     host.close_all(ErrorCode::NoError);
     tokio::time::sleep(crate::limits::ms(crate::limits::helper().stop_linger_ms())).await;
@@ -191,16 +312,36 @@ pub async fn run(
     }
     drop(endpoint);
     print_line("stopped");
-    Ok(())
+    match ended.and_then(|end| end.error()) {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
-async fn handle_connection(host: Host, pipe: TcpStream, addr: SocketAddr) {
-    let conn = match host.accept(pipe).await {
-        Ok(conn) => conn,
-        Err(e) => {
-            print_line(format!("refused {addr}: {e}"));
-            return;
-        }
+/// The next control connection; never, in app mode.
+async fn accept_control(control: &mut Option<ControlListener>) -> Result<Channel, String> {
+    match control {
+        Some(control) => control.accept().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// App mode: an inbound connection goes to the app once it is live.
+async fn app_connection(
+    host: Host,
+    app: crate::app::App,
+    pipe: TcpStream,
+    addr: SocketAddr,
+    slot: PreAuthSlot,
+) {
+    if let Some(conn) = accept_holding(&host, pipe, addr, slot).await {
+        app.inbound(conn).await;
+    }
+}
+
+async fn handle_connection(host: Host, pipe: TcpStream, addr: SocketAddr, slot: PreAuthSlot) {
+    let Some(conn) = accept_holding(&host, pipe, addr, slot).await else {
+        return;
     };
     let peer = short_id(conn.peer());
     print_line(format!("connected {peer} from {addr}"));
@@ -227,7 +368,7 @@ pub const INFO_LABEL: &str = "helper-info";
 /// halves then end cleanly and the stream does not stay half open. A
 /// requester that sends data or does not finish in time gets the stream
 /// reset instead.
-async fn send_info(stream: mousse_net_io::MuxStream) {
+pub(crate) async fn send_info(stream: mousse_net_io::MuxStream) {
     let (mut reader, writer) = stream.split();
     // `INFO_REQUEST_WAIT_MS` to finish the (empty) request.
     let wait = crate::limits::ms(crate::limits::helper().info_request_wait_ms());
@@ -340,7 +481,7 @@ fn grants_json(host: &Host) -> Value {
 }
 
 async fn control_session(state: Arc<State>, mut ch: Channel) {
-    let Ok(Some(request)) = ch.recv().await else {
+    let Ok(Some(request)) = ch.recv_first().await else {
         return;
     };
     let token = request.get("token").and_then(Value::as_str).unwrap_or("");

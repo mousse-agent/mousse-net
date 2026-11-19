@@ -85,6 +85,12 @@ pub struct Check {
     /// build under test.
     #[serde(default)]
     pub cross_machine: bool,
+    /// The check runs the Mousse app (`MOUSSE_APP_DIR`) at the revision
+    /// pinned in `app/MOUSSE_REVISION`. Runs need a clean app checkout at
+    /// that revision, and evidence counts only if it names that app build
+    /// (`app_build`; for a cross-machine cell also `host_app_build`).
+    #[serde(default)]
+    pub app: bool,
     /// Not wired yet: every cell is INCOMPLETE with this reason, and
     /// `mousse-check <phase>` does not run it. `run` still does.
     #[serde(default)]
@@ -104,6 +110,30 @@ pub struct Check {
     /// Crypto matrix settings (judge `matrix` and matrix device results).
     #[serde(default)]
     pub matrix: Option<MatrixSpec>,
+    /// Named cases, such as the routes `tcp`, `ws` and `ssh`. Each case is
+    /// its own run and its own result; every case must pass, and every
+    /// control must fail in every case. Local commands name the case with
+    /// `{case}`.
+    #[serde(default)]
+    pub cases: Vec<String>,
+    /// Engine slices this check, or one of its cases, waits for. Until the
+    /// named paths are in the tree the check (or the case) is INCOMPLETE and
+    /// is not run. A wait never makes anything pass.
+    #[serde(default)]
+    pub waits: Vec<Wait>,
+}
+
+/// A slice a check or case waits for: it has landed when every path exists.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Wait {
+    /// The slice, as the design names it: `E8`.
+    pub slice: String,
+    /// Paths relative to the repository root that the slice adds.
+    pub paths: Vec<String>,
+    /// Only this case waits; without it, the whole check does.
+    #[serde(default)]
+    pub case: Option<String>,
 }
 
 fn one() -> u64 {
@@ -225,13 +255,33 @@ impl Check {
         self.control.iter().find(|k| k.name == name)
     }
 
-    /// Cases a device must report for `target`: the matrix pairs, or one
-    /// unnamed case.
+    /// Cases a device must report for `target`: the matrix pairs, the
+    /// named cases, or one unnamed case.
     pub fn cases(&self, target: &str) -> Vec<Option<String>> {
         match &self.matrix {
             Some(m) => m.cases(target).into_iter().map(Some).collect(),
+            None if !self.cases.is_empty() => self.cases.iter().cloned().map(Some).collect(),
             None => vec![None],
         }
+    }
+
+    /// Whether each control must fail once per case (named cases), rather
+    /// than once for the cell.
+    pub fn controls_per_case(&self) -> bool {
+        !self.cases.is_empty()
+    }
+
+    /// The first unmet wait for `case` (`None`: the check as a whole), given
+    /// which repository paths exist. A check-level wait holds every case.
+    pub fn waiting<'a>(
+        &'a self,
+        case: Option<&str>,
+        exists: &dyn Fn(&str) -> bool,
+    ) -> Option<(&'a Wait, &'a str)> {
+        self.waits
+            .iter()
+            .filter(|w| w.case.is_none() || (case.is_some() && w.case.as_deref() == case))
+            .find_map(|w| w.paths.iter().find(|p| !exists(p)).map(|p| (w, p.as_str())))
     }
 }
 
@@ -258,11 +308,12 @@ impl Manifest {
     }
 
     /// Digest of everything that decides what one run of `c` on `target`
-    /// proves: the judge, test minimum, markers, profile, matrix cases, the
-    /// local commands for that target (command, working directory, env) and,
-    /// for a control, its command, args, env and expected reason. Local run
-    /// records and signed results carry it; evidence with another digest
-    /// was produced under another configuration and does not count.
+    /// proves: the judge, test minimum, markers, profile, matrix cases,
+    /// whether it is an app check, the local commands for that target
+    /// (command, working directory, env) and, for a control, its command,
+    /// args, env and expected reason. Local run records and signed results
+    /// carry it; evidence with another digest was produced under another
+    /// configuration and does not count.
     pub fn config_digest(&self, c: &Check, target: &str, control: Option<&Control>) -> String {
         let locals: Vec<serde_json::Value> = c
             .local
@@ -286,7 +337,7 @@ impl Manifest {
                 "expect_reason": k.expect_reason,
             })
         });
-        let config = serde_json::json!({
+        let mut config = serde_json::json!({
             "format": "mousse-check-config-v1",
             "check": c.id,
             "target": target,
@@ -300,6 +351,11 @@ impl Manifest {
             "local": locals,
             "control": control,
         });
+        // Added only when set, so the digests of checks without it (and
+        // the evidence that carries them) stay what they were.
+        if c.app {
+            config["app"] = serde_json::Value::Bool(true);
+        }
         let text = serde_json::to_string(&config).unwrap_or_default();
         crate::util::to_hex(&sha2::Sha256::digest(text.as_bytes()))
     }
@@ -336,6 +392,13 @@ impl Manifest {
                 if !targets.insert(t.as_str()) {
                     return Err(format!("{}: target {t} appears twice", c.id));
                 }
+            }
+            validate_cases(c)?;
+            if c.app && c.manual {
+                return Err(format!(
+                    "{}: a manual step cannot be an app check (app = true); attest it with both builds instead",
+                    c.id
+                ));
             }
             if c.manual {
                 if !c.local.is_empty() || !c.control.is_empty() {
@@ -442,6 +505,68 @@ impl Manifest {
         }
         Ok(())
     }
+}
+
+/// Named cases and waits: well-formed names, no matrix beside them, every
+/// local command names the case, and every wait names a known case.
+fn validate_cases(c: &Check) -> Result<(), String> {
+    let mut seen = BTreeSet::new();
+    for case in &c.cases {
+        if case.is_empty()
+            || case == "all"
+            || !case
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        {
+            return Err(format!("{}: bad case name {case:?}", c.id));
+        }
+        if !seen.insert(case.as_str()) {
+            return Err(format!("{}: case {case} appears twice", c.id));
+        }
+    }
+    if !c.cases.is_empty() {
+        if c.matrix.is_some() {
+            return Err(format!(
+                "{}: a check has a matrix or named cases, not both",
+                c.id
+            ));
+        }
+        if c.manual {
+            return Err(format!("{}: a manual check has no cases", c.id));
+        }
+        for l in &c.local {
+            let named = l.command.iter().any(|a| a.contains("{case}"))
+                || l.env.values().any(|v| v.contains("{case}"));
+            if !named {
+                return Err(format!(
+                    "{}: the local run for {} does not name the case; put {{case}} in its command",
+                    c.id, l.target
+                ));
+            }
+        }
+    }
+    for w in &c.waits {
+        if w.slice.trim().is_empty() || w.paths.is_empty() {
+            return Err(format!(
+                "{}: a wait names its slice and at least one path",
+                c.id
+            ));
+        }
+        for p in &w.paths {
+            if p.is_empty() || p.starts_with(['/', '\\']) || p.contains("..") || p.contains(':') {
+                return Err(format!(
+                    "{}: wait path {p:?} must be relative to the repository root",
+                    c.id
+                ));
+            }
+        }
+        if let Some(case) = &w.case {
+            if !c.cases.contains(case) {
+                return Err(format!("{}: wait for unknown case {case}", c.id));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The command one run executes: the local command, or the control's
@@ -581,6 +706,47 @@ command = ["cargo", "test"]
     }
 
     #[test]
+    fn the_app_flag_is_in_the_digest_only_when_set() {
+        let m = Manifest::parse(BASE).unwrap();
+        // Pinned: a check without `app` keeps the digest it had before the
+        // flag existed, so evidence signed for it still counts.
+        assert_eq!(
+            m.config_digest(&m.checks[0], "t1", None),
+            "ad5a265caebec10f42d717f02169ea82532f543893357ae687498ad476369ff1"
+        );
+        let app = BASE.replace(
+            "targets = [\"t1\"]
+",
+            "targets = [\"t1\"]
+app = true
+",
+        );
+        let a = Manifest::parse(&app).unwrap();
+        assert!(a.checks[0].app);
+        assert_ne!(
+            a.config_digest(&a.checks[0], "t1", None),
+            m.config_digest(&m.checks[0], "t1", None)
+        );
+        let manual = "phase = \"phase9\"
+title = \"t\"
+[[check]]
+id = \"phase9.m\"
+title = \"m\"
+plan = \"p\"
+targets = [\"t\"]
+manual = true
+steps = \"do it\"
+";
+        Manifest::parse(manual).unwrap();
+        let err = Manifest::parse(&format!(
+            "{manual}app = true
+"
+        ))
+        .unwrap_err();
+        assert!(err.contains("manual"), "{err}");
+    }
+
+    #[test]
     fn ids_targets_and_defer_entries_are_validated() {
         assert!(Manifest::parse(&BASE.replace("phase9.a", "other.a")).is_err());
         assert!(Manifest::parse(&BASE.replace("[\"t1\"]", "[\"t1\", \"t1\"]")).is_err());
@@ -592,6 +758,76 @@ command = ["cargo", "test"]
         };
         assert!(Manifest::parse(&with_defer("phase9.zzz")).is_err());
         Manifest::parse(&with_defer("phase9.a")).unwrap();
+    }
+
+    /// `BASE` with named cases and a local command that names the case.
+    fn with_cases(cases: &str, command: &str) -> String {
+        BASE.replace(
+            "targets = [\"t1\"]\n",
+            &format!("targets = [\"t1\"]\ncases = {cases}\n"),
+        )
+        .replace("command = [\"cargo\", \"test\"]", command)
+    }
+
+    const CASE_COMMAND: &str = r#"command = ["node", "run.mjs", "--route", "{case}"]"#;
+
+    #[test]
+    fn named_cases_are_checked_and_each_local_run_names_its_case() {
+        let ok = Manifest::parse(&with_cases(r#"["tcp", "ws"]"#, CASE_COMMAND)).unwrap();
+        assert_eq!(
+            ok.checks[0].cases("t1"),
+            vec![Some("tcp".to_string()), Some("ws".to_string())]
+        );
+        assert!(ok.checks[0].controls_per_case());
+        // A command that does not name the case would run the same thing
+        // for each case.
+        let err = Manifest::parse(&with_cases(
+            r#"["tcp"]"#,
+            r#"command = ["node", "run.mjs"]"#,
+        ))
+        .unwrap_err();
+        assert!(err.contains("{case}"), "{err}");
+        for bad in [r#"["tcp", "tcp"]"#, r#"["a b"]"#, r#"["all"]"#, r#"[""]"#] {
+            assert!(
+                Manifest::parse(&with_cases(bad, CASE_COMMAND)).is_err(),
+                "{bad}"
+            );
+        }
+        // The case list is part of the configuration.
+        let other = Manifest::parse(&with_cases(r#"["tcp"]"#, CASE_COMMAND)).unwrap();
+        assert_ne!(
+            ok.config_digest(&ok.checks[0], "t1", None),
+            other.config_digest(&other.checks[0], "t1", None)
+        );
+    }
+
+    #[test]
+    fn waits_name_a_slice_relative_paths_and_a_known_case() {
+        let plain = with_cases(r#"["tcp"]"#, CASE_COMMAND);
+        let with = |wait: &str| format!("{plain}[[check.waits]]\n{wait}\n");
+        let m = Manifest::parse(&with(
+            "slice = \"E8\"\npaths = [\"crates/a.rs\"]\ncase = \"tcp\"",
+        ))
+        .unwrap();
+        let c = &m.checks[0];
+        assert!(c.waiting(None, &|_| false).is_none());
+        assert_eq!(c.waiting(Some("tcp"), &|_| false).unwrap().1, "crates/a.rs");
+        assert!(c.waiting(Some("tcp"), &|_| true).is_none());
+        // Waits are not part of what a run proves.
+        let p = Manifest::parse(&plain).unwrap();
+        assert_eq!(
+            m.config_digest(c, "t1", None),
+            p.config_digest(&p.checks[0], "t1", None)
+        );
+        for bad in [
+            "slice = \"E8\"\npaths = [\"crates/a.rs\"]\ncase = \"ssh\"",
+            "slice = \"E8\"\npaths = []",
+            "slice = \"\"\npaths = [\"a\"]",
+            "slice = \"E8\"\npaths = [\"../a\"]",
+            "slice = \"E8\"\npaths = [\"/a\"]",
+        ] {
+            assert!(Manifest::parse(&with(bad)).is_err(), "{bad}");
+        }
     }
 
     #[test]

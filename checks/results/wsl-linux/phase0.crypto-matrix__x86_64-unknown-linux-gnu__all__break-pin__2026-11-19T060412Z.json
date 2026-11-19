@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "wsl-linux",
+  "key": "042f0974403d57624956aebbe7cd72f01b86773fdee66ffba37429d70a320ccb692f06069a9174535d971428932d86132cc89eef54954c5f9c5c6ed605fea234bb",
+  "payload": "{\"check\":\"phase0.crypto-matrix\",\"target\":\"x86_64-unknown-linux-gnu\",\"control\":\"break-pin\",\"build\":\"0e745a7398c0b2f6f0ab62909a343cf8145b5f01+release\",\"platform\":\"linux-x86_64\",\"outcome\":\"FAIL\",\"details\":\"printed \\\"FAIL phase0.crypto-matrix\\\"\",\"time\":\"2026-11-19T06:04:12Z\",\"device\":\"wsl-linux\",\"config\":\"7615467f2bf95dd7cffe2c4ca7d42878a81597affec85639ca3c9fa4831ea9dd\"}",
+  "signature": "5d414d1a582cb136112fe115fe6a2b0675adc9efc3142dc95073ac3654f4afef385dfe452ad5a418a80257fb0d4d1a4efa552c00eee7f2abd72ca5c4b1b22fd8"
+}

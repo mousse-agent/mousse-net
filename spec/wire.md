@@ -656,6 +656,12 @@ An unknown error code in `RESET` or `GOAWAY` is not a frame error; treat it as
   race).
 - A side may keep at most **1 024** streams opened by its peer. A further
   `OPEN` is answered with `RESET REFUSED_STREAM`; the connection stays up.
+- A side may keep fewer, counting its own streams too (the reference
+  implementation keeps 32 per connection and 128 per endpoint, to bound
+  the initial credit it has granted). It answers an `OPEN` past its own
+  limit the same way: `RESET REFUSED_STREAM`, connection up. A sender that
+  gets `REFUSED_STREAM` may open the stream again once one of its streams
+  on that connection has ended.
 
 ### 9.3 Flow control
 
@@ -781,11 +787,13 @@ A skipped hint is not an error: the joiner tries the next one.
 | Scheme | Form | Meaning |
 |---|---|---|
 | `tcp` | `tcp://<host>:<port>` | A direct TLS connection. |
+| `wss` | `wss://<host>[:<port>]<path>` | The same TLS connection, carried in WebSocket binary messages inside an outer TLS connection to a tunnel the host's owner runs. |
 | `mdns` | `mdns:<instance>` | Browse for this service instance on the local network. |
-| `ssh`, `ws`, `wss`, `relay` | reserved | Kept for later transports. Skipped as `reserved`. |
+| `ssh`, `ws`, `relay` | reserved | Kept for transports that never appear on the wire (`ssh`, plain `ws`) or later ones. Skipped as `reserved`. |
 | anything else, or no `:` | | Skipped as `unknown_scheme`. |
 
-A `tcp` or `mdns` hint that breaks its grammar is skipped as `malformed`:
+A `tcp`, `wss` or `mdns` hint that breaks its grammar is skipped as
+`malformed`:
 
 - `<port>`: decimal 1 to 65535, ASCII digits only, no sign, no leading zero.
   The port is the text after the last `:`.
@@ -800,7 +808,14 @@ A `tcp` or `mdns` hint that breaks its grammar is skipped as `malformed`:
     bytes; no trailing dot; the last label is not all digits. A reader
     lowercases the name (ASCII letters only) and uses and compares only the
     lowercased form.
-- Nothing else may appear: no user part, path, query or fragment.
+- Nothing else may appear in a `tcp` hint: no user part, path, query or
+  fragment.
+- `wss`: `<host>` as above, then an optional `:<port>` (443 when absent),
+  then `<path>`: 1 to 200 bytes of ASCII letters, digits and `.`, `_`, `~`,
+  `/`, `-`, starting with `/` and ending with `/mousse-net/1`. No user part,
+  query, fragment or percent-encoding. Vectors give the port explicitly.
+  The outer TLS connection verifies the tunnel's certificate for `<host>`;
+  the inner one is checked against the pin like any other route.
 - `<instance>`: 1 to 63 bytes of UTF-8 with no control characters (Unicode
   general category Cc).
 

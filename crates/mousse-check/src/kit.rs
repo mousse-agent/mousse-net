@@ -22,6 +22,13 @@ pub fn host() -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
 }
 
+/// Which cells a run is limited to: one target, one named case, or both.
+#[derive(Clone, Copy, Default)]
+pub struct Only<'a> {
+    pub target: Option<&'a str>,
+    pub case: Option<&'a str>,
+}
+
 /// Which parts of a check to run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Parts {
@@ -199,6 +206,9 @@ impl Kit {
         let records = self.records();
         let legacy = self.legacy_notes(m);
         let here = host();
+        let app_revision = crate::app::read_revision(self.root()).ok();
+        let root = self.root().to_path_buf();
+        let exists = move |p: &str| root.join(p).exists();
         Ok(evaluate(&Inputs {
             manifest: m,
             host: &here,
@@ -209,6 +219,8 @@ impl Kit {
             evidence: &ev,
             rejected_paths: &rejected,
             legacy: &legacy,
+            app_revision: app_revision.as_deref(),
+            exists: &exists,
         }))
     }
 
@@ -218,11 +230,15 @@ impl Kit {
         &self,
         m: &Manifest,
         c: &Check,
-        target: Option<&str>,
+        only: Only,
         parts: Parts,
         include_placeholders: bool,
         signer: Option<&Signer>,
     ) -> Result<bool, String> {
+        let Only {
+            target,
+            case: only_case,
+        } = only;
         let state = self.state()?;
         let here = host();
         let mut all_ok = true;
@@ -250,6 +266,24 @@ impl Kit {
                     c.id
                 );
             }
+            let exists = |p: &str| self.root().join(p).exists();
+            if let Some((w, path)) = c.waiting(None, &exists) {
+                eprintln!(
+                    "  {} @ {}: not run: waits for {} ({path} is not in this tree)",
+                    c.id, local.target, w.slice
+                );
+                if target.is_some() {
+                    all_ok = false;
+                }
+                continue;
+            }
+            if c.app {
+                if let Err(why) = self.app_ready() {
+                    eprintln!("  {} @ {}: not run: {why}", c.id, local.target);
+                    all_ok = false;
+                    continue;
+                }
+            }
             let timeout = Duration::from_secs(c.timeout_secs);
             let mut jobs: Vec<Option<&crate::manifest::Control>> = Vec::new();
             if parts != Parts::Controls {
@@ -268,9 +302,43 @@ impl Kit {
                     }
                 }
             }
-            for k in jobs {
+            let mut cases = Vec::new();
+            for case in c.cases(&local.target) {
+                if !c.controls_per_case() {
+                    cases.push(None);
+                    break;
+                }
+                if only_case.is_some_and(|o| Some(o) != case.as_deref()) {
+                    continue;
+                }
+                if let Some((w, path)) = c.waiting(case.as_deref(), &exists) {
+                    eprintln!(
+                        "  {} @ {} [{}]: not run: waits for {} ({path} is not in this tree)",
+                        c.id,
+                        local.target,
+                        case.as_deref().unwrap_or(""),
+                        w.slice
+                    );
+                    continue;
+                }
+                cases.push(case);
+            }
+            let jobs: Vec<_> = cases
+                .iter()
+                .flat_map(|case| jobs.iter().map(move |k| (case.as_deref(), *k)))
+                .collect();
+            for (case, k) in jobs {
                 let part = k.map(|k| k.name.as_str()).unwrap_or("normal");
-                let stem = format!("{}__{}__{}", c.id, file_part(&local.target), part);
+                let stem = match case {
+                    Some(case) => format!(
+                        "{}__{}__{}__{}",
+                        c.id,
+                        file_part(&local.target),
+                        file_part(case),
+                        part
+                    ),
+                    None => format!("{}__{}__{}", c.id, file_part(&local.target), part),
+                };
                 let out_dir = self.runs_dir().join("out").join(&stem);
                 let _ = std::fs::remove_dir_all(&out_dir);
                 std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
@@ -280,12 +348,16 @@ impl Kit {
                 // the kit cannot read is recorded as `unknown`.
                 let profile = command_profile(&cmd).unwrap_or_else(|| "unknown".into());
                 let build = state.id(&profile).to_string();
-                eprint!("  {} @ {} [{part}] ... ", c.id, local.target);
+                match case {
+                    Some(case) => eprint!("  {} @ {} [{case}] [{part}] ... ", c.id, local.target),
+                    None => eprint!("  {} @ {} [{part}] ... ", c.id, local.target),
+                }
                 let started = Instant::now();
                 let vars = Vars {
                     root: self.root(),
                     out: &out_dir,
                     build: &build,
+                    case,
                 };
                 let output = execute(&cmd, &env, local.cwd.as_deref(), &vars, timeout, &log);
                 let judged = match k {
@@ -315,6 +387,7 @@ impl Kit {
                     check: c.id.clone(),
                     target: local.target.clone(),
                     part: part.to_string(),
+                    case: case.map(str::to_string),
                     build: build.clone(),
                     time: now_rfc3339(),
                     verdict: judged.verdict,
@@ -329,6 +402,10 @@ impl Kit {
                     runner: runner_id(local),
                     config: m.config_digest(c, &local.target, k),
                     reason: k.and_then(|_| fail_reason(c, &output.text)),
+                    app_build: c
+                        .app
+                        .then(|| crate::app::line_value(&output.text, "app_build"))
+                        .flatten(),
                 };
                 let path = self.runs_dir().join(format!("{stem}.json"));
                 std::fs::create_dir_all(self.runs_dir()).map_err(|e| e.to_string())?;
@@ -342,6 +419,7 @@ impl Kit {
                         s,
                         c,
                         &local.target,
+                        case,
                         k.map(|k| k.name.as_str()),
                         &build,
                         &rec,
@@ -356,12 +434,26 @@ impl Kit {
         Ok(all_ok)
     }
 
+    /// Why app checks cannot run here: `MOUSSE_APP_DIR` must be a clean
+    /// checkout of the app at the revision in `app/MOUSSE_REVISION`.
+    pub fn app_ready(&self) -> Result<(), String> {
+        let revision = crate::app::read_revision(self.root())?;
+        let dir = std::env::var_os(crate::app::APP_DIR_ENV).ok_or_else(|| {
+            format!(
+                "an app check needs {} set to a clean checkout of the app at {revision}",
+                crate::app::APP_DIR_ENV
+            )
+        })?;
+        crate::app::check_checkout(Path::new(&dir), &revision)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn sign_run(
         &self,
         s: &Signer,
         c: &Check,
         target: &str,
+        case: Option<&str>,
         control: Option<&str>,
         build: &str,
         rec: &RunRecord,
@@ -370,7 +462,7 @@ impl Kit {
         let base = ResultPayload {
             check: c.id.clone(),
             target: target.to_string(),
-            case: None,
+            case: case.map(str::to_string),
             control: control.map(str::to_string),
             build: build.to_string(),
             platform: s.platform.clone(),
@@ -384,9 +476,19 @@ impl Kit {
             time: rec.time.clone(),
             device: s.device.clone(),
             config: Some(rec.config.clone()),
-            extra: match &rec.reason {
-                Some(r) => serde_json::json!({ "reason": r }),
-                None => Value::Null,
+            extra: {
+                let mut extra = serde_json::Map::new();
+                if let Some(r) = &rec.reason {
+                    extra.insert("reason".into(), Value::String(r.clone()));
+                }
+                if let Some(a) = &rec.app_build {
+                    extra.insert("app_build".into(), Value::String(a.clone()));
+                }
+                if extra.is_empty() {
+                    Value::Null
+                } else {
+                    Value::Object(extra)
+                }
             },
         };
         let mut payloads = Vec::new();
@@ -532,6 +634,8 @@ pub fn payload_from(v: &Value, a: &SignArgs<'_>) -> Result<ResultPayload, String
         ),
         ("host_build", s("host_build")),
         ("caller_build", s("caller_build")),
+        ("app_build", s("app_build")),
+        ("host_app_build", s("host_app_build")),
     ];
     if let Value::Object(o) = &mut extra {
         for (key, value) in lifted {
@@ -585,7 +689,7 @@ mod tests {
     }
 
     #[test]
-    fn a_result_files_reason_and_host_build_are_kept_where_the_kit_reads_them() {
+    fn a_result_files_reason_and_host_and_app_builds_are_kept_where_the_kit_reads_them() {
         let v = serde_json::json!({
             "check": "phase0.thin-slice-cross-machine",
             "target": "pc-to-mac-lan",
@@ -595,11 +699,21 @@ mod tests {
             "build": "1111111+release",
             "host_build": "1111111+debug",
             "reason": "pin_mismatch",
+            "app_build": "14912a18a2915bc53178597cbc2e9c08441d8fab",
+            "host_app_build": "24912a18a2915bc53178597cbc2e9c08441d8fab",
         });
         let p = payload_from(&v, &args()).unwrap();
         assert_eq!(p.reason().as_deref(), Some("pin_mismatch"));
         assert_eq!(p.extra_str("host_build"), Some("1111111+debug"));
         assert_eq!(p.control.as_deref(), Some("wrong-identity"));
+        assert_eq!(
+            p.extra_str("app_build"),
+            Some("14912a18a2915bc53178597cbc2e9c08441d8fab")
+        );
+        assert_eq!(
+            p.extra_str("host_app_build"),
+            Some("24912a18a2915bc53178597cbc2e9c08441d8fab")
+        );
 
         // An object `details` with a reason inside it.
         let mut v = v;

@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "mac-mini",
+  "key": "04d63225e01c2fd84d8a4588702b08561c26da25295387d39876ea36c7f2deee75ec54bd53c9d5b09712f13f737f0ece0038931c8226886a42d77430c7c4e486ee",
+  "payload": "{\"check\":\"phase1a.picker-v1-off\",\"target\":\"macos-arm64\",\"control\":\"roster-only-directory\",\"build\":\"0e745a7398c0b2f6f0ab62909a343cf8145b5f01+unknown\",\"platform\":\"macos-aarch64\",\"outcome\":\"FAIL\",\"details\":\"printed \\\"FAIL phase1a.picker-v1-off\\\" (reason=not_listed)\",\"time\":\"2026-11-19T05:19:30Z\",\"device\":\"mac-mini\",\"config\":\"73edecead632377501c5608dedabc5e12ee6d8d35aa338f9578eeef641ff9cee\",\"extra\":{\"app_build\":\"05c24f1b1bb229e7f89ab0eeb8faa38fad0ef794\",\"reason\":\"not_listed\"}}",
+  "signature": "91a5ae11c9c107d7859dbaf611a90ae3053fca46b310042f50dcb98cd5c58e8ff892aa7493f31ae92d7d67d14dd7e7845f2de3f323d96b618c8eabb135e6e0d7"
+}
