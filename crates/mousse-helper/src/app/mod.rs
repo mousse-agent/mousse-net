@@ -32,6 +32,7 @@
 
 mod budget;
 mod changes;
+mod engine_ops;
 mod frame;
 mod out;
 mod pairing;
@@ -39,6 +40,11 @@ mod paths;
 
 pub use changes::{clock, interface_source};
 pub use paths::browse_source;
+
+/// Whether a stored role (a peer record's) is `owner`.
+pub fn role_is_owner(stored: &str) -> bool {
+    engine_ops::is_owner(stored)
+}
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -61,6 +67,7 @@ use self::budget::Budget;
 use self::frame::Frame;
 use self::out::{Meta, Out};
 use crate::applog;
+use crate::engine::{Engine, ENGINE_PREFIX};
 use crate::limits::HelperLimits;
 use crate::revoke::Removal;
 
@@ -138,6 +145,7 @@ struct Shared {
     keep: paths::Keep,
     info: AppInfo,
     limits: HelperLimits,
+    engine: Arc<Engine>,
 }
 
 /// One chunk from the app for the engine.
@@ -252,7 +260,14 @@ fn error(id: &Value, error: &str, reason: impl Into<String>) -> Value {
 
 impl App {
     /// Start the channel on stdin and stdout.
-    pub fn start(host: Host, caller: Arc<Caller>, removal: Arc<Removal>, info: AppInfo) -> Self {
+    pub fn start(
+        host: Host,
+        caller: Arc<Caller>,
+        removal: Arc<Removal>,
+        info: AppInfo,
+        engine: Arc<Engine>,
+        mut engine_events: mpsc::UnboundedReceiver<Value>,
+    ) -> Self {
         let limits = *crate::limits::helper();
         let (ended, _) = watch::channel(None);
         let shared = Arc::new(Shared {
@@ -284,12 +299,19 @@ impl App {
             keep: paths::Keep::default(),
             info,
             limits,
+            engine,
         });
         tokio::spawn(read_stdin(shared.clone()));
         tokio::spawn(write_stdout(shared.clone()));
         tokio::spawn(pairing::watch_pause(shared.clone()));
         tokio::spawn(paths::keep_connected(shared.clone()));
         tokio::spawn(changes::forward_renewals(shared.clone()));
+        let events_to = shared.clone();
+        tokio::spawn(async move {
+            while let Some(event) = engine_events.recv().await {
+                events_to.event(event);
+            }
+        });
         Self { shared }
     }
 
@@ -696,6 +718,8 @@ impl Shared {
                     _ => None,
                 };
                 let entry = conn.and_then(|c| core.conns.get(&c).map(|e| (c, e.conn.clone())));
+                // Engine stream labels belong to the helper.
+                let label = label.filter(|l| !l.starts_with(ENGINE_PREFIX));
                 match (entry, label, class) {
                     (Some((no, conn)), Some(label), Some(class)) => {
                         drop(core);
@@ -726,6 +750,10 @@ impl Shared {
             op if pairing::OPS.contains(&op) => {
                 drop(core);
                 pairing::on_request(self, id, op, &map);
+            }
+            op if engine_ops::OPS.contains(&op) => {
+                drop(core);
+                engine_ops::on_request(self, id, op, &map);
             }
             other => {
                 let reason = format!("unknown op {other:?}");
@@ -1029,9 +1057,20 @@ async fn write_stdout(shared: Arc<Shared>) {
 /// Watch one connection: hand its peer's streams to the app (or refuse
 /// them), and report its end.
 async fn conn_task(shared: Arc<Shared>, no: u64, conn: Arc<Connection>, inbound: bool) {
+    // Inbound: the host opens engine streams only once the caller has
+    // opened one.
+    let (opened, opened_rx) = watch::channel(false);
+    if inbound {
+        shared.engine.on_inbound(conn.clone(), opened_rx);
+    } else {
+        shared.engine.on_outbound(conn.clone());
+    }
     let accept = async {
         while let Some(stream) = conn.accept_stream().await {
-            if !inbound {
+            opened.send_replace(true);
+            if stream.label().starts_with(ENGINE_PREFIX) {
+                shared.engine.on_stream(conn.clone(), inbound, stream);
+            } else if !inbound {
                 // Not in 1.0: the host opens no streams to its caller.
                 stream.writer.reset(ErrorCode::RefusedStream);
             } else if LABELS.contains(&stream.label()) {

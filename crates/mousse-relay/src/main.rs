@@ -12,7 +12,7 @@ use mousse_relay::state::{hex, unhex32, StateDir};
 use mousse_relay::{limits, os_rng};
 
 #[derive(Parser)]
-#[command(name = "mousse-relay", version, about = "Self-hosted Mousse relay")]
+#[command(name = "mousse-relay", version, about = "Mousse relay")]
 struct Cli {
     /// State directory (identity key, authorized list, enrollment codes).
     #[arg(long, global = true, env = "MOUSSE_RELAY_STATE", default_value = default_state())]
@@ -34,7 +34,15 @@ enum Command {
         /// Address to listen on; by default every address on the public port.
         #[arg(long)]
         listen: Option<SocketAddr>,
+        /// Hosted mode: admission tokens and leases from Plus
+        /// (`MOUSSE_NET_RELAY_PLUS_URL`, the `issuer-keys` file in the state
+        /// directory) instead of the authorized list.
+        #[arg(long)]
+        hosted: bool,
     },
+    /// Check the `issuer-keys` file; a running hosted relay reads it again
+    /// within `MOUSSE_NET_RELAY_STATE_POLL_MS`, or at once on `SIGHUP`.
+    Reload,
     /// Print a new single-use enrollment link.
     Enroll,
     /// Print the authorized registration keys.
@@ -148,7 +156,27 @@ fn run(cli: Cli) -> Result<(), String> {
             println!("codes      {}", lists.codes.len());
             println!("running    {}", if dir.running() { "yes" } else { "no" });
         }
-        Command::Run { listen } => {
+        Command::Reload => {
+            let dir = StateDir::open(&cli.state).map_err(s)?;
+            let path = dir.path().join(server::ISSUER_KEYS_FILE);
+            let keys = mousse_relay_plus::issuers::load(&path).map_err(|e| e.to_string())?;
+            println!(
+                "{} issuer keys; a running relay takes them within {} ms (at once on SIGHUP)",
+                keys.len(),
+                limits.state_poll_ms()
+            );
+        }
+        Command::Run { listen, hosted } => {
+            let hosted = if hosted {
+                Some(server::HostedConfig {
+                    settings: mousse_relay_plus::settings::from_vars(|k: &str| {
+                        std::env::var_os(k)
+                    })?,
+                    build_id: format!("mousse-relay {}", env!("CARGO_PKG_VERSION")),
+                })
+            } else {
+                None
+            };
             let dir = StateDir::open(&cli.state).map_err(s)?;
             let (_, port, _) = dir.public().map_err(s)?;
             let listen = listen.unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], port)));
@@ -158,6 +186,7 @@ fn run(cli: Cli) -> Result<(), String> {
                     state: dir,
                     listen,
                     limits,
+                    hosted,
                 })
                 .await?;
                 eprintln!(

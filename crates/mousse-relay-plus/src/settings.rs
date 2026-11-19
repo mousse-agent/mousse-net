@@ -291,6 +291,22 @@ mod tests {
     }
 
     #[test]
+    fn docs_list_every_hosted_limit_with_its_default_and_range() {
+        let doc = include_str!("../../../docs/limits.md");
+        for spec in HostedLimits::SPECS {
+            let row = format!(
+                "| `{ENV_PREFIX}{}` | {} | {} to {} |",
+                spec.name, spec.default, spec.min, spec.max
+            );
+            assert!(
+                doc.contains(&row),
+                "docs/limits.md has no row starting {row}"
+            );
+        }
+        assert!(doc.contains(&format!("| `{PLUS_URL_VAR}` |")));
+    }
+
+    #[test]
     fn known_names() {
         assert!(is_known("MOUSSE_NET_RELAY_PLUS_URL"));
         assert!(is_known("MOUSSE_NET_RELAY_CLOCK_RTT_MS"));

@@ -46,7 +46,7 @@ pub use clock::{Clock, ManualClock, SystemClock};
 pub use conn::{CloseReason, ConnStatus, Connection, MuxStream, StreamReader, StreamWriter};
 pub use endpoint::{Endpoint, PortChoice};
 pub use error::NetError;
-pub use host::{ApprovalRequest, Host, HostConfig, HostEvent, Refusal};
+pub use host::{AppliedRemoval, ApprovalRequest, Host, HostConfig, HostEvent, Refusal};
 pub use limits::Limits;
 pub use preauth::{ListenerKind, PreAuthSlot, PreAuthStats};
 pub use tls::TlsPolicy;

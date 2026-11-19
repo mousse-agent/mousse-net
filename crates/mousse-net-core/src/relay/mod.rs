@@ -12,6 +12,9 @@ pub mod machine;
 pub mod msg;
 pub mod proof;
 
+#[cfg(test)]
+mod hosted_tests;
+
 pub use cert::{check_pin, relay_certificate, RelayCertError};
 pub use limits::RelayLimits;
 pub use link::{EnrollmentLink, LinkError};

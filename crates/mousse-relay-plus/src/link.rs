@@ -1,8 +1,9 @@
 //! The hosted relay's link to Plus (`docs/phase34-design.md` §A.9): the boot
 //! announcement, the snapshot reports and the stopping snapshot.
 //!
-//! [`HostedRuntime`] holds the boot's [`Hosted`] state for every task of
-//! the relay. [`run`] announces the boot in the background, retrying the
+//! [`HostedCell`] is wherever the boot's [`Hosted`] state lives: the
+//! relay's own lock, or [`HostedRuntime`]. [`run`] announces the boot in
+//! the background, retrying the
 //! same record until Plus answers, then sends report parts one at a time
 //! as the state builds them. On a stop it makes every lease final and waits
 //! up to `MOUSSE_NET_RELAY_FINAL_REPORT_WAIT_MS` for the stopping snapshot
@@ -31,6 +32,20 @@ pub type Log = Arc<dyn Fn(&str) + Send + Sync>;
 pub const BOOT_PATH: &str = "/v1/relay/boot";
 /// API path of a report part.
 pub const REPORT_PATH: &str = "/v1/relay/report";
+
+/// Where the boot's hosted state lives, for the Plus link.
+pub trait HostedCell: Send + Sync + 'static {
+    /// Run `f` on the state at the current time. It must not wake
+    /// [`HostedCell::report_wake`] itself, or the reporter's wait would end
+    /// at once and spin.
+    fn with_hosted<R>(&self, f: impl FnOnce(&mut Hosted, Now) -> R) -> R;
+    /// Notified when a lease became final, so a snapshot may be due sooner.
+    fn report_wake(&self) -> &Notify;
+    /// Both clocks now, on the clock the state's timers use. Its monotonic
+    /// time must count while the machine sleeps (the Plus clock rests on it,
+    /// §A.9 duty 12).
+    fn now(&self) -> Now;
+}
 
 /// One hosted boot's state, shared by the relay's tasks.
 pub struct HostedRuntime {
@@ -72,19 +87,15 @@ impl HostedRuntime {
     }
 
     /// Run `f` on the state at the current time, then let the reporter
-    /// look again (a final may have made a snapshot due).
+    /// look again if a lease became final.
     pub fn with<R>(&self, f: impl FnOnce(&mut Hosted, Now) -> R) -> R {
         let now = self.now();
-        let r = f(&mut self.lock(), now);
-        self.wake.notify_one();
+        let mut h = self.lock();
+        let r = f(&mut h, now);
+        if h.take_report_wake() {
+            self.wake.notify_one();
+        }
         r
-    }
-
-    /// [`HostedRuntime::with`] for the reporter itself: it must not wake
-    /// itself, or its wait would end at once and spin.
-    fn quiet<R>(&self, f: impl FnOnce(&mut Hosted, Now) -> R) -> R {
-        let now = self.now();
-        f(&mut self.lock(), now)
     }
 
     /// Run the timers and return the events for the connection code.
@@ -101,6 +112,21 @@ impl HostedRuntime {
     /// Replace the pinned issuer keys (`mousse-relay reload`).
     pub fn reload(&self, keys: IssuerKeys) {
         self.with(|h, _| h.set_issuer_keys(keys));
+    }
+}
+
+impl HostedCell for HostedRuntime {
+    fn with_hosted<R>(&self, f: impl FnOnce(&mut Hosted, Now) -> R) -> R {
+        let now = self.now();
+        f(&mut self.lock(), now)
+    }
+
+    fn report_wake(&self) -> &Notify {
+        &self.wake
+    }
+
+    fn now(&self) -> Now {
+        HostedRuntime::now(self)
     }
 }
 
@@ -164,22 +190,22 @@ fn ms_until(now: Millis, at: Millis) -> Duration {
 /// stopping snapshot is stored or the final report wait has passed (or at
 /// once on a stop before Plus has answered the boot, since no lease can
 /// have been accepted).
-pub async fn run(rt: Arc<HostedRuntime>, link: PlusLink, mut stop: watch::Receiver<bool>) {
-    let limits = *rt.lock().limits();
+pub async fn run<C: HostedCell>(rt: Arc<C>, link: PlusLink, mut stop: watch::Receiver<bool>) {
+    let limits = rt.with_hosted(|h, _| *h.limits());
     let mut backoff = Backoff::new(limits.plus_retry_first_ms(), limits.plus_retry_max_ms());
     let boot = SignedEnvelope::sign(link.boot.encode(), &link.report_key).encode();
 
     // Announce (§A.9 duty 2): the same bytes every time.
     loop {
         if stop_asked(&stop) {
-            rt.quiet(|h, now| h.stop(now));
+            rt.with_hosted(|h, now| h.stop(now));
             return;
         }
         let sent = rt.now().mono;
         match link.http.post(BOOT_PATH, &boot).await {
             Ok(body) => match BootAnswer::decode(&body) {
                 Ok(a) => {
-                    rt.quiet(|h, now| h.boot_answered(&a, sent, now));
+                    rt.with_hosted(|h, now| h.boot_answered(&a, sent, now));
                     (link.log)("plus: boot acknowledged");
                     backoff.reset();
                     break;
@@ -205,11 +231,11 @@ pub async fn run(rt: Arc<HostedRuntime>, link: PlusLink, mut stop: watch::Receiv
     let mut deadline: Option<Millis> = None;
     loop {
         if deadline.is_none() && stop_asked(&stop) {
-            rt.quiet(|h, now| h.stop(now));
+            rt.with_hosted(|h, now| h.stop(now));
             deadline = Some(rt.now().mono.plus(limits.final_report_wait_ms()));
         }
         if let Some(d) = deadline {
-            if rt.lock().stop_reported() {
+            if rt.with_hosted(|h, _| h.stop_reported()) {
                 (link.log)("plus: stopping snapshot stored");
                 return;
             }
@@ -218,10 +244,10 @@ pub async fn run(rt: Arc<HostedRuntime>, link: PlusLink, mut stop: watch::Receiv
                 return;
             }
         }
-        let part = rt.quiet(|h, now| h.next_report_part(now));
+        let part = rt.with_hosted(|h, now| h.next_report_part(now));
         let Some(part) = part else {
             let now = rt.now();
-            let due = rt.lock().report_due(now);
+            let due = rt.with_hosted(|h, _| h.report_due(now));
             let wake = match (due, deadline) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
@@ -229,7 +255,7 @@ pub async fn run(rt: Arc<HostedRuntime>, link: PlusLink, mut stop: watch::Receiv
             let sleep = wake.map(|w| ms_until(now.mono, w));
             tokio::select! {
                 _ = async { match sleep { Some(s) => tokio::time::sleep(s).await, None => std::future::pending().await } } => {}
-                _ = rt.wake.notified() => {}
+                _ = rt.report_wake().notified() => {}
                 _ = stop.changed(), if deadline.is_none() => {}
             }
             continue;
@@ -239,7 +265,7 @@ pub async fn run(rt: Arc<HostedRuntime>, link: PlusLink, mut stop: watch::Receiv
         let failed = match link.http.post(REPORT_PATH, &env).await {
             Ok(body) => match ReportAnswer::decode(&body) {
                 Ok(a) => {
-                    rt.quiet(|h, now| h.report_answered(part.sequence, &a, sent, now));
+                    rt.with_hosted(|h, now| h.report_answered(part.sequence, &a, sent, now));
                     backoff.reset();
                     None
                 }
@@ -253,7 +279,7 @@ pub async fn run(rt: Arc<HostedRuntime>, link: PlusLink, mut stop: watch::Receiv
             let now = rt.now();
             // Wake early to take a snapshot on time, or at the stop deadline.
             let mut until = now.mono.plus(wait);
-            if let Some(t) = rt.lock().snapshot_due(now) {
+            if let Some(t) = rt.with_hosted(|h, _| h.snapshot_due(now)) {
                 until = until.min(t.max(now.mono));
             }
             if let Some(d) = deadline {
