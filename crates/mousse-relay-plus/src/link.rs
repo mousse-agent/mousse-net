@@ -80,6 +80,13 @@ impl HostedRuntime {
         r
     }
 
+    /// [`HostedRuntime::with`] for the reporter itself: it must not wake
+    /// itself, or its wait would end at once and spin.
+    fn quiet<R>(&self, f: impl FnOnce(&mut Hosted, Now) -> R) -> R {
+        let now = self.now();
+        f(&mut self.lock(), now)
+    }
+
     /// Run the timers and return the events for the connection code.
     pub fn poll(&self) -> Vec<Event> {
         self.with(|h, now| h.poll(now))
@@ -165,14 +172,14 @@ pub async fn run(rt: Arc<HostedRuntime>, link: PlusLink, mut stop: watch::Receiv
     // Announce (§A.9 duty 2): the same bytes every time.
     loop {
         if stop_asked(&stop) {
-            rt.with(|h, now| h.stop(now));
+            rt.quiet(|h, now| h.stop(now));
             return;
         }
         let sent = rt.now().mono;
         match link.http.post(BOOT_PATH, &boot).await {
             Ok(body) => match BootAnswer::decode(&body) {
                 Ok(a) => {
-                    rt.with(|h, now| h.boot_answered(&a, sent, now));
+                    rt.quiet(|h, now| h.boot_answered(&a, sent, now));
                     (link.log)("plus: boot acknowledged");
                     backoff.reset();
                     break;
@@ -198,7 +205,7 @@ pub async fn run(rt: Arc<HostedRuntime>, link: PlusLink, mut stop: watch::Receiv
     let mut deadline: Option<Millis> = None;
     loop {
         if deadline.is_none() && stop_asked(&stop) {
-            rt.with(|h, now| h.stop(now));
+            rt.quiet(|h, now| h.stop(now));
             deadline = Some(rt.now().mono.plus(limits.final_report_wait_ms()));
         }
         if let Some(d) = deadline {
@@ -211,7 +218,7 @@ pub async fn run(rt: Arc<HostedRuntime>, link: PlusLink, mut stop: watch::Receiv
                 return;
             }
         }
-        let part = rt.with(|h, now| h.next_report_part(now));
+        let part = rt.quiet(|h, now| h.next_report_part(now));
         let Some(part) = part else {
             let now = rt.now();
             let due = rt.lock().report_due(now);
@@ -232,7 +239,7 @@ pub async fn run(rt: Arc<HostedRuntime>, link: PlusLink, mut stop: watch::Receiv
         let failed = match link.http.post(REPORT_PATH, &env).await {
             Ok(body) => match ReportAnswer::decode(&body) {
                 Ok(a) => {
-                    rt.with(|h, now| h.report_answered(part.sequence, &a, sent, now));
+                    rt.quiet(|h, now| h.report_answered(part.sequence, &a, sent, now));
                     backoff.reset();
                     None
                 }
