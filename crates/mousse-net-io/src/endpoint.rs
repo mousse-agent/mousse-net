@@ -45,6 +45,9 @@ struct EndpointFile {
     profile_id: String,
     port: Option<u16>,
     fixed_port: Option<u16>,
+    /// The loopback `ws` listener's kept port (Phase 1b §4.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ws_port: Option<u16>,
 }
 
 /// Which port to listen on.
@@ -201,6 +204,7 @@ impl Endpoint {
             profile_id,
             port: None,
             fixed_port: None,
+            ws_port: None,
         };
         let endpoint = Self {
             dir: dir.to_path_buf(),
@@ -358,6 +362,42 @@ impl Endpoint {
             self.save()?;
         }
         Ok(listener)
+    }
+}
+
+impl Endpoint {
+    /// Bind the loopback `ws` listener (Phase 1b §4.1): on `port` if one
+    /// is given (0: any), else on the kept ws port (a new one if it is
+    /// taken), and keep the port it got.
+    pub async fn bind_ws(&mut self, port: Option<u16>) -> Result<TcpListener, NetError> {
+        if self.shared {
+            return Err(NetError::Refused(
+                "this endpoint is open for a caller command only".into(),
+            ));
+        }
+        let loopback = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let listener = match (port, self.file.ws_port) {
+            (Some(port), _) if port != 0 => bind_exact(loopback, port).await?,
+            (Some(_), _) | (None, None) => bind_exact(loopback, 0).await?,
+            (None, Some(kept)) => match bind_exact(loopback, kept).await {
+                Ok(listener) => listener,
+                Err(NetError::Io(e)) if e.kind() == io::ErrorKind::AddrInUse => {
+                    bind_exact(loopback, 0).await?
+                }
+                Err(e) => return Err(e),
+            },
+        };
+        let got = Some(listener.local_addr()?.port());
+        if self.file.ws_port != got {
+            self.file.ws_port = got;
+            self.save()?;
+        }
+        Ok(listener)
+    }
+
+    /// The kept `ws` port, if any.
+    pub fn ws_port(&self) -> Option<u16> {
+        self.file.ws_port
     }
 }
 

@@ -16,6 +16,22 @@
         mousse_control = "stop-on-mismatch",
         mousse_control = "public-routes",
         mousse_control = "no-rediscovery",
+        mousse_control = "no-preauth-budget",
+        mousse_control = "shared-preauth-pool",
+        mousse_control = "ws-slot-after-headers",
+        mousse_control = "ipc-unbounded-line",
+        mousse_control = "ipc-handoff-drops-buffer",
+        mousse_control = "join-only-frees-slot",
+        mousse_control = "join-only-outlives-invitation",
+        mousse_control = "fence-at-accept-only",
+        mousse_control = "fence-tcp-only",
+        mousse_control = "enroll-while-paused",
+        mousse_control = "repair-skips-slot",
+        mousse_control = "repair-skips-fence",
+        mousse_control = "limits-raise",
+        mousse_control = "ws-allow-origin",
+        mousse_control = "plain-ws-off-loopback",
+        mousse_control = "release-test-root",
         mousse_control = "inbound-before-live"
     )
 ))]
@@ -39,6 +55,22 @@ compile_error!("test-in-person lets a typed ticket count as scanned from the hos
     mousse_control = "stop-on-mismatch",
     mousse_control = "public-routes",
     mousse_control = "no-rediscovery",
+    mousse_control = "no-preauth-budget",
+    mousse_control = "shared-preauth-pool",
+    mousse_control = "ws-slot-after-headers",
+    mousse_control = "ipc-unbounded-line",
+    mousse_control = "ipc-handoff-drops-buffer",
+    mousse_control = "join-only-frees-slot",
+    mousse_control = "join-only-outlives-invitation",
+    mousse_control = "fence-at-accept-only",
+    mousse_control = "fence-tcp-only",
+    mousse_control = "enroll-while-paused",
+    mousse_control = "repair-skips-slot",
+    mousse_control = "repair-skips-fence",
+    mousse_control = "limits-raise",
+    mousse_control = "ws-allow-origin",
+    mousse_control = "plain-ws-off-loopback",
+    mousse_control = "release-test-root",
     mousse_control = "inbound-before-live",
     feature = "test-in-person"
 ))]
@@ -135,6 +167,15 @@ enum Command {
         /// Don't advertise on mDNS (it is off anyway on loopback).
         #[arg(long)]
         no_mdns: bool,
+        /// Run the loopback ws listener for a tunnel client on this port
+        /// (0: any). Without it the listener runs, on its kept port, only
+        /// with --tunnel.
+        #[arg(long)]
+        ws_port: Option<u16>,
+        /// The public wss URL of a tunnel to the ws listener, advertised in
+        /// tickets (repeatable).
+        #[arg(long = "tunnel")]
+        tunnels: Vec<String>,
         /// The name paired devices see (default: this computer's name).
         #[arg(long)]
         name: Option<String>,
@@ -605,6 +646,8 @@ async fn run(cli: Cli) -> Result<i32, String> {
             listen_ip,
             port,
             no_mdns,
+            ws_port,
+            tunnels,
             name,
             app,
         } => {
@@ -614,6 +657,8 @@ async fn run(cli: Cli) -> Result<i32, String> {
                 port,
                 mdns: !no_mdns,
                 app,
+                ws_port,
+                tunnels,
             };
             serve::run(&dir, insecure, opts).await?;
         }

@@ -50,8 +50,8 @@ use mousse_net_core::mux::PriorityClass;
 use mousse_net_core::ErrorCode;
 use mousse_net_io::store::{hex, short_id};
 use mousse_net_io::{
-    Caller, CloseReason, Connection, Host, HostEvent, MuxStream, NetError, StreamAdmission,
-    StreamReader, StreamWriter,
+    Caller, CloseReason, Connection, Host, HostEvent, ListenerKind, MuxStream, NetError,
+    StreamAdmission, StreamReader, StreamWriter,
 };
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -86,6 +86,8 @@ pub struct AppInfo {
     pub name: String,
     pub profile: String,
     pub port: u16,
+    /// The loopback ws listener's port, while it runs (Phase 1b §4.1).
+    pub ws_port: Option<u16>,
     pub routes: Vec<String>,
     pub state_dir: PathBuf,
     /// Where to look for paired hosts that moved (Phase 1a §6).
@@ -628,7 +630,16 @@ impl Shared {
             }
             "stats" => {
                 let a = &self.admission;
+                let pre = self.host.preauth_stats();
+                let per_kind = |n: fn(&mousse_net_io::PreAuthStats, ListenerKind) -> u64| {
+                    ListenerKind::ALL
+                        .iter()
+                        .map(|k| (k.name().to_owned(), Value::from(n(&pre, *k))))
+                        .collect::<Map<String, Value>>()
+                };
                 let reply = json!({
+                    "preauth_open": per_kind(mousse_net_io::PreAuthStats::open),
+                    "preauth_refused": per_kind(mousse_net_io::PreAuthStats::refused),
                     "re": id,
                     "open_streams": a.open_streams(),
                     "queued_bytes": a.queued_bytes(),
@@ -766,6 +777,7 @@ impl Shared {
             "identity": hex(self.info.identity.as_bytes()),
             "device": short_id(&self.info.identity),
             "port": self.info.port,
+            "ws_port": self.info.ws_port,
             "routes": self.info.routes,
             "paused": self.removal.paused_reason(),
         })

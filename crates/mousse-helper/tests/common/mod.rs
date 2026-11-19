@@ -146,6 +146,19 @@ impl Endpoint {
         self.app_raw(name, env, port, &browse)
     }
 
+    /// `serve --app` with extra `serve` arguments (for example
+    /// `--ws-port 0`) and `MOUSSE_NET_<name>` overrides.
+    pub fn app_args(&self, name: &str, env: &[(&str, &str)], args: &[&str]) -> App {
+        let mut all = vec!["serve", "--app", "--no-mdns", "--port", "0", "--name", name];
+        all.extend_from_slice(args);
+        let mut cmd = self.command(&all);
+        cmd.stdin(Stdio::piped());
+        for (k, v) in env {
+            cmd.env(format!("MOUSSE_NET_{k}"), v);
+        }
+        App::spawn(cmd, self.dir.clone(), name)
+    }
+
     /// [`Endpoint::app_with`], with other variables set as given (the
     /// debug-build test hooks).
     pub fn app_raw(

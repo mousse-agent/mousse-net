@@ -604,6 +604,17 @@ fn tickets() {
                 };
                 assert!(host_ok, "{hint}");
             }
+            Ok(Route::Wss { host, port, path }) => {
+                let wss = &expected["wss"];
+                assert_eq!(u(&wss["port"]), u64::from(port), "{hint}");
+                assert_eq!(wss["path"], path, "{hint}");
+                let host_ok = match host {
+                    RouteHost::Ipv4(a) => wss["host"]["ipv4"] == a.to_string(),
+                    RouteHost::Ipv6(a) => unhex(&wss["host"]["ipv6"]) == a.octets(),
+                    RouteHost::Dns(n) => wss["host"]["dns"] == n,
+                };
+                assert!(host_ok, "{hint}");
+            }
             Ok(Route::Mdns { instance }) => assert_eq!(expected["mdns"], instance, "{hint}"),
             Err(skip) => assert_eq!(expected["skip"], skip.name(), "{hint}"),
         }
