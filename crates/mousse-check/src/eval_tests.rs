@@ -220,8 +220,14 @@ impl Case {
         let mut evidence = Evidence {
             results: self.evidence.results.clone(),
             attestations: self.evidence.attestations.clone(),
+            hosted: self.evidence.hosted.clone(),
             rejected: self.evidence.rejected.clone(),
         };
+        for h in &mut evidence.hosted {
+            if h.config == AUTO {
+                h.config = digest(&h.check, &h.target, h.control.as_deref());
+            }
+        }
         for r in &mut evidence.results {
             if r.config.as_deref() == Some(AUTO) {
                 r.config = Some(digest(&r.check, &r.target, r.control.as_deref()));
@@ -1101,4 +1107,94 @@ fn a_check_or_case_waiting_for_its_slice_is_incomplete_until_it_lands() {
     // A wait never hides a check without a control.
     case.manifest.checks[1].control.clear();
     assert_eq!(case.cell("phase9.routes").status, Status::Fail);
+}
+
+const HOSTED_CHECK: &str = r#"
+[[check]]
+id = "phase9.builds"
+title = "builds"
+plan = "x"
+targets = ["windows-arm64"]
+judge = "marker"
+hosted = ["windows-arm64"]
+
+[[check.control]]
+name = "stale-helper"
+breaks = "the helper is not the build under test"
+env = { MOUSSE_BUILD_ID = "0000000+release" }
+expect_reason = "stale_helper"
+"#;
+
+fn hosted(
+    control: Option<&str>,
+    outcome: &str,
+    reason: Option<&str>,
+) -> crate::evidence::HostedRecord {
+    crate::evidence::HostedRecord {
+        format: crate::evidence::HOSTED_FORMAT.into(),
+        check: "phase9.builds".into(),
+        target: "windows-arm64".into(),
+        control: control.map(Into::into),
+        outcome: outcome.into(),
+        reason: reason.map(Into::into),
+        details: "x".into(),
+        build: format!("{HEAD}+release"),
+        app_build: None,
+        config: AUTO.into(),
+        run: "https://github.com/o/r/actions/runs/1".into(),
+        artifact_digest: "sha256:ab".into(),
+        helper_sha256: "cd".into(),
+        time: "2026-11-19T00:00:00Z".into(),
+    }
+}
+
+#[test]
+fn a_hosted_cell_counts_only_verified_hosted_records_for_this_build_and_its_control() {
+    let mut case = Case::new(HOSTED_CHECK);
+    let c = case.cell("phase9.builds");
+    assert_eq!(c.status, Status::Incomplete, "{}", c.details);
+
+    case.evidence.hosted.push(hosted(None, "PASS", None));
+    let c = case.cell("phase9.builds");
+    assert_eq!(c.status, Status::Incomplete, "{}", c.details);
+    assert!(c.details.contains("control stale-helper"), "{}", c.details);
+
+    case.evidence
+        .hosted
+        .push(hosted(Some("stale-helper"), "FAIL", Some("stale_helper")));
+    let c = case.cell("phase9.builds");
+    assert_eq!(c.status, Status::Pass, "{}", c.details);
+    assert!(c.details.starts_with("hosted:"), "{}", c.details);
+
+    // Another build, or another configuration, does not count.
+    let mut old = case.evidence.hosted.clone();
+    for h in &mut old {
+        h.build = format!("{OLD}+release");
+    }
+    let mut stale = Case::new(HOSTED_CHECK);
+    stale.evidence.hosted = old;
+    assert_eq!(stale.cell("phase9.builds").status, Status::Incomplete);
+    let mut other = Case::new(HOSTED_CHECK);
+    other.evidence.hosted = case.evidence.hosted.clone();
+    other.evidence.hosted[0].config = "0".repeat(64);
+    assert_eq!(other.cell("phase9.builds").status, Status::Incomplete);
+
+    // A control that failed for another reason fails the cell.
+    let mut wrong = Case::new(HOSTED_CHECK);
+    wrong.evidence.hosted = vec![
+        hosted(None, "PASS", None),
+        hosted(Some("stale-helper"), "FAIL", Some("probe_failed")),
+    ];
+    assert_eq!(wrong.cell("phase9.builds").status, Status::Fail);
+}
+
+#[test]
+fn a_hosted_target_cannot_also_run_locally() {
+    let bad = HOSTED_CHECK.replace(
+        "hosted = [\"windows-arm64\"]",
+        "hosted = [\"windows-arm64\"]
+local = [{ target = \"windows-arm64\", host = \"windows-aarch64\", command = [\"x\"] }]",
+    );
+    let err = Manifest::parse(&format!("{MANIFEST}{bad}")).unwrap_err();
+    assert!(err.contains("hosted"), "{err}");
 }

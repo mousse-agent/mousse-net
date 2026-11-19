@@ -309,6 +309,7 @@ targets = ["windows-x64", "windows-arm64", "macos-arm64", "macos-x64", "linux-x6
 judge = "marker"
 app = true
 waits = [{ slice = "E8", paths = ["crates/mousse-helper/tests/app_ws.rs"] }]
+hosted = ["windows-arm64"]
 # macos-x64 runs under Rosetta and linux-arm64 in a container on the Mac.
 # windows-arm64 runs natively on a GitHub-hosted windows-11-arm runner
 # (.github/workflows/windows-arm-smoke.yml). The kit counts it, shown as
