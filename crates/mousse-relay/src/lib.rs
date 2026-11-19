@@ -15,7 +15,8 @@
     any(
         mousse_control = "relay-persist-allow-set",
         mousse_control = "marker-in-splice",
-        mousse_control = "marker-in-relay-memory"
+        mousse_control = "marker-in-relay-memory",
+        mousse_control = "fifo-egress"
     ),
     not(debug_assertions)
 ))]
@@ -24,7 +25,8 @@ compile_error!("mousse_control plants a bug for tests; it is not allowed in rele
 #[cfg(any(
     mousse_control = "relay-persist-allow-set",
     mousse_control = "marker-in-splice",
-    mousse_control = "marker-in-relay-memory"
+    mousse_control = "marker-in-relay-memory",
+    mousse_control = "fifo-egress"
 ))]
 const _: () = {
     let profile = env!("MOUSSE_BUILD_PROFILE").as_bytes();
