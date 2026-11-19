@@ -1459,6 +1459,8 @@ dependencies = [
  "httparse",
  "mousse-net-core",
  "mousse-net-io",
+ "mousse-relay-plus",
+ "rand_chacha 0.10.0",
  "rand_core 0.10.1",
  "rustls",
  "serde",
