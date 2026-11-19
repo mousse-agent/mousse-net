@@ -26,6 +26,8 @@
  *   instead and do not pass --control.
  * --result <file>: also writes an unsigned result for `mousse-check sign`:
  *   check, target, control, outcome, details (the marker line), reason,
+ *   judged as the kit judges a local run (a control that does not exit
+ *   nonzero with its FAIL line and no PASS line is DID_NOT_FAIL),
  *   time, build (the helper build), app_build, and host_build and
  *   host_app_build when the app printed `host_build=` and `host_app_build=`
  *   lines (a caller reports the builds its host sent over the test link).
@@ -198,12 +200,26 @@ async function main() {
   if (flags.result) {
     const pass = markerLine(text, `PASS ${id}`)
     const fail = markerLine(text, `FAIL ${id}`)
-    const outcome = fail ? 'FAIL' : pass && code === 0 ? 'PASS' : undefined
+    // Judged as the kit judges a local run. A run passes only with exit 0, the PASS line and no FAIL line. A
+    // control fails as required only with a nonzero exit, the FAIL line and no PASS line; any other control run
+    // is recorded as DID_NOT_FAIL, which blocks its cell like a control that passed.
+    const failed = code !== 0 && fail && !pass
+    const passed = code === 0 && pass && !fail
+    let outcome
+    let details = fail ?? pass
+    if (flags.control) {
+      outcome = failed ? 'FAIL' : 'DID_NOT_FAIL'
+      if (!failed) details = `the control did not fail as required (exit ${code}, ${fail ? 'a' : 'no'} FAIL line, ${pass ? 'a' : 'no'} PASS line)${details ? `: ${details}` : ''}`
+    } else if (passed) {
+      outcome = 'PASS'
+    } else if (fail || pass || code !== 0) {
+      outcome = 'FAIL'
+      if (!fail) details = `no clean pass (exit ${code}, ${pass ? 'a' : 'no'} PASS line, no FAIL line)${pass ? `: ${pass}` : ''}`
+    }
     if (!outcome) {
       console.error(`run.mjs: no PASS or FAIL line for ${id}; no result written`)
     } else {
-      const details = fail ?? pass
-      const reason = fail && /reason=([^\s;,)"]+)/.exec(fail.slice(`FAIL ${id}`.length))?.[1]
+      const reason = outcome === 'FAIL' && fail && /reason=([^\s;,)"]+)/.exec(fail.slice(`FAIL ${id}`.length))?.[1]
       const result = {
         check: id,
         ...(flags.target ? { target: flags.target } : {}),
