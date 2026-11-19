@@ -238,3 +238,200 @@ fn inbound_passes_only_app_labels_and_outbound_refuses_host_opened_streams() {
     p.a.assert_clean();
     p.b.assert_clean();
 }
+
+/// An app that stops reading stdout: replies pile up past
+/// APP_CONTROL_QUEUE_BYTES, the channel ends, and the helper still exits,
+/// although its writer is blocked on the full pipe.
+#[test]
+fn an_app_that_stops_reading_does_not_keep_the_helper_alive() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let end = Endpoint::init("unread");
+    let mut cmd = end.command(&["serve", "--app", "--no-mdns", "--port", "0"]);
+    cmd.stdin(Stdio::piped())
+        .env("MOUSSE_NET_APP_CONTROL_QUEUE_BYTES", "65536");
+    let mut child = cmd.spawn().unwrap();
+    // stdout is held, never read.
+    let _stdout = child.stdout.take().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let writer = std::thread::spawn(move || {
+        // Each request gets a `no_hello` reply of about 60 bytes: far more
+        // than the queue limit and any pipe buffer.
+        for id in 0..20_000u64 {
+            let body = serde_json::to_vec(&json!({"op": "stats", "id": id})).unwrap();
+            if stdin.write_all(&frame(0x01, &body)).is_err() {
+                return;
+            }
+        }
+        // stdin stays open: only the stuck channel can end the helper.
+        std::thread::sleep(WAIT * 2);
+    });
+
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if started.elapsed() > WAIT {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    if status.is_none() {
+        let _ = child.kill();
+    }
+    let log = end.log();
+    assert!(status.is_some(), "the helper did not exit:\n{log}");
+    assert!(log.contains("app channel ended: Stuck"), "{log}");
+    drop(writer);
+}
+
+/// A TCP connection to `port` that sends nothing: a handshake that never
+/// starts.
+fn silent_to(port: u16) -> std::net::TcpStream {
+    let s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_millis(400)))
+        .unwrap();
+    s
+}
+
+fn port_of(route: &str) -> u16 {
+    route.rsplit(':').next().unwrap().parse().unwrap()
+}
+
+/// Whether the helper dropped `s` (true) or still holds it open waiting
+/// for its handshake (false).
+fn dropped(mut s: &std::net::TcpStream) -> bool {
+    use std::io::Read as _;
+    let start = Instant::now();
+    loop {
+        match s.read(&mut [0u8; 64]) {
+            Ok(0) => return true,
+            Ok(_) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return false
+            }
+            Err(_) => return true,
+        }
+        if start.elapsed() > WAIT {
+            return false;
+        }
+    }
+}
+
+/// A silent connection to `port` that the helper holds, once a place
+/// is free; fails if none frees up within WAIT.
+fn admitted_soon(port: u16) -> std::net::TcpStream {
+    let start = Instant::now();
+    loop {
+        let next = silent_to(port);
+        if !dropped(&next) {
+            return next;
+        }
+        assert!(start.elapsed() < WAIT, "the place never came back");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Inbound connections that have not passed step 2 hold a place from
+/// before their handshake until they are live or closed, at most
+/// PREAUTH_PER_SOURCE from one address and PREAUTH_CONNECTIONS in all; one
+/// more is dropped before any handshake work.
+#[test]
+fn connections_waiting_for_authorization_are_capped_per_source_and_in_all() {
+    // From one address: a peer with no grant waiting out its join-proof
+    // time is past its handshake but not past step 2, and keeps its place.
+    let a_end = Endpoint::init("preauth");
+    let mut a = a_end.app(
+        "hostA",
+        &[("PREAUTH_PER_SOURCE", "1"), ("JOIN_PROOF_WAIT_MS", "3000")],
+    );
+    a.hello();
+    let a_route = route_of(&mut a);
+    let port = port_of(&a_route);
+    let c_end = Endpoint::init("preauthc");
+    let mut c = c_end.app("peerC", &[]);
+    c.hello();
+    // C stores A, but A never granted C.
+    c.call(
+        "peer.add",
+        json!({"identity": a.identity, "name": a.name, "routes": [a_route]}),
+    );
+    let dial = c.start("dial", json!({"identity": a.identity}));
+    // Past the handshake, waiting for step 2.
+    std::thread::sleep(Duration::from_millis(1000));
+    assert!(
+        c.st().messages.iter().all(|m| m["re"] != dial),
+        "C's dial ended early"
+    );
+    let late = silent_to(port);
+    assert!(
+        dropped(&late),
+        "a second connection from the address got in"
+    );
+    assert!(
+        a_end.log().contains("PREAUTH_PER_SOURCE"),
+        "{}",
+        a_end.log()
+    );
+    // Step 2 ends (refused): the place is free again.
+    let reply = c.reply(dial);
+    assert!(reply.get("error").is_some(), "{reply}");
+    let _again = admitted_soon(port);
+
+    // In all: two places, both taken by handshakes that never start.
+    let b_end = Endpoint::init("preauthb");
+    let mut b = b_end.app(
+        "hostB",
+        &[("PREAUTH_CONNECTIONS", "2"), ("PREAUTH_PER_SOURCE", "2")],
+    );
+    b.hello();
+    let port = port_of(&route_of(&mut b));
+    let first = silent_to(port);
+    let second = silent_to(port);
+    assert!(!dropped(&first) && !dropped(&second));
+    let third = silent_to(port);
+    assert!(dropped(&third), "a third connection got in");
+    assert!(
+        b_end.log().contains("PREAUTH_CONNECTIONS"),
+        "{}",
+        b_end.log()
+    );
+    drop(first);
+    // The helper sees the end of the first one's handshake and frees its
+    // place.
+    let _next = admitted_soon(port);
+}
+
+/// `init --app` (the app's first start) ends with its stdin, as `serve
+/// --app` does: an app killed during it leaves no `init` behind. The hold
+/// stands for an init still busy, a keystore that is slow to answer.
+#[test]
+fn init_for_the_app_exits_when_its_stdin_closes() {
+    let end = Endpoint {
+        dir: temp_dir("initeof"),
+    };
+    let mut init = end.cli_env(&["init", "--app"], &[("MOUSSE_NET_INIT_HOLD_MS", "30000")]);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(init.exit_within(Duration::ZERO), None, "{}", init.err());
+    let closed = Instant::now();
+    init.end_stdin();
+    assert_eq!(init.exit_within(WAIT), Some(3), "{}", init.err());
+    assert!(
+        closed.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        closed.elapsed()
+    );
+    assert!(!end.dir.join("endpoint.json").exists());
+
+    // With its stdin open it makes the endpoint and exits.
+    let mut init = end.cli_env(&["init", "--app"], &[]);
+    assert_eq!(init.exit_within(WAIT), Some(0), "{}", init.err());
+    assert!(init.out().contains("created endpoint"), "{}", init.out());
+}

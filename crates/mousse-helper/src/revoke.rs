@@ -185,9 +185,13 @@ impl Removal {
         self.journal.clear()
     }
 
+    /// Pause: the host stops serving under the lock its connections
+    /// register under (a handshake that ends later is closed too), and the
+    /// app channel, which publishes its paths under its own lock after
+    /// checking the pause, closes what it had (`watch_pause`).
     fn pause(self: &Arc<Self>, reason: String) {
         applog::line(format!("networking paused: {reason}"));
-        self.host.close_all(ErrorCode::InternalError);
+        self.host.pause(ErrorCode::InternalError);
         let first = self.paused.send_replace(Some(reason)).is_none();
         if first {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -202,6 +206,7 @@ impl Removal {
         match self.settle() {
             Ok(()) => {
                 applog::line("networking resumed: the grant table is saved");
+                self.host.resume();
                 self.paused.send_replace(None);
                 true
             }

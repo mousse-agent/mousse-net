@@ -79,7 +79,7 @@ mod serve;
 mod term;
 
 use std::collections::VecDeque;
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -113,6 +113,11 @@ enum Command {
         /// An opaque profile id (default: a new random one).
         #[arg(long)]
         profile: Option<String>,
+        /// Run for the Mousse app: exit at once when stdin closes (the app
+        /// is gone), so an app killed during a first start leaves no
+        /// `init` behind.
+        #[arg(long)]
+        app: bool,
     },
     /// Show this endpoint's device id and port.
     Id,
@@ -391,6 +396,26 @@ fn offline_remove(dir: &Path, grant: u64, deny: bool) -> Result<(), String> {
     store.save(&table).map_err(|e| e.to_string())
 }
 
+/// Ends the process when stdin closes or fails: the app that started this
+/// helper is gone, whether it stopped or was killed outright.
+fn exit_when_stdin_closes() {
+    std::thread::spawn(|| {
+        let mut buf = [0u8; 256];
+        let mut stdin = std::io::stdin();
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) | Err(_) => {
+                    // Not `eprintln!`: it panics when stderr is a pipe
+                    // to the app that is gone, and the process would stay.
+                    let _ = writeln!(std::io::stderr(), "error: the app is gone");
+                    std::process::exit(3);
+                }
+                Ok(_) => {}
+            }
+        }
+    });
+}
+
 fn ask_yes_no(question: &str) -> bool {
     print!("{question} [y/N] ");
     let _ = std::io::stdout().flush();
@@ -537,7 +562,14 @@ async fn run(cli: Cli) -> Result<i32, String> {
     let dir = cli.state.unwrap_or_else(serve::default_state_dir);
     let insecure = cli.insecure_file_key;
     match cli.command {
-        Command::Init { profile } => {
+        Command::Init { profile, app } => {
+            if app {
+                exit_when_stdin_closes();
+            }
+            let hold = crate::limits::helper().init_hold_ms();
+            if hold > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(hold)).await;
+            }
             let (endpoint, _) = Endpoint::create(&dir, profile.as_deref(), storage(insecure))
                 .map_err(|e| e.to_string())?;
             println!(
@@ -677,6 +709,10 @@ fn main() {
             std::process::exit(2);
         }
     };
+    // In app mode stdout carries the channel. Its writer may be blocked on a
+    // full pipe the app stopped reading, holding stdout's lock: a final flush
+    // would wait for it forever. What it had not written is lost either way.
+    let app_mode = matches!(cli.command, Command::Serve { app: true, .. });
     let code = match runtime.block_on(run(cli)) {
         Ok(code) => code,
         Err(e) => {
@@ -684,7 +720,9 @@ fn main() {
             2
         }
     };
-    let _ = std::io::stdout().flush();
+    if !app_mode {
+        let _ = std::io::stdout().flush();
+    }
     // Exit now: a pending stdin read must not keep the process alive.
     std::process::exit(code)
 }

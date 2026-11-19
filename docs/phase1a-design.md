@@ -78,7 +78,9 @@ caller today.
 **Spawn.** The command is
 `mousse-helper --state <profileDir>/net-engine/endpoint serve --app --listen-ip 0.0.0.0`.
 
-- With no endpoint, the daemon first runs `init`.
+- With no endpoint, the daemon first runs `init --app` with its stdin
+  piped. Like `serve --app`, it exits at once when that stdin closes, so
+  a daemon killed during a first start leaves no `init` behind.
 - The key is kept in the OS keystore, one entry per endpoint.
 - If `settings.json` names another profile id (a copied folder), the
   endpoint is moved aside and re-initialized. Its devices then show "Pair
@@ -983,7 +985,7 @@ local = [
   { target = "linux-x64", host = "linux-x86_64", command = ["node", "{root}/tools/app-check/run.mjs", "phase1a.reconnect", "--out", "{out}"] },
 ]
 control = [
-  { name = "no-rediscovery", expect_reason = "unreachable", breaks = "the caller tries only the last working route", env = { RUSTFLAGS = '--cfg mousse_control="no-rediscovery"' } },
+  { name = "no-rediscovery", expect_reason = "unreachable", breaks = "the caller tries only the last working route once it has one", env = { RUSTFLAGS = '--cfg mousse_control="no-rediscovery"' } },
 ]
 
 [[check]]
@@ -1276,7 +1278,7 @@ Not touched: `sync/session.ts`, `sync/supervisor.ts`, `transports/*`,
    live LAN mDNS test needs the Mac listening.
 7. **Controls.** `stop-on-mismatch` (net-io) and `public-routes` (helper)
    for `phase1a.discovery`. `no-rediscovery` (helper: only the last
-   working route, no browse) is in place for `phase1a.reconnect`.
+   working route once a pairing has one, no browse) is in place for `phase1a.reconnect`.
 
 **Decided while building E5b**
 
@@ -1286,7 +1288,9 @@ Not touched: `sync/session.ts`, `sync/supervisor.ts`, `transports/*`,
    is already gone). `path.reopened {conn}` makes it current and closes
    the old one with `PATH_REPLACED`; it answers `no_conn`, or
    `not_renewed` for a path that is not a renewed one waiting (an inbound
-   path, or one already current). A failed try is `path.renew_failed
+   path, or one already current). An outbound path a `dial` opened while
+   another was up waits the same way, announced by its `conn.up` alone,
+   and `path.reopened` takes it too. A failed try is `path.renew_failed
    {identity, why, reason}`, and the caller tries again on the session's
    schedule. While networking is paused, a renewed path is closed at once
    and reported as `path.renew_failed {why: "paused"}`. `dial` reuses the

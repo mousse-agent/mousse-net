@@ -54,6 +54,40 @@ impl Silent {
     }
 }
 
+/// `peer.forget` while a path to that peer is still opening: once the
+/// forget has answered, no path to it comes up.
+#[test]
+fn a_path_still_opening_when_its_peer_is_forgotten_never_comes_up() {
+    let a_end = Endpoint::init("fga");
+    let b_end = Endpoint::init("fgb");
+    let mut a = a_end.app("hostA", &[]);
+    a.hello();
+    let mut b = b_end.app("peerB", &[("DIAL_TIMEOUT_MS", "30000")]);
+    b.hello();
+    let gate = gate_to(&route_of(&mut a));
+    trust(&mut a, &mut b, &[&gate.route]);
+    // B's keeper dials; the relay holds the connection.
+    gate.wait_accepted();
+    let forgot = b.call("peer.forget", json!({"identity": a.identity}));
+    assert_eq!(forgot["forgotten"], true, "{forgot}");
+    gate.open();
+    // The dial passes step 1 now, after the forget.
+    a.event("conn.up", |m| m["identity"] == b.identity.as_str());
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        outbound_ups(&b, &a.identity),
+        0,
+        "{:?}",
+        b.events("conn.up")
+    );
+    assert!(
+        b_end.log().contains("forgotten meanwhile"),
+        "{}",
+        b_end.log()
+    );
+    assert!(peer_of(&mut b, &a.identity).is_null());
+}
+
 /// The mDNS record says only "a Mousse host is here": random instance and
 /// host names, `v=1`, and nothing of the device's name or identity.
 #[test]
@@ -213,6 +247,37 @@ fn the_hosts_own_refusal_stops_the_search() {
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(hole.accepted(), 0, "no candidate after the refusal");
     assert_eq!(b.events("dial.failed").len(), 1, "parked after the refusal");
+}
+
+/// A `dial` that waits its turn behind the keeper's dial to the same host
+/// takes that dial's outcome: a host that refuses this device answers once
+/// its proof window is over, and the app's dial does not wait out a second
+/// window of its own.
+#[test]
+fn a_dial_waiting_behind_the_keeper_takes_its_refusal() {
+    let a_end = Endpoint::init("behinda");
+    let b_end = Endpoint::init("behindb");
+    let mut a = a_end.app("hostA", &[("JOIN_PROOF_WAIT_MS", "3000")]);
+    a.hello();
+    let mut b = b_end.app("peerB", &[]);
+    b.hello();
+    let a_route = route_of(&mut a);
+    // B knows A, but A holds no grant for B: the keeper dials at once and A
+    // holds that dial for its whole proof window.
+    let (identity, name) = (a.identity.clone(), a.name.clone());
+    b.call(
+        "peer.add",
+        json!({"identity": identity, "name": name, "routes": [a_route]}),
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    let start = Instant::now();
+    let reply = b.request("dial", json!({"identity": a.identity}));
+    let took = start.elapsed();
+    assert_eq!(reply["why"], "not_authorized", "{reply}");
+    assert!(
+        took < Duration::from_millis(4_000),
+        "one proof window, not two: took {took:?}"
+    );
 }
 
 const PUBLIC: [&str; 7] = [

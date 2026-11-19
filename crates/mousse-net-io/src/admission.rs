@@ -30,6 +30,8 @@ pub struct StreamAdmission {
     open: Mutex<usize>,
     queued: AtomicU64,
     peak_queued: AtomicU64,
+    held: AtomicU64,
+    peak_held: AtomicU64,
     refused: AtomicU64,
 }
 
@@ -44,6 +46,8 @@ impl StreamAdmission {
             open: Mutex::new(0),
             queued: AtomicU64::new(0),
             peak_queued: AtomicU64::new(0),
+            held: AtomicU64::new(0),
+            peak_held: AtomicU64::new(0),
             refused: AtomicU64::new(0),
         })
     }
@@ -62,6 +66,19 @@ impl StreamAdmission {
     /// The most [`StreamAdmission::queued_bytes`] has been.
     pub fn peak_queued_bytes(&self) -> u64 {
         self.peak_queued.load(Ordering::Relaxed)
+    }
+
+    /// Memory the receive queues hold for those bytes: their buffers'
+    /// sizes and overhead. Many tiny DATA frames share buffers, so this
+    /// stays near [`StreamAdmission::queued_bytes`] however the peer
+    /// splits its data.
+    pub fn held_bytes(&self) -> u64 {
+        self.held.load(Ordering::Relaxed)
+    }
+
+    /// The most [`StreamAdmission::held_bytes`] has been.
+    pub fn peak_held_bytes(&self) -> u64 {
+        self.peak_held.load(Ordering::Relaxed)
     }
 
     /// Peer opens refused for want of a place.
@@ -85,6 +102,19 @@ impl StreamAdmission {
     pub(crate) fn sub_queued(&self, n: u64) {
         let _ = self
             .queued
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |q| {
+                Some(q.saturating_sub(n))
+            });
+    }
+
+    pub(crate) fn add_held(&self, n: u64) {
+        let now = self.held.fetch_add(n, Ordering::Relaxed) + n;
+        self.peak_held.fetch_max(now, Ordering::Relaxed);
+    }
+
+    pub(crate) fn sub_held(&self, n: u64) {
+        let _ = self
+            .held
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |q| {
                 Some(q.saturating_sub(n))
             });
