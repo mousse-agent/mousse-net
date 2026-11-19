@@ -18,6 +18,8 @@
 //! - [`pairing`]: tickets, join proofs, host and joiner pairing state machines.
 //! - [`mux`]: frame codec, per-stream credit, priority scheduler, keepalive.
 //! - [`session`]: certificate-driven session lifetime and path switching.
+//! - [`pairmail`]: per-pairing directory and mailbox material from the pair
+//!   secret, sealing, and the manifest pin check.
 //! - [`removal`]: "remove on all my hosts": grant lists, signed removals
 //!   and the host's checks.
 //! - [`relay`]: the relay protocol and the relay's admission state machine.
@@ -41,6 +43,7 @@
         mousse_control = "ignore-owner",
         mousse_control = "ignore-grant-id",
         mousse_control = "resend-refused",
+        mousse_control = "unpinned-manifest",
         mousse_control = "no-pin-relay",
         mousse_control = "relay-skip-allow-set",
         mousse_control = "relay-refuse-early",
@@ -64,6 +67,7 @@ compile_error!("mousse_control plants a bug for tests; it is not allowed in rele
     mousse_control = "ignore-owner",
     mousse_control = "ignore-grant-id",
     mousse_control = "resend-refused",
+    mousse_control = "unpinned-manifest",
     mousse_control = "no-pin-relay",
     mousse_control = "relay-skip-allow-set",
     mousse_control = "relay-refuse-early",
@@ -98,6 +102,7 @@ pub mod identity;
 pub mod limits;
 pub mod mux;
 pub mod pairing;
+pub mod pairmail;
 pub mod relay;
 pub mod removal;
 pub mod session;

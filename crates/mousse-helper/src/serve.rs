@@ -215,6 +215,7 @@ pub async fn run(
         .load_identity(insecure_file_key)
         .map_err(|e| e.to_string())?;
     let real_identity = endpoint.identity();
+    let key_storage = key.storage();
     let (clock, manual_clock) = crate::app::clock();
     let mut config = HostConfig::for_endpoint(&endpoint, opts.name.clone(), clock.clone())
         .map_err(|e| e.to_string())?;
@@ -242,6 +243,17 @@ pub async fn run(
         clock.clone(),
         endpoint.dir().to_path_buf(),
     );
+    // Plus (Phase 4): nothing is fetched before ready; the client starts
+    // its background work once attached.
+    let plus = crate::plus::Plus::open(
+        crate::limits::settings().plus_url.as_deref(),
+        endpoint.dir(),
+        clock.clone(),
+        key_storage,
+        endpoint.plus_key_store(),
+        endpoint.endpoint_id(),
+        engine.events(),
+    )?;
     let choice = match opts.port {
         None => PortChoice::Kept,
         Some(0) => PortChoice::Auto,
@@ -282,6 +294,9 @@ pub async fn run(
         pending: Mutex::new(HashMap::new()),
         stop: Notify::new(),
     });
+    if let Some(plus) = plus {
+        engine.set_plus(plus);
+    }
     print_line(format!(
         "ready {} port {} build {} routes {}{}",
         short_id(&real_identity),

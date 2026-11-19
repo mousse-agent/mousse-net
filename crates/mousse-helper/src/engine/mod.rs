@@ -5,12 +5,13 @@
 //! Engine streams are opened only when the connection's agreed wire minor
 //! allows them; anything else with a `mousse-` label is refused.
 
+pub mod mailbox;
 pub mod removals;
 pub mod stream;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use mousse_net_core::grants::Role;
 use mousse_net_core::identity::IdentityPublicKey;
@@ -20,6 +21,7 @@ use mousse_net_io::{Clock, Connection, Host, MuxStream, SharedSigner};
 use serde_json::Value;
 use tokio::sync::{mpsc, watch, Notify};
 
+use crate::plus::Plus;
 use crate::revoke::Removal;
 
 /// The prefix of engine-owned stream labels.
@@ -38,11 +40,15 @@ pub struct Engine {
     admin_lock: Mutex<()>,
     /// Hosts a removal delivery runs for now.
     delivering: Mutex<HashSet<IdentityPublicKey>>,
-    /// Live outbound connections, by a local number.
-    outbound: Mutex<HashMap<u64, Arc<Connection>>>,
-    next_outbound: Mutex<u64>,
+    /// Outbound connections, held weakly: the engine never keeps a
+    /// connection open that the app let go of.
+    outbound: Mutex<Vec<Weak<Connection>>>,
     /// Wakes the mailbox task early (a new removal to deposit).
     mail_wake: Notify,
+    /// The Plus client, when `MOUSSE_NET_PLUS_URL` is set.
+    plus: OnceLock<Arc<Plus>>,
+    /// Pair secrets and the manifest, from the relay client.
+    pairs: OnceLock<Arc<dyn mailbox::PairSource>>,
 }
 
 /// Ends a host's delivery turn when dropped.
@@ -81,11 +87,42 @@ impl Engine {
             events,
             admin_lock: Mutex::new(()),
             delivering: Mutex::new(HashSet::new()),
-            outbound: Mutex::new(HashMap::new()),
-            next_outbound: Mutex::new(1),
+            outbound: Mutex::new(Vec::new()),
             mail_wake: Notify::new(),
+            plus: OnceLock::new(),
+            pairs: OnceLock::new(),
         });
         (engine, rx)
+    }
+
+    /// A sender for app events (the Plus client's).
+    pub fn events(&self) -> mpsc::UnboundedSender<Value> {
+        self.events.clone()
+    }
+
+    /// Where pair secrets and the manifest come from (the relay client).
+    /// Set before [`Engine::set_plus`]; without it there are none yet.
+    #[allow(dead_code)]
+    pub fn set_pairs(&self, pairs: Arc<dyn mailbox::PairSource>) {
+        let _ = self.pairs.set(pairs);
+    }
+
+    /// Attach the Plus client and start its background work: the link and
+    /// account refresh, and the mailbox.
+    pub fn set_plus(self: &Arc<Self>, plus: Arc<Plus>) {
+        if self.plus.set(plus.clone()).is_ok() {
+            plus.start();
+            let pairs = self
+                .pairs
+                .get_or_init(|| Arc::new(mailbox::NoPairs))
+                .clone();
+            tokio::spawn(mailbox::run(self.clone(), plus, pairs));
+        }
+    }
+
+    /// The Plus client, if Plus is set up.
+    pub fn plus(&self) -> Option<&Arc<Plus>> {
+        self.plus.get()
     }
 
     /// Send an event to the app.
@@ -111,12 +148,11 @@ impl Engine {
 
     /// Live outbound connections to `host`.
     pub fn outbound_conns(&self, host: &IdentityPublicKey) -> Vec<Arc<Connection>> {
-        self.outbound
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
+        let mut list = self.outbound.lock().unwrap_or_else(|e| e.into_inner());
+        list.retain(|w| w.upgrade().is_some_and(|c| c.status().is_live()));
+        list.iter()
+            .filter_map(Weak::upgrade)
             .filter(|c| c.peer() == host)
-            .cloned()
             .collect()
     }
 
@@ -138,26 +174,12 @@ impl Engine {
 
     /// An outbound connection is live: deliver what waits for its host.
     pub fn on_outbound(self: &Arc<Self>, conn: Arc<Connection>) {
-        let no = {
-            let mut next = self.next_outbound.lock().unwrap_or_else(|e| e.into_inner());
-            let no = *next;
-            *next += 1;
-            no
-        };
-        self.outbound
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(no, conn.clone());
-        let engine = self.clone();
-        tokio::spawn(async move {
-            tokio::spawn(removals::deliver(engine.clone(), conn.clone()));
-            conn.closed().await;
-            engine
-                .outbound
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&no);
-        });
+        {
+            let mut list = self.outbound.lock().unwrap_or_else(|e| e.into_inner());
+            list.retain(|w| w.strong_count() > 0);
+            list.push(Arc::downgrade(&conn));
+        }
+        tokio::spawn(removals::deliver(self.clone(), conn));
     }
 
     /// A stream with a `mousse-` label. Handled here or refused.

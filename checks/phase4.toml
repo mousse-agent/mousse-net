@@ -29,3 +29,36 @@ control = [
   { name = "resend-refused", breaks = "a resend after a lost answer is refused instead of getting its journaled result", env = { RUSTFLAGS = '--cfg mousse_control="resend-refused"' } },
   { name = "removal-unsigned", breaks = "the removal record's signature is not checked", env = { RUSTFLAGS = '--cfg mousse_control="removal-unsigned"' } },
 ]
+
+[[check]]
+id = "phase4.helper-plus"
+title = "Sign-in with a typed code survives a lost answer; account and usage shown from disk while Plus is down; lease request ids stored and reused across a restart; prefetch at the threshold with one current and one pending; bulk pauses alone on a failed refill; a refused block is presented again; a relay move releases before it funds the new relay"
+plan = "docs/phase34-design.md A.3 to A.8, B.10, B.11 and F.1 (E-L2)"
+targets = ["windows-x64", "macos-arm64"]
+min_tests = 23
+local = [
+  { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--no-fail-fast", "plus"] },
+  { target = "macos-arm64", host = "macos-aarch64", command = ["cargo", "test", "-p", "mousse-helper", "--no-fail-fast", "plus"] },
+]
+control = [
+  { name = "no-prefetch", breaks = "the next block is asked for only when the current one is gone", env = { RUSTFLAGS = '--cfg mousse_control="no-prefetch"' } },
+  { name = "new-request-id-on-retry", breaks = "a retried lease request gets a new request id, so a lost answer reserves a second block", env = { RUSTFLAGS = '--cfg mousse_control="new-request-id-on-retry"' } },
+  { name = "fund-two-relays", breaks = "a relay move asks Plus to fund the new relay while the old one still holds blocks", env = { RUSTFLAGS = '--cfg mousse_control="fund-two-relays"' } },
+  { name = "pause-all-classes", breaks = "a failed bulk refill pauses interactive too", env = { RUSTFLAGS = '--cfg mousse_control="pause-all-classes"' } },
+]
+
+[[check]]
+id = "phase4.directory"
+title = "Slots per pairing from the pair secret; a removed pairing's slot and token go and its slot id stays unreadable; a lost slot write is written again; mail reaches an offline host; a swapped slot, a manifest signed by another key and a removal Plus deposited itself are refused"
+plan = "docs/phase34-design.md A.5, A.6, A.13, B.12 and F.1 (E-L3)"
+targets = ["windows-x64", "linux-x64"]
+min_tests = 8
+local = [
+  { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-net-core", "-p", "mousse-helper", "--no-fail-fast", "--", "pairmail", "mailbox"] },
+  { target = "linux-x64", host = "linux-x86_64", command = ["cargo", "test", "-p", "mousse-net-core", "-p", "mousse-helper", "--no-fail-fast", "--", "pairmail", "mailbox"] },
+]
+control = [
+  { name = "keep-removed-slot", breaks = "a removed pairing's directory slot is not deleted", env = { RUSTFLAGS = '--cfg mousse_control="keep-removed-slot"' } },
+  { name = "unpinned-manifest", breaks = "a slot's manifest counts without the pinned host's signature", env = { RUSTFLAGS = '--cfg mousse_control="unpinned-manifest"' } },
+  { name = "trust-from-plus", breaks = "mail is acted on without opening it with a pairing's mail key", env = { RUSTFLAGS = '--cfg mousse_control="trust-from-plus"' } },
+]

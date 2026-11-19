@@ -719,6 +719,10 @@ pub(crate) fn channel() -> (mpsc::UnboundedSender<Cmd>, mpsc::UnboundedReceiver<
     mpsc::unbounded_channel()
 }
 
+/// Labels of engine-owned streams (wire.md 9.5). They have their own
+/// places, apart from the app's stream caps.
+pub const ENGINE_LABEL_PREFIX: &str = "mousse-";
+
 /// Start the driver task for one connection.
 pub(crate) fn spawn<P: Pipe>(
     start: Start<P>,
@@ -1088,7 +1092,11 @@ impl Driver {
                     ))
                 } else if !self.role.may_open() {
                     Err(NetError::Refused("the connection is not authorized".into()))
-                } else if let Some(permit) = self.admit.try_admit() {
+                } else if let Some(permit) = if label.starts_with(ENGINE_LABEL_PREFIX) {
+                    self.admit.try_admit_engine()
+                } else {
+                    self.admit.try_admit()
+                } {
                     self.mux
                         .open_stream(class, &label)
                         .map(|id| self.new_stream(id, class, label, permit))
@@ -1334,7 +1342,12 @@ impl Driver {
             } => {
                 // Admission: a stream past either cap is refused before
                 // anything is queued for it (Phase 1a §2.2).
-                let Some(permit) = self.admit_peer_stream() else {
+                let permit = if label.starts_with(ENGINE_LABEL_PREFIX) {
+                    self.admit.try_admit_engine()
+                } else {
+                    self.admit_peer_stream()
+                };
+                let Some(permit) = permit else {
                     self.admit.refused();
                     let _ = self.mux.reset(stream, ErrorCode::RefusedStream);
                     return;

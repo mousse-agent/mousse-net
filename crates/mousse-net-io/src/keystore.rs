@@ -9,6 +9,11 @@
 //! It exists for tests and headless runs where no keystore is reachable, and
 //! must be asked for explicitly both when the identity is created and every
 //! time it is loaded.
+//!
+//! The same store keeps the endpoint's **Plus key** ([`IdentityStore::plus_key`],
+//! Phase 4): a separate P-256 key made when the endpoint first links to
+//! Plus, so Plus never learns the identity key. It lives in `plus-key.json`
+//! and the keystore entry `endpoint-<id>-plus`, kept like the identity.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -30,6 +35,8 @@ pub const KEYRING_SERVICE: &str = "mousse-net";
 
 const IDENTITY_FILE: &str = "identity.json";
 const INSECURE_KEY_FILE: &str = "identity.key";
+const PLUS_FILE: &str = "plus-key.json";
+const PLUS_INSECURE_FILE: &str = "plus-key.key";
 
 /// Where the identity secret is kept.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,6 +86,12 @@ impl StoredIdentity {
     pub fn storage(&self) -> KeyStorage {
         self.storage
     }
+
+    /// The key, for a key that is not the identity key (the Plus key signs
+    /// its own domain-tagged records).
+    pub fn software_key(&self) -> &SoftwareKey {
+        &self.key
+    }
 }
 
 impl IdentitySigner for StoredIdentity {
@@ -95,6 +108,9 @@ impl IdentitySigner for StoredIdentity {
 #[derive(Clone, Debug)]
 pub struct IdentityStore {
     dir: PathBuf,
+    file: &'static str,
+    insecure_file: &'static str,
+    user_suffix: &'static str,
 }
 
 impl IdentityStore {
@@ -102,12 +118,25 @@ impl IdentityStore {
     pub fn new(dir: &Path) -> Self {
         Self {
             dir: dir.to_path_buf(),
+            file: IDENTITY_FILE,
+            insecure_file: INSECURE_KEY_FILE,
+            user_suffix: "",
+        }
+    }
+
+    /// The endpoint's Plus key in `dir` (Phase 4).
+    pub fn plus_key(dir: &Path) -> Self {
+        Self {
+            dir: dir.to_path_buf(),
+            file: PLUS_FILE,
+            insecure_file: PLUS_INSECURE_FILE,
+            user_suffix: "-plus",
         }
     }
 
     /// Whether an identity exists here.
     pub fn exists(&self) -> bool {
-        self.dir.join(IDENTITY_FILE).exists()
+        self.dir.join(self.file).exists()
     }
 
     /// Create a new identity for the endpoint `endpoint_id`. Fails if one
@@ -130,7 +159,7 @@ impl IdentityStore {
         let secret = key.secret_bytes();
         let keyring_user = match storage {
             KeyStorage::OsKeystore => {
-                let user = keyring_user(endpoint_id);
+                let user = format!("{}{}", keyring_user(endpoint_id), self.user_suffix);
                 keyring_entry(&user)?
                     .set_secret(secret.as_slice())
                     .map_err(|e| NetError::Store(format!("keystore: {e}")))?;
@@ -138,7 +167,7 @@ impl IdentityStore {
             }
             KeyStorage::InsecureFile => {
                 let text = Zeroizing::new(hex(secret.as_slice()));
-                write_atomic(&self.dir.join(INSECURE_KEY_FILE), text.as_bytes())?;
+                write_atomic(&self.dir.join(self.insecure_file), text.as_bytes())?;
                 None
             }
         };
@@ -149,12 +178,12 @@ impl IdentityStore {
             keyring_user,
         };
         let bytes = serde_json::to_vec_pretty(&file).map_err(|e| NetError::Store(e.to_string()))?;
-        write_atomic(&self.dir.join(IDENTITY_FILE), &bytes)?;
+        write_atomic(&self.dir.join(self.file), &bytes)?;
         Ok(StoredIdentity { key, storage })
     }
 
     fn read_file(&self) -> Result<IdentityFile, NetError> {
-        let path = self.dir.join(IDENTITY_FILE);
+        let path = self.dir.join(self.file);
         let bytes = fs::read(&path)
             .map_err(|e| NetError::Store(format!("no identity in {} ({e})", self.dir.display())))?;
         let file: IdentityFile = serde_json::from_slice(&bytes)
@@ -195,7 +224,7 @@ impl IdentityStore {
                             .into(),
                     ));
                 }
-                let path = self.dir.join(INSECURE_KEY_FILE);
+                let path = self.dir.join(self.insecure_file);
                 let text = Zeroizing::new(
                     fs::read_to_string(&path)
                         .map_err(|e| NetError::Store(format!("{}: {e}", path.display())))?,
@@ -232,7 +261,7 @@ impl IdentityStore {
                 Err(e) => return Err(NetError::Store(format!("keystore: {e}"))),
             }
         }
-        for name in [IDENTITY_FILE, INSECURE_KEY_FILE] {
+        for name in [self.file, self.insecure_file] {
             let path = self.dir.join(name);
             if path.exists() {
                 fs::remove_file(&path)

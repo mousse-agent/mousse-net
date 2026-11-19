@@ -22,6 +22,11 @@ qrcode = { version = "=0.14.1", default-features = false }
 crossterm = { version = "=0.29.0", default-features = false, features = ["windows"] }
 if-addrs = "=0.15.0"
 gethostname = "=1.1.0"
+tokio-rustls = { version = "=0.26.6", default-features = false, features = ["logging", "aws_lc_rs"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["std", "logging", "aws_lc_rs", "prefer-post-quantum"] }
+rustls-platform-verifier = "=0.7.1"
+sha2 = { version = "=0.11.1", default-features = false }
+zeroize = { version = "=1.9.2", default-features = false, features = ["alloc"] }
 
 [features]
 # Test builds only (refused in release builds): `join` and `slice-check`

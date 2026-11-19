@@ -314,6 +314,12 @@ impl Endpoint {
         Ok(key)
     }
 
+    /// The store of this endpoint's Plus key (Phase 4), next to the
+    /// identity key.
+    pub fn plus_key_store(&self) -> IdentityStore {
+        IdentityStore::plus_key(&private_state_dir(&self.dir))
+    }
+
     /// The kept port, if any.
     pub fn kept_port(&self) -> Option<u16> {
         self.file.port

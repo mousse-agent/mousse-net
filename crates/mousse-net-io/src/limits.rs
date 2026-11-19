@@ -50,6 +50,8 @@ mousse_net_core::define_limits! {
         streams_per_connection = "STREAMS_PER_CONNECTION": 32, [1, 1_024];
         /// Streams all connections of one endpoint (one helper) may have open together, both directions counted; a peer's open beyond it is refused with REFUSED_STREAM.
         streams_per_endpoint = "STREAMS_PER_ENDPOINT": 128, [1, 1_024];
+        /// Engine streams (labels starting `mousse-`) per connection, counted apart from the two caps above so they never take the app's places (tighten only).
+        engine_streams_per_connection = "OWN_STREAMS_PER_CONNECTION": 4, [1, 4];
         /// Caller: candidate addresses for one host dialled at once (Phase 1a §6).
         dial_parallel = "DIAL_PARALLEL": 4, [1, 64];
         /// Caller: how long one candidate address may take to connect and pass step 1 before the next is tried (Phase 1a §6).

@@ -89,6 +89,8 @@ mousse_net_core::define_limits! {
         removal_answer_wait_ms = "REMOVAL_ANSWER_WAIT_MS": 10_000, [1_000, 120_000];
         /// One request to Plus.
         plus_timeout_ms = "PLUS_TIMEOUT_MS": 10_000, [1_000, 60_000];
+        /// Largest answer from Plus the helper reads.
+        plus_answer_max_bytes = "PLUS_ANSWER_MAX_BYTES": 4_194_304, [65_536, 67_108_864];
         /// First wait before retrying a Plus request; each next wait doubles.
         plus_retry_first_ms = "PLUS_RETRY_FIRST_MS": 1_000, [100, 60_000];
         /// Longest wait before retrying a Plus request; not below the first.

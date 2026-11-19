@@ -58,6 +58,7 @@ spec's value: it can only be tightened.
 | `MOUSSE_NET_MDNS_ROTATE_MS` | 900000 | 60000 to 900000 | How often the mDNS instance name changes (privacy.md). |
 | `MOUSSE_NET_MDNS_ROTATE_CHECK_MS` | 5000 | 100 to 30000 | How often the advertiser checks whether the name is due to change. |
 | `MOUSSE_NET_STREAMS_PER_CONNECTION` | 32 | 1 to 1024 | Open streams on one connection, both directions counted. A peer's open past it is reset with `REFUSED_STREAM`; an own open fails with `StreamLimit`. With the engine's 256 KiB initial credit per stream, this bounds what one connection can queue unread (wire.md 9.2). |
+| `MOUSSE_NET_OWN_STREAMS_PER_CONNECTION` | 4 | 1 to 4 | Engine streams (labels starting `mousse-`, wire.md 9.5) open on one connection, both directions counted apart from `STREAMS_PER_CONNECTION` and `STREAMS_PER_ENDPOINT`, so the engine never takes the app's places. A peer's open past it is reset with `REFUSED_STREAM`. Tighten only. |
 | `MOUSSE_NET_STREAMS_PER_ENDPOINT` | 128 | 1 to 1024 | Open streams on all of an endpoint's connections together, host and caller sides alike; past it as above. |
 | `MOUSSE_NET_DIAL_PARALLEL` | 4 | 1 to 64 | Caller: candidate addresses for one host dialled at once (Phase 1a §6). |
 | `MOUSSE_NET_DIAL_TIMEOUT_MS` | 2000 | 100 to 60000 | Caller: time one candidate address has to connect and pass step 1 before it is given up (Phase 1a §6). |
@@ -104,6 +105,7 @@ spec's value: it can only be tightened.
 | `MOUSSE_NET_REMOVAL_MAX_AGE_SECS` | 2592000 | 86400 to 2592000 | "Remove on all my hosts" (Phase 4 Part D): the oldest removal a host accepts and an admin device keeps queued, and how long a host keeps removal ids. Tighten only. |
 | `MOUSSE_NET_REMOVAL_ANSWER_WAIT_MS` | 10000 | 1000 to 120000 | How long one side of `mousse-removal` waits for the other's message (the signed removal, or the host's answer). |
 | `MOUSSE_NET_PLUS_TIMEOUT_MS` | 10000 | 1000 to 60000 | One Plus request. |
+| `MOUSSE_NET_PLUS_ANSWER_MAX_BYTES` | 4194304 | 65536 to 67108864 | Largest answer from Plus the helper reads; a larger one counts as a failed request. |
 | `MOUSSE_NET_PLUS_RETRY_FIRST_MS` | 1000 | 100 to 60000 | First wait before retrying a Plus request; each next wait doubles. |
 | `MOUSSE_NET_PLUS_RETRY_MAX_MS` | 300000 | 1000 to 3600000 | Longest wait before retrying a Plus request; not below the first. |
 | `MOUSSE_NET_PLUS_PREFETCH_PERCENT` | 50 | 10 to 90 | Use of the current relay lease, in percent, at which the next block is asked for; also the status threshold the helper gives a hosted relay. |

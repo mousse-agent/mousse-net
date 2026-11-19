@@ -98,10 +98,13 @@ pub async fn publish_grants(
         Ok(s) => s,
         Err(_) => return,
     };
+    // Held weakly from here: the stream never keeps the connection open.
+    let conn = Arc::downgrade(&conn);
     let (_reader, writer) = stream.split();
     loop {
         changes.borrow_and_update();
-        if !engine.is_owner_conn(&conn) {
+        let owner = conn.upgrade().is_some_and(|c| engine.is_owner_conn(&c));
+        if !owner {
             writer.reset(ErrorCode::Cancelled);
             return;
         }
@@ -111,7 +114,7 @@ pub async fn publish_grants(
         }
         tokio::select! {
             changed = changes.changed() => if changed.is_err() { return },
-            _ = conn.closed() => return,
+            () = writer.closing() => return,
         }
     }
 }
@@ -574,6 +577,34 @@ impl Engine {
         if store.save(&file).is_ok() {
             event["ev"] = json!("removal.state");
             self.event(event);
+        }
+    }
+
+    /// Every open removal, oldest first.
+    pub(super) fn all_open_items(&self) -> Vec<Item> {
+        self.expire_old();
+        self.admin()
+            .load()
+            .map(|f| {
+                f.items
+                    .into_iter()
+                    .filter(|i| open_state(&i.state))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// After the mailbox and directory are in line with the grants: the
+    /// cleanup of every applied removal whose grant is gone is done.
+    pub(super) fn cleanup_after_sync(&self) {
+        let Ok(entries) = self.removal.removals().load() else {
+            return;
+        };
+        let grants = self.host.grants();
+        for e in entries.iter().filter(|e| e.cleanup) {
+            if e.grant.is_some_and(|g| grants.iter().all(|x| x.id.0 != g)) {
+                let _ = self.removal.cleanup_done(&e.id);
+            }
         }
     }
 
