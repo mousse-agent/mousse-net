@@ -543,7 +543,7 @@ fn trust_needs_the_fetched_key_and_its_fingerprint() {
     let fx = Fx::new("trust");
     let r = fx.remote("b", RemoteOpts::default());
     fx.hosts(&[("box", r.port())]);
-    let (end, mut a) = fx.caller("trust", &[("SSH_SETUP_TIMEOUT_MS", "1000")]);
+    let (end, mut a) = fx.caller("trust", &[("SSH_SETUP_TIMEOUT_MS", "4000")]);
     let route = resolve(&mut a, "box");
     let sha = r.sshd.host_key_sha256();
     let reply = a.request("ssh.trust", json!({"route_id": route, "sha256": sha}));
@@ -554,7 +554,7 @@ fn trust_needs_the_fetched_key_and_its_fingerprint() {
     assert_eq!(error_of(&reply), "key_mismatch", "{reply}");
     assert!(pins_of(&end, &route).is_empty());
     // Past SSH_SETUP_TIMEOUT_MS the kept key is gone.
-    std::thread::sleep(Duration::from_millis(1300));
+    std::thread::sleep(Duration::from_millis(4300));
     let reply = a.request("ssh.trust", json!({"route_id": route, "sha256": sha}));
     assert_eq!(error_of(&reply), "probe_again", "{reply}");
     assert!(pins_of(&end, &route).is_empty());
@@ -919,7 +919,7 @@ fn the_window_is_shared_by_routes_to_one_server() {
         "window",
         &[
             ("SSH_TARGET_CONNECTS", "1"),
-            ("SSH_SETUP_TIMEOUT_MS", "1000"),
+            ("SSH_SETUP_TIMEOUT_MS", "4000"),
         ],
     );
     let first = resolve(&mut a, "box");
@@ -936,7 +936,10 @@ fn the_window_is_shared_by_routes_to_one_server() {
             .contains("SSH_TARGET_CONNECTS"),
         "{reply}"
     );
-    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the probe waited"
+    );
     a.call("ssh.probe", json!({"route_id": third}));
 }
 
