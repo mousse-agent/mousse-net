@@ -66,6 +66,26 @@ phases must add. Each later phase updates this document before it ships.
   ([`wire.md`](wire.md) 10.1), so a swapped link cannot make the joiner send
   its full name to a fake host that way.
 
+## Rate groups on hosted relays (Phase 4, decided early)
+
+A hosted relay limits speed per **rate group**, a random 16-byte value in
+each paid block (`docs/phase34-design.md` A.12). Plus draws a fresh rate
+group for every relay handle, so the group itself never tells a relay
+that two handles belong to the same device across a handle rotation.
+
+What can still link them: while their rotation overlaps, both handles
+carry the same caller key fingerprints in their allow-sets, so a relay can
+tell they belong to one device directly, even when the IP address
+changes. It also sees both handles register from the same IP address at
+nearly the same time. Users are told that a hosted relay can follow a
+device across handle rotations by its callers' fingerprints, IP address
+and timing, but not by anything Plus puts in a paid block.
+
+The cost of this choice: during a rotation the old handle may spend the
+blocks it already holds at its own speed limit, beside the new handle.
+Plus bounds that by funding only the newest handle and by allowing at most
+one new handle per device and relay per day by default.
+
 ## To be filled in by later phases
 
 These headings come from the plan. Each must say what each party can see and
