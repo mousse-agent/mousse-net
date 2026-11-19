@@ -352,8 +352,11 @@ control = [
 ]
 
 # Cross-machine: the relay on the Mac, both endpoints on the PC dialling
-# out (Part G topology). They wait for a variant of the helper's relay tests
-# that takes a remote relay's enrollment links instead of starting one.
+# out (Part G topology). crates/mousse-helper/tests/app_relay_remote.rs runs
+# the cases of app_relay.rs and app_relay_rotation.rs against the Mac's relay,
+# named by enrollment links in MOUSSE_RELAY_TEST_LINKS (docs/limits.md,
+# "Relay tests"). Without links it fails with reason=not_configured and
+# writes no result. Each run needs fresh links: each is used once.
 
 [[check]]
 id = "phase3.relay-routes-cross"
@@ -363,7 +366,7 @@ targets = ["pc-to-mac-lan"]
 judge = "marker"
 cross_machine = true
 waits = [{ slice = "E-R3 cross", paths = ["crates/mousse-helper/tests/app_relay_remote.rs"] }]
-device_steps = "Start mousse-relay init --public <Mac LAN address>:<port> and mousse-relay run on the Mac from ~/mousse-net-runs-internal/<track>, and run the app_relay cases on the PC against enrollment links from mousse-relay enroll there instead of the in-process relay. The Mac only listens; the PC dials."
+device_steps = "Mac, from ~/mousse-net-runs-internal/<track> at the build under test, debug profile: cargo build -p mousse-relay; two relays, each mousse-relay --state <dir> init --public <Mac LAN IP>:<port>, then mousse-relay --state <dir> run --listen <Mac LAN IP>:<port>; five links of the first (init prints one, mousse-relay --state <dir> enroll the rest) and one of the second. The Mac only listens; the PC dials. PC: mousse-check config-digest phase3.relay-routes-cross --target pc-to-mac-lan, then cargo test -p mousse-helper --test app_relay_remote -- --ignored --exact routes_cross --nocapture with MOUSSE_RELAY_TEST_LINKS=<the six links>, MOUSSE_RELAY_TEST_HOST_BUILD=<the Mac build, <commit>+debug> and MOUSSE_RELAY_TEST_RESULT=<file>; it ends PASS phase3.relay-routes-cross or FAIL phase3.relay-routes-cross reason=<word>. Sign the file with mousse-check sign --device-key <key> --config <digest>. Controls: the same with fresh links, the control's RUSTFLAGS on the PC build (its own CARGO_TARGET_DIR) and --control <name> on config-digest; the result names the control and must say FAIL."
 control = [
   { name = "close-all-on-removal", breaks = "a removal closes every caller's circuits", env = { RUSTFLAGS = '--cfg mousse_control="close-all-on-removal"' } },
   { name = "manifest-unapproved", breaks = "manifest relay routes are dialled without approval", env = { RUSTFLAGS = '--cfg mousse_control="manifest-unapproved"' } },
@@ -377,7 +380,7 @@ targets = ["pc-to-mac-lan"]
 judge = "marker"
 cross_machine = true
 waits = [{ slice = "E-R3 cross", paths = ["crates/mousse-helper/tests/app_relay_remote.rs"] }]
-device_steps = "As phase3.relay-routes-cross, running the app_relay_rotation cases."
+device_steps = "As phase3.relay-routes-cross, with one relay and three links, running --exact rotation_cross; it ends PASS phase3.relay-rotation-cross or FAIL phase3.relay-rotation-cross reason=<word>."
 control = [
   { name = "no-overlap", breaks = "a rotation drops the old key at once", env = { RUSTFLAGS = '--cfg mousse_control="no-overlap"' } },
 ]

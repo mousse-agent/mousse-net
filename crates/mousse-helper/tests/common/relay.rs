@@ -181,9 +181,7 @@ impl TestRelay {
     /// The handle of `host_dir`'s current registration key on this relay,
     /// from its relay seed and stored salt.
     pub fn handle_of(&self, host_dir: &Path) -> [u8; 32] {
-        let relays = read_json(&host_dir.join("relays.json"));
-        let salt = relays["relays"][0]["salt"].as_str().unwrap();
-        key_from(host_dir, REGISTRATION_KEY_INFO, salt).handle(&self.relay_id)
+        handle_in(host_dir, &self.relay_id)
     }
 }
 
@@ -192,6 +190,14 @@ impl Drop for TestRelay {
         self.stop();
         let _ = std::fs::remove_dir_all(&self.path);
     }
+}
+
+/// The handle of `host_dir`'s current registration key on the relay
+/// `relay_id`, from its relay seed and stored salt.
+pub fn handle_in(host_dir: &Path, relay_id: &RelayId) -> [u8; 32] {
+    let relays = read_json(&host_dir.join("relays.json"));
+    let salt = relays["relays"][0]["salt"].as_str().unwrap();
+    key_from(host_dir, REGISTRATION_KEY_INFO, salt).handle(relay_id)
 }
 
 fn read_json(path: &Path) -> Value {

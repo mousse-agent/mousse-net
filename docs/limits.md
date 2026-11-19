@@ -270,6 +270,20 @@ The probe reads the engine limits it tests (`MOUSSE_NET_PREAUTH_*`,
 same variables, so a check that tightens one for the host tightens it for
 the probe.
 
+### Relay tests
+
+Settings of the relay's tests, not limits. The relay reads the first two
+only in debug builds; the engine and the app read none of them (the
+helper's check for unknown `MOUSSE_NET_*` names does not see them).
+
+| Variable | What it does |
+| --- | --- |
+| `MOUSSE_RELAY_TAP` | A debug relay writes its decrypted view of both legs of every circuit to this file (`crates/mousse-relay/tests/marker.rs`). |
+| `MOUSSE_RELAY_CONTROL_MARKER_FILE` | Under the `marker-in-relay-memory` control, the relay keeps copies of this file's marker in its heap. |
+| `MOUSSE_RELAY_TEST_LINKS` | Enrollment links of a running `mousse-relay`, separated by whitespace or commas, each used once; links of several relays may be mixed. `crates/mousse-helper/tests/app_relay_remote.rs` (`phase3.relay-routes-cross`, `phase3.relay-rotation-cross`) needs them, at an IP address outside loopback: `routes_cross` six (five of one relay, one of a second), `rotation_cross` three. Without them its tests fail with `reason=not_configured`. A relay route of `tools/app-check/run.mjs` (`--route relay`) passes them to the app script, and allows each relay outside loopback in `MOUSSE_NET_TEST_EGRESS`. |
+| `MOUSSE_RELAY_TEST_HOST_BUILD` | The build of the relay those links name (`<commit>[-dirty]+<profile>`), written as `host_build` in the result of `app_relay_remote.rs`. Needed with `MOUSSE_RELAY_TEST_RESULT`. |
+| `MOUSSE_RELAY_TEST_RESULT` | A file `app_relay_remote.rs` writes its unsigned result to, for `mousse-check sign`; `{check}` is replaced by the check id. No result is written when the run was not configured. |
+
 ## Fixed on purpose
 
 These are protocol constants, not limits, so they are not settings:
