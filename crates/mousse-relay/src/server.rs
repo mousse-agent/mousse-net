@@ -23,7 +23,8 @@ use futures_util::{SinkExt, StreamExt};
 use mousse_net_core::relay::machine::{ConnId, IpKey, Now, Output, Relay, RelayConfig};
 use mousse_net_core::relay::{Class, RelayId, RelayLimits};
 use mousse_net_core::relay_hosted::{BootRecord, Hosted};
-use mousse_net_core::time::{Millis, UnixTime};
+use mousse_net_core::time::UnixTime;
+use mousse_net_io::clock::{Clock, SystemClock};
 use mousse_relay_plus::http::PlusHttp;
 use mousse_relay_plus::link::{self as plus_link, HostedCell, PlusLink};
 use mousse_relay_plus::settings::HostedSettings;
@@ -86,6 +87,13 @@ struct Core {
 struct Shared {
     core: Mutex<Core>,
     limits: RelayLimits,
+    /// Where the relay's time comes from. Its monotonic time keeps counting
+    /// while the machine sleeps, so lease windows judged on the Plus clock
+    /// cannot be stretched by a suspend (§A.9 duty 12).
+    clock: Arc<dyn Clock>,
+    /// tokio's clock at start; only the `relay-clock-pauses-in-sleep`
+    /// control reads it.
+    #[cfg_attr(not(mousse_control = "relay-clock-pauses-in-sleep"), allow(dead_code))]
     epoch: Instant,
     wall_offset: Option<u64>,
     wake: Notify,
@@ -171,13 +179,14 @@ pub fn ip_key(addr: IpAddr) -> IpKey {
 
 impl Shared {
     fn now(&self) -> Now {
-        let mono = Millis(self.epoch.elapsed().as_millis() as u64);
+        let mono = self.clock.mono();
+        // Must-fail control (phase4.relay-leases `relay-clock-pauses-in-sleep`):
+        // tokio's clock, which stops while the machine sleeps.
+        #[cfg(mousse_control = "relay-clock-pauses-in-sleep")]
+        let mono = mousse_net_core::time::Millis(self.epoch.elapsed().as_millis() as u64);
         let wall = match self.wall_offset {
             Some(base) => base + mono.0 / 1000,
-            None => SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
+            None => self.clock.now().0,
         };
         Now {
             mono,
@@ -363,17 +372,31 @@ impl HostedCell for Shared {
 /// Start a relay. It holds the state directory's process lock until it
 /// stops.
 pub async fn start(config: ServerConfig) -> Result<Running, String> {
-    start_inner(config, None).await
+    start_inner(config, None, Arc::new(SystemClock::new())).await
+}
+
+/// Start a relay that reads its time from `clock` (tests only: a clock that
+/// jumps the way a sleeping machine's does).
+#[doc(hidden)]
+pub async fn start_with_clock(
+    config: ServerConfig,
+    clock: Arc<dyn Clock>,
+) -> Result<Running, String> {
+    start_inner(config, None, clock).await
 }
 
 /// Start a relay whose wall clock is `wall_base` plus whole seconds since
 /// it started (tests only).
 #[doc(hidden)]
 pub async fn start_with_wall(config: ServerConfig, wall_base: u64) -> Result<Running, String> {
-    start_inner(config, Some(wall_base)).await
+    start_inner(config, Some(wall_base), Arc::new(SystemClock::new())).await
 }
 
-async fn start_inner(config: ServerConfig, wall_offset: Option<u64>) -> Result<Running, String> {
+async fn start_inner(
+    config: ServerConfig,
+    wall_offset: Option<u64>,
+    clock: Arc<dyn Clock>,
+) -> Result<Running, String> {
     #[cfg(mousse_control = "marker-in-relay-memory")]
     crate::control::keep_marker_in_memory();
     let lock = config.state.lock_process().map_err(|e| e.to_string())?;
@@ -454,6 +477,7 @@ async fn start_inner(config: ServerConfig, wall_offset: Option<u64>) -> Result<R
             control: crate::control::PersistAllowSet::load(&config.state),
         }),
         limits: config.limits,
+        clock,
         epoch: Instant::now(),
         wall_offset,
         wake: Notify::new(),
@@ -851,14 +875,15 @@ async fn timer(shared: Arc<Shared>) {
             }
         };
         // Wall-clock times (join expiries, key drops) need a tick at least
-        // once a second.
-        let cap = shared.epoch.elapsed() + Duration::from_secs(1);
-        let at = next
-            .map(|m| Duration::from_millis(m.0))
-            .unwrap_or(cap)
-            .min(cap);
+        // once a second. The wait is measured on the relay's clock, so a
+        // machine that slept wakes to every timer that came due meanwhile.
+        let now = shared.now().mono;
+        let wait = next
+            .map(|m| Duration::from_millis(m.since(now)))
+            .unwrap_or(Duration::from_secs(1))
+            .min(Duration::from_secs(1));
         tokio::select! {
-            _ = tokio::time::sleep_until(shared.epoch + at) => {
+            _ = tokio::time::sleep(wait) => {
                 let mut guard = shared.core.lock().expect("core");
                 let core = &mut *guard;
                 let now = shared.now();

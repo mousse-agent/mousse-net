@@ -14,11 +14,13 @@ mod common;
 mod test_issuer_standin;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::{key, next, temp_dir, WAIT};
 use mousse_net_core::relay::{Class, RefuseReason, RelayClientKey, RelayId, RelayMessage};
 use mousse_net_core::relay_hosted::{BootState, HostedLimits};
+use mousse_net_io::ManualClock;
 use mousse_relay::client::{Received, RelayConn};
 use mousse_relay::server::{self, HostedConfig, Running, ServerConfig, ISSUER_KEYS_FILE};
 use mousse_relay::state::{hex, StateDir};
@@ -27,6 +29,7 @@ use test_issuer_standin::{BlockSpec, TestIssuerStandIn};
 
 struct Hosted {
     plus: TestIssuerStandIn,
+    clock: Arc<ManualClock>,
     path: PathBuf,
     relay: Option<Running>,
     id: RelayId,
@@ -64,22 +67,27 @@ impl Hosted {
         ];
         overrides.extend_from_slice(hosted);
         let limits = HostedLimits::DEFAULT.with_overrides(&overrides).unwrap();
-        let relay = server::start(ServerConfig {
-            state: dir,
-            listen: "127.0.0.1:0".parse().unwrap(),
-            limits: common::limits(&[]),
-            hosted: Some(HostedConfig {
-                settings: HostedSettings {
-                    plus_url: PlusUrl::parse(&plus.url()).unwrap(),
-                    limits,
-                },
-                build_id: "mousse-relay test".into(),
-            }),
-        })
+        let clock = Arc::new(ManualClock::new());
+        let relay = server::start_with_clock(
+            ServerConfig {
+                state: dir,
+                listen: "127.0.0.1:0".parse().unwrap(),
+                limits: common::limits(&[]),
+                hosted: Some(HostedConfig {
+                    settings: HostedSettings {
+                        plus_url: PlusUrl::parse(&plus.url()).unwrap(),
+                        limits,
+                    },
+                    build_id: "mousse-relay test".into(),
+                }),
+            },
+            clock.clone(),
+        )
         .await
         .unwrap();
         let h = Self {
             plus,
+            clock,
             path,
             relay: Some(relay),
             id,
@@ -536,4 +544,48 @@ async fn a_stop_reports_every_lease_final() {
     assert!(last.entries.iter().all(|e| e.is_final));
     assert_eq!(h.plus.final_of([1; 16]), Some((1_234, 0)));
     assert_eq!(h.plus.final_of([2; 16]), Some((0, 0)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lease_ends_on_time_across_a_machine_sleep_with_plus_unreachable() {
+    // Control relay-clock-pauses-in-sleep.
+    let (target, caller) = (key(0x6a), key(0x7a));
+    let h = Hosted::start("hosted-sleep", 9, &[("RELAY_REFILL_WAIT_MS", 1_000)]).await;
+    let mut reg = h.register(&target, &caller).await;
+    let now = h.plus.plus_now();
+    let b = block(1, 1, Class::Interactive, 1 << 20);
+    let env = h.plus.block(&BlockSpec {
+        lease_id: [1; 16],
+        relay_id: h.id.0,
+        boot_id: reg.boot_id,
+        handle: h.handle(&target),
+        class: b.class,
+        sequence: b.seq,
+        rate_cap: b.cap,
+        bytes: b.bytes,
+        not_before: now - 5,
+        // Twenty seconds left on Plus's clock.
+        expires_at: now + 20,
+        rate_group: [b.group; 16],
+    });
+    reg.send(&RelayMessage::Lease { block: env }).await.unwrap();
+    let (mut leg, mut acc) = h
+        .connect(&mut reg, &target, &caller, Class::Interactive)
+        .await;
+    leg.send_raw(b"before".to_vec()).await.unwrap();
+    assert_eq!(next(&mut acc).await, Received::Peer(b"before".to_vec()));
+    // Plus is cut off, and the machine sleeps for 25 seconds (less than any
+    // idle limit): its monotonic clock that counts sleep and its wall clock
+    // jump; tokio's clock does not.
+    h.plus.set_down(true);
+    h.clock.advance_mono(25_000);
+    h.clock.advance(25);
+    // The lease is past its expiry on the Plus clock: final, and nothing
+    // more is forwarded on it.
+    assert_eq!(status_not_threshold(&mut reg).await, vec![(1, 6, 2)]);
+    leg.send_raw(b"after".to_vec()).await.unwrap();
+    assert_eq!(
+        peer_within(&mut acc, Duration::from_millis(500)).await,
+        None
+    );
 }
