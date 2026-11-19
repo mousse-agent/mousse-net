@@ -11,7 +11,8 @@ the part another implementation needs.
 |---|---|
 | [`wire.md`](wire.md) | **Normative.** Identity keys, session certificates, step 1 and step 2, grants, pairing tickets and flows, attempt limits, the mux, control messages, error codes, versions. |
 | [`cpace.md`](cpace.md) | **Normative.** The code exchange (CPace) used by "Send link" pairing. |
-| [`vectors/`](vectors/README.md) | Test vectors for everything in `wire.md`, including rejection vectors. |
+| [`relay.md`](relay.md) | **Normative.** The relay protocol, version 1: the outer connection, relay messages, proofs, admission, splicing, self-hosted authorization. |
+| [`vectors/`](vectors/README.md) | Test vectors for everything in `wire.md` and `relay.md`, including rejection vectors. |
 | [`threat-model.md`](threat-model.md) | What Phase 0 defends against, and what it does not. |
 | [`privacy.md`](privacy.md) | What the relay, Plus and the web client can see. |
 

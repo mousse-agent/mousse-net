@@ -33,6 +33,8 @@ test-in-person = []
 
 [dev-dependencies]
 serde_json = "=1.0.154"
+# Reads the terminal QR code in tests/headless.rs, as a phone's scanner would.
+rqrr = { version = "=0.11.0", default-features = false }
 # The relay tests run the loopback test relay in the test process.
 mousse-net-core = { path = "../mousse-net-core" }
 mousse-net-io = { path = "../mousse-net-io", features = ["test-relay"] }
@@ -40,4 +42,8 @@ tokio = { version = "=1.54.1", features = ["rt-multi-thread", "net", "macros", "
 
 [[test]]
 name = "loopback"
+required-features = ["test-in-person"]
+
+[[test]]
+name = "headless"
 required-features = ["test-in-person"]

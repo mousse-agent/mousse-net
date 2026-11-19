@@ -1,0 +1,23 @@
+# The relay in Docker (docs/release.md). Pin the image by the digest in the
+# release's signed mousse-relay-image.digest.
+#
+#   docker compose run --rm relay init --state /state --public <ip or name>:443
+#   docker compose up -d
+#
+# `init` prints the enrollment link. The state volume holds the relay identity;
+# keep it across upgrades (change the digest, then `docker compose up -d`).
+services:
+  relay:
+    image: ghcr.io/mousse-agent/mousse-relay@sha256:<digest from mousse-relay-image.digest>
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    ulimits:
+      core: 0
+    ports:
+      - "443:443"
+    volumes:
+      - relay-state:/state
+volumes:
+  relay-state:

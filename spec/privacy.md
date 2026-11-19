@@ -1,7 +1,8 @@
 # What the relay, Plus and the web client can see
 
-Status: Phase 0 stub. It states what is true in Phase 0 and lists what later
-phases must add. Each later phase updates this document before it ships.
+Status: Phase 3. It states what is true with direct connections (Phase 0)
+and through a self-hosted relay (Phase 3), and lists what later phases must
+add. Each later phase updates this document before it ships.
 
 ## Phase 0 facts
 
@@ -66,6 +67,65 @@ phases must add. Each later phase updates this document before it ships.
   ([`wire.md`](wire.md) 10.1), so a swapped link cannot make the joiner send
   its full name to a fake host that way.
 
+## Through a relay (Phase 3)
+
+A relay ([`relay.md`](relay.md)) forwards WebSocket messages between two
+legs. Everything a device says to the other device travels inside the peer
+TLS session, pinned to the other device's identity key (wire.md 5.4), so
+the relay forwards bytes it cannot read. What it does see:
+
+- **IP addresses, timing and sizes.** The IP address and port of every
+  connection to it, when each opens and closes, and the size and time of
+  every message on each leg: so who talks to whom (by handle and caller
+  fingerprint, below), when, and how much. An observer on the path between
+  a device and the relay sees the same IPs, timing and sizes, and that the
+  connection is a WebSocket over TLS (ALPN `http/1.1`) to that address. The
+  path `/mousse-relay/1` and subprotocol `mousse-relay.1` are inside TLS.
+- **Handles.** A handle is a hash of the relay id and a registration key
+  ([`relay.md`](relay.md) 3). It is stable for as long as the target keeps
+  that key, so the relay can recognise a target across connections and IP
+  changes. A handle means nothing on another relay. A self-hosted relay
+  rotates a target's key only when the target sends `SUCCESSOR`; during the
+  overlap the relay knows the two handles are one target.
+- **Caller key fingerprints and who calls whom.** A target's allow-set lists
+  the fingerprint of each caller key it accepts, and every `CALL` carries
+  the caller's key, so the relay learns which caller key opens which
+  circuit to which handle. Each pairing has its own caller key: a device
+  that calls two hosts uses two unrelated keys, so the relay cannot link
+  those calls by key. It can still link them by IP address and timing.
+- **Joins.** A joiner presents an invitation tag, a hash only a ticket
+  holder can compute. The relay learns that some invitation of that handle
+  was used, never the invitation id, the ticket secret or the code.
+- **Registration keys and identity keys are different.** The relay never
+  sees an identity key or a certificate: those travel inside the peer TLS.
+- **The relay id.** Clients pin the relay by the hash of its TLS key. The
+  relay's certificate carries no name and no operator details.
+
+**What the relay keeps.** Its state directory holds only its identity key,
+the operator's list of authorized registration key fingerprints (with drop
+times after a `SUCCESSOR`), hashes of unused enrollment codes, its public
+address, and two lock files. Allow-sets, registrations, circuits and IP
+addresses live in memory only and end with the process
+([`relay.md`](relay.md) 12). Its log lines carry aggregate counts and
+errors only: never an IP address, handle, fingerprint or payload. `mousse-check
+relay-inspect` lists the state directory and flags any other file.
+
+**Who runs the relay.** A self-hosted relay is run by the person who owns
+the devices, on a machine they rent or own. The machine's provider can see
+what the relay process can see (above), and can read the identity key from
+disk; with it, the provider could stand up a copy of the relay and receive
+the same connections, but still not read them or get past either device's
+pin.
+
+**The WSS terminator.** The relay process itself ends the outer TLS: there
+is no load balancer or CDN in front of a self-hosted relay. If an operator
+puts one there, that party sees what the relay sees (above) and nothing
+more, because the peer TLS runs end to end inside.
+
+**How users are told.** Where a relay route is approved, the app must say
+that the relay's operator can see which of their devices connect, when and
+how much, and never what is said.
+
 ## Rate groups on hosted relays (Phase 4, decided early)
 
 A hosted relay limits speed per **rate group**, a random 16-byte value in
@@ -91,11 +151,8 @@ one new handle per device and relay per day by default.
 These headings come from the plan. Each must say what each party can see and
 how users are told.
 
-- **IPs, timing and sizes** at a relay (Phase 3 onward).
-- **Handles and per-pairing keys** used to address devices through a relay.
-- **Linking by issuer and IP:** what Plus and a relay can link across
-  sessions.
+- **Linking by issuer and IP:** what Plus and a hosted relay can link
+  across sessions (Phase 4; a self-hosted relay's part is above).
 - **Settlement metadata** for paid relay use (Phase 4).
-- **The WSS terminator:** what the party ending the outer WebSocket TLS sees.
 - **Web-client update trust:** how users know which web-client build they run
   (Phase 5).

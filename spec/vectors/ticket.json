@@ -495,6 +495,102 @@
       {
         "hint": "wss://desk.local/x",
         "result": {
+          "skip": "malformed"
+        }
+      },
+      {
+        "hint": "wss://desk.local/mousse-net/1",
+        "result": {
+          "wss": {
+            "host": {
+              "dns": "desk.local"
+            },
+            "path": "/mousse-net/1",
+            "port": 443
+          }
+        }
+      },
+      {
+        "hint": "wss://Tunnel.Example:8443/a/b_c.d~e-f/mousse-net/1",
+        "result": {
+          "wss": {
+            "host": {
+              "dns": "tunnel.example"
+            },
+            "path": "/a/b_c.d~e-f/mousse-net/1",
+            "port": 8443
+          }
+        }
+      },
+      {
+        "hint": "wss://[fd00::20]/mousse-net/1",
+        "result": {
+          "wss": {
+            "host": {
+              "ipv6": "fd000000000000000000000000000020"
+            },
+            "path": "/mousse-net/1",
+            "port": 443
+          }
+        }
+      },
+      {
+        "hint": "wss://203.0.113.7:7443/mousse-net/1",
+        "result": {
+          "wss": {
+            "host": {
+              "ipv4": "203.0.113.7"
+            },
+            "path": "/mousse-net/1",
+            "port": 7443
+          }
+        }
+      },
+      {
+        "hint": "wss://desk.local/mousse-net/2",
+        "result": {
+          "skip": "malformed"
+        }
+      },
+      {
+        "hint": "wss://desk.local/mousse-net/1/",
+        "result": {
+          "skip": "malformed"
+        }
+      },
+      {
+        "hint": "wss://desk.local/mousse-net/1?x=1",
+        "result": {
+          "skip": "malformed"
+        }
+      },
+      {
+        "hint": "wss://desk.local/a%2Fb/mousse-net/1",
+        "result": {
+          "skip": "malformed"
+        }
+      },
+      {
+        "hint": "wss://user@desk.local/mousse-net/1",
+        "result": {
+          "skip": "malformed"
+        }
+      },
+      {
+        "hint": "wss://desk.local:0/mousse-net/1",
+        "result": {
+          "skip": "malformed"
+        }
+      },
+      {
+        "hint": "wss://desk.local",
+        "result": {
+          "skip": "malformed"
+        }
+      },
+      {
+        "hint": "ws://127.0.0.1:8080/mousse-net/1",
+        "result": {
           "skip": "reserved"
         }
       },
@@ -529,7 +625,7 @@
         }
       }
     ],
-    "description": "Route hints (spec wire.md, \"Route hints\"). Each hint reads as a tcp route (host as ipv4 in dotted decimal, ipv6 as its 16 bytes in hex, or a dns name lowercased, and a port), an mdns instance, or is skipped with a reason: reserved, unknown_scheme or malformed."
+    "description": "Route hints (spec wire.md, \"Route hints\"). Each hint reads as a tcp route (host as ipv4 in dotted decimal, ipv6 as its 16 bytes in hex, or a dns name lowercased, and a port), a wss route (the same host, the port, 443 when the hint has none, and the path), an mdns instance, or is skipped with a reason: reserved, unknown_scheme or malformed."
   },
   "valid": {
     "binary": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450000102030405060708090a0b0c0d0e0f0550101112131415161718191a1b1c1d1e1f061a6ab13dd80782777463703a2f2f3139322e3136382e312e32303a37343433757463703a2f2f5b666430303a3a32305d3a37343433",

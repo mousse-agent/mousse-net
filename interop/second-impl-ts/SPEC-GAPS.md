@@ -19,6 +19,22 @@
 | In-person name and profile label | `wire.md` §10.3. In-person proofs combine both fixture fields, for example `Phone (Work)`. Send-link proofs use only the computer name. |
 | Live-grant proof answer in the connect convention | `wire.md` §8 step 3. The `pairing-e2e.json` convention now says the proof gets `PAIRED` when the grant's receipt names this invitation, else a second `AUTHORIZED`. |
 | Proof timeout while learning a lost `PAIRED` | `wire.md` §10.6 rule 7. The flow ends with `NOT_AUTHORIZED` and leaves the pending mark stored. Reopening the ticket can resume recovery. |
+| Relay default limits | `relay.md` §13. The defaults table gives every relay limit, and the vectors assume it unless a scenario's `limits` says otherwise. It includes `RELAY_MAX_CONNECTIONS` and `RELAY_CONNECTIONS_PER_IP`. |
+| Relay address key | `relay.md` §13 ("Address key"). The key is 16 bytes: IPv4 in bytes 0 to 3 with byte 15 set to 4, or an IPv6 /64 in bytes 0 to 7 with byte 15 set to 6. In the vectors it is opaque and only equality matters. |
+| What counts per address | `relay.md` §13 ("What counts"). Every open connection counts, whatever its role, from `RELAY_HELLO` until it closes. An accept leg leaves its address key's count once its `ACCEPT` is accepted. A connection over either connection limit is closed with 4006 and draws no nonce. |
+| Start of the registration waits | `relay.md` §6. The `REGISTER` or `ENROLL` starts the registration idle wait, and `REGISTERED` starts the keepalive. |
+| Relay firing order | `relay.md` §6. Due monotonic waits fire first, by time, then table row, then connection number. Then wall-clock items fire, whenever each came due: join expiries in order of the caller's leg, then key drops in order of fingerprint. |
+| Join expiry and promotion | `relay.md` §9.3. A waiting join circuit at its expiry closes only the joiner's leg with 4006. A promoted circuit is no longer a join circuit, so neither the budget nor the expiry applies to it. |
+| Accept proof key | `relay.md` §10.1 rule 2. The proof is checked against the key the handle is derived from, which is kept with the circuit, so an accept still works after the registration has closed or been replaced. |
+| Close order on revocation and key drop | `relay.md` §10.3. The registration connection closes first, then each circuit in order of its caller's leg, the caller's leg before the accept leg. |
+| Revocation output | `relay.md` §14. The operator's command has already changed the stored list, so `revoke` gives only the closes and no durable output. |
+| Peer data on a leg that is not spliced | `relay.md` §14. `data` on a connection that is not a spliced leg is a protocol error (close 1002). A `recv` on a spliced leg is peer data of the message's length. |
+| `SUCCESSOR` naming a listed key | `relay.md` §7.4 rule 4. A new key already on the authorized list, in any state, gets `REFUSED(not_authorized)`, and the registration closes with 1000. `successor_unauthorized_current` tests this in its last step. |
+| Relay certificate signature | `relay.md` §2.1. Only `tbsCertificate` is fixed byte for byte. The vector certificate is signed with RFC 6979 nonces and no low-S normalization, so signing the same way reproduces it. |
+| Relay pin check | `relay.md` §2.1. The pin check judges only the leaf's SPKI. A certificate off the profile passes if its key matches the pin. |
+| Writing an enrollment link | `relay.md` §11. A reader accepts any host text that the `tcp` grammar accepts. A relay writes IPv4 in dotted decimal, IPv6 in RFC 5952 form in brackets and a DNS name in lowercase, and links in that form print back unchanged. |
+| Join `INCOMING` class and hosted-only bounds | `relay.md` §4.3. The relay always sends class 0 in a join's `INCOMING`. Hosted-only fields are bounded only by the 16 384-byte message maximum until hosted mode sets their bounds. |
+| Connection numbers in the vectors | `relay.md` §6. A running relay numbers connections in the order they open; in the vectors the numbers are the scenarios' `conn` values, whatever order those open in. Ties are ordered by number. |
 
 ## Open
 

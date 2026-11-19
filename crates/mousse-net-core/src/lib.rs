@@ -18,6 +18,9 @@
 //! - [`pairing`]: tickets, join proofs, host and joiner pairing state machines.
 //! - [`mux`]: frame codec, per-stream credit, priority scheduler, keepalive.
 //! - [`session`]: certificate-driven session lifetime and path switching.
+//! - [`relay`]: the relay protocol and the relay's admission state machine.
+//! - [`relay_hosted`]: the relay's hosted mode: admission tokens, leases,
+//!   the Plus clock and reports.
 //! - [`manifest`]: the host-signed list of relay routes.
 //! - [`relay_wire`]: the relay protocol as an endpoint speaks it.
 //! - [`limits`]: every tunable limit, its default and allowed range.
@@ -34,7 +37,19 @@
         mousse_control = "break-authz",
         mousse_control = "break-raw-signature",
         mousse_control = "break-cpace-confirm",
-        mousse_control = "break-cpace-sid"
+        mousse_control = "break-cpace-sid",
+        mousse_control = "limits-raise",
+        mousse_control = "no-pin-relay",
+        mousse_control = "relay-skip-allow-set",
+        mousse_control = "relay-refuse-early",
+        mousse_control = "relay-successor-unchecked",
+        mousse_control = "relay-no-preaccept-budget",
+        mousse_control = "per-socket-rate",
+        mousse_control = "accept-replayed-lease",
+        mousse_control = "ignore-admission-expiry",
+        mousse_control = "close-funded-at-expiry",
+        mousse_control = "refuse-expired-reregister",
+        mousse_control = "expiry-on-relay-wall-clock"
     ),
     not(debug_assertions)
 ))]
@@ -47,7 +62,19 @@ compile_error!("mousse_control plants a bug for tests; it is not allowed in rele
     mousse_control = "break-authz",
     mousse_control = "break-raw-signature",
     mousse_control = "break-cpace-confirm",
-    mousse_control = "break-cpace-sid"
+    mousse_control = "break-cpace-sid",
+    mousse_control = "limits-raise",
+    mousse_control = "no-pin-relay",
+    mousse_control = "relay-skip-allow-set",
+    mousse_control = "relay-refuse-early",
+    mousse_control = "relay-successor-unchecked",
+    mousse_control = "relay-no-preaccept-budget",
+    mousse_control = "per-socket-rate",
+    mousse_control = "accept-replayed-lease",
+    mousse_control = "ignore-admission-expiry",
+    mousse_control = "close-funded-at-expiry",
+    mousse_control = "refuse-expired-reregister",
+    mousse_control = "expiry-on-relay-wall-clock"
 ))]
 const _: () = {
     let profile = env!("MOUSSE_BUILD_PROFILE").as_bytes();
@@ -78,6 +105,8 @@ pub mod limits;
 pub mod manifest;
 pub mod mux;
 pub mod pairing;
+pub mod relay;
+pub mod relay_hosted;
 pub mod relay_wire;
 pub mod session;
 pub mod session_cert;

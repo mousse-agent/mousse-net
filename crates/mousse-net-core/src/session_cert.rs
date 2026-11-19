@@ -57,20 +57,20 @@ pub const CLOCK_ERROR_MESSAGE: &str =
 
 /// `AlgorithmIdentifier` for ecdsa-with-SHA256 (1.2.840.10045.4.3.2), no
 /// parameters.
-const ECDSA_WITH_SHA256: [u8; 12] = [
+pub(crate) const ECDSA_WITH_SHA256: [u8; 12] = [
     0x30, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02,
 ];
 
 /// SPKI DER prefix for an uncompressed P-256 point: id-ecPublicKey with
 /// namedCurve prime256v1, then the BIT STRING header and its zero
 /// unused-bits byte. The 65-byte point follows.
-const SPKI_PREFIX: [u8; 26] = [
+pub(crate) const SPKI_PREFIX: [u8; 26] = [
     0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a,
     0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
 ];
 
 /// OID 2.5.4.3 (commonName), content octets.
-const OID_COMMON_NAME: [u8; 3] = [0x55, 0x04, 0x03];
+pub(crate) const OID_COMMON_NAME: [u8; 3] = [0x55, 0x04, 0x03];
 
 /// Why a certificate was rejected (or could not be built).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

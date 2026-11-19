@@ -9,6 +9,8 @@
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen_test::wasm_bindgen_test as test;
 
+mod relay;
+
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::path::PathBuf;
@@ -106,6 +108,7 @@ fn checked_in(name: &str) -> Option<String> {
         "join-proof.json",
         "mux.json",
         "pairing-attempts.json",
+        "relay-admission.json",
         "session-cert.json",
         "session-lifecycle.json",
         "ticket.json",
@@ -951,6 +954,14 @@ fn dirty_fragment(fragment: &str) -> String {
     String::from_utf8(bytes).expect("ascii")
 }
 
+fn host_json(host: &RouteHost) -> J {
+    match host {
+        RouteHost::Ipv4(a) => json!({ "ipv4": a.to_string() }),
+        RouteHost::Ipv6(a) => json!({ "ipv6": hex(&a.octets()) }),
+        RouteHost::Dns(name) => json!({ "dns": name }),
+    }
+}
+
 fn route_hint_vectors() -> J {
     let hints = [
         "tcp://192.168.1.20:7443",
@@ -996,6 +1007,18 @@ fn route_hint_vectors() -> J {
         "ssh://desk.local",
         "ws://desk.local/x",
         "wss://desk.local/x",
+        "wss://desk.local/mousse-net/1",
+        "wss://Tunnel.Example:8443/a/b_c.d~e-f/mousse-net/1",
+        "wss://[fd00::20]/mousse-net/1",
+        "wss://203.0.113.7:7443/mousse-net/1",
+        "wss://desk.local/mousse-net/2",
+        "wss://desk.local/mousse-net/1/",
+        "wss://desk.local/mousse-net/1?x=1",
+        "wss://desk.local/a%2Fb/mousse-net/1",
+        "wss://user@desk.local/mousse-net/1",
+        "wss://desk.local:0/mousse-net/1",
+        "wss://desk.local",
+        "ws://127.0.0.1:8080/mousse-net/1",
         "relay:abc",
         "quic://desk.local:7443",
         "TCP://desk.local:7443",
@@ -1007,12 +1030,10 @@ fn route_hint_vectors() -> J {
         .map(|hint| {
             let result = match Route::parse(hint) {
                 Ok(Route::Tcp { host, port }) => {
-                    let host = match host {
-                        RouteHost::Ipv4(a) => json!({ "ipv4": a.to_string() }),
-                        RouteHost::Ipv6(a) => json!({ "ipv6": hex(&a.octets()) }),
-                        RouteHost::Dns(name) => json!({ "dns": name }),
-                    };
-                    json!({ "tcp": { "host": host, "port": port } })
+                    json!({ "tcp": { "host": host_json(&host), "port": port } })
+                }
+                Ok(Route::Wss { host, port, path }) => {
+                    json!({ "wss": { "host": host_json(&host), "port": port, "path": path } })
                 }
                 Ok(Route::Mdns { instance }) => json!({ "mdns": instance }),
                 Err(skip) => json!({ "skip": skip.name() }),
@@ -1021,7 +1042,7 @@ fn route_hint_vectors() -> J {
         })
         .collect();
     json!({
-        "description": "Route hints (spec wire.md, \"Route hints\"). Each hint reads as a tcp route (host as ipv4 in dotted decimal, ipv6 as its 16 bytes in hex, or a dns name lowercased, and a port), an mdns instance, or is skipped with a reason: reserved, unknown_scheme or malformed.",
+        "description": "Route hints (spec wire.md, \"Route hints\"). Each hint reads as a tcp route (host as ipv4 in dotted decimal, ipv6 as its 16 bytes in hex, or a dns name lowercased, and a port), a wss route (the same host, the port, 443 when the hint has none, and the path), an mdns instance, or is skipped with a reason: reserved, unknown_scheme or malformed.",
         "cases": cases,
     })
 }
@@ -2444,6 +2465,7 @@ fn all_vectors() -> Vec<(&'static str, J)> {
         ("control.json", control_vectors()),
         ("hello.json", hello_vectors()),
         ("pairing-attempts.json", pairing_attempt_vectors()),
+        ("relay-admission.json", relay::relay_admission_vectors()),
     ]
 }
 

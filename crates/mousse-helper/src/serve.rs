@@ -20,7 +20,8 @@ use mousse_net_io::pipe::{accept_tcp, route_from_addr, route_uri};
 use mousse_net_io::rng::{os_rng, random_bytes};
 use mousse_net_io::store::{hex, short_id};
 use mousse_net_io::{
-    ApprovalRequest, Caller, Host, HostConfig, HostEvent, PortChoice, SharedSigner,
+    ApprovalRequest, Caller, Host, HostConfig, HostEvent, ListenerKind, PortChoice, PreAuthSlot,
+    SharedSigner,
 };
 use serde_json::{json, Value};
 use tokio::net::TcpStream;
@@ -91,102 +92,16 @@ fn print_line(line: impl AsRef<str>) {
     crate::applog::line(line);
 }
 
-/// Inbound connections that have not passed step 2 yet: the TLS handshake,
-/// then authorization or pairing. Each holds a place from before its
-/// handshake starts until its connection is live or closed: at most
-/// `PREAUTH_CONNECTIONS` in all and `PREAUTH_PER_SOURCE` from one address.
-/// A connection past either is dropped at once, before any work is spent on
-/// it, so slow or stalled handshakes cannot use up sockets, tasks and memory.
-pub(crate) struct PreAuth {
-    total: usize,
-    per_source: usize,
-    state: Mutex<PreAuthState>,
-}
-
-#[derive(Default)]
-struct PreAuthState {
-    open: usize,
-    by_source: HashMap<IpAddr, usize>,
-}
-
-/// Why a connection was dropped before its handshake.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum PreAuthFull {
-    /// `PREAUTH_CONNECTIONS` are waiting.
-    Endpoint,
-    /// `PREAUTH_PER_SOURCE` from this address are waiting.
-    Source,
-}
-
-/// A place in [`PreAuth`]; freed when dropped.
-pub(crate) struct PreAuthPermit {
-    admission: Arc<PreAuth>,
-    source: IpAddr,
-}
-
-impl PreAuth {
-    pub(crate) fn new(total: u64, per_source: u64) -> Arc<Self> {
-        Arc::new(Self {
-            total: usize::try_from(total).unwrap_or(usize::MAX),
-            per_source: usize::try_from(per_source).unwrap_or(usize::MAX),
-            state: Mutex::new(PreAuthState::default()),
-        })
-    }
-
-    fn from_limits() -> Arc<Self> {
-        let h = crate::limits::helper();
-        Self::new(h.preauth_connections(), h.preauth_per_source())
-    }
-
-    /// A place for a connection from `source`, if both caps allow one.
-    pub(crate) fn try_admit(
-        self: &Arc<Self>,
-        source: IpAddr,
-    ) -> Result<PreAuthPermit, PreAuthFull> {
-        let source = source.to_canonical();
-        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if st.open >= self.total {
-            return Err(PreAuthFull::Endpoint);
-        }
-        let from_source = st.by_source.entry(source).or_default();
-        if *from_source >= self.per_source {
-            return Err(PreAuthFull::Source);
-        }
-        *from_source += 1;
-        st.open += 1;
-        Ok(PreAuthPermit {
-            admission: self.clone(),
-            source,
-        })
-    }
-}
-
-impl Drop for PreAuthPermit {
-    fn drop(&mut self) {
-        let mut st = self
-            .admission
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        st.open = st.open.saturating_sub(1);
-        if let Some(n) = st.by_source.get_mut(&self.source) {
-            *n -= 1;
-            if *n == 0 {
-                st.by_source.remove(&self.source);
-            }
-        }
-    }
-}
-
-/// Run step 1 and step 2 on an inbound pipe, holding `permit` until the
-/// connection is live or closed. `None` if it was refused.
+/// Run step 1 and step 2 on an inbound pipe that holds `slot`; the host
+/// keeps the place until the connection is live or closed. `None` if it
+/// was refused.
 async fn accept_holding(
     host: &Host,
     pipe: TcpStream,
     addr: SocketAddr,
-    permit: PreAuthPermit,
+    slot: PreAuthSlot,
 ) -> Option<mousse_net_io::Connection> {
-    let conn = match host.accept(pipe).await {
+    let conn = match host.accept_admitted(pipe, slot).await {
         Ok(conn) => conn,
         Err(e) => {
             print_line(format!("refused {addr}: {e}"));
@@ -196,7 +111,6 @@ async fn accept_holding(
     // Bounded: the handshake by HANDSHAKE_TIMEOUT_MS, step 2 by
     // JOIN_PROOF_WAIT_MS and the invitation's own limits.
     let _ = conn.settled(true).await;
-    drop(permit);
     Some(conn)
 }
 
@@ -342,30 +256,23 @@ pub async fn run(
     };
     tokio::pin!(app_end);
     let mut ended = None;
-    let preauth = PreAuth::from_limits();
 
     loop {
         tokio::select! {
             accepted = accept_tcp(&listener) => match accepted {
-                // Paused: nothing is admitted until the removal is saved.
-                Ok((pipe, addr)) if removal.is_paused() => {
-                    print_line(format!("dropped {addr}: networking is paused"));
-                    drop(pipe);
-                }
-                Ok((pipe, addr)) => match preauth.try_admit(addr.ip()) {
-                    Err(full) => {
-                        print_line(format!("dropped {addr}: {}", match full {
-                            PreAuthFull::Endpoint => "too many connections waiting for authorization (PREAUTH_CONNECTIONS)",
-                            PreAuthFull::Source => "too many connections from its address waiting for authorization (PREAUTH_PER_SOURCE)",
-                        }));
+                // A place in the TCP pool before anything is read; none
+                // while paused (the removal is not saved yet).
+                Ok((pipe, addr)) => match host.admit(ListenerKind::Tcp, Some(addr.ip())) {
+                    Err(why) => {
+                        print_line(format!("dropped {addr}: {why}"));
                         drop(pipe);
                     }
-                    Ok(permit) => match &app {
+                    Ok(slot) => match &app {
                         Some(app) => {
-                            tokio::spawn(app_connection(host.clone(), app.clone(), pipe, addr, permit));
+                            tokio::spawn(app_connection(host.clone(), app.clone(), pipe, addr, slot));
                         }
                         None => {
-                            tokio::spawn(handle_connection(host.clone(), pipe, addr, permit));
+                            tokio::spawn(handle_connection(host.clone(), pipe, addr, slot));
                         }
                     },
                 },
@@ -429,15 +336,15 @@ async fn app_connection(
     app: crate::app::App,
     pipe: TcpStream,
     addr: SocketAddr,
-    permit: PreAuthPermit,
+    slot: PreAuthSlot,
 ) {
-    if let Some(conn) = accept_holding(&host, pipe, addr, permit).await {
+    if let Some(conn) = accept_holding(&host, pipe, addr, slot).await {
         app.inbound(conn).await;
     }
 }
 
-async fn handle_connection(host: Host, pipe: TcpStream, addr: SocketAddr, permit: PreAuthPermit) {
-    let Some(conn) = accept_holding(&host, pipe, addr, permit).await else {
+async fn handle_connection(host: Host, pipe: TcpStream, addr: SocketAddr, slot: PreAuthSlot) {
+    let Some(conn) = accept_holding(&host, pipe, addr, slot).await else {
         return;
     };
     let peer = short_id(conn.peer());
@@ -578,7 +485,7 @@ fn grants_json(host: &Host) -> Value {
 }
 
 async fn control_session(state: Arc<State>, mut ch: Channel) {
-    let Ok(Some(request)) = ch.recv().await else {
+    let Ok(Some(request)) = ch.recv_first().await else {
         return;
     };
     let token = request.get("token").and_then(Value::as_str).unwrap_or("");
@@ -729,36 +636,4 @@ pub fn default_state_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     home.join(".mousse-helper")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn ip(text: &str) -> IpAddr {
-        text.parse().unwrap()
-    }
-
-    #[test]
-    fn preauth_caps_count_all_sources_and_each_source_and_free_on_drop() {
-        let admission = PreAuth::new(3, 2);
-        let a1 = admission.try_admit(ip("10.0.0.1")).unwrap();
-        let _a2 = admission.try_admit(ip("10.0.0.1")).unwrap();
-        // The same address written as an IPv4-mapped IPv6 one.
-        assert_eq!(
-            admission.try_admit(ip("::ffff:10.0.0.1")).err(),
-            Some(PreAuthFull::Source)
-        );
-        let _b1 = admission.try_admit(ip("10.0.0.2")).unwrap();
-        assert_eq!(
-            admission.try_admit(ip("10.0.0.3")).err(),
-            Some(PreAuthFull::Endpoint)
-        );
-        drop(a1);
-        let _c1 = admission.try_admit(ip("10.0.0.3")).unwrap();
-        assert_eq!(
-            admission.try_admit(ip("10.0.0.1")).err(),
-            Some(PreAuthFull::Endpoint)
-        );
-    }
 }
