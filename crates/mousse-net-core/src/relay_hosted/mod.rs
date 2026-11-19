@@ -21,7 +21,7 @@ mod report;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 
-use crate::time::{Millis, UnixTime};
+use crate::time::Millis;
 
 pub use clock::PlusClock;
 pub use records::{
@@ -80,15 +80,8 @@ pub const CLOSE_ADMISSION_EXPIRED: u16 = 4004;
 /// The lowest and highest status threshold a `REGISTER` may give (§B.3).
 pub const THRESHOLD_PERCENT: core::ops::RangeInclusive<u64> = 10..=90;
 
-/// Both clocks, read together by the caller.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Now {
-    /// Monotonic time, for every timer and the Plus clock.
-    pub mono: Millis,
-    /// Wall clock. Used only for admission windows before the boot's first
-    /// Plus answer, and for report `sent at` until then.
-    pub wall: UnixTime,
-}
+/// Both clocks, read together by the caller: the relay machine's.
+pub use crate::relay::machine::Now;
 
 /// Which way a spliced message goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -470,6 +463,8 @@ pub struct Hosted {
     events: VecDeque<Event>,
     stopping: bool,
     reports: ReportQueue,
+    /// A lease became final since the reporter last looked.
+    report_wake: bool,
 }
 
 impl fmt::Debug for Hosted {
@@ -499,6 +494,7 @@ impl Hosted {
             events: VecDeque::new(),
             stopping: false,
             reports: ReportQueue::new(),
+            report_wake: false,
         }
     }
 
@@ -995,6 +991,18 @@ impl Hosted {
             entries: vec![status],
         });
         self.reports.note_final(now.mono);
+        self.report_wake = true;
+    }
+
+    /// Whether a lease became final since the last call: a snapshot may be
+    /// due sooner, so the reporter should look again.
+    pub fn take_report_wake(&mut self) -> bool {
+        std::mem::take(&mut self.report_wake)
+    }
+
+    /// Whether [`Hosted::poll`] has events waiting.
+    pub fn has_events(&self) -> bool {
+        !self.events.is_empty()
     }
 
     /// Make every lease that stopped being usable by time final.

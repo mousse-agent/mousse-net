@@ -81,6 +81,7 @@ impl Fixture {
             state: self.dir.clone(),
             listen: "127.0.0.1:0".parse().unwrap(),
             limits: self.limits,
+            hosted: None,
         })
         .await
         .unwrap();

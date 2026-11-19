@@ -207,11 +207,14 @@ Settings are not limits: they have no default and no range.
 | `boot-generation` | The boot generation, a decimal number. At start, under the state directory's lock, the relay adds one and writes it durably (write, fsync, rename, folder sync) before it serves. A file that does not hold a number stops startup; the count never starts over. |
 | `report-key` | The P-256 report key (hex secret, owner-only), made on first start. It signs boot and report bodies. Its public key is what an operator adds to Plus's fleet. |
 
-The pinned issuer keys are a file in the relay's configuration: one
-issuer public key per line as 130 hex digits (the 65-byte SEC1 point),
-with blank lines and `#` comments ignored. `mousse-relay reload` reads it
-again without ending the boot; a file that does not parse leaves the keys
-in force.
+| `issuer-keys` | The pinned issuer public keys, written by the operator: one per line as 130 hex digits (the 65-byte SEC1 point), blank lines and `#` comments ignored. Two overlap during a rotation. |
+
+`mousse-relay run --hosted` runs a relay in hosted mode; it needs
+`MOUSSE_NET_RELAY_PLUS_URL` and the `issuer-keys` file. The running relay
+reads `issuer-keys` again with the rest of the state directory (every
+`MOUSSE_NET_RELAY_STATE_POLL_MS`) and at once on `SIGHUP`, without ending
+the boot; a file that does not parse leaves the keys in force.
+`mousse-relay reload` checks the file.
 
 ## Fixed on purpose
 

@@ -42,6 +42,7 @@ async fn admission_resets_on_reboot_and_removal_survives_it() {
         state: f.dir.clone(),
         listen: "127.0.0.1:0".parse().unwrap(),
         limits: f.limits,
+        hosted: None,
     })
     .await;
     assert!(second.is_err(), "two relays ran on one state directory");

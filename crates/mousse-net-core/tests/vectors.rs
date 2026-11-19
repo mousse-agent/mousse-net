@@ -910,6 +910,10 @@ fn relay_output(o: &mousse_net_core::relay::Output) -> J {
         } => serde_json::json!({ "supersede": h(fingerprint), "drop_at": drop_at.0 }),
         Output::Drop { fingerprint } => serde_json::json!({ "drop": h(fingerprint) }),
         Output::ConsumeCode { hash } => serde_json::json!({ "consume_code": h(hash) }),
+        // Hosted mode only; the vectors cover self mode.
+        Output::Hold { conn, until } => serde_json::json!({ "hold": conn.0, "until": until.0 }),
+        Output::Pause { conn } => serde_json::json!({ "pause": conn.0 }),
+        Output::Resume { conn } => serde_json::json!({ "resume": conn.0 }),
     }
 }
 

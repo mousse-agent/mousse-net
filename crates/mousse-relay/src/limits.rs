@@ -31,6 +31,10 @@ pub fn from_vars(
         let Some(name) = key.strip_prefix(ENV_PREFIX) else {
             continue;
         };
+        // Hosted mode's limits and settings are read with its settings.
+        if mousse_relay_plus::settings::is_known(key) {
+            continue;
+        }
         let spec = RelayLimits::SPECS
             .iter()
             .find(|s| s.name == name)
@@ -82,6 +86,12 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(l.refuse_ms(), 700);
+        // Hosted names belong to the hosted settings.
+        assert!(from_vars(vars(&[
+            ("MOUSSE_NET_RELAY_REPORT_MS", "5000"),
+            ("MOUSSE_NET_RELAY_PLUS_URL", "https://plus.example"),
+        ]))
+        .is_ok());
         for (bad, says) in [
             (
                 ("MOUSSE_NET_RELAY_CONNECTIONS_PER_IP", "257"),
@@ -94,6 +104,7 @@ mod tests {
             (("MOUSSE_NET_RELAY_REFUSE_MS", "5_00"), "whole number"),
             (("MOUSSE_NET_RELAY_NO_SUCH", "1"), "not a relay limit"),
             (("MOUSSE_NET_KEEPALIVE_MS", "1000"), "not a relay limit"),
+            (("MOUSSE_NET_RELAY_REPORT", "1000"), "not a relay limit"),
         ] {
             let err = from_vars(vars(&[bad])).unwrap_err();
             assert!(err.contains(says), "{bad:?}: {err}");
