@@ -677,6 +677,10 @@ fn main() {
             std::process::exit(2);
         }
     };
+    // In app mode stdout carries the channel. Its writer may be blocked on a
+    // full pipe the app stopped reading, holding stdout's lock: a final flush
+    // would wait for it forever. What it had not written is lost either way.
+    let app_mode = matches!(cli.command, Command::Serve { app: true, .. });
     let code = match runtime.block_on(run(cli)) {
         Ok(code) => code,
         Err(e) => {
@@ -684,7 +688,9 @@ fn main() {
             2
         }
     };
-    let _ = std::io::stdout().flush();
+    if !app_mode {
+        let _ = std::io::stdout().flush();
+    }
     // Exit now: a pending stdin read must not keep the process alive.
     std::process::exit(code)
 }

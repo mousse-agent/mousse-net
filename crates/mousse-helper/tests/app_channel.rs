@@ -238,3 +238,51 @@ fn inbound_passes_only_app_labels_and_outbound_refuses_host_opened_streams() {
     p.a.assert_clean();
     p.b.assert_clean();
 }
+
+/// An app that stops reading stdout: replies pile up past
+/// APP_CONTROL_QUEUE_BYTES, the channel ends, and the helper still exits,
+/// although its writer is blocked on the full pipe.
+#[test]
+fn an_app_that_stops_reading_does_not_keep_the_helper_alive() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let end = Endpoint::init("unread");
+    let mut cmd = end.command(&["serve", "--app", "--no-mdns", "--port", "0"]);
+    cmd.stdin(Stdio::piped())
+        .env("MOUSSE_NET_APP_CONTROL_QUEUE_BYTES", "65536");
+    let mut child = cmd.spawn().unwrap();
+    // stdout is held, never read.
+    let _stdout = child.stdout.take().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let writer = std::thread::spawn(move || {
+        // Each request gets a `no_hello` reply of about 60 bytes: far more
+        // than the queue limit and any pipe buffer.
+        for id in 0..20_000u64 {
+            let body = serde_json::to_vec(&json!({"op": "stats", "id": id})).unwrap();
+            if stdin.write_all(&frame(0x01, &body)).is_err() {
+                return;
+            }
+        }
+        // stdin stays open: only the stuck channel can end the helper.
+        std::thread::sleep(WAIT * 2);
+    });
+
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if started.elapsed() > WAIT {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    if status.is_none() {
+        let _ = child.kill();
+    }
+    let log = end.log();
+    assert!(status.is_some(), "the helper did not exit:\n{log}");
+    assert!(log.contains("app channel ended: Stuck"), "{log}");
+    drop(writer);
+}

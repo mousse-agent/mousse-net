@@ -92,7 +92,8 @@ impl Endpoint {
         endpoint
     }
 
-    fn command(&self, args: &[&str]) -> Command {
+    /// The helper with this state directory; stdin closed, output piped.
+    pub fn command(&self, args: &[&str]) -> Command {
         let mut cmd = Command::new(bin());
         cmd.arg("--state")
             .arg(&self.dir)
