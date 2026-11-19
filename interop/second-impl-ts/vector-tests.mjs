@@ -2,11 +2,12 @@ import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
 import { test } from 'node:test';
 import { bytes, decode, encode, hex } from './cbor.ts';
-import { authenticateNativePeer, checkRaw, derToRaw, issueCertificate, lanCandidate, nativeTlsPolicy, publicKey,
+import { authenticateNativePeer, checkRaw, DerReader, derToRaw, issueCertificate, lanCandidate, nativeTlsPolicy, publicKey,
   rawToDer, SessionLifetime, sha256, signCertificateVerify, verify, verifyCertificate } from './certificate.ts';
 import * as cpace from './cpace.ts';
 import { PairingJoiner } from './pairing.ts';
 import { Gate, step2, Streams } from './session.ts';
+import * as relay from './relay.ts';
 import * as wire from './wire.ts';
 import { memoryFlowStore, replayAttemptSequence, replayEndToEnd } from './pairing-replay.mjs';
 
@@ -426,6 +427,105 @@ function outcome(expected, fn) {
 {
   const [v, add] = file('pairing-attempts.json');
   for (const sequence of v.sequences) add(sequence.name, () => replayAttemptSequence(sequence, v.conventions));
+}
+
+{
+  const [v, add] = file('relay-admission.json');
+  const d = v.derivations;
+  add('derivations: relay id, handles and fingerprints', () => {
+    matches(relay.relayId(bytes(d.relay_key)), d.relay_id);
+    matches(publicKey(bytes(d.relay_secret)), d.relay_key);
+    matches(relay.handleOf(bytes(d.relay_id), bytes(d.registration_key)), d.handle);
+    matches(relay.handleOf(bytes(d.relay_id), bytes(d.new_key)), d.new_handle);
+    matches(sha256(bytes(d.registration_key)), d.registration_fingerprint);
+  });
+  add('derivations: relay certificate and pin', () => {
+    const certificate = bytes(d.relay_certificate);
+    const tbs = relay.relayTbs(bytes(d.relay_key));
+    matches(certificate.subarray(4, 4 + tbs.length), hex(tbs));
+    const signature = new DerReader(certificate).nested(0x30);
+    signature.read(0x30);
+    signature.read(0x30);
+    const bits = signature.read(3).value;
+    assert.equal(bits[0], 0);
+    assert.ok(verify(derToRaw(bits.subarray(1)), tbs, bytes(d.relay_key)));
+    matches(relay.relayCertificate(bytes(d.relay_secret)), d.relay_certificate);
+    matches(relay.relayPinKey(certificate, bytes(d.relay_id)), d.relay_key);
+    outcome('pin_mismatch', () => relay.relayPinKey(bytes(d.other_relay_certificate), bytes(d.relay_id)));
+    const otherKey = relay.relayCertificateKey(bytes(d.other_relay_certificate));
+    assert.notEqual(hex(relay.relayId(otherKey)), d.relay_id);
+    matches(relay.relayPinKey(bytes(d.other_relay_certificate), relay.relayId(otherKey)), hex(otherKey));
+  });
+  for (const item of d.proofs) add(`derivations: ${item.name} proof`, () => {
+    const id = bytes(d.relay_id);
+    const nonce = bytes(d.nonce);
+    const exporter = bytes(d.exporter);
+    const built = {
+      register: () => relay.registerRecord(id, bytes(d.handle), nonce, exporter),
+      successor_new: () => relay.successorRecord(id, bytes(d.new_handle), nonce, exporter),
+      successor_current: () => relay.successorRecord(id, bytes(d.new_handle), nonce, exporter),
+      call: () => relay.callRecord(id, bytes(d.handle), nonce, exporter, 1n),
+      accept: () => relay.acceptRecord(id, bytes(d.handle), bytes(d.circuit), nonce, exporter),
+    }[item.name];
+    assert.ok(built, `unknown proof ${item.name}`);
+    matches(built(), item.record);
+    checkRaw(bytes(item.signature));
+    assert.ok(verify(bytes(item.signature), bytes(item.record), bytes(item.key)));
+    const signer = { register: d.registration_key, successor_new: d.new_key, successor_current: d.registration_key,
+      accept: d.registration_key }[item.name];
+    if (signer) assert.equal(item.key, signer);
+  });
+  add('derivations: invitation tag and enrollment code', () => {
+    const tag = relay.invitationTag(bytes(d.invitation.id), bytes(d.invitation.secret));
+    matches(tag, d.invitation.tag);
+    matches(sha256(tag), d.invitation.tag_hash);
+    matches(sha256(bytes(d.enrollment.code)), d.enrollment.code_hash);
+  });
+  for (const link of d.enrollment.links) add(`link ${link.text}`, () => {
+    const parsed = relay.parseEnrollmentLink(link.text);
+    assert.equal(relay.hostText(parsed.host), link.host);
+    assert.equal(parsed.port, link.port);
+    matches(parsed.relayId, d.relay_id);
+    matches(parsed.code, link.code);
+    assert.equal(relay.printEnrollmentLink(parsed), link.text);
+  });
+  for (const text of d.enrollment.rejected_links) add(`rejected link ${text}`,
+    () => outcome('link', () => relay.parseEnrollmentLink(text)));
+  for (const [index, item] of v.messages.valid.entries()) add(`valid message ${index} ${item.name}`, () => {
+    const message = relay.decodeRelay(bytes(item.hex));
+    assert.equal(message.type, item.name);
+    matches(relay.encodeRelay(message), item.hex);
+  });
+  for (const item of v.messages.malformed) add(`malformed message: ${item.why}`,
+    () => outcome('malformed', () => relay.decodeRelay(bytes(item.hex))));
+  for (const scenario of v.scenarios) add(`scenario ${scenario.name}`, () => {
+    let drawn = 0;
+    const server = new relay.SelfRelay({
+      relayKey: bytes(scenario.relay_key),
+      bootId: bytes(scenario.boot_id),
+      wallBase: scenario.wall_base,
+      authorized: scenario.authorized.map(entry => ({ fingerprint: bytes(entry.fingerprint), dropAt: entry.drop_at })),
+      codes: scenario.codes.map(code => ({ hash: bytes(code.hash), expiresAt: code.expires_at })),
+      limits: scenario.limits,
+      draw(size) {
+        assert.ok(drawn < scenario.draws.length, 'ran out of draws');
+        const value = bytes(scenario.draws[drawn++]);
+        assert.equal(value.length, size, `draw ${drawn} size`);
+        return value;
+      },
+    });
+    let last = 0;
+    for (const [index, item] of scenario.events.entries()) {
+      assert.ok(item.at >= last, 'time goes back');
+      last = item.at;
+      const event = { ...item };
+      if (item.exporter) event.exporter = bytes(item.exporter);
+      if (item.hex) event.data = bytes(item.hex);
+      if (item.fingerprint) event.fingerprint = bytes(item.fingerprint);
+      assert.deepEqual(server.handle(event), item.out, `event ${index} (${item.event} at ${item.at})`);
+    }
+    assert.equal(drawn, scenario.draws.length, 'unused draws');
+  });
 }
 
 test('lifecycle checks / a renewed path resets the backoff', () => {

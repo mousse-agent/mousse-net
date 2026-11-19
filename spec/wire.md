@@ -160,6 +160,11 @@ domain at key 1. This keeps any two signed things from ever being confused,
 whatever is added later. In `mousse-net-core`, `IdentitySigner` accepts only
 an `IdentityRecord`, which only the core builds.
 
+Relay proofs ([relay.md](relay.md) section 5) follow the same rule (canonical
+CBOR, a domain string of their own at key 1) but are signed by an
+endpoint's relay keys (a registration key per relay, a caller key per
+pairing), never by the identity key.
+
 **Hardware keys stay usable while unlocked.** A session certificate is
 renewed in the background (section 6). A key store that asks for user
 presence (a fingerprint, a PIN, a tap) on every signature would stop
@@ -396,7 +401,9 @@ in TLS 1.3).
 
 If the peer session runs inside another TLS connection (for example a
 WebSocket to a relay), the exporters MUST come from the inner peer session,
-never the outer one.
+never the outer one. The outer connection to a relay has its own exporter,
+`EXPORTER-mousse-relay-v1`, used only by relay proofs
+([relay.md](relay.md) sections 2 and 5).
 
 A TLS 1.3 exporter is derived before the client's certificate is sent, so it
 does not by itself name the client. Every construction that uses one also
@@ -789,7 +796,7 @@ A skipped hint is not an error: the joiner tries the next one.
 | `tcp` | `tcp://<host>:<port>` | A direct TLS connection. |
 | `wss` | `wss://<host>[:<port>]<path>` | The same TLS connection, carried in WebSocket binary messages inside an outer TLS connection to a tunnel the host's owner runs. |
 | `mdns` | `mdns:<instance>` | Browse for this service instance on the local network. |
-| `ssh`, `ws`, `relay` | reserved | Kept for transports that never appear on the wire (`ssh`, plain `ws`) or later ones. Skipped as `reserved`. |
+| `ssh`, `ws`, `relay` | reserved | Kept for transports that never appear on the wire (`ssh`, plain `ws`) or later ones. Skipped as `reserved`. The relay protocol itself is [relay.md](relay.md). |
 | anything else, or no `:` | | Skipped as `unknown_scheme`. |
 
 A `tcp`, `wss` or `mdns` hint that breaks its grammar is skipped as
