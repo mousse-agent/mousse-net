@@ -985,7 +985,7 @@ local = [
   { target = "linux-x64", host = "linux-x86_64", command = ["node", "{root}/tools/app-check/run.mjs", "phase1a.reconnect", "--out", "{out}"] },
 ]
 control = [
-  { name = "no-rediscovery", expect_reason = "unreachable", breaks = "the caller tries only the last working route", env = { RUSTFLAGS = '--cfg mousse_control="no-rediscovery"' } },
+  { name = "no-rediscovery", expect_reason = "unreachable", breaks = "the caller tries only the last working route once it has one", env = { RUSTFLAGS = '--cfg mousse_control="no-rediscovery"' } },
 ]
 
 [[check]]
@@ -1278,7 +1278,7 @@ Not touched: `sync/session.ts`, `sync/supervisor.ts`, `transports/*`,
    live LAN mDNS test needs the Mac listening.
 7. **Controls.** `stop-on-mismatch` (net-io) and `public-routes` (helper)
    for `phase1a.discovery`. `no-rediscovery` (helper: only the last
-   working route, no browse) is in place for `phase1a.reconnect`.
+   working route once a pairing has one, no browse) is in place for `phase1a.reconnect`.
 
 **Decided while building E5b**
 

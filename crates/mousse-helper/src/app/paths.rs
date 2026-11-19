@@ -96,8 +96,10 @@ fn stored_candidates(record: &PeerRecord) -> Vec<Route> {
         .and_then(|r| Route::parse(r).ok())
         .filter(|r| matches!(r, Route::Tcp { .. }));
     let mut out: Vec<Route> = last.into_iter().collect();
-    if cfg!(mousse_control = "no-rediscovery") {
-        // The control build tries only the last working route.
+    if cfg!(mousse_control = "no-rediscovery") && !out.is_empty() {
+        // The control build tries only the last working route. A pairing
+        // that has none yet (its first dial) still uses its addresses, so
+        // the control breaks finding a host that moved and nothing else.
         return out;
     }
     for hint in record.addresses.iter().chain(&record.routes) {

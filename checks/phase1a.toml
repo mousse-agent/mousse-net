@@ -166,7 +166,7 @@ local = [
   { target = "linux-x64", host = "linux-x86_64", command = ["node", "{root}/tools/app-check/run.mjs", "phase1a.reconnect", "--out", "{out}"] },
 ]
 control = [
-  { name = "no-rediscovery", expect_reason = "unreachable", breaks = "the caller tries only the last working route", env = { RUSTFLAGS = '--cfg mousse_control="no-rediscovery"' } },
+  { name = "no-rediscovery", expect_reason = "unreachable", breaks = "the caller tries only the last working route once it has one", env = { RUSTFLAGS = '--cfg mousse_control="no-rediscovery"' } },
 ]
 
 [[check]]
