@@ -14,6 +14,11 @@ pub const ENV_PREFIX: &str = "MOUSSE_NET_";
 /// After [`ENV_PREFIX`]: the Mousse app's own limits and controls.
 const APP_PREFIX: &str = "ENGINE_";
 
+/// Debug-build test hooks read by the network crates, not limits
+/// (Phase 1b §1.2 and §4.2). Release builds never read them, so there they
+/// count as unknown names.
+const DEBUG_HOOKS: [&str; 2] = ["TEST_EXTRA_ROOT", "TEST_CLASS_MAP"];
+
 /// After [`ENV_PREFIX`]: the Mousse app's helper path in unpackaged builds.
 const APP_HELPER_PATH: &str = "HELPER";
 
@@ -183,6 +188,7 @@ impl Limits {
                 n.strip_prefix(ENV_PREFIX).is_some_and(|rest| {
                     !rest.starts_with(APP_PREFIX)
                         && rest != APP_HELPER_PATH
+                        && !(cfg!(debug_assertions) && DEBUG_HOOKS.contains(&rest))
                         && !Self::specs().any(|s| s.name == rest)
                 })
             })

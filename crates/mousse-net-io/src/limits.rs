@@ -72,6 +72,12 @@ mousse_net_core::define_limits! {
         preauth_pipe = "PREAUTH_PIPE": 4, [1, 4];
         /// Host: of the TCP ones, connections from one IPv4 address or one IPv6 /64 (Phase 1b §6.2; tighten only).
         preauth_per_source = "PREAUTH_PER_SOURCE": 8, [1, 8];
+        /// Host: time a `ws` connection has for its whole upgrade request (Phase 1b §4.1; tighten only).
+        ws_upgrade_wait_ms = "WS_UPGRADE_WAIT_MS": 5_000, [100, 5_000];
+        /// Host: size of a `ws` upgrade request (Phase 1b §4.1; tighten only).
+        ws_header_max_bytes = "WS_HEADER_MAX_BYTES": 8_192, [1_024, 8_192];
+        /// One received `ws` message; not below the 16 KiB a sender writes per message (Phase 1b §4.1; tighten only).
+        ws_message_max_bytes = "WS_MESSAGE_MAX_BYTES": 65_536, [16_384, 65_536];
     }
     agree(io) {
         if io.outcome_retry_max_ms < io.outcome_retry_first_ms {

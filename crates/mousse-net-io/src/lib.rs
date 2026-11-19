@@ -75,7 +75,10 @@ pub type SharedSigner = Arc<dyn IdentitySigner + Send + Sync>;
         mousse_control = "fence-tcp-only",
         mousse_control = "enroll-while-paused",
         mousse_control = "repair-skips-slot",
-        mousse_control = "repair-skips-fence"
+        mousse_control = "repair-skips-fence",
+        mousse_control = "ws-allow-origin",
+        mousse_control = "plain-ws-off-loopback",
+        mousse_control = "release-test-root"
     )
 ))]
 compile_error!("a mousse_control build has a deliberate defect and is for tests only; build it without --release");
@@ -97,7 +100,10 @@ compile_error!("a mousse_control build has a deliberate defect and is for tests 
     mousse_control = "fence-tcp-only",
     mousse_control = "enroll-while-paused",
     mousse_control = "repair-skips-slot",
-    mousse_control = "repair-skips-fence"
+    mousse_control = "repair-skips-fence",
+    mousse_control = "ws-allow-origin",
+    mousse_control = "plain-ws-off-loopback",
+    mousse_control = "release-test-root"
 ))]
 const _: () = {
     let profile = env!("MOUSSE_BUILD_PROFILE").as_bytes();
@@ -142,6 +148,12 @@ pub const CONTROL: Option<&str> = if cfg!(mousse_control = "skip-pin-check") {
     Some("repair-skips-slot")
 } else if cfg!(mousse_control = "repair-skips-fence") {
     Some("repair-skips-fence")
+} else if cfg!(mousse_control = "ws-allow-origin") {
+    Some("ws-allow-origin")
+} else if cfg!(mousse_control = "plain-ws-off-loopback") {
+    Some("plain-ws-off-loopback")
+} else if cfg!(mousse_control = "release-test-root") {
+    Some("release-test-root")
 } else {
     None
 };

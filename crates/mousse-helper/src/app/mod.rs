@@ -84,6 +84,8 @@ pub struct AppInfo {
     pub name: String,
     pub profile: String,
     pub port: u16,
+    /// The loopback ws listener's port, while it runs (Phase 1b §4.1).
+    pub ws_port: Option<u16>,
     pub routes: Vec<String>,
     pub state_dir: PathBuf,
     /// Where to look for paired hosts that moved (Phase 1a §6).
@@ -771,6 +773,7 @@ impl Shared {
             "identity": hex(self.info.identity.as_bytes()),
             "device": short_id(&self.info.identity),
             "port": self.info.port,
+            "ws_port": self.info.ws_port,
             "routes": self.info.routes,
             "paused": self.removal.paused_reason(),
         })

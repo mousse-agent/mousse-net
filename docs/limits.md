@@ -69,6 +69,9 @@ spec's value: it can only be tightened.
 | `MOUSSE_NET_PREAUTH_WS` | 16 | 1 to 16 | Host: `ws` connections not yet live, per endpoint; its own pool, so a flood through a tunnel takes no TCP or pipe place. |
 | `MOUSSE_NET_PREAUTH_PIPE` | 4 | 1 to 4 | Host: pipe connections (an SSH login's `mousse-helper pipe`) not yet live, per endpoint; its own pool. |
 | `MOUSSE_NET_PREAUTH_PER_SOURCE` | 8 | 1 to 8 | Host: of the TCP ones, connections from one IPv4 address or one IPv6 /64. |
+| `MOUSSE_NET_WS_UPGRADE_WAIT_MS` | 5000 | 100 to 5000 | Host: time a `ws` connection has for its whole upgrade request; past it the socket is closed unanswered (Phase 1b §4.1). |
+| `MOUSSE_NET_WS_HEADER_MAX_BYTES` | 8192 | 1024 to 8192 | Host: size of a `ws` upgrade request; past it the socket is closed unanswered. |
+| `MOUSSE_NET_WS_MESSAGE_MAX_BYTES` | 65536 | 16384 to 65536 | One received `ws` message; a larger one ends the connection. Not below the 16 KiB every sender writes per message. |
 
 ## Helper
 
@@ -105,6 +108,16 @@ spec's value: it can only be tightened.
 | `MOUSSE_NET_IPC_LINE_MAX_BYTES` | 65536 | 1024 to 65536 | Local control channel: longest line a client may send; a longer one closes the channel (Phase 1b §6.2). |
 | `MOUSSE_NET_IPC_FIRST_LINE_WAIT_MS` | 2000 | 100 to 2000 | Local control channel: time a client has to send its first line before the channel is closed. |
 | `MOUSSE_NET_INIT_HOLD_MS` | 0 | 0 to 60000 | Checks only: how long `init` waits before it makes the endpoint, so the hard-kill check can stop the app during a first start. Run for the app (`--app`), its stdin closing still ends it at once. |
+
+## Debug-build test hooks
+
+Debug builds also read these; release builds never do, and there they
+count as unknown names.
+
+| Variable | What it does |
+| --- | --- |
+| `MOUSSE_NET_TEST_EXTRA_ROOT` | A DER certificate file the outer `wss` TLS trusts besides the platform's roots, for a test tunnel stand-in (Phase 1b §4.2). Nothing is installed in an OS store. |
+| `MOUSSE_NET_TEST_CLASS_MAP` | Maps loopback ports to address classes, so checks can stand in for tailnet and public routes (Phase 1b §1.2). |
 
 ## Fixed on purpose
 
