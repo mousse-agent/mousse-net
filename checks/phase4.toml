@@ -44,6 +44,11 @@ breaks = "the relay's shared egress writes in arrival order instead of interacti
 env = { RUSTFLAGS = '--cfg mousse_control="fifo-egress"' }
 
 [[check.control]]
+name = "relay-clock-pauses-in-sleep"
+breaks = "the relay's monotonic time stops while the machine sleeps, so a lease outlives its expiry on the Plus clock after a suspend"
+env = { RUSTFLAGS = '--cfg mousse_control="relay-clock-pauses-in-sleep"' }
+
+[[check.control]]
 name = "accept-replayed-lease"
 breaks = "the block sequence check is skipped, so a settled or older block is accepted again"
 env = { RUSTFLAGS = '--cfg mousse_control="accept-replayed-lease"' }
