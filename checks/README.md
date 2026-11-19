@@ -120,6 +120,22 @@ A cross-machine app check runs outside the kit on both machines:
 
 With `--control <name>`, `run.mjs` adds that control's environment, which it reads with `mousse-check control-env <check> --control <name>`. Pass the same `--control` to `config-digest` and `sign`. `--role` and `--topology` pass through to the app script. With `--result`, `run.mjs` writes `build` (the helper build) and `app_build`. It also writes `host_build` and `host_app_build` when the app printed `host_build=` and `host_app_build=` lines, which a caller does with the builds its host reported over the test link.
 
+## The route probe (`mousse-check probe`)
+
+Phase 1b §6.3: traffic that must never reach RPC, sent to a real host on one route. The app script of `phase1b.no-rpc-without-grant` sets up the host and runs it; `tools/build-smoke.mjs` runs its wire cases against a release helper.
+
+    mousse-check probe key <file>        # a throwaway device key; prints its identity (hex) for grant.add
+    mousse-check probe --route tcp://127.0.0.1:<port> --invite <ticket>         --grant-key <granted device, editor off> --removed-key <device whose grant was removed>         --observe http://127.0.0.1:<port>/<path> --marker phase1b.no-rpc-without-grant [--json <file>]
+
+- `--route`: `tcp://<ip>:<port>` or `ws://<loopback ip>:<port><path>`. IP literals only; the probe resolves no names. The ssh route's probe (the helper's pipe IPC) waits for E9.
+- `--invite`: an open Send link invitation (kind 2; the garbage code case needs one). Its host identity is the pin unless `--pin <hex>` says otherwise.
+- Cases, in order: `not-tls`; on ws `ws-plain-get`, `ws-wrong-path`, `ws-origin`, `ws-no-subprotocol`, `ws-large-headers`, `ws-text-message`; `tls-no-cert`, `tls-1.2`, `tls-wrong-alpn`; `fresh-open-rpc`, `fresh-open-tunnel`, `fresh-bad-proof`; `join-only-open-rpc`, `join-only-open-hello`, `join-only-open-tunnel`, `join-only-garbage-code`; `removed-open-rpc`; `editor-off-tunnel`; `fresh-silence`; `admission`; on ws `ws-slow-headers`. `--cases a,b` runs some.
+- **Wire:** each case must end the way §6.3 names, at once and with nothing let through first (the flood's extra connection must be refused well before the host's own wait for a silent connection): a refusal that arrives only after the proof wait, or after any stream frame from the host (a `RESET` included), does not count. Otherwise `reason=wire_accepted`.
+- **App:** `--observe` names a loopback HTTP endpoint the app script serves. `GET` answers a JSON object with the totals `conn_up`, `streams`, `authorized_calls`, `endpoint_sessions`, `ledger_rows` and `refusals`. The probe reads it before and after each case (after `MOUSSE_CHECK_PROBE_SETTLE_MS`). Every case must leave all six unchanged, except `editor-off-tunnel`: one `conn_up`, one stream, one refusal, at most one ledger row, nothing else. Otherwise `reason=probe_reached_app`, which wins over `wire_accepted`. `--no-app` skips the app side (build smoke only).
+- A case without its input (`--invite`, `--grant-key`, `--removed-key`) is `reason=probe_error`, never a pass.
+- Output: `PASS|FAIL <marker> <route>:<case> ...` per case, then `PASS <marker>` or `FAIL <marker> reason=<word>`.
+- Limits come from the host's own variables (`MOUSSE_NET_JOIN_PROOF_WAIT_MS`, `MOUSSE_NET_PREAUTH_TCP`, `_WS`, `_PER_SOURCE`, `MOUSSE_NET_WS_UPGRADE_WAIT_MS`, `MOUSSE_NET_WS_HEADER_MAX_BYTES`, `MOUSSE_NET_HANDSHAKE_TIMEOUT_MS`), so a check that tightens one for the host tightens it for the probe. The probe's own waits: `MOUSSE_CHECK_PROBE_CONNECT_MS` (5000), `MOUSSE_CHECK_PROBE_CLOSE_MS` (5000), `MOUSSE_CHECK_PROBE_SETTLE_MS` (1000).
+
 ## Manual steps
 
     mousse-check attest phase0.design-review --target session-cert --note "reviewed by X, link"
