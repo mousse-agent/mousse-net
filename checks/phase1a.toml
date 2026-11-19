@@ -173,13 +173,13 @@ control = [
 id = "phase1a.pair-offline"
 title = "Internet unreachable: pair over LAN, connected both ways within the bound (10 s; MOUSSE_NET_ENGINE_CHECK_PAIR_WITHIN_MS), ticket and approval injected"
 plan = "docs/phase1a-design.md §9 and §10 (M7)"
-targets = ["pc-to-mac-lan"]
+targets = ["pc-to-mac-lan", "linux-x64-offline-sim"]
 judge = "marker"
 cross_machine = true
 app = true
-device_steps = "Mac: node tools/app-check/run.mjs phase1a.pair-offline --role host. PC: mousse-check config-digest phase1a.pair-offline --target pc-to-mac-lan, then node tools/app-check/run.mjs phase1a.pair-offline --role caller --result r.json, then mousse-check sign --device-key <key> --config <digest> r.json. Controls: add --control <name> to all three."
+device_steps = "pc-to-mac-lan is INCOMPLETE: simulated cell covers the logic; real LAN-without-WAN run pending. pc-to-mac-lan, Mac: node tools/app-check/run.mjs phase1a.pair-offline --role host. PC: mousse-check config-digest phase1a.pair-offline --target pc-to-mac-lan, then node tools/app-check/run.mjs phase1a.pair-offline --role caller --result r.json, then mousse-check sign --device-key <key> --config <digest> r.json. Controls: add --control <name> to all three. linux-x64-offline-sim (simulated: it covers the pairing logic, not a real LAN without a WAN): two Linux containers on a Docker network made with `docker network create --internal`, so neither has a route to the internet, each with the Linux helper and app builds; one runs --role host, the other --role caller with MOUSSE_NET_ENGINE_CHECK_HOST set to the host container, then the result is signed as above with --target linux-x64-offline-sim. Its control runs the caller with a second network that does reach the internet."
 control = [
-  { name = "cable-plugged", expect_reason = "internet_reachable", breaks = "run with the WAN cable in; the harness must refuse it", env = { MOUSSE_CHECK_EXPECT_ONLINE = "1" } },
+  { name = "cable-plugged", expect_reason = "internet_reachable", breaks = "run with the WAN cable in (on the simulated cell: the caller's container also on a network with internet); the harness must refuse it", env = { MOUSSE_CHECK_EXPECT_ONLINE = "1" } },
 ]
 
 [[check]]
