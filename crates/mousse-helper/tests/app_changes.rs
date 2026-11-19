@@ -15,6 +15,7 @@
 
 mod common;
 
+use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
@@ -189,6 +190,56 @@ fn a_renewed_path_replaces_the_old_one_once_reopened() {
     let again = b.request("path.reopened", json!({"conn": new}));
     assert_eq!(again["error"], "not_renewed", "{again}");
     assert!(b.events("conn.down").iter().all(|m| m["conn"] != new));
+}
+
+/// A renewal names the path it replaces among this side's own outbound
+/// paths. The caller and the host number their connections apart, so with
+/// every host also dialling in, each outbound path has an inbound one with
+/// the same number; `from` is still the outbound one, for every host.
+#[test]
+fn a_renewal_names_the_outbound_path_it_replaces() {
+    // Which of two same-numbered paths a lookup meets first is up to a hash
+    // map: with eight hosts, a lookup that can pick the inbound one passes
+    // about one run in 256.
+    const HOSTS: usize = 8;
+    let b_end = Endpoint::init("rob");
+    let mut b = app(&b_end, "peerB", &[], &[MANUAL_CLOCK]);
+    b.hello();
+    let b_route = route_of(&mut b);
+    let mut hosts = Vec::new();
+    for i in 0..HOSTS {
+        let end = Endpoint::init(&format!("ro{i}"));
+        let mut a = app(&end, &format!("host{i}"), &[], &[MANUAL_CLOCK]);
+        a.hello();
+        let a_route = route_of(&mut a);
+        // Paired both ways: b dials a, and a dials b.
+        trust(&mut a, &mut b, &[&a_route]);
+        trust(&mut b, &mut a, &[&b_route]);
+        hosts.push((end, a));
+    }
+    let mut old = HashMap::new();
+    let mut deadline = 0;
+    for (_, a) in &hosts {
+        let up = nth_up(&b, "out", &a.identity, 0, WAIT);
+        nth_up(&b, "in", &a.identity, 0, WAIT);
+        old.insert(a.identity.clone(), up["conn"].as_u64().unwrap());
+        deadline = deadline.max(up["deadline"].as_i64().unwrap());
+    }
+
+    let now = b.call("test.clock", json!({}))["now"].as_i64().unwrap();
+    let due = deadline
+        - CoreLimits::DEFAULT.clock_skew_secs() as i64
+        - CoreLimits::DEFAULT.renew_lead_secs() as i64;
+    // The hosts first, so none refuses b's renewed certificate as not yet
+    // valid.
+    for (_, a) in &mut hosts {
+        a.call("test.clock", json!({"advance_secs": due - now}));
+    }
+    b.call("test.clock", json!({"advance_secs": due - now}));
+    for (_, a) in &hosts {
+        let reopen = b.event("path.reopen", |m| m["identity"] == a.identity.as_str());
+        assert_eq!(reopen["from"], old[&a.identity], "{reopen}");
+    }
 }
 
 /// A renewal that cannot reach the host is reported, and the old path

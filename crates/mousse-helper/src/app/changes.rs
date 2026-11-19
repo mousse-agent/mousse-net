@@ -48,10 +48,13 @@ pub async fn forward_renewals(shared: Arc<Shared>) {
                     }));
                     continue;
                 }
+                // The caller numbers its paths apart from the host, so an
+                // inbound connection can carry the same id: only this
+                // peer's outbound ones are candidates.
                 let from = super::lock(&shared.core)
                     .conns
                     .iter()
-                    .find(|(_, e)| e.conn.id() == from)
+                    .find(|(_, e)| !e.inbound && e.identity == pin && e.conn.id() == from)
                     .map(|(no, _)| *no);
                 let role = paths::stored_role(&shared, &pin);
                 let no = shared.add_conn(conn, false, json!({"dir": "out", "role": role}));
