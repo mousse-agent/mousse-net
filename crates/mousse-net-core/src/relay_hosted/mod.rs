@@ -7,8 +7,9 @@
 //! every hosted message (`REGISTER`, `ADMIT`, `LEASE`, `RELEASE`), before
 //! every spliced message it forwards ([`Hosted::forward`]), then calls
 //! [`Hosted::poll`] (after each call, and at the instant
-//! [`Hosted::next_wakeup`] names) and acts on the [`Event`]s it returns. The relay's Plus client feeds Plus's answers
-//! back in and sends the parts [`Hosted::next_report_part`] builds.
+//! [`Hosted::next_wakeup`] names) and acts on the [`Event`]s it returns.
+//! The relay's Plus client feeds Plus's answers back in and sends the
+//! parts [`Hosted::next_report_part`] builds.
 //!
 //! Counters live in memory only; the boot generation is the only
 //! lease-related state on disk (§B.10).
@@ -29,7 +30,7 @@ pub use records::{
     ReportPart, SignedEnvelope,
 };
 
-use records::{BLOCK_MAX_LIFETIME_SECS, MESSAGE_MAX, RATE_CAP_FLOOR, RELEASE_IDS_MAX};
+use records::{BLOCK_MAX_LIFETIME_SECS, CLASSES, MESSAGE_MAX, RATE_CAP_FLOOR, RELEASE_IDS_MAX};
 use report::ReportQueue;
 
 crate::define_limits! {
@@ -136,6 +137,18 @@ pub struct LeaseStatus {
     pub bytes: u64,
     /// Key 5.
     pub state: LeaseState,
+}
+
+impl From<LeaseStatus> for crate::relay::msg::LeaseStatusEntry {
+    fn from(s: LeaseStatus) -> Self {
+        Self {
+            lease: s.lease_id,
+            class: s.class,
+            used: s.used,
+            bytes: s.bytes,
+            state: s.state.to_u64() as u8,
+        }
+    }
 }
 
 /// Why a lease became final (§A.9 duty 5).
@@ -662,7 +675,7 @@ impl Hosted {
     /// Whether the handle holds a usable block in this boot: a current or
     /// pending lease of either class, not spent, not expired.
     pub fn funded(&self, handle: &Handle, now: Now) -> bool {
-        Class::ALL.iter().any(|c| {
+        CLASSES.iter().any(|c| {
             self.slots.get(&(*handle, *c)).is_some_and(|s| {
                 [s.current, s.pending]
                     .into_iter()
@@ -1107,7 +1120,7 @@ impl Hosted {
     /// The `LEASE_STATUS` entries of every lease `handle` holds open.
     pub fn statuses(&self, handle: &Handle) -> Vec<LeaseStatus> {
         let mut out = Vec::new();
-        for c in Class::ALL {
+        for c in CLASSES {
             if let Some(s) = self.slots.get(&(*handle, c)) {
                 for (id, state) in [
                     (s.current, LeaseState::Current),

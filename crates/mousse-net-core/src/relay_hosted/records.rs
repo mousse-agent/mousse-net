@@ -8,8 +8,6 @@
 
 use std::fmt;
 
-use sha2::{Digest, Sha256};
-
 use crate::cbor::{self, FieldError, Fields, Value};
 use crate::identity::{PublicKey, RawSignature, SignatureError, SoftwareKey};
 
@@ -62,13 +60,10 @@ pub fn relay_id(identity: &PublicKey) -> RelayId {
     identity.fingerprint()
 }
 
-/// Handle of a registration key on a relay (§A.7).
+/// Handle of a registration key on a relay (§A.7); the relay protocol's
+/// derivation.
 pub fn handle(relay_id: &RelayId, registration_key: &PublicKey) -> Handle {
-    let mut h = Sha256::new();
-    h.update(HANDLE_DOMAIN);
-    h.update(relay_id);
-    h.update(registration_key.as_bytes());
-    h.finalize().into()
+    crate::relay::proof::handle(&crate::relay::proof::RelayId(*relay_id), registration_key)
 }
 
 /// Issuer key id of an issuer key (§A.12).
@@ -79,34 +74,26 @@ pub fn issuer_key_id(key: &PublicKey) -> IssuerKeyId {
     id
 }
 
-/// A lease class.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Class {
-    /// Class 0: typing, control, small exchanges. Written first.
-    Interactive,
-    /// Class 1: file copies and other bulk transfers.
-    Bulk,
+/// A lease class, the relay protocol's circuit class.
+pub use crate::relay::msg::Class;
+
+/// Both classes.
+pub const CLASSES: [Class; 2] = [Class::Interactive, Class::Bulk];
+
+/// The wire value of a class.
+pub const fn class_to_u64(c: Class) -> u64 {
+    match c {
+        Class::Interactive => 0,
+        Class::Bulk => 1,
+    }
 }
 
-impl Class {
-    /// Both classes.
-    pub const ALL: [Class; 2] = [Class::Interactive, Class::Bulk];
-
-    /// The wire value.
-    pub const fn to_u64(self) -> u64 {
-        match self {
-            Class::Interactive => 0,
-            Class::Bulk => 1,
-        }
-    }
-
-    /// From the wire value.
-    pub const fn from_u64(v: u64) -> Option<Self> {
-        match v {
-            0 => Some(Class::Interactive),
-            1 => Some(Class::Bulk),
-            _ => None,
-        }
+/// A class from its wire value.
+pub const fn class_from_u64(v: u64) -> Option<Class> {
+    match v {
+        0 => Some(Class::Interactive),
+        1 => Some(Class::Bulk),
+        _ => None,
     }
 }
 
@@ -251,7 +238,7 @@ fn open_record(bytes: &[u8], domain: &str) -> Result<Fields, RecordError> {
 
 fn class_field(f: &mut Fields, key: u64) -> Result<Class, RecordError> {
     let v = f.uint(key)?;
-    Class::from_u64(v).ok_or(RecordError::Field(FieldError::Invalid(key)))
+    class_from_u64(v).ok_or(RecordError::Field(FieldError::Invalid(key)))
 }
 
 /// An admission token (§A.12): lets one handle register on one relay.
@@ -346,7 +333,7 @@ impl LeaseBlock {
             (4, Value::Bytes(self.relay_id.to_vec())),
             (5, Value::Bytes(self.boot_id.to_vec())),
             (6, Value::Bytes(self.handle.to_vec())),
-            (7, Value::Uint(self.class.to_u64())),
+            (7, Value::Uint(class_to_u64(self.class))),
             (8, Value::Uint(self.sequence)),
             (9, Value::Uint(self.rate_cap)),
             (10, Value::Uint(self.bytes)),
@@ -705,6 +692,7 @@ mod tests {
     use super::*;
     use rand_chacha::ChaCha20Rng;
     use rand_core::SeedableRng;
+    use sha2::{Digest, Sha256};
 
     fn key(seed: u8) -> SoftwareKey {
         SoftwareKey::generate(&mut ChaCha20Rng::from_seed([seed; 32]))
