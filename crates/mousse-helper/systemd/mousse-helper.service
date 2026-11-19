@@ -1,0 +1,27 @@
+# The headless Mousse helper as a systemd user service (design §B.13,
+# docs/headless.md): one endpoint for this user, no app. Terminals it serves
+# run as this user.
+#
+#   install -D -m 0755 mousse-helper ~/.local/bin/mousse-helper
+#   install -D -m 0644 mousse-helper.service ~/.config/systemd/user/mousse-helper.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now mousse-helper
+#   loginctl enable-linger "$USER"      # keep it running when you log out
+#
+# Then pair a phone: mousse-helper --state ~/.local/share/mousse-helper invite --qr
+[Unit]
+Description=Mousse helper (headless endpoint)
+Documentation=https://github.com/mousse-agent/mousse-net/blob/main/docs/headless.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/mousse-helper serve --headless --state %h/.local/share/mousse-helper --listen-ip 0.0.0.0
+Restart=on-failure
+RestartSec=5
+LimitCORE=0
+UMask=0077
+
+[Install]
+WantedBy=default.target

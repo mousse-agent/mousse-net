@@ -75,7 +75,8 @@ pub type SharedSigner = Arc<dyn IdentitySigner + Send + Sync>;
         mousse_control = "fence-tcp-only",
         mousse_control = "enroll-while-paused",
         mousse_control = "repair-skips-slot",
-        mousse_control = "repair-skips-fence"
+        mousse_control = "repair-skips-fence",
+        mousse_control = "no-endpoint-lock"
     )
 ))]
 compile_error!("a mousse_control build has a deliberate defect and is for tests only; build it without --release");
@@ -97,7 +98,8 @@ compile_error!("a mousse_control build has a deliberate defect and is for tests 
     mousse_control = "fence-tcp-only",
     mousse_control = "enroll-while-paused",
     mousse_control = "repair-skips-slot",
-    mousse_control = "repair-skips-fence"
+    mousse_control = "repair-skips-fence",
+    mousse_control = "no-endpoint-lock"
 ))]
 const _: () = {
     let profile = env!("MOUSSE_BUILD_PROFILE").as_bytes();
@@ -136,6 +138,8 @@ pub const CONTROL: Option<&str> = if cfg!(mousse_control = "skip-pin-check") {
     Some("fence-at-accept-only")
 } else if cfg!(mousse_control = "fence-tcp-only") {
     Some("fence-tcp-only")
+} else if cfg!(mousse_control = "no-endpoint-lock") {
+    Some("no-endpoint-lock")
 } else if cfg!(mousse_control = "enroll-while-paused") {
     Some("enroll-while-paused")
 } else if cfg!(mousse_control = "repair-skips-slot") {

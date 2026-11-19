@@ -170,6 +170,11 @@ key, grants and denials, invitations, pins and listener.
 - CPace may be **DEFERRED** in Phase 0. Until it passes review, "Send link"
   is not enabled.
 - Software identity keys on desktops are protected by the OS keystore only.
+- **Headless servers** (Phase 3, `serve --headless`) with no OS keystore
+  keep the identity key in an owner-only file (`0600`, in a `0700` state
+  directory) instead. Only file permissions protect it: root on that
+  server, a backup or a copy of its disk has the key, and can act as that
+  endpoint until its grants are removed on the devices that trust it.
 - Identity keys must sign without a user-presence prompt while the device is
   unlocked ([`wire.md`](wire.md) 4.1), so that renewal works; a hardware key
   therefore protects against copying, not against use by code running as
