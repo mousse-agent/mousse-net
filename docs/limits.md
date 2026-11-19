@@ -91,7 +91,7 @@ tightened. `RELAY_REFUSE_MS` must be below `RELAY_ACCEPT_WAIT_MS`
 
 | Variable | Default | Allowed | What it limits |
 | --- | --- | --- | --- |
-| `MOUSSE_NET_RELAY_MAX_CONNECTIONS` | 4096 | 1 to 65536 | Open outer connections (capacity). |
+| `MOUSSE_NET_RELAY_MAX_CONNECTIONS` | 1024 | 1 to 65536 | Open outer connections (capacity; about 52 KB each, plus queued bytes). |
 | `MOUSSE_NET_RELAY_CONNECTIONS_PER_IP` | 256 | 1 to 256 | Open connections per IPv4 address or IPv6 /64, except accept legs once their ACCEPT is accepted (tighten only). |
 | `MOUSSE_NET_RELAY_ACCEPT_LEGS_PER_HANDLE` | 64 | 1 to 64 | Open accept legs per handle (tighten only). |
 | `MOUSSE_NET_RELAY_CIRCUITS_PER_CALLER` | 8 | 2 to 8 | Open circuits per caller fingerprint and handle (tighten only). |

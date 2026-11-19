@@ -9,8 +9,8 @@ use crate::limits::LimitError;
 crate::define_limits! {
     /// Every limit of the relay.
     pub struct RelayLimits {
-        /// Open outer connections (capacity).
-        max_connections = "RELAY_MAX_CONNECTIONS": 4_096, [1, 65_536];
+        /// Open outer connections (capacity; about 52 KB each, plus queued bytes).
+        max_connections = "RELAY_MAX_CONNECTIONS": 1_024, [1, 65_536];
         /// Open connections per IPv4 address or IPv6 /64, except accept legs once their ACCEPT is accepted (tighten only).
         connections_per_ip = "RELAY_CONNECTIONS_PER_IP": 256, [1, 256];
         /// Open accept legs per handle (tighten only).

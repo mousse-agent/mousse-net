@@ -557,7 +557,7 @@ otherwise:
 
 | Limit | Default | What it bounds |
 |---|---|---|
-| `RELAY_MAX_CONNECTIONS` | 4096 | open connections |
+| `RELAY_MAX_CONNECTIONS` | 1024 | open connections |
 | `RELAY_CONNECTIONS_PER_IP` | 256 | open connections per address key |
 | `RELAY_ACCEPT_LEGS_PER_HANDLE` | 64 | accept legs of spliced circuits per handle |
 | `RELAY_CIRCUITS_PER_CALLER` | 8 | open circuits per caller fingerprint and handle |
