@@ -60,7 +60,7 @@ pub fn bin() -> &'static Path {
     })
 }
 
-fn temp_dir(tag: &str) -> PathBuf {
+pub fn temp_dir(tag: &str) -> PathBuf {
     let n = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -103,6 +103,16 @@ impl Endpoint {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         cmd
+    }
+
+    /// A command-line run of the helper with stdin piped and `env` set.
+    pub fn cli_env(&self, args: &[&str], env: &[(&str, &str)]) -> Cli {
+        let mut cmd = self.command(args);
+        cmd.stdin(Stdio::piped());
+        for (name, value) in env {
+            cmd.env(name, value);
+        }
+        Cli::spawn(cmd)
     }
 
     /// A command-line run of the helper.
@@ -239,6 +249,11 @@ impl Cli {
             );
             std::thread::sleep(Duration::from_millis(25));
         }
+    }
+
+    /// Close the helper's stdin, as an app that is gone does.
+    pub fn end_stdin(&mut self) {
+        self.stdin.take();
     }
 
     pub fn type_line(&mut self, text: &str) {

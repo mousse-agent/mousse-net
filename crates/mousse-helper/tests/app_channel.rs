@@ -408,3 +408,30 @@ fn connections_waiting_for_authorization_are_capped_per_source_and_in_all() {
     // place.
     let _next = admitted_soon(port);
 }
+
+/// `init --app` (the app's first start) ends with its stdin, as `serve
+/// --app` does: an app killed during it leaves no `init` behind. The hold
+/// stands for an init still busy, a keystore that is slow to answer.
+#[test]
+fn init_for_the_app_exits_when_its_stdin_closes() {
+    let end = Endpoint {
+        dir: temp_dir("initeof"),
+    };
+    let mut init = end.cli_env(&["init", "--app"], &[("MOUSSE_NET_INIT_HOLD_MS", "30000")]);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(init.exit_within(Duration::ZERO), None, "{}", init.err());
+    let closed = Instant::now();
+    init.end_stdin();
+    assert_eq!(init.exit_within(WAIT), Some(3), "{}", init.err());
+    assert!(
+        closed.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        closed.elapsed()
+    );
+    assert!(!end.dir.join("endpoint.json").exists());
+
+    // With its stdin open it makes the endpoint and exits.
+    let mut init = end.cli_env(&["init", "--app"], &[]);
+    assert_eq!(init.exit_within(WAIT), Some(0), "{}", init.err());
+    assert!(init.out().contains("created endpoint"), "{}", init.out());
+}

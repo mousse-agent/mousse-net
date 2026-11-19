@@ -78,7 +78,9 @@ caller today.
 **Spawn.** The command is
 `mousse-helper --state <profileDir>/net-engine/endpoint serve --app --listen-ip 0.0.0.0`.
 
-- With no endpoint, the daemon first runs `init`.
+- With no endpoint, the daemon first runs `init --app` with its stdin
+  piped. Like `serve --app`, it exits at once when that stdin closes, so
+  a daemon killed during a first start leaves no `init` behind.
 - The key is kept in the OS keystore, one entry per endpoint.
 - If `settings.json` names another profile id (a copied folder), the
   endpoint is moved aside and re-initialized. Its devices then show "Pair
