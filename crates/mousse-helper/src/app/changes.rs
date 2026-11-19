@@ -181,6 +181,26 @@ pub fn interface_source() -> Arc<dyn InterfaceSource> {
     Arc::new(mousse_net_io::watch::SystemInterfaces)
 }
 
+/// This computer's interface addresses, loopback included: from the
+/// computer, or in debug builds from the file named by
+/// `MOUSSE_HELPER_INTERFACES_FILE` (the address is each line's second
+/// word).
+pub fn interface_ips() -> Vec<std::net::IpAddr> {
+    #[cfg(debug_assertions)]
+    if let Some(path) = std::env::var_os("MOUSSE_HELPER_INTERFACES_FILE") {
+        return std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.split_whitespace().nth(1)?.parse().ok())
+            .collect();
+    }
+    if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|i| i.ip())
+        .collect()
+}
+
 /// The helper's clock, and in debug builds with
 /// `MOUSSE_HELPER_MANUAL_CLOCK=1` the handle `test.clock` moves it by.
 pub fn clock() -> (Arc<dyn Clock>, Option<Arc<ManualClock>>) {

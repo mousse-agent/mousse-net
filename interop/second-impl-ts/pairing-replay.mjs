@@ -356,8 +356,8 @@ export function replayAttemptSequence(sequence, input) {
         const [{ send: callerHello }, { send: proof }] = joiner.connect(conn, exporters, now);
         const [{ send: hostHello }, ...hostEffects] = host.connect(conn, endpoint.identity, exporters, now);
         // The attempt fixture starts its message log at JOIN_PROOF.
-        assert.deepEqual(host.receive(conn, onWire(callerHello), now), [{ version: 0 }]);
-        assert.deepEqual(joiner.receive(onWire(hostHello)), [{ version: 0 }]);
+        assert.deepEqual(host.receive(conn, onWire(callerHello), now), [{ version: hello.minor }]);
+        assert.deepEqual(joiner.receive(onWire(hostHello)), [{ version: hello.minor }]);
         recordSend(label, conn, proof);
         fromHost(hostEffects);
         receiveAtHost(conn, proof);
@@ -367,7 +367,7 @@ export function replayAttemptSequence(sequence, input) {
         const exporters = { join: Buffer.alloc(32, conn), pair: Buffer.alloc(32, conn + 100) };
         const [{ send: hostHello }, ...hostEffects] = host.connect(conn, hostEndpoint.identity, exporters, now);
         assert.deepEqual(hostHello, hello);
-        assert.deepEqual(host.receive(conn, onWire(hello), now), [{ version: 0 }]);
+        assert.deepEqual(host.receive(conn, onWire(hello), now), [{ version: hello.minor }]);
         const { invitation, secret } = host.ticket;
         const { key, mac } = joinProof(invitation, secret, {
           host: hostEndpoint.identity, joiner: hostEndpoint.identity, exporter: exporters.join,

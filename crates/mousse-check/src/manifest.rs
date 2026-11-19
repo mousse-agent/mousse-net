@@ -104,6 +104,10 @@ pub struct Check {
     /// Commands the kit runs itself, one per target cell it can fill.
     #[serde(default)]
     pub local: Vec<LocalRun>,
+    /// Targets run on a GitHub-hosted runner. Their cells count only
+    /// records `mousse-check hosted verify` wrote, shown as hosted.
+    #[serde(default)]
+    pub hosted: Vec<String>,
     /// Must-fail controls. Each one must make the check print FAIL.
     #[serde(default)]
     pub control: Vec<Control>,
@@ -394,6 +398,20 @@ impl Manifest {
                 }
             }
             validate_cases(c)?;
+            for h in &c.hosted {
+                if !c.targets.contains(h) {
+                    return Err(format!(
+                        "{}: hosted target {h} is not one of its targets",
+                        c.id
+                    ));
+                }
+                if c.local.iter().any(|l| &l.target == h) || c.manual {
+                    return Err(format!(
+                        "{}: hosted target {h} has a local run or is manual; a hosted cell counts only hosted records",
+                        c.id
+                    ));
+                }
+            }
             if c.app && c.manual {
                 return Err(format!(
                     "{}: a manual step cannot be an app check (app = true); attest it with both builds instead",

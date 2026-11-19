@@ -25,6 +25,9 @@
 //! - [`relay`]: the relay protocol and the relay's admission state machine.
 //! - [`relay_hosted`]: the relay's hosted mode: admission tokens, leases,
 //!   the Plus clock and reports.
+//! - [`manifest`]: the host-signed list of relay routes.
+//! - [`relay_endpoint`]: relay endpoints, the `relay` route hint, the
+//!   `mousse-keys` records and an endpoint's relay key derivation.
 //! - [`limits`]: every tunable limit, its default and allowed range.
 #![forbid(unsafe_code)]
 
@@ -57,7 +60,13 @@
         mousse_control = "ignore-admission-expiry",
         mousse_control = "close-funded-at-expiry",
         mousse_control = "refuse-expired-reregister",
-        mousse_control = "expiry-on-relay-wall-clock"
+        mousse_control = "expiry-on-relay-wall-clock",
+        mousse_control = "admit-ungranted",
+        mousse_control = "join-only-streams",
+        mousse_control = "skip-code-confirm",
+        mousse_control = "host-attempts-reset-on-reconnect",
+        mousse_control = "invitation-survives-exhaustion",
+        mousse_control = "same-code-after-failure"
     ),
     not(debug_assertions)
 ))]
@@ -88,7 +97,13 @@ compile_error!("mousse_control plants a bug for tests; it is not allowed in rele
     mousse_control = "ignore-admission-expiry",
     mousse_control = "close-funded-at-expiry",
     mousse_control = "refuse-expired-reregister",
-    mousse_control = "expiry-on-relay-wall-clock"
+    mousse_control = "expiry-on-relay-wall-clock",
+    mousse_control = "admit-ungranted",
+    mousse_control = "join-only-streams",
+    mousse_control = "skip-code-confirm",
+    mousse_control = "host-attempts-reset-on-reconnect",
+    mousse_control = "invitation-survives-exhaustion",
+    mousse_control = "same-code-after-failure"
 ))]
 const _: () = {
     let profile = env!("MOUSSE_BUILD_PROFILE").as_bytes();
@@ -116,10 +131,12 @@ pub mod cpace;
 pub mod grants;
 pub mod identity;
 pub mod limits;
+pub mod manifest;
 pub mod mux;
 pub mod pairing;
 pub mod pairmail;
 pub mod relay;
+pub mod relay_endpoint;
 pub mod relay_hosted;
 pub mod removal;
 pub mod session;

@@ -344,6 +344,14 @@ fn client_config_on(
     Ok(Arc::new(config))
 }
 
+/// A client certificate resolver that presents `own`, for test tools that
+/// build their own client configuration. The kit's route probe uses it to
+/// send deliberately wrong handshakes (TLS 1.2 only, a wrong ALPN) with a
+/// valid certificate, so the host's refusal has one cause.
+pub fn client_cert_resolver(own: &SessionCertificate) -> Arc<dyn ResolvesClientCert> {
+    Arc::new(OwnCert(certified_key(own)))
+}
+
 /// Server configuration for accepting one connection.
 pub fn server_config(
     own: &SessionCertificate,

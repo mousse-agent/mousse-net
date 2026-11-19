@@ -801,3 +801,81 @@ fn an_ipc_client_that_sends_nothing_is_closed() {
     assert!(got.is_empty(), "{}", String::from_utf8_lossy(&got));
     assert!(started.elapsed() >= Duration::from_millis(150));
 }
+
+/// The ws listener's port from `hello`.
+fn ws_port_of(app: &mut App) -> u16 {
+    app.call("hello", json!({"proto": [1, 0]}))["ws_port"]
+        .as_u64()
+        .expect("no ws listener") as u16
+}
+
+/// A ws connection takes its place at accept, before a byte of its upgrade
+/// is read: with the ws pool full, the next connection is closed at once,
+/// not after it was read for WS_UPGRADE_WAIT_MS.
+#[test]
+fn a_ws_connection_takes_its_place_before_any_byte_is_read() {
+    let end = Endpoint::init("wsslot");
+    let mut a = end.app_args("hostA", &[("PREAUTH_WS", "1")], &["--ws-port", "0"]);
+    a.hello();
+    let port = ws_port_of(&mut a);
+    let first = silent_to(port);
+    assert!(!dropped(&first), "the only place was refused");
+    let second = silent_to(port);
+    assert!(dropped(&second), "a second ws connection was read");
+    assert_eq!(a.stats()["preauth_refused"]["ws"], 1);
+    assert_eq!(a.stats()["preauth_open"]["ws"], 1);
+}
+
+/// The fence covers the ws listener too: a connection accepted before the
+/// pause that sends its upgrade during it gets 503.
+#[test]
+fn the_fence_at_the_ws_upgrade_answers_503() {
+    let a_end = Endpoint::init("wsfencea");
+    let b_end = Endpoint::init("wsfenceb");
+    let mut a = a_end.app_args(
+        "hostA",
+        &[("REMOVAL_RETRY_MS", "60000")],
+        &["--ws-port", "0"],
+    );
+    a.hello();
+    let mut b = b_end.app("peerB", &[]);
+    b.hello();
+    pair_apps(&mut a, &mut b);
+    let port = ws_port_of(&mut a);
+    let mut early = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    early
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    // Accepted, holding its place, nothing read yet.
+    std::thread::sleep(Duration::from_millis(200));
+
+    let b_identity = b.identity.clone();
+    let grants = a.call("grants.list", json!({}));
+    let grant = grants["grants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["identity"] == b_identity.as_str())
+        .unwrap()["grant"]
+        .clone();
+    block_grant_saves(&a_end.dir);
+    assert_eq!(
+        a.call("grant.remove", json!({"grant": grant}))["paused"],
+        true
+    );
+    a.event("net.paused", |_| true);
+
+    early
+        .write_all(
+            b"GET /mousse-net/1 HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+              Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\
+              Sec-WebSocket-Protocol: mousse.1\r\n\r\n",
+        )
+        .unwrap();
+    let mut got = String::new();
+    let _ = early.read_to_string(&mut got);
+    assert!(got.starts_with("HTTP/1.1 503"), "{got}");
+    // And a new one is closed at accept.
+    let late = silent_to(port);
+    assert!(dropped(&late), "a ws connection got in while paused");
+}

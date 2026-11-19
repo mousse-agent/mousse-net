@@ -30,7 +30,6 @@ use zeroize::Zeroizing;
 
 use crate::error::NetError;
 use crate::rng::os_rng;
-#[cfg(test)]
 use crate::rng::random_bytes;
 use crate::store::{hex, identity_from_hex, unhex, write_atomic};
 
@@ -342,6 +341,64 @@ pub fn keyring_user(endpoint_id: &str) -> String {
     format!("endpoint-{endpoint_id}")
 }
 
+/// The file of the relay seed, beside a file-kept identity (owner-only,
+/// written with `write_atomic`).
+const RELAY_SEED_FILE: &str = "relay-seed.key";
+
+/// The keystore entry name of an endpoint's relay seed.
+pub fn relay_seed_user(endpoint_id: &str) -> String {
+    format!("relay-seed-{endpoint_id}")
+}
+
+/// The endpoint's relay seed: 32 random bytes, kept where its identity is
+/// kept (`storage`), made on first use. Registration keys, caller keys and
+/// pair secrets are derived from it with salts kept in the helper's state
+/// files, so no other relay secret is ever written to a plain file.
+pub fn relay_seed(
+    dir: &Path,
+    endpoint_id: &str,
+    storage: KeyStorage,
+) -> Result<Zeroizing<[u8; 32]>, NetError> {
+    let parse = |secret: &[u8]| -> Result<Zeroizing<[u8; 32]>, NetError> {
+        let bytes: [u8; 32] = secret
+            .try_into()
+            .map_err(|_| NetError::Store("the relay seed has the wrong length".into()))?;
+        Ok(Zeroizing::new(bytes))
+    };
+    match storage {
+        KeyStorage::OsKeystore | KeyStorage::KeystoreOrFile => {
+            let user = relay_seed_user(endpoint_id);
+            match os_keystore::get_if_any(&user)? {
+                Some(secret) => parse(&secret),
+                None => {
+                    let seed = Zeroizing::new(random_bytes::<32>());
+                    os_keystore::set(&user, seed.as_slice())?;
+                    Ok(seed)
+                }
+            }
+        }
+        KeyStorage::File | KeyStorage::InsecureFile => {
+            let path = dir.join(RELAY_SEED_FILE);
+            if storage == KeyStorage::File && path.exists() {
+                check_owner_only(&path)?;
+            }
+            match fs::read_to_string(&path) {
+                Ok(text) => {
+                    let text = Zeroizing::new(text);
+                    parse(&Zeroizing::new(unhex(text.trim())?))
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    let seed = Zeroizing::new(random_bytes::<32>());
+                    let text = Zeroizing::new(hex(seed.as_slice()));
+                    write_atomic(&path, text.as_bytes())?;
+                    Ok(seed)
+                }
+                Err(e) => Err(NetError::Store(format!("{}: {e}", path.display()))),
+            }
+        }
+    }
+}
+
 /// The OS keystore, when this build has one (feature `os-keystore`, on by
 /// default). The relay builds without it: it keeps no endpoint identity,
 /// and a static Linux build cannot link the Secret Service client.
@@ -369,6 +426,15 @@ mod os_keystore {
         ))
     }
 
+    /// The secret, or `None` when there is no entry.
+    pub fn get_if_any(user: &str) -> Result<Option<Zeroizing<Vec<u8>>>, NetError> {
+        match entry(user)?.get_secret() {
+            Ok(secret) => Ok(Some(Zeroizing::new(secret))),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(NetError::Store(format!("keystore: {e}"))),
+        }
+    }
+
     pub fn delete(user: &str) -> Result<(), NetError> {
         match entry(user)?.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
@@ -391,6 +457,10 @@ mod os_keystore {
     }
 
     pub fn get(_user: &str) -> Result<Zeroizing<Vec<u8>>, NetError> {
+        Err(none())
+    }
+
+    pub fn get_if_any(_user: &str) -> Result<Option<Zeroizing<Vec<u8>>>, NetError> {
         Err(none())
     }
 

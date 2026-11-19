@@ -1,7 +1,8 @@
 //! E5a: reaching paired hosts (Phase 1a §5.3 and §6). The check cell
 //! `phase1a.discovery` runs this file: the mDNS record carries no name, a
 //! pin mismatch moves on to the next candidate, and the addresses a peer
-//! or the owner supplies are private-range only.
+//! supplies are private-range only (the owner's may be of any class but
+//! `forbidden`, Phase 1b §1.3).
 //!
 //! Everything runs on loopback: helpers listen on 127.0.0.1 only, and the
 //! browse source is a file (`MOUSSE_HELPER_BROWSE_FILE`), never multicast.
@@ -298,10 +299,11 @@ const PRIVATE: [&str; 5] = [
     "tcp://[fd00::5]:7443",
 ];
 
-/// `peer.addresses.set` takes private-range addresses only, and keeps them
-/// in `peers.json` across a restart.
+/// `peer.addresses.set` takes the owner's addresses of every kind but none
+/// that names a forbidden address (Phase 1b §1.3), and keeps them in
+/// `peers.json` across a restart.
 #[test]
-fn peer_addresses_set_takes_private_ranges_only_and_they_persist() {
+fn peer_addresses_set_refuses_forbidden_addresses_and_they_persist() {
     let b_end = Endpoint::init("addrb");
     let mut b = b_end.app("peerB", &[]);
     b.hello();
@@ -314,12 +316,17 @@ fn peer_addresses_set_takes_private_ranges_only_and_they_persist() {
         "peer.addresses.set",
         json!({"identity": host, "routes": PRIVATE}),
     );
-    for bad in PUBLIC {
+    for bad in [
+        "tcp://203.0.113.9:7443",
+        "tcp://[2001:db8::1]:7443",
+        "tcp://[fe80::1]:7443",
+        "tcp://0.0.0.0:7443",
+    ] {
         let reply = b.request(
             "peer.addresses.set",
             json!({"identity": host, "routes": ["tcp://10.0.0.1:1", bad]}),
         );
-        assert_eq!(reply["error"], "bad_route", "{bad}: {reply}");
+        assert_eq!(reply["error"], "forbidden_address", "{bad}: {reply}");
     }
     let unknown = b.request(
         "peer.addresses.set",
