@@ -1328,3 +1328,119 @@ fn some_identity() -> String {
     let key = SoftwareKey::generate(&mut os_rng());
     mousse_net_io::store::hex(IdentitySigner::public_key(&key).as_bytes())
 }
+
+/// A port nothing listens on right now.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// With a class map, an inbound connection takes the class the map gives
+/// the listener's port it arrived on, not the caller's source port, so a
+/// check judges the host's side by class as well as kind.
+#[test]
+fn an_inbound_connection_takes_the_class_of_the_port_it_arrived_on() {
+    let port = free_port();
+    let map = format!("{port}=public");
+    let a_end = Endpoint::init("inca");
+    let b_end = Endpoint::init("incb");
+    let mut a = a_end.app_with("hostA", &[("TEST_CLASS_MAP", &map)], port, None);
+    a.hello();
+    let a_route = route_of(&mut a);
+    assert_eq!(port_of(&a_route), port);
+    let mut b = b_end.app("peerB", &[("TEST_CLASS_MAP", &map)]);
+    b.hello();
+    trust(&mut a, &mut b, &[]);
+    b.call(
+        "peer.addresses.set",
+        json!({"identity": a.identity, "routes": [a_route]}),
+    );
+    let out = b.event("conn.up", |m| m["dir"] == "out");
+    assert_eq!(out["route"], json!({"kind": "tcp", "class": "public"}));
+    let b_identity = b.identity.clone();
+    let inbound = a.event("conn.up", |m| {
+        m["dir"] == "in" && m["identity"] == b_identity.as_str()
+    });
+    assert_eq!(inbound["route"], json!({"kind": "tcp", "class": "public"}));
+}
+
+/// `*=<class>` names the class of every loopback port the map leaves out;
+/// an inbound connection's listener port wins over its source port.
+#[test]
+fn the_class_map_default_covers_unmapped_loopback_ports() {
+    let policy = mousse_net_io::pipe::AddrPolicy::debug()
+        .with_class_map("7443=tailnet,*=public")
+        .unwrap();
+    let at = |port: u16| SocketAddr::from(([127, 0, 0, 1], port));
+    assert_eq!(policy.class_of(at(7443)), AddrClass::Tailnet);
+    assert_eq!(policy.class_of(at(50_000)), AddrClass::Public);
+    assert_eq!(
+        policy.class_of_inbound(at(50_000), Some(at(7443))),
+        AddrClass::Tailnet
+    );
+    let plain = mousse_net_io::pipe::AddrPolicy::debug()
+        .with_class_map("7443=tailnet")
+        .unwrap();
+    assert_eq!(plain.class_of(at(50_000)), AddrClass::Lan);
+    assert_eq!(
+        plain.class_of_inbound(at(50_000), Some(at(7443))),
+        AddrClass::Tailnet
+    );
+}
+
+/// Move both helpers' wall clocks to the moment `deadline`'s path is due
+/// for renewal.
+fn clocks_to_renewal(a: &mut App, b: &mut App, deadline: i64) {
+    let now = b.call("test.clock", json!({}))["now"].as_i64().unwrap();
+    let due = deadline
+        - CoreLimits::DEFAULT.clock_skew_secs() as i64
+        - CoreLimits::DEFAULT.renew_lead_secs() as i64;
+    for app in [a, b] {
+        app.call("test.clock", json!({"advance_secs": due - now}));
+    }
+}
+
+/// A renewed path's `conn.up` carries its route like any other, on both
+/// sides, so a path switch is judged by route too.
+#[test]
+fn a_renewed_path_carries_its_route() {
+    let port = free_port();
+    let map = format!("{port}=tailnet");
+    let clock = [("MOUSSE_HELPER_MANUAL_CLOCK", std::path::Path::new("1"))];
+    let a_end = Endpoint::init("rra");
+    let b_end = Endpoint::init("rrb");
+    let mut a = a_end.app_raw("hostA", &[("TEST_CLASS_MAP", &map)], port, &clock);
+    a.hello();
+    let a_route = route_of(&mut a);
+    let mut b = b_end.app_raw("peerB", &[("TEST_CLASS_MAP", &map)], 0, &clock);
+    b.hello();
+    trust(&mut a, &mut b, &[]);
+    b.call(
+        "peer.addresses.set",
+        json!({"identity": a.identity, "routes": [a_route]}),
+    );
+    let a_id = a.identity.clone();
+    let first = b.event("conn.up", |m| {
+        m["dir"] == "out" && m["identity"] == a_id.as_str()
+    });
+    let tailnet = json!({"kind": "tcp", "class": "tailnet"});
+    assert_eq!(first["route"], tailnet);
+    let deadline = first["deadline"].as_i64().unwrap();
+    clocks_to_renewal(&mut a, &mut b, deadline);
+    let reopen = b.event("path.reopen", |m| m["identity"] == a_id.as_str());
+    let renewed = reopen["conn"].clone();
+    let up = b.event("conn.up", |m| m["conn"] == renewed);
+    assert_eq!(up["route"], tailnet, "{up}");
+    let b_id = b.identity.clone();
+    let inbound = a.wait("the renewed path on A", WAIT, |st| {
+        st.messages
+            .iter()
+            .filter(|m| m["ev"] == "conn.up" && m["dir"] == "in" && m["identity"] == b_id.as_str())
+            .nth(1)
+            .cloned()
+    });
+    assert_eq!(inbound["route"], tailnet, "{inbound}");
+}

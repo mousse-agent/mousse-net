@@ -319,13 +319,14 @@ impl App {
     }
 
     /// An inbound connection that came over a `kind` listener from
-    /// `from`: announced once it is live, with its route. Returns its
-    /// number.
+    /// `from` to the listener's address `local`: announced once it is live,
+    /// with its route. Returns its number.
     pub async fn inbound(
         &self,
         conn: Connection,
         kind: RouteKind,
         from: Option<std::net::SocketAddr>,
+        local: Option<std::net::SocketAddr>,
     ) -> Option<u64> {
         let peer = short_id(conn.peer());
         // Must-fail control: announce the connection before step 2 settles.
@@ -335,9 +336,12 @@ impl App {
             return None;
         }
         let class = match (kind, from) {
-            (RouteKind::Tcp, Some(from)) => {
-                RouteClass::of_tcp(self.shared.caller.addr_policy().class_of(from))
-            }
+            (RouteKind::Tcp, Some(from)) => RouteClass::of_tcp(
+                self.shared
+                    .caller
+                    .addr_policy()
+                    .class_of_inbound(from, local),
+            ),
             (RouteKind::Ssh, _) => RouteClass::Ssh,
             _ => RouteClass::Tunnel,
         };

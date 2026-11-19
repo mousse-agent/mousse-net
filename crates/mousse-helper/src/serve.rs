@@ -619,7 +619,7 @@ async fn ws_connection(
     };
     match app {
         Some(app) => {
-            app.inbound(conn, RouteKind::Ws, None).await;
+            app.inbound(conn, RouteKind::Ws, None, None).await;
         }
         None => serve_streams(conn, addr).await,
     }
@@ -642,8 +642,10 @@ async fn app_connection(
     slot: PreAuthSlot,
     closing: watch::Receiver<bool>,
 ) {
+    // The listener's own address: a check's class map names its port.
+    let local = pipe.local_addr().ok();
     if let Some(conn) = accept_holding(&host, pipe, addr, slot).await {
-        if let Some(no) = app.inbound(conn, RouteKind::Tcp, Some(addr)).await {
+        if let Some(no) = app.inbound(conn, RouteKind::Tcp, Some(addr), local).await {
             app.close_with_socket(no, closing);
         }
     }
@@ -912,7 +914,7 @@ async fn app_control_session(
                 return;
             }
         };
-        app.inbound(conn, RouteKind::Ssh, None).await;
+        app.inbound(conn, RouteKind::Ssh, None, None).await;
         return;
     }
     drop(slot);

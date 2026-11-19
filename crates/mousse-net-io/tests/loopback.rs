@@ -361,7 +361,9 @@ async fn a_path_is_renewed_before_its_deadline_and_replaced_only_after_reopening
     clock.advance(skip);
     host.clock.advance(skip);
     let (from, new) = match within("the renewal", path_events.recv()).await {
-        Some(PathEvent::Reopen { pin, from, conn }) => {
+        Some(PathEvent::Reopen {
+            pin, from, conn, ..
+        }) => {
             assert_eq!(pin, host.identity());
             (from, conn)
         }
