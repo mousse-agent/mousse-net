@@ -247,3 +247,68 @@ async fn bad_upgrades_never_reach_the_relay_protocol() {
     let answer = String::from_utf8_lossy(&answer);
     assert!(answer.starts_with("HTTP/1.1 404"), "{answer}");
 }
+
+/// The relay may connect a caller to any leg; the caller's peer TLS, pinned
+/// to the host it meant, fails before any data when the far end is someone
+/// else.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wrong_peer_identity_fails_before_data() {
+    use mousse_net_io::certs::CertManager;
+    use mousse_net_io::{Clock, SharedSigner, SystemClock, TlsPolicy};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (target, caller) = (key(0x61), key(0x71));
+    let f = Fixture::new("peer-pin", &[], &[&target]).await;
+    let mut reg = f.register(&target).await;
+    allow(&mut reg, 1, &[&caller]).await;
+    let (leg, acc) = f
+        .connect(&mut reg, &target, &caller, Class::Interactive)
+        .await;
+
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+    let new_key = || {
+        Arc::new(mousse_net_core::identity::SoftwareKey::generate(
+            &mut mousse_relay::os_rng(),
+        ))
+    };
+    let (answering, expected) = (new_key(), new_key());
+    let answering: SharedSigner = answering;
+    let expected_pin = expected.public_key();
+    let caller_signer: SharedSigner = new_key();
+    let host_cert = CertManager::new(answering, clock.clone())
+        .current()
+        .unwrap();
+    let caller_cert = CertManager::new(caller_signer, clock.clone())
+        .current()
+        .unwrap();
+    let (host_pipe, _) = bridge(acc);
+    let (caller_pipe, _) = bridge(leg);
+    let host = {
+        let clock = clock.clone();
+        tokio::spawn(async move {
+            let Ok((mut tls, _)) =
+                mousse_net_io::tls::accept(host_pipe, &host_cert, clock, TlsPolicy::default())
+                    .await
+            else {
+                return 0;
+            };
+            let mut buf = [0u8; 64];
+            tls.read(&mut buf).await.unwrap_or(0)
+        })
+    };
+    let result = mousse_net_io::tls::connect(
+        caller_pipe,
+        &caller_cert,
+        expected_pin,
+        clock,
+        TlsPolicy::default(),
+    )
+    .await;
+    if let Ok((mut tls, _)) = result {
+        let _ = tls.write_all(b"secret").await;
+        panic!("the caller's peer TLS accepted a host it did not pin");
+    }
+    let got = tokio::time::timeout(WAIT, host).await.unwrap().unwrap();
+    assert_eq!(got, 0, "the wrong host received data");
+}

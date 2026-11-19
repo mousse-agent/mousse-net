@@ -33,7 +33,7 @@ pub enum Received {
 
 /// One outer connection to a relay.
 pub struct RelayConn {
-    ws: WebSocketStream<TlsStream<TcpStream>>,
+    ws: WebSocketStream<Box<dyn crate::Io>>,
     /// The connection's nonce and outer exporter, for proofs.
     pub binding: Binding,
     /// The relay's boot id.
@@ -66,21 +66,44 @@ pub enum DialError {
     NoHello,
 }
 
+/// The native client's outer TLS, and its exporter.
+#[cfg(not(mousse_control = "marker-in-splice"))]
+async fn outer_tls(
+    addr: SocketAddr,
+    host: &str,
+    pin: RelayId,
+    tcp: TcpStream,
+) -> Result<(Box<dyn crate::Io>, [u8; 32]), DialError> {
+    let name = ServerName::try_from(host.trim_matches(['[', ']']).to_owned())
+        .unwrap_or_else(|_| ServerName::IpAddress(addr.ip().into()));
+    let stream: TlsStream<TcpStream> = TlsConnector::from(tls::client_config(pin))
+        .connect(name, tcp)
+        .await
+        .map_err(DialError::Tls)?;
+    tls::check(stream.get_ref().1, true).map_err(DialError::Policy)?;
+    let exporter =
+        tls::exporter(stream.get_ref().1).map_err(|e| DialError::Policy(e.to_string()))?;
+    Ok((Box::new(stream), exporter))
+}
+
+/// `marker-in-splice`: no outer TLS (the relay runs without it too).
+#[cfg(mousse_control = "marker-in-splice")]
+async fn outer_tls(
+    _addr: SocketAddr,
+    _host: &str,
+    _pin: RelayId,
+    tcp: TcpStream,
+) -> Result<(Box<dyn crate::Io>, [u8; 32]), DialError> {
+    Ok((Box::new(tcp), [0; 32]))
+}
+
 impl RelayConn {
     /// Dial the relay at `addr`, pinned to `pin`. `host` is the name in the
     /// enrollment link (an IP address sends no server name).
     pub async fn dial(addr: SocketAddr, host: &str, pin: RelayId) -> Result<Self, DialError> {
         let tcp = TcpStream::connect(addr).await.map_err(DialError::Connect)?;
         let _ = tcp.set_nodelay(true);
-        let name = ServerName::try_from(host.trim_matches(['[', ']']).to_owned())
-            .unwrap_or_else(|_| ServerName::IpAddress(addr.ip().into()));
-        let stream = TlsConnector::from(tls::client_config(pin))
-            .connect(name, tcp)
-            .await
-            .map_err(DialError::Tls)?;
-        tls::check(stream.get_ref().1, true).map_err(DialError::Policy)?;
-        let exporter =
-            tls::exporter(stream.get_ref().1).map_err(|e| DialError::Policy(e.to_string()))?;
+        let (stream, exporter) = outer_tls(addr, host, pin, tcp).await?;
         let mut request = format!("ws://{host}{}", upgrade::PATH)
             .into_client_request()
             .map_err(|e| DialError::Upgrade(e.to_string()))?;

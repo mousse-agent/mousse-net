@@ -1302,6 +1302,7 @@ dependencies = [
  "getrandom 0.4.3",
  "httparse",
  "mousse-net-core",
+ "mousse-net-io",
  "rand_core 0.10.1",
  "rustls",
  "serde",

@@ -53,6 +53,11 @@ pub mod upgrade;
 use getrandom::SysRng;
 use rand_core::UnwrapErr;
 
+/// A byte stream under a relay WebSocket: the outer TLS stream.
+pub trait Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
+
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin> Io for T {}
+
 /// The OS random source.
 pub type OsRng = UnwrapErr<SysRng>;
 
