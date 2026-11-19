@@ -317,7 +317,42 @@ pub struct Attestation {
 pub struct Evidence {
     pub results: Vec<ResultPayload>,
     pub attestations: Vec<Attestation>,
+    pub hosted: Vec<HostedRecord>,
     pub rejected: Vec<(PathBuf, Rejection)>,
+}
+
+/// `format` of a hosted record.
+pub const HOSTED_FORMAT: &str = "mousse-check-hosted-v1";
+
+/// One run on a GitHub-hosted runner, written by `mousse-check hosted
+/// verify` after it checked the run's artifact against its digest, the
+/// build under test and the pinned app. Unsigned: what makes it count is
+/// that verification, the artifact digest it names, and the build and
+/// configuration it must match like any result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostedRecord {
+    pub format: String,
+    pub check: String,
+    pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control: Option<String>,
+    /// PASS or FAIL.
+    pub outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub details: String,
+    pub build: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_build: Option<String>,
+    pub config: String,
+    /// The workflow run, as a URL.
+    pub run: String,
+    /// `sha256:<hex>` of the artifact archive, as GitHub reports it.
+    pub artifact_digest: String,
+    /// SHA-256 of the helper binary the run smoked.
+    pub helper_sha256: String,
+    pub time: String,
 }
 
 /// Read every `.json` file under `dir` (recursively).
@@ -344,6 +379,12 @@ pub fn collect(dir: &Path, devices: &DeviceList) -> Evidence {
             }
         };
         match value.get("format").and_then(|f| f.as_str()) {
+            Some(HOSTED_FORMAT) => match serde_json::from_value::<HostedRecord>(value) {
+                Ok(h) => ev.hosted.push(h),
+                Err(e) => ev
+                    .rejected
+                    .push((path, Rejection::Malformed(e.to_string()))),
+            },
             Some(ATTEST_FORMAT) => match serde_json::from_value::<Attestation>(value) {
                 Ok(a) => ev.attestations.push(a),
                 Err(e) => ev

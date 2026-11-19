@@ -534,6 +534,11 @@ pub struct PeerRecord {
     /// `peer.addresses.set`), tried before the hints.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub addresses: Vec<String>,
+    /// Routes the host offered when it paired back that the automatic rule
+    /// does not cover (Phase 1b §1.3): kept as suggestions and never
+    /// dialled; the owner's Use moves one to `addresses`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub offered: Vec<String>,
     /// When pairing finished (local clock).
     pub paired_at: u64,
 }
@@ -673,6 +678,9 @@ impl PeersLock<'_> {
 
 /// Where an approval came from (Phase 1b §1.3): approved at Connect.
 pub const APPROVAL_SOURCE_TICKET: &str = "ticket";
+/// Where an approval came from: an address the owner set
+/// (`peer.addresses.set`).
+pub const APPROVAL_SOURCE_OWNER: &str = "owner";
 
 /// A destination the owner approved for a peer (Phase 1b §1.3).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -709,7 +717,13 @@ impl ApprovalStore {
         }
     }
 
-    /// Every approval.
+    /// Whether the file exists. A store from before approvals existed has
+    /// none, so nothing in it counts as approved.
+    pub fn exists(&self) -> bool {
+        self.path.exists()
+    }
+
+    /// Every approval; none when there is no file.
     pub fn load(&self) -> Result<Vec<Approval>, NetError> {
         let Some(bytes) = read_optional(&self.path)? else {
             return Ok(Vec::new());
@@ -736,6 +750,23 @@ impl ApprovalStore {
             return Ok(());
         }
         self.write(list)
+    }
+
+    /// Change the list with `change`; written only if it changed.
+    /// Returns whether it did.
+    pub fn update(
+        &self,
+        _held: &PeersLock<'_>,
+        change: impl FnOnce(&mut Vec<Approval>),
+    ) -> Result<bool, NetError> {
+        let before = self.load()?;
+        let mut list = before.clone();
+        change(&mut list);
+        if list == before {
+            return Ok(false);
+        }
+        self.write(list)?;
+        Ok(true)
     }
 
     /// Remove every approval for the peer `identity` (hex).
@@ -1265,6 +1296,7 @@ mod tests {
                             routes: Vec::new(),
                             last_route: None,
                             addresses: Vec::new(),
+                            offered: Vec::new(),
                             paired_at: 1,
                         })
                         .unwrap();
@@ -1292,6 +1324,7 @@ mod tests {
             routes: vec!["tcp://10.0.0.2:7443".into()],
             last_route: None,
             addresses: Vec::new(),
+            offered: Vec::new(),
             paired_at: 1,
         }
     }
@@ -1510,6 +1543,7 @@ mod tests {
             routes: vec!["tcp://10.0.0.2:7443".into()],
             last_route: None,
             addresses: Vec::new(),
+            offered: Vec::new(),
             paired_at: 1,
         };
         store.upsert(record.clone()).unwrap();

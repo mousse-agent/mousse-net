@@ -36,12 +36,16 @@ pub mod pipe;
 pub mod preauth;
 pub mod private;
 pub mod rng;
+pub mod routes;
 pub mod store;
 pub mod tls;
 pub mod watch;
 
 pub use admission::StreamAdmission;
-pub use caller::{Caller, CodeEntry, JoinOutcome, NoCode, PathEvent, Step1Failures};
+pub use caller::{
+    Caller, CandidateSource, CodeEntry, JoinOutcome, LaterCandidates, NoCode, PathEvent, Reached,
+    RouteClass, Search, Step1Failures,
+};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use conn::{CloseReason, ConnStatus, Connection, MuxStream, StreamReader, StreamWriter};
 pub use endpoint::{Endpoint, PortChoice};
@@ -82,6 +86,13 @@ pub type SharedSigner = Arc<dyn IdentitySigner + Send + Sync>;
         mousse_control = "user-config-in-pipe",
         mousse_control = "no-preamble-skip",
         mousse_control = "window-per-route",
+        mousse_control = "loopback-routes",
+        mousse_control = "resolve-again",
+        mousse_control = "unlisted-allowed",
+        mousse_control = "stale-renewal-routes",
+        mousse_control = "unbounded-candidates",
+        mousse_control = "ssh-races-lan",
+        mousse_control = "bind-all-lan-off",
         mousse_control = "pin-stored-memory-only"
     )
 ))]
@@ -111,6 +122,13 @@ compile_error!("a mousse_control build has a deliberate defect and is for tests 
     mousse_control = "user-config-in-pipe",
     mousse_control = "no-preamble-skip",
     mousse_control = "window-per-route",
+    mousse_control = "loopback-routes",
+    mousse_control = "resolve-again",
+    mousse_control = "unlisted-allowed",
+    mousse_control = "stale-renewal-routes",
+    mousse_control = "unbounded-candidates",
+    mousse_control = "ssh-races-lan",
+    mousse_control = "bind-all-lan-off",
     mousse_control = "pin-stored-memory-only"
 ))]
 const _: () = {
@@ -168,6 +186,20 @@ pub const CONTROL: Option<&str> = if cfg!(mousse_control = "skip-pin-check") {
     Some("no-preamble-skip")
 } else if cfg!(mousse_control = "window-per-route") {
     Some("window-per-route")
+} else if cfg!(mousse_control = "loopback-routes") {
+    Some("loopback-routes")
+} else if cfg!(mousse_control = "resolve-again") {
+    Some("resolve-again")
+} else if cfg!(mousse_control = "unlisted-allowed") {
+    Some("unlisted-allowed")
+} else if cfg!(mousse_control = "stale-renewal-routes") {
+    Some("stale-renewal-routes")
+} else if cfg!(mousse_control = "unbounded-candidates") {
+    Some("unbounded-candidates")
+} else if cfg!(mousse_control = "ssh-races-lan") {
+    Some("ssh-races-lan")
+} else if cfg!(mousse_control = "bind-all-lan-off") {
+    Some("bind-all-lan-off")
 } else {
     None
 };

@@ -60,6 +60,12 @@ spec's value: it can only be tightened.
 | `MOUSSE_NET_STREAMS_PER_ENDPOINT` | 128 | 1 to 1024 | Open streams on all of an endpoint's connections together, host and caller sides alike; past it as above. |
 | `MOUSSE_NET_DIAL_PARALLEL` | 4 | 1 to 64 | Caller: candidate addresses for one host dialled at once (Phase 1a §6). |
 | `MOUSSE_NET_DIAL_TIMEOUT_MS` | 2000 | 100 to 60000 | Caller: time one candidate address has to connect and pass step 1 before it is given up (Phase 1a §6). |
+| `MOUSSE_NET_DIAL_MAX_CANDIDATES` | 16 | 1 to 64 | Caller: candidates kept for one search, in order: the last working route, the owner's addresses, approved hints, then browse results (Phase 1b §1.4). |
+| `MOUSSE_NET_TIER_HEAD_START_MS` | 500 | 0 to 10000 | Caller: wait after the `tcp` tier starts before `ws`/`wss` candidates start; at once when there is no `tcp` candidate. Also when the `ssh` tier starts if the last working route was `ssh`. |
+| `MOUSSE_NET_DIAL_FAST_TIERS_MS` | 12000 | 1000 to 60000 | Caller: latest start of the `ssh` tier, from the start of the search; it starts earlier once the `tcp` and `ws` tiers are done, so an SSH login never races a LAN path. |
+| `MOUSSE_NET_DIAL_SEARCH_MS` | 45000 | 5000 to 300000 | Caller: one whole search across every tier; past it the search ends unreachable. |
+| `MOUSSE_NET_WS_DIAL_TIMEOUT_MS` | 10000 | 500 to 60000 | Caller: one `ws`/`wss` try: connect, outer TLS, upgrade and step 1. |
+| `MOUSSE_NET_SSH_DIAL_TIMEOUT_MS` | 20000 | 1000 to 120000 | Caller: one `ssh` try: login, marker, remote `pipe` and step 1. |
 | `MOUSSE_NET_BROWSE_WAIT_MS` | 1500 | 100 to 30000 | How long an mDNS browse listens for answers (Phase 1a §6). |
 | `MOUSSE_NET_BROWSE_CACHE_MS` | 60000 | 0 to 3600000 | How long browse results are reused before the next browse; 0 browses every time (Phase 1a §6). |
 | `MOUSSE_NET_IFACE_POLL_MS` | 5000 | 100 to 60000 | How often the network watcher lists the interfaces and reads the monotonic clock (Phase 1a §6 and §8). |
@@ -128,11 +134,33 @@ count as unknown names.
 | Variable | What it does |
 | --- | --- |
 | `MOUSSE_NET_TEST_EXTRA_ROOT` | A DER certificate file the outer `wss` TLS trusts besides the platform's roots, for a test tunnel stand-in (Phase 1b §4.2). Nothing is installed in an OS store. |
-| `MOUSSE_NET_TEST_CLASS_MAP` | Maps loopback ports to address classes, so checks can stand in for tailnet and public routes (Phase 1b §1.2). |
+| `MOUSSE_NET_TEST_CLASS_MAP` | Maps loopback ports to address classes, so checks can stand in for tailnet and public routes (Phase 1b §1.2): `<port>=<class>` entries (`lan`, `tailnet` or `public`) separated by commas. Unmapped loopback counts as `lan`. |
 | `MOUSSE_NET_SSH_BIN` | The `ssh` client to run instead of the system's (Phase 1b §3.1). |
 | `MOUSSE_NET_TEST_SSH_CONFIG` | The ssh config `ssh -G` reads instead of the user's own and the system's, so tests never read the owner's ssh config (Phase 1b §3.7). Every later call reads only the route's own config. |
 | `MOUSSE_NET_TEST_EGRESS` | A check's egress fence (Phase 1b §14): when set, the helper dials only loopback and the comma-separated IP literals listed (the Mac's address in cross-machine cells), and resolves no name but `localhost`. Empty means loopback only. |
 | `MOUSSE_NET_TEST_EGRESS_LOG` | A file the helper appends one JSON line to for each dial the fence refused; the check kit fails the run with `egress_attempted`. |
+
+## Check kit (tests only)
+
+The owner test kit's own waits and its relay. Nothing here is read by the
+engine or the app.
+
+| Variable | Default | Allowed | What it limits |
+| --- | --- | --- | --- |
+| `MOUSSE_NET_RELAY_MAX_STREAMS` | 16 | 1 to 16 (tighten) | Kit relay (`tools/app-check/relay.mjs`, Mac to PC for the chat-link check): connections carried at once. |
+| `MOUSSE_NET_RELAY_FRAME_MAX_BYTES` | 65536 | 1024 to 65536 (tighten) | Kit relay: one frame on the control connection. |
+| `MOUSSE_NET_RELAY_HELLO_WAIT_MS` | 5000 | 100 to 60000 | Kit relay: time for the control connection's first line. |
+| `MOUSSE_CHECK_PROBE_CONNECT_MS` | 5000 | 1 or more | `mousse-check probe`: one TCP connect. |
+| `MOUSSE_CHECK_PROBE_CLOSE_MS` | 5000 | 1 or more | Probe: time the host has to answer or close once it should. |
+| `MOUSSE_CHECK_PROBE_SETTLE_MS` | 1000 | 1 or more | Probe: after a case, before the app's counters are read again. |
+| `MOUSSE_CHECK_SMOKE_SERVE_MS` | 15000 | 1 or more | `tools/build-smoke.mjs`: for release `serve` and `invite` to be ready. |
+| `MOUSSE_CHECK_SMOKE_PROBE_MS` | 120000 | 1 or more | Build smoke: one probe run. |
+
+The probe reads the engine limits it tests (`MOUSSE_NET_PREAUTH_*`,
+`MOUSSE_NET_JOIN_PROOF_WAIT_MS`, `MOUSSE_NET_HANDSHAKE_TIMEOUT_MS`,
+`MOUSSE_NET_WS_UPGRADE_WAIT_MS`, `MOUSSE_NET_WS_HEADER_MAX_BYTES`) from the
+same variables, so a check that tightens one for the host tightens it for
+the probe.
 
 ## Fixed on purpose
 

@@ -13,22 +13,30 @@
 //!   lost `PAIRED` enrolled it. A link join ignores `pinned` (see
 //!   [`crate::peer::join_routes`]); a `PAIRED` for its ticket leaves a
 //!   completion record that `join.status` replays and `join.ack` drops.
+//!   `approved` lists the ticket's hints beyond the automatic rule that the
+//!   owner approved at Connect (Phase 1b §1.3): only those and private
+//!   literals are dialled, and a join that pairs stores them as `ticket`
+//!   approvals (a link join through its completion record).
 //! - **Grants:** `grants.list`, `grant.add` (idempotent), `grant.remove`
 //!   (journaled, see [`crate::revoke`]); events `grant.closed`,
 //!   `store.failed`, `net.paused` and `net.resumed`.
 //! - **Peers:** `peers.list`, `peer.add` (idempotent), `peer.forget`,
-//!   `peer.addresses.set`, and `dial`, whose `conn.up` carries the role the
-//!   peer gave this device (see [`super::paths`]).
+//!   `peer.addresses.set`, `approvals.list`, and `dial`, whose `conn.up`
+//!   carries the role the peer gave this device and the route it came up on
+//!   (see [`super::paths`]). `peer.add {offered}` keeps the routes a host
+//!   offered beyond the automatic rule as suggestions.
 //! - **Session:** `config.set {name}`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, MutexGuard};
 
 use mousse_net_core::grants::{Grant, GrantId};
-use mousse_net_core::pairing::{Arrival, InvitationId, InvitationKind, PairingCode, Route, Ticket};
+use mousse_net_core::pairing::{Arrival, InvitationId, InvitationKind, PairingCode, Ticket};
 use mousse_net_core::ErrorCode;
+use mousse_net_io::pipe::LocalRoute;
 use mousse_net_io::store::{
-    hex, identity_from_hex, short_id, unhex, CompletionStore, PeerRecord, PeerStore,
+    hex, identity_from_hex, short_id, unhex, Approval, ApprovalStore, CompletionStore, PeerRecord,
+    PeerStore, APPROVAL_SOURCE_TICKET,
 };
 use mousse_net_io::{ApprovalRequest, CodeEntry, HostEvent, NetError, NoCode};
 use serde_json::{json, Map, Value};
@@ -40,7 +48,7 @@ use crate::applog;
 use crate::revoke::Removed;
 
 /// The requests this module answers.
-pub const OPS: [&str; 17] = [
+pub const OPS: [&str; 18] = [
     "config.set",
     "invite.create",
     "invite.cancel",
@@ -58,6 +66,7 @@ pub const OPS: [&str; 17] = [
     "peer.forget",
     "peer.addresses.set",
     "dial",
+    "approvals.list",
 ];
 
 /// Pairing state of one channel.
@@ -149,6 +158,7 @@ fn peer_json(p: &PeerRecord) -> Value {
         "role": role_text(&p.role),
         "routes": p.routes,
         "addresses": p.addresses,
+        "offered": p.offered,
         "last_route": p.last_route,
         "paired_at": p.paired_at,
     })
@@ -203,6 +213,7 @@ pub fn on_request(shared: &Arc<Shared>, id: Value, op: &str, map: &Map<String, V
         }
         "grant.add" => add_grant(shared, &id, map),
         "grant.remove" => remove_grant(shared, &id, map),
+        "approvals.list" => super::paths::list_approvals(shared, &id, map),
         "peers.list" => match peers(shared).load() {
             Ok(list) => json!({"re": id, "peers": list.iter().map(peer_json).collect::<Vec<_>>()}),
             Err(e) => error(&id, "store_failed", e.to_string()),
@@ -242,7 +253,14 @@ fn invite(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
         Some("link") => InvitationKind::SendLink,
         Some(_) => return error(id, "bad_request", "kind is in_person or link"),
     };
-    let routes = shared.info.routes.clone();
+    // What the listener serves now (Phase 1b §1.5).
+    let routes = shared
+        .info
+        .listen
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .routes
+        .clone();
     match shared.host.invite(kind, routes.clone()) {
         Ok(created) => {
             let invitation = created.ticket.invitation;
@@ -419,11 +437,14 @@ async fn join(
         approved,
         typed,
     } = ask;
-    // Only private-range hints are dialled (§5.3).
-    let candidates: Vec<Route> = super::paths::ticket_routes(&ticket.routes);
+    // Private-range hints, and the ones the owner approved (§1.3).
+    let policy = shared.caller.addr_policy().clone();
+    let approved_routes = super::paths::canonical_list(Some(&json!(approved)));
+    let candidates: Vec<LocalRoute> =
+        super::paths::ticket_candidates(&policy, &ticket.routes, &approved_routes);
     let result = if candidates.is_empty() {
         Err(crate::peer::Failure {
-            text: "the ticket has no usable private-range address".into(),
+            text: "the ticket has no private-range address and none it lists was approved".into(),
             reason: "no_route".into(),
         })
     } else {
@@ -476,20 +497,30 @@ async fn join(
     };
     // A cancel that came first has answered already.
     if state(&shared).joins.remove(&key).is_none() {
-        if let Ok((conn, _, _)) = result {
+        if let Ok((conn, _, _, _)) = result {
             conn.close(ErrorCode::Cancelled);
         }
         return;
     }
     let reply = match result {
-        Ok((conn, record, already)) => {
+        Ok((conn, record, already, reached)) => {
             let role = (record.role != "unknown").then(|| role_text(&record.role));
             applog::line(format!(
                 "joined {} ({})",
                 short_id(&ticket.host_identity),
                 if already { "already paired" } else { "paired" }
             ));
-            match shared.add_conn(conn, false, json!({"dir": "out", "role": role})) {
+            // A link join stored its approvals with its completion record.
+            if ticket.kind == InvitationKind::InPerson && !already {
+                store_ticket_approvals(&shared, &ticket, &approved_routes);
+            }
+            shared.caller.forget_routes(Some(&ticket.host_identity));
+            let fields = json!({
+                "dir": "out",
+                "role": role,
+                "route": super::paths::route_json(&reached),
+            });
+            match shared.add_conn(conn, false, fields) {
                 Ok(no) => json!({
                     "re": id,
                     "identity": hex(ticket.host_identity.as_bytes()),
@@ -626,6 +657,34 @@ pub async fn prune_completions(shared: Arc<Shared>) {
     }
 }
 
+/// An in-person join paired: the ticket's hints the owner approved become
+/// `ticket` approvals for its host (§1.3). Private literals need none.
+fn store_ticket_approvals(shared: &Shared, ticket: &Ticket, approved: &[String]) {
+    let policy = shared.caller.addr_policy().clone();
+    let key = hex(ticket.host_identity.as_bytes());
+    let at = crate::peer::now_secs();
+    let entries: Vec<Approval> = super::paths::ticket_candidates(&policy, &ticket.routes, approved)
+        .into_iter()
+        .filter(|r| !policy.automatic(r) && approved.contains(&r.uri()))
+        .map(|r| Approval {
+            identity: key.clone(),
+            destination: r.uri(),
+            source: APPROVAL_SOURCE_TICKET.into(),
+            at,
+        })
+        .collect();
+    if entries.is_empty() {
+        return;
+    }
+    let peers = peers(shared);
+    let stored = peers
+        .lock()
+        .and_then(|held| ApprovalStore::in_dir(&shared.info.state_dir).add(&held, &entries));
+    if let Err(e) = stored {
+        applog::line(format!("saving approvals failed: {e}"));
+    }
+}
+
 /// The host `identity` was removed: no completion record may bring it
 /// back (Phase 1b §5.4).
 fn forget_completions(shared: &Shared, identity: &str) -> Result<(), NetError> {
@@ -685,8 +744,12 @@ fn remove_grant(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value 
         .map(|g| hex(g.identity.as_bytes()));
     let removed = shared.removal.remove(GrantId(grant));
     if let (Ok(Removed::Saved | Removed::Paused), Some(identity)) = (&removed, &identity) {
+        // Its approvals go too (§1.3), with any completion record.
         if let Err(e) = forget_completions(shared, identity) {
             applog::line(format!("dropping link completion records failed: {e}"));
+        }
+        if let Ok(pin) = identity_from_hex(identity) {
+            shared.caller.forget_routes(Some(&pin));
         }
     }
     match removed {
@@ -708,9 +771,15 @@ fn add_peer(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
     let Some(name) = str_field(map, "name") else {
         return error(id, "bad_request", "peer.add needs name");
     };
-    // The routes a host sends when it pairs back: private ranges only.
-    let routes = match super::paths::parse_routes(map.get("routes")) {
+    // The routes a host sends when it pairs back: private ranges only;
+    // the others it offered are suggestions, never dialled (§1.3).
+    let policy = shared.caller.addr_policy().clone();
+    let routes = match super::paths::parse_routes(&policy, map.get("routes")) {
         Ok(routes) => routes,
+        Err(e) => return error(id, "bad_route", e),
+    };
+    let offered = match super::paths::parse_offered(&policy, map.get("offered")) {
+        Ok(offered) => offered,
         Err(e) => return error(id, "bad_route", e),
     };
     // 1a grants are owner grants (`grant.add` makes no other).
@@ -728,6 +797,11 @@ fn add_peer(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
                         p.routes.push(r.clone());
                     }
                 }
+                for r in &offered {
+                    if !p.offered.contains(r) {
+                        p.offered.push(r.clone());
+                    }
+                }
             }
             None => list.push(PeerRecord {
                 name: name.to_owned(),
@@ -736,6 +810,7 @@ fn add_peer(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
                 routes: routes.clone(),
                 last_route: None,
                 addresses: Vec::new(),
+                offered: offered.clone(),
                 paired_at: crate::peer::now_secs(),
             }),
         }
@@ -771,6 +846,7 @@ fn forget_peer(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
         Ok(tickets) => settle(shared, &tickets),
         Err(e) => return error(id, "store_failed", e.to_string()),
     }
+    shared.caller.forget_routes(Some(&identity));
     // Its outbound connections go with it, and so do those still opening:
     // a dial or renewal that started before publishes nothing.
     let mut core = super::lock(&shared.core);

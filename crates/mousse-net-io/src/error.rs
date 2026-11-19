@@ -43,6 +43,9 @@ pub enum NetError {
         /// The stderr text or what was missing; never shown raw.
         detail: String,
     },
+    /// The route names, or resolved only to, addresses that are never
+    /// dialled (Phase 1b §1.2), or it is not approved for this peer.
+    Forbidden(String),
 }
 
 impl NetError {
@@ -58,6 +61,7 @@ impl NetError {
                 | NetError::Timeout(_)
                 | NetError::PeerCertificate(_)
                 | NetError::Ssh { .. }
+                | NetError::Forbidden(_)
         )
     }
 }
@@ -82,6 +86,7 @@ impl fmt::Display for NetError {
             NetError::StreamLimit => f.write_str("too many open streams"),
             NetError::Ssh { reason, detail } if detail.is_empty() => write!(f, "ssh: {reason}"),
             NetError::Ssh { reason, detail } => write!(f, "ssh: {reason} ({detail})"),
+            NetError::Forbidden(e) => write!(f, "forbidden address: {e}"),
         }
     }
 }

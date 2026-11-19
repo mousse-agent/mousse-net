@@ -36,9 +36,10 @@ mod frame;
 mod out;
 mod pairing;
 mod paths;
+mod routes;
 
-pub use changes::{clock, interface_source};
-pub use paths::browse_source;
+pub use changes::{clock, interface_ips, interface_source};
+pub use paths::{browse_source, StoreCandidates};
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -48,10 +49,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use mousse_net_core::identity::IdentityPublicKey;
 use mousse_net_core::mux::PriorityClass;
 use mousse_net_core::ErrorCode;
+use mousse_net_io::pipe::RouteKind;
 use mousse_net_io::store::{hex, short_id};
 use mousse_net_io::{
     Caller, CloseReason, Connection, Host, HostEvent, ListenerKind, MuxStream, NetError,
-    StreamAdmission, StreamReader, StreamWriter,
+    RouteClass, StreamAdmission, StreamReader, StreamWriter,
 };
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -89,7 +91,9 @@ pub struct AppInfo {
     pub port: u16,
     /// The loopback ws listener's port, while it runs (Phase 1b §4.1).
     pub ws_port: Option<u16>,
-    pub routes: Vec<String>,
+    /// What the listener serves now (Phase 1b §1.5): the routes tickets
+    /// carry, the unbound addresses and the routes config in effect.
+    pub listen: crate::serve::SharedListen,
     pub state_dir: PathBuf,
     /// Where to look for paired hosts that moved (Phase 1a §6).
     pub browse: Option<Arc<mousse_net_io::discovery::CachedBrowse>>,
@@ -312,24 +316,59 @@ impl App {
         end.unwrap_or(End::Eof)
     }
 
-    /// An inbound connection: announced once it is live.
-    pub async fn inbound(&self, conn: Connection) {
+    /// An inbound connection that came over a `kind` listener from
+    /// `from`: announced once it is live, with its route. Returns its
+    /// number.
+    pub async fn inbound(
+        &self,
+        conn: Connection,
+        kind: RouteKind,
+        from: Option<std::net::SocketAddr>,
+    ) -> Option<u64> {
         let peer = short_id(conn.peer());
         // Must-fail control: announce the connection before step 2 settles.
         let wait_for_live = !cfg!(mousse_control = "inbound-before-live");
         if wait_for_live && !conn.settled(true).await.is_live() {
             applog::line(format!("refused {peer}: not live"));
-            return;
+            return None;
         }
+        let class = match (kind, from) {
+            (RouteKind::Tcp, Some(from)) => {
+                RouteClass::of_tcp(self.shared.caller.addr_policy().class_of(from))
+            }
+            (RouteKind::Ssh, _) => RouteClass::Ssh,
+            _ => RouteClass::Tunnel,
+        };
         let grant = self.shared.host.grant_of(conn.id());
-        let mut fields = json!({"dir": "in"});
+        let mut fields = json!({
+            "dir": "in",
+            "route": {"kind": kind.name(), "class": class.name()},
+        });
         if let Some(g) = &grant {
             fields["grant"] = json!(g.id.0);
             fields["role"] = json!(g.role.as_str());
         }
-        if self.shared.add_conn(conn, true, fields).is_ok() {
-            applog::line(format!("connected {peer} (in)"));
-        }
+        let no = self.shared.add_conn(conn, true, fields).ok()?;
+        applog::line(format!("connected {peer} (in)"));
+        Some(no)
+    }
+
+    /// Close inbound connection `no` when the socket that accepted it
+    /// closes (`closing` turns true or its sender goes).
+    pub fn close_with_socket(&self, no: u64, mut closing: tokio::sync::watch::Receiver<bool>) {
+        let Some(conn) = lock(&self.shared.core)
+            .conns
+            .get(&no)
+            .map(|e| e.conn.clone())
+        else {
+            return;
+        };
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = closing.wait_for(|closed| *closed) => conn.close(ErrorCode::Cancelled),
+                _ = conn.closed() => {}
+            }
+        });
     }
 
     /// The network changed (an interface, or a wake): check every
@@ -729,6 +768,16 @@ impl Shared {
                 let reply = changes::reopened(self, &mut core, &id, &map);
                 self.reply(&mut core, reply);
             }
+            "routes.config" => {
+                drop(core);
+                let reply = routes::config(self, &id, &map);
+                self.event(reply);
+            }
+            "routes.test" => {
+                drop(core);
+                let route = map.get("route").and_then(Value::as_str).map(str::to_owned);
+                tokio::spawn(routes::test(self.clone(), id, route));
+            }
             #[cfg(debug_assertions)]
             "test.clock" => {
                 let reply = changes::test_clock(self, &id, &map);
@@ -784,6 +833,12 @@ impl Shared {
                 return error(id, "bad_name", e);
             }
         }
+        let listen = self
+            .info
+            .listen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         json!({
             "re": id,
             "proto": [PROTO.0, minor.min(PROTO.1)],
@@ -792,7 +847,9 @@ impl Shared {
             "device": short_id(&self.info.identity),
             "port": self.info.port,
             "ws_port": self.info.ws_port,
-            "routes": self.info.routes,
+            "routes": listen.routes,
+            "routes_config": listen.config,
+            "unbound": listen.unbound,
             "paused": self.removal.paused_reason(),
         })
     }

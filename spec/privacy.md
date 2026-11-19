@@ -66,6 +66,25 @@ phases must add. Each later phase updates this document before it ships.
   ([`wire.md`](wire.md) 10.1), so a swapped link cannot make the joiner send
   its full name to a fake host that way.
 
+## Routes beyond the LAN (Phase 1b)
+
+- **Port forwards and tunnels.** Any internet prober that reaches the
+  listener learns the host's identity key from its TLS certificate. On a
+  LAN this was already true for anyone on the network; a forward or a
+  tunnel makes it global. It learns nothing else before step 2.
+- **Approved destinations** learn the joiner's IP address when it dials
+  them, before any pin check. That is why such destinations are dialled
+  only after the owner approves them.
+- **The tunnel provider** (for example cloudflared or Funnel) ends the
+  outer WebSocket TLS. It sees both IP addresses, timing, sizes and the
+  WebSocket path, never content: the pinned peer TLS runs inside.
+- **The tailnet coordinator** sees that two of its nodes talk.
+- **Over SSH**, the remote account's profile list (labels, no paths) is
+  shown to whoever logs in as that OS account during SSH add.
+- **Checks** never reach Plus or the internet: app checks point Plus at a
+  loopback recorder, and refuse and log any other connection out of the
+  test cell.
+
 ## To be filled in by later phases
 
 These headings come from the plan. Each must say what each party can see and
@@ -76,6 +95,6 @@ how users are told.
 - **Linking by issuer and IP:** what Plus and a relay can link across
   sessions.
 - **Settlement metadata** for paid relay use (Phase 4).
-- **The WSS terminator:** what the party ending the outer WebSocket TLS sees.
+- **The WSS terminator** of a Plus relay (Phase 3); a user tunnel's is above.
 - **Web-client update trust:** how users know which web-client build they run
   (Phase 5).
