@@ -35,6 +35,7 @@ conforming implementation passes every case, including every rejection.
 | `der-raw.json` | 4.2, 4.3 | DER to raw conversion and its rejections; inputs where only raw is accepted. |
 | `mux.json` | 9.1, 9.2 | Frames that decode and re-encode unchanged; inputs that need more bytes or are rejected, with the reason; stream rules on a receiving mux (`streams`): ids opened in order with no gaps, frames on never-opened ids, frames on gone streams, `DATA` after `FIN`. |
 | `control.json` | 11 | Control messages that decode and re-encode unchanged; messages that must be rejected. |
+| `relay-admission.json` | [relay.md](../relay.md) | `derivations`: relay id, the relay certificate (and another relay's, which the pin must refuse), handles, every proof record with a signature that verifies, the invitation tag and its hash, the enrollment code hash, enrollment links and rejected ones. `messages`: every self-mode message that decodes and re-encodes unchanged, and malformed ones (non-canonical, DER proofs, bad keys, out-of-range values, duplicates, over-long lists, over 16 384 bytes). `scenarios`: scripted runs of one self-hosted relay, replayed with the listed draws, every output byte for byte (relay.md 14). They cover each attack of `docs/phase34-design.md` C.2 that names a vector, the constant refusal deadline (`unlisted_equals_offline`), the pre-accept budget and promotion, accept legs, circuits outliving registrations, `SUCCESSOR`, enrollment, revocation, keepalive and idle waits, protocol errors and connection limits. Hosted mode (leases, admission tokens) is not here. |
 
 Code-exchange (CPace) vectors live in `cpace*.json` files, documented in
 [`../cpace.md`](../cpace.md).
@@ -55,6 +56,11 @@ RUSTFLAGS='--cfg mousse_control="break-authz"' cargo test -p mousse-net-core
 | `break-raw-signature` | DER is quietly converted where a raw signature is required. | `der_to_raw`, `session_certificates` (`identity_signature_der`) |
 | `break-cpace-confirm` | The CPace confirmation compare always passes. | `pairing_e2e_vectors`, `pairing_attempt_sequences_hold`, the CPace rejection vectors |
 | `break-cpace-sid` | The CPace generator leaves the session id out. | `generator_matches_draft_b3_1`, `session_id_changes_the_generator`, the Mousse CPace vectors |
+| `relay-skip-allow-set` | The relay admits any caller of a handle with an allow-set. | `relay_admission`, `relay_admission_scenarios_hold` (`unlisted_equals_offline`) |
+| `relay-refuse-early` | A refused call is answered at once instead of at the refusal deadline. | `relay_admission`, `relay_admission_scenarios_hold` (`unlisted_equals_offline`) |
+| `relay-successor-unchecked` | `SUCCESSOR` does not check the current key's proof. | `relay_admission`, `relay_admission_scenarios_hold` (`successor_without_current_key`) |
+| `relay-no-preaccept-budget` | Join circuits have no byte budget and no per-target cap. | `relay_admission`, `relay_admission_scenarios_hold` (`preaccept_over_budget`) |
+| `no-pin-relay` | The relay pin check passes any relay key. | `relay_admission`, `the_certificate_carries_the_identity_and_only_its_pin_passes` |
 
 Each control runs the same tests as a normal build; at least one must fail.
 The cfg names are declared in the workspace lints. A build with any control
