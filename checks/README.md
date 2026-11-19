@@ -148,7 +148,7 @@ Phase 1b §6.3: traffic that must never reach RPC, sent to a real host on one ro
     mousse-check probe key <file>        # a throwaway device key; prints its identity (hex) for grant.add
     mousse-check probe --route tcp://127.0.0.1:<port> --invite <ticket>         --grant-key <granted device, editor off> --removed-key <device whose grant was removed>         --observe http://127.0.0.1:<port>/<path> --marker phase1b.no-rpc-without-grant [--json <file>]
 
-- `--route`: `tcp://<ip>:<port>` or `ws://<loopback ip>:<port><path>`. IP literals only; the probe resolves no names. The ssh route's probe (the helper's pipe IPC) waits for E9.
+- `--route`: `tcp://<ip>:<port>`, `ws://<loopback ip>:<port><path>`, or `ssh` with `--ssh-config <file> --ssh-host <alias> --ssh-profile <selector>` (the system `ssh`, or `MOUSSE_NET_SSH_BIN`, runs the remote `mousse-helper pipe --profile <selector>` in the app's own command form; the remote helper must run in app mode). IP literals only; the probe resolves no names. On ssh, case 8 adds `pipe-wrong-token`, `pipe-long-line` (`MOUSSE_NET_IPC_LINE_MAX_BYTES`) and `pipe-not-running`, which need `--pipe-state <host helper state folder>` and `--pipe-helper <mousse-helper>`.
 - `--invite`: an open Send link invitation (kind 2; the garbage code case needs one). Its host identity is the pin unless `--pin <hex>` says otherwise.
 - Cases, in order: `not-tls`; on ws `ws-plain-get`, `ws-wrong-path`, `ws-origin`, `ws-no-subprotocol`, `ws-large-headers`, `ws-text-message`; `tls-no-cert`, `tls-1.2`, `tls-wrong-alpn`; `fresh-open-rpc`, `fresh-open-tunnel`, `fresh-bad-proof`; `join-only-open-rpc`, `join-only-open-hello`, `join-only-open-tunnel`, `join-only-garbage-code`; `removed-open-rpc`; `editor-off-tunnel`; `fresh-silence`; `admission`; on ws `ws-slow-headers`. `--cases a,b` runs some.
 - **Wire:** each case must end the way §6.3 names, at once and with nothing let through first (the flood's extra connection must be refused well before the host's own wait for a silent connection): a refusal that arrives only after the proof wait, or after any stream frame from the host (a `RESET` included), does not count. Otherwise `reason=wire_accepted`.
@@ -170,6 +170,8 @@ App checks that need a real `ssh` route on loopback (the `ssh` case, SSH add) us
 - `--preamble <text>`: printed before the command's output, as a login shell's rc files might.
 
 It prints `ready port <port> host_key <SHA256:...> config <path>` and serves until its stdin closes or it is stopped.
+
+For `--route ssh`, `run.mjs` builds it and passes its path in `MOUSSE_CHECK_TEST_SSHD`, and `MOUSSE_CHECK_SSH_ROUTES` names `tools/app-check/ssh-routes.mjs`, whose `startSshRoutes({out, sides})` starts one server per side (`<out>/ssh-<side>`), each into that side's Mousse home: the case's two loopback SSH routes, one per direction. Cross-machine `ssh` cells run the server on the Mac, since Windows is not an SSH remote in 1b.
 
 ## Manual steps
 

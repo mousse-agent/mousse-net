@@ -93,3 +93,22 @@ test('the Plus recorder records every request, answers 403, and sorts update che
   assert.deepEqual(updates.map((x) => x.url), ['/update-feed/latest.yml'])
   await r.close()
 })
+
+test('the ssh case starts one test SSH server per side and stops them', async () => {
+  const { startSshRoutes } = await import('../ssh-routes.mjs')
+  const { mkdtempSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  // Stands in for test-sshd: prints its ready line, serves until stdin ends.
+  const fake = [
+    process.execPath,
+    '-e',
+    "const p=40000+Math.floor(Math.random()*1000);console.log('ready port '+p+' host_key SHA256:x config '+process.argv[process.argv.indexOf('--keys')+1]+'/ssh_config');process.stdin.resume();process.stdin.on('end',()=>process.exit(0))",
+    '--'
+  ]
+  const out = mkdtempSync(join(tmpdir(), 'ssh-routes-'))
+  const routes = await startSshRoutes({ out, command: fake, sides: { a: { mousseHome: join(out, 'a') }, b: { mousseHome: join(out, 'b') } } })
+  assert.ok(routes.a.config.includes('ssh-a') && routes.b.config.includes('ssh-b'))
+  assert.equal(typeof routes.a.port, 'number')
+  await routes.stop()
+})

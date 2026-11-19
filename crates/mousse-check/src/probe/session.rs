@@ -36,6 +36,8 @@ pub enum Target {
     Tcp(SocketAddr),
     /// `ws://<loopback ip>:<port><path>`: the host's loopback ws listener.
     Ws { addr: SocketAddr, path: String },
+    /// The system `ssh` running the remote `pipe`.
+    Ssh(super::ssh::SshRoute),
 }
 
 impl Target {
@@ -63,9 +65,9 @@ impl Target {
             }
             return Ok(Target::Ws { addr, path });
         }
-        if hint.starts_with("ssh://") || hint.starts_with("pipe:") || hint == "ssh" {
+        if hint == "ssh" || hint.starts_with("ssh://") {
             return Err(format!(
-                "{hint}: the ssh route's probe (the helper's pipe IPC) waits for E9"
+                "{hint}: the ssh route needs --ssh-config, --ssh-host and --ssh-profile"
             ));
         }
         Err(format!("{hint}: the probe dials tcp:// or ws:// routes"))
@@ -75,23 +77,30 @@ impl Target {
         match self {
             Target::Tcp(_) => "tcp",
             Target::Ws { .. } => "ws",
+            Target::Ssh(_) => "ssh",
         }
     }
 
-    pub fn addr(&self) -> SocketAddr {
+    /// The TCP address dialled; `None` for ssh, which runs a program.
+    pub fn addr(&self) -> Option<SocketAddr> {
         match self {
-            Target::Tcp(a) | Target::Ws { addr: a, .. } => *a,
+            Target::Tcp(a) | Target::Ws { addr: a, .. } => Some(*a),
+            Target::Ssh(_) => None,
         }
     }
 
     /// A pipe that carries bytes to the host's TLS: TCP, or TCP plus a ws
     /// upgrade.
     pub async fn pipe(&self, waits: &Waits) -> Result<BoxPipe, String> {
-        let tcp = tcp(self.addr(), waits).await?;
+        let addr = match self {
+            Target::Ssh(route) => return route.pipe(waits).await,
+            Target::Tcp(a) | Target::Ws { addr: a, .. } => *a,
+        };
+        let tcp = tcp(addr, waits).await?;
         match self {
-            Target::Tcp(_) => Ok(Box::new(tcp)),
+            Target::Ssh(_) | Target::Tcp(_) => Ok(Box::new(tcp)),
             Target::Ws { path, .. } => {
-                let (tcp, status) = ws::upgrade(tcp, &ws::Request::good(self.addr(), path), waits)
+                let (tcp, status) = ws::upgrade(tcp, &ws::Request::good(addr, path), waits)
                     .await
                     .map_err(|e| format!("ws upgrade: {e}"))?;
                 match tcp {
@@ -632,9 +641,13 @@ impl ServerCertVerifier for AnyServer {
     }
 }
 
-/// Keep a set of silent connections open (the admission case).
-pub async fn silent(target: &Target, waits: &Waits) -> Result<TcpStream, String> {
-    tcp(target.addr(), waits).await
+/// One silent connection (the admission case): TCP for tcp and ws (the
+/// slot is taken at accept), an ssh session past its marker for ssh.
+pub async fn silent(target: &Target, waits: &Waits) -> Result<BoxPipe, String> {
+    match target.addr() {
+        Some(a) => Ok(Box::new(tcp(a, waits).await?)),
+        None => target.pipe(waits).await,
+    }
 }
 
 /// Whether a silent connection was closed by the host within `wait`.

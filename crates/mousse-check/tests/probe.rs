@@ -232,6 +232,8 @@ async fn probe_rig(r: &Rig, cases: &[&'static str], cap: usize) -> Vec<CaseResul
         marker: "probe".into(),
         json: None,
         waits: waits(cap),
+        pipe_state: None,
+        pipe_helper: None,
     };
     probe::run(&plan).await.unwrap()
 }
@@ -326,6 +328,8 @@ async fn an_observer_that_lies_about_nothing_still_needs_every_counter() {
         marker: "probe".into(),
         json: None,
         waits: waits(CAP),
+        pipe_state: None,
+        pipe_helper: None,
     };
     assert!(probe::run(&plan).await.is_err());
     // A case without its input is a probe error, never a pass.

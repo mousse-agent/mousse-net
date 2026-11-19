@@ -14,6 +14,7 @@
 
 pub mod observe;
 pub mod session;
+pub mod ssh;
 pub mod tunnel;
 pub mod ws;
 
@@ -62,6 +63,11 @@ fn ws_only(case: &str) -> bool {
 
 /// The full list for a route.
 pub fn cases_for(target: &Target) -> Vec<&'static str> {
+    if matches!(target, Target::Ssh(_)) {
+        let mut out: Vec<&'static str> = CASES.iter().copied().filter(|c| !ws_only(c)).collect();
+        out.extend(PIPE_CASES);
+        return out;
+    }
     let mut out: Vec<&'static str> = CASES
         .iter()
         .copied()
@@ -73,8 +79,11 @@ pub fn cases_for(target: &Target) -> Vec<&'static str> {
     out
 }
 
+/// Case 8: the helper's pipe IPC, on the ssh route only.
+pub const PIPE_CASES: [&str; 3] = ["pipe-wrong-token", "pipe-long-line", "pipe-not-running"];
+
 fn known(case: &str) -> bool {
-    CASES.contains(&case) || case == "ws-slow-headers"
+    CASES.contains(&case) || case == "ws-slow-headers" || PIPE_CASES.contains(&case)
 }
 
 /// The probe's waits and the host limits it tests. Engine limits are read
@@ -105,6 +114,15 @@ pub struct Waits {
     pub preauth_ws: usize,
     /// `MOUSSE_NET_PREAUTH_PER_SOURCE` (8).
     pub preauth_per_source: usize,
+    /// `MOUSSE_NET_PREAUTH_PIPE` (4).
+    pub preauth_pipe: usize,
+    /// `MOUSSE_NET_IPC_LINE_MAX_BYTES` (65536).
+    pub ipc_line_max: usize,
+    /// `MOUSSE_NET_SSH_PREAMBLE_MAX_BYTES` (65536).
+    pub preamble_max: usize,
+    /// `MOUSSE_NET_SSH_DIAL_TIMEOUT_MS` (20000): one ssh session up to the
+    /// marker.
+    pub ssh_wait: Duration,
 }
 
 impl Waits {
@@ -136,6 +154,10 @@ impl Waits {
             preauth_tcp: num("MOUSSE_NET_PREAUTH_TCP", 48)? as usize,
             preauth_ws: num("MOUSSE_NET_PREAUTH_WS", 16)? as usize,
             preauth_per_source: num("MOUSSE_NET_PREAUTH_PER_SOURCE", 8)? as usize,
+            preauth_pipe: num("MOUSSE_NET_PREAUTH_PIPE", 4)? as usize,
+            ipc_line_max: num("MOUSSE_NET_IPC_LINE_MAX_BYTES", 65_536)? as usize,
+            preamble_max: num("MOUSSE_NET_SSH_PREAMBLE_MAX_BYTES", 65_536)? as usize,
+            ssh_wait: ms("MOUSSE_NET_SSH_DIAL_TIMEOUT_MS", 20_000)?,
         })
     }
 
@@ -151,6 +173,7 @@ impl Waits {
         match target {
             Target::Tcp(_) => self.preauth_tcp.min(self.preauth_per_source),
             Target::Ws { .. } => self.preauth_ws,
+            Target::Ssh(_) => self.preauth_pipe,
         }
     }
 }
@@ -167,6 +190,10 @@ pub struct Plan {
     pub marker: String,
     pub json: Option<PathBuf>,
     pub waits: Waits,
+    /// The host helper's state folder, for the pipe IPC cases.
+    pub pipe_state: Option<PathBuf>,
+    /// A `mousse-helper` binary, for the stopped-helper case.
+    pub pipe_helper: Option<PathBuf>,
 }
 
 /// One case's result.
@@ -208,7 +235,12 @@ mousse-check probe --route <hint> [--invite <ticket>] [--pin <identity hex>]
                    [--marker <id>] [--json <file>]
   Sends Phase 1b §6.3's cases to a host on one route and checks each close
   on the wire and, through the observer, in the app.
-  --route       tcp://<ip>:<port> or ws://<loopback ip>:<port>/<path>
+  --route       tcp://<ip>:<port>, ws://<loopback ip>:<port>/<path>, or ssh
+                with --ssh-config <file> --ssh-host <alias> --ssh-profile
+                <selector> (runs the remote mousse-helper pipe as the app
+                does; MOUSSE_NET_SSH_BIN picks the client); its pipe cases
+                need --pipe-state <host helper state> and --pipe-helper
+                <mousse-helper>
   --invite      an open invitation's ticket (fragment, or a link ending in
                 #<fragment>); its host identity is the pin unless --pin says
   --grant-key   key of a granted device whose editor is off
@@ -251,6 +283,8 @@ fn parse(args: &[String]) -> Result<Plan, String> {
     let mut cases = None;
     let mut marker = "probe".to_owned();
     let mut json_out = None;
+    let (mut ssh_config, mut ssh_host, mut ssh_command) = (None, None, None);
+    let (mut pipe_state, mut pipe_helper) = (None, None);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut value = || {
@@ -269,10 +303,40 @@ fn parse(args: &[String]) -> Result<Plan, String> {
             "--cases" => cases = Some(value()?),
             "--marker" => marker = value()?,
             "--json" => json_out = Some(PathBuf::from(value()?)),
+            "--ssh-config" => ssh_config = Some(PathBuf::from(value()?)),
+            "--ssh-host" => ssh_host = Some(value()?),
+            "--ssh-profile" => ssh_command = Some(value()?),
+            "--pipe-state" => pipe_state = Some(PathBuf::from(value()?)),
+            "--pipe-helper" => pipe_helper = Some(PathBuf::from(value()?)),
             other => return Err(format!("probe: unknown option {other} (see probe --help)")),
         }
     }
-    let target = Target::parse(&route.ok_or("probe needs --route")?)?;
+    let route = route.ok_or("probe needs --route")?;
+    let target = if route == "ssh" {
+        let config = ssh_config.ok_or("the ssh route needs --ssh-config")?;
+        let known_hosts = std::env::temp_dir().join(format!(
+            "mousse-check-probe-known-hosts-{}",
+            std::process::id()
+        ));
+        Target::Ssh(ssh::SshRoute {
+            bin: std::env::var_os("MOUSSE_NET_SSH_BIN")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("ssh")),
+            config,
+            host: ssh_host.ok_or("the ssh route needs --ssh-host")?,
+            command: {
+                let selector = ssh_command.ok_or("the ssh route needs --ssh-profile <selector>")?;
+                mousse_net_io::pipe::ssh::remote_command(
+                    "mousse-helper",
+                    &["pipe", "--profile", &selector],
+                )
+                .map_err(|e| format!("--ssh-profile: {e}"))?
+            },
+            known_hosts,
+        })
+    } else {
+        Target::parse(&route)?
+    };
     let ticket = invite
         .map(|t| {
             let fragment = t.rsplit('#').next().unwrap_or(&t).to_owned();
@@ -320,6 +384,8 @@ fn parse(args: &[String]) -> Result<Plan, String> {
         marker,
         json: json_out,
         waits: Waits::from_env()?,
+        pipe_state,
+        pipe_helper,
     })
 }
 
@@ -580,6 +646,24 @@ async fn one(plan: &Plan, case: &str) -> Result<(String, String), String> {
             Ok(("tunnel.close:editor_off".into(), got))
         }
         "admission" => admission(t, w).await,
+        "pipe-wrong-token" => Ok((
+            "refused".into(),
+            ssh::wrong_token(need(&plan.pipe_state, "--pipe-state", case)?, w).await?,
+        )),
+        "pipe-long-line" => Ok((
+            "closed".into(),
+            ssh::long_line(need(&plan.pipe_state, "--pipe-state", case)?, w).await?,
+        )),
+        "pipe-not-running" => {
+            let helper = need(&plan.pipe_helper, "--pipe-helper", case)?;
+            let scratch = std::env::temp_dir().join(format!(
+                "mousse-check-probe-pipe-{}",
+                mousse_net_io::store::hex(&mousse_net_io::rng::random_bytes::<6>())
+            ));
+            let got = ssh::not_running(helper, &scratch, w).await;
+            let _ = std::fs::remove_dir_all(&scratch);
+            Ok(("not_running".into(), got?))
+        }
         other => Err(format!("no case {other}")),
     }
 }
@@ -623,6 +707,7 @@ async fn admission(t: &Target, w: &Waits) -> Result<(String, String), String> {
     let host_wait = match t {
         Target::Tcp(_) => w.handshake_wait,
         Target::Ws { .. } => w.upgrade_wait,
+        Target::Ssh(_) => w.handshake_wait,
     };
     let extra_refused = match &mut extra {
         Ok(s) => session::closed_within(s, w.close.min(host_wait / 2)).await,
@@ -753,7 +838,20 @@ mod tests {
     fn routes_are_ip_literals_and_plain_ws_is_loopback_only() {
         assert!(Target::parse("tcp://example.com:7443").is_err());
         assert!(Target::parse("ws://192.168.1.2:80/mousse-net/1").is_err());
-        assert!(Target::parse("ssh://me@host").unwrap_err().contains("E9"));
+        assert!(Target::parse("ssh://me@host")
+            .unwrap_err()
+            .contains("--ssh-profile"));
+        let ssh = Target::Ssh(ssh::SshRoute {
+            bin: "ssh".into(),
+            config: "c".into(),
+            host: "h".into(),
+            command: "x".into(),
+            known_hosts: "k".into(),
+        });
+        let cases = cases_for(&ssh);
+        assert!(PIPE_CASES.iter().all(|c| cases.contains(c)));
+        assert!(!cases.iter().any(|c| c.starts_with("ws-")));
+        assert_eq!(Waits::from_vars(|_| None).unwrap().preauth_cap(&ssh), 4);
         let ws = Target::parse("ws://127.0.0.1:9/a/mousse-net/1").unwrap();
         assert_eq!(
             ws,
