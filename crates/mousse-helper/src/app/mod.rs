@@ -159,6 +159,9 @@ struct ConnEntry {
     conn: Arc<Connection>,
     identity: IdentityPublicKey,
     inbound: bool,
+    /// Announced by `path.reopen` and not yet reopened: the only handle
+    /// `path.reopened` accepts.
+    reopen: bool,
 }
 
 struct StreamEntry {
@@ -370,6 +373,7 @@ impl Shared {
                     conn: conn.clone(),
                     identity,
                     inbound,
+                    reopen: false,
                 },
             );
             fields["ev"] = json!("conn.up");
@@ -628,7 +632,7 @@ impl Shared {
                 }
             }
             "path.reopened" => {
-                let reply = changes::reopened(self, &core, &id, &map);
+                let reply = changes::reopened(self, &mut core, &id, &map);
                 self.reply(&mut core, reply);
             }
             #[cfg(debug_assertions)]

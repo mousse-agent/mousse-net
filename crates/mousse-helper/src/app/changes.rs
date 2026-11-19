@@ -59,12 +59,19 @@ pub async fn forward_renewals(shared: Arc<Shared>) {
                 let role = paths::stored_role(&shared, &pin);
                 let no = shared.add_conn(conn, false, json!({"dir": "out", "role": role}));
                 applog::line(format!("renewed path to {} (conn {no})", short_id(&pin)));
-                shared.event(json!({
-                    "ev": "path.reopen",
-                    "identity": identity,
-                    "from": from,
-                    "conn": no,
-                }));
+                let mut core = super::lock(&shared.core);
+                // Gone already: conn.down said so, and there is nothing to
+                // reopen.
+                if let Some(entry) = core.conns.get_mut(&no) {
+                    entry.reopen = true;
+                    core.out.json(&json!({
+                        "ev": "path.reopen",
+                        "identity": identity,
+                        "from": from,
+                        "conn": no,
+                    }));
+                    shared.queued(&core);
+                }
             }
             PathEvent::RenewFailed { pin, error } => {
                 applog::line(format!("renewing {} failed: {error}", short_id(&pin)));
@@ -81,16 +88,28 @@ pub async fn forward_renewals(shared: Arc<Shared>) {
 
 /// `path.reopened {conn}`: the app reopened its channels on the renewed
 /// path `conn`. It becomes current; the old path closes with
-/// `PATH_REPLACED`.
-pub fn reopened(shared: &Shared, core: &Core, id: &Value, map: &Map<String, Value>) -> Value {
+/// `PATH_REPLACED`. Only the outbound handle `path.reopen` announced
+/// counts: the host numbers its connections apart from the caller, so an
+/// inbound connection from the same peer can carry the renewed path's id.
+pub fn reopened(shared: &Shared, core: &mut Core, id: &Value, map: &Map<String, Value>) -> Value {
     let Some(no) = map.get("conn").and_then(Value::as_u64) else {
         return error(id, "bad_request", "path.reopened needs conn");
     };
-    let Some(entry) = core.conns.get(&no) else {
+    let Some(entry) = core.conns.get_mut(&no) else {
         return error(id, "no_conn", "no such connection");
     };
+    if entry.inbound || !entry.reopen {
+        return error(
+            id,
+            "not_renewed",
+            "path.reopen did not announce this connection",
+        );
+    }
     match shared.caller.reopened(&entry.conn) {
-        Ok(()) => json!({"re": id}),
+        Ok(()) => {
+            entry.reopen = false;
+            json!({"re": id})
+        }
         Err(e) => error(id, "not_renewed", e.to_string()),
     }
 }

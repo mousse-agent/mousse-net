@@ -192,6 +192,63 @@ fn a_renewed_path_replaces_the_old_one_once_reopened() {
     assert!(b.events("conn.down").iter().all(|m| m["conn"] != new));
 }
 
+/// `path.reopened` takes only the outbound handle `path.reopen` announced.
+/// The host numbers its connections apart from the caller, so with the
+/// peer also dialling in, an inbound connection carries the renewed path's
+/// id; naming it must not switch paths or close the working one. (Each
+/// side numbers from 1: B's caller gives its renewal 2, and B's host gives
+/// A's renewal 2.)
+#[test]
+fn only_the_announced_renewal_can_be_reopened() {
+    let a_end = Endpoint::init("rxa");
+    let b_end = Endpoint::init("rxb");
+    let mut a = app(&a_end, "hostA", &[], &[MANUAL_CLOCK]);
+    a.hello();
+    let mut b = app(&b_end, "peerB", &[], &[MANUAL_CLOCK]);
+    b.hello();
+    let a_route = route_of(&mut a);
+    let b_route = route_of(&mut b);
+    trust(&mut a, &mut b, &[&a_route]);
+    trust(&mut b, &mut a, &[&b_route]);
+    let up = nth_up(&b, "out", &a.identity, 0, WAIT);
+    let old = up["conn"].as_u64().unwrap();
+    nth_up(&b, "in", &a.identity, 0, WAIT);
+    let a_up = nth_up(&a, "out", &b.identity, 0, WAIT);
+
+    // Both sides renew: on B, A's renewed path is the second inbound one,
+    // numbered by B's host like B's own renewal is by B's caller.
+    let deadline = up["deadline"]
+        .as_i64()
+        .unwrap()
+        .max(a_up["deadline"].as_i64().unwrap());
+    to_renewal(&mut a, &mut b, deadline);
+    let reopen = b.event("path.reopen", |m| m["identity"] == a.identity.as_str());
+    assert_eq!(reopen["from"], old, "{reopen}");
+    let new = reopen["conn"].as_u64().unwrap();
+    a.event("path.reopen", |m| m["identity"] == b.identity.as_str());
+    nth_up(&b, "in", &a.identity, 1, WAIT);
+
+    let inbound: Vec<u64> = b
+        .events("conn.up")
+        .iter()
+        .filter(|m| m["dir"] == "in" && m["identity"] == a.identity.as_str())
+        .map(|m| m["conn"].as_u64().unwrap())
+        .collect();
+    for no in inbound.iter().copied().chain([old]) {
+        let r = b.request("path.reopened", json!({"conn": no}));
+        assert_eq!(r["error"], "not_renewed", "conn {no}: {r}");
+    }
+    assert!(
+        b.events("conn.down").iter().all(|m| m["conn"] != old),
+        "{:?}",
+        b.events("conn.down")
+    );
+
+    b.call("path.reopened", json!({"conn": new}));
+    let down = b.event("conn.down", |m| m["conn"] == old);
+    assert_eq!(down["reason"], "path_replaced", "{down}");
+}
+
 /// A renewal names the path it replaces among this side's own outbound
 /// paths. The caller and the host number their connections apart, so with
 /// every host also dialling in, each outbound path has an inbound one with
