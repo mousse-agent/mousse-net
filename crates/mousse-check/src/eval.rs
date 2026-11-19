@@ -336,6 +336,9 @@ fn eval_automated(inp: &Inputs<'_>, check: &Check, target: &str) -> Outcome {
             ),
         );
     }
+    if check.hosted.iter().any(|h| h == target) {
+        return eval_hosted(inp, check, target);
+    }
     let local = check.local_for(target);
     if let Some(why) = local.and_then(|l| l.placeholder.as_ref()) {
         return out(
@@ -538,6 +541,107 @@ fn legacy_note(inp: &Inputs<'_>, check: &Check, target: &str) -> String {
         .get(&(check.id.clone(), target.to_string()))
         .map(|n| format!("; {n}"))
         .unwrap_or_default()
+}
+
+/// A hosted cell: records `mousse-check hosted verify` wrote. They count
+/// like device results (this build, the pinned app, this configuration),
+/// and the cell passes only with a PASS run and every control failing for
+/// its reason.
+fn eval_hosted(inp: &Inputs<'_>, check: &Check, target: &str) -> Outcome {
+    let profile = inp.manifest.device_profile(check);
+    let counts = |r: &&crate::evidence::HostedRecord| -> Result<(), String> {
+        check_build(inp.commits, inp.build, &r.build, profile, inp.allow_dirty)?;
+        if check.app && r.app_build.as_deref() != inp.app_revision {
+            return Err(format!(
+                "app build {} is not the pinned app",
+                r.app_build.as_deref().unwrap_or("(none)")
+            ));
+        }
+        let control = match &r.control {
+            None => None,
+            Some(n) => Some(
+                check
+                    .control_named(n)
+                    .ok_or_else(|| format!("names no control of this check ({n})"))?,
+            ),
+        };
+        if r.config != inp.manifest.config_digest(check, target, control) {
+            return Err("was made for another configuration of this check".into());
+        }
+        Ok(())
+    };
+    let all: Vec<&crate::evidence::HostedRecord> = inp
+        .evidence
+        .hosted
+        .iter()
+        .filter(|r| r.check == check.id && r.target == target)
+        .collect();
+    let mut stale = Vec::new();
+    let ok: Vec<_> = all
+        .iter()
+        .filter(|r| match counts(r) {
+            Ok(()) => true,
+            Err(why) => {
+                stale.push(why);
+                false
+            }
+        })
+        .collect();
+    let hint = "a GitHub-hosted run, checked with `mousse-check hosted verify`";
+    let normal: Vec<_> = ok.iter().filter(|r| r.control.is_none()).collect();
+    if let Some(f) = normal.iter().find(|r| r.outcome != "PASS") {
+        return out(
+            Status::Fail,
+            format!("hosted run {} reported {}: {}", f.run, f.outcome, f.details),
+        );
+    }
+    let Some(pass) = normal.first() else {
+        let why = stale.first().map(|w| format!(": {w}")).unwrap_or_default();
+        return out(
+            Status::Incomplete,
+            format!(
+                "no hosted result for this build ({hint}); {} record(s) do not count{why}",
+                stale.len()
+            ),
+        );
+    };
+    let mut gaps = Vec::new();
+    for k in &check.control {
+        let mine: Vec<_> = ok
+            .iter()
+            .filter(|r| r.control.as_deref() == Some(k.name.as_str()))
+            .collect();
+        if mine.is_empty() {
+            gaps.push(format!("no hosted result for control {}", k.name));
+        } else if let Some(bad) = mine.iter().find(|r| {
+            r.outcome != "FAIL"
+                || k.expect_reason
+                    .as_ref()
+                    .is_some_and(|want| r.reason.as_ref() != Some(want))
+        }) {
+            return out(
+                Status::Fail,
+                format!(
+                    "control {} did not fail as required on the hosted run ({} reason={})",
+                    k.name,
+                    bad.outcome,
+                    bad.reason.as_deref().unwrap_or("none")
+                ),
+            );
+        }
+    }
+    if !gaps.is_empty() {
+        return out(Status::Incomplete, gaps.join("; "));
+    }
+    out(
+        Status::Pass,
+        format!(
+            "hosted: {} (artifact {}); {} control(s) failed as required",
+            pass.run,
+            pass.artifact_digest,
+            check.control.len()
+        ),
+    )
 }
 
 fn eval_device(inp: &Inputs<'_>, check: &Check, target: &str) -> Outcome {

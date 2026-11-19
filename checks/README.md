@@ -49,6 +49,7 @@ Each `[[check]]`:
 | `device_steps` | how a device produces its result, shown while the cell is INCOMPLETE |
 | `timeout_secs` | per run, default 3600 |
 | `cases` | named cases, such as routes (`["tcp", "ws", "ssh"]`). Each case is its own run and its own result; the cell passes only when every case passes, and every control must fail in every case. Not with `[check.matrix]` or `manual`. Each local command (or its `env`) must name `{case}`; the kit also sets `MOUSSE_CHECK_CASE` |
+| `hosted` | targets run on a GitHub-hosted runner; see "Hosted cells" |
 | `[[check.waits]]` | `slice`, `paths` (relative to the root) and optional `case`. Until every path exists, the check (or only that case) is INCOMPLETE with "waits for <slice>" and is not run. Lets a check land before the engine slice it tests. Waits do not count in `config` |
 | `[[check.local]]` | `target`, `host` (`windows-x86_64`, `macos-aarch64`, `linux-x86_64`, ...), `command`, optional `cwd`, `env`, `placeholder`. Runs when the kit is on that host. `{root}`, `{out}` (a fresh folder per run) and `{build}` are replaced; `MOUSSE_BUILD_ID` is set. |
 | `[[check.control]]` | `name`, `breaks` (what is broken), and `args` (appended), `env` (added) or `command` (replaces). `missing = "reason"` while the control does not exist: the check is FAIL until it does. `expect_reason = "<word>"`: the control must fail for this reason (see below). |
@@ -130,6 +131,15 @@ A cross-machine app check runs outside the kit on both machines:
     mousse-check sign --device-key <key> --config <digest> r.json
 
 With `--control <name>`, `run.mjs` adds that control's environment, which it reads with `mousse-check control-env <check> --control <name>`. Pass the same `--control` to `config-digest` and `sign`. `--role` and `--topology` pass through to the app script. With `--result`, `run.mjs` writes `build` (the helper build) and `app_build`. It also writes `host_build` and `host_app_build` when the app printed `host_build=` and `host_app_build=` lines, which a caller does with the builds its host reported over the test link.
+
+## Hosted cells
+
+A target in a check's `hosted` list (for `phase1b.desktop-builds`, `windows-arm64`) runs on a GitHub-hosted runner, `.github/workflows/windows-arm-smoke.yml` (run by hand with the commit under test, and the app repository when the runner can read it). It smokes the build and its must-fail control and uploads one artifact. The cell counts only records `mousse-check hosted verify` wrote after checking that artifact:
+
+    gh run download <run id> -n windows-arm64-smoke   # or download the zip from the run page
+    mousse-check hosted verify phase1b.desktop-builds --target windows-arm64         --zip windows-arm64-smoke.zip --digest sha256:<the artifact digest GitHub shows> --run <run URL>
+
+It checks the archive against GitHub's digest, the engine commit against the build under test, the app build against `app/MOUSSE_REVISION`, the helper's SHA-256, that the smoke ended `PASS` and each control ended `FAIL` with its `expect_reason`, then writes one unsigned record per run to `checks/results/hosted/`. The cell counts them like device results (this build, the pinned app, this configuration) and shows `hosted: <run> (artifact <digest>)`. A hosted target has no local run.
 
 ## The route probe (`mousse-check probe`)
 

@@ -1,0 +1,73 @@
+# The windows-arm64 cell of phase1b.desktop-builds, on a GitHub-hosted
+# windows-11-arm runner (no Windows on Arm machine is at hand). Run by hand
+# for the commit under test; the kit counts the run only after
+# `mousse-check hosted verify` checked its artifact (checks/README.md,
+# "Hosted cells").
+name: windows-arm smoke
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Engine commit to smoke (the build under test)
+        required: true
+      app_repository:
+        description: The app repository to package (owner/name), if the runner can read it
+        required: false
+        default: ''
+permissions:
+  contents: read
+jobs:
+  smoke:
+    runs-on: windows-11-arm
+    env:
+      CHECK: phase1b.desktop-builds
+      CARGO_PROFILE_RELEASE_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+      - name: Rust
+        shell: bash
+        run: rustup toolchain install 1.96.0 --profile minimal && rustup default 1.96.0
+      - name: App checkout (pinned revision)
+        if: ${{ inputs.app_repository != '' }}
+        shell: bash
+        run: |
+          rev=$(tr -d '[:space:]' < app/MOUSSE_REVISION)
+          git clone --quiet "https://github.com/${{ inputs.app_repository }}.git" ../app
+          git -C ../app checkout --quiet "$rev"
+          echo "MOUSSE_APP_DIR=$(cd ../app && pwd -W)" >> "$GITHUB_ENV"
+      - name: Build the release helper and mousse-check
+        shell: bash
+        run: |
+          unset MOUSSE_BUILD_ID
+          cargo build --release --locked -p mousse-helper --bin mousse-helper -p mousse-check --bin mousse-check
+      - name: Smoke
+        shell: bash
+        run: |
+          mkdir -p artifact
+          commit=$(git log -1 --format=%H -- . ':(exclude)checks')
+          set +e
+          MOUSSE_BUILD_ID="$commit+release" node tools/build-smoke.mjs "$CHECK" --target windows-arm64 \
+            --helper target/release/mousse-helper.exe --probe target/release/mousse-check.exe \
+            --out smoke-out > artifact/smoke.log 2>&1
+          echo "exit $?" >> artifact/exit.txt
+          # The must-fail control: a helper that is not the build under test.
+          MOUSSE_BUILD_ID="0000000+release" node tools/build-smoke.mjs "$CHECK" --target windows-arm64 \
+            --helper target/release/mousse-helper.exe --probe target/release/mousse-check.exe \
+            --out control-out > artifact/control-stale-helper.log 2>&1
+          echo "control exit $?" >> artifact/exit.txt
+          set -e
+          cp target/release/mousse-helper.exe artifact/
+          app=$(sed -n 's/^app_build=//p' artifact/smoke.log | head -1)
+          hash=$(sha256sum artifact/mousse-helper.exe | cut -d' ' -f1)
+          printf '{"engine_commit":"%s","app_build":%s,"helper_sha256":"%s","helper":"mousse-helper.exe"}\n' \
+            "$commit" "$( [ -n "$app" ] && printf '"%s"' "$app" || printf null )" "$hash" > artifact/hosted.json
+          cat artifact/exit.txt artifact/hosted.json
+          tail -n 3 artifact/smoke.log artifact/control-stale-helper.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-arm64-smoke
+          path: artifact/
+          if-no-files-found: error

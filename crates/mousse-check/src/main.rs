@@ -54,6 +54,11 @@ USAGE
   mousse-check probe --route <hint> (--observe <url> | --no-app) [--invite <ticket>] ...
       Send traffic that must never reach RPC to a host on one route, and
       check each close on the wire and in the app (probe --help).
+  mousse-check hosted verify <check-id> --target <cell> --zip <artifact.zip>
+                             --digest sha256:<hex> --run <run url>
+      Count a GitHub-hosted run: check the artifact against GitHub's digest,
+      the build under test and the pinned app, the smoke's PASS and each
+      control's FAIL, then write records to checks/results/hosted/.
   mousse-check probe key <file>
       Write a throwaway device key for the probe and print its identity.
 
@@ -97,6 +102,9 @@ const VALUE_FLAGS: &[&str] = &[
     "--targets",
     "--config",
     "--case",
+    "--zip",
+    "--digest",
+    "--run",
 ];
 
 impl Args {
@@ -177,6 +185,7 @@ fn real_main(raw: Vec<String>) -> Result<ExitCode, String> {
         "config-digest" => cmd_config_digest(&kit, &a),
         "control-env" => cmd_control_env(&kit, &a),
         "device" => cmd_device(&kit, &a),
+        "hosted" => cmd_hosted(&kit, &a),
         "report" => cmd_report(&kit, &a, None),
         phase if kit.has_phase(phase) => cmd_report(&kit, &a, Some(phase)),
         other => Err(format!(
@@ -492,6 +501,40 @@ fn config_for(
         ),
     };
     Ok(m.config_digest(&c, target, control))
+}
+
+/// `hosted verify`: check a hosted run's artifact and record it.
+fn cmd_hosted(kit: &Kit, a: &Args) -> Result<ExitCode, String> {
+    a.only_known(&["--target", "--zip", "--digest", "--run"])?;
+    if a.positional.first().map(String::as_str) != Some("verify") {
+        return Err("usage: mousse-check hosted verify <check-id> --target <cell> --zip <file> --digest sha256:<hex> --run <url>".into());
+    }
+    let id = a
+        .positional
+        .get(1)
+        .ok_or("hosted verify needs a check id")?;
+    let (m, c) = kit.find_check(id)?;
+    let need = |f: &str| a.get(f).ok_or_else(|| format!("hosted verify needs {f}"));
+    let state = kit.state()?;
+    let app = mousse_check::app::read_revision(kit.root()).ok();
+    let scratch = std::env::temp_dir().join(format!("mousse-check-hosted-{}", std::process::id()));
+    let paths = mousse_check::hosted::verify(&mousse_check::hosted::VerifyArgs {
+        check: &c,
+        manifest: &m,
+        target: need("--target")?,
+        zip: Path::new(need("--zip")?),
+        digest: need("--digest")?,
+        run: need("--run")?,
+        commit: &state.commit,
+        app_revision: app.as_deref(),
+        out: &kit.results_dir().join("hosted"),
+        scratch: &scratch,
+    });
+    let _ = std::fs::remove_dir_all(&scratch);
+    for p in paths? {
+        println!("wrote {}", p.display());
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// `control-env`: what a control adds to the environment, for runs made

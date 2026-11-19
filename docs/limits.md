@@ -128,6 +128,28 @@ count as unknown names.
 | `MOUSSE_NET_TEST_EGRESS` | A check's egress fence (Phase 1b §14): when set, the helper dials only loopback and the comma-separated IP literals listed (the Mac's address in cross-machine cells), and resolves no name but `localhost`. Empty means loopback only. |
 | `MOUSSE_NET_TEST_EGRESS_LOG` | A file the helper appends one JSON line to for each dial the fence refused; the check kit fails the run with `egress_attempted`. |
 
+## Check kit (tests only)
+
+The owner test kit's own waits and its relay. Nothing here is read by the
+engine or the app.
+
+| Variable | Default | Allowed | What it limits |
+| --- | --- | --- | --- |
+| `MOUSSE_NET_RELAY_MAX_STREAMS` | 16 | 1 to 16 (tighten) | Kit relay (`tools/app-check/relay.mjs`, Mac to PC for the chat-link check): connections carried at once. |
+| `MOUSSE_NET_RELAY_FRAME_MAX_BYTES` | 65536 | 1024 to 65536 (tighten) | Kit relay: one frame on the control connection. |
+| `MOUSSE_NET_RELAY_HELLO_WAIT_MS` | 5000 | 100 to 60000 | Kit relay: time for the control connection's first line. |
+| `MOUSSE_CHECK_PROBE_CONNECT_MS` | 5000 | 1 or more | `mousse-check probe`: one TCP connect. |
+| `MOUSSE_CHECK_PROBE_CLOSE_MS` | 5000 | 1 or more | Probe: time the host has to answer or close once it should. |
+| `MOUSSE_CHECK_PROBE_SETTLE_MS` | 1000 | 1 or more | Probe: after a case, before the app's counters are read again. |
+| `MOUSSE_CHECK_SMOKE_SERVE_MS` | 15000 | 1 or more | `tools/build-smoke.mjs`: for release `serve` and `invite` to be ready. |
+| `MOUSSE_CHECK_SMOKE_PROBE_MS` | 120000 | 1 or more | Build smoke: one probe run. |
+
+The probe reads the engine limits it tests (`MOUSSE_NET_PREAUTH_*`,
+`MOUSSE_NET_JOIN_PROOF_WAIT_MS`, `MOUSSE_NET_HANDSHAKE_TIMEOUT_MS`,
+`MOUSSE_NET_WS_UPGRADE_WAIT_MS`, `MOUSSE_NET_WS_HEADER_MAX_BYTES`) from the
+same variables, so a check that tightens one for the host tightens it for
+the probe.
+
 ## Fixed on purpose
 
 These are protocol constants, not limits, so they are not settings:
