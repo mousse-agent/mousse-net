@@ -36,12 +36,16 @@ pub mod pipe;
 pub mod preauth;
 pub mod private;
 pub mod rng;
+pub mod routes;
 pub mod store;
 pub mod tls;
 pub mod watch;
 
 pub use admission::StreamAdmission;
-pub use caller::{Caller, CodeEntry, JoinOutcome, NoCode, PathEvent, Step1Failures};
+pub use caller::{
+    Caller, CandidateSource, CodeEntry, JoinOutcome, LaterCandidates, NoCode, PathEvent, Reached,
+    RouteClass, Search, Step1Failures,
+};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use conn::{CloseReason, ConnStatus, Connection, MuxStream, StreamReader, StreamWriter};
 pub use endpoint::{Endpoint, PortChoice};
@@ -78,7 +82,14 @@ pub type SharedSigner = Arc<dyn IdentitySigner + Send + Sync>;
         mousse_control = "repair-skips-fence",
         mousse_control = "ws-allow-origin",
         mousse_control = "plain-ws-off-loopback",
-        mousse_control = "release-test-root"
+        mousse_control = "release-test-root",
+        mousse_control = "loopback-routes",
+        mousse_control = "resolve-again",
+        mousse_control = "unlisted-allowed",
+        mousse_control = "stale-renewal-routes",
+        mousse_control = "unbounded-candidates",
+        mousse_control = "ssh-races-lan",
+        mousse_control = "bind-all-lan-off"
     )
 ))]
 compile_error!("a mousse_control build has a deliberate defect and is for tests only; build it without --release");
@@ -103,7 +114,14 @@ compile_error!("a mousse_control build has a deliberate defect and is for tests 
     mousse_control = "repair-skips-fence",
     mousse_control = "ws-allow-origin",
     mousse_control = "plain-ws-off-loopback",
-    mousse_control = "release-test-root"
+    mousse_control = "release-test-root",
+    mousse_control = "loopback-routes",
+    mousse_control = "resolve-again",
+    mousse_control = "unlisted-allowed",
+    mousse_control = "stale-renewal-routes",
+    mousse_control = "unbounded-candidates",
+    mousse_control = "ssh-races-lan",
+    mousse_control = "bind-all-lan-off"
 ))]
 const _: () = {
     let profile = env!("MOUSSE_BUILD_PROFILE").as_bytes();
@@ -154,6 +172,20 @@ pub const CONTROL: Option<&str> = if cfg!(mousse_control = "skip-pin-check") {
     Some("plain-ws-off-loopback")
 } else if cfg!(mousse_control = "release-test-root") {
     Some("release-test-root")
+} else if cfg!(mousse_control = "loopback-routes") {
+    Some("loopback-routes")
+} else if cfg!(mousse_control = "resolve-again") {
+    Some("resolve-again")
+} else if cfg!(mousse_control = "unlisted-allowed") {
+    Some("unlisted-allowed")
+} else if cfg!(mousse_control = "stale-renewal-routes") {
+    Some("stale-renewal-routes")
+} else if cfg!(mousse_control = "unbounded-candidates") {
+    Some("unbounded-candidates")
+} else if cfg!(mousse_control = "ssh-races-lan") {
+    Some("ssh-races-lan")
+} else if cfg!(mousse_control = "bind-all-lan-off") {
+    Some("bind-all-lan-off")
 } else {
     None
 };

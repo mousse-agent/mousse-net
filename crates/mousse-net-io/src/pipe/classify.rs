@@ -109,10 +109,15 @@ fn classify_v6(ip: Ipv6Addr) -> AddrClass {
 /// The class of `ip`. An IPv4-mapped IPv6 address takes the class of its
 /// IPv4 address.
 pub fn classify(ip: IpAddr) -> AddrClass {
-    match ip {
+    let class = match ip {
         IpAddr::V4(v4) => classify_v4(v4),
         IpAddr::V6(v6) => classify_v6(v6),
+    };
+    // The control build counts every range outside the allowlist as public.
+    if cfg!(mousse_control = "unlisted-allowed") && class == AddrClass::Forbidden {
+        return AddrClass::Public;
     }
+    class
 }
 
 #[cfg(test)]

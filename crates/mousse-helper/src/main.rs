@@ -31,7 +31,19 @@
         mousse_control = "limits-raise",
         mousse_control = "ws-allow-origin",
         mousse_control = "plain-ws-off-loopback",
-        mousse_control = "release-test-root"
+        mousse_control = "release-test-root",
+        mousse_control = "peer-ssh-routes",
+        mousse_control = "loopback-routes",
+        mousse_control = "plain-ws-from-ticket",
+        mousse_control = "unapproved-public",
+        mousse_control = "unapproved-last-route",
+        mousse_control = "upgrade-trusts-routes",
+        mousse_control = "resolve-again",
+        mousse_control = "unlisted-allowed",
+        mousse_control = "stale-renewal-routes",
+        mousse_control = "unbounded-candidates",
+        mousse_control = "ssh-races-lan",
+        mousse_control = "bind-all-lan-off"
     )
 ))]
 compile_error!("a mousse_control build has a deliberate defect and is for tests only; build it without --release");
@@ -70,6 +82,18 @@ compile_error!("test-in-person lets a typed ticket count as scanned from the hos
     mousse_control = "ws-allow-origin",
     mousse_control = "plain-ws-off-loopback",
     mousse_control = "release-test-root",
+    mousse_control = "peer-ssh-routes",
+    mousse_control = "loopback-routes",
+    mousse_control = "plain-ws-from-ticket",
+    mousse_control = "unapproved-public",
+    mousse_control = "unapproved-last-route",
+    mousse_control = "upgrade-trusts-routes",
+    mousse_control = "resolve-again",
+    mousse_control = "unlisted-allowed",
+    mousse_control = "stale-renewal-routes",
+    mousse_control = "unbounded-candidates",
+    mousse_control = "ssh-races-lan",
+    mousse_control = "bind-all-lan-off",
     feature = "test-in-person"
 ))]
 const _: () = {

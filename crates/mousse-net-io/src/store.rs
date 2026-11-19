@@ -533,6 +533,11 @@ pub struct PeerRecord {
     /// `peer.addresses.set`), tried before the hints.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub addresses: Vec<String>,
+    /// Routes the host offered when it paired back that the automatic rule
+    /// does not cover (Phase 1b §1.3): kept as suggestions and never
+    /// dialled; the owner's Use moves one to `addresses`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub offered: Vec<String>,
     /// When pairing finished (local clock).
     pub paired_at: u64,
 }
@@ -635,6 +640,88 @@ impl PeerStore {
         let bytes =
             serde_json::to_vec_pretty(&file).map_err(|e| store_err(&self.path, e.into()))?;
         write_atomic(&self.path, &bytes)
+    }
+}
+
+/// Where an approved destination came from (Phase 1b §1.3).
+pub const APPROVED_BY_TICKET: &str = "ticket";
+/// The owner entered the destination (`peer.addresses.set`).
+pub const APPROVED_BY_OWNER: &str = "owner";
+
+/// One destination the owner approved for one peer (Phase 1b §1.3).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Approval {
+    /// The peer's identity key (hex SEC1).
+    pub identity: String,
+    /// The canonical route: scheme, lower-case host, explicit port and path.
+    pub destination: String,
+    /// [`APPROVED_BY_TICKET`] or [`APPROVED_BY_OWNER`].
+    pub source: String,
+    /// When it was approved (Unix seconds, local clock).
+    pub at: u64,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct ApprovalFile {
+    version: u32,
+    approvals: Vec<Approval>,
+}
+
+/// `approvals.json`: the destinations dialled beyond the automatic rule,
+/// each with its source, one file per profile. Written like `peers.json`:
+/// under an exclusive lock, atomically, owner-only. A store from before
+/// approvals existed has no file, so nothing in it counts as approved.
+#[derive(Clone, Debug)]
+pub struct ApprovalStore {
+    path: PathBuf,
+    lock_path: PathBuf,
+}
+
+impl ApprovalStore {
+    /// `approvals.json` in `dir`.
+    pub fn in_dir(dir: &Path) -> Self {
+        Self {
+            path: dir.join("approvals.json"),
+            lock_path: dir.join("approvals.lock"),
+        }
+    }
+
+    /// Whether the file exists (a 1.0 store has none).
+    pub fn exists(&self) -> bool {
+        self.path.exists()
+    }
+
+    /// Every approval; none when the file does not exist.
+    pub fn load(&self) -> Result<Vec<Approval>, NetError> {
+        let Some(bytes) = read_optional(&self.path)? else {
+            return Ok(Vec::new());
+        };
+        let file: ApprovalFile =
+            serde_json::from_slice(&bytes).map_err(|e| store_err(&self.path, e.into()))?;
+        Ok(file.approvals)
+    }
+
+    /// Change the list with `change` and write it, under the lock.
+    /// Returns whether anything changed; an unchanged list is not written.
+    pub fn update(&self, change: impl FnOnce(&mut Vec<Approval>)) -> Result<bool, NetError> {
+        if let Some(dir) = self.lock_path.parent() {
+            fs::create_dir_all(dir).map_err(|e| store_err(dir, e))?;
+        }
+        let _lock = hold_lock(&self.lock_path)?;
+        let before = self.load()?;
+        let mut list = before.clone();
+        change(&mut list);
+        if list == before && self.exists() {
+            return Ok(false);
+        }
+        let file = ApprovalFile {
+            version: 1,
+            approvals: list,
+        };
+        let bytes =
+            serde_json::to_vec_pretty(&file).map_err(|e| store_err(&self.path, e.into()))?;
+        write_atomic(&self.path, &bytes)?;
+        Ok(true)
     }
 }
 
@@ -996,6 +1083,7 @@ mod tests {
                             routes: Vec::new(),
                             last_route: None,
                             addresses: Vec::new(),
+                            offered: Vec::new(),
                             paired_at: 1,
                         })
                         .unwrap();
@@ -1023,6 +1111,7 @@ mod tests {
             routes: vec!["tcp://10.0.0.2:7443".into()],
             last_route: None,
             addresses: Vec::new(),
+            offered: Vec::new(),
             paired_at: 1,
         }
     }
@@ -1241,6 +1330,7 @@ mod tests {
             routes: vec!["tcp://10.0.0.2:7443".into()],
             last_route: None,
             addresses: Vec::new(),
+            offered: Vec::new(),
             paired_at: 1,
         };
         store.upsert(record.clone()).unwrap();

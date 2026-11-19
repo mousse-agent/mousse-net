@@ -1,17 +1,31 @@
-//! Reaching paired hosts (Phase 1a §5.3 and §6).
+//! Reaching paired hosts (Phase 1a §5.3 and §6; Phase 1b §1.3 and §1.4).
 //!
-//! - **Private ranges.** Every address a peer or the owner supplies (ticket
-//!   hints, `peer.add` routes from a pairback, `peer.addresses.set`) must be
-//!   a `tcp://` route to an IP in a private range; anything else is
-//!   refused with `bad_route` (hints are skipped). Debug builds also take
-//!   loopback, so tests run on one computer without listening on the LAN.
-//! - **Candidates**, in order: the route that last worked, the addresses
-//!   the owner added, the hints. They live in `peers.json`. When none of
-//!   them answers as the host, the browse source (mDNS, cached) is asked
-//!   and the addresses it found are tried too.
-//! - **Dialling** is [`Caller::dial_candidates`](mousse_net_io::Caller):
-//!   several at once, a pin mismatch moves on, the host's own refusal
-//!   stops the search.
+//! - **Who may supply what (§1.3).** A ticket hint or a route a host sends
+//!   when it pairs back (`peer.add {routes}`) is dialled only under 1a's
+//!   automatic rule: a `tcp` route to an IP literal of class `lan` (debug
+//!   builds: loopback too). A ticket's other `tcp` and `wss` hints are
+//!   dialled only when the owner approved them at Connect (`join
+//!   {approved}`); its plain `ws` and `ssh` hints are skipped. Other
+//!   pairback routes are kept as suggestions (`peer.add {offered}`), never
+//!   dialled. The owner's own addresses (`peer.addresses.set`) may be of
+//!   any kind; none may name a `forbidden` address.
+//! - **Approvals.** `<state>/approvals.json` holds every destination
+//!   dialled beyond the automatic rule, with its source: `ticket` (added
+//!   when an approved join succeeds) or `owner` (`peer.addresses.set` adds
+//!   its own and drops the ones it no longer lists). `peer.forget` and
+//!   `grant.remove` drop the peer's. A store from 1.0 has no file, so its
+//!   routes count only under the automatic rule.
+//! - **Candidates**, built from the store for every search, renewals
+//!   included: the last working route, the owner's addresses, the hints;
+//!   each must pass the automatic rule or have an approval for that peer,
+//!   the last working route too. The browse source (mDNS, cached) runs
+//!   beside the search and what it finds joins the `tcp` tier, under the
+//!   automatic rule only.
+//! - **Dialling** is [`Caller::search`](mousse_net_io::Caller::search):
+//!   bounded tiers, a pin mismatch moves on, the host's own refusal stops
+//!   the search. Any change to a host's addresses or approvals bumps the
+//!   caller's route generation for it ([`Caller::forget_routes`]), and a
+//!   last working route that lost its approval is dropped.
 //! - **Keep connected.** Once the app said `hello`, the helper keeps one
 //!   outbound path to every paired host. A host that cannot be reached is
 //!   tried again after `KEEP_RETRY_FIRST_MS`, doubling up to
@@ -23,15 +37,19 @@
 //!   `MOUSSE_HELPER_BROWSE_FILE` instead of mDNS: one `ip:port` per line.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mousse_net_core::identity::IdentityPublicKey;
 use mousse_net_core::pairing::Route;
 use mousse_net_io::discovery::BrowseSource;
-use mousse_net_io::pipe::{is_private_route, route_from_addr, route_ip, route_uri};
-use mousse_net_io::store::{hex, identity_from_hex, short_id, PeerRecord, PeerStore};
-use mousse_net_io::{Connection, NetError};
+use mousse_net_io::pipe::{AddrPolicy, LocalRoute, RouteKind};
+use mousse_net_io::store::{
+    hex, identity_from_hex, short_id, Approval, ApprovalStore, PeerRecord, PeerStore,
+    APPROVED_BY_OWNER,
+};
+use mousse_net_io::{CandidateSource, Connection, NetError, Reached, Search};
 use serde_json::{json, Map, Value};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
@@ -39,123 +57,330 @@ use tokio::time::Instant;
 use super::{error, Shared};
 use crate::applog;
 
-/// Whether an address a peer or the owner supplied may be stored and
-/// dialled (§5.3).
-pub fn allowed_route(route: &Route) -> bool {
+/// Whether a route a peer supplied (a ticket hint or a pairback route) may
+/// be dialled without the owner's approval: 1a's automatic rule.
+pub fn peer_route_ok(policy: &AddrPolicy, route: &LocalRoute) -> bool {
     if cfg!(mousse_control = "public-routes") {
         // The control build takes any TCP address.
-        return matches!(route, Route::Tcp { .. });
+        return matches!(route, LocalRoute::Tcp { .. });
     }
-    is_private_route(route)
-        || (cfg!(debug_assertions) && route_ip(route).is_some_and(|ip| ip.is_loopback()))
+    if cfg!(mousse_control = "peer-ssh-routes") && route.kind() == RouteKind::Ssh {
+        // The control build lets a peer name an ssh target.
+        return true;
+    }
+    policy.automatic(route)
 }
 
-/// The hints of a ticket this helper may dial.
-pub fn ticket_routes(hints: &[String]) -> Vec<Route> {
-    crate::peer::usable_routes(hints)
-        .into_iter()
-        .filter(allowed_route)
-        .collect()
-}
-
-/// Routes given on the app channel: a list of hints, each a `tcp://`
-/// route in a private range. The error names the first that is not.
-pub fn parse_routes(value: Option<&Value>) -> Result<Vec<String>, String> {
-    let list = match value {
-        None | Some(Value::Null) => return Ok(Vec::new()),
-        Some(Value::Array(list)) => list,
-        Some(_) => return Err("routes is a list of route hints".into()),
-    };
-    let mut out = Vec::new();
-    for r in list {
-        let route = match r.as_str().map(Route::parse) {
-            Some(Ok(route)) => route,
-            _ => return Err(format!("not a route: {r}")),
-        };
-        if !allowed_route(&route) {
-            return Err(format!(
-                "{} is not a private-range address (10/8, 172.16/12, 192.168/16, \
-                 169.254/16 or fc00::/7)",
-                route_uri(&route)
-            ));
-        }
-        let uri = route_uri(&route);
-        if !out.contains(&uri) {
-            out.push(uri);
-        }
-    }
-    Ok(out)
-}
-
-/// Where to look for `record`'s host before browsing: the last working
-/// route, then the owner's addresses, then the hints.
-fn stored_candidates(record: &PeerRecord) -> Vec<Route> {
-    let last = record
-        .last_route
-        .as_deref()
-        .and_then(|r| Route::parse(r).ok())
-        .filter(|r| matches!(r, Route::Tcp { .. }));
-    let mut out: Vec<Route> = last.into_iter().collect();
-    if cfg!(mousse_control = "no-rediscovery") && !out.is_empty() {
-        // The control build tries only the last working route. A pairing
-        // that has none yet (its first dial) still uses its addresses, so
-        // the control breaks finding a host that moved and nothing else.
-        return out;
-    }
-    for hint in record.addresses.iter().chain(&record.routes) {
-        if let Ok(route) = Route::parse(hint) {
-            if allowed_route(&route) && !out.contains(&route) {
-                out.push(route);
+/// The routes in `approved` (`join {approved}`), in canonical form; text
+/// that is not a route is left out.
+pub fn canonical_list(value: Option<&Value>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for v in value.and_then(Value::as_array).into_iter().flatten() {
+        if let Some(route) = v.as_str().and_then(|t| LocalRoute::parse(t).ok()) {
+            if !out.contains(&route.uri()) {
+                out.push(route.uri());
             }
         }
     }
     out
 }
 
-/// Reach `record`'s host: the stored candidates, then what the browse
-/// source finds. Returns the live connection and the route it used.
-async fn reach(shared: &Shared, record: &PeerRecord) -> Result<(Connection, Route), NetError> {
-    let pin = record.pin()?;
-    let stored = stored_candidates(record);
-    let first = match shared.caller.dial_candidates(&stored, pin).await {
-        Ok(found) => return Ok(found),
-        // The host itself refused: no other address changes that.
-        Err(e @ NetError::Closed(_)) => return Err(e),
-        Err(e) => e,
+/// The hints of a ticket this helper may dial (§1.3): those under the
+/// automatic rule, and `tcp` or `wss` hints the owner approved at Connect
+/// that name no forbidden address. Plain `ws` and `ssh` hints are reserved
+/// on the wire and skipped.
+pub fn ticket_candidates(
+    policy: &AddrPolicy,
+    hints: &[String],
+    approved: &[String],
+) -> Vec<LocalRoute> {
+    let mut out: Vec<LocalRoute> = Vec::new();
+    for hint in hints {
+        let route = match Route::parse(hint).ok().and_then(LocalRoute::from_route) {
+            Some(route) => route,
+            // The control build reads a plain ws hint as an owner's route.
+            None if cfg!(mousse_control = "plain-ws-from-ticket") => {
+                match LocalRoute::parse(hint) {
+                    Ok(route) if route.kind() == RouteKind::Ws => route,
+                    _ => continue,
+                }
+            }
+            None => continue,
+        };
+        let approved = approved.contains(&route.uri())
+            // The control build dials any TCP hint without approval.
+            || (cfg!(mousse_control = "unapproved-public") && route.kind() == RouteKind::Tcp);
+        let ok = peer_route_ok(policy, &route) || (approved && !policy.names_forbidden(&route));
+        if ok && !out.contains(&route) {
+            out.push(route);
+        }
+    }
+    out
+}
+
+/// A list of route texts from the app channel, each parsed.
+fn route_list(value: Option<&Value>) -> Result<Vec<LocalRoute>, String> {
+    let list = match value {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Array(list)) => list,
+        Some(_) => return Err("routes is a list of route hints".into()),
     };
-    let Some(browse) = shared
+    let mut out: Vec<LocalRoute> = Vec::new();
+    for r in list {
+        let route = r
+            .as_str()
+            .and_then(|t| LocalRoute::parse(t).ok())
+            .ok_or_else(|| format!("not a route: {r}"))?;
+        if !out.contains(&route) {
+            out.push(route);
+        }
+    }
+    Ok(out)
+}
+
+/// The routes a host sends when it pairs back (`peer.add {routes}`): 1a's
+/// automatic rule only. The error names the first that is not.
+pub fn parse_routes(policy: &AddrPolicy, value: Option<&Value>) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for route in route_list(value)? {
+        if !peer_route_ok(policy, &route) {
+            return Err(format!(
+                "{} is not a private-range address (10/8, 172.16/12, 192.168/16, \
+                 169.254/16 or fc00::/7)",
+                route.uri()
+            ));
+        }
+        out.push(route.uri());
+    }
+    Ok(out)
+}
+
+/// The other routes a host offered when it paired back (`peer.add
+/// {offered}`): `tcp` or `wss` naming no forbidden address, kept as
+/// suggestions. A peer never names a plain `ws` or an `ssh` route.
+pub fn parse_offered(policy: &AddrPolicy, value: Option<&Value>) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for route in route_list(value)? {
+        let kind_ok = matches!(route, LocalRoute::Tcp { .. } | LocalRoute::Wss { .. })
+            || (cfg!(mousse_control = "peer-ssh-routes") && route.kind() == RouteKind::Ssh);
+        if !kind_ok {
+            return Err(format!(
+                "{} is not a route a peer may offer (tcp or wss only)",
+                route.uri()
+            ));
+        }
+        if policy.names_forbidden(&route) {
+            return Err(format!(
+                "{} names an address that is never dialled",
+                route.uri()
+            ));
+        }
+        out.push(route.uri());
+    }
+    Ok(out)
+}
+
+/// The owner's addresses (`peer.addresses.set`): any kind, none naming a
+/// forbidden address. The error is `(error, reason)`.
+pub fn parse_owner_routes(
+    policy: &AddrPolicy,
+    value: Option<&Value>,
+) -> Result<Vec<String>, (&'static str, String)> {
+    let mut out = Vec::new();
+    for route in route_list(value).map_err(|e| ("bad_route", e))? {
+        if policy.names_forbidden(&route) {
+            return Err((
+                "forbidden_address",
+                format!("{} names an address that is never dialled", route.uri()),
+            ));
+        }
+        out.push(route.uri());
+    }
+    Ok(out)
+}
+
+/// What may be dialled for one peer beyond the automatic rule.
+struct Allowed {
+    approvals: Vec<Approval>,
+    /// The control build counts a 1.0 store's routes as approved.
+    trust_stored: bool,
+}
+
+impl Allowed {
+    fn load(dir: &Path) -> Self {
+        let store = ApprovalStore::in_dir(dir);
+        Self {
+            approvals: store.load().unwrap_or_default(),
+            trust_stored: cfg!(mousse_control = "upgrade-trusts-routes") && !store.exists(),
+        }
+    }
+
+    /// Whether `route` may be dialled for the peer `identity`.
+    fn allows(&self, policy: &AddrPolicy, identity: &str, route: &LocalRoute) -> bool {
+        if policy.automatic(route) {
+            return true;
+        }
+        if policy.names_forbidden(route) {
+            return false;
+        }
+        let uri = route.uri();
+        self.trust_stored
+            || self
+                .approvals
+                .iter()
+                .any(|a| a.identity == identity && a.destination == uri)
+    }
+}
+
+/// A stored route: an owner's address of any kind, or a hint by the
+/// wire's grammar.
+fn stored_route(text: &str, owner: bool) -> Option<LocalRoute> {
+    if owner {
+        LocalRoute::parse(text).ok()
+    } else {
+        Route::parse(text).ok().and_then(LocalRoute::from_route)
+    }
+}
+
+/// The search for `record`'s host from the store as it is now, without
+/// the browse: the last working route, the owner's addresses, the hints,
+/// each allowed by the automatic rule or an approval.
+pub fn stored_search(policy: &AddrPolicy, dir: &Path, record: &PeerRecord) -> Search {
+    let allowed = Allowed::load(dir);
+    let may = |route: &LocalRoute| allowed.allows(policy, &record.identity, route);
+    let last = record
+        .last_route
+        .as_deref()
+        .and_then(|r| stored_route(r, true))
+        // The control build dials the last working route unchecked.
+        .filter(|r| cfg!(mousse_control = "unapproved-last-route") || may(r));
+    let ssh_first = last.as_ref().is_some_and(|r| r.kind() == RouteKind::Ssh);
+    let mut out: Vec<LocalRoute> = last.into_iter().collect();
+    if cfg!(mousse_control = "no-rediscovery") && !out.is_empty() {
+        // The control build tries only the last working route. A pairing
+        // that has none yet (its first dial) still uses its addresses, so
+        // the control breaks finding a host that moved and nothing else.
+        return Search {
+            candidates: out,
+            ssh_first,
+            later: None,
+        };
+    }
+    let owner = record.addresses.iter().map(|r| (r, true));
+    let hints = record.routes.iter().map(|r| (r, false));
+    for (text, is_owner) in owner.chain(hints) {
+        if let Some(route) = stored_route(text, is_owner) {
+            if may(&route) && !out.contains(&route) {
+                out.push(route);
+            }
+        }
+    }
+    Search {
+        candidates: out,
+        ssh_first,
+        later: None,
+    }
+}
+
+/// Renewals build their search from the store, as every dial does.
+pub struct StoreCandidates {
+    pub dir: PathBuf,
+    pub policy: AddrPolicy,
+}
+
+impl CandidateSource for StoreCandidates {
+    fn search(&self, pin: &IdentityPublicKey) -> Search {
+        let key = hex(pin.as_bytes());
+        PeerStore::in_dir(&self.dir)
+            .load()
+            .ok()
+            .and_then(|peers| peers.into_iter().find(|p| p.identity == key))
+            .map(|record| stored_search(&self.policy, &self.dir, &record))
+            .unwrap_or_default()
+    }
+}
+
+/// After the approvals of `identity` changed: drop its last working route
+/// if that lost its approval, and bump the caller's route generation.
+pub(super) fn approvals_changed(shared: &Shared, identity: &IdentityPublicKey) {
+    let dir = &shared.info.state_dir;
+    let policy = shared.caller.addr_policy().clone();
+    let allowed = Allowed::load(dir);
+    let key = hex(identity.as_bytes());
+    let _ = PeerStore::in_dir(dir).update(|list| {
+        if let Some(p) = list.iter_mut().find(|p| p.identity == key) {
+            // The control build keeps a last route that lost its approval.
+            let keep = cfg!(mousse_control = "unapproved-last-route")
+                || p.last_route
+                    .as_deref()
+                    .and_then(|r| stored_route(r, true))
+                    .is_some_and(|r| allowed.allows(&policy, &key, &r));
+            if !keep {
+                p.last_route = None;
+            }
+        }
+    });
+    shared.caller.forget_routes(Some(identity));
+}
+
+/// Reach `record`'s host: the stored candidates, with what the browse
+/// source finds joining as it arrives. Returns the live connection and how
+/// it was reached.
+async fn reach(shared: &Shared, record: &PeerRecord) -> Result<(Connection, Reached), NetError> {
+    let pin = record.pin()?;
+    let policy = shared.caller.addr_policy().clone();
+    let mut search = stored_search(&policy, &shared.info.state_dir, record);
+    let browse = shared
         .info
         .browse
-        .as_ref()
-        .filter(|_| !cfg!(mousse_control = "no-rediscovery"))
-    else {
-        return Err(first);
-    };
-    let found = match browse.addresses().await {
-        Ok(found) => found,
-        Err(e) => {
-            applog::line(format!("browse failed: {e}"));
-            return Err(first);
-        }
-    };
-    let more: Vec<Route> = found
-        .into_iter()
-        .map(route_from_addr)
-        .filter(|r| !stored.contains(r))
-        .collect();
-    if more.is_empty() {
-        return Err(first);
+        .clone()
+        .filter(|_| !cfg!(mousse_control = "no-rediscovery"));
+    if let Some(browse) = browse {
+        search.later = Some(Box::pin(async move {
+            match browse.addresses().await {
+                Ok(found) => found
+                    .into_iter()
+                    .map(LocalRoute::tcp)
+                    .filter(|r| policy.automatic(r))
+                    .collect(),
+                Err(e) => {
+                    applog::line(format!("browse failed: {e}"));
+                    Vec::new()
+                }
+            }
+        }));
     }
-    match shared.caller.dial_candidates(&more, pin).await {
-        Ok((conn, used)) => {
-            // Renewals try the stored candidates too, after this one.
-            let mut order = vec![used.clone()];
-            order.extend(stored.into_iter().chain(more).filter(|r| *r != used));
-            shared.caller.remember_routes(pin, order);
-            Ok((conn, used))
+    shared.caller.search(search, pin).await
+}
+
+/// `{kind, class}` for `conn.up`.
+pub fn route_json(reached: &Reached) -> Value {
+    json!({"kind": reached.route.kind().name(), "class": reached.class.name()})
+}
+
+/// `approvals.list {identity?}`.
+pub fn list_approvals(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
+    let only = map
+        .get("identity")
+        .and_then(Value::as_str)
+        .map(str::to_lowercase);
+    match ApprovalStore::in_dir(&shared.info.state_dir).load() {
+        Ok(list) => {
+            let list: Vec<Value> = list
+                .into_iter()
+                .filter(|a| only.as_ref().is_none_or(|i| *i == a.identity))
+                .map(|a| {
+                    json!({
+                        "identity": a.identity,
+                        "destination": a.destination,
+                        "source": a.source,
+                        "at": a.at,
+                    })
+                })
+                .collect();
+            json!({"re": id, "approvals": list})
         }
-        Err(e @ NetError::Closed(_)) => Err(e),
-        Err(_) => Err(first),
+        Err(e) => error(id, "store_failed", e.to_string()),
     }
 }
 
@@ -329,14 +554,15 @@ pub async fn dial(
         .note_end(pin, reached.as_ref().err().map(Failure::of));
     let (conn, used) = reached.map_err(DialError::Failed)?;
     // Only the route is noted, on the record as stored now.
-    let _ = PeerStore::in_dir(&shared.info.state_dir).note_route(&pin, route_uri(&used));
+    let _ = PeerStore::in_dir(&shared.info.state_dir).note_route(&pin, used.route.uri());
     applog::line(format!(
         "connected {} (out) at {}",
         short_id(&pin),
-        route_uri(&used)
+        used.route
     ));
     let role = super::pairing::role_text(&record.role);
-    let no = match shared.add_outbound(conn, gen, json!({"dir": "out", "role": role})) {
+    let fields = json!({"dir": "out", "role": role, "route": route_json(&used)});
+    let no = match shared.add_outbound(conn, gen, fields) {
         Ok(no) => no,
         Err(super::Stale::Paused) => return Err(DialError::Paused),
         Err(super::Stale::Forgotten) => {
@@ -378,8 +604,9 @@ pub async fn dial_op(shared: Arc<Shared>, id: Value, identity: String) {
 }
 
 /// `peer.addresses.set {identity, routes}`: the addresses the owner added
-/// for a paired host, in place of the ones before. Each must be in a
-/// private range.
+/// for a paired host, in place of the ones before. Any route kind; none
+/// may name a forbidden address. Each becomes an `owner` approval, and the
+/// owner approvals it no longer lists go.
 pub fn set_addresses(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
     let identity = match map
         .get("identity")
@@ -389,21 +616,49 @@ pub fn set_addresses(shared: &Shared, id: &Value, map: &Map<String, Value>) -> V
         Some(Ok(identity)) => identity,
         _ => return error(id, "bad_request", "peer.addresses.set needs identity (hex)"),
     };
-    let routes = match parse_routes(map.get("routes")) {
+    let routes = match parse_owner_routes(shared.caller.addr_policy(), map.get("routes")) {
         Ok(routes) => routes,
-        Err(e) => return error(id, "bad_route", e),
+        Err((code, e)) => return error(id, code, e),
     };
     let key = hex(identity.as_bytes());
-    let mut found = false;
-    let updated = PeerStore::in_dir(&shared.info.state_dir).update(|list| {
+    let dir = &shared.info.state_dir;
+    match PeerStore::in_dir(dir).load() {
+        Err(e) => return error(id, "store_failed", e.to_string()),
+        Ok(list) if !list.iter().any(|p| p.identity == key) => {
+            return error(id, "no_peer", "not paired with that identity")
+        }
+        Ok(_) => {}
+    }
+    let at = crate::peer::now_secs();
+    let approved = ApprovalStore::in_dir(dir).update(|list| {
+        list.retain(|a| {
+            a.identity != key || a.source != APPROVED_BY_OWNER || routes.contains(&a.destination)
+        });
+        for r in &routes {
+            let has = list
+                .iter()
+                .any(|a| a.identity == key && a.source == APPROVED_BY_OWNER && a.destination == *r);
+            if !has {
+                list.push(Approval {
+                    identity: key.clone(),
+                    destination: r.clone(),
+                    source: APPROVED_BY_OWNER.into(),
+                    at,
+                });
+            }
+        }
+    });
+    if let Err(e) = approved {
+        return error(id, "store_failed", e.to_string());
+    }
+    let updated = PeerStore::in_dir(dir).update(|list| {
         if let Some(p) = list.iter_mut().find(|p| p.identity == key) {
-            found = true;
             p.addresses = routes.clone();
         }
     });
+    approvals_changed(shared, &identity);
     match updated {
         Err(e) => error(id, "store_failed", e.to_string()),
-        Ok(()) if !found => error(id, "no_peer", "not paired with that identity"),
         Ok(()) => {
             shared.keep.kick(Kick::Reset(Some(identity)));
             json!({"re": id, "routes": routes})

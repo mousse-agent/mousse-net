@@ -15,9 +15,13 @@
 //!   after the last one closed) is current at once. A dial or join while a
 //!   path is current is such a switch.
 //! - Renewal: [`Caller::start_renewals`] runs each session's timer. When a
-//!   path nears its deadline the caller dials the host again (over the
-//!   routes it last used, with a fresh certificate if ours runs out),
-//!   retrying on the session's schedule. The new path stays a candidate
+//!   path nears its deadline the caller searches for the host again, with a
+//!   fresh certificate if ours runs out, retrying on the session's
+//!   schedule. The candidates come from the [`CandidateSource`] the app
+//!   gave ([`Caller::use_candidates`]), built from its store each time, so
+//!   an edited or unapproved route is never dialled. Without one, the
+//!   routes the last search used are kept per pin with a generation, and
+//!   [`Caller::forget_routes`] drops them. The new path stays a candidate
 //!   until the app reopened its channels on it and called
 //!   [`Caller::reopened`]; only then does it become current and the old one
 //!   close with `PATH_REPLACED`.
@@ -44,11 +48,28 @@
 //! - A caller that sent a `JOIN_PROOF` and has no answer 10 s later closes
 //!   the connection with `NOT_AUTHORIZED` (wire.md 8.2), and the join ends
 //!   without reconnecting.
+//! - **Search** ([`Caller::search`], Phase 1b §1.4): at most
+//!   `DIAL_MAX_CANDIDATES` candidates, in the order given, in three tiers.
+//!   `tcp` starts at once, `DIAL_PARALLEL` tries at a time, each
+//!   `DIAL_TIMEOUT_MS`; candidates found later (a browse) join it as they
+//!   arrive. `ws`/`wss` starts `TIER_HEAD_START_MS` later (at once with no
+//!   `tcp` candidate), each try `WS_DIAL_TIMEOUT_MS`. `ssh` runs one try at
+//!   a time, each `SSH_DIAL_TIMEOUT_MS`, starting when the first two tiers
+//!   are done or `DIAL_FAST_TIERS_MS` into the search, whichever is first;
+//!   after `TIER_HEAD_START_MS` instead when the last working route was
+//!   `ssh`. The whole search ends after `DIAL_SEARCH_MS`. Each try
+//!   resolves its route once ([`pipe::resolve`]) and dials exactly the
+//!   addresses that gives; `ws`/`wss` and `ssh` pipes come from the
+//!   [`RouteDialer`]s the app gave ([`Caller::use_ws_dialer`],
+//!   [`Caller::use_ssh_dialer`]).
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
+use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::time::Duration;
 
 use mousse_net_core::authz::CallerGateState;
 use mousse_net_core::authz::{CallerGate, CallerTraffic, Traffic, Verdict};
@@ -60,17 +81,21 @@ use mousse_net_core::pairing::{
     JoinerPairing, JoinerRecord, JoinerState, PairedHost, PairingCode, Ticket,
 };
 use mousse_net_core::session::{CandidatePhase, PeerSession, SessionEvent};
-use mousse_net_core::session_cert::CertError;
+use mousse_net_core::session_cert::{CertError, SessionCertificate};
 use mousse_net_core::{ConnectionId, ErrorCode, Millis};
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 
 use crate::admission::StreamAdmission;
 use crate::certs::CertManager;
 use crate::clock::Clock;
 use crate::conn::{self, CloseReason, Cmd, ConnStatus, Connection, Outbox, Role as ConnRole};
 use crate::error::NetError;
-use crate::limits::{ms, Limits};
-use crate::pipe::{connect_tcp_within, route_uri, Pipe, Route};
+use crate::limits::{ms, IoLimits, Limits};
+use crate::pipe::{
+    self, connect_addr, AddrClass, AddrPolicy, BoxPipe, LocalRoute, Pipe, Resolver, Route,
+    RouteDialer, RouteKind, SystemResolver,
+};
 use crate::rng::os_rng;
 use crate::store::{FlowHold, FlowRecords, MemoryFlowRecords};
 use crate::tls::{self, Handshake, TlsPolicy};
@@ -103,6 +128,87 @@ impl CodeEntry for NoCode {
     }
 }
 
+/// Candidates that arrive while a search runs (a browse).
+pub type LaterCandidates = Pin<Box<dyn Future<Output = Vec<LocalRoute>> + Send>>;
+
+/// What one search dials (Phase 1b §1.4).
+#[derive(Default)]
+pub struct Search {
+    /// In order: the last working route, the owner's addresses, then
+    /// approved hints, already filtered by the approvals.
+    pub candidates: Vec<LocalRoute>,
+    /// The last working route was `ssh`: the `ssh` tier starts after
+    /// `TIER_HEAD_START_MS` instead of waiting for the faster tiers.
+    pub ssh_first: bool,
+    /// More `tcp` candidates found while the search runs (an mDNS browse);
+    /// they join the `tcp` tier as they arrive, after the others.
+    pub later: Option<LaterCandidates>,
+}
+
+impl Search {
+    /// A search of `candidates` only.
+    pub fn of(candidates: Vec<LocalRoute>) -> Self {
+        Self {
+            candidates,
+            ..Self::default()
+        }
+    }
+}
+
+/// Builds a search for a pinned host from the app's current store, for
+/// renewals: a renewal never dials a list remembered from before an edit.
+pub trait CandidateSource: Send + Sync {
+    /// The search for `pin` now.
+    fn search(&self, pin: &IdentityPublicKey) -> Search;
+}
+
+/// What kind of path a connection came up on, as `conn.up` shows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RouteClass {
+    /// `tcp` to a LAN address.
+    Lan,
+    /// `tcp` to a tailnet address.
+    Tailnet,
+    /// `tcp` to an internet address (a port forward).
+    Public,
+    /// `ws` or `wss` through the owner's tunnel.
+    Tunnel,
+    /// `ssh` stdio.
+    Ssh,
+}
+
+impl RouteClass {
+    /// The name `conn.up` uses.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Lan => "lan",
+            Self::Tailnet => "tailnet",
+            Self::Public => "public",
+            Self::Tunnel => "tunnel",
+            Self::Ssh => "ssh",
+        }
+    }
+
+    /// The class of a `tcp` path to an address of `class`.
+    pub fn of_tcp(class: AddrClass) -> Self {
+        match class {
+            AddrClass::Tailnet => Self::Tailnet,
+            AddrClass::Public => Self::Public,
+            // A forbidden address is never dialled.
+            AddrClass::Lan | AddrClass::Forbidden => Self::Lan,
+        }
+    }
+}
+
+/// How a path was reached.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reached {
+    /// The route that answered.
+    pub route: LocalRoute,
+    /// The class of the address dialled (`tunnel` and `ssh` by kind).
+    pub class: RouteClass,
+}
+
 /// A path change the app must act on (see [`Caller::start_renewals`]).
 #[derive(Debug)]
 pub enum PathEvent {
@@ -132,8 +238,20 @@ pub enum PathEvent {
 struct Paths {
     sessions: HashMap<IdentityPublicKey, PeerSession>,
     conns: HashMap<ConnectionId, mpsc::UnboundedSender<Cmd>>,
-    /// Where each pinned host was last reached, best first.
-    routes: HashMap<IdentityPublicKey, Vec<Route>>,
+    /// Where each pinned host was last reached, best first, with the
+    /// generation of its routes when they were kept.
+    routes: HashMap<IdentityPublicKey, (u64, Vec<LocalRoute>)>,
+    /// Per pinned host, how often its routes were forgotten
+    /// ([`Caller::forget_routes`]).
+    route_gens: HashMap<IdentityPublicKey, u64>,
+    /// Bumped with every host's generation.
+    all_gen: u64,
+}
+
+impl Paths {
+    fn route_gen(&self, pin: &IdentityPublicKey) -> u64 {
+        self.all_gen + self.route_gens.get(pin).copied().unwrap_or(0)
+    }
 }
 
 impl Paths {
@@ -163,6 +281,167 @@ pub struct Caller<F: CodeExchangeFactory + Clone = CpaceExchangeFactory> {
     /// by ticket hash, until the app says the pin is stored. Each still
     /// holds its ticket.
     settling: Mutex<HashMap<[u8; 32], SharedJoiner<F>>>,
+    opener: Opener,
+    candidates: Option<Arc<dyn CandidateSource>>,
+}
+
+/// Opens pipes for routes: `tcp` itself, other kinds through their
+/// dialers. Every address it dials went through [`pipe::resolve`].
+#[derive(Clone)]
+struct Opener {
+    addrs: AddrPolicy,
+    resolver: Arc<dyn Resolver>,
+    ws: Option<Arc<dyn RouteDialer>>,
+    ssh: Option<Arc<dyn RouteDialer>>,
+    io: IoLimits,
+}
+
+impl Opener {
+    /// How long one try of a route of `kind` may take, step 1 included.
+    fn within(&self, kind: RouteKind) -> Duration {
+        ms(match kind {
+            RouteKind::Tcp => self.io.dial_timeout_ms(),
+            RouteKind::Ws => self.io.ws_dial_timeout_ms(),
+            RouteKind::Ssh => self.io.ssh_dial_timeout_ms(),
+        })
+    }
+
+    /// Where to open pipes for `route`: each allowed address once, with
+    /// its class; `None` for `ssh`.
+    async fn targets(
+        &self,
+        route: &LocalRoute,
+    ) -> Result<Vec<(Option<SocketAddr>, RouteClass)>, NetError> {
+        let kind = route.kind();
+        if kind == RouteKind::Ssh {
+            return Ok(vec![(None, RouteClass::Ssh)]);
+        }
+        Ok(pipe::resolve(route, &self.addrs, &self.resolver)
+            .await?
+            .into_iter()
+            .map(|(addr, class)| {
+                let class = match kind {
+                    RouteKind::Tcp => RouteClass::of_tcp(class),
+                    _ => RouteClass::Tunnel,
+                };
+                (Some(addr), class)
+            })
+            .collect())
+    }
+
+    /// Open one pipe for `route` at `addr`.
+    async fn open(
+        &self,
+        route: &LocalRoute,
+        addr: Option<SocketAddr>,
+    ) -> Result<BoxPipe, NetError> {
+        let within = self.within(route.kind());
+        let dialer = match route.kind() {
+            RouteKind::Tcp => {
+                let mut addr = addr.ok_or_else(|| NetError::Refused("no address".into()))?;
+                if cfg!(mousse_control = "resolve-again") {
+                    // The control build resolves the name again and dials
+                    // that answer, not the address that was classified.
+                    if let LocalRoute::Tcp {
+                        host: mousse_net_core::pairing::RouteHost::Dns(name),
+                        port,
+                    } = route
+                    {
+                        if let Some(again) = self.resolver.resolve(name, *port).await?.first() {
+                            addr = *again;
+                        }
+                    }
+                }
+                let connect = ms(self.io.connect_timeout_ms()).min(within);
+                let stream = connect_addr(addr, connect).await?;
+                return Ok(Box::new(stream));
+            }
+            RouteKind::Ws => match &self.ws {
+                Some(dialer) => Some(dialer),
+                None => {
+                    // The built-in ws client (§4.2), at the classified
+                    // address.
+                    let target = route
+                        .ws_target()
+                        .ok_or_else(|| NetError::Refused(format!("{route} is not a ws route")))?;
+                    let addr = addr.ok_or_else(|| NetError::Refused("no address".into()))?;
+                    let pipe = pipe::ws::dial(&target, addr, &self.io).await?;
+                    return Ok(Box::new(pipe));
+                }
+            },
+            RouteKind::Ssh => self.ssh.as_ref(),
+        };
+        let dialer = dialer.ok_or_else(|| {
+            NetError::Refused(format!(
+                "{} routes cannot be dialled by this build",
+                route.kind().name()
+            ))
+        })?;
+        dialer.dial(route, addr, within).await
+    }
+
+    /// A pipe for `route`: its addresses in turn, the first that opens.
+    async fn open_any(&self, route: &LocalRoute) -> Result<(BoxPipe, RouteClass), NetError> {
+        let mut last = None;
+        for (addr, class) in self.targets(route).await? {
+            match self.open(route, addr).await {
+                Ok(pipe) => return Ok((pipe, class)),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| NetError::Refused(format!("{route}: no address"))))
+    }
+}
+
+/// What one try of a search needs.
+#[derive(Clone)]
+struct Dialing {
+    own: SessionCertificate,
+    pin: IdentityPublicKey,
+    clock: Arc<dyn Clock>,
+    tls: TlsPolicy,
+    opener: Opener,
+}
+
+/// A try that passed step 1: the stream, the handshake and the class.
+type Passed = (tokio_rustls::TlsStream<BoxPipe>, Handshake, RouteClass);
+
+/// A finished try: its route and how it went.
+type Tried = (LocalRoute, Result<Passed, NetError>);
+
+impl Dialing {
+    /// One try: each address of `route` in turn, until one passes step 1.
+    async fn attempt(&self, route: &LocalRoute) -> Result<Passed, NetError> {
+        let mut last = None;
+        for (addr, class) in self.opener.targets(route).await? {
+            let tried = async {
+                let pipe = self.opener.open(route, addr).await?;
+                tls::connect(pipe, &self.own, self.pin, self.clock.clone(), self.tls).await
+            };
+            match tried.await {
+                Ok((stream, handshake)) => return Ok((stream, handshake, class)),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| NetError::Refused(format!("{route}: no address"))))
+    }
+}
+
+/// The tier of a route kind: `tcp`, `ws`, `ssh`.
+fn tier(kind: RouteKind) -> usize {
+    match kind {
+        RouteKind::Tcp => 0,
+        RouteKind::Ws => 1,
+        RouteKind::Ssh => 2,
+    }
+}
+
+/// What woke a search.
+enum Woke {
+    Try(Option<Result<(tokio::task::Id, Box<Tried>), tokio::task::JoinError>>),
+    Later(Vec<LocalRoute>),
+    Tick,
+    Deadline,
 }
 
 fn lock(paths: &Mutex<Paths>) -> MutexGuard<'_, Paths> {
@@ -238,7 +517,16 @@ where
         limits: Limits,
         factory: F,
     ) -> Self {
+        let opener = Opener {
+            addrs: AddrPolicy::for_build().unwrap_or_else(|_| AddrPolicy::release()),
+            resolver: Arc::new(SystemResolver),
+            ws: None,
+            ssh: None,
+            io: *limits.io(),
+        };
         Self {
+            opener,
+            candidates: None,
             certs: Arc::new(CertManager::with_limits(signer, clock.clone(), &limits)),
             clock,
             policy: TlsPolicy::from_limits(&limits),
@@ -264,6 +552,38 @@ where
     /// share one, so its caps count every connection of the endpoint.
     pub fn use_stream_admission(&mut self, streams: Arc<StreamAdmission>) {
         self.streams = streams;
+    }
+
+    /// Classify dialled addresses with `addrs` (by default
+    /// [`AddrPolicy::for_build`]).
+    pub fn use_addr_policy(&mut self, addrs: AddrPolicy) {
+        self.opener.addrs = addrs;
+    }
+
+    /// The address policy this caller dials with.
+    pub fn addr_policy(&self) -> &AddrPolicy {
+        &self.opener.addrs
+    }
+
+    /// Resolve names with `resolver` (by default the system's).
+    pub fn use_resolver(&mut self, resolver: Arc<dyn Resolver>) {
+        self.opener.resolver = resolver;
+    }
+
+    /// Open `ws` and `wss` pipes with `dialer` instead of the built-in
+    /// client ([`pipe::ws::dial`]).
+    pub fn use_ws_dialer(&mut self, dialer: Arc<dyn RouteDialer>) {
+        self.opener.ws = Some(dialer);
+    }
+
+    /// Open `ssh` pipes with `dialer` (none by default).
+    pub fn use_ssh_dialer(&mut self, dialer: Arc<dyn RouteDialer>) {
+        self.opener.ssh = Some(dialer);
+    }
+
+    /// Build every renewal's search with `source`, from the app's store.
+    pub fn use_candidates(&mut self, source: Arc<dyn CandidateSource>) {
+        self.candidates = Some(source);
     }
 
     /// The stream places this caller's connections use.
@@ -306,10 +626,50 @@ where
     }
 
     /// Where to reach the host pinned as `pin` when a path must be
-    /// renewed, best first. [`Caller::dial_candidates`] keeps this up to
-    /// date; call it after a join or a dial over a pipe of your own.
+    /// renewed and no [`CandidateSource`] is set, best first.
+    /// [`Caller::search`] keeps this up to date; call it after a join or a
+    /// dial over a pipe of your own.
+    pub fn remember_local_routes(&self, pin: IdentityPublicKey, routes: Vec<LocalRoute>) {
+        let mut paths = lock(&self.paths);
+        let gen = paths.route_gen(&pin);
+        paths.routes.insert(pin, (gen, routes));
+    }
+
+    /// [`Caller::remember_local_routes`] for wire routes (`mdns` ones are
+    /// left out).
     pub fn remember_routes(&self, pin: IdentityPublicKey, routes: Vec<Route>) {
-        lock(&self.paths).routes.insert(pin, routes);
+        let routes = routes
+            .into_iter()
+            .filter_map(LocalRoute::from_route)
+            .collect();
+        self.remember_local_routes(pin, routes);
+    }
+
+    /// The routes of `pin` (of every host with `None`) changed: an address
+    /// was set, an approval given or taken back, the host forgotten or
+    /// removed. Bumps the generation, so the remembered routes are
+    /// dropped and a renewal that started before ends without a path.
+    pub fn forget_routes(&self, pin: Option<&IdentityPublicKey>) {
+        let mut paths = lock(&self.paths);
+        match pin {
+            Some(pin) => *paths.route_gens.entry(*pin).or_default() += 1,
+            None => paths.all_gen += 1,
+        }
+        // The control build keeps dialling what it remembered.
+        if cfg!(mousse_control = "stale-renewal-routes") {
+            return;
+        }
+        match pin {
+            Some(pin) => {
+                paths.routes.remove(pin);
+            }
+            None => paths.routes.clear(),
+        }
+    }
+
+    /// The current generation of `pin`'s routes.
+    pub fn route_generation(&self, pin: &IdentityPublicKey) -> u64 {
+        lock(&self.paths).route_gen(pin)
     }
 
     /// The app reopened its channels on a renewed path: make it current.
@@ -339,13 +699,54 @@ where
     }
 
     /// Bring up a new path to `pin` for a renewal: live, not yet current.
+    /// The search comes from the candidate source, built now; without one,
+    /// from the routes kept at this generation.
     async fn renew(&self, pin: IdentityPublicKey) -> Result<Connection, NetError> {
-        let routes = lock(&self.paths)
-            .routes
-            .get(&pin)
-            .cloned()
-            .unwrap_or_default();
-        self.race(&routes, pin).await.map(|(conn, _)| conn)
+        let stale = cfg!(mousse_control = "stale-renewal-routes");
+        let (gen, remembered) = {
+            let paths = lock(&self.paths);
+            let gen = paths.route_gen(&pin);
+            let remembered = paths
+                .routes
+                .get(&pin)
+                .filter(|(kept, _)| *kept == gen || stale)
+                .map(|(_, routes)| routes.clone())
+                .unwrap_or_default();
+            (gen, remembered)
+        };
+        let search = match &self.candidates {
+            // The control build dials the list it remembered.
+            Some(source) if !stale => source.search(&pin),
+            _ => Search::of(remembered),
+        };
+        let (conn, reached, tried) = self.race(search, pin).await?;
+        if lock(&self.paths).route_gen(&pin) != gen && !stale {
+            // The routes changed while this renewal searched: the next try
+            // builds the list again.
+            conn.close(ErrorCode::Cancelled);
+            return Err(NetError::Refused(
+                "the host's routes changed during the renewal".into(),
+            ));
+        }
+        self.keep_order(pin, &reached, tried, gen);
+        Ok(conn)
+    }
+
+    /// Remember the routes a search took, the winner first, if the
+    /// generation is still `gen`.
+    fn keep_order(
+        &self,
+        pin: IdentityPublicKey,
+        reached: &Reached,
+        tried: Vec<LocalRoute>,
+        gen: u64,
+    ) {
+        let mut order = vec![reached.route.clone()];
+        order.extend(tried.into_iter().filter(|r| *r != reached.route));
+        let mut paths = lock(&self.paths);
+        if paths.route_gen(&pin) == gen {
+            paths.routes.insert(pin, (gen, order));
+        }
     }
 
     /// A connection that passed step 1 with `pin` becomes the host's
@@ -497,14 +898,30 @@ where
         }
     }
 
-    /// Dial the host pinned as `pin` at whichever of `routes` answers as
-    /// that host first, over TCP (Phase 1a §6).
-    ///
-    /// Up to [`IoLimits::dial_parallel`](crate::limits::IoLimits::dial_parallel)
-    /// candidates are tried at once, in order, each given
-    /// [`IoLimits::dial_timeout_ms`](crate::limits::IoLimits::dial_timeout_ms)
-    /// to connect and pass step 1, so a slow or silent address never holds
-    /// up the rest.
+    /// Dial the host pinned as `pin` at whichever of the wire `routes`
+    /// answers as that host first: [`Caller::search`] with these
+    /// candidates only (`mdns` ones are left out). Returns the route used.
+    pub async fn dial_candidates(
+        &self,
+        routes: &[Route],
+        pin: IdentityPublicKey,
+    ) -> Result<(Connection, Route), NetError> {
+        let candidates = routes
+            .iter()
+            .cloned()
+            .filter_map(LocalRoute::from_route)
+            .collect();
+        let (conn, reached) = self.search(Search::of(candidates), pin).await?;
+        let used = reached
+            .route
+            .to_route()
+            .ok_or_else(|| NetError::Refused("not a wire route".into()))?;
+        Ok((conn, used))
+    }
+
+    /// Search for the host pinned as `pin` (Phase 1b §1.4; see the module
+    /// docs for the tiers and bounds) and make the path current as
+    /// [`Caller::dial`] does.
     ///
     /// Any step 1 failure on a candidate means "not this host here": a
     /// candidate whose identity is not the pin is another endpoint (for
@@ -516,68 +933,213 @@ where
     /// the pinned host: the other tries end, and if the host then refuses
     /// (for example `NOT_AUTHORIZED`) the refusal is returned and no
     /// further candidate is tried.
-    pub async fn dial_candidates(
+    pub async fn search(
         &self,
-        routes: &[Route],
+        search: Search,
         pin: IdentityPublicKey,
-    ) -> Result<(Connection, Route), NetError> {
-        let (conn, route) = self.race(routes, pin).await?;
+    ) -> Result<(Connection, Reached), NetError> {
+        let gen = self.route_generation(&pin);
+        let (conn, reached, tried) = self.race(search, pin).await?;
         self.promote_first(&conn);
-        let mut order = vec![route.clone()];
-        order.extend(routes.iter().filter(|r| **r != route).cloned());
-        self.remember_routes(pin, order);
-        Ok((conn, route))
+        self.keep_order(pin, &reached, tried, gen);
+        Ok((conn, reached))
     }
 
-    /// [`Caller::dial_candidates`] without making the path current: the
-    /// live connection and the route it used.
+    /// Open a pipe for one route, without TLS: its addresses in turn, as a
+    /// search try would (a join's pipe). Bounded by the route kind's try
+    /// time.
+    pub async fn open_route(&self, route: &LocalRoute) -> Result<(BoxPipe, RouteClass), NetError> {
+        let within = self.opener.within(route.kind());
+        tokio::time::timeout(within, self.opener.open_any(route))
+            .await
+            .unwrap_or(Err(NetError::Timeout("open the route")))
+    }
+
+    /// Dial `route` and pass step 1 pinned to `pin`, then close before
+    /// step 2: how long that took (`routes.test`, Phase 1b §1.5).
+    pub async fn probe_route(
+        &self,
+        route: &LocalRoute,
+        pin: IdentityPublicKey,
+    ) -> Result<Duration, NetError> {
+        let started = Instant::now();
+        let dialing = Dialing {
+            own: self.certs.current()?,
+            pin,
+            clock: self.clock.clone(),
+            tls: self.policy,
+            opener: self.opener.clone(),
+        };
+        let within = self.opener.within(route.kind());
+        let (stream, _, _) = tokio::time::timeout(within, dialing.attempt(route))
+            .await
+            .unwrap_or(Err(NetError::Timeout("route test")))?;
+        drop(stream);
+        Ok(started.elapsed())
+    }
+
+    /// [`Caller::search`] without making the path current: the live
+    /// connection, how it was reached, and every candidate the search
+    /// took, in order.
     async fn race(
         &self,
-        routes: &[Route],
+        search: Search,
         pin: IdentityPublicKey,
-    ) -> Result<(Connection, Route), NetError> {
-        let io = self.limits.io();
+    ) -> Result<(Connection, Reached, Vec<LocalRoute>), NetError> {
+        let io = *self.limits.io();
+        // The control build takes every candidate and searches for as long
+        // as the tries take.
+        let unbounded = cfg!(mousse_control = "unbounded-candidates");
+        let max = if unbounded {
+            usize::MAX
+        } else {
+            usize::try_from(io.dial_max_candidates())
+                .unwrap_or(1)
+                .max(1)
+        };
         let parallel = usize::try_from(io.dial_parallel()).unwrap_or(1).max(1);
-        let within = ms(io.dial_timeout_ms());
-        let connect_within = ms(io.connect_timeout_ms()).min(within);
-        let own = self.certs.current()?;
-        let mut queue = routes.iter().cloned();
+        let mut taken: Vec<LocalRoute> = Vec::new();
+        let mut queues: [VecDeque<LocalRoute>; 3] = Default::default();
+        let take = |route: LocalRoute,
+                    taken: &mut Vec<LocalRoute>,
+                    queues: &mut [VecDeque<LocalRoute>; 3]| {
+            if taken.len() < max && !taken.contains(&route) {
+                taken.push(route.clone());
+                queues[tier(route.kind())].push_back(route);
+            }
+        };
+        let Search {
+            candidates,
+            ssh_first,
+            mut later,
+        } = search;
+        for route in candidates {
+            take(route, &mut taken, &mut queues);
+        }
+        let start = Instant::now();
+        let deadline = (!unbounded).then(|| start + ms(io.dial_search_ms()));
+        let head = ms(io.tier_head_start_ms());
+        let ws_at = if queues[0].is_empty() && later.is_none() {
+            start
+        } else {
+            start + head
+        };
+        let mut ssh_at = if ssh_first {
+            start + head
+        } else {
+            start + ms(io.dial_fast_tiers_ms())
+        };
+        // The control build starts ssh with tcp.
+        if cfg!(mousse_control = "ssh-races-lan") {
+            ssh_at = start;
+        }
+        let dialing = Dialing {
+            own: self.certs.current()?,
+            pin,
+            clock: self.clock.clone(),
+            tls: self.policy,
+            opener: self.opener.clone(),
+        };
         let mut tries = tokio::task::JoinSet::new();
+        let mut kinds: HashMap<tokio::task::Id, usize> = HashMap::new();
+        let mut running = [0usize; 3];
         let mut last = None;
         let mut step1 = Step1Failures::default();
         loop {
-            while tries.len() < parallel {
-                let Some(route) = queue.next() else {
-                    break;
-                };
-                let (own, clock, policy) = (own.clone(), self.clock.clone(), self.policy);
-                tries.spawn(async move {
-                    let attempt = async {
-                        let pipe = connect_tcp_within(&route, connect_within).await?;
-                        tls::connect(pipe, &own, pin, clock, policy).await
-                    };
-                    let result = tokio::time::timeout(within, attempt)
-                        .await
-                        .unwrap_or(Err(NetError::Timeout("candidate address")));
-                    (route, result)
-                });
+            let now = Instant::now();
+            let fast_done = later.is_none()
+                && queues[0].is_empty()
+                && queues[1].is_empty()
+                && running[0] == 0
+                && running[1] == 0;
+            if fast_done && now < ssh_at {
+                ssh_at = now;
             }
-            let Some(joined) = tries.join_next().await else {
+            for (t, opens) in [(0, true), (1, now >= ws_at), (2, now >= ssh_at)] {
+                let cap = if t == 2 { 1 } else { parallel };
+                while opens && running[t] < cap {
+                    let Some(route) = queues[t].pop_front() else {
+                        break;
+                    };
+                    let within = dialing.opener.within(route.kind());
+                    let d = dialing.clone();
+                    let handle = tries.spawn(async move {
+                        let result = tokio::time::timeout(within, d.attempt(&route))
+                            .await
+                            .unwrap_or(Err(NetError::Timeout("candidate address")));
+                        (route, result)
+                    });
+                    kinds.insert(handle.id(), t);
+                    running[t] += 1;
+                }
+            }
+            if tries.is_empty() && later.is_none() && queues.iter().all(VecDeque::is_empty) {
                 break;
+            }
+            let tick = [(1, ws_at), (2, ssh_at)]
+                .into_iter()
+                .filter(|(t, at)| !queues[*t].is_empty() && *at > now)
+                .map(|(_, at)| at)
+                .min();
+            let woke = tokio::select! {
+                joined = tries.join_next_with_id(), if !tries.is_empty() => {
+                    Woke::Try(joined.map(|r| r.map(|(id, tried)| (id, Box::new(tried)))))
+                }
+                found = async {
+                    match later.as_mut() {
+                        Some(found) => found.await,
+                        None => std::future::pending().await,
+                    }
+                }, if later.is_some() => Woke::Later(found),
+                () = async {
+                    match tick {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => Woke::Tick,
+                () = async {
+                    match deadline {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => Woke::Deadline,
             };
-            // A try that panicked is a candidate that failed.
-            let Ok((route, result)) = joined else {
-                continue;
+            let (route, result) = match woke {
+                Woke::Tick | Woke::Try(None) => continue,
+                Woke::Later(found) => {
+                    later = None;
+                    for route in found {
+                        take(route, &mut taken, &mut queues);
+                    }
+                    continue;
+                }
+                Woke::Deadline => {
+                    tries.abort_all();
+                    return Err(NetError::Timeout("search for the host (DIAL_SEARCH_MS)"));
+                }
+                Woke::Try(Some(Err(e))) => {
+                    // A try that panicked is a candidate that failed.
+                    if let Some(t) = kinds.remove(&e.id()) {
+                        running[t] -= 1;
+                    }
+                    continue;
+                }
+                Woke::Try(Some(Ok((id, done)))) => {
+                    if let Some(t) = kinds.remove(&id) {
+                        running[t] -= 1;
+                    }
+                    *done
+                }
             };
             match result {
-                Ok((stream, handshake)) => {
+                Ok((stream, handshake, class)) => {
                     // Step 1 passed: this is the pinned host. The other
                     // tries end here.
                     tries.abort_all();
                     let id = self.admit(pin, &handshake)?;
                     let conn = self.start(id, stream, handshake, pin, None);
                     return match conn.settled(false).await {
-                        status if status.is_live() => Ok((conn, route)),
+                        status if status.is_live() => Ok((conn, Reached { route, class }, taken)),
                         ConnStatus::Closed(reason) => Err(NetError::Closed(reason)),
                         other => Err(NetError::Refused(format!("unexpected state {other:?}"))),
                     };
@@ -598,7 +1160,11 @@ where
         Err(last.unwrap_or_else(|| {
             NetError::Refused(format!(
                 "no candidate answered as this host ({})",
-                routes.iter().map(route_uri).collect::<Vec<_>>().join(", ")
+                taken
+                    .iter()
+                    .map(LocalRoute::uri)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ))
         }))
     }

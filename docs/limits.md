@@ -60,6 +60,12 @@ spec's value: it can only be tightened.
 | `MOUSSE_NET_STREAMS_PER_ENDPOINT` | 128 | 1 to 1024 | Open streams on all of an endpoint's connections together, host and caller sides alike; past it as above. |
 | `MOUSSE_NET_DIAL_PARALLEL` | 4 | 1 to 64 | Caller: candidate addresses for one host dialled at once (Phase 1a §6). |
 | `MOUSSE_NET_DIAL_TIMEOUT_MS` | 2000 | 100 to 60000 | Caller: time one candidate address has to connect and pass step 1 before it is given up (Phase 1a §6). |
+| `MOUSSE_NET_DIAL_MAX_CANDIDATES` | 16 | 1 to 64 | Caller: candidates kept for one search, in order: the last working route, the owner's addresses, approved hints, then browse results (Phase 1b §1.4). |
+| `MOUSSE_NET_TIER_HEAD_START_MS` | 500 | 0 to 10000 | Caller: wait after the `tcp` tier starts before `ws`/`wss` candidates start; at once when there is no `tcp` candidate. Also when the `ssh` tier starts if the last working route was `ssh`. |
+| `MOUSSE_NET_DIAL_FAST_TIERS_MS` | 12000 | 1000 to 60000 | Caller: latest start of the `ssh` tier, from the start of the search; it starts earlier once the `tcp` and `ws` tiers are done, so an SSH login never races a LAN path. |
+| `MOUSSE_NET_DIAL_SEARCH_MS` | 45000 | 5000 to 300000 | Caller: one whole search across every tier; past it the search ends unreachable. |
+| `MOUSSE_NET_WS_DIAL_TIMEOUT_MS` | 10000 | 500 to 60000 | Caller: one `ws`/`wss` try: connect, outer TLS, upgrade and step 1. |
+| `MOUSSE_NET_SSH_DIAL_TIMEOUT_MS` | 20000 | 1000 to 120000 | Caller: one `ssh` try: login, marker, remote `pipe` and step 1. |
 | `MOUSSE_NET_BROWSE_WAIT_MS` | 1500 | 100 to 30000 | How long an mDNS browse listens for answers (Phase 1a §6). |
 | `MOUSSE_NET_BROWSE_CACHE_MS` | 60000 | 0 to 3600000 | How long browse results are reused before the next browse; 0 browses every time (Phase 1a §6). |
 | `MOUSSE_NET_IFACE_POLL_MS` | 5000 | 100 to 60000 | How often the network watcher lists the interfaces and reads the monotonic clock (Phase 1a §6 and §8). |
@@ -117,7 +123,7 @@ count as unknown names.
 | Variable | What it does |
 | --- | --- |
 | `MOUSSE_NET_TEST_EXTRA_ROOT` | A DER certificate file the outer `wss` TLS trusts besides the platform's roots, for a test tunnel stand-in (Phase 1b §4.2). Nothing is installed in an OS store. |
-| `MOUSSE_NET_TEST_CLASS_MAP` | Maps loopback ports to address classes, so checks can stand in for tailnet and public routes (Phase 1b §1.2). |
+| `MOUSSE_NET_TEST_CLASS_MAP` | Maps loopback ports to address classes, so checks can stand in for tailnet and public routes (Phase 1b §1.2): `<port>=<class>` entries (`lan`, `tailnet` or `public`) separated by commas. Unmapped loopback counts as `lan`. |
 
 ## Fixed on purpose
 
