@@ -95,6 +95,8 @@ pub struct Waits {
     pub proof_wait: Duration,
     /// `MOUSSE_NET_WS_UPGRADE_WAIT_MS` (5000).
     pub upgrade_wait: Duration,
+    /// `MOUSSE_NET_HANDSHAKE_TIMEOUT_MS` (10000).
+    pub handshake_wait: Duration,
     /// `MOUSSE_NET_WS_HEADER_MAX_BYTES` (8192).
     pub header_max: usize,
     /// `MOUSSE_NET_PREAUTH_TCP` (48).
@@ -129,6 +131,7 @@ impl Waits {
             settle: ms("MOUSSE_CHECK_PROBE_SETTLE_MS", 1_000)?,
             proof_wait: ms("MOUSSE_NET_JOIN_PROOF_WAIT_MS", 10_000)?,
             upgrade_wait: ms("MOUSSE_NET_WS_UPGRADE_WAIT_MS", 5_000)?,
+            handshake_wait: ms("MOUSSE_NET_HANDSHAKE_TIMEOUT_MS", 10_000)?,
             header_max: num("MOUSSE_NET_WS_HEADER_MAX_BYTES", 8_192)? as usize,
             preauth_tcp: num("MOUSSE_NET_PREAUTH_TCP", 48)? as usize,
             preauth_ws: num("MOUSSE_NET_PREAUTH_WS", 16)? as usize,
@@ -607,17 +610,24 @@ async fn admission(t: &Target, w: &Waits) -> Result<(String, String), String> {
         held.push(session::silent(t, w).await?);
     }
     let mut extra = session::silent(t, w).await;
-    let extra_refused = match &mut extra {
-        Ok(s) => session::closed_within(s, w.close).await,
-        Err(_) => true,
-    };
-    // The first `cap` must still be open: check each briefly.
+    // The first `cap` must still be open: check each briefly, before the
+    // host's own waits (the ws upgrade wait) could close them.
     let mut early = 0;
     for s in &mut held {
         if session::closed_within(s, Duration::from_millis(50)).await {
             early += 1;
         }
     }
+    // A refusal is at accept, so it must come well before the host's own
+    // wait for a silent connection would close it anyway.
+    let host_wait = match t {
+        Target::Tcp(_) => w.handshake_wait,
+        Target::Ws { .. } => w.upgrade_wait,
+    };
+    let extra_refused = match &mut extra {
+        Ok(s) => session::closed_within(s, w.close.min(host_wait / 2)).await,
+        Err(_) => true,
+    };
     drop(held);
     drop(extra);
     let got = match (early, extra_refused) {
