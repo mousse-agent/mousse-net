@@ -13,7 +13,9 @@ workspace = true
 [dependencies]
 mousse-net-core = { path = "../mousse-net-core" }
 mousse-net-io = { path = "../mousse-net-io" }
-tokio = { version = "=1.54.1", features = ["rt-multi-thread", "net", "io-util", "io-std", "macros", "sync", "time", "signal"] }
+tokio = { version = "=1.54.1", features = ["rt-multi-thread", "net", "io-util", "io-std", "macros", "sync", "time", "signal", "process"] }
+# SSH host key fingerprints (Phase 1b §3.2).
+sha2 = { version = "=0.11.1", default-features = false }
 clap = { version = "=4.6.7", features = ["derive", "env"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"

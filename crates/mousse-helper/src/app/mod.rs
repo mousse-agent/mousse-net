@@ -138,6 +138,8 @@ struct Shared {
     admission: Arc<StreamAdmission>,
     pairing: Mutex<pairing::State>,
     keep: paths::Keep,
+    /// SSH routes: `ssh.*` and the connection window (Phase 1b §3).
+    ssh: Arc<crate::ssh::Ssh>,
     info: AppInfo,
     limits: HelperLimits,
 }
@@ -284,6 +286,7 @@ impl App {
             removal,
             pairing: Mutex::new(pairing::State::new(info.name.clone())),
             keep: paths::Keep::default(),
+            ssh: Arc::new(crate::ssh::Ssh::new(&info.state_dir)),
             info,
             limits,
         });
@@ -725,6 +728,15 @@ impl Shared {
                 let reply = changes::test_clock(self, &id, &map);
                 self.reply(&mut core, reply);
             }
+            #[cfg(debug_assertions)]
+            "test.ssh_dial" => {
+                drop(core);
+                tokio::spawn(ssh_dial_op(self.clone(), id, map));
+            }
+            op if crate::ssh::OPS.contains(&op) => {
+                drop(core);
+                tokio::spawn(ssh_op(self.clone(), id, op.to_owned(), map));
+            }
             op if pairing::OPS.contains(&op) => {
                 drop(core);
                 pairing::on_request(self, id, op, &map);
@@ -1163,4 +1175,80 @@ async fn tx_pump(
         }
     }
     shared.tx_ended(handle);
+}
+
+/// `ssh.*` (Phase 1b §3, §7): run off the reader, the reply queued when
+/// done. A wait in the connection window is announced as `ssh.waiting`.
+async fn ssh_op(shared: Arc<Shared>, id: Value, op: String, map: Map<String, Value>) {
+    let ssh = shared.ssh.clone();
+    let events = shared.clone();
+    let reply = match ssh.handle(&op, &map, move |ev| events.event(ev)).await {
+        Ok(mut reply) => {
+            if let Some(obj) = reply.as_object_mut() {
+                obj.insert("re".into(), id);
+            }
+            reply
+        }
+        Err(f) => error(&id, f.error, f.reason),
+    };
+    shared.event(reply);
+}
+
+/// Debug builds only: `test.ssh_dial {route_id, selector, identity,
+/// within_ms?}` opens an outbound path to the paired host `identity` over
+/// the SSH route alone, as the caller's `ssh` tier will, and announces it
+/// with `conn.up`. Checks use it to drive `ssh-stdio` end to end.
+#[cfg(debug_assertions)]
+async fn ssh_dial_op(shared: Arc<Shared>, id: Value, map: Map<String, Value>) {
+    let field = |k: &str| map.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
+    let pin = match mousse_net_io::store::identity_from_hex(&field("identity")) {
+        Ok(pin) => pin,
+        Err(_) => {
+            shared.event(error(
+                &id,
+                "bad_request",
+                "test.ssh_dial needs identity (hex)",
+            ));
+            return;
+        }
+    };
+    let within = std::time::Duration::from_millis(
+        map.get("within_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(20_000),
+    );
+    let deadline = tokio::time::Instant::now() + within;
+    let route_id = field("route_id");
+    let events = shared.clone();
+    let host = route_id.clone();
+    let opened = shared
+        .ssh
+        .dial(&route_id, &field("selector"), within, move |wait| {
+            events.event(json!({
+                "ev": "ssh.waiting",
+                "route_id": host,
+                "ms": u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+            }))
+        })
+        .await;
+    let gen = shared.peer_gen(&pin);
+    let dialled = match opened {
+        Ok(pipe) => match tokio::time::timeout_at(deadline, shared.caller.dial(pipe, pin)).await {
+            Ok(got) => got,
+            Err(_) => Err(NetError::Timeout("ssh dial")),
+        },
+        Err(e) => Err(e),
+    };
+    let reply = match dialled {
+        Ok(conn) => {
+            let fields = json!({"dir": "out", "route": {"kind": "ssh", "class": "ssh"}});
+            match shared.add_outbound(conn, gen, fields) {
+                Ok(no) => json!({"re": id, "conn": no}),
+                Err(_) => error(&id, "paused", "networking is paused"),
+            }
+        }
+        Err(NetError::Ssh { reason, detail }) => error(&id, reason.name(), detail),
+        Err(e) => error(&id, "unreachable", e.to_string()),
+    };
+    shared.event(reply);
 }

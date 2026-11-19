@@ -107,6 +107,16 @@ spec's value: it can only be tightened.
 | `MOUSSE_NET_KEEP_RETRY_MAX_MS` | 60000 | 10 to 3600000 | App mode: longest wait between those redials; not below the first. |
 | `MOUSSE_NET_IPC_LINE_MAX_BYTES` | 65536 | 1024 to 65536 | Local control channel: longest line a client may send; a longer one closes the channel (Phase 1b §6.2). |
 | `MOUSSE_NET_IPC_FIRST_LINE_WAIT_MS` | 2000 | 100 to 2000 | Local control channel: time a client has to send its first line before the channel is closed. |
+| `MOUSSE_NET_SSH_CONNECT_TIMEOUT_SECS` | 10 | 1 to 120 | ssh: `ConnectTimeout` on every call, and the limit on `ssh -G` (Phase 1b §3.1). |
+| `MOUSSE_NET_SSH_ALIVE_INTERVAL_SECS` | 15 | 1 to 300 | ssh: `ServerAliveInterval`. |
+| `MOUSSE_NET_SSH_ALIVE_COUNT` | 3 | 1 to 20 | ssh: `ServerAliveCountMax`. |
+| `MOUSSE_NET_SSH_TARGET_CONNECTS` | 5 | 1 to 5 | ssh: connections per resolved host and port per `SSH_TARGET_WINDOW_MS` (key fetches, setup sessions and pipe dials alike, every route and alias for the server together), so setup plus retries stay under `ufw limit`. One over waits; a wait past its call's deadline fails with `timeout`. |
+| `MOUSSE_NET_SSH_TARGET_WINDOW_MS` | 30000 | 30000 to 600000 | ssh: the window `SSH_TARGET_CONNECTS` counts over. Tighten only, which here means longer. |
+| `MOUSSE_NET_SSH_SETUP_TIMEOUT_MS` | 60000 | 1000 to 600000 | ssh: one `ssh.run` or `ssh.probe`; also how long a probed key is kept for `ssh.trust` (Phase 1b §3.2). |
+| `MOUSSE_NET_SSH_STDERR_MAX_BYTES` | 16384 | 1024 to 1048576 | ssh: stderr kept to name the failure's reason; never shown raw. |
+| `MOUSSE_NET_SSH_PREAMBLE_MAX_BYTES` | 65536 | 0 to 65536 | ssh: output skipped before the `mousse-ssh/1` marker (a login shell's rc files); past it the try fails with `remote_failed` (Phase 1b §3.3). |
+| `MOUSSE_NET_SSH_REPLY_MAX_BYTES` | 1048576 | 1024 to 1048576 | ssh: one `ssh.run` reply after the marker; a longer one fails with `remote_failed` (Phase 1b §3.4). |
+| `MOUSSE_NET_PIPE_CONNECT_WAIT_MS` | 2000 | 100 to 60000 | Remote `mousse-helper pipe`: reach the running helper's IPC and get its `ok`; past it, `not_running` (Phase 1b §3.3). |
 | `MOUSSE_NET_INIT_HOLD_MS` | 0 | 0 to 60000 | Checks only: how long `init` waits before it makes the endpoint, so the hard-kill check can stop the app during a first start. Run for the app (`--app`), its stdin closing still ends it at once. |
 
 ## Debug-build test hooks
@@ -118,6 +128,8 @@ count as unknown names.
 | --- | --- |
 | `MOUSSE_NET_TEST_EXTRA_ROOT` | A DER certificate file the outer `wss` TLS trusts besides the platform's roots, for a test tunnel stand-in (Phase 1b §4.2). Nothing is installed in an OS store. |
 | `MOUSSE_NET_TEST_CLASS_MAP` | Maps loopback ports to address classes, so checks can stand in for tailnet and public routes (Phase 1b §1.2). |
+| `MOUSSE_NET_SSH_BIN` | The `ssh` client to run instead of the system's (Phase 1b §3.1). |
+| `MOUSSE_NET_TEST_SSH_CONFIG` | The ssh config `ssh -G` reads instead of the user's own and the system's, so tests never read the owner's ssh config (Phase 1b §3.7). Every later call reads only the route's own config. |
 
 ## Fixed on purpose
 
@@ -137,3 +149,6 @@ These are protocol constants, not limits, so they are not settings:
   can only issue shorter certificates (`CERT_LIFETIME_SECS`).
 - The joiner record's bound of 3 attempts: the stored format rejects more.
 - The mDNS name format (`mousse-` and 12 random characters, privacy.md).
+- The `mousse-ssh/1` marker, the selector grammar (26 characters of
+  `[a-z2-7]`) and the remote `pipe` exit codes (`not_running` 2,
+  `no_endpoint` 3, `refused` 4): the two ends of an SSH route rely on them.

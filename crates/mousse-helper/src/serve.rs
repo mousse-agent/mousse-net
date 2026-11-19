@@ -200,12 +200,9 @@ pub async fn run(
         None
     };
 
-    // The app channel replaces the control listener in app mode.
-    let mut control = if opts.app {
-        None
-    } else {
-        Some(ControlListener::bind(state_dir).await?)
-    };
+    // In app mode the app channel carries everything else; the control
+    // listener answers only `pipe` and `status` (Phase 1b §3.3).
+    let mut control = Some(ControlListener::bind(state_dir).await?);
     let token = hex(&random_bytes::<32>());
     if let Some(control) = &control {
         ipc::write_control_file(state_dir, control.addr(), &token)?;
@@ -337,9 +334,23 @@ pub async fn run(
                 break;
             }
             ctl = accept_control(&mut control) => match ctl {
-                Ok(ch) => {
-                    tokio::spawn(control_session(state.clone(), ch));
-                }
+                Ok(ch) => match &app {
+                    // A place in the pipe pool before anything is read;
+                    // none while paused.
+                    Some(app) => {
+                        let slot = host.admit(ListenerKind::Pipe, None);
+                        tokio::spawn(app_control_session(
+                            host.clone(),
+                            app.clone(),
+                            state.clone(),
+                            ch,
+                            slot,
+                        ));
+                    }
+                    None => {
+                        tokio::spawn(control_session(state.clone(), ch));
+                    }
+                },
                 Err(e) => print_line(format!("control channel: {e}")),
             },
             Some(change) = net_changes.recv() => {
@@ -425,7 +436,7 @@ async fn ws_connection(
     }
 }
 
-/// The next control connection; never, in app mode.
+/// The next control connection.
 async fn accept_control(control: &mut Option<ControlListener>) -> Result<Channel, String> {
     match control {
         Some(control) => control.accept().await,
@@ -653,6 +664,65 @@ async fn control_session(state: Arc<State>, mut ch: Channel) {
             return;
         }
         other => reply_error(format!("unknown command {other:?}")),
+    };
+    let _ = ch.send(&reply).await;
+}
+
+/// App mode's control connection (Phase 1b §3.3): it holds a pipe pool
+/// place from accept (`slot`), and answers only `pipe` and `status`.
+/// `pipe` hands the stream, with whatever the line reader already holds,
+/// to the host as an inbound connection; the place passes on with it.
+async fn app_control_session(
+    host: Host,
+    app: crate::app::App,
+    state: Arc<State>,
+    mut ch: Channel,
+    slot: Result<PreAuthSlot, mousse_net_io::Refusal>,
+) {
+    let slot = match slot {
+        Ok(slot) => slot,
+        Err(why) => {
+            print_line(format!("refused pipe: {why}"));
+            let _ = ch
+                .send(&json!({"error": "refused", "reason": why.to_string()}))
+                .await;
+            return;
+        }
+    };
+    let Ok(Some(request)) = ch.recv_first().await else {
+        return;
+    };
+    let token = request.get("token").and_then(Value::as_str).unwrap_or("");
+    // Control (tests only): a pipe is handed over without the token.
+    let token_ok = ipc::token_matches(token, &state.token);
+    let cmd = request.get("cmd").and_then(Value::as_str).unwrap_or("");
+    if cmd == "pipe" && (token_ok || cfg!(mousse_control = "pipe-no-token")) {
+        if ch.send(&json!({"ok": true})).await.is_err() {
+            return;
+        }
+        let pipe = ch.into_pipe();
+        let conn = match host.accept_admitted(pipe, slot).await {
+            Ok(conn) => conn,
+            Err(e) => {
+                print_line(format!("refused pipe: {e}"));
+                return;
+            }
+        };
+        app.inbound(conn).await;
+        return;
+    }
+    drop(slot);
+    let reply = if !token_ok {
+        json!({"error": "refused", "reason": "bad control token"})
+    } else if cmd == "status" {
+        json!({
+            "device": short_id(&state.ticket_identity),
+            "identity": hex(state.ticket_identity.as_bytes()),
+            "build": crate::BUILD,
+            "app": true,
+        })
+    } else {
+        reply_error("This profile is run by Mousse; use mousse-cli net-engine")
     };
     let _ = ch.send(&reply).await;
 }

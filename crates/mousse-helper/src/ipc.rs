@@ -122,17 +122,18 @@ impl ControlListener {
                 Err(e) => return Err(format!("control channel: {}: {e}", path.display())),
             }
             // A socket path has a short length limit (104 bytes on macOS,
-            // 108 on Linux).
-            let unix = tokio::net::UnixListener::bind(&path).map_err(|e| {
-                if e.kind() == std::io::ErrorKind::InvalidInput {
-                    format!(
-                        "control channel: {} is too long for a socket path; use a shorter --state",
-                        path.display()
-                    )
-                } else {
-                    format!("control channel: {}: {e}", path.display())
+            // 108 on Linux). Past it, the socket is bound by its name in
+            // the state directory after changing to it (Phase 1b §3.3).
+            // One helper runs per profile and every path it uses is
+            // absolute, so that is safe.
+            let unix = match tokio::net::UnixListener::bind(&path) {
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                    std::env::set_current_dir(dir)
+                        .and_then(|()| tokio::net::UnixListener::bind(CONTROL_SOCKET))
                 }
-            })?;
+                other => other,
+            }
+            .map_err(|e| format!("control channel: {}: {e}", path.display()))?;
             mousse_net_io::private::restrict_file(&path)
                 .map_err(|e| format!("control channel: {}: {e}", path.display()))?;
             Ok(Self {
@@ -176,45 +177,99 @@ type BoxWrite = Box<dyn AsyncWrite + Send + Unpin>;
 
 /// One line-delimited JSON connection.
 pub struct Channel {
-    rd: BufReader<BoxRead>,
+    rd: LineReader,
     wr: BoxWrite,
+}
+
+/// The read side of a [`Channel`]: lines through a buffered reader. As a
+/// byte stream it gives what the reader already holds first, then the
+/// rest of the stream, so nothing read ahead of a line is lost.
+pub struct LineReader {
+    rd: BufReader<BoxRead>,
     /// The longest line read, on a listener's side (`IPC_LINE_MAX_BYTES`).
     /// `None` on a command's side, which reads its own `serve`'s replies.
     max_line: Option<usize>,
 }
 
-impl Channel {
-    /// Wrap a dialled stream.
-    pub fn new<S: AsyncRead + AsyncWrite + Send + 'static>(stream: S) -> Self {
-        let (rd, wr): (ReadHalf<S>, WriteHalf<S>) = tokio::io::split(stream);
-        Self {
-            rd: BufReader::new(Box::new(rd) as BoxRead),
-            wr: Box::new(wr),
-            max_line: None,
-        }
+/// A control connection turned into a raw byte stream after its request
+/// and reply lines (the remote `pipe`, Phase 1b §3.3). Bytes the line
+/// reader had already buffered come first.
+pub struct IpcPipe {
+    rd: BoxRead,
+    wr: BoxWrite,
+}
+
+impl IpcPipe {
+    /// Join a read side and a write side.
+    pub fn new(rd: BoxRead, wr: BoxWrite) -> Self {
+        Self { rd, wr }
+    }
+}
+
+impl AsyncRead for IpcPipe {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().rd).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for IpcPipe {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().wr).poll_write(cx, buf)
     }
 
-    /// Wrap an accepted stream: every line at most `IPC_LINE_MAX_BYTES`
-    /// (Phase 1b §6.2).
-    pub fn bounded<S: AsyncRead + AsyncWrite + Send + 'static>(stream: S) -> Self {
-        let mut ch = Self::new(stream);
-        // Control (tests only): lines are read with no cap.
-        if !cfg!(mousse_control = "ipc-unbounded-line") {
-            ch.max_line = usize::try_from(crate::limits::helper().ipc_line_max_bytes()).ok();
-        }
-        ch
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().wr).poll_flush(cx)
     }
 
-    /// The first message on an accepted stream: it must come within
-    /// `IPC_FIRST_LINE_WAIT_MS`, else the channel counts as closed.
-    pub async fn recv_first(&mut self) -> Result<Option<Value>, String> {
-        if cfg!(mousse_control = "ipc-unbounded-line") {
-            return self.recv().await;
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().wr).poll_shutdown(cx)
+    }
+}
+
+impl AsyncRead for LineReader {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().rd).poll_read(cx, buf)
+    }
+}
+
+impl LineReader {
+    /// The byte stream from here on: what the reader holds, then the rest.
+    /// Control (tests only): the held bytes are dropped.
+    pub fn into_stream(self) -> BoxRead {
+        if cfg!(mousse_control = "ipc-handoff-drops-buffer") {
+            return self.rd.into_inner();
         }
-        let wait = crate::limits::ms(crate::limits::helper().ipc_first_line_wait_ms());
-        match tokio::time::timeout(wait, self.recv()).await {
-            Ok(got) => got,
-            Err(_) => Err("no request in time".into()),
+        Box::new(self)
+    }
+
+    /// The next message; `None` when the other side closed.
+    pub async fn recv(&mut self) -> Result<Option<Value>, String> {
+        match self.read_line().await {
+            Ok(None) => Ok(None),
+            Ok(Some(line)) => serde_json::from_slice(&line)
+                .map(Some)
+                .map_err(|e| format!("bad control message: {e}")),
+            // A pipe whose other end went away reads as an error on Windows.
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(None),
+            Err(e) => Err(e.to_string()),
         }
     }
 
@@ -251,6 +306,44 @@ impl Channel {
             }
         }
     }
+}
+
+impl Channel {
+    /// Wrap a dialled stream.
+    pub fn new<S: AsyncRead + AsyncWrite + Send + 'static>(stream: S) -> Self {
+        let (rd, wr): (ReadHalf<S>, WriteHalf<S>) = tokio::io::split(stream);
+        Self {
+            rd: LineReader {
+                rd: BufReader::new(Box::new(rd) as BoxRead),
+                max_line: None,
+            },
+            wr: Box::new(wr),
+        }
+    }
+
+    /// Wrap an accepted stream: every line at most `IPC_LINE_MAX_BYTES`
+    /// (Phase 1b §6.2).
+    pub fn bounded<S: AsyncRead + AsyncWrite + Send + 'static>(stream: S) -> Self {
+        let mut ch = Self::new(stream);
+        // Control (tests only): lines are read with no cap.
+        if !cfg!(mousse_control = "ipc-unbounded-line") {
+            ch.rd.max_line = usize::try_from(crate::limits::helper().ipc_line_max_bytes()).ok();
+        }
+        ch
+    }
+
+    /// The first message on an accepted stream: it must come within
+    /// `IPC_FIRST_LINE_WAIT_MS`, else the channel counts as closed.
+    pub async fn recv_first(&mut self) -> Result<Option<Value>, String> {
+        if cfg!(mousse_control = "ipc-unbounded-line") {
+            return self.recv().await;
+        }
+        let wait = crate::limits::ms(crate::limits::helper().ipc_first_line_wait_ms());
+        match tokio::time::timeout(wait, self.recv()).await {
+            Ok(got) => got,
+            Err(_) => Err("no request in time".into()),
+        }
+    }
 
     /// Send one message.
     pub async fn send(&mut self, value: &Value) -> Result<(), String> {
@@ -262,15 +355,19 @@ impl Channel {
 
     /// The next message; `None` when the other side closed.
     pub async fn recv(&mut self) -> Result<Option<Value>, String> {
-        match self.read_line().await {
-            Ok(None) => Ok(None),
-            Ok(Some(line)) => serde_json::from_slice(&line)
-                .map(Some)
-                .map_err(|e| format!("bad control message: {e}")),
-            // A pipe whose other end went away reads as an error on Windows.
-            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(None),
-            Err(e) => Err(e.to_string()),
-        }
+        self.rd.recv().await
+    }
+
+    /// The two sides, for a caller that writes while it waits for a reply.
+    pub fn into_halves(self) -> (LineReader, BoxWrite) {
+        (self.rd, self.wr)
+    }
+
+    /// The raw byte stream after the lines so far (the helper's side of
+    /// `pipe`). Bytes the line reader already holds, the first TLS bytes
+    /// the client sent behind its request, come first (Phase 1b §3.3).
+    pub fn into_pipe(self) -> IpcPipe {
+        IpcPipe::new(self.rd.into_stream(), self.wr)
     }
 }
 
@@ -311,7 +408,18 @@ async fn connect_as(dir: &Path, addr: &str, uid: u32) -> Result<Option<Channel>,
     if addr != UNIX_ADDR {
         return Ok(None);
     }
+    // A path too long for a socket is reached by its name in the state
+    // directory after changing to it, as the listener bound it.
     let stream = match tokio::net::UnixStream::connect(dir.join(CONTROL_SOCKET)).await {
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+            match std::env::set_current_dir(dir) {
+                Ok(()) => tokio::net::UnixStream::connect(CONTROL_SOCKET).await,
+                Err(e) => Err(e),
+            }
+        }
+        other => other,
+    };
+    let stream = match stream {
         Ok(stream) => stream,
         Err(_) => return Ok(None),
     };
