@@ -249,6 +249,43 @@ fn only_the_announced_renewal_can_be_reopened() {
     assert_eq!(down["reason"], "path_replaced", "{down}");
 }
 
+/// A path the app dialled while another was up waits as the candidate,
+/// as a renewed one does: `path.reopened` on it switches paths, though no
+/// `path.reopen` announced it.
+#[test]
+fn a_path_dialled_while_one_is_up_can_be_reopened() {
+    let a_end = Endpoint::init("rda");
+    let b_end = Endpoint::init("rdb");
+    let mut a = app(&a_end, "hostA", &[], &[]);
+    a.hello();
+    let mut b = app(&b_end, "peerB", &[], &[]);
+    b.hello();
+    let a_route = route_of(&mut a);
+    trust(&mut a, &mut b, &[&a_route]);
+    let old = nth_up(&b, "out", &a.identity, 0, WAIT)["conn"]
+        .as_u64()
+        .unwrap();
+
+    let dialled = b.call("dial", json!({"identity": a.identity}));
+    assert_eq!(dialled["already"], false, "{dialled}");
+    let new = dialled["conn"].as_u64().unwrap();
+    assert_ne!(new, old);
+    assert_eq!(nth_up(&b, "out", &a.identity, 1, WAIT)["conn"], new);
+    assert!(
+        b.events("conn.down").is_empty(),
+        "{:?}",
+        b.events("conn.down")
+    );
+
+    let r = b.request("path.reopened", json!({"conn": new}));
+    assert!(r.get("error").is_none(), "{r}");
+    let down = b.event("conn.down", |m| m["conn"] == old);
+    assert_eq!(down["reason"], "path_replaced", "{down}");
+    // The old one was current, never a candidate.
+    let again = b.request("path.reopened", json!({"conn": new}));
+    assert_eq!(again["error"], "not_renewed", "{again}");
+}
+
 /// A renewal names the path it replaces among this side's own outbound
 /// paths. The caller and the host number their connections apart, so with
 /// every host also dialling in, each outbound path has an inbound one with

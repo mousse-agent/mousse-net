@@ -59,7 +59,7 @@ use mousse_net_core::pairing::{
     Arrival, CodeExchangeFactory, CpaceExchangeFactory, InvitationKind, JoinerAction, JoinerName,
     JoinerPairing, JoinerRecord, JoinerState, PairedHost, PairingCode, Ticket,
 };
-use mousse_net_core::session::{PeerSession, SessionEvent};
+use mousse_net_core::session::{CandidatePhase, PeerSession, SessionEvent};
 use mousse_net_core::session_cert::CertError;
 use mousse_net_core::{ConnectionId, ErrorCode, Millis};
 use tokio::sync::mpsc;
@@ -325,6 +325,17 @@ where
             .map_err(|e| NetError::Refused(format!("not a renewed path: {e:?}")))?;
         paths.run(events);
         Ok(())
+    }
+
+    /// Whether `conn` is its host's candidate path, live and waiting for
+    /// [`Caller::reopened`]: a renewed path, or one dialled while another
+    /// was current.
+    pub fn is_reopening(&self, conn: &Connection) -> bool {
+        lock(&self.paths)
+            .sessions
+            .get(conn.peer())
+            .and_then(|session| session.candidate())
+            .is_some_and(|c| c.conn == conn.id() && c.phase == CandidatePhase::Reopening)
     }
 
     /// Bring up a new path to `pin` for a renewal: live, not yet current.

@@ -102,8 +102,9 @@ pub async fn forward_renewals(shared: Arc<Shared>) {
 
 /// `path.reopened {conn}`: the app reopened its channels on the renewed
 /// path `conn`. It becomes current; the old path closes with
-/// `PATH_REPLACED`. Only the outbound handle `path.reopen` announced
-/// counts: the host numbers its connections apart from the caller, so an
+/// `PATH_REPLACED`. Only an outbound handle the caller holds as the
+/// candidate counts (announced by `path.reopen`, or a dial while a path was
+/// up): the host numbers its connections apart from the caller, so an
 /// inbound connection from the same peer can carry the renewed path's id.
 pub fn reopened(shared: &Shared, core: &mut Core, id: &Value, map: &Map<String, Value>) -> Value {
     let Some(no) = map.get("conn").and_then(Value::as_u64) else {
@@ -116,7 +117,7 @@ pub fn reopened(shared: &Shared, core: &mut Core, id: &Value, map: &Map<String, 
         return error(
             id,
             "not_renewed",
-            "path.reopen did not announce this connection",
+            "not a renewed or newly dialled outbound path",
         );
     }
     match shared.caller.reopened(&entry.conn) {

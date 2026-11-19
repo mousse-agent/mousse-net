@@ -1286,7 +1286,9 @@ Not touched: `sync/session.ts`, `sync/supervisor.ts`, `transports/*`,
    is already gone). `path.reopened {conn}` makes it current and closes
    the old one with `PATH_REPLACED`; it answers `no_conn`, or
    `not_renewed` for a path that is not a renewed one waiting (an inbound
-   path, or one already current). A failed try is `path.renew_failed
+   path, or one already current). An outbound path a `dial` opened while
+   another was up waits the same way, announced by its `conn.up` alone,
+   and `path.reopened` takes it too. A failed try is `path.renew_failed
    {identity, why, reason}`, and the caller tries again on the session's
    schedule. While networking is paused, a renewed path is closed at once
    and reported as `path.renew_failed {why: "paused"}`. `dial` reuses the

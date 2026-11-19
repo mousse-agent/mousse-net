@@ -159,7 +159,9 @@ struct ConnEntry {
     conn: Arc<Connection>,
     identity: IdentityPublicKey,
     inbound: bool,
-    /// Announced by `path.reopen` and not yet reopened: the only handle
+    /// An outbound path the caller holds as its host's candidate, not yet
+    /// reopened: announced by `path.reopen` (a renewal) or by `conn.up`
+    /// while another path to the host was up (a dial). The only handles
     /// `path.reopened` accepts.
     reopen: bool,
 }
@@ -431,6 +433,9 @@ impl Shared {
                     return Err(Stale::Forgotten);
                 }
             }
+            // Under the core lock `path.reopened` takes, so the app can
+            // reopen this path as soon as it sees `conn.up`.
+            let reopen = !inbound && self.caller.is_reopening(&conn);
             let conn = Arc::new(conn);
             let no = core.next_conn;
             core.next_conn += 1;
@@ -440,7 +445,7 @@ impl Shared {
                     conn: conn.clone(),
                     identity,
                     inbound,
-                    reopen: false,
+                    reopen,
                 },
             );
             fields["ev"] = json!("conn.up");
