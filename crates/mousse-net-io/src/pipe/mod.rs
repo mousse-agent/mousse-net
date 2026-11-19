@@ -5,13 +5,36 @@
 //! (LAN, tailnet, port forward), `ws`/`wss` through a user tunnel and
 //! `ssh` stdio. No pipe adds an authentication path of its own.
 //!
-//! [`classify`] is the one address classifier (§1.2).
+//! [`classify`] is the one address classifier (§1.2); [`AddrPolicy`] adds
+//! the build's loopback rule, and [`resolve`] turns a route into the exact
+//! addresses to dial. [`LocalRoute`] is every route kind this device dials,
+//! the two that never travel on the wire included.
+//!
+//! **Dialers for other pipes.** The caller dials `tcp` itself, and `ws`/`wss`
+//! with [`ws::dial`] unless it was given another [`RouteDialer`]
+//! ([`Caller::use_ws_dialer`](crate::Caller::use_ws_dialer)). An `ssh` route
+//! is opened by the dialer given with
+//! [`Caller::use_ssh_dialer`](crate::Caller::use_ssh_dialer). A dialer gets
+//! the route, the classified address for `ws`/`wss` (`None` for `ssh`, which
+//! `ssh -G` resolves) and the try's time, and returns the pipe, a
+//! [`BoxPipe`]. TLS and step 1 run on top as for TCP. A `wss` dialer keeps
+//! the name for SNI and `Host` only and connects to the address given.
 
 mod classify;
+mod local;
+mod policy;
+pub mod test_egress;
+pub mod ws;
 
 pub use classify::{classify, AddrClass};
+pub use local::{LocalRoute, RouteKind, MAX_SSH_TARGET_LEN, MAX_SSH_USER_LEN};
+pub use policy::{
+    resolve, AddrPolicy, ResolveFuture, Resolver, SystemResolver, TEST_CLASS_MAP_VAR,
+};
 
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -24,6 +47,31 @@ use crate::limits::{ms, Limits};
 pub trait Pipe: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
 
 impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> Pipe for T {}
+
+/// A pipe of any kind.
+pub type BoxPipe = Box<dyn Pipe>;
+
+/// What a [`RouteDialer`] returns.
+pub type DialFuture = Pin<Box<dyn Future<Output = Result<BoxPipe, NetError>> + Send>>;
+
+/// Opens the pipe for one route kind other than `tcp` (see the module
+/// docs).
+pub trait RouteDialer: Send + Sync {
+    /// Open a pipe for `route`: to `addr` for `ws`/`wss`, the classified
+    /// address the caller resolved once; `None` for `ssh`. The caller gives
+    /// up after `within` (`WS_DIAL_TIMEOUT_MS`, `SSH_DIAL_TIMEOUT_MS`),
+    /// which also covers step 1 on the pipe.
+    fn dial(&self, route: &LocalRoute, addr: Option<SocketAddr>, within: Duration) -> DialFuture;
+}
+
+impl<F> RouteDialer for F
+where
+    F: Fn(&LocalRoute, Option<SocketAddr>, Duration) -> DialFuture + Send + Sync,
+{
+    fn dial(&self, route: &LocalRoute, addr: Option<SocketAddr>, within: Duration) -> DialFuture {
+        self(route, addr, within)
+    }
+}
 
 pub use mousse_net_core::pairing::{Route, RouteHost};
 
@@ -66,34 +114,13 @@ pub async fn connect_tcp(route: &Route) -> Result<TcpStream, NetError> {
     connect_tcp_within(route, ms(Limits::DEFAULT.io().connect_timeout_ms())).await
 }
 
-/// Whether `ip` is in a private range: the `lan` class of [`classify`]
-/// (RFC 1918, IPv4 link-local, IPv6 unique local outside the tailnet
-/// range). An IPv4-mapped IPv6 address counts as its IPv4 address.
-pub fn is_private_ip(ip: IpAddr) -> bool {
-    classify(ip) == AddrClass::Lan
-}
-
-/// The address of a `tcp://` route given as an IP literal; `None` for a DNS
-/// name or an mDNS route.
-pub fn route_ip(route: &Route) -> Option<IpAddr> {
-    match route {
-        Route::Tcp {
-            host: RouteHost::Ipv4(ip),
-            ..
-        } => Some(IpAddr::V4(*ip)),
-        Route::Tcp {
-            host: RouteHost::Ipv6(ip),
-            ..
-        } => Some(IpAddr::V6(*ip)),
-        _ => None,
-    }
-}
-
-/// Whether a peer-supplied route may be dialled (Phase 1a §5.3): a
-/// `tcp://` route to an IP literal in a private range. Names are refused,
-/// since they could resolve anywhere.
-pub fn is_private_route(route: &Route) -> bool {
-    route_ip(route).is_some_and(is_private_ip)
+/// Connect to exactly `addr`, giving up after `within`, with Nagle off.
+pub async fn connect_addr(addr: SocketAddr, within: Duration) -> Result<TcpStream, NetError> {
+    let stream = tokio::time::timeout(within, TcpStream::connect(addr))
+        .await
+        .map_err(|_| NetError::Timeout("TCP connect"))??;
+    stream.set_nodelay(true)?;
+    Ok(stream)
 }
 
 /// Dial a `tcp://` route, giving up after `timeout`
@@ -106,9 +133,18 @@ pub async fn connect_tcp_within(route: &Route, timeout: Duration) -> Result<TcpS
         )));
     };
     let target = match host {
-        RouteHost::Ipv4(ip) => IpAddr::V4(*ip).to_string(),
-        RouteHost::Ipv6(ip) => IpAddr::V6(*ip).to_string(),
-        RouteHost::Dns(name) => name.clone(),
+        RouteHost::Ipv4(ip) => {
+            test_egress::check_ip(IpAddr::V4(*ip), *port)?;
+            IpAddr::V4(*ip).to_string()
+        }
+        RouteHost::Ipv6(ip) => {
+            test_egress::check_ip(IpAddr::V6(*ip), *port)?;
+            IpAddr::V6(*ip).to_string()
+        }
+        RouteHost::Dns(name) => {
+            test_egress::check_name(name, *port)?;
+            name.clone()
+        }
     };
     let stream = tokio::time::timeout(timeout, TcpStream::connect((target.as_str(), *port)))
         .await
@@ -140,51 +176,5 @@ mod tests {
         let tunnel = parse_route("wss://X.example/mousse-net/1").unwrap();
         assert_eq!(route_uri(&tunnel), "wss://x.example:443/mousse-net/1");
         assert_eq!(parse_route(&route_uri(&tunnel)).unwrap(), tunnel);
-    }
-
-    #[test]
-    fn private_ranges_are_rfc1918_link_local_and_ula_only() {
-        for ok in [
-            "10.0.0.1",
-            "10.255.255.255",
-            "172.16.0.1",
-            "172.31.255.254",
-            "192.168.1.20",
-            "169.254.3.4",
-            "fc00::1",
-            "fd12:3456::9",
-            "::ffff:192.168.0.2",
-        ] {
-            assert!(is_private_ip(ok.parse().unwrap()), "{ok}");
-        }
-        for no in [
-            "8.8.8.8",
-            "172.32.0.1",
-            "172.15.255.255",
-            "100.64.0.1",
-            "100.100.100.100",
-            "127.0.0.1",
-            "0.0.0.0",
-            "203.0.113.9",
-            "fe80::1",
-            "::1",
-            "2001:db8::1",
-            "fe00::1",
-            "::ffff:8.8.8.8",
-        ] {
-            assert!(!is_private_ip(no.parse().unwrap()), "{no}");
-        }
-        assert!(is_private_route(
-            &parse_route("tcp://192.168.1.2:7443").unwrap()
-        ));
-        assert!(is_private_route(
-            &parse_route("tcp://[fd00::2]:7443").unwrap()
-        ));
-        assert!(!is_private_route(
-            &parse_route("tcp://mac.local:7443").unwrap()
-        ));
-        assert!(!is_private_route(
-            &parse_route("tcp://8.8.8.8:7443").unwrap()
-        ));
     }
 }

@@ -35,6 +35,11 @@ pub enum NetError {
     /// No place for another stream: the connection or the endpoint has as
     /// many open as its limit allows. Open it once one ends.
     StreamLimit,
+    /// Reaching the host through a relay failed before the peer TLS.
+    Relay(crate::relay::RelayError),
+    /// The route names, or resolved only to, addresses that are never
+    /// dialled (Phase 1b §1.2), or it is not approved for this peer.
+    Forbidden(String),
 }
 
 impl NetError {
@@ -49,6 +54,8 @@ impl NetError {
                 | NetError::Tls(_)
                 | NetError::Timeout(_)
                 | NetError::PeerCertificate(_)
+                | NetError::Relay(_)
+                | NetError::Forbidden(_)
         )
     }
 }
@@ -71,11 +78,19 @@ impl fmt::Display for NetError {
             NetError::StreamReset(c) => write!(f, "stream reset ({})", c.name()),
             NetError::Refused(e) => write!(f, "refused: {e}"),
             NetError::StreamLimit => f.write_str("too many open streams"),
+            NetError::Relay(e) => write!(f, "{e}"),
+            NetError::Forbidden(e) => write!(f, "forbidden address: {e}"),
         }
     }
 }
 
 impl std::error::Error for NetError {}
+
+impl From<crate::relay::RelayError> for NetError {
+    fn from(e: crate::relay::RelayError) -> Self {
+        NetError::Relay(e)
+    }
+}
 
 impl From<std::io::Error> for NetError {
     fn from(e: std::io::Error) -> Self {

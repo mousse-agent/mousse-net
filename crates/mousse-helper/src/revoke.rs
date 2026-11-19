@@ -224,6 +224,9 @@ pub struct Removal {
     steps: Mutex<()>,
     /// `Some(reason)` while networking is paused.
     paused: watch::Sender<Option<String>>,
+    /// Counts removals applied in memory (journaled first), so relay
+    /// allow-sets are pushed after each one (Phase 3 §B.5).
+    removed: watch::Sender<u64>,
 }
 
 impl Removal {
@@ -232,12 +235,14 @@ impl Removal {
     /// accepted. If the replay fails, networking starts paused.
     pub fn start(host: Host, dir: &Path) -> Arc<Self> {
         let (paused, _) = watch::channel(None);
+        let (removed, _) = watch::channel(0);
         let removal = Arc::new(Self {
             journal: Journal::in_dir(dir),
             removals: RemovalJournal::in_dir(dir),
             host,
             steps: Mutex::new(()),
             paused,
+            removed,
         });
         if let Err(why) = removal.settle() {
             removal.pause(format!("replaying removals failed: {why}"));
@@ -260,6 +265,11 @@ impl Removal {
         self.paused.subscribe()
     }
 
+    /// Changes each time a journaled removal took effect.
+    pub fn removed(&self) -> watch::Receiver<u64> {
+        self.removed.subscribe()
+    }
+
     /// Remove `grant` (§5.4 step 2).
     pub fn remove(self: &Arc<Self>, grant: GrantId) -> Result<Removed, JournalFailed> {
         let _steps = self.steps.lock().unwrap_or_else(|e| e.into_inner());
@@ -269,7 +279,10 @@ impl Removal {
         if !cfg!(mousse_control = "no-revoke-journal") {
             self.journal.add(grant.0).map_err(JournalFailed)?;
         }
-        match self.host.remove_grant(grant) {
+        let removed = self.host.remove_grant(grant);
+        // In memory the grant is gone either way: relays hear it now.
+        self.removed.send_modify(|n| *n += 1);
+        match removed {
             Ok(_) => {
                 if !self.is_paused() {
                     if let Err(e) = self.journal.clear() {
@@ -336,7 +349,12 @@ impl Removal {
         if let Err(e) = applied.saved {
             self.pause(format!("saving the grant table failed: {e}"));
         }
-        Ok(applied.decision.result())
+        let result = applied.decision.result();
+        if result == RemovalResult::Applied {
+            // Relays hear it now (Phase 3 §B.5).
+            self.removed.send_modify(|n| *n += 1);
+        }
+        Ok(result)
     }
 
     /// The removal journal.

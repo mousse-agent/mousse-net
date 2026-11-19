@@ -145,6 +145,24 @@ The cost of this choice: during a rotation the old handle may spend the
 blocks it already holds at its own speed limit, beside the new handle.
 Plus bounds that by funding only the newest handle and by allowing at most
 one new handle per device and relay per day by default.
+## Routes beyond the LAN (Phase 1b)
+
+- **Port forwards and tunnels.** Any internet prober that reaches the
+  listener learns the host's identity key from its TLS certificate. On a
+  LAN this was already true for anyone on the network; a forward or a
+  tunnel makes it global. It learns nothing else before step 2.
+- **Approved destinations** learn the joiner's IP address when it dials
+  them, before any pin check. That is why such destinations are dialled
+  only after the owner approves them.
+- **The tunnel provider** (for example cloudflared or Funnel) ends the
+  outer WebSocket TLS. It sees both IP addresses, timing, sizes and the
+  WebSocket path, never content: the pinned peer TLS runs inside.
+- **The tailnet coordinator** sees that two of its nodes talk.
+- **Over SSH**, the remote account's profile list (labels, no paths) is
+  shown to whoever logs in as that OS account during SSH add.
+- **Checks** never reach Plus or the internet: app checks point Plus at a
+  loopback recorder, and refuse and log any other connection out of the
+  test cell.
 
 ## To be filled in by later phases
 

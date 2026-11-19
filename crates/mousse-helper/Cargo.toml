@@ -39,6 +39,15 @@ test-in-person = []
 serde_json = "=1.0.154"
 # Reads the terminal QR code in tests/headless.rs, as a phone's scanner would.
 rqrr = { version = "=0.11.0", default-features = false }
+# The relay tests run the real relay in the test process.
+mousse-relay = { path = "../mousse-relay" }
+tokio = { version = "=1.54.1", features = ["rt-multi-thread", "net", "macros", "sync", "time"] }
+# The TLS-terminating tunnel stand-in in tests/app_ws.rs.
+rustls = { version = "=0.23.46", default-features = false, features = ["std", "logging", "aws_lc_rs"] }
+tokio-rustls = { version = "=0.26.6", default-features = false, features = ["logging", "aws_lc_rs"] }
+rcgen = { version = "=0.14.10", default-features = false, features = ["aws_lc_rs"] }
+# `app_link` runs a host whose code exchange skips the key confirmation.
+rand_core = { version = "=0.10.1", default-features = false }
 
 [[test]]
 name = "loopback"

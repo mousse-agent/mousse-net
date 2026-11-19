@@ -102,7 +102,6 @@ impl Engine {
 
     /// Where pair secrets and the manifest come from (the relay client).
     /// Set before [`Engine::set_plus`]; without it there are none yet.
-    #[allow(dead_code)]
     pub fn set_pairs(&self, pairs: Arc<dyn mailbox::PairSource>) {
         let _ = self.pairs.set(pairs);
     }

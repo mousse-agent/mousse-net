@@ -446,6 +446,13 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
         ];
         match inv.params.kind {
             InvitationKind::SendLink => {
+                // Must-fail control: a new connection gets every attempt
+                // back.
+                if cfg!(mousse_control = "host-attempts-reset-on-reconnect")
+                    && inv.attempts_left > 0
+                {
+                    inv.attempts_left = self.attempts_per_invitation;
+                }
                 // The code is already on screen; show it again for this
                 // joiner. A send-link invitation never asks for approval.
                 if let Some(code) = &inv.code {
@@ -558,7 +565,12 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
             // gets a fresh code, shown from now on; none once no attempts
             // are left.
             if inv.attempts_left > 0 {
-                let next = PairingCode::generate(rng);
+                // Must-fail control: the next attempt keeps this code.
+                let next = if cfg!(mousse_control = "same-code-after-failure") {
+                    code.clone()
+                } else {
+                    PairingCode::generate(rng)
+                };
                 actions.push(HostAction::ShowCode {
                     invitation,
                     code: next.clone(),
@@ -751,7 +763,8 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
                     .values()
                     .any(|a| a.state == AttemptState::Running)
         });
-        if exhausted {
+        // Must-fail control: the invitation stays open with no attempts.
+        if exhausted && !cfg!(mousse_control = "invitation-survives-exhaustion") {
             self.end_if_open(invitation, ErrorCode::AttemptsExhausted)
         } else {
             Vec::new()
