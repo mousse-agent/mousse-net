@@ -56,8 +56,22 @@ pub async fn forward_renewals(shared: Arc<Shared>) {
                     .iter()
                     .find(|(_, e)| !e.inbound && e.identity == pin && e.conn.id() == from)
                     .map(|(no, _)| *no);
+                // A renewal that ends after its peer was forgotten opens
+                // nothing: read the generation, then the stored record.
+                let gen = shared.peer_gen(&pin);
+                if paths::find_peer(&shared, &pin).is_err() {
+                    conn.close(ErrorCode::Cancelled);
+                    applog::line(format!(
+                        "closed a renewed path to {}: not paired any more",
+                        short_id(&pin)
+                    ));
+                    continue;
+                }
                 let role = paths::stored_role(&shared, &pin);
-                let no = shared.add_conn(conn, false, json!({"dir": "out", "role": role}));
+                let Some(no) = shared.add_outbound(conn, gen, json!({"dir": "out", "role": role}))
+                else {
+                    continue;
+                };
                 applog::line(format!("renewed path to {} (conn {no})", short_id(&pin)));
                 let mut core = super::lock(&shared.core);
                 // Gone already: conn.down said so, and there is nothing to

@@ -467,8 +467,10 @@ fn forget_peer(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
     if let Err(e) = updated {
         return error(id, "store_failed", e.to_string());
     }
-    // Its outbound connections go with it.
-    let core = super::lock(&shared.core);
+    // Its outbound connections go with it, and so do those still opening:
+    // a dial or renewal that started before publishes nothing.
+    let mut core = super::lock(&shared.core);
+    *core.peer_gen.entry(identity).or_default() += 1;
     for entry in core.conns.values() {
         if !entry.inbound && entry.identity == identity {
             entry.conn.close(ErrorCode::Cancelled);

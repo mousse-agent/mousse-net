@@ -269,7 +269,7 @@ pub(super) fn stored_role(shared: &Shared, pin: &IdentityPublicKey) -> Value {
         .unwrap_or(Value::Null)
 }
 
-fn find_peer(shared: &Shared, pin: &IdentityPublicKey) -> Result<PeerRecord, DialError> {
+pub(super) fn find_peer(shared: &Shared, pin: &IdentityPublicKey) -> Result<PeerRecord, DialError> {
     let key = hex(pin.as_bytes());
     PeerStore::in_dir(&shared.info.state_dir)
         .load()
@@ -291,6 +291,9 @@ pub async fn dial(
     pin: IdentityPublicKey,
     fresh: bool,
 ) -> Result<Dialled, DialError> {
+    // Read before the stored record: a forget after this point keeps the
+    // path this dial opens from being published.
+    let gen = shared.peer_gen(&pin);
     let before: HashSet<u64> = outbound(shared, &pin).into_iter().collect();
     let ended_before = shared.keep.ended(pin).0;
     let lock = shared.keep.lock_for(pin);
@@ -331,7 +334,9 @@ pub async fn dial(
         route_uri(&used)
     ));
     let role = super::pairing::role_text(&record.role);
-    let no = shared.add_conn(conn, false, json!({"dir": "out", "role": role}));
+    let Some(no) = shared.add_outbound(conn, gen, json!({"dir": "out", "role": role})) else {
+        return Err(DialError::NoPeer("forgotten while the path opened".into()));
+    };
     Ok(Dialled {
         conn: no,
         already: false,

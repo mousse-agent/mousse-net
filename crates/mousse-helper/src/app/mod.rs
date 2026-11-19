@@ -202,6 +202,10 @@ struct Core {
     peak_buffered: u64,
     /// Shutdown: end once everything queued is written.
     ending: Option<End>,
+    /// Per peer, how often `peer.forget` removed it. A dial or a renewal
+    /// reads it before it starts and publishes its path only if it has not
+    /// changed, so no path to a forgotten peer comes up after the forget.
+    peer_gen: HashMap<IdentityPublicKey, u64>,
 }
 
 fn lock(core: &Mutex<Core>) -> MutexGuard<'_, Core> {
@@ -257,6 +261,7 @@ impl App {
                 buffered: 0,
                 peak_buffered: 0,
                 ending: None,
+                peer_gen: HashMap::new(),
             }),
             wake_writer: Notify::new(),
             ended,
@@ -360,11 +365,45 @@ impl Shared {
         self.queued(&core);
     }
 
-    fn add_conn(self: &Arc<Self>, conn: Connection, inbound: bool, mut fields: Value) -> u64 {
-        let conn = Arc::new(conn);
+    fn add_conn(self: &Arc<Self>, conn: Connection, inbound: bool, fields: Value) -> u64 {
+        self.publish(conn, inbound, None, fields)
+            .unwrap_or_else(|| unreachable!("an unchecked connection is always published"))
+    }
+
+    /// The generation of `pin` (see `Core::peer_gen`).
+    fn peer_gen(&self, pin: &IdentityPublicKey) -> u64 {
+        lock(&self.core).peer_gen.get(pin).copied().unwrap_or(0)
+    }
+
+    /// Publish an outbound path to a peer whose generation was `gen` when
+    /// the work that opened it started. If the peer was forgotten since,
+    /// the path is closed instead and `None` is returned.
+    fn add_outbound(self: &Arc<Self>, conn: Connection, gen: u64, fields: Value) -> Option<u64> {
+        self.publish(conn, false, Some(gen), fields)
+    }
+
+    fn publish(
+        self: &Arc<Self>,
+        conn: Connection,
+        inbound: bool,
+        gen: Option<u64>,
+        mut fields: Value,
+    ) -> Option<u64> {
         let identity = *conn.peer();
         let no = {
             let mut core = lock(&self.core);
+            if let Some(gen) = gen {
+                if core.peer_gen.get(&identity).copied().unwrap_or(0) != gen {
+                    drop(core);
+                    conn.close(ErrorCode::Cancelled);
+                    applog::line(format!(
+                        "closed a new path to {}: forgotten meanwhile",
+                        short_id(&identity)
+                    ));
+                    return None;
+                }
+            }
+            let conn = Arc::new(conn);
             let no = core.next_conn;
             core.next_conn += 1;
             core.conns.insert(
@@ -382,10 +421,10 @@ impl Shared {
             fields["deadline"] = json!(conn.deadline().secs());
             core.out.conn_event(no, &fields);
             self.queued(&core);
+            tokio::spawn(conn_task(self.clone(), no, conn, inbound));
             no
         };
-        tokio::spawn(conn_task(self.clone(), no, conn, inbound));
-        no
+        Some(no)
     }
 
     /// The connection ended: its streams end with it (`conn.down` says so).

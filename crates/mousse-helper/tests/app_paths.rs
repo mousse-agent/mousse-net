@@ -54,6 +54,101 @@ impl Silent {
     }
 }
 
+/// A loopback relay to `target` that takes connections at once but passes
+/// them on only once opened: a dial that is still on its way.
+struct Gate {
+    route: String,
+    open: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    accepted: Arc<AtomicUsize>,
+}
+
+fn gate_to(target: &str) -> Gate {
+    use std::net::TcpStream;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let route = format!("tcp://{}", listener.local_addr().unwrap());
+    let target = target.trim_start_matches("tcp://").to_owned();
+    let open = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let (gate, count) = (open.clone(), accepted.clone());
+    std::thread::spawn(move || {
+        for inbound in listener.incoming().flatten() {
+            count.fetch_add(1, Ordering::SeqCst);
+            let (gate, target) = (gate.clone(), target.clone());
+            std::thread::spawn(move || {
+                let (lock, cv) = &*gate;
+                let mut opened = lock.lock().unwrap();
+                while !*opened {
+                    opened = cv.wait(opened).unwrap();
+                }
+                drop(opened);
+                let Ok(outbound) = TcpStream::connect(&target) else {
+                    return;
+                };
+                let (mut in_r, mut out_w) =
+                    (inbound.try_clone().unwrap(), outbound.try_clone().unwrap());
+                std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut in_r, &mut out_w);
+                    let _ = out_w.shutdown(std::net::Shutdown::Write);
+                });
+                let (mut out_r, mut in_w) = (outbound, inbound);
+                let _ = std::io::copy(&mut out_r, &mut in_w);
+                let _ = in_w.shutdown(std::net::Shutdown::Write);
+            });
+        }
+    });
+    Gate {
+        route,
+        open,
+        accepted,
+    }
+}
+
+impl Gate {
+    fn open(&self) {
+        let (lock, cv) = &*self.open;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+    }
+}
+
+/// `peer.forget` while a path to that peer is still opening: once the
+/// forget has answered, no path to it comes up.
+#[test]
+fn a_path_still_opening_when_its_peer_is_forgotten_never_comes_up() {
+    let a_end = Endpoint::init("fga");
+    let b_end = Endpoint::init("fgb");
+    let mut a = a_end.app("hostA", &[]);
+    a.hello();
+    let mut b = b_end.app("peerB", &[("DIAL_TIMEOUT_MS", "30000")]);
+    b.hello();
+    let gate = gate_to(&route_of(&mut a));
+    trust(&mut a, &mut b, &[&gate.route]);
+    // B's keeper dials; the relay holds the connection.
+    let start = Instant::now();
+    while gate.accepted.load(Ordering::SeqCst) == 0 {
+        assert!(start.elapsed() < WAIT, "B never dialled");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let forgot = b.call("peer.forget", json!({"identity": a.identity}));
+    assert_eq!(forgot["forgotten"], true, "{forgot}");
+    gate.open();
+    // The dial passes step 1 now, after the forget.
+    a.event("conn.up", |m| m["identity"] == b.identity.as_str());
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        outbound_ups(&b, &a.identity),
+        0,
+        "{:?}",
+        b.events("conn.up")
+    );
+    assert!(
+        b_end.log().contains("forgotten meanwhile"),
+        "{}",
+        b_end.log()
+    );
+    assert!(peer_of(&mut b, &a.identity).is_null());
+}
+
 /// The mDNS record says only "a Mousse host is here": random instance and
 /// host names, `v=1`, and nothing of the device's name or identity.
 #[test]
