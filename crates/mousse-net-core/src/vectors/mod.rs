@@ -9,6 +9,8 @@
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen_test::wasm_bindgen_test as test;
 
+mod relay;
+
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::path::PathBuf;
@@ -106,6 +108,7 @@ fn checked_in(name: &str) -> Option<String> {
         "join-proof.json",
         "mux.json",
         "pairing-attempts.json",
+        "relay-admission.json",
         "session-cert.json",
         "session-lifecycle.json",
         "ticket.json",
@@ -2413,6 +2416,7 @@ fn all_vectors() -> Vec<(&'static str, J)> {
         ("control.json", control_vectors()),
         ("hello.json", hello_vectors()),
         ("pairing-attempts.json", pairing_attempt_vectors()),
+        ("relay-admission.json", relay::relay_admission_vectors()),
     ]
 }
 

@@ -20,6 +20,7 @@
 //! - [`session`]: certificate-driven session lifetime and path switching.
 //! - [`removal`]: "remove on all my hosts": grant lists, signed removals
 //!   and the host's checks.
+//! - [`relay`]: the relay protocol and the relay's admission state machine.
 //! - [`limits`]: every tunable limit, its default and allowed range.
 #![forbid(unsafe_code)]
 
@@ -39,7 +40,12 @@
         mousse_control = "accept-any-signer",
         mousse_control = "ignore-owner",
         mousse_control = "ignore-grant-id",
-        mousse_control = "resend-refused"
+        mousse_control = "resend-refused",
+        mousse_control = "no-pin-relay",
+        mousse_control = "relay-skip-allow-set",
+        mousse_control = "relay-refuse-early",
+        mousse_control = "relay-successor-unchecked",
+        mousse_control = "relay-no-preaccept-budget"
     ),
     not(debug_assertions)
 ))]
@@ -57,7 +63,12 @@ compile_error!("mousse_control plants a bug for tests; it is not allowed in rele
     mousse_control = "accept-any-signer",
     mousse_control = "ignore-owner",
     mousse_control = "ignore-grant-id",
-    mousse_control = "resend-refused"
+    mousse_control = "resend-refused",
+    mousse_control = "no-pin-relay",
+    mousse_control = "relay-skip-allow-set",
+    mousse_control = "relay-refuse-early",
+    mousse_control = "relay-successor-unchecked",
+    mousse_control = "relay-no-preaccept-budget"
 ))]
 const _: () = {
     let profile = env!("MOUSSE_BUILD_PROFILE").as_bytes();
@@ -87,6 +98,7 @@ pub mod identity;
 pub mod limits;
 pub mod mux;
 pub mod pairing;
+pub mod relay;
 pub mod removal;
 pub mod session;
 pub mod session_cert;
