@@ -159,6 +159,45 @@ key, grants and denials, invitations, pins and listener.
   neutral message and does not guess.
 - Skew is fixed at ±10 min everywhere.
 
+## Routes beyond the LAN (Phase 1b)
+
+Phase 1b adds routes that leave the LAN: a tailnet, a port forward, a
+WebSocket tunnel the owner runs, and SSH.
+
+- **Every route ends at the same checks.** TCP, `ws` and SSH pipes carry
+  the same TLS session: the caller pins the host, and the host runs step 2
+  ([`wire.md`](wire.md) 8). No route adds a way in; a valid identity with no
+  grant reaches no channel on any route.
+- **Internet-exposed listeners.** A port forward or a tunnel puts the
+  listener on the internet. Connections that are not yet live are held in
+  pools per listener kind (TCP, `ws`, pipe) and per source, taken at
+  accept. The pools keep a flood on one kind from taking another kind's
+  places, so a tunnel flood cannot block the owner's SSH pipe or LAN joins.
+  They are **not** a defence against denial of service: a flood on one kind
+  can delay that kind's legitimate connections.
+- **Dialling only approved destinations.** A ticket's or a peer's
+  destination outside private-range literals is dialled only after the
+  owner approved it; the approval is stored with where it came from. A name
+  is resolved once, and the address dialled is the one that was classified,
+  so a name cannot be re-pointed between the check and the dial.
+- **Listening only where the owner chose.** The listener binds only the
+  interfaces the owner selected.
+- **No remote command from a peer.** A peer's routes can never make a
+  device run SSH, and plain `ws` is dialled only to a loopback address (the
+  local end of a tunnel client on the same computer).
+- **SSH add** trusts the SSH host key the owner confirmed plus the SSH
+  login, and nothing else. Host keys are pinned strictly; a changed key
+  stops the route.
+- **The `ws` listener refuses browsers:** requests with `Origin`, without
+  the `mousse.1` subprotocol, on another path, or slower or larger than the
+  caps are refused before any byte reaches TLS.
+- **The editor tunnel over the engine** keeps v1's rules: the editor
+  switch, teardown on every change of rights, and loopback-only forwards.
+
+The kit's route probe (`mousse-check probe`) sends the traffic each layer
+must stop, on every route, and checks both the close on the wire and that
+nothing reached the app.
+
 ## Residual risks in Phase 0
 
 - In-person approval relies on the owner checking that the device is next to
