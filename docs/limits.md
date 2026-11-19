@@ -134,7 +134,7 @@ count as unknown names.
 | Variable | What it does |
 | --- | --- |
 | `MOUSSE_NET_TEST_EXTRA_ROOT` | A DER certificate file the outer `wss` TLS trusts besides the platform's roots, for a test tunnel stand-in (Phase 1b §4.2). Nothing is installed in an OS store. |
-| `MOUSSE_NET_TEST_CLASS_MAP` | Maps loopback ports to address classes, so checks can stand in for tailnet and public routes (Phase 1b §1.2): `<port>=<class>` entries (`lan`, `tailnet` or `public`) separated by commas. Unmapped loopback counts as `lan`. |
+| `MOUSSE_NET_TEST_CLASS_MAP` | Maps loopback ports to address classes, so checks can stand in for tailnet and public routes (Phase 1b §1.2): `<port>=<class>` entries (`lan`, `tailnet` or `public`) separated by commas, plus an optional `*=<class>` for every loopback port the map leaves out (otherwise `lan`). An inbound loopback connection takes the class of the listener port it arrived on when the map names that port. |
 | `MOUSSE_NET_SSH_BIN` | The `ssh` client to run instead of the system's (Phase 1b §3.1). |
 | `MOUSSE_NET_TEST_SSH_CONFIG` | The ssh config `ssh -G` reads instead of the user's own and the system's, so tests never read the owner's ssh config (Phase 1b §3.7). Every later call reads only the route's own config. |
 | `MOUSSE_NET_TEST_EGRESS` | A check's egress fence (Phase 1b §14): when set, the helper dials only loopback and the comma-separated IP literals listed (the Mac's address in cross-machine cells), and resolves no name but `localhost`. Empty means loopback only. |

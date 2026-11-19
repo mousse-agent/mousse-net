@@ -234,7 +234,7 @@ pub enum PathEvent {
         /// The new path.
         conn: Connection,
         /// How it was reached, for its `conn.up` route.
-        reached: Reached,
+        reached: Box<Reached>,
     },
     /// A renewal try failed. The session asks again later (after 30 s,
     /// doubling up to 5 min) until the old path's deadline.
@@ -1684,7 +1684,7 @@ where
                         pin,
                         from,
                         conn,
-                        reached,
+                        reached: Box::new(reached),
                     },
                     Err(error) => PathEvent::RenewFailed { pin, error },
                 };
