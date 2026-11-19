@@ -33,7 +33,13 @@
         mousse_control = "break-raw-signature",
         mousse_control = "break-cpace-confirm",
         mousse_control = "break-cpace-sid",
-        mousse_control = "limits-raise"
+        mousse_control = "admit-ungranted",
+        mousse_control = "join-only-streams",
+        mousse_control = "limits-raise",
+        mousse_control = "skip-code-confirm",
+        mousse_control = "host-attempts-reset-on-reconnect",
+        mousse_control = "invitation-survives-exhaustion",
+        mousse_control = "same-code-after-failure"
     ),
     not(debug_assertions)
 ))]
@@ -47,7 +53,13 @@ compile_error!("mousse_control plants a bug for tests; it is not allowed in rele
     mousse_control = "break-raw-signature",
     mousse_control = "break-cpace-confirm",
     mousse_control = "break-cpace-sid",
-    mousse_control = "limits-raise"
+    mousse_control = "admit-ungranted",
+    mousse_control = "join-only-streams",
+    mousse_control = "limits-raise",
+    mousse_control = "skip-code-confirm",
+    mousse_control = "host-attempts-reset-on-reconnect",
+    mousse_control = "invitation-survives-exhaustion",
+    mousse_control = "same-code-after-failure"
 ))]
 const _: () = {
     let profile = env!("MOUSSE_BUILD_PROFILE").as_bytes();

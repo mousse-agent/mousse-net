@@ -101,13 +101,24 @@ A check with `app = true` runs the Mousse app against the helper built from this
 - A record or signed result counts only if its app build is the pinned revision. A dirty app build never counts. Without the pin, every app cell is INCOMPLETE.
 - For a cross-machine app check, the result must also carry `extra.host_app_build`, the host's app build, and it must be the pinned revision too.
 
-`tools/app-check/run.mjs <check> [--out <dir>]` is the local command of the app checks.
+`tools/app-check/run.mjs <check> [--out <dir>] [--route <case>]` is the local command of the app checks.
 
 1. It builds the debug helper from this checkout with `cargo build -p mousse-helper`, so a control's `RUSTFLAGS` apply.
 2. It runs `node scripts/net-engine-check.mjs <check> --out <dir>` in `MOUSSE_APP_DIR`, with `MOUSSE_NET_HELPER` set to that helper and `MOUSSE_NET_ENGINE_HELPER_BUILD` set to its build.
 3. It prints `helper_build=`, then the app's `app_build=` line and its marker line.
 
 App controls set `MOUSSE_NET_ENGINE_CONTROL`, which only unpackaged app builds read.
+
+Phase 1b and later app checks run with the kit's stand-ins (Phase 1b §14, "Plus and egress"); Phase 0 and 1a checks run as they were signed.
+
+- **Plus recorder** (`tools/app-check/recorder.mjs`): `MOUSSE_ID_ORIGIN` and `MOUSSE_PLUS_ORIGIN` point at a loopback server that records each request (`<out>/plus-requests.jsonl`) and answers 403; `MOUSSE_UPDATE_FEED_URL` points under it at `/update-feed`. It proves it records before each run. A Plus request fails the run with `plus_contacted`, an update check with `egress_attempted`.
+- **Egress guard** (`tools/app-check/egress-guard.cjs`): loaded into every node process of the check through `NODE_OPTIONS`, and named in `MOUSSE_CHECK_EGRESS_GUARD` for the app's check mode to load first. It refuses and logs (`MOUSSE_CHECK_EGRESS_LOG`, `<out>/egress-refused.jsonl`) TCP, TLS and UDP outside loopback and `MOUSSE_NET_TEST_EGRESS`, and name lookups other than `localhost`. Debug helpers read `MOUSSE_NET_TEST_EGRESS` and log to `MOUSSE_NET_TEST_EGRESS_LOG` the same way. Any refusal fails the run with `egress_attempted`. The guard proves it refuses before each run.
+- **OS fence** where no admin rights are needed and nothing outside loopback is allowed: a network namespace on Linux, a `sandbox-exec` profile on macOS; Windows relies on the two guards. Printed as `fence=`.
+- `MOUSSE_CHECK_PROBE_BIN` is `mousse-check` built from this checkout, for `mousse-check probe`.
+
+`--route tcp|ws|ssh` is a route case (`cases` in the manifest; the kit passes `--route {case}`). The app script gives the app only that route and writes every `conn.up` event, one JSON object per line, to `<out>/conn-up.jsonl`. Each event's `route` is `{kind, class}` or a route hint; its kind (or the hint's scheme, `wss` counting as `ws`) must be the case's route, or the run fails with `route_mismatch`. On a single machine, `tcp` must show both the `tailnet` and the `public` class. `--result` writes the route as the result's `case`.
+
+The app's own `PASS <id>` and `FAIL <id>` lines are shown as `app: ...`, and `run.mjs` prints the run's verdict line last: `FAIL <id> reason=<word>` with the first of `plus_contacted`, `egress_attempted` and `route_mismatch` that applies, else the app's clean verdict. An app that neither passes nor fails cleanly (exit code and lines disagree) gets no verdict line.
 
 A cross-machine app check runs outside the kit on both machines:
 
@@ -119,6 +130,22 @@ A cross-machine app check runs outside the kit on both machines:
     mousse-check sign --device-key <key> --config <digest> r.json
 
 With `--control <name>`, `run.mjs` adds that control's environment, which it reads with `mousse-check control-env <check> --control <name>`. Pass the same `--control` to `config-digest` and `sign`. `--role` and `--topology` pass through to the app script. With `--result`, `run.mjs` writes `build` (the helper build) and `app_build`. It also writes `host_build` and `host_app_build` when the app printed `host_build=` and `host_app_build=` lines, which a caller does with the builds its host reported over the test link.
+
+## The route probe (`mousse-check probe`)
+
+Phase 1b §6.3: traffic that must never reach RPC, sent to a real host on one route. The app script of `phase1b.no-rpc-without-grant` sets up the host and runs it; `tools/build-smoke.mjs` runs its wire cases against a release helper.
+
+    mousse-check probe key <file>        # a throwaway device key; prints its identity (hex) for grant.add
+    mousse-check probe --route tcp://127.0.0.1:<port> --invite <ticket>         --grant-key <granted device, editor off> --removed-key <device whose grant was removed>         --observe http://127.0.0.1:<port>/<path> --marker phase1b.no-rpc-without-grant [--json <file>]
+
+- `--route`: `tcp://<ip>:<port>` or `ws://<loopback ip>:<port><path>`. IP literals only; the probe resolves no names. The ssh route's probe (the helper's pipe IPC) waits for E9.
+- `--invite`: an open Send link invitation (kind 2; the garbage code case needs one). Its host identity is the pin unless `--pin <hex>` says otherwise.
+- Cases, in order: `not-tls`; on ws `ws-plain-get`, `ws-wrong-path`, `ws-origin`, `ws-no-subprotocol`, `ws-large-headers`, `ws-text-message`; `tls-no-cert`, `tls-1.2`, `tls-wrong-alpn`; `fresh-open-rpc`, `fresh-open-tunnel`, `fresh-bad-proof`; `join-only-open-rpc`, `join-only-open-hello`, `join-only-open-tunnel`, `join-only-garbage-code`; `removed-open-rpc`; `editor-off-tunnel`; `fresh-silence`; `admission`; on ws `ws-slow-headers`. `--cases a,b` runs some.
+- **Wire:** each case must end the way §6.3 names, at once and with nothing let through first (the flood's extra connection must be refused well before the host's own wait for a silent connection): a refusal that arrives only after the proof wait, or after any stream frame from the host (a `RESET` included), does not count. Otherwise `reason=wire_accepted`.
+- **App:** `--observe` names a loopback HTTP endpoint the app script serves. `GET` answers a JSON object with the totals `conn_up`, `streams`, `authorized_calls`, `endpoint_sessions`, `ledger_rows` and `refusals`. The probe reads it before and after each case (after `MOUSSE_CHECK_PROBE_SETTLE_MS`). Every case must leave all six unchanged, except `editor-off-tunnel`: one `conn_up`, one stream, one refusal, at most one ledger row, nothing else. Otherwise `reason=probe_reached_app`, which wins over `wire_accepted`. `--no-app` skips the app side (build smoke only).
+- A case without its input (`--invite`, `--grant-key`, `--removed-key`) is `reason=probe_error`, never a pass.
+- Output: `PASS|FAIL <marker> <route>:<case> ...` per case, then `PASS <marker>` or `FAIL <marker> reason=<word>`.
+- Limits come from the host's own variables (`MOUSSE_NET_JOIN_PROOF_WAIT_MS`, `MOUSSE_NET_PREAUTH_TCP`, `_WS`, `_PER_SOURCE`, `MOUSSE_NET_WS_UPGRADE_WAIT_MS`, `MOUSSE_NET_WS_HEADER_MAX_BYTES`, `MOUSSE_NET_HANDSHAKE_TIMEOUT_MS`), so a check that tightens one for the host tightens it for the probe. The probe's own waits: `MOUSSE_CHECK_PROBE_CONNECT_MS` (5000), `MOUSSE_CHECK_PROBE_CLOSE_MS` (5000), `MOUSSE_CHECK_PROBE_SETTLE_MS` (1000).
 
 ## Manual steps
 

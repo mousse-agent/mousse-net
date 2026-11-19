@@ -38,7 +38,15 @@
         mousse_control = "pipe-no-token",
         mousse_control = "no-preamble-skip",
         mousse_control = "pipe-outlives-helper",
-        mousse_control = "window-per-route"
+        mousse_control = "window-per-route",
+        mousse_control = "inbound-before-live",
+        mousse_control = "journal-pins-link",
+        mousse_control = "fabricate-pending-kind2",
+        mousse_control = "joiner-records-in-memory",
+        mousse_control = "link-accepts-kind1",
+        mousse_control = "no-completion-record",
+        mousse_control = "done-pin-only",
+        mousse_control = "replay-after-removal"
     )
 ))]
 compile_error!("a mousse_control build has a deliberate defect and is for tests only; build it without --release");
@@ -84,6 +92,14 @@ compile_error!("test-in-person lets a typed ticket count as scanned from the hos
     mousse_control = "no-preamble-skip",
     mousse_control = "pipe-outlives-helper",
     mousse_control = "window-per-route",
+    mousse_control = "inbound-before-live",
+    mousse_control = "journal-pins-link",
+    mousse_control = "fabricate-pending-kind2",
+    mousse_control = "joiner-records-in-memory",
+    mousse_control = "link-accepts-kind1",
+    mousse_control = "no-completion-record",
+    mousse_control = "done-pin-only",
+    mousse_control = "replay-after-removal",
     feature = "test-in-person"
 ))]
 const _: () = {

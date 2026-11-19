@@ -17,11 +17,13 @@ const APP_PREFIX: &str = "ENGINE_";
 /// Debug-build test hooks read by the network crates, not limits
 /// (Phase 1b §1.2 and §4.2). Release builds never read them, so there they
 /// count as unknown names.
-const DEBUG_HOOKS: [&str; 4] = [
+const DEBUG_HOOKS: [&str; 6] = [
     "TEST_EXTRA_ROOT",
     "TEST_CLASS_MAP",
     "SSH_BIN",
     "TEST_SSH_CONFIG",
+    "TEST_EGRESS",
+    "TEST_EGRESS_LOG",
 ];
 
 /// After [`ENV_PREFIX`]: the Mousse app's helper path in unpackaged builds.
@@ -110,6 +112,8 @@ mousse_net_core::define_limits! {
         ssh_reply_max_bytes = "SSH_REPLY_MAX_BYTES": 1_048_576, [1_024, 1_048_576];
         /// Remote `pipe`: reach the running helper's IPC and get its `ok` (Phase 1b §3.3).
         pipe_connect_wait_ms = "PIPE_CONNECT_WAIT_MS": 2_000, [100, 60_000];
+        /// App mode: how long a "Send link" completion record the app never acknowledged (`join.ack`) is kept after its ticket expired (Phase 1b §5.4).
+        join_done_keep_secs = "JOIN_DONE_KEEP_SECS": 86_400, [0, 2_592_000];
         /// Checks only: how long `init` waits before it makes the endpoint, so a check can stop the app during the first start. Run for the app (`--app`), its stdin closing still ends it at once.
         init_hold_ms = "INIT_HOLD_MS": 0, [0, 60_000];
     }

@@ -1739,9 +1739,13 @@ version = "0.1.0"
 dependencies = [
  "getrandom 0.2.17",
  "mousse-net-core",
+ "mousse-net-io",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "tokio",
+ "tokio-rustls",
  "toml",
  "zeroize",
 ]
@@ -1759,6 +1763,7 @@ dependencies = [
  "portable-pty",
  "qrcode",
  "rand 0.10.4",
+ "rand_core 0.10.1",
  "rcgen",
  "russh",
  "rustls",

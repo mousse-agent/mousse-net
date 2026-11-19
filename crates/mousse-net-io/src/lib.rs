@@ -81,7 +81,8 @@ pub type SharedSigner = Arc<dyn IdentitySigner + Send + Sync>;
         mousse_control = "release-test-root",
         mousse_control = "user-config-in-pipe",
         mousse_control = "no-preamble-skip",
-        mousse_control = "window-per-route"
+        mousse_control = "window-per-route",
+        mousse_control = "pin-stored-memory-only"
     )
 ))]
 compile_error!("a mousse_control build has a deliberate defect and is for tests only; build it without --release");
@@ -109,7 +110,8 @@ compile_error!("a mousse_control build has a deliberate defect and is for tests 
     mousse_control = "release-test-root",
     mousse_control = "user-config-in-pipe",
     mousse_control = "no-preamble-skip",
-    mousse_control = "window-per-route"
+    mousse_control = "window-per-route",
+    mousse_control = "pin-stored-memory-only"
 ))]
 const _: () = {
     let profile = env!("MOUSSE_BUILD_PROFILE").as_bytes();

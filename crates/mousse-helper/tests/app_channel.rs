@@ -24,7 +24,7 @@ fn hello_comes_first_and_the_helpers_own_lines_go_to_its_log() {
     );
     // The lower minor wins.
     let hello = a.call("hello", json!({"proto": [1, 7], "name": "x"}));
-    assert_eq!(hello["proto"], json!([1, 0]));
+    assert_eq!(hello["proto"], json!([1, 1]));
     let identity = hello["identity"].as_str().unwrap();
     assert!(
         !identity.is_empty() && identity.chars().all(|c| c.is_ascii_hexdigit()),
@@ -233,7 +233,13 @@ fn inbound_passes_only_app_labels_and_outbound_refuses_host_opened_streams() {
     let reset = p.b.event("stream.reset", |m| m["handle"] == h);
     assert_eq!(reset["code"], "cancelled");
 
-    assert_eq!(p.a.events("stream.incoming").len(), 1);
+    // One editor tunnel (Phase 1b §9.2) reaches the app with its label.
+    p.b.open(p.b_conn, "mousse.tunnel", "interactive");
+    let tunnel = p.a.incoming(p.a_conn, 1);
+    let incoming = p.a.event("stream.incoming", |m| m["handle"] == tunnel);
+    assert_eq!(incoming["label"], "mousse.tunnel");
+
+    assert_eq!(p.a.events("stream.incoming").len(), 2);
     assert!(p.b.events("stream.incoming").is_empty());
     p.a.assert_clean();
     p.b.assert_clean();
@@ -312,4 +318,64 @@ fn init_for_the_app_exits_when_its_stdin_closes() {
     let mut init = end.cli_env(&["init", "--app"], &[]);
     assert_eq!(init.exit_within(WAIT), Some(0), "{}", init.err());
     assert!(init.out().contains("created endpoint"), "{}", init.out());
+}
+
+/// A device with no grant dials in and waits for a proof it never sends:
+/// the host's app hears nothing of it, before or after the proof wait
+/// closes it (Phase 1b §6.1, the helper's `inbound`).
+#[test]
+fn a_connection_that_never_becomes_live_is_never_announced() {
+    let a_end = Endpoint::init("unlive-a");
+    let b_end = Endpoint::init("unlive-b");
+    let mut a = a_end.app("hostA", &[("JOIN_PROOF_WAIT_MS", "1000")]);
+    let mut b = b_end.app("peerB", &[]);
+    a.hello();
+    b.hello();
+    let route = route_of(&mut a);
+    // B pins A, but A never grants B.
+    let (identity, name) = (a.identity.clone(), a.name.clone());
+    b.call(
+        "peer.add",
+        json!({"identity": identity, "name": name, "routes": [route]}),
+    );
+    // Long enough for B's dial, A's proof wait and its close.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert!(a.events("conn.up").is_empty(), "{:?}", a.events("conn.up"));
+    a.assert_clean();
+}
+
+/// Under a check's egress fence (debug builds, Phase 1b §14), a dial off
+/// loopback to an address the fence does not list is refused before any
+/// packet and logged for the kit.
+#[test]
+fn under_the_egress_fence_a_dial_off_loopback_is_refused_and_logged() {
+    let a_end = Endpoint::init("fence-a");
+    let b_end = Endpoint::init("fence-b");
+    let log = b_end.dir.join("egress.jsonl");
+    let mut a = a_end.app("hostA", &[]);
+    let mut b = b_end.app(
+        "peerB",
+        &[
+            ("TEST_EGRESS", "10.255.255.2"),
+            ("TEST_EGRESS_LOG", log.to_str().unwrap()),
+        ],
+    );
+    a.hello();
+    b.hello();
+    let (identity, name) = (a.identity.clone(), a.name.clone());
+    // A private address no test network uses; the fence stops the dial first.
+    b.call(
+        "peer.add",
+        json!({"identity": identity, "name": name, "routes": ["tcp://10.255.255.1:9"]}),
+    );
+    let deadline = Instant::now() + WAIT;
+    let logged = loop {
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        if text.contains("10.255.255.1:9") || Instant::now() > deadline {
+            break text;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(logged.contains("\"helper\""), "{logged}");
+    assert!(logged.contains("10.255.255.1:9"), "{logged}");
 }

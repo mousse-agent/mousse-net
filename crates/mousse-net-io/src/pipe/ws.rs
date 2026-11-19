@@ -558,6 +558,7 @@ pub async fn dial(
             "plain ws goes only to a loopback address, not {addr}"
         )));
     }
+    super::test_egress::check_ip(addr.ip(), addr.port())?;
     let tcp = TcpStream::connect(addr).await?;
     tcp.set_nodelay(true)?;
     let outer = if target.secure {

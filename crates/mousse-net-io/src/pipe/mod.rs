@@ -9,6 +9,7 @@
 
 mod classify;
 pub mod ssh;
+pub mod test_egress;
 pub mod ws;
 
 pub use classify::{classify, AddrClass};
@@ -108,9 +109,18 @@ pub async fn connect_tcp_within(route: &Route, timeout: Duration) -> Result<TcpS
         )));
     };
     let target = match host {
-        RouteHost::Ipv4(ip) => IpAddr::V4(*ip).to_string(),
-        RouteHost::Ipv6(ip) => IpAddr::V6(*ip).to_string(),
-        RouteHost::Dns(name) => name.clone(),
+        RouteHost::Ipv4(ip) => {
+            test_egress::check_ip(IpAddr::V4(*ip), *port)?;
+            IpAddr::V4(*ip).to_string()
+        }
+        RouteHost::Ipv6(ip) => {
+            test_egress::check_ip(IpAddr::V6(*ip), *port)?;
+            IpAddr::V6(*ip).to_string()
+        }
+        RouteHost::Dns(name) => {
+            test_egress::check_name(name, *port)?;
+            name.clone()
+        }
     };
     let stream = tokio::time::timeout(timeout, TcpStream::connect((target.as_str(), *port)))
         .await
