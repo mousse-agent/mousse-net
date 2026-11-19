@@ -229,7 +229,10 @@ mod tests {
             RelayEndpoint::from_destination("relay://relay.example:443"),
             Some(r.endpoint.clone())
         );
-        assert_eq!(RelayEndpoint::from_destination("relay://Relay.example:443"), None);
+        assert_eq!(
+            RelayEndpoint::from_destination("relay://Relay.example:443"),
+            None
+        );
         let v6 = RelayEndpoint::parse("[2001:db8::1]:7000").unwrap();
         assert_eq!(v6.destination(), "relay://[2001:db8::1]:7000");
         assert_eq!(v6.host_text(), "2001:db8::1");
@@ -238,9 +241,14 @@ mod tests {
 
     #[test]
     fn keys_records_round_trip_and_refuse_extras() {
-        let key = SoftwareKey::from_secret_bytes(&[7; 32]).unwrap().public_key();
+        let key = SoftwareKey::from_secret_bytes(&[7; 32])
+            .unwrap()
+            .public_key();
         assert_eq!(decode_keys_request(&encode_keys_request(&key)), Ok(key));
-        assert_eq!(decode_keys_answer(&encode_keys_answer(&[9; 32])), Ok([9; 32]));
+        assert_eq!(
+            decode_keys_answer(&encode_keys_answer(&[9; 32])),
+            Ok([9; 32])
+        );
         let extra = cbor::encode(&Value::Map(vec![
             (1, Value::Bytes(vec![9; 32])),
             (2, Value::Uint(1)),
@@ -251,10 +259,32 @@ mod tests {
 
     #[test]
     fn derived_keys_depend_on_seed_info_and_salt() {
-        let a = derive_key(&[1; 32], CALLER_KEY_INFO, b"x").unwrap().public_key();
-        assert_eq!(a, derive_key(&[1; 32], CALLER_KEY_INFO, b"x").unwrap().public_key());
-        assert_ne!(a, derive_key(&[1; 32], CALLER_KEY_INFO, b"y").unwrap().public_key());
-        assert_ne!(a, derive_key(&[2; 32], CALLER_KEY_INFO, b"x").unwrap().public_key());
-        assert_ne!(a, derive_key(&[1; 32], REGISTRATION_KEY_INFO, b"x").unwrap().public_key());
+        let a = derive_key(&[1; 32], CALLER_KEY_INFO, b"x")
+            .unwrap()
+            .public_key();
+        assert_eq!(
+            a,
+            derive_key(&[1; 32], CALLER_KEY_INFO, b"x")
+                .unwrap()
+                .public_key()
+        );
+        assert_ne!(
+            a,
+            derive_key(&[1; 32], CALLER_KEY_INFO, b"y")
+                .unwrap()
+                .public_key()
+        );
+        assert_ne!(
+            a,
+            derive_key(&[2; 32], CALLER_KEY_INFO, b"x")
+                .unwrap()
+                .public_key()
+        );
+        assert_ne!(
+            a,
+            derive_key(&[1; 32], REGISTRATION_KEY_INFO, b"x")
+                .unwrap()
+                .public_key()
+        );
     }
 }

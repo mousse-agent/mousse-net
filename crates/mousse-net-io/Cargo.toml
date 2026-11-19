@@ -24,6 +24,10 @@ mdns-sd = { version = "=0.22.0", default-features = false, features = ["async"] 
 if-addrs = { version = "=0.15.0", features = ["link-local"] }
 tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"] }
 futures-util = { version = "=0.3.34", default-features = false, features = ["sink", "std"] }
+rustls-platform-verifier = "=0.7.1"
+futures-core = { version = "=0.3.34", default-features = false }
+futures-sink = { version = "=0.3.34", default-features = false }
+httparse = "=1.10.1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "=0.2.191"

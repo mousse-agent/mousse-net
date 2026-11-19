@@ -5,8 +5,9 @@
 # INCOMPLETE. Format: checks/README.md.
 #
 # The relay engine's checks (E-R0, E-R1, E-R2, E-R7), the headless daemon's
-# (E-R5) and the release checks (E-R6). The helper's relay client adds its own
-# (phase3.relay-routes, phase3.relay-rotation, phase3.vps-demo) when it lands.
+# (E-R5) and the release checks (E-R6). The helper's relay client (E-R3, E-R4)
+# has phase3.relay-client, phase3.relay-routes and phase3.relay-rotation; its
+# tests run the real mousse-relay in the test process, on loopback.
 
 phase = "phase3"
 title = "Self-hosted relay"
@@ -351,7 +352,8 @@ control = [
 ]
 
 # Cross-machine: the relay on the Mac, both endpoints on the PC dialling
-# out (Part G topology). They wait for E-R2's relay binary.
+# out (Part G topology). They wait for a variant of the helper's relay tests
+# that takes a remote relay's enrollment links instead of starting one.
 
 [[check]]
 id = "phase3.relay-routes-cross"
@@ -360,8 +362,8 @@ plan = "docs/phase34-design.md Part G (phase3.relay-routes, pc-to-mac)"
 targets = ["pc-to-mac-lan"]
 judge = "marker"
 cross_machine = true
-waits = [{ slice = "E-R2", paths = ["crates/mousse-relay/src/main.rs"] }]
-device_steps = "Start mousse-relay init --public <Mac LAN address>:<port> on the Mac from ~/mousse-net-runs-internal/<track>, and run the app_relay cases on the PC against the enrollment links it prints instead of the loopback test relay (the cases take a relay link once E-R2 lands). The Mac only listens; the PC dials."
+waits = [{ slice = "E-R3 cross", paths = ["crates/mousse-helper/tests/app_relay_remote.rs"] }]
+device_steps = "Start mousse-relay init --public <Mac LAN address>:<port> and mousse-relay run on the Mac from ~/mousse-net-runs-internal/<track>, and run the app_relay cases on the PC against enrollment links from mousse-relay enroll there instead of the in-process relay. The Mac only listens; the PC dials."
 control = [
   { name = "close-all-on-removal", breaks = "a removal closes every caller's circuits", env = { RUSTFLAGS = '--cfg mousse_control="close-all-on-removal"' } },
   { name = "manifest-unapproved", breaks = "manifest relay routes are dialled without approval", env = { RUSTFLAGS = '--cfg mousse_control="manifest-unapproved"' } },
@@ -374,7 +376,7 @@ plan = "docs/phase34-design.md Part G (phase3.relay-rotation, pc-to-mac)"
 targets = ["pc-to-mac-lan"]
 judge = "marker"
 cross_machine = true
-waits = [{ slice = "E-R2", paths = ["crates/mousse-relay/src/main.rs"] }]
+waits = [{ slice = "E-R3 cross", paths = ["crates/mousse-helper/tests/app_relay_remote.rs"] }]
 device_steps = "As phase3.relay-routes-cross, running the app_relay_rotation cases."
 control = [
   { name = "no-overlap", breaks = "a rotation drops the old key at once", env = { RUSTFLAGS = '--cfg mousse_control="no-overlap"' } },

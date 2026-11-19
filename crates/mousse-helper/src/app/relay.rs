@@ -59,21 +59,22 @@ use mousse_net_core::relay_endpoint::{
     REGISTRATION_KEY_INFO,
 };
 use mousse_net_core::{ConnectionId, ErrorCode};
+use mousse_net_io::pipe::{test_egress, AddrClass, AddrPolicy};
 use mousse_net_io::relay::{
     dial_call, dial_join, AllowSet, Proof, RelayAddr, RelayError, TargetCommand, TargetEvent,
     TargetLink, WsPipe,
 };
 use mousse_net_io::rng::random_bytes;
-use mousse_net_io::store::{hex, identity_from_hex, short_id, unhex};
+use mousse_net_io::store::{
+    hex, identity_from_hex, short_id, unhex, Approval, ApprovalStore, PeerStore,
+};
 use mousse_net_io::{ConnStatus, Connection, MuxStream, NetError};
 use serde_json::{json, Map, Value};
 use tokio::sync::{mpsc, watch};
 use tokio::task::AbortHandle;
 use zeroize::Zeroizing;
 
-use super::relay_store::{
-    fixed, Approval, Files, GrantKey, OldKey, OwnRelay, PeerRelay, Recovery, SOURCES,
-};
+use super::relay_store::{fixed, Files, GrantKey, OldKey, OwnRelay, PeerRelay, Recovery};
 use super::{error, AppInfo, Shared};
 use crate::applog;
 
@@ -85,15 +86,17 @@ pub const MANIFEST_LABEL: &str = "mousse-manifest";
 pub const KEYS_MINOR: u64 = 1;
 
 /// The requests this module answers.
-pub const OPS: [&str; 7] = [
+pub const OPS: [&str; 6] = [
     "relay.enroll",
     "relay.list",
     "relay.remove",
     "relay.rotate",
     "peer.relay.allow",
     "peer.relay.disallow",
-    "approvals.list",
 ];
+
+/// A join circuit: the relay, the registration's salt and the circuit id.
+type JoinCircuit = (String, String, [u8; 16]);
 
 /// Where one of this computer's relays stands.
 #[derive(Clone, Debug, Default)]
@@ -130,7 +133,7 @@ pub struct State {
     invites: Mutex<Vec<OpenInvite>>,
     /// Inbound connections that came on a join circuit: the relay, the
     /// registration's salt and the circuit (for `PROMOTE`).
-    join_circuits: Mutex<HashMap<ConnectionId, (String, String, [u8; 16])>>,
+    join_circuits: Mutex<HashMap<ConnectionId, JoinCircuit>>,
     /// This host's current signed manifest.
     manifest: Mutex<Option<(Manifest, Envelope)>>,
     /// Inbound connections (by number) that got the current manifest.
@@ -208,99 +211,90 @@ fn dial_within() -> Duration {
 // ---------------------------------------------------------------------------
 // Address classes (Phase 1b §1.2)
 
-/// The class of an address a relay endpoint resolved to: `public`,
-/// `tailnet`, `lan` or `forbidden`.
-pub fn class_of(ip: IpAddr) -> &'static str {
-    match ip.to_canonical() {
-        IpAddr::V4(v4) => {
-            let o = v4.octets();
-            let n = u32::from(v4);
-            let within = |base: u32, bits: u32| n >> (32 - bits) == base >> (32 - bits);
-            if within(0x6440_0000, 10) {
-                "tailnet"
-            } else if o[0] == 10
-                || within(0xac10_0000, 12)
-                || within(0xc0a8_0000, 16)
-                || within(0xa9fe_0000, 16)
-            {
-                "lan"
-            } else if o[0] == 0
-                || o[0] == 127
-                || o[0] >= 224
-                || within(0xc000_0000, 24)
-                || within(0xc000_0200, 24)
-                || within(0xc612_0000, 15)
-                || within(0xc633_6400, 24)
-                || within(0xcb00_7100, 24)
-            {
-                "forbidden"
-            } else {
-                "public"
-            }
-        }
-        IpAddr::V6(v6) => {
-            let s = v6.segments();
-            if s[0] == 0xfd7a && s[1] == 0x115c && s[2] == 0xa1e0 {
-                "tailnet"
-            } else if s[0] & 0xfe00 == 0xfc00 {
-                "lan"
-            } else if s[0] & 0xe000 == 0x2000
-                && !(s[0] == 0x2001 && s[1] == 0x0db8)
-                && s[0] != 0x2002
-            {
-                "public"
-            } else {
-                "forbidden"
-            }
-        }
+/// Whether a relay endpoint address of `class` may be dialled. The owner's
+/// own relay (`own`) may be any class the policy dials; a peer's relay
+/// route only public or tailnet (§B.11), so a host's ticket or manifest
+/// cannot point its callers at their LAN. Debug builds also take loopback,
+/// for tests on one computer.
+fn relay_class_ok(class: AddrClass, own: bool, loopback: bool) -> bool {
+    match class {
+        AddrClass::Forbidden => false,
+        AddrClass::Public | AddrClass::Tailnet => true,
+        AddrClass::Lan => own || (loopback && cfg!(debug_assertions)),
     }
 }
 
-/// Whether a relay endpoint at `ip` may be dialled: public or tailnet
-/// (§B.11). Debug builds also take loopback, for tests on one computer.
-pub fn dialable(ip: IpAddr) -> bool {
-    matches!(class_of(ip), "public" | "tailnet")
-        || (cfg!(debug_assertions) && ip.to_canonical().is_loopback())
-}
-
-/// Resolve an endpoint once; `all`: every address, else the dialable ones.
-async fn resolve(endpoint: &RelayEndpoint, all: bool) -> Result<Vec<RelayAddr>, RelayError> {
+/// Resolve an endpoint once and keep the addresses that may be dialled,
+/// each classed by the caller's address policy (Phase 1b §1.2). A check's
+/// egress fence (debug builds) applies here too.
+async fn resolve(
+    policy: &AddrPolicy,
+    endpoint: &RelayEndpoint,
+    own: bool,
+) -> Result<Vec<RelayAddr>, RelayError> {
+    let fenced = |e: NetError| RelayError::Io(std::io::Error::other(e.to_string()));
     let name = match &endpoint.host {
         mousse_net_core::relay_endpoint::EndpointHost::Dns(name) => Some(name.clone()),
         _ => None,
     };
     let addrs: Vec<SocketAddr> = match &name {
-        Some(name) => tokio::net::lookup_host((name.as_str(), endpoint.port))
-            .await
-            .map_err(RelayError::Io)?
-            .collect(),
+        Some(name) => {
+            test_egress::check_name(name, endpoint.port).map_err(fenced)?;
+            tokio::net::lookup_host((name.as_str(), endpoint.port))
+                .await
+                .map_err(RelayError::Io)?
+                .collect()
+        }
         None => match endpoint.host_text().parse::<IpAddr>() {
             Ok(ip) => vec![SocketAddr::new(ip, endpoint.port)],
             Err(_) => Vec::new(),
         },
     };
-    Ok(addrs
-        .into_iter()
-        .filter(|a| all || dialable(a.ip()))
-        .map(|addr| RelayAddr {
+    let mut out = Vec::new();
+    let mut fence = None;
+    for addr in addrs {
+        let class = policy.class_of(addr);
+        let loopback = addr.ip().to_canonical().is_loopback();
+        if !relay_class_ok(class, own, loopback) {
+            continue;
+        }
+        if let Err(e) = test_egress::check_ip(addr.ip(), addr.port()) {
+            fence = Some(fenced(e));
+            continue;
+        }
+        out.push(RelayAddr {
             addr,
             name: name.clone(),
-        })
-        .collect())
+        });
+    }
+    match (out.is_empty(), fence) {
+        (true, Some(e)) => Err(e),
+        _ => Ok(out),
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Approvals
 
+/// Where an approval came from, beside Phase 1b's `ticket` and `owner`: a
+/// relay route in a host's manifest the owner approved (Phase 3 §B.11).
+pub const APPROVAL_SOURCE_MANIFEST: &str = "manifest";
+
+/// Every approval in `approvals.json` (Phase 1b §1.3), the relay ones
+/// included.
+fn approvals(shared: &Shared) -> Vec<Approval> {
+    ApprovalStore::in_dir(&shared.info.state_dir)
+        .load()
+        .unwrap_or_default()
+}
+
 /// Whether `destination` is approved for the host `pin`: an entry for that
 /// host, or the owner's own relay (approved by pasting its link).
 fn approved(shared: &Shared, pin: &IdentityPublicKey, destination: &str) -> bool {
-    let Ok(file) = shared.relay.files.approvals() else {
-        return false;
-    };
+    let list = approvals(shared);
     let pin = hex(pin.as_bytes());
     let me = hex(shared.info.identity.as_bytes());
-    let exact = file.approvals.iter().any(|a| {
+    let exact = list.iter().any(|a| {
         a.destination == destination
             && (a.identity == pin || (a.identity == me && a.source == "owner"))
     });
@@ -310,51 +304,53 @@ fn approved(shared: &Shared, pin: &IdentityPublicKey, destination: &str) -> bool
     // The control build approves every relay destination of a host once
     // one is approved.
     cfg!(mousse_control = "blanket-approval")
-        && file
-            .approvals
+        && list
             .iter()
             .any(|a| a.identity == pin && a.destination.starts_with("relay://"))
 }
 
+/// Approve `destination` for `identity` (hex), unless it is already. Like
+/// every approval change, under the peers lock.
 fn add_approval(
     shared: &Shared,
     identity: &str,
     destination: &str,
     source: &str,
 ) -> Result<(), String> {
-    let _io = guard(&shared.relay.io);
-    let mut file = shared.relay.files.approvals()?;
-    file.approvals
-        .retain(|a| !(a.identity == identity && a.destination == destination));
-    file.approvals.push(Approval {
-        identity: identity.into(),
-        destination: destination.into(),
-        source: source.into(),
-        at: now(),
-    });
-    shared.relay.files.save_approvals(file)
+    let peers = PeerStore::in_dir(&shared.info.state_dir);
+    let held = peers.lock().map_err(|e| e.to_string())?;
+    ApprovalStore::in_dir(&shared.info.state_dir)
+        .add(
+            &held,
+            &[Approval {
+                identity: identity.into(),
+                destination: destination.into(),
+                source: source.into(),
+                at: now(),
+            }],
+        )
+        .map_err(|e| e.to_string())
 }
 
+/// Drop the approval of `destination` for `identity`; whether there was one.
 fn remove_approval(shared: &Shared, identity: &str, destination: &str) -> Result<bool, String> {
-    let _io = guard(&shared.relay.io);
-    let mut file = shared.relay.files.approvals()?;
-    let before = file.approvals.len();
-    file.approvals
-        .retain(|a| !(a.identity == identity && a.destination == destination));
-    let removed = file.approvals.len() != before;
-    shared.relay.files.save_approvals(file)?;
-    Ok(removed)
+    let peers = PeerStore::in_dir(&shared.info.state_dir);
+    let held = peers.lock().map_err(|e| e.to_string())?;
+    ApprovalStore::in_dir(&shared.info.state_dir)
+        .update(&held, |list| {
+            list.retain(|a| !(a.identity == identity && a.destination == destination))
+        })
+        .map_err(|e| e.to_string())
 }
 
 /// `peer.forget` and a removal delete that peer's entries (Phase 1b §1.3);
 /// a forget also drops what this device keeps about the host's relays.
 pub fn forget_peer(shared: &Shared, pin: &IdentityPublicKey) {
     let key = hex(pin.as_bytes());
-    let _io = guard(&shared.relay.io);
-    if let Ok(mut file) = shared.relay.files.approvals() {
-        file.approvals.retain(|a| a.identity != key);
-        let _ = shared.relay.files.save_approvals(file);
+    if let Ok(held) = PeerStore::in_dir(&shared.info.state_dir).lock() {
+        let _ = ApprovalStore::in_dir(&shared.info.state_dir).remove_identity(&held, &key);
     }
+    let _io = guard(&shared.relay.io);
     if let Ok(mut file) = shared.relay.files.peers() {
         file.peers.retain(|p| p.identity != key);
         let _ = shared.relay.files.save_peers(file);
@@ -534,7 +530,7 @@ async fn registration(
                         },
                     );
                 }
-                register(&endpoint, id, key.clone()).await
+                register(&shared, &endpoint, id, key.clone()).await
             }
         };
         let error = match link {
@@ -578,12 +574,13 @@ async fn registration(
 }
 
 async fn register(
+    shared: &Shared,
     endpoint: &RelayEndpoint,
     id: RelayId,
     key: Arc<RelayClientKey>,
 ) -> Result<TargetLink, RelayError> {
     // The owner pasted this endpoint: any class it resolves to is theirs.
-    let addrs = resolve(endpoint, true).await?;
+    let addrs = resolve(shared.caller.addr_policy(), endpoint, true).await?;
     let mut last = RelayError::Unreachable;
     for addr in addrs {
         match TargetLink::register(&addr, id, key.clone(), Proof::Register, dial_within()).await {
@@ -703,9 +700,14 @@ async fn accept_incoming(
     let app = super::App {
         shared: shared.clone(),
     };
-    app.inbound_with(
+    let class = if class == Class::Bulk {
+        "relay_bulk"
+    } else {
+        "relay"
+    };
+    app.inbound_on(
         conn,
-        json!({"route": {"kind": "relay", "class": if class == Class::Bulk { "relay_bulk" } else { "relay" }, "destination": destination}}),
+        json!({"kind": "relay", "class": class, "destination": destination}),
     )
     .await;
     guard(&shared.relay.join_circuits).remove(&id);
@@ -1100,13 +1102,15 @@ pub fn caller_fingerprint(shared: &Shared, pin: &IdentityPublicKey) -> Option<St
         .map(|k| hex(&k.public_key().fingerprint()))
 }
 
-/// Caller: on every new outbound connection, enroll the caller key. The
-/// host keeps the same pair secret for the same grant, so this only
-/// confirms a key it has; it fills in an answer that is missing, heals a
-/// host that lost its copy, and is the caller's first stream, after which
-/// the host may open `mousse-manifest` even before the app opens one.
-pub async fn ensure_keys(shared: Arc<Shared>, conn: Arc<Connection>) {
-    if conn.minor().unwrap_or(0) < KEYS_MINOR || shared.relay.seed().is_err() {
+/// Caller: on every new outbound connection, enroll the caller key before
+/// the connection is published, so the exchange never takes one of the
+/// app's stream places. The host keeps the same pair secret for the same
+/// grant, so this only confirms a key it has; it fills in an answer that is
+/// missing, heals a host that lost its copy, and is the caller's first
+/// stream, after which the host may open `mousse-manifest` (the engine
+/// lets a host open streams only once its caller has opened one).
+pub async fn ensure_keys(shared: &Arc<Shared>, conn: &Connection) {
+    if shared.relay.seed().is_err() {
         return;
     }
     // Debug builds: a test holds the caller key back, as if the circuit
@@ -1122,28 +1126,38 @@ pub async fn ensure_keys(shared: Arc<Shared>, conn: Arc<Connection>) {
             short_id(&pin)
         ));
     };
-    let had = match peer_entry(&shared, &pin) {
+    let had = match peer_entry(shared, &pin) {
         Ok(p) => p.pair_secret,
         Err(e) => return failed(e),
     };
-    let key = match caller_key(&shared, &pin) {
+    let key = match caller_key(shared, &pin) {
         Ok(k) => k,
         Err(e) => return failed(e),
     };
-    let stream = match conn
-        .open_stream(PriorityClass::Interactive, KEYS_LABEL)
-        .await
-    {
-        Ok(s) => s,
-        Err(e) => return failed(e.to_string()),
+    // Bounded: the connection is not published until this ends.
+    let exchange = async {
+        // A host from before minor 1 has no `mousse-keys`.
+        if conn.hello_minor().await.unwrap_or(0) < KEYS_MINOR {
+            return Err("the host has no relay keys".to_owned());
+        }
+        let stream = conn
+            .open_stream(PriorityClass::Interactive, KEYS_LABEL)
+            .await
+            .map_err(|e| e.to_string())?;
+        let (mut reader, writer) = stream.split();
+        writer
+            .write(&encode_keys_request(&key.public_key()))
+            .await
+            .map_err(|e| e.to_string())?;
+        writer.finish();
+        read_all(&mut reader, 256)
+            .await
+            .ok_or_else(|| "no answer".to_owned())
     };
-    let (mut reader, writer) = stream.split();
-    if let Err(e) = writer.write(&encode_keys_request(&key.public_key())).await {
-        return failed(e.to_string());
-    }
-    writer.finish();
-    let Some(answer) = read_all(&mut reader, 256).await else {
-        return failed("no answer".into());
+    let answer = match tokio::time::timeout(dial_within(), exchange).await {
+        Ok(Ok(answer)) => answer,
+        Ok(Err(e)) => return failed(e),
+        Err(_) => return failed("no answer in time".into()),
     };
     let Ok(secret) = decode_keys_answer(&answer) else {
         return failed("malformed answer".into());
@@ -1152,7 +1166,7 @@ pub async fn ensure_keys(shared: Arc<Shared>, conn: Arc<Connection>) {
     if had.as_deref() == Some(hex(secret.as_slice()).as_str()) {
         return;
     }
-    let stored = update_peer(&shared, &pin, |p| {
+    let stored = update_peer(shared, &pin, |p| {
         p.pair_secret = Some(hex(secret.as_slice()));
         p.join_tag = None;
     });
@@ -1168,16 +1182,21 @@ pub async fn ensure_keys(shared: Arc<Shared>, conn: Arc<Connection>) {
 /// Host: send the current manifest on an inbound connection (once the
 /// caller has opened a stream on it).
 pub fn send_manifest(shared: &Arc<Shared>, no: u64, conn: Arc<Connection>) {
-    if conn.minor().unwrap_or(0) < KEYS_MINOR {
+    if guard(&shared.relay.manifest).is_none() {
         return;
     }
-    let Some((_, envelope)) = guard(&shared.relay.manifest).clone() else {
-        return;
-    };
-    if !guard(&shared.relay.manifest_sent).insert(no) {
-        return;
-    }
+    let shared = shared.clone();
     tokio::spawn(async move {
+        // A caller from before minor 1 resets streams a host opens.
+        if conn.hello_minor().await.unwrap_or(0) < KEYS_MINOR {
+            return;
+        }
+        let Some((_, envelope)) = guard(&shared.relay.manifest).clone() else {
+            return;
+        };
+        if !guard(&shared.relay.manifest_sent).insert(no) {
+            return;
+        }
         if let Ok(stream) = conn
             .open_stream(PriorityClass::Interactive, MANIFEST_LABEL)
             .await
@@ -1455,7 +1474,7 @@ pub async fn dial_route(
         .is_none()
         .then(|| entry.join_tag.as_deref().and_then(fixed::<32>))
         .flatten();
-    let addrs = resolve(&route.endpoint, false).await?;
+    let addrs = resolve(shared.caller.addr_policy(), &route.endpoint, false).await?;
     if addrs.is_empty() {
         return Err(NetError::Relay(RelayError::Unreachable));
     }
@@ -1559,8 +1578,12 @@ pub fn join_candidates(ticket: &Ticket, approved: &[String]) -> Vec<(RelayRoute,
 }
 
 /// Dial a join circuit for `route`.
-pub async fn dial_join_route(route: &RelayRoute, tag: [u8; 32]) -> Result<WsPipe, NetError> {
-    let addrs = resolve(&route.endpoint, false).await?;
+pub async fn dial_join_route(
+    policy: &AddrPolicy,
+    route: &RelayRoute,
+    tag: [u8; 32],
+) -> Result<WsPipe, NetError> {
+    let addrs = resolve(policy, &route.endpoint, false).await?;
     let mut last = NetError::Relay(RelayError::Unreachable);
     for addr in addrs {
         match dial_join(&addr, route.relay, route.handle, tag, dial_within()).await {
@@ -1622,7 +1645,7 @@ pub fn peer_json(shared: &Shared, pin: &IdentityPublicKey) -> Value {
     let manifest = stored_manifest(&entry, pin);
     let mut routes = Vec::new();
     let mut seen = HashSet::new();
-    let approvals = shared.relay.files.approvals().unwrap_or_default().approvals;
+    let approvals = approvals(shared);
     let pin_hex = hex(pin.as_bytes());
     let mut push = |destination: String, relay: &RelayId, from: &str| {
         if !seen.insert(destination.clone()) {
@@ -1699,7 +1722,8 @@ pub fn on_request(shared: &Arc<Shared>, id: Value, op: &str, map: &Map<String, V
                 (Some(Ok(pin)), Some(destination)) => {
                     let key = hex(pin.as_bytes());
                     let done = if op == "peer.relay.allow" {
-                        add_approval(shared, &key, &destination, "manifest").map(|()| true)
+                        add_approval(shared, &key, &destination, APPROVAL_SOURCE_MANIFEST)
+                            .map(|()| true)
                     } else {
                         remove_approval(shared, &key, &destination)
                     };
@@ -1719,21 +1743,6 @@ pub fn on_request(shared: &Arc<Shared>, id: Value, op: &str, map: &Map<String, V
                     format!("{op} needs identity (hex) and destination (relay://host:port)"),
                 ),
             }
-        }
-        "approvals.list" => {
-            let only = str_field(map, "identity").map(str::to_lowercase);
-            let list: Vec<Value> = shared
-                .relay
-                .files
-                .approvals()
-                .unwrap_or_default()
-                .approvals
-                .into_iter()
-                .filter(|a| only.as_ref().is_none_or(|o| *o == a.identity))
-                .filter(|a| SOURCES.contains(&a.source.as_str()))
-                .map(|a| json!({"identity": a.identity, "destination": a.destination, "source": a.source, "at": a.at}))
-                .collect();
-            json!({"re": id, "approvals": list})
         }
         other => error(&id, "unknown_op", format!("unknown op {other:?}")),
     };
@@ -1772,7 +1781,7 @@ async fn enroll_inner(
         .relay
         .key(REGISTRATION_KEY_INFO, &salt)
         .map_err(|e| ("store_failed", e))?;
-    let addrs = resolve(&endpoint, true)
+    let addrs = resolve(shared.caller.addr_policy(), &endpoint, true)
         .await
         .map_err(|e| (e.word(), e.to_string()))?;
     let mut last = RelayError::Unreachable;
@@ -1967,29 +1976,18 @@ fn end_overlaps(shared: &Arc<Shared>) {
 mod tests {
     use super::*;
 
-    fn ip(t: &str) -> IpAddr {
-        t.parse().unwrap()
-    }
-
     #[test]
-    fn relay_endpoints_classify_like_routes() {
-        assert_eq!(class_of(ip("8.8.8.8")), "public");
-        assert_eq!(class_of(ip("100.101.7.2")), "tailnet");
-        assert_eq!(class_of(ip("192.168.1.20")), "lan");
-        assert_eq!(class_of(ip("10.0.0.1")), "lan");
-        assert_eq!(class_of(ip("172.20.0.1")), "lan");
-        assert_eq!(class_of(ip("169.254.1.1")), "lan");
-        assert_eq!(class_of(ip("203.0.113.5")), "forbidden");
-        assert_eq!(class_of(ip("224.0.0.251")), "forbidden");
-        assert_eq!(class_of(ip("0.1.2.3")), "forbidden");
-        assert_eq!(class_of(ip("::ffff:192.168.1.1")), "lan");
-        assert_eq!(class_of(ip("fd7a:115c:a1e0::1")), "tailnet");
-        assert_eq!(class_of(ip("fd00::1")), "lan");
-        assert_eq!(class_of(ip("2606:4700::1111")), "public");
-        assert_eq!(class_of(ip("2001:db8::1")), "forbidden");
-        assert_eq!(class_of(ip("fe80::1")), "forbidden");
-        assert!(!dialable(ip("192.168.1.20")));
-        assert!(dialable(ip("100.101.7.2")));
-        assert_eq!(dialable(ip("127.0.0.1")), cfg!(debug_assertions));
+    fn a_peer_s_relay_route_dials_only_public_or_tailnet_addresses() {
+        for own in [false, true] {
+            assert!(relay_class_ok(AddrClass::Public, own, false));
+            assert!(relay_class_ok(AddrClass::Tailnet, own, false));
+            assert!(!relay_class_ok(AddrClass::Forbidden, own, true));
+        }
+        assert!(!relay_class_ok(AddrClass::Lan, false, false));
+        assert!(relay_class_ok(AddrClass::Lan, true, false));
+        assert_eq!(
+            relay_class_ok(AddrClass::Lan, false, true),
+            cfg!(debug_assertions)
+        );
     }
 }

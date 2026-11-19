@@ -138,6 +138,8 @@ pub enum HostEvent {
         invitation: InvitationId,
         /// The code.
         code: PairingCode,
+        /// Code attempts the invitation has left, this one's included.
+        attempts_left: u8,
     },
     /// A device was paired.
     Enrolled {
@@ -540,7 +542,12 @@ where
                         }));
                 }
                 HostAction::ShowCode { invitation, code } => {
-                    let _ = self.events.send(HostEvent::ShowCode { invitation, code });
+                    let attempts_left = self.pairing.attempts_left(&invitation).unwrap_or(0);
+                    let _ = self.events.send(HostEvent::ShowCode {
+                        invitation,
+                        code,
+                        attempts_left,
+                    });
                 }
                 HostAction::Enrolled {
                     invitation,
@@ -785,6 +792,14 @@ where
             .map_err(|e| NetError::Refused(e.to_string()))
     }
 
+    /// A send-link invitation's code on show now and the attempts it has
+    /// left; `None` once it is no longer open (or for an in-person one).
+    pub fn invitation_code(&self, invitation: &InvitationId) -> Option<(PairingCode, u8)> {
+        let inner = lock(&self.shared);
+        let code = inner.pairing.code(invitation)?.clone();
+        Some((code, inner.pairing.attempts_left(invitation)?))
+    }
+
     /// Where an invitation stands.
     pub fn invitation_status(&self, invitation: &InvitationId) -> Option<InvitationStatus> {
         lock(&self.shared).pairing.status(invitation)
@@ -991,6 +1006,12 @@ where
     /// Whether the admission fence is set.
     pub fn fence_set(&self) -> bool {
         lock(&self.shared).paused
+    }
+
+    /// Whether the admission fence stops connections of `kind` now: the
+    /// `ws` upgrade answers 503 when it does (Phase 1b §4.1).
+    pub fn fence_covers(&self, kind: ListenerKind) -> bool {
+        lock(&self.shared).fenced(kind)
     }
 
     /// Stop serving: set the admission fence and close every connection

@@ -1,5 +1,6 @@
 //! Local state files: the host's grant table, the caller's paired hosts and
-//! the joiner's flow records.
+//! the destinations approved for them, and the joiner's flow records and
+//! completion records.
 //!
 //! Every write goes to a temporary file in the same directory, is flushed to
 //! disk, then renamed over the old file, so a crash leaves either the old or
@@ -533,6 +534,11 @@ pub struct PeerRecord {
     /// `peer.addresses.set`), tried before the hints.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub addresses: Vec<String>,
+    /// Routes the host offered when it paired back that the automatic rule
+    /// does not cover (Phase 1b §1.3): kept as suggestions and never
+    /// dialled; the owner's Use moves one to `addresses`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub offered: Vec<String>,
     /// When pairing finished (local clock).
     pub paired_at: u64,
 }
@@ -581,6 +587,11 @@ impl PeerStore {
         }
     }
 
+    /// The folder `peers.json` is in.
+    pub fn dir(&self) -> &Path {
+        self.path.parent().unwrap_or(Path::new("."))
+    }
+
     /// All paired hosts.
     pub fn load(&self) -> Result<Vec<PeerRecord>, NetError> {
         let Some(bytes) = read_optional(&self.path)? else {
@@ -620,14 +631,21 @@ impl PeerStore {
     /// Change the list with `change` and write it, all under the lock: no
     /// other writer runs between the read and the write.
     pub fn update(&self, change: impl FnOnce(&mut Vec<PeerRecord>)) -> Result<(), NetError> {
+        self.lock()?.update(change)
+        // The lock goes with the guard.
+    }
+
+    /// Hold the lock on `peers.json` until the guard drops, for changes
+    /// that go with it: `approvals.json` and the completion records in
+    /// `joins/` change only under it.
+    pub fn lock(&self) -> Result<PeersLock<'_>, NetError> {
         if let Some(dir) = self.lock_path.parent() {
             fs::create_dir_all(dir).map_err(|e| store_err(dir, e))?;
         }
-        let _lock = hold_lock(&self.lock_path)?;
-        let mut peers = self.load()?;
-        change(&mut peers);
-        self.write(peers)
-        // The lock goes with `_lock`.
+        Ok(PeersLock {
+            store: self,
+            _file: hold_lock(&self.lock_path)?,
+        })
     }
 
     fn write(&self, peers: Vec<PeerRecord>) -> Result<(), NetError> {
@@ -636,6 +654,288 @@ impl PeerStore {
             serde_json::to_vec_pretty(&file).map_err(|e| store_err(&self.path, e.into()))?;
         write_atomic(&self.path, &bytes)
     }
+}
+
+/// `peers.json` held under its lock ([`PeerStore::lock`]).
+pub struct PeersLock<'a> {
+    store: &'a PeerStore,
+    _file: File,
+}
+
+impl PeersLock<'_> {
+    /// All paired hosts.
+    pub fn load(&self) -> Result<Vec<PeerRecord>, NetError> {
+        self.store.load()
+    }
+
+    /// Change the list with `change` and write it.
+    pub fn update(&self, change: impl FnOnce(&mut Vec<PeerRecord>)) -> Result<(), NetError> {
+        let mut peers = self.store.load()?;
+        change(&mut peers);
+        self.store.write(peers)
+    }
+}
+
+/// Where an approval came from (Phase 1b §1.3): approved at Connect.
+pub const APPROVAL_SOURCE_TICKET: &str = "ticket";
+/// Where an approval came from: an address the owner set
+/// (`peer.addresses.set`).
+pub const APPROVAL_SOURCE_OWNER: &str = "owner";
+
+/// A destination the owner approved for a peer (Phase 1b §1.3).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Approval {
+    /// The peer's identity (hex SEC1).
+    pub identity: String,
+    /// The destination, canonical (scheme, lower-case host, explicit port).
+    pub destination: String,
+    /// `ticket` (approved at Connect) or `owner` (an address the owner set).
+    pub source: String,
+    /// When it was approved (Unix seconds).
+    pub at: u64,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct ApprovalFile {
+    version: u32,
+    approvals: Vec<Approval>,
+}
+
+/// `approvals.json`: the destinations approved per peer, owner-only. It is
+/// changed only while `peers.json` is locked ([`PeerStore::lock`]), so a
+/// peer and its approvals change together.
+#[derive(Clone, Debug)]
+pub struct ApprovalStore {
+    path: PathBuf,
+}
+
+impl ApprovalStore {
+    /// `approvals.json` in `dir`.
+    pub fn in_dir(dir: &Path) -> Self {
+        Self {
+            path: dir.join("approvals.json"),
+        }
+    }
+
+    /// Whether the file exists. A store from before approvals existed has
+    /// none, so nothing in it counts as approved.
+    pub fn exists(&self) -> bool {
+        self.path.exists()
+    }
+
+    /// Every approval; none when there is no file.
+    pub fn load(&self) -> Result<Vec<Approval>, NetError> {
+        let Some(bytes) = read_optional(&self.path)? else {
+            return Ok(Vec::new());
+        };
+        let file: ApprovalFile =
+            serde_json::from_slice(&bytes).map_err(|e| store_err(&self.path, e.into()))?;
+        Ok(file.approvals)
+    }
+
+    /// Add `entries`, skipping any already there for the same peer and
+    /// destination. Writes only if something was added.
+    pub fn add(&self, _held: &PeersLock<'_>, entries: &[Approval]) -> Result<(), NetError> {
+        let mut list = self.load()?;
+        let before = list.len();
+        for e in entries {
+            if !list
+                .iter()
+                .any(|a| a.identity == e.identity && a.destination == e.destination)
+            {
+                list.push(e.clone());
+            }
+        }
+        if list.len() == before {
+            return Ok(());
+        }
+        self.write(list)
+    }
+
+    /// Change the list with `change`; written only if it changed.
+    /// Returns whether it did.
+    pub fn update(
+        &self,
+        _held: &PeersLock<'_>,
+        change: impl FnOnce(&mut Vec<Approval>),
+    ) -> Result<bool, NetError> {
+        let before = self.load()?;
+        let mut list = before.clone();
+        change(&mut list);
+        if list == before {
+            return Ok(false);
+        }
+        self.write(list)?;
+        Ok(true)
+    }
+
+    /// Remove every approval for the peer `identity` (hex).
+    pub fn remove_identity(&self, _held: &PeersLock<'_>, identity: &str) -> Result<(), NetError> {
+        let mut list = self.load()?;
+        let before = list.len();
+        list.retain(|a| a.identity != identity);
+        if list.len() == before {
+            return Ok(());
+        }
+        self.write(list)
+    }
+
+    fn write(&self, approvals: Vec<Approval>) -> Result<(), NetError> {
+        let file = ApprovalFile {
+            version: 1,
+            approvals,
+        };
+        let bytes =
+            serde_json::to_vec_pretty(&file).map_err(|e| store_err(&self.path, e.into()))?;
+        write_atomic(&self.path, &bytes)
+    }
+}
+
+/// The outcome a [`CompletionRecord`] holds: the ticket's own `PAIRED`.
+pub const COMPLETION_PAIRED: &str = "paired";
+
+/// A "Send link" join that ended with a `PAIRED` for its ticket (Phase 1b
+/// §5.4), kept in `joins/<ticket hash>.done` before the pin is saved. It
+/// holds every write the join makes after it, so a helper that stopped
+/// part way can make them again ([`CompletionStore`]).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompletionRecord {
+    /// The ticket hash (hex).
+    pub ticket_hash: String,
+    /// The host's identity (hex SEC1).
+    pub host_identity: String,
+    /// Always [`COMPLETION_PAIRED`].
+    pub outcome: String,
+    /// The host as the join stores it in `peers.json`.
+    pub peer: PeerRecord,
+    /// The approvals the join stores in `approvals.json`.
+    pub approvals: Vec<Approval>,
+    /// The ticket's expiry (Unix seconds): a record the app never
+    /// acknowledges is dropped `JOIN_DONE_KEEP_SECS` after it.
+    pub expires_at: u64,
+    /// When the join finished (Unix seconds).
+    pub at: u64,
+}
+
+/// The completion records in the `joins` folder, beside the flow records.
+/// Deleting one for a removal, and replaying one, happen under
+/// `peers.json`'s lock, so the two never interleave.
+#[derive(Clone, Debug)]
+pub struct CompletionStore {
+    dir: PathBuf,
+}
+
+impl CompletionStore {
+    /// The `joins` folder in `dir`.
+    pub fn in_dir(dir: &Path) -> Self {
+        Self {
+            dir: dir.join("joins"),
+        }
+    }
+
+    /// The file for `ticket_hash`.
+    pub fn path(&self, ticket_hash: &[u8; 32]) -> PathBuf {
+        self.dir.join(format!("{}.done", hex(ticket_hash)))
+    }
+
+    /// Write `record` durably, replacing any for its ticket.
+    pub fn save(&self, record: &CompletionRecord) -> Result<(), NetError> {
+        let hash = record_hash(record)?;
+        crate::private::make_private_dir_durably(&self.dir).map_err(|e| store_err(&self.dir, e))?;
+        let path = self.path(&hash);
+        let bytes = serde_json::to_vec_pretty(record).map_err(|e| store_err(&path, e.into()))?;
+        write_atomic(&path, &bytes)
+    }
+
+    /// The record for `ticket_hash`, if any. One that does not parse, or
+    /// is filed under another ticket's name, is an error.
+    pub fn load(&self, ticket_hash: &[u8; 32]) -> Result<Option<CompletionRecord>, NetError> {
+        let path = self.path(ticket_hash);
+        let Some(bytes) = read_optional(&path)? else {
+            return Ok(None);
+        };
+        let record: CompletionRecord =
+            serde_json::from_slice(&bytes).map_err(|e| store_err(&path, e.into()))?;
+        if record_hash(&record)? != *ticket_hash {
+            return Err(NetError::Store(format!(
+                "{}: the record is for another ticket",
+                path.display()
+            )));
+        }
+        Ok(Some(record))
+    }
+
+    /// Delete the record for `ticket_hash`. Returns whether there was one.
+    pub fn remove(&self, ticket_hash: &[u8; 32]) -> Result<bool, NetError> {
+        let path = self.path(ticket_hash);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(store_err(&path, e)),
+        }
+    }
+
+    /// Every record that parses, with its ticket hash.
+    pub fn list(&self) -> Result<Vec<([u8; 32], CompletionRecord)>, NetError> {
+        let entries = match fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(store_err(&self.dir, e)),
+        };
+        let mut out = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".done")) else {
+                continue;
+            };
+            let Some(hash) = unhex(stem).ok().and_then(|b| <[u8; 32]>::try_from(b).ok()) else {
+                continue;
+            };
+            if let Ok(Some(record)) = self.load(&hash) {
+                out.push((hash, record));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Delete every record naming the host `identity` (hex): it was
+    /// removed, and no replay may bring it back. Returns their tickets.
+    pub fn remove_naming(
+        &self,
+        _held: &PeersLock<'_>,
+        identity: &str,
+    ) -> Result<Vec<[u8; 32]>, NetError> {
+        let mut removed = Vec::new();
+        for (hash, record) in self.list()? {
+            if record.host_identity == identity && self.remove(&hash)? {
+                removed.push(hash);
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Delete the records whose ticket expired more than `keep_secs`
+    /// before `now` (Unix seconds). Returns how many went.
+    pub fn prune(&self, now: u64, keep_secs: u64) -> Result<usize, NetError> {
+        let mut pruned = 0;
+        for (hash, record) in self.list()? {
+            if is_stale(&record, now, keep_secs) && self.remove(&hash)? {
+                pruned += 1;
+            }
+        }
+        Ok(pruned)
+    }
+}
+
+/// A completion record kept past its time: more than `keep_secs` after
+/// its ticket expired.
+pub fn is_stale(record: &CompletionRecord, now: u64, keep_secs: u64) -> bool {
+    record.expires_at.saturating_add(keep_secs) < now
+}
+
+fn record_hash(record: &CompletionRecord) -> Result<[u8; 32], NetError> {
+    <[u8; 32]>::try_from(unhex(&record.ticket_hash)?)
+        .map_err(|_| NetError::Store("a completion record's ticket hash is not 32 bytes".into()))
 }
 
 /// Where a joiner keeps its flow records (wire.md 10.7): per ticket hash,
@@ -996,6 +1296,7 @@ mod tests {
                             routes: Vec::new(),
                             last_route: None,
                             addresses: Vec::new(),
+                            offered: Vec::new(),
                             paired_at: 1,
                         })
                         .unwrap();
@@ -1023,6 +1324,7 @@ mod tests {
             routes: vec!["tcp://10.0.0.2:7443".into()],
             last_route: None,
             addresses: Vec::new(),
+            offered: Vec::new(),
             paired_at: 1,
         }
     }
@@ -1241,6 +1543,7 @@ mod tests {
             routes: vec!["tcp://10.0.0.2:7443".into()],
             last_route: None,
             addresses: Vec::new(),
+            offered: Vec::new(),
             paired_at: 1,
         };
         store.upsert(record.clone()).unwrap();

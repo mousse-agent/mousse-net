@@ -51,7 +51,10 @@ pub enum TargetEvent {
         pipe: Box<WsPipe>,
     },
     /// An accept leg failed; the caller gets `UNREACHABLE`.
-    AcceptFailed { circuit: [u8; 16], error: RelayError },
+    AcceptFailed {
+        circuit: [u8; 16],
+        error: RelayError,
+    },
 }
 
 /// Allow-set sequences grow for the life of the process and start from the
@@ -147,7 +150,9 @@ impl TargetLink {
         .await
         .map_err(|_| RelayError::Timeout)??;
         if got != expected {
-            return Err(RelayError::Protocol("the relay named another handle".into()));
+            return Err(RelayError::Protocol(
+                "the relay named another handle".into(),
+            ));
         }
         Ok(Self {
             link,

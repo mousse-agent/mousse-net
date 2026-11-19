@@ -540,7 +540,7 @@ pub struct Connection {
     status: watch::Receiver<ConnStatus>,
     incoming: tokio::sync::Mutex<mpsc::UnboundedReceiver<MuxStream>>,
     /// The minor version both sides agreed, once the peer's `HELLO` came.
-    minor: Arc<std::sync::OnceLock<u64>>,
+    minor: watch::Receiver<Option<u64>>,
 }
 
 impl fmt::Debug for Connection {
@@ -572,9 +572,30 @@ impl Connection {
     }
 
     /// The wire minor version both sides use, once the peer's first
-    /// `HELLO` was accepted (always so on a live connection).
+    /// `HELLO` was accepted. Always so once the peer has opened a stream;
+    /// a host may be live before its caller's `HELLO` arrives.
     pub fn minor(&self) -> Option<u64> {
-        self.minor.get().copied()
+        *self.minor.borrow()
+    }
+
+    /// Wait for the peer's first `HELLO` and return the agreed minor
+    /// version; `None` if the connection ends first. A host can be live
+    /// before its caller's `HELLO` has arrived.
+    pub async fn hello_minor(&self) -> Option<u64> {
+        let mut rx = self.minor.clone();
+        let mut status = self.status.clone();
+        loop {
+            if let Some(minor) = *rx.borrow_and_update() {
+                return Some(minor);
+            }
+            if matches!(*status.borrow_and_update(), ConnStatus::Closed(_)) {
+                return None;
+            }
+            tokio::select! {
+                changed = rx.changed() => if changed.is_err() { return *rx.borrow() },
+                changed = status.changed() => if changed.is_err() { return *rx.borrow() },
+            }
+        }
     }
 
     /// The current status.
@@ -726,7 +747,7 @@ pub(crate) fn spawn<P: Pipe>(
     let (status_tx, status_rx) = watch::channel(ConnStatus::Pending);
     let (closing_tx, _) = watch::channel(false);
     let (accept_tx, accept_rx) = mpsc::unbounded_channel();
-    let minor = Arc::new(std::sync::OnceLock::new());
+    let (minor, minor_rx) = watch::channel(None);
     let connection = Connection {
         id: start.conn,
         peer: start.peer,
@@ -735,7 +756,7 @@ pub(crate) fn spawn<P: Pipe>(
         cmd: cmd_tx.clone(),
         status: status_rx,
         incoming: tokio::sync::Mutex::new(accept_rx),
-        minor: minor.clone(),
+        minor: minor_rx,
     };
     let driver = Driver {
         mux: Mux::with_limits(start.side, start.clock.mono(), start.limits.core()),
@@ -787,7 +808,7 @@ struct Driver {
     /// The peer's `HELLO`s so far.
     hello: HelloState,
     /// Where the agreed minor version is published for the handle.
-    minor: Arc<std::sync::OnceLock<u64>>,
+    minor: watch::Sender<Option<u64>>,
     reason: Option<CloseReason>,
     /// Encoded frames a closing step produced, sent before the GOAWAY.
     before_close: VecDeque<Vec<u8>>,
@@ -1309,7 +1330,13 @@ impl Driver {
                 };
                 match self.hello.on_hello(*major_version, *minor_version) {
                     HelloOutcome::Agreed(minor) => {
-                        let _ = self.minor.set(minor);
+                        self.minor.send_if_modified(|m| {
+                            let first = m.is_none();
+                            if first {
+                                *m = Some(minor);
+                            }
+                            first
+                        });
                     }
                     HelloOutcome::Ignored => return Verdict::Ignore,
                     HelloOutcome::Close(code) => return Verdict::Close(code),

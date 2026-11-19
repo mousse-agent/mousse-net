@@ -50,7 +50,13 @@
         mousse_control = "ignore-admission-expiry",
         mousse_control = "close-funded-at-expiry",
         mousse_control = "refuse-expired-reregister",
-        mousse_control = "expiry-on-relay-wall-clock"
+        mousse_control = "expiry-on-relay-wall-clock",
+        mousse_control = "admit-ungranted",
+        mousse_control = "join-only-streams",
+        mousse_control = "skip-code-confirm",
+        mousse_control = "host-attempts-reset-on-reconnect",
+        mousse_control = "invitation-survives-exhaustion",
+        mousse_control = "same-code-after-failure"
     ),
     not(debug_assertions)
 ))]
@@ -75,7 +81,13 @@ compile_error!("mousse_control plants a bug for tests; it is not allowed in rele
     mousse_control = "ignore-admission-expiry",
     mousse_control = "close-funded-at-expiry",
     mousse_control = "refuse-expired-reregister",
-    mousse_control = "expiry-on-relay-wall-clock"
+    mousse_control = "expiry-on-relay-wall-clock",
+    mousse_control = "admit-ungranted",
+    mousse_control = "join-only-streams",
+    mousse_control = "skip-code-confirm",
+    mousse_control = "host-attempts-reset-on-reconnect",
+    mousse_control = "invitation-survives-exhaustion",
+    mousse_control = "same-code-after-failure"
 ))]
 const _: () = {
     let profile = env!("MOUSSE_BUILD_PROFILE").as_bytes();
@@ -107,8 +119,8 @@ pub mod manifest;
 pub mod mux;
 pub mod pairing;
 pub mod relay;
-pub mod relay_hosted;
 pub mod relay_endpoint;
+pub mod relay_hosted;
 pub mod session;
 pub mod session_cert;
 pub mod time;

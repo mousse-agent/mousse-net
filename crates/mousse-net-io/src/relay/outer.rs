@@ -341,7 +341,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> RelayLink<S> {
     pub fn into_pipe(self) -> WsPipe<S> {
         WsPipe::new(self.ws)
     }
-
 }
 
 /// How a spliced relay connection ended, once it has.

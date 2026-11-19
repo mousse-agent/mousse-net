@@ -13,9 +13,9 @@
 //!   the pair secret it sent, its newest manifest, the relay hints its
 //!   ticket carried, and the ticket's invitation tag until `mousse-keys`
 //!   is answered.
-//! - `approvals.json`: dial approvals per peer and destination, in the
-//!   form of Phase 1b §1.3, with `relay://host:port` destinations and the
-//!   `manifest` source.
+//!
+//! Relay approvals are Phase 1b's (`approvals.json`, `ApprovalStore`), with
+//! `relay://host:port` destinations and the `manifest` source.
 
 use std::fs;
 use std::io;
@@ -128,26 +128,7 @@ pub struct PeersFile {
     pub peers: Vec<PeerRelay>,
 }
 
-/// Where an approval came from (Phase 1b §1.3, Phase 3 §B.11).
-pub const SOURCES: [&str; 3] = ["ticket", "owner", "manifest"];
-
-/// One approved destination for one peer.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Approval {
-    pub identity: String,
-    pub destination: String,
-    pub source: String,
-    pub at: u64,
-}
-
-#[derive(Default, Serialize, Deserialize)]
-pub struct ApprovalsFile {
-    pub version: u32,
-    #[serde(default)]
-    pub approvals: Vec<Approval>,
-}
-
-/// The four files of one state folder.
+/// The three files of one state folder.
 #[derive(Clone, Debug)]
 pub struct Files {
     dir: PathBuf,
@@ -207,15 +188,6 @@ impl Files {
     pub fn save_peers(&self, mut file: PeersFile) -> Result<(), String> {
         file.version = 1;
         self.write("relay-peers.json", &file)
-    }
-
-    pub fn approvals(&self) -> Result<ApprovalsFile, String> {
-        self.read("approvals.json")
-    }
-
-    pub fn save_approvals(&self, mut file: ApprovalsFile) -> Result<(), String> {
-        file.version = 1;
-        self.write("approvals.json", &file)
     }
 }
 

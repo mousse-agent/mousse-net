@@ -29,7 +29,30 @@
         mousse_control = "repair-skips-slot",
         mousse_control = "repair-skips-fence",
         mousse_control = "limits-raise",
-        mousse_control = "no-endpoint-lock"
+        mousse_control = "no-endpoint-lock",
+        mousse_control = "ws-allow-origin",
+        mousse_control = "plain-ws-off-loopback",
+        mousse_control = "release-test-root",
+        mousse_control = "peer-ssh-routes",
+        mousse_control = "loopback-routes",
+        mousse_control = "plain-ws-from-ticket",
+        mousse_control = "unapproved-public",
+        mousse_control = "unapproved-last-route",
+        mousse_control = "upgrade-trusts-routes",
+        mousse_control = "resolve-again",
+        mousse_control = "unlisted-allowed",
+        mousse_control = "stale-renewal-routes",
+        mousse_control = "unbounded-candidates",
+        mousse_control = "ssh-races-lan",
+        mousse_control = "bind-all-lan-off",
+        mousse_control = "inbound-before-live",
+        mousse_control = "journal-pins-link",
+        mousse_control = "fabricate-pending-kind2",
+        mousse_control = "joiner-records-in-memory",
+        mousse_control = "link-accepts-kind1",
+        mousse_control = "no-completion-record",
+        mousse_control = "done-pin-only",
+        mousse_control = "replay-after-removal"
     )
 ))]
 compile_error!("a mousse_control build has a deliberate defect and is for tests only; build it without --release");
@@ -66,6 +89,29 @@ compile_error!("test-in-person lets a typed ticket count as scanned from the hos
     mousse_control = "repair-skips-fence",
     mousse_control = "limits-raise",
     mousse_control = "no-endpoint-lock",
+    mousse_control = "ws-allow-origin",
+    mousse_control = "plain-ws-off-loopback",
+    mousse_control = "release-test-root",
+    mousse_control = "peer-ssh-routes",
+    mousse_control = "loopback-routes",
+    mousse_control = "plain-ws-from-ticket",
+    mousse_control = "unapproved-public",
+    mousse_control = "unapproved-last-route",
+    mousse_control = "upgrade-trusts-routes",
+    mousse_control = "resolve-again",
+    mousse_control = "unlisted-allowed",
+    mousse_control = "stale-renewal-routes",
+    mousse_control = "unbounded-candidates",
+    mousse_control = "ssh-races-lan",
+    mousse_control = "bind-all-lan-off",
+    mousse_control = "inbound-before-live",
+    mousse_control = "journal-pins-link",
+    mousse_control = "fabricate-pending-kind2",
+    mousse_control = "joiner-records-in-memory",
+    mousse_control = "link-accepts-kind1",
+    mousse_control = "no-completion-record",
+    mousse_control = "done-pin-only",
+    mousse_control = "replay-after-removal",
     feature = "test-in-person"
 ))]
 const _: () = {
@@ -163,6 +209,15 @@ enum Command {
         /// Don't advertise on mDNS (it is off anyway on loopback).
         #[arg(long)]
         no_mdns: bool,
+        /// Run the loopback ws listener for a tunnel client on this port
+        /// (0: any). Without it the listener runs, on its kept port, only
+        /// with --tunnel.
+        #[arg(long)]
+        ws_port: Option<u16>,
+        /// The public wss URL of a tunnel to the ws listener, advertised in
+        /// tickets (repeatable).
+        #[arg(long = "tunnel")]
+        tunnels: Vec<String>,
         /// The name paired devices see (default: this computer's name).
         #[arg(long)]
         name: Option<String>,
@@ -697,6 +752,8 @@ async fn run(cli: Cli) -> Result<i32, String> {
             listen_ip,
             port,
             no_mdns,
+            ws_port,
+            tunnels,
             name,
             app,
             headless,
@@ -711,6 +768,8 @@ async fn run(cli: Cli) -> Result<i32, String> {
                 port,
                 mdns: !no_mdns,
                 app,
+                ws_port,
+                tunnels,
             };
             serve::run(&dir, insecure, opts).await?;
         }

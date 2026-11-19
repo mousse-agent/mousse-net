@@ -8,11 +8,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use mousse_net_core::pairing::{Arrival, InvitationKind, Route, Ticket, CODE_FAILED_MESSAGE};
 use mousse_net_core::session_cert::CertError;
 use mousse_net_core::ErrorCode;
-use mousse_net_io::pipe::{connect_tcp_within, parse_route, route_uri};
-use mousse_net_io::store::{hex, short_id, PeerRecord, PeerStore};
+use mousse_net_io::pipe::{route_uri, BoxPipe, LocalRoute, RouteKind};
+use mousse_net_io::store::{
+    hex, is_stale, short_id, Approval, ApprovalStore, CompletionRecord, CompletionStore,
+    PeerRecord, PeerStore, PeersLock, APPROVAL_SOURCE_TICKET, COMPLETION_PAIRED,
+};
 use mousse_net_io::{
-    Caller, CloseReason, CodeEntry, Connection, Endpoint, JoinOutcome, NetError, Step1Failures,
-    SystemClock,
+    Caller, CloseReason, CodeEntry, Connection, Endpoint, JoinOutcome, NetError, Reached,
+    Step1Failures, SystemClock,
 };
 use serde_json::json;
 
@@ -53,11 +56,6 @@ pub fn parse_ticket(text: &str) -> Result<Ticket, String> {
     Ticket::from_fragment(fragment).map_err(|e| format!("bad ticket: {e:?}"))
 }
 
-/// How long a TCP connect may take (`CONNECT_TIMEOUT_MS`).
-fn connect_timeout() -> Duration {
-    crate::limits::ms(crate::limits::get().net.io().connect_timeout_ms())
-}
-
 /// Wall-clock now, in Unix seconds.
 pub fn now_secs() -> u64 {
     SystemTime::now()
@@ -66,27 +64,26 @@ pub fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Routes typed on the command line: each must parse.
-fn parse_routes(list: &[String]) -> Result<Vec<Route>, String> {
+/// Routes typed on the command line by the owner: each must parse.
+fn parse_routes(list: &[String]) -> Result<Vec<LocalRoute>, String> {
     list.iter()
-        .map(|r| parse_route(r).map_err(|e| e.to_string()))
+        .map(|r| LocalRoute::parse(r).map_err(|e| e.to_string()))
         .collect()
 }
 
 /// Routes from a ticket or the peer store: hints this version cannot use
 /// (unknown or reserved schemes, mDNS names without a browser) are skipped.
-pub(crate) fn usable_routes(hints: &[String]) -> Vec<Route> {
+pub(crate) fn usable_routes(hints: &[String]) -> Vec<LocalRoute> {
     hints
         .iter()
-        .filter_map(|h| Route::parse(h).ok())
-        .filter(|r| matches!(r, Route::Tcp { .. }))
+        .filter_map(|h| Route::parse(h).ok().and_then(LocalRoute::from_route))
         .collect()
 }
 
-/// Where a join dials: a `tcp` route, or a relay with the ticket's
-/// invitation tag (Phase 3 B.7).
+/// Where a join dials: a route of this computer's own, or a relay with the
+/// ticket's invitation tag (Phase 3 B.7).
 pub(crate) enum JoinRoute {
-    Tcp(Route),
+    Local(LocalRoute),
     Relay {
         route: mousse_net_core::relay_endpoint::RelayRoute,
         tag: [u8; 32],
@@ -96,40 +93,45 @@ pub(crate) enum JoinRoute {
 impl JoinRoute {
     fn hint(&self) -> String {
         match self {
-            JoinRoute::Tcp(route) => route_uri(route),
+            JoinRoute::Local(route) => route.uri(),
             JoinRoute::Relay { route, .. } => route.to_hint(),
+        }
+    }
+
+    fn order(&self) -> u8 {
+        match self {
+            JoinRoute::Local(route) => match route.kind() {
+                RouteKind::Tcp => 0,
+                RouteKind::Ws => 1,
+                RouteKind::Ssh => 2,
+            },
+            JoinRoute::Relay { .. } => 3,
+        }
+    }
+
+    /// A pipe to the host on this route, and how it was reached.
+    async fn open(&self, caller: &Caller) -> Result<(BoxPipe, JoinedVia), NetError> {
+        match self {
+            JoinRoute::Local(route) => {
+                let (pipe, class) = caller.open_route(route).await?;
+                let reached = Reached {
+                    route: route.clone(),
+                    class,
+                };
+                Ok((pipe, JoinedVia::Local(reached)))
+            }
+            JoinRoute::Relay { route, tag } => {
+                let pipe = crate::app::dial_join_route(caller.addr_policy(), route, *tag).await?;
+                Ok((Box::new(pipe), JoinedVia::Relay(route.clone())))
+            }
         }
     }
 }
 
-/// One join attempt on `pipe`, redialling the same way if it drops.
-#[allow(clippy::too_many_arguments)]
-async fn join_on<P, C, D, Fut>(
-    caller: &Caller,
-    pipe: P,
-    ticket: &Ticket,
-    arrival: Arrival,
-    name: &str,
-    codes: &mut C,
-    consented: bool,
-    pinned: bool,
-    redial: D,
-) -> Result<(Connection, JoinOutcome), NetError>
-where
-    P: mousse_net_io::pipe::Pipe,
-    C: CodeEntry,
-    D: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<P, NetError>>,
-{
-    if consented {
-        caller
-            .join_pinned_with_redial(pipe, ticket, arrival, name, codes, redial)
-            .await
-    } else {
-        caller
-            .join_with_redial(pipe, ticket, arrival, name, codes, pinned, redial)
-            .await
-    }
+/// How a join reached its host.
+pub(crate) enum JoinedVia {
+    Local(Reached),
+    Relay(mousse_net_core::relay_endpoint::RelayRoute),
 }
 
 /// Asks for the send-link code on the terminal.
@@ -201,6 +203,8 @@ pub fn reason_of(e: &NetError) -> String {
             Some(code) => code.name().to_lowercase(),
             None => "connection_dropped".into(),
         },
+        // A ticket past its expiry, refused before dialling.
+        NetError::Join(mousse_net_core::pairing::JoinerError::Expired) => "expired".into(),
         NetError::Join(e) => match e.code() {
             Some(code) => code.name().to_lowercase(),
             None => "pairing_refused".into(),
@@ -210,6 +214,7 @@ pub fn reason_of(e: &NetError) -> String {
         NetError::Timeout(_) => "timeout".into(),
         NetError::Io(_) => "unreachable".into(),
         NetError::Relay(e) => e.word().into(),
+        NetError::Forbidden(_) => "forbidden_address".into(),
         _ => "error".into(),
     }
 }
@@ -276,14 +281,11 @@ pub async fn join(
             "pairing_failed",
         ));
     }
-    let candidates: Vec<JoinRoute> = if routes.is_empty() {
+    let candidates = if routes.is_empty() {
         usable_routes(&ticket.routes)
     } else {
         parse_routes(routes).map_err(|e| Failure::new(e, "bad_route"))?
-    }
-    .into_iter()
-    .map(JoinRoute::Tcp)
-    .collect();
+    };
     if candidates.is_empty() {
         return Err(Failure::new(
             "the ticket has no usable address; pass --route tcp://host:port",
@@ -295,7 +297,8 @@ pub async fn join(
     } else {
         println!("joining; the host owner is asked to confirm");
     }
-    let (conn, record, already_paired) = join_routes(
+    let candidates: Vec<JoinRoute> = candidates.into_iter().map(JoinRoute::Local).collect();
+    let (conn, record, already_paired, _) = join_routes(
         &side.caller,
         &side.peers(),
         ticket,
@@ -303,6 +306,7 @@ pub async fn join(
         name,
         &candidates,
         false,
+        None,
         &mut TypedCode,
         |_| {},
     )
@@ -323,6 +327,16 @@ pub async fn join(
 /// §5.1), so the ticket's host counts as pinned and a join past the
 /// ticket's expiry learns whether a lost `PAIRED` enrolled it. Otherwise a
 /// send link may end "already paired" only for a host pinned before.
+///
+/// `link`: an app join of a "Send link" ticket (Phase 1b §5.4), with the
+/// destinations the owner approved at Connect. It never takes the
+/// consented path: `consented` is ignored, the host counts as pinned only
+/// if `peers.json` held its pin before the join, and a ticket past its
+/// expiry is learned only from a pending record the flow store holds.
+/// Only a `PAIRED` for the ticket completes it: a completion record is
+/// written first, then the pin, the approvals and the settled mark. An
+/// "already paired" answer is existing access only and changes nothing
+/// stored.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn join_routes<C: CodeEntry>(
     caller: &Caller,
@@ -332,54 +346,70 @@ pub(crate) async fn join_routes<C: CodeEntry>(
     name: &str,
     candidates: &[JoinRoute],
     consented: bool,
+    link: Option<&[String]>,
     codes: &mut C,
     mut progress: impl FnMut(&str),
-) -> Result<(Connection, PeerRecord, bool), Failure> {
-    let pinned = consented
-        || peers.load().is_ok_and(|ps| {
-            ps.iter()
-                .any(|p| p.pin().ok() == Some(ticket.host_identity))
-        });
+) -> Result<(Connection, PeerRecord, bool, JoinedVia), Failure> {
+    let held = peers.load().is_ok_and(|ps| {
+        ps.iter()
+            .any(|p| p.pin().ok() == Some(ticket.host_identity))
+    });
+    let link = link.filter(|_| ticket.kind == InvitationKind::SendLink);
+    let (pinned, resume) = match link {
+        None => (consented || held, consented),
+        // Must-fail controls: the app's consent counts as a pin, or makes
+        // up a pending outcome past the ticket's expiry.
+        Some(_) => (
+            held || (consented && cfg!(mousse_control = "journal-pins-link")),
+            consented && cfg!(mousse_control = "fabricate-pending-kind2"),
+        ),
+    };
+    // Refusals the ticket and its flow record already give come before
+    // any dial: an expired ticket, no tries left, the wrong arrival.
+    caller
+        .check_join(ticket, arrival, name, resume)
+        .map_err(|e| Failure::of(&e))?;
     let mut last = Failure::new("no route answered", "unreachable");
     // Any step 1 failure on an address means "try the next one"; one is
     // shown only when no address passed (wire.md 5.4).
     let mut step1 = Step1Failures::default();
-    for candidate in candidates {
-        let hint = candidate.hint();
+    // Pipe-generic (Phase 1b §1.4): `tcp` candidates first, then `ws`/`wss`,
+    // then `ssh`, each pipe from `Caller::open_route` (resolved once, the
+    // classified address dialled); then the relays (Phase 3 B.7).
+    let mut ordered: Vec<&JoinRoute> = candidates.iter().collect();
+    ordered.sort_by_key(|r| r.order());
+    for route in ordered {
+        let hint = route.hint();
         progress(&hint);
-        // If the connection drops before PAIRED, the join reconnects the
-        // same way to learn whether the host enrolled this device.
-        let joined = match candidate {
-            JoinRoute::Tcp(route) => {
-                let pipe = match connect_tcp_within(route, connect_timeout()).await {
-                    Ok(p) => p,
-                    Err(e) => {
-                        last = Failure::new(format!("{hint}: {e}"), "unreachable");
-                        continue;
-                    }
-                };
-                let redial = || connect_tcp_within(route, connect_timeout());
-                join_on(
-                    caller, pipe, ticket, arrival, name, codes, consented, pinned, redial,
-                )
-                .await
-            }
-            JoinRoute::Relay { route, tag } => {
-                let pipe = match crate::app::dial_join_route(route, *tag).await {
-                    Ok(p) => p,
-                    Err(e) => {
-                        last = Failure::new(format!("{hint}: {e}"), &reason_of(&e));
-                        continue;
-                    }
-                };
-                let redial = || crate::app::dial_join_route(route, *tag);
-                join_on(
-                    caller, pipe, ticket, arrival, name, codes, consented, pinned, redial,
-                )
-                .await
+        let (pipe, reached) = match route.open(caller).await {
+            Ok(p) => p,
+            Err(e) => {
+                last = Failure::new(format!("{hint}: {e}"), &reason_of(&e));
+                continue;
             }
         };
+        // If the connection drops before PAIRED, the join reconnects the
+        // same way to learn whether the host enrolled this device.
+        let redial = || async { route.open(caller).await.map(|(pipe, _)| pipe) };
+        let joined = if resume {
+            caller
+                .join_pinned_with_redial(pipe, ticket, arrival, name, codes, redial)
+                .await
+        } else {
+            caller
+                .join_with_redial(pipe, ticket, arrival, name, codes, pinned, redial)
+                .await
+        };
         match joined {
+            Ok((conn, outcome)) if link.is_some() => {
+                let approved = link.unwrap_or_default();
+                let (record, already) =
+                    finish_link(caller, peers, ticket, &hint, approved, outcome)?;
+                if let JoinRoute::Local(route) = route {
+                    caller.remember_local_routes(ticket.host_identity, vec![route.clone()]);
+                }
+                return Ok((conn, record, already, reached));
+            }
             Ok((conn, outcome)) => {
                 let already = matches!(outcome, JoinOutcome::AlreadyPaired);
                 // Built from the stored record as it is under the lock, so
@@ -404,6 +434,7 @@ pub(crate) async fn join_routes<C: CodeEntry>(
                             routes: ticket.routes.clone(),
                             last_route: Some(hint.clone()),
                             addresses: existing.map(|p| p.addresses.clone()).unwrap_or_default(),
+                            offered: existing.map(|p| p.offered.clone()).unwrap_or_default(),
                             paired_at: now_secs(),
                         };
                         peers.retain(|p| p.pin().ok() != Some(ticket.host_identity));
@@ -416,10 +447,10 @@ pub(crate) async fn join_routes<C: CodeEntry>(
                 caller
                     .pin_stored(ticket)
                     .map_err(|e| Failure::new(e.to_string(), "store"))?;
-                if let JoinRoute::Tcp(route) = candidate {
-                    caller.remember_routes(ticket.host_identity, vec![route.clone()]);
+                if let JoinRoute::Local(route) = route {
+                    caller.remember_local_routes(ticket.host_identity, vec![route.clone()]);
                 }
-                return Ok((conn, record, already));
+                return Ok((conn, record, already, reached));
             }
             // Another endpoint at this address: try the next one.
             Err(NetError::PeerCertificate(CertError::PinMismatch)) => {
@@ -446,6 +477,184 @@ pub(crate) async fn join_routes<C: CodeEntry>(
         Some(e) => Err(Failure::of(&e)),
         None => Err(last),
     }
+}
+
+/// A test hook (debug builds): `MOUSSE_HELPER_TEST_CRASH=<point>` stops the
+/// helper at once at that point, as a crash would.
+pub(crate) fn crash_point(point: &str) {
+    #[cfg(debug_assertions)]
+    if std::env::var("MOUSSE_HELPER_TEST_CRASH").as_deref() == Ok(point) {
+        std::process::exit(86);
+    }
+    let _ = point;
+}
+
+/// The end of an app's "Send link" join (Phase 1b §5.4 and §3.6).
+fn finish_link(
+    caller: &Caller,
+    peers: &PeerStore,
+    ticket: &Ticket,
+    hint: &str,
+    approved: &[String],
+    outcome: JoinOutcome,
+) -> Result<(PeerRecord, bool), Failure> {
+    let store = |e: NetError| Failure::new(e.to_string(), "store");
+    let hash = ticket.hash();
+    let identity = hex(ticket.host_identity.as_bytes());
+    let existing = peers
+        .load()
+        .map_err(store)?
+        .into_iter()
+        .find(|p| p.identity == identity);
+    let host = match outcome {
+        JoinOutcome::Paired(host) => host,
+        JoinOutcome::AlreadyPaired => {
+            // Existing access, not this ticket's: no completion record, and
+            // the stored row stays as it is.
+            caller.settle_stored(&hash).map_err(store)?;
+            let record = existing.unwrap_or(PeerRecord {
+                name: short_id(&ticket.host_identity),
+                identity,
+                role: "unknown".into(),
+                routes: Vec::new(),
+                last_route: None,
+                addresses: Vec::new(),
+                offered: Vec::new(),
+                paired_at: 0,
+            });
+            return Ok((record, true));
+        }
+    };
+    crash_point("link-paired");
+    let now = caller.now().secs();
+    let peer = PeerRecord {
+        name: host.name,
+        identity: identity.clone(),
+        role: host.role.as_str().to_owned(),
+        routes: ticket.routes.clone(),
+        last_route: Some(hint.to_owned()),
+        addresses: existing.map(|p| p.addresses).unwrap_or_default(),
+        offered: Vec::new(),
+        paired_at: now,
+    };
+    let done = CompletionRecord {
+        ticket_hash: hex(&hash),
+        host_identity: identity,
+        outcome: COMPLETION_PAIRED.into(),
+        peer: peer.clone(),
+        approvals: ticket_approvals(ticket, approved, now),
+        expires_at: ticket.expires_at.secs(),
+        at: now,
+    };
+    // Must-fail control: the pin is saved with no completion record first.
+    if cfg!(mousse_control = "no-completion-record") {
+        crash_point("link-done-saved");
+        let held = peers.lock().map_err(store)?;
+        held.update(|list| merge_peer(list, peer.clone()))
+            .map_err(store)?;
+        ApprovalStore::in_dir(peers.dir())
+            .add(&held, &done.approvals)
+            .map_err(store)?;
+    } else {
+        CompletionStore::in_dir(peers.dir())
+            .save(&done)
+            .map_err(store)?;
+        crash_point("link-done-saved");
+        replay_completion(peers.dir(), &hash, true, None).map_err(store)?;
+    }
+    caller.settle_stored(&hash).map_err(store)?;
+    Ok((peer, false))
+}
+
+/// The approvals a link join stores: each approved destination that is one
+/// of the ticket's hints, canonical. Any other is ignored.
+fn ticket_approvals(ticket: &Ticket, approved: &[String], now: u64) -> Vec<Approval> {
+    let canonical = |text: &str| match Route::parse(text) {
+        Ok(route) => route_uri(&route),
+        Err(_) => text.to_owned(),
+    };
+    let hints: Vec<String> = ticket.routes.iter().map(|h| canonical(h)).collect();
+    let mut out: Vec<Approval> = Vec::new();
+    for a in approved {
+        let destination = canonical(a);
+        if hints.contains(&destination) && !out.iter().any(|o| o.destination == destination) {
+            out.push(Approval {
+                identity: hex(ticket.host_identity.as_bytes()),
+                destination,
+                source: APPROVAL_SOURCE_TICKET.into(),
+                at: now,
+            });
+        }
+    }
+    out
+}
+
+/// Put `record` in place of the stored row for its host, keeping the
+/// addresses the owner set on that row.
+fn merge_peer(list: &mut Vec<PeerRecord>, mut record: PeerRecord) {
+    if let Some(old) = list.iter().find(|p| p.identity == record.identity) {
+        if !old.addresses.is_empty() {
+            record.addresses = old.addresses.clone();
+        }
+    }
+    list.retain(|p| p.identity != record.identity);
+    list.push(record);
+}
+
+/// Make the writes of the completion record for `ticket_hash` again, under
+/// the peers lock: the host's row in `peers.json` (merged as the join
+/// merges it), then its approvals. Each is idempotent. Returns the record,
+/// or `None` if there is none: never made, acknowledged, dropped by a
+/// removal of its host, or past `stale` (`(now, keep_secs)`), in which
+/// case it is deleted here. `full`: false only for the `done-pin-only`
+/// must-fail control, which saves the pin without routes or approvals.
+pub(crate) fn replay_completion(
+    dir: &Path,
+    ticket_hash: &[u8; 32],
+    full: bool,
+    stale: Option<(u64, u64)>,
+) -> Result<Option<CompletionRecord>, NetError> {
+    let peers = PeerStore::in_dir(dir);
+    let held = peers.lock()?;
+    let records = CompletionStore::in_dir(dir);
+    let Some(record) = records.load(ticket_hash)? else {
+        return Ok(None);
+    };
+    if let Some((now, keep)) = stale {
+        if is_stale(&record, now, keep) {
+            records.remove(ticket_hash)?;
+            return Ok(None);
+        }
+    }
+    let mut peer = record.peer.clone();
+    if !full {
+        peer.routes.clear();
+        peer.last_route = None;
+    }
+    held.update(|list| merge_peer(list, peer))?;
+    if full {
+        ApprovalStore::in_dir(dir).add(&held, &record.approvals)?;
+    }
+    Ok(Some(record))
+}
+
+/// The host `identity` (hex) was removed (`peer.forget`, or a removal of
+/// its grant): delete its approvals and every completion record naming it,
+/// under the peers lock, so no replay brings it back. Returns their
+/// tickets, whose pending marks the caller clears once the lock is
+/// released. `held` is the peers lock the removal holds.
+pub(crate) fn drop_completions(
+    dir: &Path,
+    held: &PeersLock<'_>,
+    identity: &str,
+) -> Result<Vec<[u8; 32]>, NetError> {
+    // Must-fail control: the records stay, and a later replay restores
+    // the removed host.
+    if cfg!(mousse_control = "replay-after-removal") {
+        return Ok(Vec::new());
+    }
+    ApprovalStore::in_dir(dir).remove_identity(held, identity)?;
+    CompletionStore::in_dir(dir).remove_naming(held, identity)
 }
 
 /// A readable reason for a failed or closed connection.
@@ -514,12 +723,12 @@ pub async fn dial(
     };
     let (conn, used) = side
         .caller
-        .dial_candidates(&candidates, pin)
+        .search(mousse_net_io::Search::of(candidates), pin)
         .await
         .map_err(|e| describe(&e))?;
     // Only the route is noted, on the record as stored now: a re-pair of
     // this host meanwhile keeps its name, role and routes.
-    let _ = side.peers().note_route(&pin, route_uri(&used));
+    let _ = side.peers().note_route(&pin, used.route.uri());
     Ok(conn)
 }
 

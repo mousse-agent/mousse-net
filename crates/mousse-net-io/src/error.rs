@@ -37,6 +37,9 @@ pub enum NetError {
     StreamLimit,
     /// Reaching the host through a relay failed before the peer TLS.
     Relay(crate::relay::RelayError),
+    /// The route names, or resolved only to, addresses that are never
+    /// dialled (Phase 1b §1.2), or it is not approved for this peer.
+    Forbidden(String),
 }
 
 impl NetError {
@@ -52,6 +55,7 @@ impl NetError {
                 | NetError::Timeout(_)
                 | NetError::PeerCertificate(_)
                 | NetError::Relay(_)
+                | NetError::Forbidden(_)
         )
     }
 }
@@ -75,6 +79,7 @@ impl fmt::Display for NetError {
             NetError::Refused(e) => write!(f, "refused: {e}"),
             NetError::StreamLimit => f.write_str("too many open streams"),
             NetError::Relay(e) => write!(f, "{e}"),
+            NetError::Forbidden(e) => write!(f, "forbidden address: {e}"),
         }
     }
 }
