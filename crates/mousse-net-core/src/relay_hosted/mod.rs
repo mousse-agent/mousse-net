@@ -463,6 +463,8 @@ pub struct Hosted {
     events: VecDeque<Event>,
     stopping: bool,
     reports: ReportQueue,
+    /// A lease became final since the reporter last looked.
+    report_wake: bool,
 }
 
 impl fmt::Debug for Hosted {
@@ -492,6 +494,7 @@ impl Hosted {
             events: VecDeque::new(),
             stopping: false,
             reports: ReportQueue::new(),
+            report_wake: false,
         }
     }
 
@@ -988,6 +991,18 @@ impl Hosted {
             entries: vec![status],
         });
         self.reports.note_final(now.mono);
+        self.report_wake = true;
+    }
+
+    /// Whether a lease became final since the last call: a snapshot may be
+    /// due sooner, so the reporter should look again.
+    pub fn take_report_wake(&mut self) -> bool {
+        std::mem::take(&mut self.report_wake)
+    }
+
+    /// Whether [`Hosted::poll`] has events waiting.
+    pub fn has_events(&self) -> bool {
+        !self.events.is_empty()
     }
 
     /// Make every lease that stopped being usable by time final.

@@ -341,7 +341,11 @@ impl Relay {
     /// Hosted: the earliest monotonic time a lease, refill or admission wait
     /// fires. Call [`Relay::tick`] then too.
     pub fn next_hosted_wake(&self, now: Now) -> Option<Millis> {
-        self.hosted.as_ref().and_then(|h| h.next_wakeup(now))
+        let h = self.hosted.as_ref()?;
+        if h.has_events() {
+            return Some(now.mono);
+        }
+        h.next_wakeup(now)
     }
 
     /// The relay id.
