@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "mac-mini",
+  "key": "04d63225e01c2fd84d8a4588702b08561c26da25295387d39876ea36c7f2deee75ec54bd53c9d5b09712f13f737f0ece0038931c8226886a42d77430c7c4e486ee",
+  "payload": "{\"check\":\"phase0.cpace-vectors\",\"target\":\"macos-arm64\",\"build\":\"0e745a7398c0b2f6f0ab62909a343cf8145b5f01+debug\",\"platform\":\"macos-aarch64\",\"outcome\":\"PASS\",\"details\":\"23 tests passed\",\"time\":\"2026-11-19T05:28:54Z\",\"device\":\"mac-mini\",\"config\":\"3b4badebc3ae7943226df9d877eaf21bf970743ff0fc1a783bad33bce1e63c9f\"}",
+  "signature": "aab4240f53f79e047dde122f5c2f8a5acad02d2b206719552ca555ebcc4da832f1926b14f0446bbba5b30a4b8654f6140eceaf5f550d202deffea91f05125d18"
+}
