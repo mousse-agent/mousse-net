@@ -175,7 +175,11 @@ pub async fn resolve(
         }
     };
     let found = match host {
-        mousse_net_core::pairing::RouteHost::Dns(name) => resolver.resolve(name, port).await?,
+        mousse_net_core::pairing::RouteHost::Dns(name) => {
+            // A check's egress fence resolves no name (debug builds only).
+            super::test_egress::check_name(name, port)?;
+            resolver.resolve(name, port).await?
+        }
         _ => route
             .ip()
             .map(|ip| vec![SocketAddr::new(ip, port)])

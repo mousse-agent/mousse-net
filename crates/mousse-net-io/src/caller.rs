@@ -346,6 +346,10 @@ impl Opener {
         addr: Option<SocketAddr>,
     ) -> Result<BoxPipe, NetError> {
         let within = self.within(route.kind());
+        if let Some(addr) = addr {
+            // A check's egress fence (debug builds only).
+            pipe::test_egress::check_ip(addr.ip(), addr.port())?;
+        }
         let dialer = match route.kind() {
             RouteKind::Tcp => {
                 let mut addr = addr.ok_or_else(|| NetError::Refused("no address".into()))?;
