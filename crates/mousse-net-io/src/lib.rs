@@ -18,6 +18,7 @@
 //! - [`discovery`]: mDNS with a rotating random instance name.
 //! - [`watch`]: interface changes and wakes, for the caller to redial.
 //! - [`limits`]: every limit, its default and allowed range.
+//! - [`relay`]: calling, joining and registering through a relay.
 // Only `private` (the Windows security calls) may use unsafe code.
 #![deny(unsafe_code)]
 
@@ -34,6 +35,7 @@ pub mod keystore;
 pub mod limits;
 pub mod pipe;
 pub mod private;
+pub mod relay;
 pub mod rng;
 pub mod store;
 pub mod tls;
@@ -64,7 +66,8 @@ pub type SharedSigner = Arc<dyn IdentitySigner + Send + Sync>;
         mousse_control = "shared-endpoint-state",
         mousse_control = "allow-break-env",
         mousse_control = "no-stream-cap",
-        mousse_control = "stop-on-mismatch"
+        mousse_control = "stop-on-mismatch",
+        mousse_control = "no-pin-relay"
     )
 ))]
 compile_error!("a mousse_control build has a deliberate defect and is for tests only; build it without --release");
@@ -77,7 +80,8 @@ compile_error!("a mousse_control build has a deliberate defect and is for tests 
     mousse_control = "shared-endpoint-state",
     mousse_control = "allow-break-env",
     mousse_control = "no-stream-cap",
-    mousse_control = "stop-on-mismatch"
+    mousse_control = "stop-on-mismatch",
+    mousse_control = "no-pin-relay"
 ))]
 const _: () = {
     let profile = env!("MOUSSE_BUILD_PROFILE").as_bytes();
@@ -104,6 +108,8 @@ pub const CONTROL: Option<&str> = if cfg!(mousse_control = "skip-pin-check") {
     Some("allow-break-env")
 } else if cfg!(mousse_control = "no-stream-cap") {
     Some("no-stream-cap")
+} else if cfg!(mousse_control = "no-pin-relay") {
+    Some("no-pin-relay")
 } else {
     None
 };

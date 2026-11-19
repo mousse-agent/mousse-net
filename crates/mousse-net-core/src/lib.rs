@@ -18,6 +18,7 @@
 //! - [`pairing`]: tickets, join proofs, host and joiner pairing state machines.
 //! - [`mux`]: frame codec, per-stream credit, priority scheduler, keepalive.
 //! - [`session`]: certificate-driven session lifetime and path switching.
+//! - [`relay_wire`]: the relay protocol as an endpoint speaks it.
 //! - [`limits`]: every tunable limit, its default and allowed range.
 #![forbid(unsafe_code)]
 
@@ -75,6 +76,7 @@ pub mod identity;
 pub mod limits;
 pub mod mux;
 pub mod pairing;
+pub mod relay_wire;
 pub mod session;
 pub mod session_cert;
 pub mod time;

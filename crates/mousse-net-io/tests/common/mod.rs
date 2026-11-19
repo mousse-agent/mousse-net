@@ -229,7 +229,7 @@ async fn accept_loop(
 }
 
 /// Echo every stream on `conn` until it closes.
-async fn serve_echo(conn: Connection, streams: Arc<AtomicUsize>) {
+pub async fn serve_echo(conn: Connection, streams: Arc<AtomicUsize>) {
     while let Some(stream) = conn.accept_stream().await {
         streams.fetch_add(1, Ordering::SeqCst);
         tokio::spawn(async move {
