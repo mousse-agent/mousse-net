@@ -1160,6 +1160,14 @@ gains "Relays" and "Plus".
   aggregate counters only; no IP, handle or fingerprint is ever logged;
   core dumps off (`PR_SET_DUMPABLE` 0, `ulimit -c 0` in the image); panic
   messages carry no payload; the state directory holds only §B.1's files.
+  *Settled in E-R6:* the relay itself sets both at start of every command,
+  in every build: the core-dump limit to 0 (soft and hard, since the image
+  has no shell for `ulimit`) and `PR_SET_DUMPABLE` 0. Debug builds only
+  honour `MOUSSE_NET_RELAY_TEST_KEEP_DUMPABLE=1`, which skips the second, so
+  `phase3.marker` can sample the relay's memory; release builds ignore it.
+  `status --json` reports both; `phase3.relay-hardening` checks them (control
+  `relay-dumpable`), and `phase3.install` checks them in the release image
+  and under the systemd unit.
 - **Threats:** Part C's table, plus: Plus can deny service but never add
   trust; a stolen issuer key lets the thief forward relay traffic at our
   cost until rotation, never read or authorize anything.

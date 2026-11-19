@@ -17,7 +17,8 @@
         mousse_control = "marker-in-splice",
         mousse_control = "marker-in-relay-memory",
         mousse_control = "fifo-egress",
-        mousse_control = "relay-clock-pauses-in-sleep"
+        mousse_control = "relay-clock-pauses-in-sleep",
+        mousse_control = "relay-dumpable"
     ),
     not(debug_assertions)
 ))]
@@ -28,7 +29,8 @@ compile_error!("mousse_control plants a bug for tests; it is not allowed in rele
     mousse_control = "marker-in-splice",
     mousse_control = "marker-in-relay-memory",
     mousse_control = "fifo-egress",
-    mousse_control = "relay-clock-pauses-in-sleep"
+    mousse_control = "relay-clock-pauses-in-sleep",
+    mousse_control = "relay-dumpable"
 ))]
 const _: () = {
     let profile = env!("MOUSSE_BUILD_PROFILE").as_bytes();

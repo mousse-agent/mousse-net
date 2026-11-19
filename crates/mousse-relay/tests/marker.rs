@@ -172,6 +172,9 @@ async fn the_marker_never_shows_at_the_relay() {
         .arg(&path)
         .args(["run", "--listen", "127.0.0.1:0"])
         .env("MOUSSE_RELAY_TAP", &tap)
+        // Debug builds only: stay dumpable so this test can read the
+        // relay's memory (a release relay is never dumpable).
+        .env("MOUSSE_NET_RELAY_TEST_KEEP_DUMPABLE", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     if cfg!(mousse_control = "marker-in-relay-memory") {

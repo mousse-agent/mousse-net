@@ -618,7 +618,7 @@ const LINK = /^mousse-relay:\/\/([^/\s]+)\/#([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)$/
 function relayStatus(text) {
   try {
     const j = JSON.parse(text);
-    return { id: j.relay_id, sha256: j.build?.sha256 };
+    return { id: j.relay_id, sha256: j.build?.sha256, dumpable: j.process?.dumpable, core: j.process?.core_limit };
   } catch {
     return {};
   }
@@ -647,6 +647,7 @@ function checkService(name, linkId, sha256) {
   const st = relayStatus(status.stdout);
   if (!st.id || st.id !== linkId) fail("identity", `status relay id ${st.id} against link ${linkId}`);
   if (st.sha256 !== sha256) fail("build-hash", `installed relay ${st.sha256}, release ${sha256}`);
+  if (st.dumpable !== false || st.core !== 0) fail("dumpable", `installed relay dumpable ${st.dumpable}, core limit ${st.core}`);
 }
 
 async function install() {
@@ -750,6 +751,7 @@ async function install() {
       const st = relayStatus(status.stdout);
       if (st.id !== linkRelay(m)) fail("identity", `round ${round}: status relay id ${st.id} against link ${linkRelay(m)}`);
       if (st.sha256 !== sha256) fail("build-hash", `image relay ${st.sha256}, release ${sha256}`);
+      if (st.dumpable !== false || st.core !== 0) fail("dumpable", `image relay dumpable ${st.dumpable}, core limit ${st.core}`);
     }
     say("The relay image keeps its identity in the state volume across restarts");
 

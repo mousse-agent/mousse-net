@@ -222,6 +222,25 @@ env = { RUSTFLAGS = '--cfg mousse_control="no-endpoint-lock"' }
 # Ubuntu cloud image are fetched once by pinned hash.
 
 [[check]]
+id = "phase3.relay-hardening"
+title = "Every relay command starts with core dumps off (hard limit 0) and the process non-dumpable; only a debug build honours the test hook that keeps it dumpable"
+plan = "design §B.15 \"Docker\" (core dumps off), §B.16 (PR_SET_DUMPABLE 0); phase3.install checks the same in the release image and the systemd unit"
+targets = ["linux-x64"]
+judge = "cargo-test"
+min_tests = 2
+device_steps = "in Linux: mousse-check run phase3.relay-hardening --sign-with <key>, then the same with --control"
+
+[[check.local]]
+target = "linux-x64"
+host = "linux-x86_64"
+command = ["cargo", "test", "-p", "mousse-relay", "--test", "hardening", "--no-fail-fast"]
+
+[[check.control]]
+name = "relay-dumpable"
+breaks = "the relay leaves its process dumpable, so same-user processes can read its memory"
+env = { RUSTFLAGS = '--cfg mousse_control="relay-dumpable"' }
+
+[[check]]
 id = "phase3.reproducible"
 title = "Two independent builds of the relay give the same hash; the minisign signature verifies; install.sh refuses an unsigned, tampered, re-signed or replayed download"
 plan = "design §B.15 \"Reproducible builds\" and \"Signed\"; Part G.1"

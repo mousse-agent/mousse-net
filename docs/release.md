@@ -102,7 +102,8 @@ root, all capabilities dropped (Docker lets an unprivileged process bind 443
 inside the container), `no-new-privileges`, core dumps off and one named
 volume at `/state`. The image is `scratch` plus the static binary: no shell,
 no package manager, user 65532. The relay sets its own core-dump limit
-to 0 at start, so dumps stay off without a shell to run `ulimit -c 0`.
+to 0 at start and makes its process non-dumpable (`PR_SET_DUMPABLE` 0),
+so dumps stay off without a shell to run `ulimit -c 0` (design §B.16).
 
     docker compose run --rm relay init --state /state --public <ip or name>:443
     docker compose up -d

@@ -10,6 +10,11 @@ use mousse_net_core::relay::RelayLimits;
 /// Prefix of every limit variable.
 pub const ENV_PREFIX: &str = "MOUSSE_NET_";
 
+/// A test hook, not a limit: debug builds keep the process dumpable when it
+/// is `1` (`phase3.marker` samples the relay's memory). Release builds
+/// ignore it. Never refused as an unknown name.
+pub const TEST_KEEP_DUMPABLE: &str = "MOUSSE_NET_RELAY_TEST_KEEP_DUMPABLE";
+
 /// Digits only: no sign, spaces, units or underscores.
 fn parse_whole(text: &str) -> Option<u64> {
     if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
@@ -31,6 +36,9 @@ pub fn from_vars(
         let Some(name) = key.strip_prefix(ENV_PREFIX) else {
             continue;
         };
+        if key == TEST_KEEP_DUMPABLE {
+            continue;
+        }
         // Hosted mode's limits and settings are read with its settings.
         if mousse_relay_plus::settings::is_known(key) {
             continue;

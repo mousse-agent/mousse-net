@@ -145,6 +145,7 @@ fn run(cli: Cli) -> Result<(), String> {
                         "sha256": executable_sha256()?,
                     },
                     "log": { "destination": "stderr" },
+                    "process": process_hardening(),
                     "state": state_listing(dir.path())?,
                 });
                 println!("{status:#}");
@@ -206,11 +207,19 @@ fn run(cli: Cli) -> Result<(), String> {
 /// Core dumps off before anything else runs (design §B.15, §B.16): a crash
 /// must not write the identity key or spliced bytes to disk, wherever the
 /// relay runs (the image has no shell to set `ulimit -c 0`). The hard limit
-/// goes to 0 too, so nothing in the process can raise it again.
+/// goes to 0 too, so nothing in the process can raise it again. The process
+/// is also made non-dumpable (`PR_SET_DUMPABLE` 0), so other processes of
+/// the same user cannot attach to it or read its memory through `/proc`.
+///
+/// Debug builds only: `MOUSSE_NET_RELAY_TEST_KEEP_DUMPABLE=1` keeps the
+/// process dumpable, so `phase3.marker` can sample the relay's memory.
+/// Release builds ignore it.
 fn no_core_dumps() {
     #[cfg(target_os = "linux")]
     {
-        use rustix::process::{setrlimit, Resource, Rlimit};
+        use rustix::process::{
+            set_dumpable_behavior, setrlimit, DumpableBehavior, Resource, Rlimit,
+        };
         let none = Rlimit {
             current: Some(0),
             maximum: Some(0),
@@ -218,7 +227,32 @@ fn no_core_dumps() {
         if let Err(e) = setrlimit(Resource::Core, none) {
             eprintln!("mousse-relay: cannot turn core dumps off: {e}");
         }
+        let keep = cfg!(debug_assertions)
+            && std::env::var_os(limits::TEST_KEEP_DUMPABLE).is_some_and(|v| v == "1");
+        // The `relay-dumpable` control build (tests only) leaves it dumpable.
+        if !keep && !cfg!(mousse_control = "relay-dumpable") {
+            if let Err(e) = set_dumpable_behavior(DumpableBehavior::NotDumpable) {
+                eprintln!("mousse-relay: cannot make the process non-dumpable: {e}");
+            }
+        }
     }
+}
+
+/// This process's core-dump limit and whether it is dumpable (Linux), for
+/// `status --json`.
+fn process_hardening() -> serde_json::Value {
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::process::{dumpable_behavior, getrlimit, DumpableBehavior, Resource};
+        let core = getrlimit(Resource::Core);
+        serde_json::json!({
+            "dumpable": dumpable_behavior().ok().map(|d| d != DumpableBehavior::NotDumpable),
+            "core_limit": core.current,
+            "core_limit_max": core.maximum,
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    serde_json::json!({})
 }
 
 /// SHA-256 of the running executable, as `SHA256SUMS` lists it.

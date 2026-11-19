@@ -175,11 +175,7 @@ impl IdentityStore {
             .map_err(|e| NetError::Store(format!("{}: {e}", self.dir.display())))?;
         let key = SoftwareKey::generate(&mut os_rng());
         let secret = key.secret_bytes();
-        let in_keystore = |user: &str| -> Result<(), NetError> {
-            keyring_entry(user)?
-                .set_secret(secret.as_slice())
-                .map_err(|e| NetError::Store(format!("keystore: {e}")))
-        };
+        let in_keystore = |user: &str| os_keystore::set(user, secret.as_slice());
         let in_file = |name: &str| -> Result<(), NetError> {
             // write_atomic makes the file owner-only before any byte.
             let text = Zeroizing::new(hex(secret.as_slice()));
@@ -249,11 +245,7 @@ impl IdentityStore {
                     .keyring_user
                     .as_deref()
                     .ok_or_else(|| NetError::Store("identity file has no keystore entry".into()))?;
-                let secret = Zeroizing::new(
-                    keyring_entry(user)?
-                        .get_secret()
-                        .map_err(|e| NetError::Store(format!("keystore: {e}")))?,
-                );
+                let secret = os_keystore::get(user)?;
                 (secret, KeyStorage::OsKeystore)
             }
             "file" => {
@@ -304,10 +296,7 @@ impl IdentityStore {
     pub fn delete(&self) -> Result<(), NetError> {
         let file = self.read_file()?;
         if let Some(user) = file.keyring_user.as_deref() {
-            match keyring_entry(user)?.delete_credential() {
-                Ok(()) | Err(keyring::Error::NoEntry) => {}
-                Err(e) => return Err(NetError::Store(format!("keystore: {e}"))),
-            }
+            os_keystore::delete(user)?;
         }
         for name in [self.file, self.insecure_file, self.file_key_file] {
             let path = self.dir.join(name);
@@ -353,9 +342,61 @@ pub fn keyring_user(endpoint_id: &str) -> String {
     format!("endpoint-{endpoint_id}")
 }
 
-fn keyring_entry(user: &str) -> Result<keyring::Entry, NetError> {
-    keyring::Entry::new(KEYRING_SERVICE, user)
-        .map_err(|e| NetError::Store(format!("keystore: {e}")))
+/// The OS keystore, when this build has one (feature `os-keystore`, on by
+/// default). The relay builds without it: it keeps no endpoint identity,
+/// and a static Linux build cannot link the Secret Service client.
+#[cfg(feature = "os-keystore")]
+mod os_keystore {
+    use super::{NetError, KEYRING_SERVICE};
+    use zeroize::Zeroizing;
+
+    fn entry(user: &str) -> Result<keyring::Entry, NetError> {
+        keyring::Entry::new(KEYRING_SERVICE, user)
+            .map_err(|e| NetError::Store(format!("keystore: {e}")))
+    }
+
+    pub fn set(user: &str, secret: &[u8]) -> Result<(), NetError> {
+        entry(user)?
+            .set_secret(secret)
+            .map_err(|e| NetError::Store(format!("keystore: {e}")))
+    }
+
+    pub fn get(user: &str) -> Result<Zeroizing<Vec<u8>>, NetError> {
+        Ok(Zeroizing::new(
+            entry(user)?
+                .get_secret()
+                .map_err(|e| NetError::Store(format!("keystore: {e}")))?,
+        ))
+    }
+
+    pub fn delete(user: &str) -> Result<(), NetError> {
+        match entry(user)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(NetError::Store(format!("keystore: {e}"))),
+        }
+    }
+}
+
+#[cfg(not(feature = "os-keystore"))]
+mod os_keystore {
+    use super::NetError;
+    use zeroize::Zeroizing;
+
+    fn none() -> NetError {
+        NetError::Store("keystore: this build has no OS keystore".into())
+    }
+
+    pub fn set(_user: &str, _secret: &[u8]) -> Result<(), NetError> {
+        Err(none())
+    }
+
+    pub fn get(_user: &str) -> Result<Zeroizing<Vec<u8>>, NetError> {
+        Err(none())
+    }
+
+    pub fn delete(_user: &str) -> Result<(), NetError> {
+        Err(none())
+    }
 }
 
 #[cfg(test)]
