@@ -233,7 +233,13 @@ fn inbound_passes_only_app_labels_and_outbound_refuses_host_opened_streams() {
     let reset = p.b.event("stream.reset", |m| m["handle"] == h);
     assert_eq!(reset["code"], "cancelled");
 
-    assert_eq!(p.a.events("stream.incoming").len(), 1);
+    // One editor tunnel (Phase 1b §9.2) reaches the app with its label.
+    p.b.open(p.b_conn, "mousse.tunnel", "interactive");
+    let tunnel = p.a.incoming(p.a_conn, 1);
+    let incoming = p.a.event("stream.incoming", |m| m["handle"] == tunnel);
+    assert_eq!(incoming["label"], "mousse.tunnel");
+
+    assert_eq!(p.a.events("stream.incoming").len(), 2);
     assert!(p.b.events("stream.incoming").is_empty());
     p.a.assert_clean();
     p.b.assert_clean();
@@ -434,4 +440,28 @@ fn init_for_the_app_exits_when_its_stdin_closes() {
     let mut init = end.cli_env(&["init", "--app"], &[]);
     assert_eq!(init.exit_within(WAIT), Some(0), "{}", init.err());
     assert!(init.out().contains("created endpoint"), "{}", init.out());
+}
+
+/// A device with no grant dials in and waits for a proof it never sends:
+/// the host's app hears nothing of it, before or after the proof wait
+/// closes it (Phase 1b §6.1, the helper's `inbound`).
+#[test]
+fn a_connection_that_never_becomes_live_is_never_announced() {
+    let a_end = Endpoint::init("unlive-a");
+    let b_end = Endpoint::init("unlive-b");
+    let mut a = a_end.app("hostA", &[("JOIN_PROOF_WAIT_MS", "1000")]);
+    let mut b = b_end.app("peerB", &[]);
+    a.hello();
+    b.hello();
+    let route = route_of(&mut a);
+    // B pins A, but A never grants B.
+    let (identity, name) = (a.identity.clone(), a.name.clone());
+    b.call(
+        "peer.add",
+        json!({"identity": identity, "name": name, "routes": [route]}),
+    );
+    // Long enough for B's dial, A's proof wait and its close.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert!(a.events("conn.up").is_empty(), "{:?}", a.events("conn.up"));
+    a.assert_clean();
 }

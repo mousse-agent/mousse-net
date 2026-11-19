@@ -68,12 +68,14 @@ use crate::revoke::Removal;
 const PROTO: (u64, u64) = (1, 0);
 
 /// The stream labels an inbound connection passes on to the app (§3.2).
-pub const LABELS: [&str; 5] = [
+pub const LABELS: [&str; 6] = [
     "mousse.hello",
     "mousse.rpc",
     "mousse.sub",
     "mousse.blob",
     "mousse.put",
+    // One editor tunnel (Phase 1b §9.2).
+    "mousse.tunnel",
 ];
 
 /// What the app learns in the `hello` reply.
@@ -306,7 +308,9 @@ impl App {
     /// An inbound connection: announced once it is live.
     pub async fn inbound(&self, conn: Connection) {
         let peer = short_id(conn.peer());
-        if !conn.settled(true).await.is_live() {
+        // Must-fail control: announce the connection before step 2 settles.
+        let wait_for_live = !cfg!(mousse_control = "inbound-before-live");
+        if wait_for_live && !conn.settled(true).await.is_live() {
             applog::line(format!("refused {peer}: not live"));
             return;
         }

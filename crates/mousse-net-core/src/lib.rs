@@ -32,7 +32,9 @@
         mousse_control = "break-authz",
         mousse_control = "break-raw-signature",
         mousse_control = "break-cpace-confirm",
-        mousse_control = "break-cpace-sid"
+        mousse_control = "break-cpace-sid",
+        mousse_control = "admit-ungranted",
+        mousse_control = "join-only-streams"
     ),
     not(debug_assertions)
 ))]
@@ -45,7 +47,9 @@ compile_error!("mousse_control plants a bug for tests; it is not allowed in rele
     mousse_control = "break-authz",
     mousse_control = "break-raw-signature",
     mousse_control = "break-cpace-confirm",
-    mousse_control = "break-cpace-sid"
+    mousse_control = "break-cpace-sid",
+    mousse_control = "admit-ungranted",
+    mousse_control = "join-only-streams"
 ))]
 const _: () = {
     let profile = env!("MOUSSE_BUILD_PROFILE").as_bytes();
