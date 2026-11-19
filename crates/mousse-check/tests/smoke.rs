@@ -48,3 +48,21 @@ console.log('ok')
         String::from_utf8_lossy(&o.stderr)
     );
 }
+
+/// The node fixtures: the Mac relay, the loopback chat page and the Plus
+/// recorder (tools/app-check/test/fixtures.test.mjs).
+#[test]
+fn the_relay_chat_page_and_recorder_self_tests_pass() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let o = Command::new("node")
+        .args(["--test", "tools/app-check/test/fixtures.test.mjs"])
+        .current_dir(root)
+        .output()
+        .expect("node runs");
+    assert!(
+        o.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+}

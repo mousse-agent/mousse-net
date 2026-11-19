@@ -294,7 +294,7 @@ waits = [
   { slice = "E8", paths = ["crates/mousse-helper/tests/app_ws.rs"], case = "ws" },
   { slice = "E9", paths = ["crates/mousse-helper/tests/app_ssh.rs"], case = "ssh" },
 ]
-device_steps = "As phase1a.pair-offline, once per case, with phase1b.routes-cross --route <case> on both run.mjs commands; the Mac runs --role host and is the only side listening off loopback. tcp and ws pair by kit fixture (run.mjs --fixture); ssh by a real SSH add from the PC. Controls run per case, and each result names its case."
+device_steps = "As phase1a.pair-offline, once per case, with phase1b.routes-cross --route <case> on both run.mjs commands; the Mac runs --role host and is the only side listening off loopback. tcp and ws pair by kit fixture (the app script grants the PC on the Mac and pins the Mac on the PC, as phase1a.pair-offline does); ssh by a real SSH add from the PC. The PC runs with MOUSSE_NET_TEST_EGRESS=<mac LAN ip>. Controls run per case, and each result names its case."
 control = [
   { name = "plus-probe", expect_reason = "plus_contacted", breaks = "route setup asks Plus for anything", env = { MOUSSE_NET_ENGINE_CONTROL = "plus-probe" } },
   { name = "egress-probe", expect_reason = "egress_attempted", breaks = "the app contacts an address outside the cell", env = { MOUSSE_NET_ENGINE_CONTROL = "egress-probe" } },
@@ -334,7 +334,7 @@ title = "Mac: Send link; post it in the kit's loopback chat page; PC opens the p
 plan = "docs/phase1b-design.md §14 (chat fixture, deep link) and §15 order step 7"
 targets = ["pc-to-mac-lan"]
 manual = true
-steps = "Attest with both app and helper builds. Mac: node tools/app-check/relay.mjs serve; PC: node tools/app-check/relay.mjs dial and node tools/app-check/chat-page.mjs --link <link>; open the printed page in the default browser and click the link."
+steps = "Attest with both app and helper builds. The same throwaway token file (32+ hex digits) on both. Mac: node tools/app-check/relay.mjs serve --listen <mac LAN ip>:<port> --control <mac LAN ip>:<port> --token-file <file>. PC: node tools/app-check/relay.mjs dial --relay <mac LAN ip>:<control port> --to 127.0.0.1:<PC helper port> --token-file <file>, and share the relay listen address in pairback. Mac: Send link; PC: node tools/app-check/chat-page.mjs --link <link>, open the printed page in the default browser and click the link."
 
 [[check]]
 id = "phase1b.login-start"
