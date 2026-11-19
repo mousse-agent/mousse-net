@@ -33,7 +33,7 @@ use mousse_net_io::store::{
 use mousse_net_io::{ApprovalRequest, CodeEntry, HostEvent, NetError, NoCode};
 use serde_json::{json, Map, Value};
 use tokio::sync::mpsc;
-use tokio::task::AbortHandle;
+use tokio::task::JoinHandle;
 
 use super::{error, Shared};
 use crate::applog;
@@ -76,7 +76,7 @@ pub struct State {
 struct Join {
     /// The `join` request, answered when it ends.
     id: Value,
-    task: AbortHandle,
+    task: JoinHandle<()>,
     /// Where `join.code` sends a link's code.
     codes: Option<mpsc::UnboundedSender<String>>,
 }
@@ -186,7 +186,10 @@ pub fn on_request(shared: &Arc<Shared>, id: Value, op: &str, map: &Map<String, V
             None => return,
         },
         "join.code" => submit_code(shared, &id, map),
-        "join.cancel" => cancel_join(shared, &id, map),
+        "join.cancel" => match cancel_join(shared, &id, map) {
+            Some(reply) => reply,
+            None => return,
+        },
         "join.status" => join_status(shared, &id, map),
         "join.ack" => join_ack(shared, &id, map),
         "grants.list" => {
@@ -354,7 +357,7 @@ fn start_join(shared: &Arc<Shared>, id: &Value, map: &Map<String, Value>) -> Opt
         key,
         Join {
             id: id.clone(),
-            task: task.abort_handle(),
+            task,
             codes,
         },
     );
@@ -386,8 +389,8 @@ impl CodeEntry for ChannelCode {
     }
 
     async fn ask(&mut self, attempts_left: u8, retry: bool) -> Option<String> {
-        // A code sent before this ask was for an earlier one.
-        while self.typed.try_recv().is_ok() {}
+        // Every `join.code` is a code the owner submitted, so one sent
+        // early is kept for this ask rather than dropped.
         let ev = if retry {
             "join.attempt_failed"
         } else {
@@ -504,16 +507,28 @@ async fn join(
     shared.event(reply);
 }
 
-fn cancel_join(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
+/// Stop a join; `None` when the reply comes once it has stopped. The
+/// replies wait until the join has let go of its ticket, so a join of the
+/// same ticket started after them is not refused as one in progress.
+fn cancel_join(shared: &Arc<Shared>, id: &Value, map: &Map<String, Value>) -> Option<Value> {
     let Some(key) = str_field(map, "invitation").map(str::to_lowercase) else {
-        return error(id, "bad_request", "join.cancel needs invitation");
+        return Some(error(id, "bad_request", "join.cancel needs invitation"));
     };
     let Some(join) = state(shared).joins.remove(&key) else {
-        return error(id, "no_join", "no join with that invitation is running");
+        return Some(error(
+            id,
+            "no_join",
+            "no join with that invitation is running",
+        ));
     };
     join.task.abort();
-    shared.event(error(&join.id, "cancelled", "the join was cancelled"));
-    json!({"re": id})
+    let (shared, id) = (shared.clone(), id.clone());
+    tokio::spawn(async move {
+        let _ = join.task.await;
+        shared.event(error(&join.id, "cancelled", "the join was cancelled"));
+        shared.event(json!({"re": id}));
+    });
+    None
 }
 
 /// `join.code {invitation, code}`: the code typed for a link join. A code

@@ -387,7 +387,10 @@ fn a_code_that_is_not_six_digits_spends_no_attempt() {
         assert_eq!(reply["error"], "bad_code", "{bad:?}: {reply}");
     }
     assert!(a.events("join.attempt_failed").is_empty());
-    // No attempt started on the host either: no new code.
+    // No attempt started on the host either: no new code after the one
+    // shown again when A was let in.
+    nth(&b, "invite.code", &l.inv, 0);
+    settle_a_moment();
     assert_eq!(count(&b, "invite.code", &l.inv), 1);
     type_code(&mut a, &l.inv, &l.code());
     let reply = a.reply(id);
@@ -588,6 +591,10 @@ fn a_swapped_links_code_fails_and_the_real_invitation_is_untouched() {
     // B never saw A: its link still pairs with its first code.
     assert!(b.events("invite.code").is_empty());
     let id = join(&mut a, &real.uri(), json!({}));
+    assert_eq!(
+        nth(&a, "join.code_needed", &real.inv, 0)["attempts_left"],
+        3
+    );
     assert_eq!(nth(&b, "invite.code", &real.inv, 0)["attempts_left"], 3);
     type_code(&mut a, &real.inv, &real.code());
     let reply = a.reply(id);
