@@ -67,6 +67,10 @@ spec's value: it can only be tightened.
 | `MOUSSE_NET_IFACE_POLL_MS` | 5000 | 100 to 60000 | How often the network watcher lists the interfaces and reads the monotonic clock (Phase 1a §6 and §8). |
 | `MOUSSE_NET_WAKE_JUMP_MS` | 10000 | 1000 to 600000 | How far the monotonic clock may run past one watcher poll before the gap counts as a sleep and wake (Phase 1a §8). |
 | `MOUSSE_NET_WAKE_PING_MS` | 2000 | 100 to 30000 | After a wake or an interface change, how long each connection has to answer a PING before it is closed as dead (Phase 1a §8). |
+| `MOUSSE_NET_PREAUTH_TCP` | 48 | 1 to 48 | Host: TCP connections not yet live, per endpoint. The place is taken at accept, before anything is read, and held until the connection is live or closed (join-only: until enrollment, a close or the end of the invitation). One more is closed at accept (Phase 1b §6.2). |
+| `MOUSSE_NET_PREAUTH_WS` | 16 | 1 to 16 | Host: `ws` connections not yet live, per endpoint; its own pool, so a flood through a tunnel takes no TCP or pipe place. |
+| `MOUSSE_NET_PREAUTH_PIPE` | 4 | 1 to 4 | Host: pipe connections (an SSH login's `mousse-helper pipe`) not yet live, per endpoint; its own pool. |
+| `MOUSSE_NET_PREAUTH_PER_SOURCE` | 8 | 1 to 8 | Host: of the TCP ones, connections from one IPv4 address or one IPv6 /64. |
 
 ## Helper
 
@@ -100,8 +104,6 @@ spec's value: it can only be tightened.
 | `MOUSSE_NET_REMOVAL_RETRY_MS` | 1000 | 10 to 60000 | While networking is paused because a removal (`grant.remove`) could not be saved, how often the helper tries the save again (Phase 1a §5.4). |
 | `MOUSSE_NET_KEEP_RETRY_FIRST_MS` | 1000 | 10 to 60000 | App mode: wait before redialling a paired host that could not be reached; each next wait doubles (Phase 1a §6). |
 | `MOUSSE_NET_KEEP_RETRY_MAX_MS` | 60000 | 10 to 3600000 | App mode: longest wait between those redials; not below the first. |
-| `MOUSSE_NET_PREAUTH_CONNECTIONS` | 64 | 1 to 64 | Host: inbound connections not yet past step 2 (the TLS handshake, then authorization or pairing), from all addresses together. One more is dropped before its handshake starts, so slow or stalled handshakes cannot use up sockets and memory. |
-| `MOUSSE_NET_PREAUTH_PER_SOURCE` | 8 | 1 to 8 | Host: of those, connections from one source address; not above `PREAUTH_CONNECTIONS`. |
 | `MOUSSE_NET_REMOVAL_MAX_AGE_SECS` | 2592000 | 86400 to 2592000 | "Remove on all my hosts" (Phase 4 Part D): the oldest removal a host accepts and an admin device keeps queued, and how long a host keeps removal ids. Tighten only. |
 | `MOUSSE_NET_REMOVAL_ANSWER_WAIT_MS` | 10000 | 1000 to 120000 | How long one side of `mousse-removal` waits for the other's message (the signed removal, or the host's answer). |
 | `MOUSSE_NET_PLUS_TIMEOUT_MS` | 10000 | 1000 to 60000 | One Plus request. |
@@ -113,6 +115,8 @@ spec's value: it can only be tightened.
 | `MOUSSE_NET_PLUS_REFILL_DEADLINE_MS` | 5000 | 1000 to 9000 | After this long without a new block, relayed bulk shows paused; below the relay's default refill wait. |
 | `MOUSSE_NET_PLUS_MAIL_POLL_SECS` | 300 | 30 to 86400 | How often a host fetches its Plus inbox (also after a network change). |
 | `MOUSSE_NET_VIA_RELAY_MOVE_STAGE_SECS` | 86400 | 0 to 604800 | How long a move to another hosted relay stages the new route before cutting over. |
+| `MOUSSE_NET_IPC_LINE_MAX_BYTES` | 65536 | 1024 to 65536 | Local control channel: longest line a client may send; a longer one closes the channel (Phase 1b §6.2). |
+| `MOUSSE_NET_IPC_FIRST_LINE_WAIT_MS` | 2000 | 100 to 2000 | Local control channel: time a client has to send its first line before the channel is closed. |
 | `MOUSSE_NET_INIT_HOLD_MS` | 0 | 0 to 60000 | Checks only: how long `init` waits before it makes the endpoint, so the hard-kill check can stop the app during a first start. Run for the app (`--app`), its stdin closing still ends it at once. |
 
 ## Settings
@@ -162,6 +166,52 @@ Fixed on purpose in the relay protocol: the 16 384-byte relay message, the
 allow-set, 4 lease ids per `RELEASE`, the path, the subprotocol, the close
 codes, the refusal reasons, the domain strings and the exporter label
 (spec/relay.md 13).
+
+## Relay, hosted mode
+
+A relay in hosted mode also reads these (`docs/phase34-design.md` §H.1),
+with the same rules as the rows above. `HostedLimits` in
+`crates/mousse-net-core/src/relay_hosted/mod.rs` holds them, and
+`crates/mousse-relay-plus/src/settings.rs` reads them.
+
+| Variable | Default | Allowed | What it limits |
+| --- | --- | --- | --- |
+| `MOUSSE_NET_RELAY_REFILL_WAIT_MS` | 10000 | 1000 to 10000 | A paused class waits this long for a `LEASE` before its circuits close with 4001. With the longest peer keepalive (15 s) it stays below the shortest peer idle timeout (30 s), so it can only be shortened. |
+| `MOUSSE_NET_RELAY_REPORT_MS` | 10000 | 1000 to 60000 | Snapshot interval; below Plus's boot silence time (120 s by default). |
+| `MOUSSE_NET_RELAY_REPORT_MIN_MS` | 1000 | 100 to 5000 | Longest delay from a final to its snapshot, and the shortest gap between snapshots; below `REPORT_MS`. |
+| `MOUSSE_NET_RELAY_FINAL_REPORT_WAIT_MS` | 5000 | 0 to 60000 | On a graceful stop, how long to wait for the stopping snapshot to be stored. |
+| `MOUSSE_NET_RELAY_PLUS_TIMEOUT_MS` | 10000 | 1000 to 60000 | One call to Plus. |
+| `MOUSSE_NET_RELAY_CLOCK_RTT_MS` | 2000 | 100 to 10000 | Longest round trip whose Plus answer may set the Plus clock; a longer one only ends leases earlier. |
+| `MOUSSE_NET_RELAY_PLUS_RETRY_FIRST_MS` | 1000 | 100 to 60000 | First wait before sending a boot announcement or report part again after a failed call. Each next wait doubles; a `retry after` from Plus lengthens it. |
+| `MOUSSE_NET_RELAY_PLUS_RETRY_MAX_MS` | 30000 | 1000 to 600000 | Longest such wait; not below the first. |
+| `MOUSSE_NET_RELAY_PLUS_ANSWER_MAX_BYTES` | 65536 | 16384 to 1048576 | Largest Plus answer read. |
+
+Fixed, not variables (Part A of the design): `REQUEST_MAX` 16 384,
+`REPORT_MAX` 65 536, `REPORT_ENTRIES_MAX` 1024, `BLOCK_MAX_LIFETIME`
+172 800 s, `FORWARD_MARGIN` 180 s, the one-second rate burst, the 65 536
+rate-cap floor and smallest block, and at most four lease ids per
+`RELEASE`.
+
+### Settings
+
+Settings are not limits: they have no default and no range.
+
+| Variable | Required | Value |
+| --- | --- | --- |
+| `MOUSSE_NET_RELAY_PLUS_URL` | in hosted mode | The Plus base URL, `https://host[:port][/path]`. TLS 1.3 with the platform's certificate verifier and no pin (Plus is not a trust anchor). `http://` is accepted only to a loopback IP address, for tests on one machine. No user, query or fragment. A missing or bad value stops startup with a message naming the variable. |
+
+### State directory files (hosted)
+
+| File | What |
+| --- | --- |
+| `boot-generation` | The boot generation, a decimal number. At start, under the state directory's lock, the relay adds one and writes it durably (write, fsync, rename, folder sync) before it serves. A file that does not hold a number stops startup; the count never starts over. |
+| `report-key` | The P-256 report key (hex secret, owner-only), made on first start. It signs boot and report bodies. Its public key is what an operator adds to Plus's fleet. |
+
+The pinned issuer keys are a file in the relay's configuration: one
+issuer public key per line as 130 hex digits (the 65-byte SEC1 point),
+with blank lines and `#` comments ignored. `mousse-relay reload` reads it
+again without ending the boot; a file that does not parse leaves the keys
+in force.
 
 ## Fixed on purpose
 

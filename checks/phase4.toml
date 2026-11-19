@@ -1,15 +1,106 @@
-# Phase 4 (engine): the helper's Plus client, directory slots and the
-# inbox, and "remove on all my hosts" (docs/phase34-design.md Part G.2).
-#
-# Owner check: `mousse-check phase4` shows PASS in every target cell, with
-# no INCOMPLETE. Format: checks/README.md. Plus is the test stand-in on
-# loopback until the Plus team's double replaces it; no real account is
-# ever used.
+# Phase 4: the hosted relay, the helper's Plus client and "remove on all my
+# hosts" (docs/phase34-design.md Part G.2).
+# Format: checks/README.md.
 
 phase = "phase4"
-title = "Hosted relay, the helper's Plus client and remove on all my hosts"
-plan = "docs/phase34-design.md#part-g-owner-checks"
-# `local = [...]` and `control = [...]` are the inline form of [[check.local]] and [[check.control]].
+title = "Hosted relay, Plus client and remove on all my hosts"
+plan = "docs/phase34-design.md#g2-checksphase4toml"
+
+[defer]
+
+# ---------------------------------------------------------------------------
+# Hosted relay (E-L1)
+
+[[check]]
+id = "phase4.relay-leases"
+title = "Hosted relay: leases, sequences, aggregate rates, splitting, pause, release, finals on stop and admission expiry"
+plan = "docs/phase34-design.md G.2 phase4.relay-leases; A.9 duties; B.10"
+targets = ["linux-x64", "macos-arm64"]
+judge = "cargo-test"
+min_tests = 60
+# Today this runs the hosted state machine and the relay's link to Plus
+# against the test issuer stand-in. The relay-level cases (circuits through
+# a pause with the peer session alive, interactive written before bulk)
+# join when the relay itself (E-R2) lands; until then it is a placeholder.
+placeholder = "the relay-level cases need the relay itself (E-R2)"
+device_steps = "on that machine: mousse-check run phase4.relay-leases --sign-with <key>, then the same with --control"
+
+[[check.local]]
+target = "linux-x64"
+host = "linux-x86_64"
+command = ["cargo", "test", "-p", "mousse-net-core", "-p", "mousse-relay-plus", "--no-fail-fast"]
+
+[[check.local]]
+target = "macos-arm64"
+host = "macos-aarch64"
+command = ["cargo", "test", "-p", "mousse-net-core", "-p", "mousse-relay-plus", "--no-fail-fast"]
+
+[[check.control]]
+name = "per-socket-rate"
+breaks = "the rate bucket is kept per socket instead of per rate group and class, so parallel sockets multiply the cap"
+env = { RUSTFLAGS = '--cfg mousse_control="per-socket-rate"' }
+
+[[check.control]]
+name = "fifo-egress"
+breaks = "the relay's shared egress writes in arrival order instead of interactive before bulk"
+missing = "the shared egress comes with the relay itself (E-R2), which has not landed"
+
+[[check.control]]
+name = "accept-replayed-lease"
+breaks = "the block sequence check is skipped, so a settled or older block is accepted again"
+env = { RUSTFLAGS = '--cfg mousse_control="accept-replayed-lease"' }
+
+[[check.control]]
+name = "ignore-admission-expiry"
+breaks = "the admission token's not after is ignored: an unfunded registration stays and takes new leases"
+env = { RUSTFLAGS = '--cfg mousse_control="ignore-admission-expiry"' }
+
+[[check.control]]
+name = "close-funded-at-expiry"
+breaks = "a registration closes with 4004 at its token's not after even while its handle holds a usable block"
+env = { RUSTFLAGS = '--cfg mousse_control="close-funded-at-expiry"' }
+
+[[check.control]]
+name = "refuse-expired-reregister"
+breaks = "a REGISTER with an expired but otherwise valid token is refused even while the handle holds a usable block"
+env = { RUSTFLAGS = '--cfg mousse_control="refuse-expired-reregister"' }
+
+[[check]]
+id = "phase4.relay-move-clock"
+title = "Two relays with offset wall clocks: the old one forwards nothing past a lease's latest forwarding time on Plus's clock"
+plan = "docs/phase34-design.md G.2 phase4.relay-move-clock; A.9 duty 12"
+targets = ["linux-x64", "macos-arm64"]
+judge = "cargo-test"
+# Needs the relay (E-R2), the helper's relay move (E-L2) and the Plus
+# double. The relay's side of the Plus clock and its control are in place.
+placeholder = "needs the relay (E-R2), the helper's relay move (E-L2) and the Plus double"
+device_steps = "on that machine: mousse-check run phase4.relay-move-clock --sign-with <key>, then the same with --control"
+
+[[check.local]]
+target = "linux-x64"
+host = "linux-x86_64"
+command = ["cargo", "test", "-p", "mousse-net-core", "--no-fail-fast", "--lib", "relay_hosted::"]
+
+[[check.local]]
+target = "macos-arm64"
+host = "macos-aarch64"
+command = ["cargo", "test", "-p", "mousse-net-core", "--no-fail-fast", "--lib", "relay_hosted::"]
+
+[[check.control]]
+name = "expiry-on-relay-wall-clock"
+breaks = "lease windows are judged on the relay's own wall clock instead of its Plus clock"
+env = { RUSTFLAGS = '--cfg mousse_control="expiry-on-relay-wall-clock"' }
+
+[[check.control]]
+name = "fund-before-forward-limit"
+breaks = "Plus funds the new relay before the old relay's blocks pass their latest forwarding time"
+missing = "a Plus-side control: it comes with the Plus double (P8)"
+
+# ---------------------------------------------------------------------------
+# The helper's Plus client, directory and inbox (E-L2, E-L3) and "remove on
+# all my hosts" (E-L4). Plus is the test stand-in on loopback
+# (crates/mousse-helper/tests/common/plus_standin.rs) until the Plus team's
+# double replaces it; no real account is ever used.
 
 [[check]]
 id = "phase4.remove-everywhere"
@@ -17,18 +108,46 @@ title = "Grant lists to owners only; one removal per confirmed host and grant id
 plan = "docs/phase34-design.md Part D and F.1 (E-L4)"
 targets = ["windows-x64", "linux-x64"]
 min_tests = 23
-local = [
-  { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-net-core", "-p", "mousse-helper", "--no-fail-fast", "removal"] },
-  { target = "linux-x64", host = "linux-x86_64", command = ["cargo", "test", "-p", "mousse-net-core", "-p", "mousse-helper", "--no-fail-fast", "removal"] },
-]
-control = [
-  { name = "accept-any-signer", breaks = "a removal signed by a device without an owner grant is applied", env = { RUSTFLAGS = '--cfg mousse_control="accept-any-signer"' } },
-  { name = "ignore-owner", breaks = "a grant another owner authorized is removed", env = { RUSTFLAGS = '--cfg mousse_control="ignore-owner"' } },
-  { name = "ignore-grant-id", breaks = "a removal for an older grant id removes the newer pairing", env = { RUSTFLAGS = '--cfg mousse_control="ignore-grant-id"' } },
-  { name = "auto-send-unknown", breaks = "a grant the host lists after the user acted is removed without asking again", env = { RUSTFLAGS = '--cfg mousse_control="auto-send-unknown"' } },
-  { name = "resend-refused", breaks = "a resend after a lost answer is refused instead of getting its journaled result", env = { RUSTFLAGS = '--cfg mousse_control="resend-refused"' } },
-  { name = "removal-unsigned", breaks = "the removal record's signature is not checked", env = { RUSTFLAGS = '--cfg mousse_control="removal-unsigned"' } },
-]
+
+[[check.local]]
+target = "windows-x64"
+host = "windows-x86_64"
+command = ["cargo", "test", "-p", "mousse-net-core", "-p", "mousse-helper", "--no-fail-fast", "removal"]
+
+[[check.local]]
+target = "linux-x64"
+host = "linux-x86_64"
+command = ["cargo", "test", "-p", "mousse-net-core", "-p", "mousse-helper", "--no-fail-fast", "removal"]
+
+[[check.control]]
+name = "accept-any-signer"
+breaks = "a removal signed by a device without an owner grant is applied"
+env = { RUSTFLAGS = '--cfg mousse_control="accept-any-signer"' }
+
+[[check.control]]
+name = "ignore-owner"
+breaks = "a grant another owner authorized is removed"
+env = { RUSTFLAGS = '--cfg mousse_control="ignore-owner"' }
+
+[[check.control]]
+name = "ignore-grant-id"
+breaks = "a removal for an older grant id removes the newer pairing"
+env = { RUSTFLAGS = '--cfg mousse_control="ignore-grant-id"' }
+
+[[check.control]]
+name = "auto-send-unknown"
+breaks = "a grant the host lists after the user acted is removed without asking again"
+env = { RUSTFLAGS = '--cfg mousse_control="auto-send-unknown"' }
+
+[[check.control]]
+name = "resend-refused"
+breaks = "a resend after a lost answer is refused instead of getting its journaled result"
+env = { RUSTFLAGS = '--cfg mousse_control="resend-refused"' }
+
+[[check.control]]
+name = "removal-unsigned"
+breaks = "the removal record's signature is not checked"
+env = { RUSTFLAGS = '--cfg mousse_control="removal-unsigned"' }
 
 [[check]]
 id = "phase4.helper-plus"
@@ -36,16 +155,36 @@ title = "Sign-in with a typed code survives a lost answer; account and usage sho
 plan = "docs/phase34-design.md A.3 to A.8, B.10, B.11 and F.1 (E-L2)"
 targets = ["windows-x64", "macos-arm64"]
 min_tests = 23
-local = [
-  { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--no-fail-fast", "plus"] },
-  { target = "macos-arm64", host = "macos-aarch64", command = ["cargo", "test", "-p", "mousse-helper", "--no-fail-fast", "plus"] },
-]
-control = [
-  { name = "no-prefetch", breaks = "the next block is asked for only when the current one is gone", env = { RUSTFLAGS = '--cfg mousse_control="no-prefetch"' } },
-  { name = "new-request-id-on-retry", breaks = "a retried lease request gets a new request id, so a lost answer reserves a second block", env = { RUSTFLAGS = '--cfg mousse_control="new-request-id-on-retry"' } },
-  { name = "fund-two-relays", breaks = "a relay move asks Plus to fund the new relay while the old one still holds blocks", env = { RUSTFLAGS = '--cfg mousse_control="fund-two-relays"' } },
-  { name = "pause-all-classes", breaks = "a failed bulk refill pauses interactive too", env = { RUSTFLAGS = '--cfg mousse_control="pause-all-classes"' } },
-]
+
+[[check.local]]
+target = "windows-x64"
+host = "windows-x86_64"
+command = ["cargo", "test", "-p", "mousse-helper", "--no-fail-fast", "plus"]
+
+[[check.local]]
+target = "macos-arm64"
+host = "macos-aarch64"
+command = ["cargo", "test", "-p", "mousse-helper", "--no-fail-fast", "plus"]
+
+[[check.control]]
+name = "no-prefetch"
+breaks = "the next block is asked for only when the current one is gone"
+env = { RUSTFLAGS = '--cfg mousse_control="no-prefetch"' }
+
+[[check.control]]
+name = "new-request-id-on-retry"
+breaks = "a retried lease request gets a new request id, so a lost answer reserves a second block"
+env = { RUSTFLAGS = '--cfg mousse_control="new-request-id-on-retry"' }
+
+[[check.control]]
+name = "fund-two-relays"
+breaks = "a relay move asks Plus to fund the new relay while the old one still holds blocks"
+env = { RUSTFLAGS = '--cfg mousse_control="fund-two-relays"' }
+
+[[check.control]]
+name = "pause-all-classes"
+breaks = "a failed bulk refill pauses interactive too"
+env = { RUSTFLAGS = '--cfg mousse_control="pause-all-classes"' }
 
 [[check]]
 id = "phase4.directory"
@@ -53,12 +192,28 @@ title = "Slots per pairing from the pair secret; a removed pairing's slot and to
 plan = "docs/phase34-design.md A.5, A.6, A.13, B.12 and F.1 (E-L3)"
 targets = ["windows-x64", "linux-x64"]
 min_tests = 8
-local = [
-  { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-net-core", "-p", "mousse-helper", "--no-fail-fast", "--", "pairmail", "mailbox"] },
-  { target = "linux-x64", host = "linux-x86_64", command = ["cargo", "test", "-p", "mousse-net-core", "-p", "mousse-helper", "--no-fail-fast", "--", "pairmail", "mailbox"] },
-]
-control = [
-  { name = "keep-removed-slot", breaks = "a removed pairing's directory slot is not deleted", env = { RUSTFLAGS = '--cfg mousse_control="keep-removed-slot"' } },
-  { name = "unpinned-manifest", breaks = "a slot's manifest counts without the pinned host's signature", env = { RUSTFLAGS = '--cfg mousse_control="unpinned-manifest"' } },
-  { name = "trust-from-plus", breaks = "mail is acted on without opening it with a pairing's mail key", env = { RUSTFLAGS = '--cfg mousse_control="trust-from-plus"' } },
-]
+
+[[check.local]]
+target = "windows-x64"
+host = "windows-x86_64"
+command = ["cargo", "test", "-p", "mousse-net-core", "-p", "mousse-helper", "--no-fail-fast", "--", "pairmail", "mailbox"]
+
+[[check.local]]
+target = "linux-x64"
+host = "linux-x86_64"
+command = ["cargo", "test", "-p", "mousse-net-core", "-p", "mousse-helper", "--no-fail-fast", "--", "pairmail", "mailbox"]
+
+[[check.control]]
+name = "keep-removed-slot"
+breaks = "a removed pairing's directory slot is not deleted"
+env = { RUSTFLAGS = '--cfg mousse_control="keep-removed-slot"' }
+
+[[check.control]]
+name = "unpinned-manifest"
+breaks = "a slot's manifest counts without the pinned host's signature"
+env = { RUSTFLAGS = '--cfg mousse_control="unpinned-manifest"' }
+
+[[check.control]]
+name = "trust-from-plus"
+breaks = "mail is acted on without opening it with a pairing's mail key"
+env = { RUSTFLAGS = '--cfg mousse_control="trust-from-plus"' }

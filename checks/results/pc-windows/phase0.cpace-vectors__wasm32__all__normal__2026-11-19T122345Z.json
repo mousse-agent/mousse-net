@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "pc-windows",
+  "key": "048ad3ccda2d27fdfc98c131f2fa25bea736ec0a3e8a107dcbfa6b2f5a86b88da452c337f09925646ec76897452505e718f3f397ddf39674e9f5ad64590bc93d57",
+  "payload": "{\"check\":\"phase0.cpace-vectors\",\"target\":\"wasm32\",\"build\":\"8ae4d57d75eeccdbe7a4c1fa42feb101665a3f95+debug\",\"platform\":\"windows-x86_64\",\"outcome\":\"PASS\",\"details\":\"23 tests passed\",\"time\":\"2026-11-19T12:23:45Z\",\"device\":\"pc-windows\",\"config\":\"36dc0970a351fb1b4855f804508372891837e034b5573f04799f88c739185dca\"}",
+  "signature": "82411b86a9e65d0508f02d1393bb9a401176a0c3862f706d99da05207171f7c6646333151ab1b1caa3248ecf426379de9223b1ce249bd39b1bc27c2fb8572c02"
+}

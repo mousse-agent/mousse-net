@@ -90,6 +90,11 @@ fn lock_file(path: &Path, shared: bool) -> Result<File, NetError> {
         .truncate(false)
         .open(path)
         .map_err(|e| NetError::Store(format!("{}: {e}", path.display())))?;
+    // The `no-endpoint-lock` control build (tests only) takes no lock, so a
+    // second process runs the same endpoint.
+    if cfg!(mousse_control = "no-endpoint-lock") {
+        return Ok(file);
+    }
     let locked = if shared {
         file.try_lock_shared()
     } else {

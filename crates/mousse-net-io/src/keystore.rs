@@ -5,10 +5,14 @@
 //! Service on Linux. `identity.json` in the state directory records only the
 //! public key and where the secret lives.
 //!
+//! [`KeyStorage::File`] keeps the secret in an owner-only (`0600`) file in the
+//! state directory. It is for headless servers with no OS keystore (design
+//! §B.13): chosen when the endpoint is created, it loads like a keystore key,
+//! and a key file that others can read is refused.
+//!
 //! [`KeyStorage::InsecureFile`] keeps the secret in a plain file next to it.
-//! It exists for tests and headless runs where no keystore is reachable, and
-//! must be asked for explicitly both when the identity is created and every
-//! time it is loaded.
+//! It exists for tests, and must be asked for explicitly both when the
+//! identity is created and every time it is loaded.
 //!
 //! The same store keeps the endpoint's **Plus key** ([`IdentityStore::plus_key`],
 //! Phase 4): a separate P-256 key made when the endpoint first links to
@@ -37,21 +41,32 @@ const IDENTITY_FILE: &str = "identity.json";
 const INSECURE_KEY_FILE: &str = "identity.key";
 const PLUS_FILE: &str = "plus-key.json";
 const PLUS_INSECURE_FILE: &str = "plus-key.key";
+const FILE_KEY_FILE: &str = "identity.secret";
+const PLUS_FILE_KEY_FILE: &str = "plus-key.secret";
 
 /// Where the identity secret is kept.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyStorage {
     /// The operating system keystore.
     OsKeystore,
+    /// An owner-only file in the state directory, for headless servers
+    /// with no OS keystore.
+    File,
     /// A plain file in the state directory. Tests only.
     InsecureFile,
+    /// When creating only: the OS keystore if it takes the key, otherwise
+    /// [`KeyStorage::File`] (a headless server with no keystore). The
+    /// identity records which one was used.
+    KeystoreOrFile,
 }
 
 impl KeyStorage {
     fn name(self) -> &'static str {
         match self {
             KeyStorage::OsKeystore => "os-keystore",
+            KeyStorage::File => "file",
             KeyStorage::InsecureFile => "insecure-file",
+            KeyStorage::KeystoreOrFile => "keystore-or-file",
         }
     }
 }
@@ -110,6 +125,7 @@ pub struct IdentityStore {
     dir: PathBuf,
     file: &'static str,
     insecure_file: &'static str,
+    file_key_file: &'static str,
     user_suffix: &'static str,
 }
 
@@ -120,6 +136,7 @@ impl IdentityStore {
             dir: dir.to_path_buf(),
             file: IDENTITY_FILE,
             insecure_file: INSECURE_KEY_FILE,
+            file_key_file: FILE_KEY_FILE,
             user_suffix: "",
         }
     }
@@ -130,6 +147,7 @@ impl IdentityStore {
             dir: dir.to_path_buf(),
             file: PLUS_FILE,
             insecure_file: PLUS_INSECURE_FILE,
+            file_key_file: PLUS_FILE_KEY_FILE,
             user_suffix: "-plus",
         }
     }
@@ -157,18 +175,39 @@ impl IdentityStore {
             .map_err(|e| NetError::Store(format!("{}: {e}", self.dir.display())))?;
         let key = SoftwareKey::generate(&mut os_rng());
         let secret = key.secret_bytes();
-        let keyring_user = match storage {
+        let in_keystore = |user: &str| -> Result<(), NetError> {
+            keyring_entry(user)?
+                .set_secret(secret.as_slice())
+                .map_err(|e| NetError::Store(format!("keystore: {e}")))
+        };
+        let in_file = |name: &str| -> Result<(), NetError> {
+            // write_atomic makes the file owner-only before any byte.
+            let text = Zeroizing::new(hex(secret.as_slice()));
+            write_atomic(&self.dir.join(name), text.as_bytes())
+        };
+        let (storage, keyring_user) = match storage {
             KeyStorage::OsKeystore => {
                 let user = format!("{}{}", keyring_user(endpoint_id), self.user_suffix);
-                keyring_entry(&user)?
-                    .set_secret(secret.as_slice())
-                    .map_err(|e| NetError::Store(format!("keystore: {e}")))?;
-                Some(user)
+                in_keystore(&user)?;
+                (KeyStorage::OsKeystore, Some(user))
+            }
+            KeyStorage::KeystoreOrFile => {
+                let user = format!("{}{}", keyring_user(endpoint_id), self.user_suffix);
+                match in_keystore(&user) {
+                    Ok(()) => (KeyStorage::OsKeystore, Some(user)),
+                    Err(_) => {
+                        in_file(self.file_key_file)?;
+                        (KeyStorage::File, None)
+                    }
+                }
+            }
+            KeyStorage::File => {
+                in_file(self.file_key_file)?;
+                (KeyStorage::File, None)
             }
             KeyStorage::InsecureFile => {
-                let text = Zeroizing::new(hex(secret.as_slice()));
-                write_atomic(&self.dir.join(self.insecure_file), text.as_bytes())?;
-                None
+                in_file(self.insecure_file)?;
+                (KeyStorage::InsecureFile, None)
             }
         };
         let file = IdentityFile {
@@ -217,6 +256,15 @@ impl IdentityStore {
                 );
                 (secret, KeyStorage::OsKeystore)
             }
+            "file" => {
+                let path = self.dir.join(self.file_key_file);
+                check_owner_only(&path)?;
+                let text = Zeroizing::new(
+                    fs::read_to_string(&path)
+                        .map_err(|e| NetError::Store(format!("{}: {e}", path.display())))?,
+                );
+                (Zeroizing::new(unhex(text.trim())?), KeyStorage::File)
+            }
             "insecure-file" => {
                 if !allow_insecure_file {
                     return Err(NetError::Store(
@@ -261,7 +309,7 @@ impl IdentityStore {
                 Err(e) => return Err(NetError::Store(format!("keystore: {e}"))),
             }
         }
-        for name in [self.file, self.insecure_file] {
+        for name in [self.file, self.insecure_file, self.file_key_file] {
             let path = self.dir.join(name);
             if path.exists() {
                 fs::remove_file(&path)
@@ -270,6 +318,34 @@ impl IdentityStore {
         }
         Ok(())
     }
+}
+
+/// A key file must be readable by its owner only (`0600` or stricter, as
+/// `ssh` asks of a private key). On Windows the state directory's
+/// owner-only DACL, inherited by the file, does this.
+fn check_owner_only(path: &Path) -> Result<(), NetError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::symlink_metadata(path)
+            .map_err(|e| NetError::Store(format!("{}: {e}", path.display())))?;
+        if !meta.file_type().is_file() {
+            return Err(NetError::Store(format!(
+                "{} is not a plain file",
+                path.display()
+            )));
+        }
+        if meta.mode() & 0o077 != 0 {
+            return Err(NetError::Store(format!(
+                "{} can be read by other users (mode {:o}); make it 0600",
+                path.display(),
+                meta.mode() & 0o777
+            )));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 /// The keystore entry name for an endpoint.
@@ -318,6 +394,34 @@ mod tests {
             .unwrap();
         store.delete().unwrap();
         assert!(!store.exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_key_loads_without_the_flag_and_only_while_owner_only() {
+        let dir = temp_dir("idsoft");
+        let store = IdentityStore::new(&dir);
+        let created = store.create(KeyStorage::File, "ep1").unwrap();
+        let loaded = store.load(false).unwrap();
+        assert_eq!(loaded.public_key(), created.public_key());
+        assert_eq!(loaded.storage(), KeyStorage::File);
+        assert!(!dir.join(INSECURE_KEY_FILE).exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let key = dir.join(FILE_KEY_FILE);
+            assert_eq!(
+                fs::metadata(&key).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            fs::set_permissions(&key, fs::Permissions::from_mode(0o640)).unwrap();
+            let err = store.load(false).unwrap_err().to_string();
+            assert!(err.contains("make it 0600"), "{err}");
+            fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(store.load(false).is_ok());
+        }
+        store.delete().unwrap();
+        assert!(!dir.join(FILE_KEY_FILE).exists());
         fs::remove_dir_all(&dir).unwrap();
     }
 

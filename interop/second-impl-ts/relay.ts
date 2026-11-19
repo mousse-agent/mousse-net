@@ -663,7 +663,10 @@ export class SelfRelay {
     const proofOk = verify(message.proof!, callRecord(this.relayId, message.handle!, conn.nonce, conn.exporter,
       message.class!), message.key!);
     const open = this.circuits.filter(c => c.handle === handle && this.isCallerCircuit(c) && c.fingerprint === fingerprint);
-    if (!proofOk || !registration?.allow || !registration.allow.callers.has(fingerprint) ||
+    // Must-fail control (MOUSSE_SECOND_BREAK=relay-allow-set): any caller of a
+    // handle with an allow-set is admitted.
+    const listed = process.env.MOUSSE_SECOND_BREAK === 'relay-allow-set' || registration?.allow?.callers.has(fingerprint);
+    if (!proofOk || !registration?.allow || !listed ||
         open.length >= this.limits.RELAY_CIRCUITS_PER_CALLER) {
       conn.refuseAt = deadline;
       return;

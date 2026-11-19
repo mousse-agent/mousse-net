@@ -1761,3 +1761,69 @@ chats and bots stay out of 1b (§9).
 **Open questions**
 
 None.
+
+**Spike results (S1, S2)**
+
+Run 2026-11-19; method and full numbers in `spikes/ssh-pipe/README.md`
+and `spikes/route-policy/README.md`. The test server for E9 is
+`spikes/ssh-pipe/src/sshd.rs` (`russh =0.65.2`).
+
+S1, the pipe:
+
+1. Constrained config: works with the system client on Windows
+   (OpenSSH_for_Windows 9.5p2), macOS (10.3p1) and Linux (9.6p1), and PC to
+   Mac over the LAN. Settles §3.1 as written.
+2. Paths in the config: double quotes; a space and an apostrophe need
+   nothing more; on Windows backslashes or forward slashes both work. `%`
+   must be written `%%` (unescaped it fails, and `%d` silently reads the
+   wrong file). The same applies to a `-o` value on the command line.
+   Single quotes and bare paths fail.
+3. Probe: `-N` with every auth method off writes one `mousse-<id>` line to
+   the temporary file and exits 255 with `Permission denied (publickey).`
+   The line's base64 is the key; its SHA256 matches the server on all
+   three clients. The strict connect with that line passes; another key
+   fails with `Host key for mousse-<id> has changed ...`.
+4. Preamble: skipped, then 1 MiB of random bytes echoes back identical on
+   every OS pair. A `.zshenv` that prints without a final newline puts the
+   marker mid-line, so the client skips to the first `mousse-ssh/1\n`
+   anywhere within `SSH_PREAMBLE_MAX_BYTES`, not only at a line start
+   (§3.3, E9).
+5. 150-byte socket path on macOS: absolute bind fails; bind and connect by
+   the relative name after `chdir` work. Settles §3.3 "Long socket paths".
+6. Killing the client: the remote child was gone within 15 ms (macOS),
+   62 ms (Linux), 0.5 s (PC to Mac) and about 1 s (Windows).
+7. Stderr for the reason mapping: `Permission denied (publickey).`
+   (`auth_denied`); `REMOTE HOST IDENTIFICATION HAS CHANGED` / `Host key for
+   <alias> has changed` (`host_key_changed`); `No <TYPE> host key is known
+   for <alias>` (`host_key_unknown`); `connect to host <h> port <p>:
+   Connection refused` (`unreachable`); `Connection timed out` and
+   `Connection timed out during banner exchange` (`timeout`); exit 127 with
+   `not found` (`remote_not_installed`). Windows `ssh.exe` with
+   `ConnectTimeout` prints nothing for a refused port at `LogLevel=ERROR`,
+   so exit 255 with empty stderr maps to `unreachable`.
+8. Windows remotes: **no-go.** A key logon reaching a GUI-session pipe was
+   not tested (an S4U task needs admin rights here; no `sshd` installed),
+   nor `sshd`'s session teardown. The `cmd /c` form works only as
+   `""<launcher>" <args>"` (a path with `&` or parentheses breaks the plain
+   form). SSH add refuses Windows remotes with
+   `windows_remote_unsupported` in 1b.
+
+S2, route policy:
+
+1. Resolve once: a `.invalid` name that the system cannot resolve dialled
+   fine through rustls (SNI by name) and `client_async` on the TLS stream,
+   with one lookup for two dials. The platform verifier refuses the test
+   certificate without the extra root. Settles §1.2 and §4.2 as written.
+2. Bounded search, `DIAL_PARALLEL` 4, `DIAL_TIMEOUT_MS` 2000: 16 dead
+   candidates take 8.0 s on Windows (a refused loopback connect itself
+   takes about 2 s there, so every try times out) and 4.0 s on Linux; a
+   live 16th candidate wins at 6.1 s (Windows) and 2.0 s (Linux).
+3. cloudflared quick tunnel, once: upgrade, `mousse.1`, binary frames and a
+   65 536-byte message pass; upgrade at 735 ms cold and 97 ms warm; 1 KiB
+   round trip 11 ms median. The tunnel adds no `Origin`.
+
+Decisions: the §13.3 defaults hold (`TIER_HEAD_START_MS` 500,
+`WS_DIAL_TIMEOUT_MS` 10000, `SSH_DIAL_TIMEOUT_MS` 20000,
+`DIAL_FAST_TIERS_MS` 12000, `DIAL_SEARCH_MS` 45000); none changes. The
+`WS_MESSAGE_MAX_BYTES` floor is 16 384, the largest message a writer sends
+(§4.2), so the override range is 16 384 to 65 536, tighten only.

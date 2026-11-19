@@ -22,7 +22,7 @@ use mousse_net_io::store::write_atomic;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{
-    AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, Lines, ReadHalf, WriteHalf,
+    AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, ReadHalf, WriteHalf,
 };
 
 const CONTROL_FILE: &str = "control.json";
@@ -156,7 +156,7 @@ impl ControlListener {
             let fresh = mousse_net_io::private::create_pipe_server(&self.addr, false)
                 .map_err(|e| e.to_string())?;
             let connected = std::mem::replace(&mut self.next, fresh);
-            Ok(Channel::new(connected))
+            Ok(Channel::bounded(connected))
         }
         #[cfg(not(windows))]
         loop {
@@ -164,7 +164,7 @@ impl ControlListener {
             // Another user's connection is dropped unread. The folder is
             // owner-only, so this takes root or a socket passed on.
             match stream.peer_cred() {
-                Ok(cred) if cred.uid() == self.uid => return Ok(Channel::new(stream)),
+                Ok(cred) if cred.uid() == self.uid => return Ok(Channel::bounded(stream)),
                 _ => continue,
             }
         }
@@ -176,17 +176,79 @@ type BoxWrite = Box<dyn AsyncWrite + Send + Unpin>;
 
 /// One line-delimited JSON connection.
 pub struct Channel {
-    lines: Lines<BufReader<BoxRead>>,
+    rd: BufReader<BoxRead>,
     wr: BoxWrite,
+    /// The longest line read, on a listener's side (`IPC_LINE_MAX_BYTES`).
+    /// `None` on a command's side, which reads its own `serve`'s replies.
+    max_line: Option<usize>,
 }
 
 impl Channel {
-    /// Wrap an accepted or dialled stream.
+    /// Wrap a dialled stream.
     pub fn new<S: AsyncRead + AsyncWrite + Send + 'static>(stream: S) -> Self {
         let (rd, wr): (ReadHalf<S>, WriteHalf<S>) = tokio::io::split(stream);
         Self {
-            lines: BufReader::new(Box::new(rd) as BoxRead).lines(),
+            rd: BufReader::new(Box::new(rd) as BoxRead),
             wr: Box::new(wr),
+            max_line: None,
+        }
+    }
+
+    /// Wrap an accepted stream: every line at most `IPC_LINE_MAX_BYTES`
+    /// (Phase 1b §6.2).
+    pub fn bounded<S: AsyncRead + AsyncWrite + Send + 'static>(stream: S) -> Self {
+        let mut ch = Self::new(stream);
+        // Control (tests only): lines are read with no cap.
+        if !cfg!(mousse_control = "ipc-unbounded-line") {
+            ch.max_line = usize::try_from(crate::limits::helper().ipc_line_max_bytes()).ok();
+        }
+        ch
+    }
+
+    /// The first message on an accepted stream: it must come within
+    /// `IPC_FIRST_LINE_WAIT_MS`, else the channel counts as closed.
+    pub async fn recv_first(&mut self) -> Result<Option<Value>, String> {
+        if cfg!(mousse_control = "ipc-unbounded-line") {
+            return self.recv().await;
+        }
+        let wait = crate::limits::ms(crate::limits::helper().ipc_first_line_wait_ms());
+        match tokio::time::timeout(wait, self.recv()).await {
+            Ok(got) => got,
+            Err(_) => Err("no request in time".into()),
+        }
+    }
+
+    /// One line without its end, within `max_line` bytes. `None` at the
+    /// end of the stream with nothing read.
+    async fn read_line(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+        let mut line = Vec::new();
+        loop {
+            let buf = self.rd.fill_buf().await?;
+            if buf.is_empty() {
+                return Ok((!line.is_empty()).then_some(line));
+            }
+            let (take, done) = match buf.iter().position(|b| *b == b'\n') {
+                Some(i) => (i + 1, true),
+                None => (buf.len(), false),
+            };
+            line.extend_from_slice(&buf[..take]);
+            self.rd.consume(take);
+            if let Some(max) = self.max_line {
+                // The line end does not count.
+                if line.len() - usize::from(done) > max {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "line longer than IPC_LINE_MAX_BYTES",
+                    ));
+                }
+            }
+            if done {
+                line.pop();
+                if line.last() == Some(&b'\r') {
+                    line.pop();
+                }
+                return Ok(Some(line));
+            }
         }
     }
 
@@ -200,9 +262,9 @@ impl Channel {
 
     /// The next message; `None` when the other side closed.
     pub async fn recv(&mut self) -> Result<Option<Value>, String> {
-        match self.lines.next_line().await {
+        match self.read_line().await {
             Ok(None) => Ok(None),
-            Ok(Some(line)) => serde_json::from_str(&line)
+            Ok(Some(line)) => serde_json::from_slice(&line)
                 .map(Some)
                 .map_err(|e| format!("bad control message: {e}")),
             // A pipe whose other end went away reads as an error on Windows.

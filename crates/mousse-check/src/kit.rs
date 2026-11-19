@@ -22,6 +22,13 @@ pub fn host() -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
 }
 
+/// Which cells a run is limited to: one target, one named case, or both.
+#[derive(Clone, Copy, Default)]
+pub struct Only<'a> {
+    pub target: Option<&'a str>,
+    pub case: Option<&'a str>,
+}
+
 /// Which parts of a check to run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Parts {
@@ -200,6 +207,8 @@ impl Kit {
         let legacy = self.legacy_notes(m);
         let here = host();
         let app_revision = crate::app::read_revision(self.root()).ok();
+        let root = self.root().to_path_buf();
+        let exists = move |p: &str| root.join(p).exists();
         Ok(evaluate(&Inputs {
             manifest: m,
             host: &here,
@@ -211,6 +220,7 @@ impl Kit {
             rejected_paths: &rejected,
             legacy: &legacy,
             app_revision: app_revision.as_deref(),
+            exists: &exists,
         }))
     }
 
@@ -220,11 +230,15 @@ impl Kit {
         &self,
         m: &Manifest,
         c: &Check,
-        target: Option<&str>,
+        only: Only,
         parts: Parts,
         include_placeholders: bool,
         signer: Option<&Signer>,
     ) -> Result<bool, String> {
+        let Only {
+            target,
+            case: only_case,
+        } = only;
         let state = self.state()?;
         let here = host();
         let mut all_ok = true;
@@ -252,6 +266,17 @@ impl Kit {
                     c.id
                 );
             }
+            let exists = |p: &str| self.root().join(p).exists();
+            if let Some((w, path)) = c.waiting(None, &exists) {
+                eprintln!(
+                    "  {} @ {}: not run: waits for {} ({path} is not in this tree)",
+                    c.id, local.target, w.slice
+                );
+                if target.is_some() {
+                    all_ok = false;
+                }
+                continue;
+            }
             if c.app {
                 if let Err(why) = self.app_ready() {
                     eprintln!("  {} @ {}: not run: {why}", c.id, local.target);
@@ -277,9 +302,43 @@ impl Kit {
                     }
                 }
             }
-            for k in jobs {
+            let mut cases = Vec::new();
+            for case in c.cases(&local.target) {
+                if !c.controls_per_case() {
+                    cases.push(None);
+                    break;
+                }
+                if only_case.is_some_and(|o| Some(o) != case.as_deref()) {
+                    continue;
+                }
+                if let Some((w, path)) = c.waiting(case.as_deref(), &exists) {
+                    eprintln!(
+                        "  {} @ {} [{}]: not run: waits for {} ({path} is not in this tree)",
+                        c.id,
+                        local.target,
+                        case.as_deref().unwrap_or(""),
+                        w.slice
+                    );
+                    continue;
+                }
+                cases.push(case);
+            }
+            let jobs: Vec<_> = cases
+                .iter()
+                .flat_map(|case| jobs.iter().map(move |k| (case.as_deref(), *k)))
+                .collect();
+            for (case, k) in jobs {
                 let part = k.map(|k| k.name.as_str()).unwrap_or("normal");
-                let stem = format!("{}__{}__{}", c.id, file_part(&local.target), part);
+                let stem = match case {
+                    Some(case) => format!(
+                        "{}__{}__{}__{}",
+                        c.id,
+                        file_part(&local.target),
+                        file_part(case),
+                        part
+                    ),
+                    None => format!("{}__{}__{}", c.id, file_part(&local.target), part),
+                };
                 let out_dir = self.runs_dir().join("out").join(&stem);
                 let _ = std::fs::remove_dir_all(&out_dir);
                 std::fs::create_dir_all(&out_dir).map_err(|e| e.to_string())?;
@@ -289,12 +348,16 @@ impl Kit {
                 // the kit cannot read is recorded as `unknown`.
                 let profile = command_profile(&cmd).unwrap_or_else(|| "unknown".into());
                 let build = state.id(&profile).to_string();
-                eprint!("  {} @ {} [{part}] ... ", c.id, local.target);
+                match case {
+                    Some(case) => eprint!("  {} @ {} [{case}] [{part}] ... ", c.id, local.target),
+                    None => eprint!("  {} @ {} [{part}] ... ", c.id, local.target),
+                }
                 let started = Instant::now();
                 let vars = Vars {
                     root: self.root(),
                     out: &out_dir,
                     build: &build,
+                    case,
                 };
                 let output = execute(&cmd, &env, local.cwd.as_deref(), &vars, timeout, &log);
                 let judged = match k {
@@ -324,6 +387,7 @@ impl Kit {
                     check: c.id.clone(),
                     target: local.target.clone(),
                     part: part.to_string(),
+                    case: case.map(str::to_string),
                     build: build.clone(),
                     time: now_rfc3339(),
                     verdict: judged.verdict,
@@ -355,6 +419,7 @@ impl Kit {
                         s,
                         c,
                         &local.target,
+                        case,
                         k.map(|k| k.name.as_str()),
                         &build,
                         &rec,
@@ -388,6 +453,7 @@ impl Kit {
         s: &Signer,
         c: &Check,
         target: &str,
+        case: Option<&str>,
         control: Option<&str>,
         build: &str,
         rec: &RunRecord,
@@ -396,7 +462,7 @@ impl Kit {
         let base = ResultPayload {
             check: c.id.clone(),
             target: target.to_string(),
-            case: None,
+            case: case.map(str::to_string),
             control: control.map(str::to_string),
             build: build.to_string(),
             platform: s.platform.clone(),

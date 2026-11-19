@@ -10,7 +10,7 @@ use mousse_check::evidence::{
     DeviceList, ATTEST_FORMAT,
 };
 use mousse_check::kit::{
-    host, payload_from, public_hex, read_unsigned, write_signed, Kit, Parts, SignArgs, Signer,
+    host, payload_from, public_hex, read_unsigned, write_signed, Kit, Only, Parts, SignArgs, Signer,
 };
 use mousse_check::report::table;
 use mousse_check::util::now_rfc3339;
@@ -23,9 +23,10 @@ USAGE
       Run this machine's local checks and their must-fail controls, collect
       signed device results and attestations, print the table. Exit 0 only if
       the phase passes. Example: mousse-check phase0
-  mousse-check run <check-id> [--control] [--target <cell>]
+  mousse-check run <check-id> [--control] [--target <cell>] [--case <name>]
                    [--sign-with <key file> [--device <name>] [--platform <text>] [--out <dir>]]
-      Run one check here (or, with --control, its controls). With --sign-with,
+      Run one check here (or, with --control, its controls). A check with
+      named cases runs once per case, or only --case. With --sign-with,
       also write signed results, for a machine whose results another machine
       evaluates.
   mousse-check sign --device-key <key file> [--device <name>] [--check <id>] [--target <cell>]
@@ -50,6 +51,11 @@ USAGE
   mousse-check device list
   mousse-check report [<phase>] [--allow-dirty] [--full] [--json]
       Print the table from stored runs and results without running anything.
+  mousse-check relay-inspect --state <dir> [--binary <deployed> [--local <built>]] [--log <file>]
+      On a self-hosted relay: compare the deployed binary's hash with a local
+      build, list the state directory against the files a relay may keep,
+      and scan its log for addresses or identifiers. Never prints a secret.
+      Needs no checkout. Ends with PASS relay-inspect or FAIL relay-inspect.
 
 Global: --root <dir> (default: the git checkout containing the current folder).
 App checks (app = true) run only with MOUSSE_APP_DIR set to a clean checkout of
@@ -75,6 +81,10 @@ struct Args {
 
 const VALUE_FLAGS: &[&str] = &[
     "--root",
+    "--state",
+    "--binary",
+    "--local",
+    "--log",
     "--only",
     "--target",
     "--sign-with",
@@ -90,6 +100,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--key",
     "--targets",
     "--config",
+    "--case",
 ];
 
 impl Args {
@@ -158,6 +169,9 @@ fn real_main(raw: Vec<String>) -> Result<ExitCode, String> {
         print!("{HELP}");
         return Ok(ExitCode::SUCCESS);
     }
+    if cmd == "relay-inspect" {
+        return cmd_relay_inspect(&a);
+    }
     let kit = Kit::open(a.get("--root").map(Path::new))?;
     match cmd.as_str() {
         "run" => cmd_run(&kit, &a),
@@ -204,7 +218,7 @@ fn cmd_report(kit: &Kit, a: &Args, run_phase: Option<&str>) -> Result<ExitCode, 
             if !only.is_empty() && !only.contains(&c.id.as_str()) {
                 continue;
             }
-            kit.run_local(&m, c, None, Parts::Both, false, None)?;
+            kit.run_local(&m, c, Only::default(), Parts::Both, false, None)?;
         }
         eprintln!();
     }
@@ -236,6 +250,7 @@ fn cmd_run(kit: &Kit, a: &Args) -> Result<ExitCode, String> {
     a.only_known(&[
         "--control",
         "--target",
+        "--case",
         "--sign-with",
         "--device",
         "--platform",
@@ -275,7 +290,29 @@ fn cmd_run(kit: &Kit, a: &Args) -> Result<ExitCode, String> {
     } else {
         Parts::Normal
     };
-    let ok = kit.run_local(&m, &c, a.get("--target"), parts, true, signer.as_ref())?;
+    if let Some(case) = a.get("--case") {
+        if !c.cases.iter().any(|k| k == case) {
+            return Err(format!(
+                "{id} has no case {case} (cases: {})",
+                if c.cases.is_empty() {
+                    "none".to_string()
+                } else {
+                    c.cases.join(", ")
+                }
+            ));
+        }
+    }
+    let ok = kit.run_local(
+        &m,
+        &c,
+        Only {
+            target: a.get("--target"),
+            case: a.get("--case"),
+        },
+        parts,
+        true,
+        signer.as_ref(),
+    )?;
     Ok(if ok {
         ExitCode::SUCCESS
     } else {
@@ -423,6 +460,28 @@ fn cmd_sign(kit: &Kit, a: &Args) -> Result<ExitCode, String> {
 }
 
 /// `config-digest`: the digest a device records before producing a result.
+fn cmd_relay_inspect(a: &Args) -> Result<ExitCode, String> {
+    a.only_known(&["--state", "--binary", "--local", "--log"])?;
+    let state = a
+        .get("--state")
+        .ok_or("relay-inspect needs --state <dir>")?;
+    if a.get("--local").is_some() && a.get("--binary").is_none() {
+        return Err("--local needs --binary".into());
+    }
+    let report = mousse_check::inspect::run(
+        Path::new(state),
+        a.get("--binary").map(Path::new),
+        a.get("--local").map(Path::new),
+        a.get("--log").map(Path::new),
+    );
+    print!("{}", mousse_check::inspect::render(&report));
+    Ok(if report.problems.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    })
+}
+
 fn cmd_config_digest(kit: &Kit, a: &Args) -> Result<ExitCode, String> {
     a.only_known(&["--target", "--control"])?;
     let id = a

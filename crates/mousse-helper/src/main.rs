@@ -23,7 +23,21 @@
         mousse_control = "fund-two-relays",
         mousse_control = "keep-removed-slot",
         mousse_control = "unpinned-manifest",
-        mousse_control = "trust-from-plus"
+        mousse_control = "trust-from-plus",
+        mousse_control = "no-preauth-budget",
+        mousse_control = "shared-preauth-pool",
+        mousse_control = "ws-slot-after-headers",
+        mousse_control = "ipc-unbounded-line",
+        mousse_control = "ipc-handoff-drops-buffer",
+        mousse_control = "join-only-frees-slot",
+        mousse_control = "join-only-outlives-invitation",
+        mousse_control = "fence-at-accept-only",
+        mousse_control = "fence-tcp-only",
+        mousse_control = "enroll-while-paused",
+        mousse_control = "repair-skips-slot",
+        mousse_control = "repair-skips-fence",
+        mousse_control = "limits-raise",
+        mousse_control = "no-endpoint-lock"
     )
 ))]
 compile_error!("a mousse_control build has a deliberate defect and is for tests only; build it without --release");
@@ -54,6 +68,20 @@ compile_error!("test-in-person lets a typed ticket count as scanned from the hos
     mousse_control = "keep-removed-slot",
     mousse_control = "unpinned-manifest",
     mousse_control = "trust-from-plus",
+    mousse_control = "no-preauth-budget",
+    mousse_control = "shared-preauth-pool",
+    mousse_control = "ws-slot-after-headers",
+    mousse_control = "ipc-unbounded-line",
+    mousse_control = "ipc-handoff-drops-buffer",
+    mousse_control = "join-only-frees-slot",
+    mousse_control = "join-only-outlives-invitation",
+    mousse_control = "fence-at-accept-only",
+    mousse_control = "fence-tcp-only",
+    mousse_control = "enroll-while-paused",
+    mousse_control = "repair-skips-slot",
+    mousse_control = "repair-skips-fence",
+    mousse_control = "limits-raise",
+    mousse_control = "no-endpoint-lock",
     feature = "test-in-person"
 ))]
 const _: () = {
@@ -136,6 +164,8 @@ enum Command {
         /// `init` behind.
         #[arg(long)]
         app: bool,
+        #[command(flatten)]
+        headless: Headless,
     },
     /// Show this endpoint's device id and port.
     Id,
@@ -158,8 +188,10 @@ enum Command {
         /// docs/phase1a-design.md §2). The helper's own lines go to
         /// `helper.log` in the state directory, and it exits when stdin
         /// closes.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "headless")]
         app: bool,
+        #[command(flatten)]
+        headless: Headless,
     },
     /// Make an invitation on the running host and print the ticket and a QR
     /// code. In person (the default), answer "Is the device next to you?";
@@ -170,6 +202,10 @@ enum Command {
         /// a fresh one for each attempt.
         #[arg(long)]
         link: bool,
+        /// Show the ticket as a QR code in the terminal, for the phone's
+        /// in-app scanner (the default in person).
+        #[arg(long, conflicts_with_all = ["link", "no_qr"])]
+        qr: bool,
         /// Print only the ticket line, no QR code.
         #[arg(long)]
         no_qr: bool,
@@ -251,6 +287,56 @@ enum Command {
         #[arg(last = true)]
         command: Vec<String>,
     },
+}
+
+/// A headless endpoint (design §B.13): one endpoint on a server, no app,
+/// driven by this CLI. Its key goes in the OS keystore when one takes it,
+/// otherwise in an owner-only file in the state directory.
+#[derive(clap::Args, Debug, Clone, Copy)]
+struct Headless {
+    /// No app: create the endpoint on first start if the state directory
+    /// has none, with its key in the OS keystore or, where there is none,
+    /// in an owner-only file (0600) in the state directory.
+    #[arg(long)]
+    headless: bool,
+    /// With --headless: keep the key in the owner-only file even if an OS
+    /// keystore is available.
+    #[arg(long, requires = "headless")]
+    key_file: bool,
+}
+
+impl Headless {
+    fn storage(self) -> KeyStorage {
+        if self.key_file {
+            KeyStorage::File
+        } else {
+            KeyStorage::KeystoreOrFile
+        }
+    }
+}
+
+/// Create the endpoint in `dir` for a headless run and say where its key
+/// went.
+fn create_headless(
+    dir: &Path,
+    profile: Option<&str>,
+    headless: Headless,
+) -> Result<Endpoint, String> {
+    let (endpoint, key) =
+        Endpoint::create(dir, profile, headless.storage()).map_err(|e| e.to_string())?;
+    println!(
+        "created endpoint {} in {}",
+        short_id(&endpoint.identity()),
+        dir.display()
+    );
+    match key.storage() {
+        KeyStorage::OsKeystore => println!("identity key: in the OS keystore"),
+        _ => println!(
+            "identity key: in an owner-only file in {} (no OS keystore used)",
+            dir.display()
+        ),
+    }
+    Ok(endpoint)
 }
 
 /// How a ticket reached this device. A ticket given on the command line
@@ -580,13 +666,21 @@ async fn run(cli: Cli) -> Result<i32, String> {
     let dir = cli.state.unwrap_or_else(serve::default_state_dir);
     let insecure = cli.insecure_file_key;
     match cli.command {
-        Command::Init { profile, app } => {
+        Command::Init {
+            profile,
+            app,
+            headless,
+        } => {
             if app {
                 exit_when_stdin_closes();
             }
             let hold = crate::limits::helper().init_hold_ms();
             if hold > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(hold)).await;
+            }
+            if headless.headless {
+                create_headless(&dir, profile.as_deref(), headless)?;
+                return Ok(0);
             }
             let (endpoint, _) = Endpoint::create(&dir, profile.as_deref(), storage(insecure))
                 .map_err(|e| e.to_string())?;
@@ -623,7 +717,12 @@ async fn run(cli: Cli) -> Result<i32, String> {
             no_mdns,
             name,
             app,
+            headless,
         } => {
+            if headless.headless && !Endpoint::exists(&dir) {
+                // Dropped at once: serve opens it again and takes its locks.
+                create_headless(&dir, None, headless)?;
+            }
             let opts = serve::ServeOptions {
                 name: name.unwrap_or_else(computer_name),
                 listen_ip,
@@ -633,7 +732,7 @@ async fn run(cli: Cli) -> Result<i32, String> {
             };
             serve::run(&dir, insecure, opts).await?;
         }
-        Command::Invite { link, no_qr } => invite(&dir, link, no_qr).await?,
+        Command::Invite { link, qr: _, no_qr } => invite(&dir, link, no_qr).await?,
         Command::Join {
             ticket,
             arrival,

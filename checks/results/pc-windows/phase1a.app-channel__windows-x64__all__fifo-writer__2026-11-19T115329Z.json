@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "pc-windows",
+  "key": "048ad3ccda2d27fdfc98c131f2fa25bea736ec0a3e8a107dcbfa6b2f5a86b88da452c337f09925646ec76897452505e718f3f397ddf39674e9f5ad64590bc93d57",
+  "payload": "{\"check\":\"phase1a.app-channel\",\"target\":\"windows-x64\",\"control\":\"fifo-writer\",\"build\":\"8ae4d57d75eeccdbe7a4c1fa42feb101665a3f95+debug\",\"platform\":\"windows-x86_64\",\"outcome\":\"FAIL\",\"details\":\"1 of 18 tests failed\",\"time\":\"2026-11-19T11:53:29Z\",\"device\":\"pc-windows\",\"config\":\"24bf92dacb1888ca43ecbc93ae0591beef0655b0613a8370258f9162a503a9c0\"}",
+  "signature": "c97853932ea76c7c8060cf0cb297405cc1e6f9b2a491643ebf76197986728c41458faba3079c27733ed09635fe075e795defc2e72141077d6ae05eb896007f8e"
+}

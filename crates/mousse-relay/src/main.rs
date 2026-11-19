@@ -45,7 +45,13 @@ enum Command {
         fingerprint: String,
     },
     /// Print the relay id, address, and whether it is running.
-    Status,
+    Status {
+        /// Machine-readable, with this binary's SHA-256 (to compare with a
+        /// reproducible build of the release, docs/release.md), where the
+        /// log goes and the state directory's file list.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn default_state() -> &'static str {
@@ -114,10 +120,27 @@ fn run(cli: Cli) -> Result<(), String> {
             }
             println!("revoked");
         }
-        Command::Status => {
+        Command::Status { json } => {
             let dir = StateDir::open(&cli.state).map_err(s)?;
             let (_, _, public) = dir.public().map_err(s)?;
             let lists = dir.read().map_err(s)?;
+            if json {
+                let status = serde_json::json!({
+                    "relay_id": hex(&dir.relay_id().map_err(s)?.0),
+                    "public": public,
+                    "authorized": lists.authorized.len(),
+                    "codes": lists.codes.len(),
+                    "running": dir.running(),
+                    "build": {
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "sha256": executable_sha256()?,
+                    },
+                    "log": { "destination": "stderr" },
+                    "state": state_listing(dir.path())?,
+                });
+                println!("{status:#}");
+                return Ok(());
+            }
             println!("relay id   {}", hex(&dir.relay_id().map_err(s)?.0));
             println!("public     {public}");
             println!("authorized {}", lists.authorized.len());
@@ -148,6 +171,42 @@ fn run(cli: Cli) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// SHA-256 of the running executable, as `SHA256SUMS` lists it.
+fn executable_sha256() -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let exe = std::env::current_exe().map_err(|e| format!("own executable: {e}"))?;
+    let mut file = std::fs::File::open(&exe).map_err(|e| format!("{}: {e}", exe.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1 << 16];
+    loop {
+        let n = std::io::Read::read(&mut file, &mut buf)
+            .map_err(|e| format!("{}: {e}", exe.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex(&hasher.finalize()))
+}
+
+/// The state directory's files: names and sizes, never contents.
+fn state_listing(dir: &std::path::Path) -> Result<Vec<serde_json::Value>, String> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))? {
+        let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
+        let meta = entry
+            .metadata()
+            .map_err(|e| format!("{}: {e}", entry.path().display()))?;
+        files.push(serde_json::json!({
+            "name": entry.file_name().to_string_lossy(),
+            "bytes": meta.len(),
+            "dir": meta.is_dir(),
+        }));
+    }
+    files.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    Ok(files)
 }
 
 async fn shutdown_signal() {

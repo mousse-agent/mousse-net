@@ -23,6 +23,8 @@
 //! - [`removal`]: "remove on all my hosts": grant lists, signed removals
 //!   and the host's checks.
 //! - [`relay`]: the relay protocol and the relay's admission state machine.
+//! - [`relay_hosted`]: the relay's hosted mode: admission tokens, leases,
+//!   the Plus clock and reports.
 //! - [`limits`]: every tunable limit, its default and allowed range.
 #![forbid(unsafe_code)]
 
@@ -44,11 +46,18 @@
         mousse_control = "ignore-grant-id",
         mousse_control = "resend-refused",
         mousse_control = "unpinned-manifest",
+        mousse_control = "limits-raise",
         mousse_control = "no-pin-relay",
         mousse_control = "relay-skip-allow-set",
         mousse_control = "relay-refuse-early",
         mousse_control = "relay-successor-unchecked",
-        mousse_control = "relay-no-preaccept-budget"
+        mousse_control = "relay-no-preaccept-budget",
+        mousse_control = "per-socket-rate",
+        mousse_control = "accept-replayed-lease",
+        mousse_control = "ignore-admission-expiry",
+        mousse_control = "close-funded-at-expiry",
+        mousse_control = "refuse-expired-reregister",
+        mousse_control = "expiry-on-relay-wall-clock"
     ),
     not(debug_assertions)
 ))]
@@ -68,11 +77,18 @@ compile_error!("mousse_control plants a bug for tests; it is not allowed in rele
     mousse_control = "ignore-grant-id",
     mousse_control = "resend-refused",
     mousse_control = "unpinned-manifest",
+    mousse_control = "limits-raise",
     mousse_control = "no-pin-relay",
     mousse_control = "relay-skip-allow-set",
     mousse_control = "relay-refuse-early",
     mousse_control = "relay-successor-unchecked",
-    mousse_control = "relay-no-preaccept-budget"
+    mousse_control = "relay-no-preaccept-budget",
+    mousse_control = "per-socket-rate",
+    mousse_control = "accept-replayed-lease",
+    mousse_control = "ignore-admission-expiry",
+    mousse_control = "close-funded-at-expiry",
+    mousse_control = "refuse-expired-reregister",
+    mousse_control = "expiry-on-relay-wall-clock"
 ))]
 const _: () = {
     let profile = env!("MOUSSE_BUILD_PROFILE").as_bytes();
@@ -104,6 +120,7 @@ pub mod mux;
 pub mod pairing;
 pub mod pairmail;
 pub mod relay;
+pub mod relay_hosted;
 pub mod removal;
 pub mod session;
 pub mod session_cert;

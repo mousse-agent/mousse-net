@@ -35,7 +35,14 @@ pub struct LimitSpec {
 impl LimitSpec {
     /// Check `value` against the range.
     pub fn check(&self, value: u64) -> Result<(), LimitError> {
-        if (self.min..=self.max).contains(&value) {
+        // Control (tests only): any value from the minimum up is taken, so
+        // an override can raise a tighten-only limit.
+        let max = if cfg!(mousse_control = "limits-raise") {
+            u64::MAX
+        } else {
+            self.max
+        };
+        if (self.min..=max).contains(&value) {
             Ok(())
         } else {
             Err(LimitError::OutOfRange {

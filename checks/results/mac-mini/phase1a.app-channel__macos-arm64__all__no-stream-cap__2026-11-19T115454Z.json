@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "mac-mini",
+  "key": "04d63225e01c2fd84d8a4588702b08561c26da25295387d39876ea36c7f2deee75ec54bd53c9d5b09712f13f737f0ece0038931c8226886a42d77430c7c4e486ee",
+  "payload": "{\"check\":\"phase1a.app-channel\",\"target\":\"macos-arm64\",\"control\":\"no-stream-cap\",\"build\":\"8ae4d57d75eeccdbe7a4c1fa42feb101665a3f95+debug\",\"platform\":\"macos-aarch64\",\"outcome\":\"FAIL\",\"details\":\"3 of 18 tests failed\",\"time\":\"2026-11-19T11:54:54Z\",\"device\":\"mac-mini\",\"config\":\"171339a8eafa5a2a484977fb663c6969880296f463929459a74f7f17bcf28df9\"}",
+  "signature": "ccd1143b503f62ac98d149e6dc339e21f549b1a166d74d8ea1a2c7e243ae9d32c7293569f3f7c0a963cb9b4f8399c49754dc37a6430d92112b8bf6e66ce211c1"
+}

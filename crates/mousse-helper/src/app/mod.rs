@@ -56,8 +56,8 @@ use mousse_net_core::mux::PriorityClass;
 use mousse_net_core::ErrorCode;
 use mousse_net_io::store::{hex, short_id};
 use mousse_net_io::{
-    Caller, CloseReason, Connection, Host, HostEvent, MuxStream, NetError, StreamAdmission,
-    StreamReader, StreamWriter,
+    Caller, CloseReason, Connection, Host, HostEvent, ListenerKind, MuxStream, NetError,
+    StreamAdmission, StreamReader, StreamWriter,
 };
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -646,7 +646,16 @@ impl Shared {
             }
             "stats" => {
                 let a = &self.admission;
+                let pre = self.host.preauth_stats();
+                let per_kind = |n: fn(&mousse_net_io::PreAuthStats, ListenerKind) -> u64| {
+                    ListenerKind::ALL
+                        .iter()
+                        .map(|k| (k.name().to_owned(), Value::from(n(&pre, *k))))
+                        .collect::<Map<String, Value>>()
+                };
                 let reply = json!({
+                    "preauth_open": per_kind(mousse_net_io::PreAuthStats::open),
+                    "preauth_refused": per_kind(mousse_net_io::PreAuthStats::refused),
                     "re": id,
                     "open_streams": a.open_streams(),
                     "queued_bytes": a.queued_bytes(),
