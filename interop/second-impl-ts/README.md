@@ -1,8 +1,9 @@
 # mousse-net wire protocol in TypeScript
 
 This package implements the version 1 wire records and the pairing exchange
-from the protocol spec. A TLS transport supplies the peer identity and the
-two TLS exporters. The package issues and verifies session certificates,
+from the protocol spec, and the self-mode relay admission of
+`spec/relay.md`. A TLS transport supplies the peer identity and the two TLS
+exporters. The package issues and verifies session certificates,
 signs and verifies TLS CertificateVerify bytes, and checks the negotiated
 handshake against the native TLS policy. The transport configures TLS from
 that policy, verifies CertificateVerify, and checks the host certificate
@@ -35,7 +36,10 @@ npm test
 The tests print case counts by vector file and end with `PASS second-impl` or
 `FAIL second-impl`. They replay fifteen pairing flows and
 twelve attempt sequences with the supplied random draws, and compare
-the resulting messages byte for byte. The suite also checks retry
+the resulting messages byte for byte. The relay tests rebuild every relay
+derivation and the relay certificate, decode and re-encode every relay message,
+and replay the twenty-five self-mode relay scenarios with their draws,
+comparing every output in order. The suite also checks retry
 scheduling with a candidate path, clock rollback, reconnect after ticket
 expiry, and mux stream ordering, closure, and limits.
 

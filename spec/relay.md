@@ -84,12 +84,17 @@ Certificate ::= SEQUENCE {
 ```
 
 The certificate has no extensions and does not expire (RFC 5280 4.1.2.5's
-"no well-defined expiration date"). A relay writes exactly this profile;
-`spec/vectors/relay-admission.json` `certificate` has one.
+"no well-defined expiration date"). A relay writes exactly this profile.
+Only `tbsCertificate` is fixed byte for byte: the signature depends on the
+ECDSA nonce. The vector (`relay-admission.json`,
+`derivations.relay_certificate`) is signed with RFC 6979 nonces and no
+low-S normalization, so an implementation that signs the same way
+reproduces it exactly.
 
-A **native client** does not judge the chain, the name, the validity or the
-self-signature. It reads the `subjectPublicKeyInfo` of the leaf
-certificate, requires the 26-byte prefix followed by a valid uncompressed
+A **native client** does not judge the chain, the name, the validity, the
+self-signature or anything else of the profile: a certificate off the
+profile whose key matches the pin passes. It reads the
+`subjectPublicKeyInfo` of the leaf certificate, requires the 26-byte prefix followed by a valid uncompressed
 P-256 point (wire.md 4.1), requires `H(point)` to equal the pinned relay id
 (section 3), and verifies the handshake's `CertificateVerify` with that
 key. Anything else fails the handshake. A browser profile (Web PKI) is
@@ -202,6 +207,11 @@ tells a client nothing about which handles exist or who is listed.
 `REGISTER` with keys 3 and 4 in self mode, and without them in hosted mode,
 is a protocol error.
 
+The relay always sends class 0 in a join's `INCOMING`. Size bounds of the
+hosted-only fields (admission tokens, `LEASE` blocks, `LEASE_STATUS`
+entries, distinct `RELEASE` ids) are set with hosted mode; until then only
+the 16 384-byte message maximum bounds them.
+
 ### 4.4 Close codes and refusal reasons
 
 The relay closes connections with these WebSocket close codes:
@@ -256,20 +266,25 @@ drops). The waits are the relay limits of `docs/limits.md` ("Relay"):
 | first message | `RELAY_HELLO_WAIT_MS` | `RELAY_HELLO` | close 4002 if no first message |
 | refusal deadline | `RELAY_REFUSE_MS` | the arrival of a `CALL` or `JOIN` | `UNREACHABLE` for a refused one |
 | accept wait | `RELAY_ACCEPT_WAIT_MS` | `INCOMING` | `UNREACHABLE` if no accept leg came |
-| registration idle | `RELAY_REGISTRATION_IDLE_MS` | each message received on a registration connection | close 4002 |
-| keepalive | `RELAY_KEEPALIVE_MS` | each message sent on a registration connection | `PING` |
+| registration idle | `RELAY_REGISTRATION_IDLE_MS` | each message received on a registration connection, starting with its `REGISTER` or `ENROLL` | close 4002 |
+| keepalive | `RELAY_KEEPALIVE_MS` | each message sent on a registration connection, starting with its `REGISTERED` | `PING` |
 | circuit idle | `RELAY_CIRCUIT_IDLE_MS` | `SPLICED`, and each peer message either way | close both legs 4002 |
 
 A wait of `w` ms started at `t` **fires** when the monotonic clock reaches
 `t + w`. Before it handles anything, the relay fires every wait that is
 due, in order of the time each fires; waits that fire at the same moment
-in the order of the table's rows; and within a row in order of connection
-(for a circuit, its caller's leg). A wait that firing starts (the
-keepalive after a `PING`) fires in turn if it is due as well. Wall-clock
-times fire after them, when the wall clock reaches them: first join
-circuits at their invitation's expiry (close both legs 4006), in order of
-the caller's leg; then superseded registration keys at their drop time
-(section 7.4), in order of fingerprint.
+in the order of the table's rows; and within a row in increasing order of
+connection number (for a circuit, its caller's leg). A running relay
+numbers its connections in the order they open; in the vectors the numbers
+are the scenarios' `conn` values, whatever order those open in. A
+wait that firing starts (the keepalive after a `PING`) fires in turn if it
+is due as well.
+
+Wall-clock times fire after every due wait, whatever time each came due:
+first every join circuit whose invitation expiry the wall clock has
+reached (section 9.3), in order of the caller's leg; then every superseded
+registration key whose drop time it has reached (section 7.4), in order of
+fingerprint.
 
 ## 7. Registration
 
@@ -327,7 +342,8 @@ record (section 5), with the handle of the new key. The relay requires:
    registered with;
 3. the current key is on the authorized list and has not itself been
    superseded;
-4. the new key differs from the current key.
+4. the new key is not on the authorized list at all (so two keys can
+   never keep each other alive).
 
 If any fails, the relay sends `REFUSED(not_authorized)` and closes the
 registration connection with 1000 (its circuits keep running). Otherwise it
@@ -336,7 +352,8 @@ key **superseded**, with a drop time `RELAY_SUCCESSOR_OVERLAP_SECS` after
 now on its wall clock. Nothing is sent. The new key registers on its own
 connection like any authorized key, and both are registered during the
 overlap. At the drop time the relay removes the old key from the list and
-closes its registration and every circuit of its handle with 4000.
+closes its registration and every circuit of its handle with 4000, in the
+order of section 10.3.
 
 A superseded key can still register until it is dropped, but it can never
 vouch for another successor, so a key the operator never authorized only
@@ -411,9 +428,11 @@ A join circuit, until it is promoted, may carry at most
 `RELAY_PREACCEPT_BYTES` of peer bytes in each direction (the sum of the
 payload lengths of the peer messages forwarded that way). A peer message
 that would take a direction over the budget is not forwarded: the relay
-closes both legs with 4006. A join circuit also closes, both legs 4006,
-when the wall clock reaches the expiry its invitation had when the `JOIN`
-was admitted.
+closes both legs with 4006. A join circuit also closes with 4006 when the wall clock
+reaches the expiry its invitation had when the `JOIN` was admitted: both
+legs if it is spliced, the joiner's leg if it is still waiting. A promoted
+circuit is no longer a join circuit: neither the budget nor the expiry
+applies to it.
 
 ### 9.4 `PROMOTE`
 
@@ -437,8 +456,10 @@ On `INCOMING` the target opens a **new** outer connection and sends
 requires:
 
 1. the circuit is waiting for its accept leg and belongs to key 1's handle;
-2. the accept proof verifies against the registration key of that handle
-   with this connection's nonce and outer exporter;
+2. the accept proof verifies, with this connection's nonce and outer
+   exporter, against the registration key the handle is derived from. The
+   relay keeps that key with the circuit, so this works after the
+   registration connection has closed or been replaced;
 3. fewer than `RELAY_ACCEPT_LEGS_PER_HANDLE` accept legs of this handle are
    open.
 
@@ -469,7 +490,10 @@ A circuit ends when:
   both legs 4006 (section 9.3);
 - the relay stops: both legs 4003.
 
-When the relay closes both legs it closes the caller's leg first. A call or
+When the relay closes both legs it closes the caller's leg first. When it
+closes a registration and circuits together (a revocation, a key drop),
+it closes the registration connection first, then each circuit in order of
+its caller's leg. A call or
 join leg that closes before its circuit is spliced ends the circuit; an
 `ACCEPT` for it is then refused like any unknown circuit. A registration
 connection that closes ends the registration (its allow-set is forgotten)
@@ -494,7 +518,10 @@ where `<host>:<port>` follows the grammar of wire.md 10.2.1 for `tcp`
 hints (an IPv6 address in brackets), and the relay id (32 bytes) and the
 enrollment code (16 bytes) are written in base64url without padding with
 the strict rules of wire.md 10.2 (link form). Nothing else may appear. The
-code is valid for `RELAY_ENROLL_SECS` and single use.
+code is valid for `RELAY_ENROLL_SECS` and single use. A reader accepts any
+host text the `tcp` grammar accepts. A relay writes the host in one form:
+IPv4 dotted decimal, IPv6 in RFC 5952 form in brackets, a DNS name in
+lowercase; links in that form print back unchanged.
 
 **`ENROLL`** `{1: key, 2: register proof, 3: code}` is the first message of
 a registration connection. The relay, in order:
@@ -523,14 +550,49 @@ memory only and end with the process.
 ## 13. Local limits
 
 Every wait, count and size above that is not a protocol constant is a relay
-limit, read from `MOUSSE_NET_RELAY_*` (`docs/limits.md`, "Relay"). Limits a
-client can push against may only be tightened. Besides the waits of section
-6 they cover open connections, control connections per IPv4 address or IPv6
-/64, accept legs per handle, circuits per caller, live registrations, the
-pre-accept budget and join count, the per-circuit queue and the shared
-egress ceiling. A connection over a connection limit is closed with 4006
-before `RELAY_HELLO`. Accept legs count against their handle's limit, not
-the per-address one, once their `ACCEPT` arrives.
+limit, read from `MOUSSE_NET_<name>` and documented in `docs/limits.md`
+("Relay"). Limits a client can push against may only be tightened. The
+defaults, which the vectors assume unless a scenario's `limits` says
+otherwise:
+
+| Limit | Default | What it bounds |
+|---|---|---|
+| `RELAY_MAX_CONNECTIONS` | 1024 | open connections |
+| `RELAY_CONNECTIONS_PER_IP` | 256 | open connections per address key |
+| `RELAY_ACCEPT_LEGS_PER_HANDLE` | 64 | accept legs of spliced circuits per handle |
+| `RELAY_CIRCUITS_PER_CALLER` | 8 | open circuits per caller fingerprint and handle |
+| `RELAY_MAX_REGISTRATIONS` | 1024 | live registrations |
+| `RELAY_HELLO_WAIT_MS` | 5000 | first message wait (section 6) |
+| `RELAY_UPGRADE_WAIT_MS` | 5000 | the TLS handshake and upgrade together |
+| `RELAY_HEADER_MAX_BYTES` | 8192 | the upgrade request |
+| `RELAY_ACCEPT_WAIT_MS` | 10000 | accept wait |
+| `RELAY_REFUSE_MS` | 500 | refusal deadline; below the accept wait |
+| `RELAY_PREACCEPT_BYTES` | 65536 | pre-accept budget per direction |
+| `RELAY_PREACCEPT_PER_TARGET` | 4 | join circuits per handle |
+| `RELAY_KEEPALIVE_MS` | 15000 | keepalive |
+| `RELAY_REGISTRATION_IDLE_MS` | 45000 | registration idle |
+| `RELAY_CIRCUIT_IDLE_MS` | 60000 | circuit idle |
+| `RELAY_QUEUE_BYTES` | 262144 | bytes queued per circuit and direction |
+| `RELAY_EGRESS_BPS` | 12500000 | shared egress, bytes per second |
+| `RELAY_ENROLL_SECS` | 3600 | enrollment code lifetime |
+| `RELAY_SUCCESSOR_OVERLAP_SECS` | 604800 | overlap after `SUCCESSOR` |
+| `RELAY_STATE_POLL_MS` | 1000 | how often the running relay rereads its state directory |
+
+**Address key.** Connections count against the **address key** of their
+peer: 16 bytes, an IPv4 address in bytes 0 to 3 with byte 15 set to 4 (an
+IPv4-mapped IPv6 address counts as its IPv4 address), or the first 64 bits
+of an IPv6 address in bytes 0 to 7 with byte 15 set to 6, all other bytes
+zero. The key never leaves the relay's memory. In the vectors it is opaque:
+only equality matters.
+
+**What counts.** Every open connection counts against its address key and
+`RELAY_MAX_CONNECTIONS`, whatever its role, from `RELAY_HELLO` until it
+closes, except that an accept leg stops counting against its address key
+once its `ACCEPT` is accepted; it then counts against its handle's
+`RELAY_ACCEPT_LEGS_PER_HANDLE`. A connection that would go over either
+connection limit is closed with 4006 before `RELAY_HELLO`, and no nonce is
+drawn for it. A relay also counts connections still in their TLS handshake
+or upgrade the same way, so handshakes cannot get around the limits.
 
 Interactive circuits are written before bulk ones at the relay's shared
 egress. Per circuit and direction at most `RELAY_QUEUE_BYTES` are buffered;
@@ -568,10 +630,10 @@ Connections are numbered by the scenario. Events:
 |---|---|
 | `open` | a client connection `conn` with address key `ip` and outer exporter `exporter` completed its upgrade; the relay draws a nonce and sends `RELAY_HELLO`, or closes it with 4006 if a connection limit is reached |
 | `recv` | the client on `conn` sent the message `hex` |
-| `data` | the client on spliced leg `conn` sent a peer message of `len` bytes |
+| `data` | the client on `conn` sent a peer message of `len` bytes. On a connection that is not a spliced leg this is a protocol error (close 1002). A `recv` on a spliced leg is the same as `data` with the message's length. |
 | `closed` | the client closed `conn` |
 | `tick` | nothing happens but time |
-| `revoke` | the operator revoked the registration fingerprint `fingerprint` |
+| `revoke` | the operator revoked the registration fingerprint `fingerprint`. The operator's command has already changed the stored list, so there is no durable output, only the closes. |
 
 Outputs: `{"send": conn, "message": type name, "hex": ...}`, `{"close": conn, "code": ...}`,
 `{"splice": [caller conn, accept conn], "circuit": ..., "class": ...}`, `{"forward":

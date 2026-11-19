@@ -3264,11 +3264,28 @@
               "code": 1000
             }
           ]
+        },
+        {
+          "at": 50,
+          "conn": 2,
+          "event": "recv",
+          "hex": "a40012015841049a2f9f7997a7fab2453c002b8bdc08fe4c8b6221ce689f771c0ee9067e0e039326f5aa18be3e7365b8d5cc00314c68d89892ea5eca81e56fefe0c59aa2f1326e02584070b59429c5a18f42cb5c7d0e32e01ec8c0c4bba3e096c0b8b8e93eb07a6acebfe8be029fc8b8c927bb70da2f56fbf209c3a0f91b057e52f3dfa3d35822a9035c03584059c6b2e2b90fc2a6666a5376dfe60b26816374452f217554075e6efc59df60333a9180da21be0c70642afb424fbd34a88c4734e69f5242f0e1149d5e2f6bf511",
+          "out": [
+            {
+              "hex": "a20010016e6e6f745f617574686f72697a6564",
+              "message": "REFUSED",
+              "send": 2
+            },
+            {
+              "close": 2,
+              "code": 1000
+            }
+          ]
         }
       ],
       "limits": {},
       "name": "successor_unauthorized_current",
-      "notes": "A SUCCESSOR proved by both keys authorizes the new key and supersedes the current one (no answer). The superseded key, still registered, cannot vouch for another successor. The new key registers on its own connection.",
+      "notes": "A SUCCESSOR proved by both keys authorizes the new key and supersedes the current one (no answer). The superseded key, still registered, cannot vouch for another successor. The new key registers on its own connection, and cannot name a key already on the list (the superseded one) as its successor.",
       "relay_key": "049a65173d48a0a0c706eeec2a75ae1f56793be988b2d407e9a7d3aba7574a9ea5101daceaadf42b661543a353e4f505ec41281df8535fecc5912ea39ed6b50568",
       "wall_base": 1790000000
     },

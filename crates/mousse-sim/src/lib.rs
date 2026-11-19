@@ -30,6 +30,7 @@ mod drills;
 mod exchange;
 mod host;
 mod log;
+mod relay;
 mod sim;
 mod world;
 
@@ -52,14 +53,19 @@ pub enum Drill {
     /// both: deny or removal on one endpoint, dials that reach the other
     /// endpoint's port, both restarting.
     SharedEndpoints,
+    /// One self-hosted relay: registrations, allow-set pushes and removals,
+    /// listed, unlisted and bad-proof calls, joins and promotion, accept
+    /// legs, revocation, reboots and key rotation.
+    RelayAdmission,
 }
 
 impl Drill {
     /// Every drill.
-    pub const ALL: [Drill; 3] = [
+    pub const ALL: [Drill; 4] = [
         Drill::Handshake,
         Drill::PairingLimits,
         Drill::SharedEndpoints,
+        Drill::RelayAdmission,
     ];
 
     /// The CLI name.
@@ -68,6 +74,7 @@ impl Drill {
             Drill::Handshake => "handshake",
             Drill::PairingLimits => "pairing-limits",
             Drill::SharedEndpoints => "shared-endpoints",
+            Drill::RelayAdmission => "relay-admission",
         }
     }
 
@@ -77,6 +84,7 @@ impl Drill {
             Drill::Handshake => drills::HANDSHAKE_VARIANTS,
             Drill::PairingLimits => drills::PAIRING_VARIANTS,
             Drill::SharedEndpoints => drills::SHARED_VARIANTS,
+            Drill::RelayAdmission => relay::RELAY_VARIANTS,
         }
     }
 }
@@ -131,11 +139,17 @@ pub enum Bug {
     SharedGrantTable,
     /// The verifier ignores the session certificate's validity window.
     AcceptExpiredCert,
+    /// The relay's timer runs on a clock ahead of the rest of the relay, so
+    /// refused calls are answered before their deadline.
+    RelayEarlyAnswer,
+    /// After a reboot the relay reapplies a target's old allow-set when it
+    /// registers again, before the target pushes a fresh one.
+    RelayStaleAllowSet,
 }
 
 impl Bug {
     /// Every planted bug.
-    pub const ALL: [Bug; 9] = [
+    pub const ALL: [Bug; 11] = [
         Bug::KeepChannelAfterRemoval,
         Bug::HostWorkBeforeDebit,
         Bug::JoinerWorkBeforeDebit,
@@ -145,6 +159,8 @@ impl Bug {
         Bug::NoPinOnReconnect,
         Bug::SharedGrantTable,
         Bug::AcceptExpiredCert,
+        Bug::RelayEarlyAnswer,
+        Bug::RelayStaleAllowSet,
     ];
 
     /// The CLI name.
@@ -159,6 +175,8 @@ impl Bug {
             Bug::NoPinOnReconnect => "no-pin-on-reconnect",
             Bug::SharedGrantTable => "shared-grant-table",
             Bug::AcceptExpiredCert => "accept-expired-cert",
+            Bug::RelayEarlyAnswer => "relay-early-answer",
+            Bug::RelayStaleAllowSet => "relay-stale-allow-set",
         }
     }
 
@@ -174,6 +192,7 @@ impl Bug {
             | Bug::JoinerWorkBeforeDebit
             | Bug::JoinerNewFlowOnReconnect => Drill::PairingLimits,
             Bug::SharedGrantTable => Drill::SharedEndpoints,
+            Bug::RelayEarlyAnswer | Bug::RelayStaleAllowSet => Drill::RelayAdmission,
         }
     }
 
@@ -188,6 +207,8 @@ impl Bug {
             Bug::NoPinOnReconnect => Invariant::PinMatch,
             Bug::SharedGrantTable => Invariant::EndpointIsolation,
             Bug::AcceptExpiredCert => Invariant::Step1Spec,
+            Bug::RelayEarlyAnswer => Invariant::RelayOneAnswer,
+            Bug::RelayStaleAllowSet => Invariant::RelayAllowSetOnly,
         }
     }
 }

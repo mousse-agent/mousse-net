@@ -24,14 +24,14 @@ export function checkRaw(raw: Uint8Array): void {
   }
 }
 
-function der(tag: number, ...parts: Uint8Array[]): Buffer {
+export function der(tag: number, ...parts: Uint8Array[]): Buffer {
   const body = concat(...parts);
   const length: number[] = [];
   for (let n = body.length; n > 0; n >>>= 8) length.unshift(n & 255);
   return concat(Buffer.from(body.length < 128 ? [tag, body.length] : [tag, 0x80 | length.length, ...length]), body);
 }
 
-class DerReader {
+export class DerReader {
   private offset = 0;
   constructor(data: Uint8Array, error = 'malformed') {
     this.data = data;
@@ -114,16 +114,16 @@ export function verify(signature: Uint8Array, message: Uint8Array, key: Uint8Arr
   return validPoint(key) && p256.verify(signature, message, key, { prehash: true, lowS: false });
 }
 
-const spkiPrefix = bytes('3059301306072a8648ce3d020106082a8648ce3d030107034200');
-const versionField = bytes('a003020102');
-const algorithm = bytes('300a06082a8648ce3d040302');
+export const spkiPrefix = bytes('3059301306072a8648ce3d020106082a8648ce3d030107034200');
+export const versionField = bytes('a003020102');
+export const algorithm = bytes('300a06082a8648ce3d040302');
 const name = der(0x30, der(0x31, der(0x30, bytes('0603550403'), der(0x0c, utf8('mousse-session')))));
 const oid = bytes('061369e595e3c0fbf68a84f595c9dabef4e2f7be05');
 
 export interface Window { not_before: number; not_after: number }
 const goodWindow = ({ not_before: start, not_after: end }: Window) => start < end && end - start <= 86400;
 
-function time(seconds: number): Buffer {
+export function time(seconds: number): Buffer {
   requireThat(Number.isSafeInteger(seconds) && seconds >= 0 && seconds < 253402300800, 'malformed');
   const iso = new Date(seconds * 1000).toISOString();
   const digits = iso.slice(0, 19).replace(/[-:T]/g, '') + 'Z';
@@ -144,7 +144,7 @@ function readTime(reader: DerReader): number {
   return parsed;
 }
 
-function serialNumber(spki: Uint8Array): Uint8Array {
+export function serialNumber(spki: Uint8Array): Uint8Array {
   const serial = sha256(spki).slice(0, 16);
   serial[0] = (serial[0] & 0x3f) | 0x40;
   return serial;

@@ -6,6 +6,7 @@ members = [
   "crates/mousse-net-io",
   "crates/mousse-helper",
   "crates/mousse-check",
+  "crates/mousse-relay",
   "crates/mousse-relay-plus",
 ]
 exclude = ["spikes"]

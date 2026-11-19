@@ -126,12 +126,13 @@ export function encodeTicket(ticket: Ticket): Buffer {
 }
 
 export const encodeFragment = (data: Uint8Array): string => Buffer.from(data).toString('base64url');
-export function decodeFragment(fragment: string): Ticket {
-  requireThat(fragment.length > 0 && !/[^A-Za-z0-9_-]/.test(fragment), 'encoding');
-  const data = Buffer.from(fragment, 'base64url');
-  requireThat(encodeFragment(data) === fragment, 'encoding');
-  return decodeTicket(data);
+export function decodeBase64url(text: string): Buffer {
+  requireThat(text.length > 0 && !/[^A-Za-z0-9_-]/.test(text), 'encoding');
+  const data = Buffer.from(text, 'base64url');
+  requireThat(encodeFragment(data) === text, 'encoding');
+  return data;
 }
+export const decodeFragment = (fragment: string): Ticket => decodeTicket(decodeBase64url(fragment));
 
 export const checkJoinerExpiry = (expires: UInt, now: UInt) => {
   requireThat(BigInt(now) < BigInt(expires) + 600n, 'expired');
