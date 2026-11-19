@@ -47,7 +47,7 @@ use mousse_net_io::discovery::BrowseSource;
 use mousse_net_io::pipe::{AddrPolicy, LocalRoute, RouteKind};
 use mousse_net_io::store::{
     hex, identity_from_hex, short_id, Approval, ApprovalStore, PeerRecord, PeerStore,
-    APPROVED_BY_OWNER,
+    APPROVAL_SOURCE_OWNER,
 };
 use mousse_net_io::{CandidateSource, Connection, NetError, Reached, Search};
 use serde_json::{json, Map, Value};
@@ -622,44 +622,46 @@ pub fn set_addresses(shared: &Shared, id: &Value, map: &Map<String, Value>) -> V
     };
     let key = hex(identity.as_bytes());
     let dir = &shared.info.state_dir;
-    match PeerStore::in_dir(dir).load() {
-        Err(e) => return error(id, "store_failed", e.to_string()),
-        Ok(list) if !list.iter().any(|p| p.identity == key) => {
-            return error(id, "no_peer", "not paired with that identity")
-        }
-        Ok(_) => {}
-    }
     let at = crate::peer::now_secs();
-    let approved = ApprovalStore::in_dir(dir).update(|list| {
-        list.retain(|a| {
-            a.identity != key || a.source != APPROVED_BY_OWNER || routes.contains(&a.destination)
-        });
-        for r in &routes {
-            let has = list
-                .iter()
-                .any(|a| a.identity == key && a.source == APPROVED_BY_OWNER && a.destination == *r);
-            if !has {
-                list.push(Approval {
-                    identity: key.clone(),
-                    destination: r.clone(),
-                    source: APPROVED_BY_OWNER.into(),
-                    at,
+    // The row and its owner approvals change together, under the peers
+    // lock.
+    let store = PeerStore::in_dir(dir);
+    let changed = store.lock().and_then(|held| {
+        if !held.load()?.iter().any(|p| p.identity == key) {
+            return Ok(false);
+        }
+        ApprovalStore::in_dir(dir).update(&held, |list| {
+            list.retain(|a| {
+                a.identity != key
+                    || a.source != APPROVAL_SOURCE_OWNER
+                    || routes.contains(&a.destination)
+            });
+            for r in &routes {
+                let has = list.iter().any(|a| {
+                    a.identity == key && a.source == APPROVAL_SOURCE_OWNER && a.destination == *r
                 });
+                if !has {
+                    list.push(Approval {
+                        identity: key.clone(),
+                        destination: r.clone(),
+                        source: APPROVAL_SOURCE_OWNER.into(),
+                        at,
+                    });
+                }
             }
-        }
+        })?;
+        held.update(|list| {
+            if let Some(p) = list.iter_mut().find(|p| p.identity == key) {
+                p.addresses = routes.clone();
+            }
+        })?;
+        Ok(true)
     });
-    if let Err(e) = approved {
-        return error(id, "store_failed", e.to_string());
-    }
-    let updated = PeerStore::in_dir(dir).update(|list| {
-        if let Some(p) = list.iter_mut().find(|p| p.identity == key) {
-            p.addresses = routes.clone();
-        }
-    });
-    approvals_changed(shared, &identity);
-    match updated {
+    match changed {
         Err(e) => error(id, "store_failed", e.to_string()),
-        Ok(()) => {
+        Ok(false) => error(id, "no_peer", "not paired with that identity"),
+        Ok(true) => {
+            approvals_changed(shared, &identity);
             shared.keep.kick(Kick::Reset(Some(identity)));
             json!({"re": id, "routes": routes})
         }

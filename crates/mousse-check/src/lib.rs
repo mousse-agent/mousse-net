@@ -22,6 +22,7 @@ pub mod eval;
 pub mod evidence;
 pub mod kit;
 pub mod manifest;
+pub mod probe;
 pub mod report;
 pub mod runner;
 pub mod util;

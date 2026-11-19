@@ -17,7 +17,12 @@ const APP_PREFIX: &str = "ENGINE_";
 /// Debug-build test hooks read by the network crates, not limits
 /// (Phase 1b §1.2 and §4.2). Release builds never read them, so there they
 /// count as unknown names.
-const DEBUG_HOOKS: [&str; 2] = ["TEST_EXTRA_ROOT", "TEST_CLASS_MAP"];
+const DEBUG_HOOKS: [&str; 4] = [
+    "TEST_EXTRA_ROOT",
+    "TEST_CLASS_MAP",
+    "TEST_EGRESS",
+    "TEST_EGRESS_LOG",
+];
 
 /// After [`ENV_PREFIX`]: the Mousse app's helper path in unpackaged builds.
 const APP_HELPER_PATH: &str = "HELPER";
@@ -85,6 +90,8 @@ mousse_net_core::define_limits! {
         ipc_line_max_bytes = "IPC_LINE_MAX_BYTES": 65_536, [1_024, 65_536];
         /// IPC: how long a local client has to send its first line (Phase 1b §6.2; tighten only).
         ipc_first_line_wait_ms = "IPC_FIRST_LINE_WAIT_MS": 2_000, [100, 2_000];
+        /// App mode: how long a "Send link" completion record the app never acknowledged (`join.ack`) is kept after its ticket expired (Phase 1b §5.4).
+        join_done_keep_secs = "JOIN_DONE_KEEP_SECS": 86_400, [0, 2_592_000];
         /// Checks only: how long `init` waits before it makes the endpoint, so a check can stop the app during the first start. Run for the app (`--app`), its stdin closing still ends it at once.
         init_hold_ms = "INIT_HOLD_MS": 0, [0, 60_000];
     }

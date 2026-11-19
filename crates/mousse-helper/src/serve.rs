@@ -405,7 +405,13 @@ pub async fn run(
         // Outbound connections for the app: the same key, flow records and
         // stream places as the host.
         let mut caller = Caller::new(signer.clone(), clock.clone(), crate::limits::get().net);
-        caller.use_flow_records(Arc::new(endpoint.flow_records()));
+        // Must-fail control: flow records in memory, so a restart gives a
+        // send link its tries back.
+        if cfg!(mousse_control = "joiner-records-in-memory") {
+            caller.use_flow_records(Arc::new(mousse_net_io::store::MemoryFlowRecords::default()));
+        } else {
+            caller.use_flow_records(Arc::new(endpoint.flow_records()));
+        }
         caller.use_stream_admission(host.stream_admission());
         // Renewals search from the store as it is then (Phase 1b §1.5).
         caller.use_candidates(Arc::new(crate::app::StoreCandidates {
@@ -724,7 +730,9 @@ fn on_event(state: &State, event: HostEvent) {
                 }
             }
         }
-        HostEvent::ShowCode { invitation, code } => {
+        HostEvent::ShowCode {
+            invitation, code, ..
+        } => {
             // Only the inviting command shows the code; it is never logged.
             if let Some(tx) = waiter(&invitation) {
                 let _ = tx.send(json!({"event": "code", "code": code.as_str()}));

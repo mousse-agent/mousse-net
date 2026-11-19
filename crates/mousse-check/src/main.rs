@@ -51,6 +51,11 @@ USAGE
   mousse-check device list
   mousse-check report [<phase>] [--allow-dirty] [--full] [--json]
       Print the table from stored runs and results without running anything.
+  mousse-check probe --route <hint> (--observe <url> | --no-app) [--invite <ticket>] ...
+      Send traffic that must never reach RPC to a host on one route, and
+      check each close on the wire and in the app (probe --help).
+  mousse-check probe key <file>
+      Write a throwaway device key for the probe and print its identity.
 
 Global: --root <dir> (default: the git checkout containing the current folder).
 App checks (app = true) run only with MOUSSE_APP_DIR set to a clean checkout of
@@ -152,6 +157,10 @@ fn real_main(raw: Vec<String>) -> Result<ExitCode, String> {
         return Ok(ExitCode::from(2));
     };
     let rest = raw[1..].to_vec();
+    // The probe talks to a host, not to a checkout: no kit root needed.
+    if cmd == "probe" {
+        return mousse_check::probe::main(&rest).map(ExitCode::from);
+    }
     let a = Args::parse(
         rest,
         matches!(cmd.as_str(), "sign" | "config-digest" | "control-env"),

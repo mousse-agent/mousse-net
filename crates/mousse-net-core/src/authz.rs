@@ -213,20 +213,25 @@ impl ConnectionGate {
             (_, Keepalive | Hello | GoAway) => Verdict::Allow,
             (_, HostOnly) => Verdict::Close(ErrorCode::ProtocolError),
             (GateState::AwaitingJoinProof { .. }, JoinProof) => Verdict::Allow,
-            #[cfg(not(mousse_control = "break-authz"))]
+            #[cfg(not(any(mousse_control = "break-authz", mousse_control = "admit-ungranted")))]
             (GateState::AwaitingJoinProof { .. }, Pairing | Stream) => {
                 Verdict::Close(ErrorCode::NotAuthorized)
             }
-            // Must-fail control: a connection with no grant may open streams.
-            #[cfg(mousse_control = "break-authz")]
+            // Must-fail controls: a connection with no grant, awaiting a
+            // proof, may open streams.
+            #[cfg(any(mousse_control = "break-authz", mousse_control = "admit-ungranted"))]
             (GateState::AwaitingJoinProof { .. }, Stream) => Verdict::Allow,
-            #[cfg(mousse_control = "break-authz")]
+            #[cfg(any(mousse_control = "break-authz", mousse_control = "admit-ungranted"))]
             (GateState::AwaitingJoinProof { .. }, Pairing) => {
                 Verdict::Close(ErrorCode::NotAuthorized)
             }
             (GateState::JoinOnly { .. }, Pairing) => Verdict::Allow,
             (GateState::JoinOnly { .. }, JoinProof) => Verdict::Close(ErrorCode::ProtocolError),
+            #[cfg(not(mousse_control = "join-only-streams"))]
             (GateState::JoinOnly { .. }, Stream) => Verdict::Close(ErrorCode::NotAuthorized),
+            // Must-fail control: a join-only connection may open streams.
+            #[cfg(mousse_control = "join-only-streams")]
+            (GateState::JoinOnly { .. }, Stream) => Verdict::Allow,
             // A granted device may send one proof, before any stream: the
             // host answers it, and a valid one starts a pairing that
             // replaces the grant (wire.md 8).

@@ -89,7 +89,8 @@ pub type SharedSigner = Arc<dyn IdentitySigner + Send + Sync>;
         mousse_control = "stale-renewal-routes",
         mousse_control = "unbounded-candidates",
         mousse_control = "ssh-races-lan",
-        mousse_control = "bind-all-lan-off"
+        mousse_control = "bind-all-lan-off",
+        mousse_control = "pin-stored-memory-only"
     )
 ))]
 compile_error!("a mousse_control build has a deliberate defect and is for tests only; build it without --release");
@@ -121,7 +122,8 @@ compile_error!("a mousse_control build has a deliberate defect and is for tests 
     mousse_control = "stale-renewal-routes",
     mousse_control = "unbounded-candidates",
     mousse_control = "ssh-races-lan",
-    mousse_control = "bind-all-lan-off"
+    mousse_control = "bind-all-lan-off",
+    mousse_control = "pin-stored-memory-only"
 ))]
 const _: () = {
     let profile = env!("MOUSSE_BUILD_PROFILE").as_bytes();
