@@ -1,0 +1,97 @@
+# Phase 4: the hosted relay, the helper's Plus client and "remove on all my
+# hosts" (docs/phase34-design.md Part G.2).
+# Format: checks/README.md.
+
+phase = "phase4"
+title = "Hosted relay, Plus client and remove on all my hosts"
+plan = "docs/phase34-design.md#g2-checksphase4toml"
+
+[defer]
+
+# ---------------------------------------------------------------------------
+# Hosted relay (E-L1)
+
+[[check]]
+id = "phase4.relay-leases"
+title = "Hosted relay: leases, sequences, aggregate rates, splitting, pause, release, finals on stop and admission expiry"
+plan = "docs/phase34-design.md G.2 phase4.relay-leases; A.9 duties; B.10"
+targets = ["linux-x64", "macos-arm64"]
+judge = "cargo-test"
+min_tests = 60
+# Today this runs the hosted state machine and the relay's link to Plus
+# against the test issuer stand-in. The relay-level cases (circuits through
+# a pause with the peer session alive, interactive written before bulk)
+# join when the relay itself (E-R2) lands; until then it is a placeholder.
+placeholder = "the relay-level cases need the relay itself (E-R2)"
+device_steps = "on that machine: mousse-check run phase4.relay-leases --sign-with <key>, then the same with --control"
+
+[[check.local]]
+target = "linux-x64"
+host = "linux-x86_64"
+command = ["cargo", "test", "-p", "mousse-net-core", "-p", "mousse-relay-plus", "--no-fail-fast"]
+
+[[check.local]]
+target = "macos-arm64"
+host = "macos-aarch64"
+command = ["cargo", "test", "-p", "mousse-net-core", "-p", "mousse-relay-plus", "--no-fail-fast"]
+
+[[check.control]]
+name = "per-socket-rate"
+breaks = "the rate bucket is kept per socket instead of per rate group and class, so parallel sockets multiply the cap"
+env = { RUSTFLAGS = '--cfg mousse_control="per-socket-rate"' }
+
+[[check.control]]
+name = "fifo-egress"
+breaks = "the relay's shared egress writes in arrival order instead of interactive before bulk"
+missing = "the shared egress comes with the relay itself (E-R2), which has not landed"
+
+[[check.control]]
+name = "accept-replayed-lease"
+breaks = "the block sequence check is skipped, so a settled or older block is accepted again"
+env = { RUSTFLAGS = '--cfg mousse_control="accept-replayed-lease"' }
+
+[[check.control]]
+name = "ignore-admission-expiry"
+breaks = "the admission token's not after is ignored: an unfunded registration stays and takes new leases"
+env = { RUSTFLAGS = '--cfg mousse_control="ignore-admission-expiry"' }
+
+[[check.control]]
+name = "close-funded-at-expiry"
+breaks = "a registration closes with 4004 at its token's not after even while its handle holds a usable block"
+env = { RUSTFLAGS = '--cfg mousse_control="close-funded-at-expiry"' }
+
+[[check.control]]
+name = "refuse-expired-reregister"
+breaks = "a REGISTER with an expired but otherwise valid token is refused even while the handle holds a usable block"
+env = { RUSTFLAGS = '--cfg mousse_control="refuse-expired-reregister"' }
+
+[[check]]
+id = "phase4.relay-move-clock"
+title = "Two relays with offset wall clocks: the old one forwards nothing past a lease's latest forwarding time on Plus's clock"
+plan = "docs/phase34-design.md G.2 phase4.relay-move-clock; A.9 duty 12"
+targets = ["linux-x64", "macos-arm64"]
+judge = "cargo-test"
+# Needs the relay (E-R2), the helper's relay move (E-L2) and the Plus
+# double. The relay's side of the Plus clock and its control are in place.
+placeholder = "needs the relay (E-R2), the helper's relay move (E-L2) and the Plus double"
+device_steps = "on that machine: mousse-check run phase4.relay-move-clock --sign-with <key>, then the same with --control"
+
+[[check.local]]
+target = "linux-x64"
+host = "linux-x86_64"
+command = ["cargo", "test", "-p", "mousse-net-core", "--no-fail-fast", "--lib", "relay_hosted::"]
+
+[[check.local]]
+target = "macos-arm64"
+host = "macos-aarch64"
+command = ["cargo", "test", "-p", "mousse-net-core", "--no-fail-fast", "--lib", "relay_hosted::"]
+
+[[check.control]]
+name = "expiry-on-relay-wall-clock"
+breaks = "lease windows are judged on the relay's own wall clock instead of its Plus clock"
+env = { RUSTFLAGS = '--cfg mousse_control="expiry-on-relay-wall-clock"' }
+
+[[check.control]]
+name = "fund-before-forward-limit"
+breaks = "Plus funds the new relay before the old relay's blocks pass their latest forwarding time"
+missing = "a Plus-side control: it comes with the Plus double (P8)"

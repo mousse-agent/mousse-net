@@ -1,0 +1,26 @@
+[package]
+name = "mousse-relay-plus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+description = "The hosted relay's side of Plus: settings, boot generation, report key, issuer keys, the boot announcement and the snapshot reports."
+
+[lints]
+workspace = true
+
+[dependencies]
+mousse-net-core = { path = "../mousse-net-core" }
+mousse-net-io = { path = "../mousse-net-io" }
+tokio = { version = "=1.54.1", features = ["rt", "net", "io-util", "macros", "sync", "time"] }
+tokio-rustls = { version = "=0.26.6", default-features = false, features = ["logging", "aws_lc_rs"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["std", "logging", "aws_lc_rs", "prefer-post-quantum"] }
+rustls-platform-verifier = "=0.7.1"
+httparse = "=1.10.1"
+zeroize = { version = "=1.9.2", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync"] }
+rand_chacha = "=0.10.0"
+rand_core = { version = "=0.10.1", default-features = false }

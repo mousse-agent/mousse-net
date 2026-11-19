@@ -106,11 +106,42 @@ mod persist {
 }
 
 /// `marker-in-relay-memory` (`phase3.marker`, memory positive control):
-/// the relay keeps a copy of every spliced message in its heap, so a memory
-/// sample of the process must find the marker.
+/// the relay reads the marker from the file named by
+/// `MOUSSE_RELAY_CONTROL_MARKER_FILE` and keeps copies in its heap, so a
+/// memory sample of the process must find it. (A file, not the variable
+/// itself: the environment sits in process memory too, and the control must
+/// be caught for the heap copy.)
 #[cfg(mousse_control = "marker-in-relay-memory")]
-pub fn keep_in_memory(bytes: &[u8]) {
+pub fn keep_marker_in_memory() {
     use std::sync::Mutex;
     static KEPT: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
-    KEPT.lock().expect("kept").push(bytes.to_vec());
+    if let Some(path) = std::env::var_os("MOUSSE_RELAY_CONTROL_MARKER_FILE") {
+        if let Ok(bytes) = std::fs::read(path) {
+            for _ in 0..16 {
+                KEPT.lock().expect("kept").push(bytes.clone());
+            }
+        }
+    }
+}
+
+/// Debug builds only: append each spliced message the relay forwards to the
+/// file named by `MOUSSE_RELAY_TAP`, the relay's decrypted view of both
+/// legs for `phase3.marker`. Release builds have no tap.
+#[cfg(debug_assertions)]
+pub fn tap(bytes: &[u8]) {
+    use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
+    static TAP: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+    let tap = TAP.get_or_init(|| {
+        let path = std::env::var_os("MOUSSE_RELAY_TAP")?;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
+            .map(Mutex::new)
+    });
+    if let Some(f) = tap {
+        let _ = f.lock().expect("tap").write_all(bytes);
+    }
 }
