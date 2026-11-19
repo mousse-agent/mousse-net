@@ -1033,3 +1033,47 @@ fn ssh_limits_can_only_be_tightened() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The caller's `ssh` tier: an SSH address the owner set with
+/// `peer.addresses.set {route_id, selector, shell}` is what `dial` reaches
+/// the host over; a Windows shell is refused; `ssh.forget` drops the
+/// address and its approval.
+#[test]
+fn the_ssh_tier_dials_an_owner_ssh_address() {
+    let fx = Fx::new("tier");
+    let r = fx.remote("b", RemoteOpts::default());
+    fx.hosts(&[("box", r.port())]);
+    let (_a_end, mut a) = fx.caller("tiera", &[]);
+    let (b_end, b, _) = host_for(&mut a, "tierb");
+    r.publish(&[(SEL, &b_end.dir, true)]);
+    let route = resolve(&mut a, "box");
+    pin(&mut a, &route);
+    // B is known by its SSH address alone.
+    let identity = b.identity.clone();
+    a.call("peer.forget", json!({"identity": identity}));
+    a.call(
+        "peer.add",
+        json!({"identity": identity, "name": "hostB", "routes": []}),
+    );
+    let windows = a.request(
+        "peer.addresses.set",
+        json!({"identity": identity, "routes": [{"route_id": route, "selector": SEL, "shell": "cmd"}]}),
+    );
+    assert_eq!(
+        error_of(&windows),
+        "windows_remote_unsupported",
+        "{windows}"
+    );
+    let set = a.call(
+        "peer.addresses.set",
+        json!({"identity": identity, "routes": [{"route_id": route, "selector": SEL, "shell": "sh"}]}),
+    );
+    let uri = format!("ssh://mousse-{route}");
+    assert_eq!(set["routes"], json!([uri]));
+    let reply = a.call("dial", json!({"identity": identity}));
+    let conn = reply["conn"].as_u64().unwrap_or_else(|| panic!("{reply}"));
+    let up = a.event("conn.up", |m| m["conn"] == conn);
+    assert_eq!(up["route"], json!({"kind": "ssh", "class": "ssh"}), "{up}");
+    a.call("ssh.forget", json!({"route_id": route}));
+    assert_eq!(peer_of(&mut a, &identity)["addresses"], json!([]));
+}

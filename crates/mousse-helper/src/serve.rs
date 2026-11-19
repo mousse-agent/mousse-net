@@ -410,6 +410,9 @@ pub async fn run(
             caller.use_flow_records(Arc::new(endpoint.flow_records()));
         }
         caller.use_stream_admission(host.stream_admission());
+        // The ssh tier opens SSH routes set up by `ssh.resolve` (Phase 1b §3).
+        let ssh = Arc::new(crate::ssh::Ssh::new(endpoint.dir()));
+        caller.use_ssh_dialer(Arc::new(crate::ssh::Dialer(ssh.clone())));
         // Renewals search from the store as it is then (Phase 1b §1.5).
         caller.use_candidates(Arc::new(crate::app::StoreCandidates {
             dir: endpoint.dir().to_path_buf(),
@@ -433,6 +436,7 @@ pub async fn run(
                 ))
             }),
             manual_clock,
+            ssh,
         };
         Some(crate::app::App::start(
             host.clone(),

@@ -25,6 +25,7 @@
 //! never connects again.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -33,6 +34,7 @@ use mousse_net_io::pipe::ssh::{
     self as sshpipe, config_path, find_marker, MarkerSearch, SshParams, SshReason, SshTarget,
     SshWindow, MARKER,
 };
+use mousse_net_io::pipe::{BoxPipe, DialFuture, LocalRoute, RouteDialer};
 use mousse_net_io::rng::random_bytes;
 use mousse_net_io::store::{hex, write_atomic};
 use mousse_net_io::NetError;
@@ -138,6 +140,12 @@ struct RouteFile {
     /// `ssh -G`'s `userknownhostsfile`, for the `in_user_known_hosts` hint.
     #[serde(default)]
     user_known_hosts: Vec<String>,
+    /// The remote profile's selector and shell, once `peer.addresses.set`
+    /// bound the route to a paired host (§7).
+    #[serde(default)]
+    selector: Option<String>,
+    #[serde(default)]
+    shell: Option<String>,
 }
 
 /// A fetched host key: its type and base64 blob, as in `known_hosts`.
@@ -358,6 +366,8 @@ impl Ssh {
                 .get("userknownhostsfile")
                 .cloned()
                 .unwrap_or_default(),
+            selector: before.as_ref().and_then(|b| b.selector.clone()),
+            shell: before.as_ref().and_then(|b| b.shell.clone()),
         };
         let meta = serde_json::to_vec(&route).map_err(|e| fail("store_failed", e.to_string()))?;
         write_atomic(&self.meta_path(&id), &meta)
@@ -625,7 +635,6 @@ impl Ssh {
     /// Open the pipe of route `id` to the remote profile `selector`
     /// (§3.3), within `within`. The caller's `ssh` tier calls this
     /// (`SSH_DIAL_TIMEOUT_MS`); TLS and step 1 run on top.
-    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub async fn dial(
         &self,
         id: &str,
@@ -644,6 +653,78 @@ impl Ssh {
             on_wait,
         )
         .await
+    }
+
+    /// `peer.addresses.set`'s SSH entry `{route_id, selector, shell}` (§7):
+    /// the route set up by `ssh.resolve` now reaches the remote profile
+    /// `selector`. Returns the address stored for the peer,
+    /// `ssh://mousse-<route_id>`. Only an `sh` remote is supported in 1b.
+    pub fn bind(&self, fields: &Map<String, Value>) -> Result<String, Fail> {
+        let text = |k: &str| fields.get(k).and_then(Value::as_str);
+        let id = route_id(text("route_id").unwrap_or(""))?;
+        let selector = text("selector")
+            .filter(|s| crate::pipe::is_selector(s))
+            .ok_or_else(|| fail("bad_route", "selector must be 26 characters of [a-z2-7]"))?;
+        match text("shell").unwrap_or("sh") {
+            "sh" => {}
+            "cmd" | "powershell" => {
+                return Err(fail(
+                    SshReason::WindowsRemoteUnsupported.name(),
+                    "Adding a Windows computer over SSH isn't supported yet.",
+                ))
+            }
+            other => return Err(fail("bad_route", format!("unknown shell {other:?}"))),
+        }
+        let mut route = self.route(&id)?;
+        route.selector = Some(selector.to_owned());
+        route.shell = Some("sh".into());
+        let meta = serde_json::to_vec(&route).map_err(|e| fail("store_failed", e.to_string()))?;
+        write_atomic(&self.meta_path(&id), &meta)
+            .map_err(|e| fail("store_failed", e.to_string()))?;
+        Ok(format!("ssh://{}", alias(&id)))
+    }
+
+    /// The route id and selector an `ssh` address names, if it is one
+    /// `peer.addresses.set` bound.
+    fn bound(&self, route: &LocalRoute) -> Option<(String, String)> {
+        let LocalRoute::Ssh { target, .. } = route else {
+            return None;
+        };
+        let id = route_id(target.strip_prefix("mousse-")?).ok()?;
+        let selector = self.route(&id).ok()?.selector?;
+        Some((id, selector))
+    }
+}
+
+/// The caller's `ssh` tier (Phase 1b §1.4): opens an `ssh://mousse-<route_id>`
+/// address through its route's config to the bound remote profile. The
+/// caller bounds the try by `SSH_DIAL_TIMEOUT_MS` and runs step 1 on the
+/// pipe. Any other `ssh` address was never set up and is not dialled.
+pub struct Dialer(pub Arc<Ssh>);
+
+impl RouteDialer for Dialer {
+    fn dial(&self, route: &LocalRoute, _addr: Option<SocketAddr>, within: Duration) -> DialFuture {
+        let ssh = self.0.clone();
+        let bound = ssh.bound(route);
+        let uri = route.uri();
+        Box::pin(async move {
+            let Some((id, selector)) = bound else {
+                return Err(NetError::Ssh {
+                    reason: SshReason::RemoteFailed,
+                    detail: format!("{uri} was not set up with ssh.resolve"),
+                });
+            };
+            let host = id.clone();
+            let pipe = ssh
+                .dial(&id, &selector, within, move |wait| {
+                    crate::applog::line(format!(
+                        "ssh route {host} waits {} ms for the connection window",
+                        wait.as_millis()
+                    ))
+                })
+                .await?;
+            Ok(Box::new(pipe) as BoxPipe)
+        })
     }
 }
 

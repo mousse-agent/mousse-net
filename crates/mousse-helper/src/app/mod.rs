@@ -101,6 +101,8 @@ pub struct AppInfo {
     /// `test.clock` moves.
     #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub manual_clock: Option<Arc<mousse_net_io::ManualClock>>,
+    /// SSH routes (Phase 1b §3), shared with the caller's `ssh` tier.
+    pub ssh: Arc<crate::ssh::Ssh>,
 }
 
 /// Why the channel ended.
@@ -293,7 +295,7 @@ impl App {
             removal,
             pairing: Mutex::new(pairing::State::new(info.name.clone())),
             keep: paths::Keep::default(),
-            ssh: Arc::new(crate::ssh::Ssh::new(&info.state_dir)),
+            ssh: info.ssh.clone(),
             info,
             limits,
         });
@@ -1245,7 +1247,18 @@ async fn tx_pump(
 async fn ssh_op(shared: Arc<Shared>, id: Value, op: String, map: Map<String, Value>) {
     let ssh = shared.ssh.clone();
     let events = shared.clone();
-    let reply = match ssh.handle(&op, &map, move |ev| events.event(ev)).await {
+    let mut done = ssh.handle(&op, &map, move |ev| events.event(ev)).await;
+    if op == "ssh.forget" && done.is_ok() {
+        // The route's address and approvals go too (§1.3).
+        let id = map.get("route_id").and_then(Value::as_str).unwrap_or("");
+        if let Err(e) = paths::forget_address(&shared, &format!("ssh://mousse-{id}")) {
+            done = Err(crate::ssh::Fail {
+                error: "store_failed",
+                reason: e.to_string(),
+            });
+        }
+    }
+    let reply = match done {
         Ok(mut reply) => {
             if let Some(obj) = reply.as_object_mut() {
                 obj.insert("re".into(), id);
