@@ -11,11 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use mousse_net_core::identity::SoftwareKey;
-use mousse_net_core::relay_wire::{
-    accept, enroll, handle, register, successor, AllowedInvitation, CircuitId, Class, Fingerprint,
-    Handle, IncomingKind, RelayId, RelayMessage,
-};
+use mousse_net_core::relay::msg::InvitationEntry;
+use mousse_net_core::relay::{Class, RelayClientKey, RelayId, RelayMessage};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
@@ -26,21 +23,18 @@ use super::{wait_spliced, RelayError};
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AllowSet {
     /// Caller key fingerprints, at most 256.
-    pub callers: Vec<Fingerprint>,
+    pub callers: Vec<[u8; 32]>,
     /// Invitation tag hashes, at most 8.
-    pub invitations: Vec<AllowedInvitation>,
+    pub invitations: Vec<InvitationEntry>,
 }
 
 /// Something for a live registration to send.
 #[derive(Debug)]
 pub enum TargetCommand {
     /// Make a join circuit a listed caller's circuit (§B.7).
-    Promote {
-        circuit: CircuitId,
-        caller: Fingerprint,
-    },
+    Promote { circuit: [u8; 16], caller: [u8; 32] },
     /// Vouch for a new registration key (self mode, §B.4).
-    Successor { new_key: Arc<SoftwareKey> },
+    Successor { new_key: Arc<RelayClientKey> },
 }
 
 /// What a live registration reports.
@@ -48,20 +42,16 @@ pub enum TargetCommand {
 pub enum TargetEvent {
     /// The relay took the allow-set with this sequence.
     AllowSetOk { sequence: u64 },
-    /// A caller or joiner was spliced to an accept leg: run the host side
-    /// of the peer session on `pipe`.
+    /// A caller (`caller` set) or a joiner (`None`) was spliced to an
+    /// accept leg: run the host side of the peer session on `pipe`.
     Incoming {
-        circuit: CircuitId,
-        kind: IncomingKind,
+        circuit: [u8; 16],
         class: Class,
-        caller: Option<Fingerprint>,
+        caller: Option<[u8; 32]>,
         pipe: Box<WsPipe>,
     },
     /// An accept leg failed; the caller gets `UNREACHABLE`.
-    AcceptFailed {
-        circuit: CircuitId,
-        error: RelayError,
-    },
+    AcceptFailed { circuit: [u8; 16], error: RelayError },
 }
 
 /// Allow-set sequences grow for the life of the process and start from the
@@ -83,6 +73,14 @@ fn next_sequence() -> u64 {
     }
 }
 
+fn allow_message(set: AllowSet) -> RelayMessage {
+    RelayMessage::AllowSet {
+        sequence: next_sequence(),
+        callers: set.callers,
+        invitations: set.invitations,
+    }
+}
+
 /// How a registration is proved.
 #[derive(Clone, Copy)]
 pub enum Proof {
@@ -97,8 +95,8 @@ pub struct TargetLink {
     link: RelayLink,
     addr: RelayAddr,
     relay: RelayId,
-    key: Arc<SoftwareKey>,
-    handle: Handle,
+    key: Arc<RelayClientKey>,
+    handle: [u8; 32],
     within: Duration,
 }
 
@@ -114,16 +112,25 @@ impl TargetLink {
     pub async fn register(
         addr: &RelayAddr,
         relay: RelayId,
-        key: Arc<SoftwareKey>,
+        key: Arc<RelayClientKey>,
         proof: Proof,
         within: Duration,
     ) -> Result<Self, RelayError> {
         let started = Instant::now();
         let mut link = RelayLink::connect(addr, relay, within).await?;
-        let expected = handle(&relay, &key.public_key());
+        let expected = key.handle(&relay);
+        let signed = key.register_proof(&relay, &link.binding());
         let msg = match proof {
-            Proof::Register => register(&link.binding(), &key),
-            Proof::Enroll(code) => enroll(&link.binding(), &key, code),
+            Proof::Register => RelayMessage::Register {
+                key: key.public_key(),
+                proof: signed,
+                hosted: None,
+            },
+            Proof::Enroll(code) => RelayMessage::Enroll {
+                key: key.public_key(),
+                proof: signed,
+                code,
+            },
         };
         let left = within.saturating_sub(started.elapsed());
         let got = tokio::time::timeout(left, async {
@@ -132,17 +139,15 @@ impl TargetLink {
                 RelayMessage::Registered { handle } => Ok(handle),
                 RelayMessage::Refused { reason } => Err(RelayError::Refused(reason)),
                 other => Err(RelayError::Protocol(format!(
-                    "expected REGISTERED, got type {}",
-                    other.kind()
+                    "expected REGISTERED, got {}",
+                    other.name()
                 ))),
             }
         })
         .await
         .map_err(|_| RelayError::Timeout)??;
         if got != expected {
-            return Err(RelayError::Protocol(
-                "the relay named another handle".into(),
-            ));
+            return Err(RelayError::Protocol("the relay named another handle".into()));
         }
         Ok(Self {
             link,
@@ -155,7 +160,7 @@ impl TargetLink {
     }
 
     /// This registration's handle.
-    pub fn handle(&self) -> Handle {
+    pub fn handle(&self) -> [u8; 32] {
         self.handle
     }
 
@@ -182,12 +187,7 @@ impl TargetLink {
             if push {
                 push = false;
                 let set = allow.borrow_and_update().clone();
-                let msg = RelayMessage::AllowSet {
-                    sequence: next_sequence(),
-                    callers: set.callers,
-                    invitations: set.invitations,
-                };
-                if let Err(e) = self.link.send(&msg).await {
+                if let Err(e) = self.link.send(&allow_message(set)).await {
                     return e;
                 }
                 last_sent = Instant::now();
@@ -208,12 +208,7 @@ impl TargetLink {
                     // `PROMOTE` names a caller the set just listed.
                     if allow.has_changed().unwrap_or(false) {
                         let set = allow.borrow_and_update().clone();
-                        let msg = RelayMessage::AllowSet {
-                            sequence: next_sequence(),
-                            callers: set.callers,
-                            invitations: set.invitations,
-                        };
-                        if let Err(e) = self.link.send(&msg).await {
+                        if let Err(e) = self.link.send(&allow_message(set)).await {
                             return e;
                         }
                     }
@@ -223,7 +218,13 @@ impl TargetLink {
                             RelayMessage::Promote { circuit, caller }
                         }
                         Some(TargetCommand::Successor { new_key }) => {
-                            successor(&self.link.binding(), &self.key, &new_key)
+                            let binding = self.link.binding();
+                            let new_public = new_key.public_key();
+                            RelayMessage::Successor {
+                                key: new_public,
+                                new_proof: new_key.successor_proof(&self.relay, &new_public, &binding),
+                                current_proof: self.key.successor_proof(&self.relay, &new_public, &binding),
+                            }
                         }
                     };
                     if let Err(e) = self.link.send(&msg).await {
@@ -235,24 +236,23 @@ impl TargetLink {
                     last_heard = Instant::now();
                     match got {
                         Err(e) => return e,
-                        Ok(RelayMessage::Ping(b)) => {
-                            if let Err(e) = self.link.send(&RelayMessage::Pong(b)).await {
+                        Ok(RelayMessage::Ping { data }) => {
+                            if let Err(e) = self.link.send(&RelayMessage::Pong { data }).await {
                                 return e;
                             }
                             last_sent = Instant::now();
                         }
-                        Ok(RelayMessage::Pong(_)) => {}
+                        Ok(RelayMessage::Pong { .. }) => {}
                         Ok(RelayMessage::AllowSetOk { sequence }) => {
                             let _ = events.send(TargetEvent::AllowSetOk { sequence });
                         }
-                        Ok(RelayMessage::Incoming { circuit, kind, class, caller }) => {
+                        Ok(RelayMessage::Incoming { circuit, class, caller }) => {
                             tokio::spawn(accept_leg(
                                 self.addr.clone(),
                                 self.relay,
                                 self.key.clone(),
                                 self.within,
                                 circuit,
-                                kind,
                                 class,
                                 caller,
                                 events.clone(),
@@ -263,15 +263,15 @@ impl TargetLink {
                         Ok(RelayMessage::LeaseStatus { .. }) => {}
                         Ok(other) => {
                             return RelayError::Protocol(format!(
-                                "unexpected relay message type {}",
-                                other.kind()
+                                "unexpected relay message {}",
+                                other.name()
                             ))
                         }
                     }
                 }
                 () = tokio::time::sleep_until(ping_at) => {
-                    let b = crate::rng::random_bytes::<8>();
-                    if let Err(e) = self.link.send(&RelayMessage::Ping(b)).await {
+                    let data = crate::rng::random_bytes::<8>();
+                    if let Err(e) = self.link.send(&RelayMessage::Ping { data }).await {
                         return e;
                     }
                     last_sent = Instant::now();
@@ -289,18 +289,21 @@ impl TargetLink {
 async fn accept_leg(
     addr: RelayAddr,
     relay: RelayId,
-    key: Arc<SoftwareKey>,
+    key: Arc<RelayClientKey>,
     within: Duration,
-    circuit: CircuitId,
-    kind: IncomingKind,
+    circuit: [u8; 16],
     class: Class,
-    caller: Option<Fingerprint>,
+    caller: Option<[u8; 32]>,
     events: mpsc::UnboundedSender<TargetEvent>,
 ) {
     let leg = async {
         let started = Instant::now();
         let mut link = RelayLink::connect(&addr, relay, within).await?;
-        let msg = accept(&link.binding(), &key, &circuit);
+        let msg = RelayMessage::Accept {
+            handle: key.handle(&relay),
+            circuit,
+            proof: key.accept_proof(&relay, &circuit, &link.binding()),
+        };
         let left = within.saturating_sub(started.elapsed());
         tokio::time::timeout(left, async {
             link.send(&msg).await?;
@@ -313,7 +316,6 @@ async fn accept_leg(
     let event = match leg.await {
         Ok(pipe) => TargetEvent::Incoming {
             circuit,
-            kind,
             class,
             caller,
             pipe: Box::new(pipe),

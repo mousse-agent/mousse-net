@@ -20,7 +20,12 @@
 
 use crate::cbor::{self, FieldError, Fields, Value};
 use crate::identity::{IdentityPublicKey, IdentityRecord, PublicKey, RawSignature};
-use crate::relay_wire::{relay_id, Envelope, Handle, RelayEndpoint, RelayId, RelayRoute};
+use crate::relay::proof::RelayId;
+use crate::relay_endpoint::{RelayEndpoint, RelayRoute};
+
+/// The signed envelope a manifest travels in: `{1: record, 2: raw
+/// signature}` (§A.12).
+pub use crate::relay_hosted::records::SignedEnvelope as Envelope;
 
 /// The domain at key 1.
 pub const MANIFEST_DOMAIN: &str = "mousse-manifest-v1";
@@ -39,7 +44,7 @@ pub struct ManifestRoute {
     /// Where it listens, 1 to 4.
     pub endpoints: Vec<RelayEndpoint>,
     /// The host's handle there.
-    pub handle: Handle,
+    pub handle: [u8; 32],
     /// A region label, 0 to 32 bytes.
     pub region: String,
 }
@@ -47,7 +52,7 @@ pub struct ManifestRoute {
 impl ManifestRoute {
     /// The relay id.
     pub fn relay(&self) -> RelayId {
-        relay_id(&self.relay_key)
+        RelayId::of(&self.relay_key)
     }
 
     /// One dialable route per endpoint.
@@ -218,7 +223,7 @@ impl Manifest {
     /// Check an envelope against the pinned host: signed by `pin`, for
     /// `pin`. Returns the manifest.
     pub fn open(envelope: &Envelope, pin: &IdentityPublicKey) -> Result<Self, ManifestError> {
-        if !envelope.verify(pin) {
+        if envelope.verify(pin).is_err() {
             return Err(ManifestError::WrongSigner);
         }
         let manifest = Self::decode(&envelope.record)?;

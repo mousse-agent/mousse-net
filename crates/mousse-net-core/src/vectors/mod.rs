@@ -1049,7 +1049,7 @@ fn route_hint_vectors() -> J {
 
 fn relay_hint_vectors() -> J {
     use crate::base64url;
-    use crate::relay_wire::RelayRoute;
+    use crate::relay_endpoint::RelayRoute;
     let id = base64url::encode(&[0x11; 32]);
     let handle = base64url::encode(&[0x22; 32]);
     let short = base64url::encode(&[0x11; 31]);
@@ -1075,7 +1075,7 @@ fn relay_hint_vectors() -> J {
                 Some(r) => json!({
                     "endpoint": r.endpoint.to_string(),
                     "destination": r.endpoint.destination(),
-                    "relay": hex(&r.relay),
+                    "relay": hex(&r.relay.0),
                     "handle": hex(&r.handle),
                 }),
                 None => json!("malformed"),

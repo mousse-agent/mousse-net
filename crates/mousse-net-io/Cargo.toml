@@ -38,13 +38,8 @@ keyring = { version = "=3.6.3", features = ["apple-native"] }
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 keyring = { version = "=3.6.3", features = ["sync-secret-service", "crypto-rust"] }
 
-[features]
-# A minimal self-mode relay on loopback, for tests until `mousse-relay`
-# replaces it.
-test-relay = []
-
 [dev-dependencies]
-# The integration tests use the test relay.
-mousse-net-io = { path = ".", features = ["test-relay"] }
+# The relay tests run the real relay in the test process.
+mousse-relay = { path = "../mousse-relay" }
 tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "time", "test-util"] }
 rand_chacha = "=0.10.0"

@@ -7,16 +7,21 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+
+/// The upgrade path (spec `relay.md` 2).
+pub const RELAY_PATH: &str = "/mousse-relay/1";
+/// The WebSocket subprotocol.
+pub const RELAY_SUBPROTOCOL: &str = "mousse-relay.1";
+/// The outer TLS ALPN.
+pub const RELAY_ALPN: &[u8] = b"http/1.1";
 use std::task::{ready, Context, Poll};
 use std::time::Duration;
 
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
-use mousse_net_core::identity::{PublicKey, RawSignature, SoftwareKey};
-use mousse_net_core::relay_wire::{
-    certificate_key, relay_id, Binding, CloseCode, Mode, RelayId, RelayMessage, RELAY_ALPN,
-    RELAY_EXPORTER_LABEL, RELAY_MESSAGE_MAX, RELAY_PATH, RELAY_SUBPROTOCOL, RELAY_VERSION,
-    WS_MESSAGE_MAX,
-};
+use mousse_net_core::identity::{PublicKey, RawSignature};
+use mousse_net_core::relay::msg::{RELAY_MESSAGE_MAX, RELAY_VERSION, WS_MESSAGE_MAX};
+use mousse_net_core::relay::proof::OUTER_EXPORTER_LABEL;
+use mousse_net_core::relay::{check_pin, Binding, Mode, RelayCertError, RelayId, RelayMessage};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::Resumption;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime as PkiTime};
@@ -60,16 +65,12 @@ pub fn ws_config() -> WebSocketConfig {
 struct RelayPin(RelayId);
 
 fn pinned_key(pin: &RelayId, cert: &CertificateDer<'_>) -> Result<PublicKey, TlsError> {
-    let key = certificate_key(cert.as_ref()).ok_or(TlsError::InvalidCertificate(
-        rustls::CertificateError::BadEncoding,
-    ))?;
-    #[cfg(not(mousse_control = "no-pin-relay"))]
-    if relay_id(&key) != *pin {
-        return Err(TlsError::General(RELAY_PIN_MISMATCH.into()));
-    }
-    #[cfg(mousse_control = "no-pin-relay")]
-    let _ = pin;
-    Ok(key)
+    check_pin(cert.as_ref(), pin).map_err(|e| match e {
+        RelayCertError::PinMismatch => TlsError::General(RELAY_PIN_MISMATCH.into()),
+        RelayCertError::Malformed => {
+            TlsError::InvalidCertificate(rustls::CertificateError::BadEncoding)
+        }
+    })
 }
 
 const RELAY_PIN_MISMATCH: &str = "relay key is not the pinned relay";
@@ -139,6 +140,7 @@ type ClientTls = tokio_rustls::client::TlsStream<TcpStream>;
 /// one per WebSocket message.
 pub struct RelayLink<S = ClientTls> {
     ws: WebSocketStream<S>,
+    relay: RelayId,
     binding: Binding,
     mode: Mode,
     boot_id: [u8; 16],
@@ -192,7 +194,7 @@ impl RelayLink<ClientTls> {
         let relay_key = conn
             .peer_certificates()
             .and_then(|certs| certs.first())
-            .and_then(|cert| certificate_key(cert.as_ref()));
+            .and_then(|cert| check_pin(cert.as_ref(), &relay).ok());
         let group = conn.negotiated_key_exchange_group().map(|g| g.name());
         if group != Some(NamedGroup::X25519MLKEM768) {
             return Err(RelayError::Tls(format!(
@@ -203,7 +205,7 @@ impl RelayLink<ClientTls> {
             return Err(RelayError::Tls("ALPN http/1.1 was not negotiated".into()));
         }
         let mut exporter = [0u8; 32];
-        conn.export_keying_material(&mut exporter, RELAY_EXPORTER_LABEL.as_bytes(), None)
+        conn.export_keying_material(&mut exporter, OUTER_EXPORTER_LABEL, None)
             .map_err(|e| RelayError::Tls(e.to_string()))?;
         let host = match &addr.name {
             Some(name) => format!("{name}:{}", addr.addr.port()),
@@ -231,8 +233,8 @@ impl RelayLink<ClientTls> {
         }
         let mut link = RelayLink {
             ws,
+            relay,
             binding: Binding {
-                relay,
                 nonce: [0; 32],
                 exporter,
             },
@@ -264,21 +266,14 @@ impl RelayLink<ClientTls> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> RelayLink<S> {
-    /// A link on an accepted connection (the relay side), with its binding.
-    pub fn from_parts(ws: WebSocketStream<S>, binding: Binding, mode: Mode) -> Self {
-        Self {
-            ws,
-            binding,
-            mode,
-            boot_id: [0; 16],
-            relay_key: None,
-        }
-    }
-
-    /// The relay's identity key (its id is the pinned one). Known on the
-    /// dialling side only.
+    /// The relay's identity key (its id is the pinned one).
     pub fn relay_key(&self) -> Option<PublicKey> {
         self.relay_key
+    }
+
+    /// The pinned relay id.
+    pub fn relay(&self) -> RelayId {
+        self.relay
     }
 
     /// What this connection's proofs are bound to.
@@ -347,10 +342,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> RelayLink<S> {
         WsPipe::new(self.ws)
     }
 
-    /// The WebSocket, for splicing on the relay side.
-    pub fn into_ws(self) -> WebSocketStream<S> {
-        self.ws
-    }
 }
 
 /// How a spliced relay connection ended, once it has.
@@ -361,11 +352,6 @@ impl CloseWatch {
     /// The relay's close code, if one arrived.
     pub fn code(&self) -> Option<u16> {
         *self.0.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// The close code as ours, if it is one.
-    pub fn reason(&self) -> Option<CloseCode> {
-        self.code().and_then(CloseCode::from_code)
     }
 
     fn set(&self, code: u16) {
@@ -473,52 +459,5 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WsPipe<S> {
         Pin::new(&mut self.ws)
             .poll_close(cx)
             .map_err(io::Error::other)
-    }
-}
-
-/// A relay's identity key as a rustls signing key, for the relay side of
-/// the outer TLS.
-pub struct RelaySigningKey(Arc<SoftwareKey>);
-
-impl RelaySigningKey {
-    /// Sign the outer TLS with `key`.
-    pub fn new(key: Arc<SoftwareKey>) -> Self {
-        Self(key)
-    }
-}
-
-impl fmt::Debug for RelaySigningKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("RelaySigningKey(..)")
-    }
-}
-
-impl rustls::sign::SigningKey for RelaySigningKey {
-    fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn rustls::sign::Signer>> {
-        offered
-            .contains(&SCHEME)
-            .then(|| Box::new(RelaySigner(self.0.clone())) as Box<dyn rustls::sign::Signer>)
-    }
-
-    fn algorithm(&self) -> rustls::SignatureAlgorithm {
-        rustls::SignatureAlgorithm::ECDSA
-    }
-}
-
-struct RelaySigner(Arc<SoftwareKey>);
-
-impl fmt::Debug for RelaySigner {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("RelaySigner(..)")
-    }
-}
-
-impl rustls::sign::Signer for RelaySigner {
-    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, TlsError> {
-        Ok(self.0.sign_raw(message).to_der())
-    }
-
-    fn scheme(&self) -> SignatureScheme {
-        SCHEME
     }
 }

@@ -22,7 +22,8 @@
 //! - [`relay_hosted`]: the relay's hosted mode: admission tokens, leases,
 //!   the Plus clock and reports.
 //! - [`manifest`]: the host-signed list of relay routes.
-//! - [`relay_wire`]: the relay protocol as an endpoint speaks it.
+//! - [`relay_endpoint`]: relay endpoints, the `relay` route hint, the
+//!   `mousse-keys` records and an endpoint's relay key derivation.
 //! - [`limits`]: every tunable limit, its default and allowed range.
 #![forbid(unsafe_code)]
 
@@ -107,7 +108,7 @@ pub mod mux;
 pub mod pairing;
 pub mod relay;
 pub mod relay_hosted;
-pub mod relay_wire;
+pub mod relay_endpoint;
 pub mod session;
 pub mod session_cert;
 pub mod time;
