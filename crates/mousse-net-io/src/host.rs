@@ -167,6 +167,8 @@ struct Inner<F: CodeExchangeFactory> {
     /// (see [`EnrollmentSaveError::Unsettled`]). No grant is served until a
     /// save works.
     reconcile: bool,
+    /// [`Host::pause`]: no connection is served until [`Host::resume`].
+    paused: bool,
     events: mpsc::UnboundedSender<HostEvent>,
 }
 
@@ -245,10 +247,10 @@ where
         }
     }
 
-    /// Whether grants may be served: no rolled-back enrollment is waiting
-    /// to be saved away.
+    /// Whether grants may be served: not paused, and no rolled-back
+    /// enrollment is waiting to be saved away.
     fn serving(&self) -> bool {
-        !self.reconcile
+        !self.reconcile && !self.paused
     }
 
     /// Remove the grants past their expiry, close their connections and
@@ -525,6 +527,7 @@ where
                 store,
                 unsaved: false,
                 reconcile: false,
+                paused: false,
                 events,
             }),
             certs: CertManager::with_limits(signer, config.clock.clone(), &config.limits),
@@ -814,6 +817,24 @@ where
     /// Whether the grant table has changes that are not saved yet.
     pub fn has_unsaved_changes(&self) -> bool {
         lock(&self.shared).unsaved
+    }
+
+    /// Stop serving: close every connection with `code`, and close every
+    /// connection that registers until [`Host::resume`], also one whose
+    /// handshake began before. Both happen under the lock connections
+    /// register under, so none slips between them.
+    pub fn pause(&self, code: ErrorCode) {
+        let mut inner = lock(&self.shared);
+        inner.paused = true;
+        let conns: Vec<ConnectionId> = inner.conns.keys().copied().collect();
+        for conn in conns {
+            inner.close_conn(conn, code);
+        }
+    }
+
+    /// Serve again after [`Host::pause`].
+    pub fn resume(&self) {
+        lock(&self.shared).paused = false;
     }
 
     /// Close every connection with `code`.

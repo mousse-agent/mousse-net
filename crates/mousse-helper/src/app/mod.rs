@@ -208,6 +208,15 @@ struct Core {
     peer_gen: HashMap<IdentityPublicKey, u64>,
 }
 
+/// Why a connection that finished opening was closed instead of published.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stale {
+    /// Networking paused meanwhile.
+    Paused,
+    /// Its peer was forgotten meanwhile.
+    Forgotten,
+}
+
 fn lock(core: &Mutex<Core>) -> MutexGuard<'_, Core> {
     core.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -299,18 +308,15 @@ impl App {
             applog::line(format!("refused {peer}: not live"));
             return;
         }
-        if self.shared.removal.is_paused() {
-            conn.close(ErrorCode::InternalError);
-            return;
-        }
         let grant = self.shared.host.grant_of(conn.id());
         let mut fields = json!({"dir": "in"});
         if let Some(g) = &grant {
             fields["grant"] = json!(g.id.0);
             fields["role"] = json!(g.role.as_str());
         }
-        applog::line(format!("connected {peer} (in)"));
-        self.shared.add_conn(conn, true, fields);
+        if self.shared.add_conn(conn, true, fields).is_ok() {
+            applog::line(format!("connected {peer} (in)"));
+        }
     }
 
     /// The network changed (an interface, or a wake): check every
@@ -365,9 +371,15 @@ impl Shared {
         self.queued(&core);
     }
 
-    fn add_conn(self: &Arc<Self>, conn: Connection, inbound: bool, fields: Value) -> u64 {
+    /// Publish a connection: `conn.up`. While networking is paused it is
+    /// closed instead.
+    fn add_conn(
+        self: &Arc<Self>,
+        conn: Connection,
+        inbound: bool,
+        fields: Value,
+    ) -> Result<u64, Stale> {
         self.publish(conn, inbound, None, fields)
-            .unwrap_or_else(|| unreachable!("an unchecked connection is always published"))
     }
 
     /// The generation of `pin` (see `Core::peer_gen`).
@@ -378,7 +390,12 @@ impl Shared {
     /// Publish an outbound path to a peer whose generation was `gen` when
     /// the work that opened it started. If the peer was forgotten since,
     /// the path is closed instead and `None` is returned.
-    fn add_outbound(self: &Arc<Self>, conn: Connection, gen: u64, fields: Value) -> Option<u64> {
+    fn add_outbound(
+        self: &Arc<Self>,
+        conn: Connection,
+        gen: u64,
+        fields: Value,
+    ) -> Result<u64, Stale> {
         self.publish(conn, false, Some(gen), fields)
     }
 
@@ -388,10 +405,21 @@ impl Shared {
         inbound: bool,
         gen: Option<u64>,
         mut fields: Value,
-    ) -> Option<u64> {
+    ) -> Result<u64, Stale> {
         let identity = *conn.peer();
         let no = {
             let mut core = lock(&self.core);
+            // Checked under the lock `watch_pause` closes connections
+            // under: a pause either sees this connection or is seen here.
+            if self.removal.is_paused() {
+                drop(core);
+                conn.close(ErrorCode::InternalError);
+                applog::line(format!(
+                    "closed a new path with {}: networking is paused",
+                    short_id(&identity)
+                ));
+                return Err(Stale::Paused);
+            }
             if let Some(gen) = gen {
                 if core.peer_gen.get(&identity).copied().unwrap_or(0) != gen {
                     drop(core);
@@ -400,7 +428,7 @@ impl Shared {
                         "closed a new path to {}: forgotten meanwhile",
                         short_id(&identity)
                     ));
-                    return None;
+                    return Err(Stale::Forgotten);
                 }
             }
             let conn = Arc::new(conn);
@@ -424,7 +452,7 @@ impl Shared {
             tokio::spawn(conn_task(self.clone(), no, conn, inbound));
             no
         };
-        Some(no)
+        Ok(no)
     }
 
     /// The connection ended: its streams end with it (`conn.down` says so).

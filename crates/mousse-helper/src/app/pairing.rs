@@ -335,15 +335,17 @@ async fn join(
                 short_id(&ticket.host_identity),
                 if already { "already paired" } else { "paired" }
             ));
-            let no = shared.add_conn(conn, false, json!({"dir": "out", "role": role}));
-            json!({
-                "re": id,
-                "identity": hex(ticket.host_identity.as_bytes()),
-                "name": record.name,
-                "role": role,
-                "already": already,
-                "conn": no,
-            })
+            match shared.add_conn(conn, false, json!({"dir": "out", "role": role})) {
+                Ok(no) => json!({
+                    "re": id,
+                    "identity": hex(ticket.host_identity.as_bytes()),
+                    "name": record.name,
+                    "role": role,
+                    "already": already,
+                    "conn": no,
+                }),
+                Err(_) => paused(&shared, &id),
+            }
         }
         Err(f) => error(&id, &f.reason, f.text),
     };
@@ -560,6 +562,13 @@ pub async fn watch_pause(shared: Arc<Shared>) {
                     for entry in core.conns.values() {
                         entry.conn.close(ErrorCode::InternalError);
                     }
+                }
+                // Joins still running stop; each is answered `paused`.
+                let joins: Vec<(Value, AbortHandle)> =
+                    state(&shared).joins.drain().map(|(_, join)| join).collect();
+                for (id, task) in joins {
+                    task.abort();
+                    shared.event(paused(&shared, &id));
                 }
                 shared.event(json!({"ev": "net.paused", "reason": reason}));
             }

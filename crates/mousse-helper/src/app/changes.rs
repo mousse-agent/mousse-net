@@ -68,7 +68,7 @@ pub async fn forward_renewals(shared: Arc<Shared>) {
                     continue;
                 }
                 let role = paths::stored_role(&shared, &pin);
-                let Some(no) = shared.add_outbound(conn, gen, json!({"dir": "out", "role": role}))
+                let Ok(no) = shared.add_outbound(conn, gen, json!({"dir": "out", "role": role}))
                 else {
                     continue;
                 };

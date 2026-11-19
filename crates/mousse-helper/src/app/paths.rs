@@ -334,8 +334,12 @@ pub async fn dial(
         route_uri(&used)
     ));
     let role = super::pairing::role_text(&record.role);
-    let Some(no) = shared.add_outbound(conn, gen, json!({"dir": "out", "role": role})) else {
-        return Err(DialError::NoPeer("forgotten while the path opened".into()));
+    let no = match shared.add_outbound(conn, gen, json!({"dir": "out", "role": role})) {
+        Ok(no) => no,
+        Err(super::Stale::Paused) => return Err(DialError::Paused),
+        Err(super::Stale::Forgotten) => {
+            return Err(DialError::NoPeer("forgotten while the path opened".into()))
+        }
     };
     Ok(Dialled {
         conn: no,
