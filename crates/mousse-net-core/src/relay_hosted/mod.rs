@@ -5,9 +5,9 @@
 //!
 //! [`Hosted`] is one relay boot. The relay's connection code calls it on
 //! every hosted message (`REGISTER`, `ADMIT`, `LEASE`, `RELEASE`), before
-//! every spliced message it forwards ([`Hosted::forward`]), and at the
-//! instant [`Hosted::next_wakeup`] names, and acts on the [`Event`]s that
-//! [`Hosted::poll`] returns. The relay's Plus client feeds Plus's answers
+//! every spliced message it forwards ([`Hosted::forward`]), then calls
+//! [`Hosted::poll`] (after each call, and at the instant
+//! [`Hosted::next_wakeup`] names) and acts on the [`Event`]s it returns. The relay's Plus client feeds Plus's answers
 //! back in and sends the parts [`Hosted::next_report_part`] builds.
 //!
 //! Counters live in memory only; the boot generation is the only
@@ -618,8 +618,10 @@ impl Hosted {
         Ok(())
     }
 
-    /// The handle's registration connection closed or was replaced. Its
-    /// circuits and leases stay (§B.4).
+    /// The handle's registration connection closed, and no other live
+    /// registration of the handle replaced it (a replacement is a new
+    /// [`Hosted::register`] and needs no call here). Its circuits and
+    /// leases stay (§B.4).
     pub fn unregister(&mut self, handle: &Handle) {
         if let Some(a) = self.admissions.get_mut(handle) {
             a.registered = false;
@@ -1089,10 +1091,15 @@ impl Hosted {
                 at(t);
             }
         }
+        // Tokens not yet past `not after`. One already past is kept only
+        // while funded, and its block ending is a lease event or a lease
+        // expiry, both covered above.
+        let t = self.admission_now_ms(now);
         for a in self.admissions.values() {
             let end = a.not_after.saturating_mul(1_000).saturating_add(1);
-            let t = self.admission_now_ms(now);
-            at(now.mono.plus(end.saturating_sub(t)));
+            if end > t {
+                at(now.mono.plus(end - t));
+            }
         }
         next
     }

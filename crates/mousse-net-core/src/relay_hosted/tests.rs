@@ -288,8 +288,10 @@ fn past_admission_expiry_a_funded_registration_carries_on_but_takes_no_lease() {
         at(0),
     )
     .unwrap();
-    // Past not after: kept, and its circuits still forward.
+    // Past not after: kept, and its circuits still forward. No timer is
+    // due for it (the block ending is what closes it).
     let later = at(120_000);
+    assert_eq!(h.next_wakeup(later), Some(Millis(3_600_000)));
     assert!(!h
         .poll(later)
         .iter()
