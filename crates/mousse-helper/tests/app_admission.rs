@@ -879,3 +879,178 @@ fn the_fence_at_the_ws_upgrade_answers_503() {
     let late = silent_to(port);
     assert!(dropped(&late), "a ws connection got in while paused");
 }
+
+// ---------------------------------------------------------------------
+// The pipe listener: app mode's IPC, which the remote `pipe` of an SSH
+// route reaches (Phase 1b §3.3).
+// ---------------------------------------------------------------------
+
+/// A pipe request line, with the token.
+fn pipe_request(token: &str) -> Vec<u8> {
+    format!("{{\"cmd\":\"pipe\",\"token\":\"{token}\"}}\n").into_bytes()
+}
+
+/// A tokio connection to the IPC of the helper in `dir`.
+#[cfg(windows)]
+async fn ipc_async(dir: &Path) -> tokio::net::windows::named_pipe::NamedPipeClient {
+    let file: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("control.json")).unwrap()).unwrap();
+    tokio::net::windows::named_pipe::ClientOptions::new()
+        .open(file["addr"].as_str().unwrap())
+        .unwrap()
+}
+
+#[cfg(not(windows))]
+async fn ipc_async(dir: &Path) -> tokio::net::UnixStream {
+    tokio::net::UnixStream::connect(dir.join("control.sock"))
+        .await
+        .unwrap()
+}
+
+/// Bytes the IPC line reader read together with the pipe request are not
+/// lost: the caller's ClientHello goes in the same write as the request,
+/// and the session still comes up over the handed-over stream.
+#[test]
+fn the_pipe_handoff_keeps_the_bytes_read_with_the_request() {
+    let end = Endpoint::init("handoff");
+    let mut b = end.app("hostB", &[]);
+    b.hello();
+    let caller = Caller::new(
+        Arc::new(SoftwareKey::generate(&mut os_rng())),
+        Arc::new(mousse_net_io::SystemClock::default()),
+        Limits::DEFAULT,
+    );
+    b.call(
+        "grant.add",
+        json!({"identity": mousse_net_io::store::hex(caller.identity().as_bytes()), "name": "laptop"}),
+    );
+    let pin = mousse_net_io::store::identity_from_hex(&b.identity).unwrap();
+    let token: Value =
+        serde_json::from_slice(&std::fs::read(end.dir.join("control.json")).unwrap()).unwrap();
+    let token = token["token"].as_str().unwrap().to_owned();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let dialled = rt.block_on(async {
+        let ipc = ipc_async(&end.dir).await;
+        let (mine, mut theirs) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            // The caller's first TLS record, the ClientHello, in full.
+            let mut head = [0u8; 5];
+            theirs.read_exact(&mut head).await?;
+            let mut hello = vec![0u8; usize::from(u16::from_be_bytes([head[3], head[4]]))];
+            theirs.read_exact(&mut hello).await?;
+            let (mut rd, mut wr) = tokio::io::split(ipc);
+            let mut first = pipe_request(&token);
+            first.extend_from_slice(&head);
+            first.extend_from_slice(&hello);
+            // One write: the helper's line reader takes the ClientHello
+            // with the request.
+            wr.write_all(&first).await?;
+            // The reply line, a byte at a time: nothing behind it is taken.
+            let mut line = Vec::new();
+            loop {
+                let byte = rd.read_u8().await?;
+                if byte == b'\n' {
+                    break;
+                }
+                line.push(byte);
+            }
+            let reply: Value = serde_json::from_slice(&line).unwrap();
+            assert_eq!(reply["ok"], true, "{reply}");
+            let (mut cr, mut cw) = tokio::io::split(theirs);
+            let _ = tokio::join!(
+                tokio::io::copy(&mut rd, &mut cw),
+                tokio::io::copy(&mut cr, &mut wr)
+            );
+            std::io::Result::Ok(())
+        });
+        tokio::time::timeout(Duration::from_secs(10), caller.dial(mine, pin)).await
+    });
+    let conn = dialled
+        .expect("the handshake never finished over the handed-over pipe")
+        .expect("the dial over the pipe failed");
+    let caller_identity = mousse_net_io::store::hex(caller.identity().as_bytes());
+    b.event("conn.up", |m| {
+        m["dir"] == "in" && m["identity"] == caller_identity.as_str()
+    });
+    drop(conn);
+    drop(rt);
+}
+
+/// The pipe pool is its own: with the ws pool full a pipe still gets its
+/// place, taken at accept; PREAUTH_PIPE + 1 is refused before any read.
+#[test]
+fn a_pipe_takes_its_own_place_at_accept_and_one_past_the_pool_is_refused() {
+    let end = Endpoint::init("pipepool");
+    let mut a = end.app_args(
+        "hostA",
+        &[("PREAUTH_WS", "1"), ("PREAUTH_PIPE", "1")],
+        &["--ws-port", "0"],
+    );
+    a.hello();
+    let ws = silent_to(ws_port_of(&mut a));
+    assert!(!dropped(&ws), "the only ws place was refused");
+    assert_eq!(a.stats()["preauth_open"]["ws"], 1);
+
+    // The ws pool is full; a pipe still connects. It holds its place while
+    // its handshake has not started.
+    let (mut first, token) = ipc_raw(&end.dir);
+    first.write_all(&pipe_request(&token)).unwrap();
+    let got = read_line_within(first.try_clone().unwrap(), Duration::from_secs(5))
+        .expect("no answer to the first pipe");
+    let reply: Value = serde_json::from_slice(&got).unwrap();
+    assert_eq!(reply["ok"], true, "{reply}");
+    assert_eq!(a.stats()["preauth_open"]["pipe"], 1);
+
+    // One more: refused at accept, without its request being read.
+    let (second, _) = ipc_raw(&end.dir);
+    let got = read_line_within(second, Duration::from_secs(5)).expect("no answer");
+    let reply: Value = serde_json::from_slice(&got).unwrap();
+    assert_eq!(reply["error"], "refused", "{reply}");
+    assert!(
+        reply["reason"].as_str().unwrap().contains("PREAUTH_PIPE"),
+        "{reply}"
+    );
+    assert_eq!(a.stats()["preauth_refused"]["pipe"], 1);
+    drop(first);
+    drop(ws);
+}
+
+/// The fence covers the pipe listener: while a removal is not saved, a
+/// pipe is refused at accept.
+#[test]
+fn the_fence_covers_the_pipe_listener() {
+    let mut p = pair_up("pipefence", &[("REMOVAL_RETRY_MS", "60000")], &[]);
+    // Before the pause a pipe gets in.
+    let (mut conn, token) = ipc_raw(&p.a_end.dir);
+    conn.write_all(&pipe_request(&token)).unwrap();
+    let got = read_line_within(conn, Duration::from_secs(5)).expect("no answer");
+    let reply: Value = serde_json::from_slice(&got).unwrap();
+    assert_eq!(reply["ok"], true, "{reply}");
+
+    let b_identity = p.b.identity.clone();
+    let grants = p.a.call("grants.list", json!({}));
+    let grant = grants["grants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["identity"] == b_identity.as_str())
+        .unwrap()["grant"]
+        .clone();
+    block_grant_saves(&p.a_end.dir);
+    assert_eq!(
+        p.a.call("grant.remove", json!({"grant": grant}))["paused"],
+        true
+    );
+    p.a.event("net.paused", |_| true);
+    let (mut conn, token) = ipc_raw(&p.a_end.dir);
+    let _ = conn.write_all(&pipe_request(&token));
+    let got = read_line_within(conn, Duration::from_secs(5)).expect("the pipe stayed open");
+    let reply: Value = serde_json::from_slice(&got).unwrap_or(Value::Null);
+    assert_eq!(
+        reply["error"], "refused",
+        "a pipe got in while paused: {reply}"
+    );
+}
