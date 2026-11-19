@@ -13,6 +13,8 @@ use mousse_net_core::time::UnixTime;
 use mousse_relay::client::{DialError, Received, RelayConn};
 use mousse_relay::server::{self, Running, ServerConfig};
 use mousse_relay::state::{hex, StateDir};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+use tokio::sync::mpsc;
 
 pub const WAIT: Duration = Duration::from_secs(10);
 
@@ -215,4 +217,31 @@ pub async fn closed(c: &mut RelayConn) -> Option<u16> {
             return code;
         }
     }
+}
+
+/// Turn a spliced relay leg into a byte stream. `inject` sends raw peer
+/// messages beside the stream (the packet control).
+pub fn bridge(mut conn: RelayConn) -> (DuplexStream, mpsc::UnboundedSender<Vec<u8>>) {
+    let (mine, theirs) = tokio::io::duplex(256 * 1024);
+    let (tx, mut inject) = mpsc::unbounded_channel::<Vec<u8>>();
+    tokio::spawn(async move {
+        let (mut rd, mut wr) = tokio::io::split(theirs);
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            tokio::select! {
+                n = rd.read(&mut buf) => match n {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => if conn.send_raw(buf[..n].to_vec()).await.is_err() { break },
+                },
+                got = conn.recv() => match got {
+                    Received::Peer(b) => if wr.write_all(&b).await.is_err() { break },
+                    _ => break,
+                },
+                raw = inject.recv() => if let Some(raw) = raw {
+                    let _ = conn.send_raw(raw).await;
+                },
+            }
+        }
+    });
+    (mine, tx)
 }

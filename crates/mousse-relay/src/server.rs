@@ -31,7 +31,7 @@ use crate::egress::Egress;
 use crate::state::{Lists, StateDir, StateError};
 use crate::{os_rng, tls, upgrade, OsRng};
 
-type Ws = WebSocketStream<BufReader<TlsStream<TcpStream>>>;
+type Ws = WebSocketStream<BufReader<Box<dyn crate::Io>>>;
 
 /// What a connection's writer does next.
 enum Cmd {
@@ -278,6 +278,8 @@ pub async fn start_with_wall(config: ServerConfig, wall_base: u64) -> Result<Run
 }
 
 async fn start_inner(config: ServerConfig, wall_offset: Option<u64>) -> Result<Running, String> {
+    #[cfg(mousse_control = "marker-in-relay-memory")]
+    crate::control::keep_marker_in_memory();
     let lock = config.state.lock_process().map_err(|e| e.to_string())?;
     let identity = config.state.identity().map_err(|e| e.to_string())?;
     let lists = config.state.read().map_err(|e: StateError| e.to_string())?;
@@ -395,10 +397,8 @@ async fn handshake(
     acceptor: TlsAcceptor,
     tcp: TcpStream,
 ) -> Result<(Ws, [u8; 32]), String> {
-    let tls = acceptor.accept(tcp).await.map_err(|e| e.to_string())?;
-    tls::check(tls.get_ref().1, false)?;
-    let exporter = tls::exporter(tls.get_ref().1).map_err(|e| e.to_string())?;
-    let mut stream = BufReader::new(tls);
+    let (io, exporter) = outer_tls(acceptor, tcp).await?;
+    let mut stream = BufReader::new(io);
     if let Err(e) = upgrade::accept(&mut stream, shared.limits.header_max_bytes() as usize).await {
         let _ = tokio::io::AsyncWriteExt::shutdown(&mut stream).await;
         return Err(format!("{e:?}"));
@@ -543,12 +543,35 @@ async fn on_message(shared: &Shared, conn: ConnId, bytes: Vec<u8>) {
     shared.execute(core, outs, Some((bytes, permits)));
 }
 
-/// The relay's view of spliced bytes. Release builds do nothing here; the
-/// memory positive control of `phase3.marker` copies them into the heap.
+/// The outer TLS of a new connection, and its exporter.
+#[cfg(not(mousse_control = "marker-in-splice"))]
+async fn outer_tls(
+    acceptor: TlsAcceptor,
+    tcp: TcpStream,
+) -> Result<(Box<dyn crate::Io>, [u8; 32]), String> {
+    let tls: TlsStream<TcpStream> = acceptor.accept(tcp).await.map_err(|e| e.to_string())?;
+    tls::check(tls.get_ref().1, false)?;
+    let exporter = tls::exporter(tls.get_ref().1).map_err(|e| e.to_string())?;
+    Ok((Box::new(tls), exporter))
+}
+
+/// `marker-in-splice` (`phase3.marker`, packet positive control): the
+/// relay runs without outer TLS, so a packet capture sees what it forwards.
+#[cfg(mousse_control = "marker-in-splice")]
+async fn outer_tls(
+    _acceptor: TlsAcceptor,
+    tcp: TcpStream,
+) -> Result<(Box<dyn crate::Io>, [u8; 32]), String> {
+    Ok((Box::new(tcp), [0; 32]))
+}
+
+/// The relay's view of spliced bytes. Release builds do nothing here. A
+/// debug build writes them to the file named by `MOUSSE_RELAY_TAP`, the
+/// "debug relay tap" of `phase3.marker`.
 #[inline]
 fn marker_tap(_bytes: &[u8]) {
-    #[cfg(mousse_control = "marker-in-relay-memory")]
-    crate::control::keep_in_memory(_bytes);
+    #[cfg(debug_assertions)]
+    crate::control::tap(_bytes);
 }
 
 async fn writer(

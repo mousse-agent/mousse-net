@@ -1,8 +1,9 @@
-# Threat model, Phase 0
+# Threat model
 
-Status: Phase 0 draft. Covers what Phase 0 builds: two desktop devices that
+Status: Phase 3 draft. Covers what Phase 0 builds (two desktop devices that
 pair in person on a LAN, open channels over one TLS connection, and remove a
-grant. Relays, Plus, phones and browsers come later and extend this document.
+grant) and, under "Relays", the self-hosted relay of Phase 3. Plus, phones
+and browsers come later and extend this document.
 
 ## What we protect
 
@@ -158,6 +159,74 @@ key, grants and denials, invitations, pins and listener.
 - A wrong clock and an expired certificate look the same. The app shows one
   neutral message and does not guess.
 - Skew is fixed at ±10 min everywhere.
+
+## Relays
+
+A relay ([`relay.md`](relay.md)) carries connections between devices that
+cannot reach each other directly. It is trusted for availability only:
+never to read traffic, never to decide who may use a host.
+
+| Attacker | Can do |
+|---|---|
+| **Relay operator** (or whoever controls its machine) | Run modified relay code: see and drop everything the relay handles, admit anyone, connect anyone to any leg, replay old messages. |
+| **Stranger at the relay** | Reach the relay's port with its own keys; register, call, join and accept with them; open many connections. |
+| **Removed caller** | A device whose grant the host removed, still holding its caller key. |
+
+Defences (`docs/phase34-design.md` Part C, each proved by a vector in
+`relay-admission.json` or a check in `checks/phase3.toml`):
+
+- **Nothing is readable at the relay.** Each circuit carries the peer TLS
+  session, pinned to the other device's identity key, end to end. A relay
+  that connects a caller to the wrong leg fails the caller's pin before any
+  data. A malicious relay that admits a stranger reaches a host that still
+  runs step 1 and step 2 itself, and refuses it. (`phase3.marker`,
+  Phase 1b's admission checks over a relay route.)
+- **The relay is pinned.** Native clients pin the relay id, the hash of its
+  TLS key, and require the hybrid key exchange; another relay key fails the
+  handshake before any relay message (`no-pin-relay` control).
+- **Proofs cannot be reused.** Every proof is bound to the relay id, the
+  handle, a fresh relay nonce, the outer TLS exporter and its purpose, so a
+  proof from one connection, relay or message cannot stand for another
+  (`register_replayed`, `call_replayed_other_connection`,
+  `call_other_relay`).
+- **Handles are derived, never claimed.** A target can register only the
+  handle of a key it holds, and only if the operator's list holds that key
+  or a key on it vouched for it with `SUCCESSOR` (`register_other_key`,
+  `successor_without_current_key`, `successor_unauthorized_current`).
+- **Only the target admits.** A call reaches a target only if its caller key
+  is in the allow-set the target pushed on its live registration; the relay
+  adds nothing. A removed caller's circuits close when the next allow-set
+  arrives, and no other caller's do (`removed_caller_closed`,
+  `removal_leaves_others`).
+- **Refusals say nothing.** An unlisted caller, an unknown handle, an
+  offline target and a bad proof get the same `UNREACHABLE` from one code
+  path at the same deadline, so a stranger cannot learn whether a caller is
+  listed or a host is online (`unlisted_equals_offline`; the timing rule of
+  `phase3.relay-admission`).
+- **Joins are bounded.** A join needs the invitation tag, which only a
+  ticket holder can compute, and runs under a byte budget, a per-target
+  cap and the invitation's expiry until the target promotes it
+  (`join_without_tag`, `preaccept_over_budget`, `preaccept_per_target`).
+- **Accept legs are signed** over the circuit by the handle's registration
+  key (`accept_wrong_key`).
+- **A reboot forgets admission.** Registrations and allow-sets live in
+  memory only; after a restart every call is refused until the target
+  registers again and pushes its set (`phase3.relay-reboot`).
+- **Local limits** bound connections per address, accept legs per handle,
+  circuits per caller, queued bytes and egress, and are tighten-only where a
+  client could push against them (`phase3.relay-limits`).
+
+What a relay can still do:
+
+- **Deny service.** It can drop or delay anything; devices fall back to
+  their other routes.
+- **See metadata.** IP addresses, timing, sizes, handles, caller
+  fingerprints and who calls whom ([`privacy.md`](privacy.md), "Through a
+  relay").
+- **Impersonate itself with a stolen key.** Whoever copies the relay's
+  identity key can run a relay clients accept, with the same powers as the
+  operator above and no more. Registration keys and caller keys never leave
+  the devices.
 
 ## Residual risks in Phase 0
 
