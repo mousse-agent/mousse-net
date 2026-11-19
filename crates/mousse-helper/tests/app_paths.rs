@@ -215,6 +215,37 @@ fn the_hosts_own_refusal_stops_the_search() {
     assert_eq!(b.events("dial.failed").len(), 1, "parked after the refusal");
 }
 
+/// A `dial` that waits its turn behind the keeper's dial to the same host
+/// takes that dial's outcome: a host that refuses this device answers once
+/// its proof window is over, and the app's dial does not wait out a second
+/// window of its own.
+#[test]
+fn a_dial_waiting_behind_the_keeper_takes_its_refusal() {
+    let a_end = Endpoint::init("behinda");
+    let b_end = Endpoint::init("behindb");
+    let mut a = a_end.app("hostA", &[("JOIN_PROOF_WAIT_MS", "3000")]);
+    a.hello();
+    let mut b = b_end.app("peerB", &[]);
+    b.hello();
+    let a_route = route_of(&mut a);
+    // B knows A, but A holds no grant for B: the keeper dials at once and A
+    // holds that dial for its whole proof window.
+    let (identity, name) = (a.identity.clone(), a.name.clone());
+    b.call(
+        "peer.add",
+        json!({"identity": identity, "name": name, "routes": [a_route]}),
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    let start = Instant::now();
+    let reply = b.request("dial", json!({"identity": a.identity}));
+    let took = start.elapsed();
+    assert_eq!(reply["why"], "not_authorized", "{reply}");
+    assert!(
+        took < Duration::from_millis(4_000),
+        "one proof window, not two: took {took:?}"
+    );
+}
+
 const PUBLIC: [&str; 7] = [
     "tcp://8.8.8.8:7443",
     "tcp://203.0.113.9:7443",

@@ -43,7 +43,7 @@ control = [
 
 [[check]]
 id = "phase1a.discovery"
-title = "mDNS carries no name; a pin mismatch moves on; peer-supplied routes are private-range only"
+title = "mDNS carries no name; a pin mismatch moves on; peer-supplied routes are private-range only; a dial waiting behind another takes its outcome"
 plan = "docs/phase1a-design.md §5.3, §6 and §10 (E5a)"
 targets = ["linux-x64", "macos-arm64"]
 min_tests = 8
@@ -54,6 +54,7 @@ local = [
 control = [
   { name = "stop-on-mismatch", breaks = "the caller gives up at the first candidate with another identity", env = { RUSTFLAGS = '--cfg mousse_control="stop-on-mismatch"' } },
   { name = "public-routes", breaks = "pairback and peer.addresses.set accept public addresses", env = { RUSTFLAGS = '--cfg mousse_control="public-routes"' } },
+  { name = "dial-again-behind", breaks = "a dial that waited behind another dial to the same host dials again instead of taking its outcome", env = { RUSTFLAGS = '--cfg mousse_control="dial-again-behind"' } },
 ]
 
 # App checks (`app = true`): run the Mousse app at the revision in

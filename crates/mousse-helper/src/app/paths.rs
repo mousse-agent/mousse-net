@@ -162,6 +162,25 @@ pub enum DialError {
     NoPeer(String),
     Paused,
     Failed(NetError),
+    /// Another dial to the host ended this way while this one waited its
+    /// turn.
+    Same(Failure),
+}
+
+/// How a dial failed, kept for the dials that waited behind it.
+#[derive(Clone, Debug)]
+pub struct Failure {
+    pub why: String,
+    pub reason: String,
+}
+
+impl Failure {
+    fn of(e: &NetError) -> Self {
+        Failure {
+            why: crate::peer::reason_of(e),
+            reason: crate::peer::describe(e),
+        }
+    }
 }
 
 /// What a dial gave.
@@ -178,6 +197,8 @@ pub struct Dialled {
 pub struct Keep {
     locks: Mutex<HashMap<IdentityPublicKey, Arc<tokio::sync::Mutex<()>>>>,
     kicks: Mutex<Option<mpsc::UnboundedSender<Kick>>>,
+    /// Per host: how many dials have ended, and how the last one failed.
+    ends: Mutex<HashMap<IdentityPublicKey, (u64, Option<Failure>)>>,
 }
 
 /// Something the keeper should look at.
@@ -197,6 +218,21 @@ impl Keep {
             .entry(pin)
             .or_default()
             .clone()
+    }
+
+    fn ended(&self, pin: IdentityPublicKey) -> (u64, Option<Failure>) {
+        self.ends
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&pin)
+            .cloned()
+            .unwrap_or((0, None))
+    }
+
+    fn note_end(&self, pin: IdentityPublicKey, failure: Option<Failure>) {
+        let mut ends = self.ends.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = ends.entry(pin).or_insert((0, None));
+        *entry = (entry.0 + 1, failure);
     }
 
     /// Tell the keeper (once it runs).
@@ -246,13 +282,17 @@ fn find_peer(shared: &Shared, pin: &IdentityPublicKey) -> Result<PeerRecord, Dia
 /// Open an outbound path to the paired host `pin` and announce it with
 /// `conn.up`. `fresh`: the app asked (`dial`), so a path is opened even if
 /// one is up, unless another dial opened one while this one waited its
-/// turn. Otherwise (the keeper) any outbound path will do.
+/// turn; if that other dial failed instead, its failure is the answer (it
+/// ended after the app asked, and a host that refuses this device makes
+/// each dial wait out its proof window: dialing again would double the
+/// wait). Otherwise (the keeper) any outbound path will do.
 pub async fn dial(
     shared: &Arc<Shared>,
     pin: IdentityPublicKey,
     fresh: bool,
 ) -> Result<Dialled, DialError> {
     let before: HashSet<u64> = outbound(shared, &pin).into_iter().collect();
+    let ended_before = shared.keep.ended(pin).0;
     let lock = shared.keep.lock_for(pin);
     let _turn = lock.lock().await;
     let now = outbound(shared, &pin);
@@ -267,11 +307,22 @@ pub async fn dial(
             already: true,
         });
     }
+    if fresh && !cfg!(mousse_control = "dial-again-behind") {
+        if let (ended, Some(failure)) = shared.keep.ended(pin) {
+            if ended > ended_before {
+                return Err(DialError::Same(failure));
+            }
+        }
+    }
     if shared.removal.is_paused() {
         return Err(DialError::Paused);
     }
     let record = find_peer(shared, &pin)?;
-    let (conn, used) = reach(shared, &record).await.map_err(DialError::Failed)?;
+    let reached = reach(shared, &record).await;
+    shared
+        .keep
+        .note_end(pin, reached.as_ref().err().map(Failure::of));
+    let (conn, used) = reached.map_err(DialError::Failed)?;
     // Only the route is noted, on the record as stored now.
     let _ = PeerStore::in_dir(&shared.info.state_dir).note_route(&pin, route_uri(&used));
     applog::line(format!(
@@ -302,6 +353,12 @@ pub async fn dial_op(shared: Arc<Shared>, id: Value, identity: String) {
                     "error": "unreachable",
                     "reason": crate::peer::describe(&e),
                     "why": crate::peer::reason_of(&e),
+                }),
+                Err(DialError::Same(f)) => json!({
+                    "re": id,
+                    "error": "unreachable",
+                    "reason": f.reason,
+                    "why": f.why,
                 }),
             }
         }
