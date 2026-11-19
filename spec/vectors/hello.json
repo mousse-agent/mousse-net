@@ -3,34 +3,34 @@
     {
       "local": {
         "major": 1,
-        "minor": 0,
-        "oldest_minor": 0
+        "minor": 2,
+        "oldest_minor": 1
       },
       "name": "same_version",
       "peer": {
         "major": 1,
-        "minor": 0
+        "minor": 2
       },
-      "result": 0
+      "result": 2
     },
     {
       "local": {
         "major": 1,
-        "minor": 0,
-        "oldest_minor": 0
+        "minor": 2,
+        "oldest_minor": 1
       },
       "name": "peer_newer_minor",
       "peer": {
         "major": 1,
         "minor": 7
       },
-      "result": 0
+      "result": 2
     },
     {
       "local": {
         "major": 1,
-        "minor": 0,
-        "oldest_minor": 0
+        "minor": 2,
+        "oldest_minor": 1
       },
       "name": "peer_major_2",
       "peer": {
@@ -42,8 +42,8 @@
     {
       "local": {
         "major": 1,
-        "minor": 0,
-        "oldest_minor": 0
+        "minor": 2,
+        "oldest_minor": 1
       },
       "name": "peer_major_0",
       "peer": {
@@ -118,25 +118,25 @@
       "result": "close:unsupported_version"
     }
   ],
-  "description": "HELLO version negotiation (spec wire.md, \"Versions\"). `local` is what the receiving side speaks (its newest and oldest minor version), `peer` is the HELLO it received. `result` is the minor version both sides use, or the close code. `this_build` is what mousse-net-core version 1.0 speaks; `hello` is its HELLO. `repeated`: several HELLOs arrive on one connection, as control-message bytes, in order. Only the first counts; each later one is `ignored`, whatever it holds. `agreed` is the connection's minor version at the end (null if the first HELLO closed it).",
-  "hello": "a3000101010200",
+  "description": "HELLO version negotiation (spec wire.md, \"Versions\"). `local` is what the receiving side speaks (its newest and oldest minor version), `peer` is the HELLO it received. `result` is the minor version both sides use, or the close code. `this_build` is what this mousse-net-core build speaks; `hello` is its HELLO. `repeated`: several HELLOs arrive on one connection, as control-message bytes, in order. Only the first counts; each later one is `ignored`, whatever it holds. `agreed` is the connection's minor version at the end (null if the first HELLO closed it).",
+  "hello": "a3000101010202",
   "repeated": [
     {
-      "agreed": 0,
+      "agreed": 2,
       "hellos": [
         {
-          "control": "a3000101010200",
-          "result": 0
+          "control": "a3000101010202",
+          "result": 2
         },
         {
-          "control": "a3000101010200",
+          "control": "a3000101010202",
           "result": "ignored"
         }
       ],
       "local": {
         "major": 1,
-        "minor": 0,
-        "oldest_minor": 0
+        "minor": 2,
+        "oldest_minor": 1
       },
       "name": "second_hello_same"
     },
@@ -160,11 +160,11 @@
       "name": "second_hello_other_minor"
     },
     {
-      "agreed": 0,
+      "agreed": 2,
       "hellos": [
         {
-          "control": "a3000101010200",
-          "result": 0
+          "control": "a3000101010202",
+          "result": 2
         },
         {
           "control": "a3000101020200",
@@ -173,8 +173,8 @@
       ],
       "local": {
         "major": 1,
-        "minor": 0,
-        "oldest_minor": 0
+        "minor": 2,
+        "oldest_minor": 1
       },
       "name": "second_hello_other_major"
     },
@@ -186,21 +186,21 @@
           "result": "close:unsupported_version"
         },
         {
-          "control": "a3000101010200",
+          "control": "a3000101010202",
           "result": "ignored"
         }
       ],
       "local": {
         "major": 1,
-        "minor": 0,
-        "oldest_minor": 0
+        "minor": 2,
+        "oldest_minor": 1
       },
       "name": "first_hello_refused"
     }
   ],
   "this_build": {
     "major": 1,
-    "minor": 0,
-    "oldest_minor": 0
+    "minor": 2,
+    "oldest_minor": 1
   }
 }

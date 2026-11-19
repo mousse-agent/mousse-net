@@ -15,7 +15,8 @@
         mousse_control = "no-revoke-journal",
         mousse_control = "stop-on-mismatch",
         mousse_control = "public-routes",
-        mousse_control = "no-rediscovery"
+        mousse_control = "no-rediscovery",
+        mousse_control = "auto-send-unknown"
     )
 ))]
 compile_error!("a mousse_control build has a deliberate defect and is for tests only; build it without --release");
@@ -38,6 +39,7 @@ compile_error!("test-in-person lets a typed ticket count as scanned from the hos
     mousse_control = "stop-on-mismatch",
     mousse_control = "public-routes",
     mousse_control = "no-rediscovery",
+    mousse_control = "auto-send-unknown",
     feature = "test-in-person"
 ))]
 const _: () = {
@@ -57,6 +59,7 @@ const _: () = {
 
 mod app;
 mod applog;
+mod engine;
 mod ipc;
 mod limits;
 mod peer;

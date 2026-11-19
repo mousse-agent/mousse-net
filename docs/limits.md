@@ -100,7 +100,26 @@ spec's value: it can only be tightened.
 | `MOUSSE_NET_KEEP_RETRY_MAX_MS` | 60000 | 10 to 3600000 | App mode: longest wait between those redials; not below the first. |
 | `MOUSSE_NET_PREAUTH_CONNECTIONS` | 64 | 1 to 64 | Host: inbound connections not yet past step 2 (the TLS handshake, then authorization or pairing), from all addresses together. One more is dropped before its handshake starts, so slow or stalled handshakes cannot use up sockets and memory. |
 | `MOUSSE_NET_PREAUTH_PER_SOURCE` | 8 | 1 to 8 | Host: of those, connections from one source address; not above `PREAUTH_CONNECTIONS`. |
+| `MOUSSE_NET_REMOVAL_MAX_AGE_SECS` | 2592000 | 86400 to 2592000 | "Remove on all my hosts" (Phase 4 Part D): the oldest removal a host accepts and an admin device keeps queued, and how long a host keeps removal ids. Tighten only. |
+| `MOUSSE_NET_REMOVAL_ANSWER_WAIT_MS` | 10000 | 1000 to 120000 | How long one side of `mousse-removal` waits for the other's message (the signed removal, or the host's answer). |
+| `MOUSSE_NET_PLUS_TIMEOUT_MS` | 10000 | 1000 to 60000 | One Plus request. |
+| `MOUSSE_NET_PLUS_RETRY_FIRST_MS` | 1000 | 100 to 60000 | First wait before retrying a Plus request; each next wait doubles. |
+| `MOUSSE_NET_PLUS_RETRY_MAX_MS` | 300000 | 1000 to 3600000 | Longest wait before retrying a Plus request; not below the first. |
+| `MOUSSE_NET_PLUS_PREFETCH_PERCENT` | 50 | 10 to 90 | Use of the current relay lease, in percent, at which the next block is asked for; also the status threshold the helper gives a hosted relay. |
+| `MOUSSE_NET_PLUS_NOT_BEFORE_RETRY_MS` | 1000 | 1000 to 10000 | Wait before presenting a block or admission token again that a relay refused for `not before`, or for having no Plus clock yet. |
+| `MOUSSE_NET_PLUS_REFILL_DEADLINE_MS` | 5000 | 1000 to 9000 | After this long without a new block, relayed bulk shows paused; below the relay's default refill wait. |
+| `MOUSSE_NET_PLUS_MAIL_POLL_SECS` | 300 | 30 to 86400 | How often a host fetches its Plus inbox (also after a network change). |
+| `MOUSSE_NET_VIA_RELAY_MOVE_STAGE_SECS` | 86400 | 0 to 604800 | How long a move to another hosted relay stages the new route before cutting over. |
 | `MOUSSE_NET_INIT_HOLD_MS` | 0 | 0 to 60000 | Checks only: how long `init` waits before it makes the endpoint, so the hard-kill check can stop the app during a first start. Run for the app (`--app`), its stdin closing still ends it at once. |
+
+## Settings
+
+Settings are not limits: text values, read once at startup. An invalid
+value stops startup with a message naming the variable.
+
+| Variable | Default | What it sets |
+|---|---|---|
+| `MOUSSE_NET_PLUS_URL` | unset (no Plus) | The Plus origin, `https://host[:port]` with no path. Plus is not a trust anchor, so the platform verifier checks it and nothing is pinned. Debug builds also take `http://` on a loopback address, for the test stand-in. |
 
 ## Fixed on purpose
 
@@ -119,4 +138,8 @@ These are protocol constants, not limits, so they are not settings:
 - The verifier's 24 h certificate maximum (`MAX_LIFETIME_SECS`); a device
   can only issue shorter certificates (`CERT_LIFETIME_SECS`).
 - The joiner record's bound of 3 attempts: the stored format rejects more.
+- Engine-stream messages: at most 262 144 bytes (wire.md 9.5). Plus's fixed
+  maxima (`REQUEST_MAX` 16 384, `DIR_ENTRY_MAX` 4096, `MAIL_ENVELOPE_MAX`
+  8192, `DEPOSIT_TOKENS_MAX` 256, `BLOCK_MAX_LIFETIME` 172 800 s, the
+  65 536-byte block and rate-cap floors).
 - The mDNS name format (`mousse-` and 12 random characters, privacy.md).

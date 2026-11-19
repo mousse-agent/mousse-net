@@ -18,6 +18,8 @@
 //! - [`pairing`]: tickets, join proofs, host and joiner pairing state machines.
 //! - [`mux`]: frame codec, per-stream credit, priority scheduler, keepalive.
 //! - [`session`]: certificate-driven session lifetime and path switching.
+//! - [`removal`]: "remove on all my hosts": grant lists, signed removals
+//!   and the host's checks.
 //! - [`limits`]: every tunable limit, its default and allowed range.
 #![forbid(unsafe_code)]
 
@@ -32,7 +34,12 @@
         mousse_control = "break-authz",
         mousse_control = "break-raw-signature",
         mousse_control = "break-cpace-confirm",
-        mousse_control = "break-cpace-sid"
+        mousse_control = "break-cpace-sid",
+        mousse_control = "removal-unsigned",
+        mousse_control = "accept-any-signer",
+        mousse_control = "ignore-owner",
+        mousse_control = "ignore-grant-id",
+        mousse_control = "resend-refused"
     ),
     not(debug_assertions)
 ))]
@@ -45,7 +52,12 @@ compile_error!("mousse_control plants a bug for tests; it is not allowed in rele
     mousse_control = "break-authz",
     mousse_control = "break-raw-signature",
     mousse_control = "break-cpace-confirm",
-    mousse_control = "break-cpace-sid"
+    mousse_control = "break-cpace-sid",
+    mousse_control = "removal-unsigned",
+    mousse_control = "accept-any-signer",
+    mousse_control = "ignore-owner",
+    mousse_control = "ignore-grant-id",
+    mousse_control = "resend-refused"
 ))]
 const _: () = {
     let profile = env!("MOUSSE_BUILD_PROFILE").as_bytes();
@@ -75,6 +87,7 @@ pub mod identity;
 pub mod limits;
 pub mod mux;
 pub mod pairing;
+pub mod removal;
 pub mod session;
 pub mod session_cert;
 pub mod time;
@@ -93,7 +106,7 @@ pub const PROTOCOL_VERSION: u64 = 1;
 /// Minor protocol version this build speaks. Peers exchange it in `HELLO`
 /// and use the lower of the two. The current and previous minor versions are
 /// supported.
-pub const PROTOCOL_MINOR_VERSION: u64 = 0;
+pub const PROTOCOL_MINOR_VERSION: u64 = 2;
 
 /// TLS ALPN protocol identifier for peer sessions. It carries the major
 /// version only.

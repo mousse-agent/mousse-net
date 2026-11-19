@@ -17,6 +17,9 @@ const APP_PREFIX: &str = "ENGINE_";
 /// After [`ENV_PREFIX`]: the Mousse app's helper path in unpackaged builds.
 const APP_HELPER_PATH: &str = "HELPER";
 
+/// After [`ENV_PREFIX`]: settings that are not limits ([`settings`]).
+const SETTINGS: [&str; 1] = ["PLUS_URL"];
+
 mousse_net_core::define_limits! {
     /// The helper's own limits.
     pub struct HelperLimits {
@@ -80,6 +83,26 @@ mousse_net_core::define_limits! {
         preauth_connections = "PREAUTH_CONNECTIONS": 64, [1, 64];
         /// Host: of those, connections from one source address (tighten only).
         preauth_per_source = "PREAUTH_PER_SOURCE": 8, [1, 8];
+        /// Oldest removal ("remove on all my hosts") a host accepts or an admin device keeps queued; also how long a host keeps removal ids (tighten only).
+        removal_max_age_secs = "REMOVAL_MAX_AGE_SECS": 2_592_000, [86_400, 2_592_000];
+        /// How long one side of `mousse-removal` waits for the other's message (the removal, or the host's answer).
+        removal_answer_wait_ms = "REMOVAL_ANSWER_WAIT_MS": 10_000, [1_000, 120_000];
+        /// One request to Plus.
+        plus_timeout_ms = "PLUS_TIMEOUT_MS": 10_000, [1_000, 60_000];
+        /// First wait before retrying a Plus request; each next wait doubles.
+        plus_retry_first_ms = "PLUS_RETRY_FIRST_MS": 1_000, [100, 60_000];
+        /// Longest wait before retrying a Plus request; not below the first.
+        plus_retry_max_ms = "PLUS_RETRY_MAX_MS": 300_000, [1_000, 3_600_000];
+        /// Use of the current lease, in percent, at which the next block is asked for (and the threshold the relay reports at).
+        plus_prefetch_percent = "PLUS_PREFETCH_PERCENT": 50, [10, 90];
+        /// Wait before presenting a block or admission token again that a relay refused for `not before`, or for having no Plus clock yet.
+        plus_not_before_retry_ms = "PLUS_NOT_BEFORE_RETRY_MS": 1_000, [1_000, 10_000];
+        /// After this long without a new block, relayed bulk shows paused; below the relay's default refill wait.
+        plus_refill_deadline_ms = "PLUS_REFILL_DEADLINE_MS": 5_000, [1_000, 9_000];
+        /// How often a host fetches its Plus inbox.
+        plus_mail_poll_secs = "PLUS_MAIL_POLL_SECS": 300, [30, 86_400];
+        /// How long a hosted relay move stages the new route before cutting over.
+        via_relay_move_stage_secs = "VIA_RELAY_MOVE_STAGE_SECS": 86_400, [0, 604_800];
         /// Checks only: how long `init` waits before it makes the endpoint, so a check can stop the app during the first start. Run for the app (`--app`), its stdin closing still ends it at once.
         init_hold_ms = "INIT_HOLD_MS": 0, [0, 60_000];
     }
@@ -103,6 +126,12 @@ mousse_net_core::define_limits! {
             return Err(LimitError::Conflict(format!(
                 "PREAUTH_PER_SOURCE ({}) is above PREAUTH_CONNECTIONS ({})",
                 h.preauth_per_source, h.preauth_connections
+            )));
+        }
+        if h.plus_retry_max_ms < h.plus_retry_first_ms {
+            return Err(LimitError::Conflict(format!(
+                "PLUS_RETRY_MAX_MS ({}) is below PLUS_RETRY_FIRST_MS ({})",
+                h.plus_retry_max_ms, h.plus_retry_first_ms
             )));
         }
         if h.keep_retry_max_ms < h.keep_retry_first_ms {
@@ -189,6 +218,7 @@ impl Limits {
                 n.strip_prefix(ENV_PREFIX).is_some_and(|rest| {
                     !rest.starts_with(APP_PREFIX)
                         && rest != APP_HELPER_PATH
+                        && !SETTINGS.contains(&rest)
                         && !Self::specs().any(|s| s.name == rest)
                 })
             })
@@ -217,6 +247,8 @@ pub fn init_from_env() -> Result<(), String> {
     }
     let limits = Limits::from_vars(|key| std::env::var_os(key))?;
     let _ = LIMITS.set(limits);
+    let settings = Settings::from_vars(|key| std::env::var_os(key))?;
+    let _ = SETTINGS_READ.set(settings);
     Ok(())
 }
 
@@ -228,6 +260,71 @@ pub fn get() -> &'static Limits {
 /// The helper's own limits.
 pub fn helper() -> &'static HelperLimits {
     &get().helper
+}
+
+/// Settings that are not limits: text values read once at startup
+/// (`docs/limits.md`, "Settings").
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Settings {
+    /// `MOUSSE_NET_PLUS_URL`: the Plus origin, `https://host[:port]` with
+    /// no path. Unset: no Plus. Debug builds also take `http://` on a
+    /// loopback address, for the test stand-in.
+    pub plus_url: Option<String>,
+}
+
+impl Settings {
+    /// From the variables `var` returns. An invalid value is an error that
+    /// names the variable.
+    pub fn from_vars(var: impl Fn(&str) -> Option<OsString>) -> Result<Self, String> {
+        let key = format!("{ENV_PREFIX}PLUS_URL");
+        let plus_url = match var(&key) {
+            None => None,
+            Some(raw) => {
+                let text = raw
+                    .into_string()
+                    .map_err(|_| format!("{key} is not valid text"))?;
+                Some(check_plus_url(&text).map_err(|why| format!("{key}={text:?}: {why}"))?)
+            }
+        };
+        Ok(Self { plus_url })
+    }
+}
+
+/// Check a Plus origin: `https://host[:port]`, no path, query or user.
+/// Debug builds also take `http://` on a loopback address.
+pub fn check_plus_url(text: &str) -> Result<String, String> {
+    let text = text.strip_suffix('/').unwrap_or(text);
+    let (scheme, rest) = text
+        .split_once("://")
+        .ok_or_else(|| "needs https://host".to_string())?;
+    if rest.is_empty() || rest.contains(['/', '?', '#', '@', ' ']) {
+        return Err("must be an origin: https://host[:port], with no path".into());
+    }
+    match scheme {
+        "https" => Ok(text.to_owned()),
+        "http" if cfg!(debug_assertions) && is_loopback_authority(rest) => Ok(text.to_owned()),
+        "http" => Err("must use https (http only on loopback, in debug builds)".into()),
+        _ => Err("must use https".into()),
+    }
+}
+
+fn is_loopback_authority(authority: &str) -> bool {
+    let host = match authority.rsplit_once(':') {
+        Some((h, port)) if port.bytes().all(|b| b.is_ascii_digit()) => h,
+        _ => authority,
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+static SETTINGS_READ: OnceLock<Settings> = OnceLock::new();
+
+/// The settings read at startup (none before that).
+pub fn settings() -> &'static Settings {
+    SETTINGS_READ.get_or_init(Settings::default)
 }
 
 /// `ms` milliseconds.
@@ -438,6 +535,32 @@ mod tests {
                 "docs/limits.md has no row starting {row}"
             );
         }
+    }
+
+    #[test]
+    fn the_plus_url_is_an_https_origin() {
+        assert_eq!(
+            check_plus_url("https://plus.example/"),
+            Ok("https://plus.example".into())
+        );
+        assert!(check_plus_url("https://plus.example/v1").is_err());
+        assert!(check_plus_url("https://user@plus.example").is_err());
+        assert!(check_plus_url("ftp://plus.example").is_err());
+        assert!(check_plus_url("http://plus.example").is_err());
+        // The test stand-in, on loopback, in debug builds only.
+        assert_eq!(
+            check_plus_url("http://127.0.0.1:4000").is_ok(),
+            cfg!(debug_assertions)
+        );
+        let names = ["MOUSSE_NET_PLUS_URL", "MOUSSE_NET_PLUS_URLS"].map(OsString::from);
+        assert_eq!(
+            Limits::unknown_names(names.into_iter()),
+            vec!["MOUSSE_NET_PLUS_URLS".to_string()]
+        );
+        let bad = Settings::from_vars(|k| {
+            (k == "MOUSSE_NET_PLUS_URL").then(|| OsString::from("plus.example"))
+        });
+        assert!(bad.unwrap_err().contains("MOUSSE_NET_PLUS_URL"));
     }
 
     #[test]

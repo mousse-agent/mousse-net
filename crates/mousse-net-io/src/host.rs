@@ -42,8 +42,9 @@ use mousse_net_core::pairing::{
     InvitationId, InvitationKind, InvitationParams, InvitationStatus, PairingCode,
     SessionExporters,
 };
+use mousse_net_core::removal::{self, Decision, Journaled, RemovalId, SignedRemoval};
 use mousse_net_core::{ConnectionId, ErrorCode, Millis, UnixTime};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::admission::StreamAdmission;
 use crate::certs::CertManager;
@@ -115,6 +116,15 @@ pub struct ApprovalRequest {
     pub name: String,
 }
 
+/// What [`Host::apply_removal`] did.
+#[derive(Debug)]
+pub struct AppliedRemoval {
+    /// The decision, journaled when it had to be.
+    pub decision: Decision,
+    /// For an applied removal: whether the grant table was saved.
+    pub saved: Result<(), NetError>,
+}
+
 /// Something the host application should know about.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HostEvent {
@@ -170,6 +180,8 @@ struct Inner<F: CodeExchangeFactory> {
     /// [`Host::pause`]: no connection is served until [`Host::resume`].
     paused: bool,
     events: mpsc::UnboundedSender<HostEvent>,
+    /// Bumped on every change to the grant table ([`Host::grants_changed`]).
+    grants_gen: watch::Sender<u64>,
 }
 
 struct Shared<F: CodeExchangeFactory> {
@@ -230,6 +242,7 @@ where
     /// Save the grant table. On failure the change stays in effect in
     /// memory, the host reports [`HostEvent::StoreFailed`] and retries.
     fn persist(&mut self) -> Result<(), NetError> {
+        self.grants_gen.send_modify(|g| *g += 1);
         let Some(store) = &self.store else {
             return Ok(());
         };
@@ -351,6 +364,7 @@ where
         let Some(store) = self.store.clone() else {
             return actions;
         };
+        self.grants_gen.send_modify(|g| *g += 1);
         let failure = match store.save_enrollment(&before, &self.grants, &pending) {
             Ok(()) => return actions,
             Err(f) => f,
@@ -529,6 +543,7 @@ where
                 reconcile: false,
                 paused: false,
                 events,
+                grants_gen: watch::channel(0).0,
             }),
             certs: CertManager::with_limits(signer, config.clock.clone(), &config.limits),
             clock: config.clock,
@@ -697,6 +712,61 @@ where
     /// All grants.
     pub fn grants(&self) -> Vec<Grant> {
         lock(&self.shared).grants.grants().cloned().collect()
+    }
+
+    /// Changes to the grant table: the value grows on every change (a
+    /// grant added, replaced, removed, expired or denied).
+    pub fn grants_changed(&self) -> watch::Receiver<u64> {
+        lock(&self.shared).grants_gen.subscribe()
+    }
+
+    /// Apply a signed removal from an owner-role device (Phase 4, design
+    /// D.4), under the lock connections are admitted and devices enrolled
+    /// under.
+    ///
+    /// Runs [`removal::decide`] with `journaled` (the removal journal's
+    /// entry for this id, if any). A decision that must be journaled is
+    /// passed to `record`, which must make it durable before it returns;
+    /// if it fails, nothing changes and the error is returned. Then, for
+    /// `applied`, the grant is removed (its connections close with
+    /// `GRANT_REVOKED`) and the table saved; a failed save is reported in
+    /// [`AppliedRemoval::saved`], and the caller pauses networking until a
+    /// save works, as for any removal (Phase 1a §5.4). While the host is
+    /// paused nothing is decided.
+    pub fn apply_removal(
+        &self,
+        signed: &SignedRemoval,
+        max_age_secs: u64,
+        journaled: impl FnOnce(&RemovalId) -> Option<Journaled>,
+        record: impl FnOnce(&Decision) -> Result<(), String>,
+    ) -> Result<AppliedRemoval, String> {
+        let now = self.shared.clock.now();
+        let mut inner = lock(&self.shared);
+        if !inner.serving() {
+            return Err("networking is paused".into());
+        }
+        let decision = removal::decide(
+            signed,
+            &self.identity(),
+            &inner.grants,
+            journaled(&signed.removal().id),
+            now,
+            max_age_secs,
+            self.shared.limits.core().clock_skew_secs(),
+        );
+        if let Decision::Journal { .. } = decision {
+            record(&decision)?;
+        }
+        let mut saved = Ok(());
+        if let Decision::Journal {
+            grant: Some(grant), ..
+        } = decision
+        {
+            let events = inner.grants.remove(grant);
+            inner.apply_grant_events(events);
+            saved = inner.persist();
+        }
+        Ok(AppliedRemoval { decision, saved })
     }
 
     /// All local denials.

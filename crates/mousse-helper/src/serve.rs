@@ -235,6 +235,13 @@ pub async fn run(
     // anything is accepted (Phase 1a §5.4). If that fails, networking
     // starts paused.
     let removal = crate::revoke::Removal::start(host.clone(), &endpoint.grants_dir());
+    let (engine, engine_events) = crate::engine::Engine::new(
+        host.clone(),
+        removal.clone(),
+        signer.clone(),
+        clock.clone(),
+        endpoint.dir().to_path_buf(),
+    );
     let choice = match opts.port {
         None => PortChoice::Kept,
         Some(0) => PortChoice::Auto,
@@ -326,8 +333,17 @@ pub async fn run(
             Arc::new(caller),
             removal.clone(),
             info,
+            engine.clone(),
+            engine_events,
         ))
     } else {
+        // No app: engine events are only logged.
+        let mut engine_events = engine_events;
+        tokio::spawn(async move {
+            while let Some(event) = engine_events.recv().await {
+                print_line(format!("engine: {event}"));
+            }
+        });
         None
     };
     let app_end = async {

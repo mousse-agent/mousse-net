@@ -1539,11 +1539,11 @@ fn hello_vectors() -> J {
         })
     };
     json!({
-        "description": "HELLO version negotiation (spec wire.md, \"Versions\"). `local` is what the receiving side speaks (its newest and oldest minor version), `peer` is the HELLO it received. `result` is the minor version both sides use, or the close code. `this_build` is what mousse-net-core version 1.0 speaks; `hello` is its HELLO. `repeated`: several HELLOs arrive on one connection, as control-message bytes, in order. Only the first counts; each later one is `ignored`, whatever it holds. `agreed` is the connection's minor version at the end (null if the first HELLO closed it).",
+        "description": "HELLO version negotiation (spec wire.md, \"Versions\"). `local` is what the receiving side speaks (its newest and oldest minor version), `peer` is the HELLO it received. `result` is the minor version both sides use, or the close code. `this_build` is what this mousse-net-core build speaks; `hello` is its HELLO. `repeated`: several HELLOs arrive on one connection, as control-message bytes, in order. Only the first counts; each later one is `ignored`, whatever it holds. `agreed` is the connection's minor version at the end (null if the first HELLO closed it).",
         "this_build": { "major": local.major, "minor": local.minor, "oldest_minor": local.oldest_minor },
         "hello": hex(&ControlMessage::hello().encode()),
         "cases": [
-            case("same_version", local, (1, 0)),
+            case("same_version", local, (1, local.minor)),
             case("peer_newer_minor", local, (1, 7)),
             case("peer_major_2", local, (2, 0)),
             case("peer_major_0", local, (0, 0)),
@@ -1554,10 +1554,22 @@ fn hello_vectors() -> J {
             case("major_checked_before_minor", later, (2, 4)),
         ],
         "repeated": [
-            sequence("second_hello_same", local, &[(1, 0), (1, 0)]),
+            sequence(
+                "second_hello_same",
+                local,
+                &[(1, local.minor), (1, local.minor)],
+            ),
             sequence("second_hello_other_minor", later, &[(1, 3), (1, 9)]),
-            sequence("second_hello_other_major", local, &[(1, 0), (2, 0)]),
-            sequence("first_hello_refused", local, &[(2, 0), (1, 0)]),
+            sequence(
+                "second_hello_other_major",
+                local,
+                &[(1, local.minor), (2, 0)],
+            ),
+            sequence(
+                "first_hello_refused",
+                local,
+                &[(2, 0), (1, local.minor)],
+            ),
         ],
     })
 }

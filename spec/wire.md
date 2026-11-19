@@ -38,7 +38,7 @@ The code exchange used by "Send link" pairing (CPace) is specified in
 | Name | Value | Where |
 |---|---|---|
 | Major protocol version | `1` | Session certificate (record and extension), pairing ticket, `HELLO` |
-| Minor protocol version | `0` | `HELLO` |
+| Minor protocol version | `2` | `HELLO` |
 | TLS ALPN | `mousse/1` | TLS ClientHello and ServerHello |
 
 - A peer MUST reject a certificate or ticket whose major version it does not
@@ -152,8 +152,9 @@ display and indexing value; it does not appear on the wire.
 
 **What the identity key signs (frozen).** The identity key signs only
 canonical CBOR maps (section 3) whose key `1` is a text domain string, and
-each domain string names exactly one record type. Major version 1 has one
-domain: `mousse-session-v1`, the session record (5.1). A new signed record
+each domain string names exactly one record type. Major version 1 has
+these domains: `mousse-session-v1`, the session record (5.1), and
+`mousse-removal-v1`, a removal from an owner-role device (9.5). A new signed record
 needs a new domain string that no other record uses; the identity key MUST
 never sign raw bytes, a hash supplied from outside, or a record without its
 domain at key 1. This keeps any two signed things from ever being confused,
@@ -484,7 +485,9 @@ Rules:
   effect on other endpoints of the same device.
 - Grant ids are local and never reused, also across restarts: an endpoint
   stores the next grant id with its grants, because the grant that last
-  used an id may already be gone.
+  used an id may already be gone. A grant that replaces another (a new
+  pairing of the same device) takes a new id, so a grant id names exactly
+  one pairing.
 
 **Removal from another device (later phases).** Phase 0 removes grants only
 locally. When removal messages are added, an endpoint accepts one only from
@@ -687,6 +690,54 @@ An unknown error code in `RESET` or `GOAWAY` is not a frame error; treat it as
   receiving anything.
 - **GOAWAY** ends the connection: the sender sends nothing after it and closes
   the pipe; the receiver stops sending and closes too.
+
+### 9.5 Engine streams
+
+Streams whose label starts with `mousse-` belong to the engine: an
+implementation handles them itself and never passes them to an
+application, and an application cannot open them. Each is opened only when
+the connection's agreed minor version (section 2) allows it; any other
+`mousse-` stream is answered with `RESET REFUSED_STREAM`.
+
+Each message on an engine stream is a 4-byte big-endian length followed by
+that many bytes of one canonical CBOR map (section 3). A message is at most
+**262 144** bytes; a longer declared length is a protocol error on that
+stream (`RESET PROTOCOL_ERROR`).
+
+| Label | Minor | Opened by | Carries |
+|---|---|---|---|
+| `mousse-grants` | 2 | host, to a caller whose live grant has role `owner` | `{1: [{1: identity key (65), 2: grant id (uint), 3: role (text), 4: name (text)}]}`: every grant on the host, at the stream's start and again on every change |
+| `mousse-removal` | 2 | caller | caller → host: one signed removal envelope; host → caller: `{1: removal id (16), 2: result (0 applied, 1 stale, 2 refused)}`; then both finish |
+
+**The removal record** (domain `mousse-removal-v1`), signed by the admin
+device's identity key: `{1: "mousse-removal-v1", 2: signer identity key
+(65), 3: recipient host identity key (65), 4: removed identity key (65), 5:
+grant id on the recipient (uint), 6: removal id (16, random), 7: issued at
+(Unix seconds)}`. The envelope is `{1: record bytes, 2: raw signature (64)}`
+over the record bytes. A removal is signed once; every resend carries the
+same bytes.
+
+**What a host accepts**, under the lock under which it admits connections
+and enrolls devices, in order; a failure answers `refused` or `stale` and
+changes nothing else:
+
+1. The signature verifies under key 2, and that signer holds a live grant
+   with role `owner` on this endpoint.
+2. Key 3 is this endpoint's identity.
+3. The removal id is new. A known id whose record bytes hash (SHA-256) to
+   the stored hash returns the stored result and does nothing else; a known
+   id with other bytes is `refused`. `issued at` is at most the removal
+   maximum age plus the clock skew in the past, and at most the clock skew
+   in the future.
+4. Key 4 holds a grant whose id equals key 5; otherwise `stale` (a newer
+   pairing of that device stays).
+5. That grant's authorizing owner equals the signer's grant's authorizing
+   owner; otherwise `refused`.
+
+The host stores the removal id, the record hash and the result durably for
+every result from check 3 on, before it acts; for `applied` it then removes
+the grant, whose connections close with `GRANT_REVOKED`. It keeps removal
+ids for the maximum age plus the skew.
 
 ## 10. Pairing
 

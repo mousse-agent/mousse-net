@@ -1,0 +1,31 @@
+# Phase 4 (engine): the helper's Plus client, directory slots and the
+# inbox, and "remove on all my hosts" (docs/phase34-design.md Part G.2).
+#
+# Owner check: `mousse-check phase4` shows PASS in every target cell, with
+# no INCOMPLETE. Format: checks/README.md. Plus is the test stand-in on
+# loopback until the Plus team's double replaces it; no real account is
+# ever used.
+
+phase = "phase4"
+title = "Hosted relay, the helper's Plus client and remove on all my hosts"
+plan = "docs/phase34-design.md#part-g-owner-checks"
+# `local = [...]` and `control = [...]` are the inline form of [[check.local]] and [[check.control]].
+
+[[check]]
+id = "phase4.remove-everywhere"
+title = "Grant lists to owners only; one removal per confirmed host and grant id; a stale grant id leaves the newer pairing; a grant learned later needs a second confirmation; a resend returns the journaled result; non-owner signers, wrong-owner grants and reused ids with other bytes are refused"
+plan = "docs/phase34-design.md Part D and F.1 (E-L4)"
+targets = ["windows-x64", "linux-x64"]
+min_tests = 23
+local = [
+  { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-net-core", "-p", "mousse-helper", "--no-fail-fast", "removal"] },
+  { target = "linux-x64", host = "linux-x86_64", command = ["cargo", "test", "-p", "mousse-net-core", "-p", "mousse-helper", "--no-fail-fast", "removal"] },
+]
+control = [
+  { name = "accept-any-signer", breaks = "a removal signed by a device without an owner grant is applied", env = { RUSTFLAGS = '--cfg mousse_control="accept-any-signer"' } },
+  { name = "ignore-owner", breaks = "a grant another owner authorized is removed", env = { RUSTFLAGS = '--cfg mousse_control="ignore-owner"' } },
+  { name = "ignore-grant-id", breaks = "a removal for an older grant id removes the newer pairing", env = { RUSTFLAGS = '--cfg mousse_control="ignore-grant-id"' } },
+  { name = "auto-send-unknown", breaks = "a grant the host lists after the user acted is removed without asking again", env = { RUSTFLAGS = '--cfg mousse_control="auto-send-unknown"' } },
+  { name = "resend-refused", breaks = "a resend after a lost answer is refused instead of getting its journaled result", env = { RUSTFLAGS = '--cfg mousse_control="resend-refused"' } },
+  { name = "removal-unsigned", breaks = "the removal record's signature is not checked", env = { RUSTFLAGS = '--cfg mousse_control="removal-unsigned"' } },
+]
