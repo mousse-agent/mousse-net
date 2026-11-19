@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "wsl-linux",
+  "key": "042f0974403d57624956aebbe7cd72f01b86773fdee66ffba37429d70a320ccb692f06069a9174535d971428932d86132cc89eef54954c5f9c5c6ed605fea234bb",
+  "payload": "{\"check\":\"phase1a.reconnect\",\"target\":\"linux-x64\",\"build\":\"366dd2b062641eed1e639b5c974e95999b8894d8+unknown\",\"platform\":\"linux-x86_64\",\"outcome\":\"PASS\",\"details\":\"printed \\\"PASS phase1a.reconnect\\\"\",\"time\":\"2026-11-19T18:40:17Z\",\"device\":\"wsl-linux\",\"config\":\"77cad85cc11d6f6fcb1dbe32c1c9ad6c6213eb93240a309276fa9b1ec26f2350\",\"extra\":{\"app_build\":\"9621efca899d24ff23261bef7b7dc0519cffb02d\"}}",
+  "signature": "a3fd470f057c77bcf44a6f6f06fdf81d52400adf6f5e52c39819a4f6ba74941a58afbac9dc33503086dba6058e4c068343c53c6910dd2faf7a6c6f139a8e125c"
+}

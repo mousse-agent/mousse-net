@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "pc-windows",
+  "key": "048ad3ccda2d27fdfc98c131f2fa25bea736ec0a3e8a107dcbfa6b2f5a86b88da452c337f09925646ec76897452505e718f3f397ddf39674e9f5ad64590bc93d57",
+  "payload": "{\"check\":\"phase0.sim-pairing-attempts\",\"target\":\"windows-x64\",\"build\":\"366dd2b062641eed1e639b5c974e95999b8894d8+release\",\"platform\":\"windows-x86_64\",\"outcome\":\"PASS\",\"details\":\"printed \\\"PASS sim pairing-limits\\\"\",\"time\":\"2026-11-19T18:12:31Z\",\"device\":\"pc-windows\",\"config\":\"e8c77be07cfb947f648dba586a0c9799135fd5e21e3967df6aea1b25b4edeb91\"}",
+  "signature": "9c8bd7b71f965a184212299fba53fa4af499dea5424aaff3aeca456a275fa66e27df3e6f67a4b432d2eb2cfdbd29784e3130f18202e71077d2ada4d256e757a7"
+}
