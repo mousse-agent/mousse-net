@@ -35,6 +35,14 @@ pub enum NetError {
     /// No place for another stream: the connection or the endpoint has as
     /// many open as its limit allows. Open it once one ends.
     StreamLimit,
+    /// An `ssh` call or pipe failed before the pipe carried anything
+    /// (Phase 1b §3.1). `detail` is the kept stderr, for a tooltip only.
+    Ssh {
+        /// What the app shows.
+        reason: crate::pipe::ssh::SshReason,
+        /// The stderr text or what was missing; never shown raw.
+        detail: String,
+    },
 }
 
 impl NetError {
@@ -49,6 +57,7 @@ impl NetError {
                 | NetError::Tls(_)
                 | NetError::Timeout(_)
                 | NetError::PeerCertificate(_)
+                | NetError::Ssh { .. }
         )
     }
 }
@@ -71,6 +80,8 @@ impl fmt::Display for NetError {
             NetError::StreamReset(c) => write!(f, "stream reset ({})", c.name()),
             NetError::Refused(e) => write!(f, "refused: {e}"),
             NetError::StreamLimit => f.write_str("too many open streams"),
+            NetError::Ssh { reason, detail } if detail.is_empty() => write!(f, "ssh: {reason}"),
+            NetError::Ssh { reason, detail } => write!(f, "ssh: {reason} ({detail})"),
         }
     }
 }
