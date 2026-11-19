@@ -5,8 +5,9 @@ count in `mousse-net-core`, `mousse-net-io` and `mousse-helper` is a named
 default in one place per crate: `Limits` in
 `crates/mousse-net-core/src/limits.rs` (the core takes it as a parameter),
 `IoLimits` in `crates/mousse-net-io/src/limits.rs` (passed in through
-`HostConfig::limits` and `Caller::new`), and `HelperLimits` in
-`crates/mousse-helper/src/limits.rs`.
+`HostConfig::limits` and `Caller::new`), `HelperLimits` in
+`crates/mousse-helper/src/limits.rs`, and for the relay `RelayLimits` in
+`crates/mousse-net-core/src/relay/limits.rs`.
 
 The helper reads `MOUSSE_NET_<NAME>` once at startup. A value must be a
 whole number in the unit the name ends with (`_MS`, `_SECS`, `_BYTES`; no
@@ -78,13 +79,49 @@ spec's value: it can only be tightened.
 | `MOUSSE_NET_ENDPOINT_LOCK_RETRY_MS` | 100 | 1 to 1000 | Wait between tries on a held endpoint lock. |
 | `MOUSSE_NET_COMPUTER_NAME_MAX_BYTES` | 64 | 1 to 64 | Longest default device name taken from the computer name (names are at most 64 bytes). |
 
+## Relay
+
+`RelayLimits` in `crates/mousse-net-core/src/relay/limits.rs`. `mousse-relay`
+reads `MOUSSE_NET_<NAME>` at startup with the same rules; every name starts
+with `RELAY_`, and the relay accepts no other `MOUSSE_NET_*` name. Where a
+client could push against a limit (connections, legs, circuits, budgets,
+waits a client fills), its range ends at the default: it can only be
+tightened. `RELAY_REFUSE_MS` must be below `RELAY_ACCEPT_WAIT_MS`
+(spec/relay.md 9.1).
+
+| Variable | Default | Allowed | What it limits |
+| --- | --- | --- | --- |
+| `MOUSSE_NET_RELAY_MAX_CONNECTIONS` | 4096 | 1 to 65536 | Open outer connections (capacity). |
+| `MOUSSE_NET_RELAY_CONNECTIONS_PER_IP` | 256 | 1 to 256 | Control connections (callers', joiners' and targets', and connections that have not sent their first message) per IPv4 address or IPv6 /64; accept legs not counted (tighten only). |
+| `MOUSSE_NET_RELAY_ACCEPT_LEGS_PER_HANDLE` | 64 | 1 to 64 | Open accept legs per handle (tighten only). |
+| `MOUSSE_NET_RELAY_CIRCUITS_PER_CALLER` | 8 | 2 to 8 | Open circuits per caller fingerprint and handle (tighten only). |
+| `MOUSSE_NET_RELAY_MAX_REGISTRATIONS` | 1024 | 1 to 65536 | Live registrations (capacity). |
+| `MOUSSE_NET_RELAY_HELLO_WAIT_MS` | 5000 | 500 to 5000 | Wait for the first client message after RELAY_HELLO (tighten only). |
+| `MOUSSE_NET_RELAY_UPGRADE_WAIT_MS` | 5000 | 100 to 5000 | Whole TLS and WebSocket upgrade (tighten only). |
+| `MOUSSE_NET_RELAY_HEADER_MAX_BYTES` | 8192 | 1024 to 8192 | Largest upgrade request (tighten only). |
+| `MOUSSE_NET_RELAY_ACCEPT_WAIT_MS` | 10000 | 1000 to 30000 | Wait for the target's accept leg after INCOMING. |
+| `MOUSSE_NET_RELAY_REFUSE_MS` | 500 | 500 to 5000 | Constant refusal deadline from a CALL or JOIN; below the accept wait. |
+| `MOUSSE_NET_RELAY_PREACCEPT_BYTES` | 65536 | 16384 to 65536 | Peer bytes per join circuit and direction before promotion (tighten only). |
+| `MOUSSE_NET_RELAY_PREACCEPT_PER_TARGET` | 4 | 1 to 4 | Join circuits per handle (tighten only). |
+| `MOUSSE_NET_RELAY_KEEPALIVE_MS` | 15000 | 1000 to 15000 | PING on a registration connection after this long without sending. |
+| `MOUSSE_NET_RELAY_REGISTRATION_IDLE_MS` | 45000 | 30000 to 45000 | Registration closed after this long without receiving (tighten only). |
+| `MOUSSE_NET_RELAY_CIRCUIT_IDLE_MS` | 60000 | 46000 to 600000 | Spliced circuit closed after this long with no bytes either way; above the peer idle timeout. |
+| `MOUSSE_NET_RELAY_QUEUE_BYTES` | 262144 | 16384 to 262144 | Bytes buffered per circuit and direction before the relay stops reading that leg (tighten only). |
+| `MOUSSE_NET_RELAY_EGRESS_BPS` | 12500000 | 125000 to 12500000000 | Shared egress ceiling in bytes per second (capacity). |
+| `MOUSSE_NET_RELAY_ENROLL_SECS` | 3600 | 60 to 3600 | Enrollment code lifetime; single use (tighten only). |
+| `MOUSSE_NET_RELAY_SUCCESSOR_OVERLAP_SECS` | 604800 | 86400 to 2592000 | After a SUCCESSOR, how long the superseded registration key stays authorized. |
+| `MOUSSE_NET_RELAY_STATE_POLL_MS` | 1000 | 100 to 60000 | How often the running relay re-reads its authorized list and enrollment codes, so `revoke` and `enroll` take effect. |
+
+Fixed on purpose in the relay protocol: the 16 384-byte relay message, the
+65 536-byte WebSocket message, 256 caller fingerprints and 8 invitations per
+allow-set, 4 lease ids per `RELEASE`, the path, the subprotocol, the close
+codes, the refusal reasons, the domain strings and the exporter label
+(spec/relay.md 13).
+
 ## Relay, hosted mode
 
-`mousse-relay` reads only names that start with `MOUSSE_NET_RELAY_` (the
-limit names in the code start with `RELAY_`), once at startup, with the
-same rules as the helper. These rows are the hosted
-mode's (`docs/phase34-design.md` §H.1); the self-hosted relay's rows join
-them with the relay itself (E-R2). `HostedLimits` in
+A relay in hosted mode also reads these (`docs/phase34-design.md` §H.1),
+with the same rules as the rows above. `HostedLimits` in
 `crates/mousse-net-core/src/relay_hosted/mod.rs` holds them, and
 `crates/mousse-relay-plus/src/settings.rs` reads them.
 

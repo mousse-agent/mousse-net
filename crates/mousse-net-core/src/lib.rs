@@ -18,6 +18,7 @@
 //! - [`pairing`]: tickets, join proofs, host and joiner pairing state machines.
 //! - [`mux`]: frame codec, per-stream credit, priority scheduler, keepalive.
 //! - [`session`]: certificate-driven session lifetime and path switching.
+//! - [`relay`]: the relay protocol and the relay's admission state machine.
 //! - [`relay_hosted`]: the relay's hosted mode: admission tokens, leases,
 //!   the Plus clock and reports.
 //! - [`limits`]: every tunable limit, its default and allowed range.
@@ -35,6 +36,11 @@
         mousse_control = "break-raw-signature",
         mousse_control = "break-cpace-confirm",
         mousse_control = "break-cpace-sid",
+        mousse_control = "no-pin-relay",
+        mousse_control = "relay-skip-allow-set",
+        mousse_control = "relay-refuse-early",
+        mousse_control = "relay-successor-unchecked",
+        mousse_control = "relay-no-preaccept-budget",
         mousse_control = "per-socket-rate",
         mousse_control = "accept-replayed-lease",
         mousse_control = "ignore-admission-expiry",
@@ -54,6 +60,11 @@ compile_error!("mousse_control plants a bug for tests; it is not allowed in rele
     mousse_control = "break-raw-signature",
     mousse_control = "break-cpace-confirm",
     mousse_control = "break-cpace-sid",
+    mousse_control = "no-pin-relay",
+    mousse_control = "relay-skip-allow-set",
+    mousse_control = "relay-refuse-early",
+    mousse_control = "relay-successor-unchecked",
+    mousse_control = "relay-no-preaccept-budget",
     mousse_control = "per-socket-rate",
     mousse_control = "accept-replayed-lease",
     mousse_control = "ignore-admission-expiry",
@@ -89,6 +100,7 @@ pub mod identity;
 pub mod limits;
 pub mod mux;
 pub mod pairing;
+pub mod relay;
 pub mod relay_hosted;
 pub mod session;
 pub mod session_cert;
