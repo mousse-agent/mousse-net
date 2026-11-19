@@ -1478,7 +1478,7 @@ E-R0 may lower, never raise past the range shown). Limits marked
 
 | Variable | Default | Allowed | What it limits |
 |---|---|---|---|
-| `MOUSSE_NET_RELAY_MAX_CONNECTIONS` | 4096 | 1 to 65536 (capacity) | Open outer connections |
+| `MOUSSE_NET_RELAY_MAX_CONNECTIONS` | 1024 | 1 to 65536 (capacity) | Open outer connections |
 | `MOUSSE_NET_RELAY_CONNECTIONS_PER_IP` † | 256 | 1 to 256 (tighten) | Callers' and targets' control connections per IPv4 address or IPv6 /64; accept legs not counted |
 | `MOUSSE_NET_RELAY_ACCEPT_LEGS_PER_HANDLE` † | 64 | 1 to 64 (tighten) | Open accept legs per handle |
 | `MOUSSE_NET_RELAY_CIRCUITS_PER_CALLER` † | 8 | 2 to 8 (tighten) | Open circuits per caller fingerprint and handle |
@@ -1502,6 +1502,52 @@ E-R0 may lower, never raise past the range shown). Limits marked
 | `MOUSSE_NET_RELAY_FINAL_REPORT_WAIT_MS` | 5000 | 0 to 60000 | Wait for the stopping snapshot to be stored (hosted) |
 | `MOUSSE_NET_RELAY_PLUS_TIMEOUT_MS` | 10000 | 1000 to 60000 | One call to Plus (hosted) |
 | `MOUSSE_NET_RELAY_CLOCK_RTT_MS` | 2000 | 100 to 10000 | Longest round trip whose Plus answer may set the Plus clock (hosted, A.9 duty 12); a longer one only ends leases earlier |
+
+### E-R0 results
+
+Measured 2026-11-19 with `mousse-relay` itself (release build) and its
+bench client (`crates/mousse-relay/examples/relay_bench.rs`), the relay on
+the Mac mini (Apple silicon, 10 cores, 16 GB) and the client on the PC
+across the home LAN (ICMP 4 to 93 ms, so at least one end is on Wi-Fi),
+then both on the Mac over loopback for the CPU ceiling. Pinned self-signed
+relay TLS with X25519MLKEM768, WebSocket through `tokio-tungstenite` 0.30.
+
+| Measure | LAN, PC to Mac | Loopback on the Mac |
+|---|---|---|
+| Dial (TCP, TLS, upgrade, `RELAY_HELLO`), p50 / p90 | 19 to 23 ms / 22 to 41 ms | 0.7 ms / 0.7 ms |
+| Call setup, `CALL` to `SPLICED`, p50 / p90 | 38 ms / 62 to 131 ms | 1.5 ms / 1.5 ms |
+| of which the accept leg's own dial, p50 | 22 to 24 ms | 0.7 ms |
+| Round trip of 64 bytes through a splice, p50 / p99 | 15 ms / 116 ms | 0.08 ms / 0.10 ms |
+| Throughput, 1 / 4 / 8 bulk circuits, ceiling lifted | 52 / 41 to 54 / 41 to 49 MB/s | 1944 / 3626 / 3715 MB/s |
+| Relay CPU at that throughput | 0.28 core | 3.4 cores |
+| Throughput at the default 12.5 MB/s ceiling | 13.8 / 12.8 / 13.3 MB/s | |
+| Relay memory, idle / per open connection | 4.4 MB / 52 KB | |
+
+What they settle:
+
+- **The accept leg costs one dial per call:** about one TLS and upgrade
+  round trip on the network, 0.7 ms of relay CPU. Accept legs on new
+  connections stay (§B.8).
+- **CPU is not the limit.** One Apple core splices about 1.1 GB/s with
+  both legs' TLS; a VPS core several times slower still has a wide margin
+  over the egress ceiling. `RELAY_EGRESS_BPS` stays 12 500 000 (100 Mbit/s,
+  a small VPS's port and monthly quota), a capacity limit operators raise.
+- **Memory is.** With the library's default 128 KiB WebSocket read and
+  write buffers a connection cost about 168 KB; with a 16 KiB read buffer
+  and no write buffer (now fixed in `mousse-relay`) 52 KB, at the same
+  throughput. Queued bytes add at most 2 x `RELAY_QUEUE_BYTES` per spliced
+  circuit. `RELAY_MAX_CONNECTIONS` drops from 4096 to **1024**: 52 MB of
+  connections and at most 256 MB of queues fit a 1 GB VPS; operators
+  with more memory raise it.
+- **`RELAY_QUEUE_BYTES` stays 262144:** 16 and 64 KiB gave 28 to 47 MB/s on
+  the LAN where 256 KiB gave 49 to 54 MB/s.
+- **`RELAY_CONNECTIONS_PER_IP` stays 256** (13 MB per address at most),
+  `RELAY_ACCEPT_LEGS_PER_HANDLE` stays 64 (a 65th accept leg was refused
+  with `REFUSED(limit)` in the hold run, as specified) and
+  `RELAY_CIRCUITS_PER_CALLER` stays 8.
+
+The relay's other numbers come from the waits of `spec/relay.md` and need
+no measurement.
 
 ## H.2 Helper (`MOUSSE_NET_*`)
 
@@ -1549,4 +1595,5 @@ Part A's fixed maxima.
    boot. Self-hosted moves keep their overlap.
 
 **Settled:** every question from the three council rounds and the final
-review. The relay defaults marked † in §H.1 wait for E-R0's numbers.
+review. The relay defaults marked † in §H.1 are set from E-R0's numbers
+("E-R0 results", §H.1).

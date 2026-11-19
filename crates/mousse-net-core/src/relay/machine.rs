@@ -306,7 +306,8 @@ impl Relay {
         }
     }
 
-    /// The authorized list as the machine holds it.
+    /// The authorized list as the machine holds it, in order of
+    /// fingerprint.
     pub fn authorized(&self) -> Vec<AuthorizedKey> {
         self.authorized
             .iter()
@@ -315,6 +316,22 @@ impl Relay {
                 drop_at: *drop_at,
             })
             .collect()
+    }
+
+    /// The stored enrollment codes, in order of their hash.
+    pub fn codes(&self) -> Vec<EnrollCode> {
+        self.codes
+            .iter()
+            .map(|(hash, expires_at)| EnrollCode {
+                hash: *hash,
+                expires_at: *expires_at,
+            })
+            .collect()
+    }
+
+    /// Open connections counted against `ip`.
+    pub fn connections_at(&self, ip: IpKey) -> u64 {
+        u64::from(self.per_ip.get(&ip).copied().unwrap_or(0))
     }
 
     /// The earliest monotonic time a wait fires, if any. Wall-clock times
@@ -830,16 +847,16 @@ impl Relay {
         let current_ok = cfg!(mousse_control = "relay-successor-unchecked")
             || proof::verify(&current_key, &record, &current_proof).is_ok();
         let current_listed = matches!(self.authorized.get(&current_fp), Some(None));
-        if !(new_ok && current_ok && current_listed) || new_key == current_key {
+        let new_fp = new_key.fingerprint();
+        if !(new_ok && current_ok && current_listed) || self.authorized.contains_key(&new_fp) {
             self.registrations.remove(&handle);
             self.refuse(conn, RefuseReason::NotAuthorized, out);
             return;
         }
-        let fingerprint = new_key.fingerprint();
-        if let std::collections::btree_map::Entry::Vacant(e) = self.authorized.entry(fingerprint) {
-            e.insert(None);
-            out.push(Output::Authorize { fingerprint });
-        }
+        self.authorized.insert(new_fp, None);
+        out.push(Output::Authorize {
+            fingerprint: new_fp,
+        });
         let drop_at = now.wall.plus(self.config.limits.successor_overlap_secs());
         self.authorized.insert(current_fp, Some(drop_at));
         out.push(Output::Supersede {
