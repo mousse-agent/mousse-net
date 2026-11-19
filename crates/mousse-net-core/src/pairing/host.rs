@@ -231,6 +231,11 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
         }
     }
 
+    /// Change the name `PAIRED` sends from now on.
+    pub fn set_host_name(&mut self, host_name: String) {
+        self.host_name = host_name;
+    }
+
     /// Create an invitation that expires [`Limits::ticket_lifetime_secs`]
     /// from `now`.
     pub fn create<R: CryptoRng + ?Sized>(

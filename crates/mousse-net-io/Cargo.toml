@@ -21,6 +21,7 @@ zeroize = { version = "=1.9.2", default-features = false, features = ["alloc"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
 mdns-sd = { version = "=0.22.0", default-features = false, features = ["async"] }
+if-addrs = { version = "=0.15.0", features = ["link-local"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "=0.2.191"

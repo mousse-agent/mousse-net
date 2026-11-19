@@ -417,3 +417,92 @@ async fn a_step_one_failure_on_a_candidate_tries_the_next_and_the_clock_message_
         host.stop().await;
     }
 }
+
+/// A join the app consented to and recorded first (Phase 1a §5.1) may have
+/// lost its `PAIRED` in a crash. Repeated after the ticket's joiner-side
+/// expiry, it still reconnects with the same ticket: the host's answer says
+/// whether this invitation enrolled the device. An ordinary join refuses
+/// the expired ticket before dialling.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_consented_join_learns_its_outcome_after_the_ticket_expired() {
+    let dir = temp_dir("consented");
+    let mut host = TestHost::start(new_signer()).await;
+    let mut caller = new_caller_with_clock(new_signer(), host.clock.clone());
+    caller.use_flow_records(Arc::new(FlowRecordStore::in_dir(&dir)));
+    let ticket = host.invite();
+    let route = host.route();
+
+    let pipe = connect_tcp(&route).await.unwrap();
+    let mut no_code = NoCode;
+    let join = caller.join_pinned_with_redial(
+        pipe,
+        &ticket,
+        Arrival::InAppScan,
+        "laptop",
+        &mut no_code,
+        || connect_tcp(&route),
+    );
+    let (result, ()) = tokio::join!(within("join", join), host.approve_next_request());
+    let (first, outcome) = result.unwrap();
+    assert!(matches!(outcome, JoinOutcome::Paired(_)), "{outcome:?}");
+    caller.pin_stored(&ticket).unwrap();
+    first.close(ErrorCode::NoError);
+
+    // Past the ticket's expiry, clock skew included.
+    let core = mousse_net_core::Limits::DEFAULT;
+    host.clock
+        .advance((core.ticket_lifetime_secs() + core.clock_skew_secs() + 1) as i64);
+    let pipe = connect_tcp(&route).await.unwrap();
+    let plain = caller
+        .join(pipe, &ticket, Arrival::InAppScan, "laptop")
+        .await;
+    assert!(
+        matches!(plain, Err(NetError::Join(JoinerError::Expired))),
+        "{:?}",
+        plain.map(|(_, o)| o)
+    );
+
+    // The consented join reconnects and learns this invitation enrolled it.
+    let pipe = connect_tcp(&route).await.unwrap();
+    let (_again, outcome) = within(
+        "consented join after expiry",
+        caller.join_pinned_with_redial(
+            pipe,
+            &ticket,
+            Arrival::InAppScan,
+            "laptop",
+            &mut no_code,
+            || connect_tcp(&route),
+        ),
+    )
+    .await
+    .unwrap();
+    match outcome {
+        JoinOutcome::Paired(paired) => assert_eq!(paired.role.as_str(), "owner"),
+        other => panic!("{other:?}"),
+    }
+    caller.pin_stored(&ticket).unwrap();
+
+    // With the grant gone, the host has nothing for it: not enrolled.
+    let grant = host.grant_of(&caller.identity()).unwrap();
+    assert!(host.host.remove_grant(grant).unwrap());
+    let pipe = connect_tcp(&route).await.unwrap();
+    let gone = within(
+        "consented join with no grant",
+        caller.join_pinned_with_redial(
+            pipe,
+            &ticket,
+            Arrival::InAppScan,
+            "laptop",
+            &mut no_code,
+            || connect_tcp(&route),
+        ),
+    )
+    .await;
+    match gone {
+        Err(e) => assert!(closed_with(&e, ErrorCode::InvitationInvalid), "{e:?}"),
+        Ok((_, outcome)) => panic!("{outcome:?}"),
+    }
+    host.stop().await;
+    std::fs::remove_dir_all(&dir).unwrap();
+}

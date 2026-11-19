@@ -197,6 +197,7 @@ Status: approved design, 2026-11-18. Code: this repository. Wire spec: [`spec/`]
 
 ### 8. App integration
 - **Desktop:** one helper per profile with networking on, all running for the whole OS session (switching the open profile in the app doesn't stop the others), restarted on a crash. A profile is reachable only while its OS user is logged in, because the keystore unlocks at login; hosting with nobody logged in waits for the headless daemon. Each helper binds its own port (picked at start and kept; a fixed port per profile for port forwarding) and advertises it.
+  - **Phase 1a exception:** helpers start when Mousse is first opened after login, and keep running after its window closes. Starting at login comes in Phase 1b.
 - **CLI:** through user-restricted IPC, or headless.
 - **Phone:**
   - Capacitor → Swift/Kotlin → UniFFI.
