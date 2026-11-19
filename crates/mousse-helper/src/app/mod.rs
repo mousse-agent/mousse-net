@@ -556,7 +556,11 @@ impl Shared {
             fields["deadline"] = json!(conn.deadline().secs());
             core.out.conn_event(no, &fields);
             self.queued(&core);
-            tokio::spawn(conn_task(self.clone(), no, conn, inbound));
+            tokio::spawn(conn_task(self.clone(), no, conn.clone(), inbound));
+            if !inbound {
+                let shared = self.clone();
+                tokio::spawn(async move { relay::ensure_keys(&shared, &conn).await });
+            }
             no
         };
         Ok(no)

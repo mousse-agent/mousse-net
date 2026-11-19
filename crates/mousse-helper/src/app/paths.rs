@@ -603,7 +603,6 @@ pub async fn dial(
         }
     };
     let fields = json!({"dir": "out", "role": role, "route": route});
-    super::relay::ensure_keys(shared, &conn).await;
     let no = match shared.add_outbound(conn, gen, fields) {
         Ok(no) => no,
         Err(super::Stale::Paused) => return Err(DialError::Paused),

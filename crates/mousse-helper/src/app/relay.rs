@@ -1151,13 +1151,13 @@ pub fn caller_fingerprint(shared: &Shared, pin: &IdentityPublicKey) -> Option<St
         .map(|k| hex(&k.public_key().fingerprint()))
 }
 
-/// Caller: on every new outbound connection, enroll the caller key before
-/// the connection is published, so the exchange never takes one of the
-/// app's stream places. The host keeps the same pair secret for the same
-/// grant, so this only confirms a key it has; it fills in an answer that is
-/// missing, heals a host that lost its copy, and is the caller's first
-/// stream, after which the host may open `mousse-manifest` (the engine
-/// lets a host open streams only once its caller has opened one).
+/// Caller: on every new outbound connection, enroll the caller key, beside
+/// the app's streams (an engine stream takes an engine place, not one of
+/// the app's). The host keeps the same pair secret for the same grant, so
+/// this only confirms a key it has; it fills in an answer that is missing,
+/// heals a host that lost its copy, and is a caller stream, after which
+/// the host may open `mousse-manifest` (the engine lets a host open
+/// streams only once its caller has opened one).
 pub async fn ensure_keys(shared: &Arc<Shared>, conn: &Connection) {
     if shared.relay.seed().is_err() {
         return;
@@ -1183,7 +1183,7 @@ pub async fn ensure_keys(shared: &Arc<Shared>, conn: &Connection) {
         Ok(k) => k,
         Err(e) => return failed(e),
     };
-    // Bounded: the connection is not published until this ends.
+    // Bounded, like a dial.
     let exchange = async {
         // A host from before minor 1 has no `mousse-keys`.
         if conn.hello_minor().await.unwrap_or(0) < KEYS_MINOR {

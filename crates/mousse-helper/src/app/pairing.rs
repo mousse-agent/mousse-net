@@ -546,7 +546,6 @@ async fn join(
                 }
             };
             let fields = json!({"dir": "out", "role": role, "route": route});
-            super::relay::ensure_keys(&shared, &conn).await;
             match shared.add_conn(conn, false, fields) {
                 Ok(no) => {
                     if let Some(route) = via {
