@@ -1,0 +1,22 @@
+[package]
+name = "route-policy"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+rust-version = "1.96"
+description = "Phase 1b spike S2: resolve once, dial the classified address, wss through rustls and tokio-tungstenite; the bounded dial search, timed."
+
+# Its own workspace: the engine workspace excludes spikes/.
+[workspace]
+
+[dependencies]
+tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["std", "logging", "tls12", "aws_lc_rs", "prefer-post-quantum"] }
+tokio-rustls = { version = "=0.26.6", default-features = false, features = ["logging", "tls12", "aws_lc_rs"] }
+rustls-platform-verifier = "=0.7.1"
+tokio-tungstenite = { version = "=0.30.0", default-features = false, features = ["handshake"] }
+futures-util = { version = "=0.3.34", default-features = false, features = ["std", "sink"] }
+rcgen = { version = "=0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
+# Only to turn on prebuilt NASM objects on Windows (as spikes/tls-matrix does).
+aws-lc-rs = { version = "=1.19.0", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
