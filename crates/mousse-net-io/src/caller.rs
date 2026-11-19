@@ -92,6 +92,16 @@ pub trait CodeEntry: Send {
     /// Ask for the code. `retry` is `Some(attempts left)` after a wrong
     /// code. `None` gives up.
     fn code(&mut self, retry: Option<u8>) -> impl Future<Output = Option<String>> + Send;
+
+    /// [`CodeEntry::code`] with the attempts left also on the first ask:
+    /// `retry` says a code was wrong. By default it asks [`CodeEntry::code`].
+    fn ask(
+        &mut self,
+        attempts_left: u8,
+        retry: bool,
+    ) -> impl Future<Output = Option<String>> + Send {
+        self.code(retry.then_some(attempts_left))
+    }
 }
 
 /// For in-person tickets: there is never a code to type.
@@ -298,6 +308,113 @@ where
             ))),
             None => Ok(()),
         }
+    }
+
+    /// Clear the durable outcome-pending mark kept for `ticket_hash` once
+    /// the app has stored what the join learned, whether or not the join
+    /// is still in memory (after a restart it is not). Settles the flow in
+    /// memory first, as [`Caller::pin_stored`] does, then takes the
+    /// ticket's hold and clears the stored mark. A join of the same ticket
+    /// running now keeps its hold, and settles its own record.
+    pub fn settle_stored(&self, ticket_hash: &[u8; 32]) -> Result<(), NetError> {
+        let flow = self
+            .settling
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(ticket_hash);
+        if let Some(flow) = flow {
+            let mut flow = lock_joiner(&flow);
+            let actions = flow.pairing.on_pin_stored();
+            flow.run(actions);
+            flow.hold = None;
+            if let Some(e) = flow.save_failed.take() {
+                return Err(NetError::Store(format!(
+                    "the pairing record could not be saved: {e}"
+                )));
+            }
+        }
+        // Must-fail control: only the flow in memory is settled.
+        if cfg!(mousse_control = "pin-stored-memory-only") {
+            return Ok(());
+        }
+        let _hold = match self.records.hold(ticket_hash) {
+            Ok(hold) => hold,
+            // Another join of this ticket holds it: that join settles it.
+            Err(NetError::Refused(_)) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        match self.records.load(ticket_hash)? {
+            Some(stored) if stored.outcome_pending => self.records.swap(
+                Some(&stored),
+                &JoinerRecord {
+                    outcome_pending: false,
+                    ..stored
+                },
+            ),
+            _ => Ok(()),
+        }
+    }
+
+    /// The flow record kept for `ticket_hash` (wire.md 10.7), if any.
+    pub fn flow_record(&self, ticket_hash: &[u8; 32]) -> Result<Option<JoinerRecord>, NetError> {
+        self.records.load(ticket_hash)
+    }
+
+    /// The code attempts a flow with nothing stored starts with.
+    pub fn attempts_per_flow(&self) -> u8 {
+        u8::try_from(self.limits.core().joiner_attempts_per_flow())
+            .unwrap_or(u8::MAX)
+            .min(mousse_net_core::pairing::JOINER_ATTEMPTS_PER_FLOW)
+    }
+
+    /// The time on this caller's clock.
+    pub fn now(&self) -> mousse_net_core::UnixTime {
+        self.clock.now()
+    }
+
+    /// The refusals a join of `ticket` would give before dialling, from
+    /// the ticket and its stored flow record: an in-person ticket that did
+    /// not come from the in-app scanner, this device's own ticket, a name
+    /// that cannot be sent, an expired ticket or no attempts left. A join
+    /// with `resume` (a consented one, Phase 1a §5.1) may go past the
+    /// ticket's expiry to learn a lost outcome, as the join itself does.
+    pub fn check_join(
+        &self,
+        ticket: &Ticket,
+        arrival: Arrival,
+        name: &str,
+        resume: bool,
+    ) -> Result<(), NetError> {
+        let mut stored = self.records.load(&ticket.hash())?;
+        if resume {
+            let core = self.limits.core();
+            let fresh = ticket
+                .check_fresh_for_joiner_with_skew(self.clock.now(), core.clock_skew_secs())
+                .is_ok();
+            if !fresh && !stored.is_some_and(|r| r.outcome_pending) {
+                // What the join would store before it dials.
+                stored = Some(JoinerRecord {
+                    ticket_hash: ticket.hash(),
+                    attempts_left: stored.map_or(self.attempts_per_flow(), |r| r.attempts_left),
+                    outcome_pending: true,
+                });
+            }
+        }
+        JoinerPairing::with_limits(
+            ticket.clone(),
+            arrival,
+            self.identity(),
+            JoinerName {
+                computer: name.to_owned(),
+                profile: None,
+            },
+            self.factory.clone(),
+            stored.as_ref(),
+            self.clock.now(),
+            self.limits.core(),
+        )
+        .map(|_| ())
+        .map_err(NetError::Join)
     }
 
     /// This device's identity.
@@ -904,7 +1021,7 @@ where
                     retry,
                 } => {
                     let asked = status.clone();
-                    let Some(typed) = codes.code(retry.then_some(attempts_left)).await else {
+                    let Some(typed) = codes.ask(attempts_left, retry).await else {
                         connection.close(ErrorCode::Cancelled);
                         return Err(NetError::Refused("pairing cancelled".into()));
                     };

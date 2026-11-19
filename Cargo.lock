@@ -1217,6 +1217,7 @@ dependencies = [
  "mousse-net-io",
  "portable-pty",
  "qrcode",
+ "rand_core 0.10.1",
  "serde",
  "serde_json",
  "tokio",

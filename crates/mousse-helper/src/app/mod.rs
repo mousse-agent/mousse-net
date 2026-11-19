@@ -64,8 +64,9 @@ use crate::applog;
 use crate::limits::HelperLimits;
 use crate::revoke::Removal;
 
-/// The protocol this helper speaks: 1.0.
-const PROTO: (u64, u64) = (1, 0);
+/// The protocol this helper speaks: 1.1 (Phase 1b §7), which serves a 1.0
+/// app too.
+const PROTO: (u64, u64) = (1, 1);
 
 /// The stream labels an inbound connection passes on to the app (§3.2).
 pub const LABELS: [&str; 5] = [
@@ -288,6 +289,7 @@ impl App {
         tokio::spawn(read_stdin(shared.clone()));
         tokio::spawn(write_stdout(shared.clone()));
         tokio::spawn(pairing::watch_pause(shared.clone()));
+        tokio::spawn(pairing::prune_completions(shared.clone()));
         tokio::spawn(paths::keep_connected(shared.clone()));
         tokio::spawn(changes::forward_renewals(shared.clone()));
         Self { shared }

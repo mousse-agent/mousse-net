@@ -24,7 +24,7 @@ fn hello_comes_first_and_the_helpers_own_lines_go_to_its_log() {
     );
     // The lower minor wins.
     let hello = a.call("hello", json!({"proto": [1, 7], "name": "x"}));
-    assert_eq!(hello["proto"], json!([1, 0]));
+    assert_eq!(hello["proto"], json!([1, 1]));
     let identity = hello["identity"].as_str().unwrap();
     assert!(
         !identity.is_empty() && identity.chars().all(|c| c.is_ascii_hexdigit()),

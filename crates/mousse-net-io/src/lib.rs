@@ -64,7 +64,8 @@ pub type SharedSigner = Arc<dyn IdentitySigner + Send + Sync>;
         mousse_control = "shared-endpoint-state",
         mousse_control = "allow-break-env",
         mousse_control = "no-stream-cap",
-        mousse_control = "stop-on-mismatch"
+        mousse_control = "stop-on-mismatch",
+        mousse_control = "pin-stored-memory-only"
     )
 ))]
 compile_error!("a mousse_control build has a deliberate defect and is for tests only; build it without --release");
@@ -77,7 +78,8 @@ compile_error!("a mousse_control build has a deliberate defect and is for tests 
     mousse_control = "shared-endpoint-state",
     mousse_control = "allow-break-env",
     mousse_control = "no-stream-cap",
-    mousse_control = "stop-on-mismatch"
+    mousse_control = "stop-on-mismatch",
+    mousse_control = "pin-stored-memory-only"
 ))]
 const _: () = {
     let profile = env!("MOUSSE_BUILD_PROFILE").as_bytes();

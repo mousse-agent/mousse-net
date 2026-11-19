@@ -80,6 +80,8 @@ mousse_net_core::define_limits! {
         preauth_connections = "PREAUTH_CONNECTIONS": 64, [1, 64];
         /// Host: of those, connections from one source address (tighten only).
         preauth_per_source = "PREAUTH_PER_SOURCE": 8, [1, 8];
+        /// App mode: how long a "Send link" completion record the app never acknowledged (`join.ack`) is kept after its ticket expired (Phase 1b §5.4).
+        join_done_keep_secs = "JOIN_DONE_KEEP_SECS": 86_400, [0, 2_592_000];
         /// Checks only: how long `init` waits before it makes the endpoint, so a check can stop the app during the first start. Run for the app (`--app`), its stdin closing still ends it at once.
         init_hold_ms = "INIT_HOLD_MS": 0, [0, 60_000];
     }
