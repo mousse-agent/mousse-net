@@ -71,26 +71,46 @@ fn a_peer_opening_past_the_connection_cap_is_refused() {
     p.b.assert_clean();
 }
 
+/// With A's app reading nothing, everything waits in A's engine: at most
+/// the initial credit of each admitted stream, and in memory little more,
+/// also when B splits its data into the smallest DATA frames it may send
+/// (many frames share one receive buffer).
 #[test]
 fn with_app_reads_stalled_the_engine_queue_stays_within_the_caps() {
-    let mut p = pair_up("queue", &[], &ROOMY);
-    let opened = open_bulk(&mut p.b, p.b_conn, 40);
-    for &h in &opened {
-        p.b.send(h, &pattern(512 * KIB as usize, h as u8), false);
+    for (tag, frame) in [("queue", None), ("queuefrag", Some("1024"))] {
+        let mut b_env = ROOMY.to_vec();
+        if let Some(frame) = frame {
+            b_env.push(("SEND_CHUNK_BYTES", frame));
+        }
+        let mut p = pair_up(tag, &[], &b_env);
+        let opened = open_bulk(&mut p.b, p.b_conn, 40);
+        for &h in &opened {
+            p.b.send(h, &pattern(512 * KIB as usize, h as u8), false);
+        }
+        let total = p.b.settle(Duration::from_millis(700), |b| {
+            opened.iter().map(|&h| b.sent(h)).sum::<u64>()
+        });
+        let stats = p.a.stats();
+        let peak = u(&stats["peak_queued_bytes"]);
+        let bound = 32 * INITIAL_CREDIT;
+        assert!(
+            peak <= bound,
+            "{tag}: {peak} queued, bound {bound}: {stats}"
+        );
+        // And the bound was reached: the test filled every admitted stream.
+        assert!(peak >= bound - 2 * INITIAL_CREDIT, "{tag}: {peak}: {stats}");
+        assert!(total > peak);
+        // Memory: the bytes and a buffer's overhead per 16 KiB, not one
+        // allocation per frame (256 frames of 1 KiB a stream).
+        let held = u(&stats["peak_held_bytes"]);
+        let held_bound = bound + 32 * 8 * KIB;
+        assert!(
+            held <= held_bound,
+            "{tag}: {held} held, bound {held_bound}: {stats}"
+        );
+        assert_eq!(u(&stats["app_buffered_bytes"]), 0);
+        p.a.assert_clean();
     }
-    // A's app reads nothing: everything waits in A's engine.
-    let total = p.b.settle(Duration::from_millis(700), |b| {
-        opened.iter().map(|&h| b.sent(h)).sum::<u64>()
-    });
-    let stats = p.a.stats();
-    let peak = u(&stats["peak_queued_bytes"]);
-    let bound = 32 * INITIAL_CREDIT;
-    assert!(peak <= bound, "{peak} queued, bound {bound}: {stats}");
-    // And the bound was reached: the test filled every admitted stream.
-    assert!(peak >= bound - 2 * INITIAL_CREDIT, "{peak}: {stats}");
-    assert!(total > peak);
-    assert_eq!(u(&stats["app_buffered_bytes"]), 0);
-    p.a.assert_clean();
 }
 
 #[test]

@@ -50,6 +50,7 @@ spec's value: it can only be tightened.
 | `MOUSSE_NET_CLOSE_LINGER_MS` | 2000 | 100 to 30000 | Time a closing connection has to send its last frame and shut the pipe, while it reads and drops what the peer still sends. |
 | `MOUSSE_NET_WRITE_HIGH_WATER_BYTES` | 262144 | 16384 to 67108864 | Queued bytes per stream above which a write waits. |
 | `MOUSSE_NET_READ_BUFFER_BYTES` | 32768 | 1024 to 1048576 | Bytes read from the pipe at a time. |
+| `MOUSSE_NET_RX_CHUNK_BYTES` | 16384 | 1024 to 65536 | Size of the buffers received `DATA` frames share until read. A peer's tiny frames fill one buffer instead of an allocation each, so what waits unread costs about its bytes. |
 | `MOUSSE_NET_HANDSHAKE_TIMEOUT_MS` | 10000 | 1000 to 60000 | TLS handshake time. |
 | `MOUSSE_NET_CONNECT_TIMEOUT_MS` | 5000 | 100 to 60000 | TCP connect time. |
 | `MOUSSE_NET_CERT_LIFETIME_SECS` | 86400 | 3600 to 86400 | Lifetime of the session certificates this device issues; verifiers reject more than 24 h (wire.md 5.2). |

@@ -557,6 +557,8 @@ impl Shared {
                     "open_streams": a.open_streams(),
                     "queued_bytes": a.queued_bytes(),
                     "peak_queued_bytes": a.peak_queued_bytes(),
+                    "held_bytes": a.held_bytes(),
+                    "peak_held_bytes": a.peak_held_bytes(),
                     "refused_streams": a.refused_streams(),
                     "handles": core.streams.len(),
                     "conns": core.conns.len(),
