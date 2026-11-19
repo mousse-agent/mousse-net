@@ -477,10 +477,13 @@ async fn repair(at: AtRepair) {
     match at {
         AtRepair::Nothing => {}
         AtRepair::FillPool => {
-            while let Ok(slot) = e.host.admit(ListenerKind::Tcp, None) {
-                fill.push(slot);
+            for _ in 0..2 {
+                fill.push(e.host.admit(ListenerKind::Tcp, None).unwrap());
             }
-            assert_eq!(fill.len(), 2);
+            assert!(
+                e.host.admit(ListenerKind::Tcp, None).is_err(),
+                "the pool is not full"
+            );
         }
         AtRepair::SetFence => e.host.set_fence(true),
     }
