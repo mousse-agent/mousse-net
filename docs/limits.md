@@ -98,6 +98,8 @@ spec's value: it can only be tightened.
 | `MOUSSE_NET_REMOVAL_RETRY_MS` | 1000 | 10 to 60000 | While networking is paused because a removal (`grant.remove`) could not be saved, how often the helper tries the save again (Phase 1a §5.4). |
 | `MOUSSE_NET_KEEP_RETRY_FIRST_MS` | 1000 | 10 to 60000 | App mode: wait before redialling a paired host that could not be reached; each next wait doubles (Phase 1a §6). |
 | `MOUSSE_NET_KEEP_RETRY_MAX_MS` | 60000 | 10 to 3600000 | App mode: longest wait between those redials; not below the first. |
+| `MOUSSE_NET_PREAUTH_CONNECTIONS` | 64 | 1 to 64 | Host: inbound connections not yet past step 2 (the TLS handshake, then authorization or pairing), from all addresses together. One more is dropped before its handshake starts, so slow or stalled handshakes cannot use up sockets and memory. |
+| `MOUSSE_NET_PREAUTH_PER_SOURCE` | 8 | 1 to 8 | Host: of those, connections from one source address; not above `PREAUTH_CONNECTIONS`. |
 
 ## Fixed on purpose
 

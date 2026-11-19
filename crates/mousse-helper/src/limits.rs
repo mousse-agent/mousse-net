@@ -76,6 +76,10 @@ mousse_net_core::define_limits! {
         keep_retry_first_ms = "KEEP_RETRY_FIRST_MS": 1_000, [10, 60_000];
         /// Keep connected: longest wait between redials of a host that could not be reached; not below the first wait.
         keep_retry_max_ms = "KEEP_RETRY_MAX_MS": 60_000, [10, 3_600_000];
+        /// Host: inbound connections not yet past step 2 (TLS handshake, then authorization or pairing), from all addresses together; one more is dropped before its handshake starts (tighten only).
+        preauth_connections = "PREAUTH_CONNECTIONS": 64, [1, 64];
+        /// Host: of those, connections from one source address (tighten only).
+        preauth_per_source = "PREAUTH_PER_SOURCE": 8, [1, 8];
     }
     agree(h) {
         if h.app_credit_interactive_reserve_bytes >= h.app_credit_budget_bytes {
@@ -91,6 +95,12 @@ mousse_net_core::define_limits! {
                 h.app_stream_credit_bytes,
                 h.app_credit_budget_bytes,
                 h.app_credit_interactive_reserve_bytes
+            )));
+        }
+        if h.preauth_per_source > h.preauth_connections {
+            return Err(LimitError::Conflict(format!(
+                "PREAUTH_PER_SOURCE ({}) is above PREAUTH_CONNECTIONS ({})",
+                h.preauth_per_source, h.preauth_connections
             )));
         }
         if h.keep_retry_max_ms < h.keep_retry_first_ms {
@@ -238,6 +248,25 @@ pub fn describe(d: Duration) -> String {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// The pre-authorization caps bound what an unauthenticated peer can
+    /// hold: they can be tightened, never raised.
+    #[test]
+    fn preauth_caps_can_only_be_tightened() {
+        for name in ["PREAUTH_CONNECTIONS", "PREAUTH_PER_SOURCE"] {
+            let spec = HelperLimits::SPECS.iter().find(|s| s.name == name).unwrap();
+            assert_eq!(spec.max, spec.default, "{name}");
+        }
+        assert!(Limits::from_vars(vars(&[("MOUSSE_NET_PREAUTH_PER_SOURCE", "9")])).is_err());
+        assert!(Limits::from_vars(vars(&[("MOUSSE_NET_PREAUTH_CONNECTIONS", "65")])).is_err());
+        let tight = Limits::from_vars(vars(&[
+            ("MOUSSE_NET_PREAUTH_CONNECTIONS", "4"),
+            ("MOUSSE_NET_PREAUTH_PER_SOURCE", "2"),
+        ]))
+        .unwrap();
+        assert_eq!(tight.helper.preauth_connections, 4);
+        assert_eq!(tight.helper.preauth_per_source, 2);
+    }
 
     fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
         let map: HashMap<String, OsString> = pairs
