@@ -593,16 +593,20 @@ const exec = (name, args, o = {}) => docker(["exec", name, ...args], { allowFail
 
 const LINK = /^mousse-relay:\/\/([^/\s]+)\/#([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)$/m;
 
-function relayIdFromStatus(text) {
+// `status --json` from the relay: its id (hex) and its own SHA-256.
+function relayStatus(text) {
   try {
     const j = JSON.parse(text);
-    return j.relay_id ?? j.relay?.id ?? j.id;
+    return { id: j.relay_id, sha256: j.build?.sha256 };
   } catch {
-    return undefined;
+    return {};
   }
 }
 
-function checkService(name, linkId) {
+// The relay id in an enrollment link (base64url), as hex.
+const linkRelay = (m) => Buffer.from(m[2], "base64url").toString("hex");
+
+function checkService(name, linkId, sha256) {
   let active = "";
   for (let i = 0; i < 20; i++) {
     active = exec(name, ["systemctl", "is-active", "mousse-relay"], { quiet: true }).stdout.trim();
@@ -616,9 +620,12 @@ function checkService(name, linkId) {
   if (!/^AmbientCapabilities=cap_net_bind_service$/m.test(show)) fail("unit", `ambient capabilities: ${show}`);
   const user = exec(name, ["ps", "-o", "user=", "-C", "mousse-relay"]).stdout.trim();
   if (user !== "mousse-relay") fail("unit", `relay process runs as ${user || "nobody"}`);
+  const listening = exec(name, ["ss", "-Hltn", "sport = :443"]).stdout.trim();
+  if (!listening) fail("not-listening", "nothing listens on 443");
   const status = exec(name, ["runuser", "-u", "mousse-relay", "--", "/usr/local/bin/mousse-relay", "status", "--json", "--state", "/var/lib/mousse-relay"]);
-  const id = relayIdFromStatus(status.stdout);
-  if (!id || id !== linkId) fail("identity", `status relay id ${id} against link ${linkId}`);
+  const st = relayStatus(status.stdout);
+  if (!st.id || st.id !== linkId) fail("identity", `status relay id ${st.id} against link ${linkId}`);
+  if (st.sha256 !== sha256) fail("build-hash", `installed relay ${st.sha256}, release ${sha256}`);
 }
 
 async function install() {
@@ -633,6 +640,7 @@ async function install() {
   const good = makeDist("good", built, source, ver, minisignDir, keys);
   plantControl(good);
   const name = artifactName(good);
+  const sha256 = sha256File(path.join(good, name));
 
   // 1. A tampered download installs nothing.
   {
@@ -656,11 +664,11 @@ async function install() {
     const m = r.stdout.match(LINK);
     if (!m || m[1] !== PUBLIC) fail("no-link", "install.sh printed no enrollment link for the public address");
     say(`install.sh: enrollment link for ${m[1]}`);
-    checkService(box, m[2]);
+    checkService(box, linkRelay(m), sha256);
     const up = exec(box, ["sh", "/mnt/dist/install.sh", "--from", "/mnt/dist"]);
     if (up.code !== 0) fail("upgrade-failed", "install.sh failed as an upgrade");
     if (LINK.test(up.stdout)) fail("upgrade-reinit", "the upgrade made a new enrollment link");
-    checkService(box, m[2]);
+    checkService(box, linkRelay(m), sha256);
     say("install.sh upgrade keeps the relay identity");
     docker(["rm", "-f", box], { quiet: true });
   }
@@ -682,10 +690,10 @@ async function install() {
     const m = txt.match(LINK);
     if (!m || m[1] !== PUBLIC) fail("template-no-link", "the template left no enrollment link in /root/mousse-relay.txt");
     say(`cloud-init template: enrollment link for ${m[1]}`);
-    checkService(box, m[2]);
+    checkService(box, linkRelay(m), sha256);
     const up = exec(box, ["/usr/local/sbin/mousse-relay-install", "--from", "/mnt/dist"]);
     if (up.code !== 0 || LINK.test(up.stdout)) fail("upgrade-failed", "the template's upgrade failed or made a new link");
-    checkService(box, m[2]);
+    checkService(box, linkRelay(m), sha256);
     say("The template's upgrade keeps the relay identity");
     docker(["rm", "-f", box], { quiet: true });
   }
@@ -710,14 +718,17 @@ async function install() {
       docker(["run", "-d", "--name", box, "--network-alias", "relay", ...hardened, tag]);
       cleanups.push(() => docker(["rm", "-f", box], { allowFail: true, quiet: true }));
       sleep(2000);
-      const st = docker(["inspect", box, "--format", "{{.State.Running}}"]).stdout.trim();
-      if (st !== "true") fail("not-running", "the relay container stopped");
+      const up = docker(["inspect", box, "--format", "{{.State.Running}}"]).stdout.trim();
+      if (up !== "true") fail("not-running", "the relay container stopped");
       const probe = docker(["run", "--rm", "--network", NETWORK, UBUNTU.tag, "timeout", "5", "bash", "-c", "</dev/tcp/relay/443"], { allowFail: true });
       if (probe.code !== 0) fail("not-listening", "the relay container does not accept on 443");
+      // Stopped as an upgrade would stop it, then started again on the volume.
+      docker(["stop", "-t", "10", box], { quiet: true });
       docker(["rm", "-f", box], { quiet: true });
       const status = docker(["run", "--rm", ...hardened, tag, "status", "--json", "--state", "/state"]);
-      const id = relayIdFromStatus(status.stdout);
-      if (id !== m[2]) fail("identity", `round ${round}: status relay id ${id} against link ${m[2]}`);
+      const st = relayStatus(status.stdout);
+      if (st.id !== linkRelay(m)) fail("identity", `round ${round}: status relay id ${st.id} against link ${linkRelay(m)}`);
+      if (st.sha256 !== sha256) fail("build-hash", `image relay ${st.sha256}, release ${sha256}`);
     }
     say("The relay image keeps its identity in the state volume across restarts");
   }

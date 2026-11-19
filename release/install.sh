@@ -292,7 +292,7 @@ Wants=network-online.target
 Type=simple
 User=$SERVICE_USER
 Group=$(id -gn "$SERVICE_USER")
-ExecStart=$BIN serve --state $STATE
+ExecStart=$BIN run --state $STATE
 Restart=on-failure
 RestartSec=2
 # Only the right to bind ports below 1024.

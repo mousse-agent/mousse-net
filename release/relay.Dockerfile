@@ -20,4 +20,4 @@ USER 65532:65532
 VOLUME ["/state"]
 EXPOSE 443
 ENTRYPOINT ["/mousse-relay"]
-CMD ["serve", "--state", "/state"]
+CMD ["run", "--state", "/state"]
