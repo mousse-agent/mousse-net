@@ -786,8 +786,9 @@ fn a_grant_removal_also_drops_the_completion_record() {
 }
 
 /// The result of A adding B one way (as over SSH): B grants A, A holds
-/// B's pin under a name of its own. Returns B's grant id for A and A's
-/// stored row for B.
+/// B's pin under a name of its own and is connected to it (as keep
+/// connected leaves it). Returns B's grant id for A and A's stored row
+/// for B.
 fn one_way(a: &mut App, b: &mut App) -> (Value, Value) {
     let (identity, name) = (a.identity.clone(), a.name.clone());
     let grant = b.call("grant.add", json!({"identity": identity, "name": name}))["grant"].clone();
@@ -797,6 +798,7 @@ fn one_way(a: &mut App, b: &mut App) -> (Value, Value) {
         "peer.add",
         json!({"identity": identity, "name": "B over SSH", "routes": [route]}),
     );
+    wait_outbound(a, &identity, 0);
     (grant, row_of(a, &identity))
 }
 
