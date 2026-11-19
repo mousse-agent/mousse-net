@@ -549,6 +549,9 @@ pub struct RunRecord {
     /// The `reason=` word on a control's FAIL line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// For an app check: the `app_build=` line the run printed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_build: Option<String>,
 }
 
 /// Names one `[[check.local]]` entry: `local:<target>@<host>:<digest>`,

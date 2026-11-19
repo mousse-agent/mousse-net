@@ -85,6 +85,12 @@ pub struct Check {
     /// build under test.
     #[serde(default)]
     pub cross_machine: bool,
+    /// The check runs the Mousse app (`MOUSSE_APP_DIR`) at the revision
+    /// pinned in `app/MOUSSE_REVISION`. Runs need a clean app checkout at
+    /// that revision, and evidence counts only if it names that app build
+    /// (`app_build`; for a cross-machine cell also `host_app_build`).
+    #[serde(default)]
+    pub app: bool,
     /// Not wired yet: every cell is INCOMPLETE with this reason, and
     /// `mousse-check <phase>` does not run it. `run` still does.
     #[serde(default)]
@@ -258,11 +264,12 @@ impl Manifest {
     }
 
     /// Digest of everything that decides what one run of `c` on `target`
-    /// proves: the judge, test minimum, markers, profile, matrix cases, the
-    /// local commands for that target (command, working directory, env) and,
-    /// for a control, its command, args, env and expected reason. Local run
-    /// records and signed results carry it; evidence with another digest
-    /// was produced under another configuration and does not count.
+    /// proves: the judge, test minimum, markers, profile, matrix cases,
+    /// whether it is an app check, the local commands for that target
+    /// (command, working directory, env) and, for a control, its command,
+    /// args, env and expected reason. Local run records and signed results
+    /// carry it; evidence with another digest was produced under another
+    /// configuration and does not count.
     pub fn config_digest(&self, c: &Check, target: &str, control: Option<&Control>) -> String {
         let locals: Vec<serde_json::Value> = c
             .local
@@ -286,7 +293,7 @@ impl Manifest {
                 "expect_reason": k.expect_reason,
             })
         });
-        let config = serde_json::json!({
+        let mut config = serde_json::json!({
             "format": "mousse-check-config-v1",
             "check": c.id,
             "target": target,
@@ -300,6 +307,11 @@ impl Manifest {
             "local": locals,
             "control": control,
         });
+        // Added only when set, so the digests of checks without it (and
+        // the evidence that carries them) stay what they were.
+        if c.app {
+            config["app"] = serde_json::Value::Bool(true);
+        }
         let text = serde_json::to_string(&config).unwrap_or_default();
         crate::util::to_hex(&sha2::Sha256::digest(text.as_bytes()))
     }
@@ -336,6 +348,12 @@ impl Manifest {
                 if !targets.insert(t.as_str()) {
                     return Err(format!("{}: target {t} appears twice", c.id));
                 }
+            }
+            if c.app && c.manual {
+                return Err(format!(
+                    "{}: a manual step cannot be an app check (app = true); attest it with both builds instead",
+                    c.id
+                ));
             }
             if c.manual {
                 if !c.local.is_empty() || !c.control.is_empty() {
@@ -578,6 +596,47 @@ command = ["cargo", "test"]
             "{BASE}[[check.control]]\nname = \"f\"\nbreaks = \"x\"\nargs = [\"--features\", \"control-x\"]\n"
         );
         Manifest::parse(&ok).unwrap();
+    }
+
+    #[test]
+    fn the_app_flag_is_in_the_digest_only_when_set() {
+        let m = Manifest::parse(BASE).unwrap();
+        // Pinned: a check without `app` keeps the digest it had before the
+        // flag existed, so evidence signed for it still counts.
+        assert_eq!(
+            m.config_digest(&m.checks[0], "t1", None),
+            "ad5a265caebec10f42d717f02169ea82532f543893357ae687498ad476369ff1"
+        );
+        let app = BASE.replace(
+            "targets = [\"t1\"]
+",
+            "targets = [\"t1\"]
+app = true
+",
+        );
+        let a = Manifest::parse(&app).unwrap();
+        assert!(a.checks[0].app);
+        assert_ne!(
+            a.config_digest(&a.checks[0], "t1", None),
+            m.config_digest(&m.checks[0], "t1", None)
+        );
+        let manual = "phase = \"phase9\"
+title = \"t\"
+[[check]]
+id = \"phase9.m\"
+title = \"m\"
+plan = \"p\"
+targets = [\"t\"]
+manual = true
+steps = \"do it\"
+";
+        Manifest::parse(manual).unwrap();
+        let err = Manifest::parse(&format!(
+            "{manual}app = true
+"
+        ))
+        .unwrap_err();
+        assert!(err.contains("manual"), "{err}");
     }
 
     #[test]

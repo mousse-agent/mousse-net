@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "pc-windows",
+  "key": "048ad3ccda2d27fdfc98c131f2fa25bea736ec0a3e8a107dcbfa6b2f5a86b88da452c337f09925646ec76897452505e718f3f397ddf39674e9f5ad64590bc93d57",
+  "payload": "{\"check\":\"phase0.sim-handshake\",\"target\":\"windows-x64\",\"control\":\"accept-expired-cert\",\"build\":\"8ae4d57d75eeccdbe7a4c1fa42feb101665a3f95+release\",\"platform\":\"windows-x86_64\",\"outcome\":\"FAIL\",\"details\":\"printed \\\"FAIL sim handshake\\\"\",\"time\":\"2026-11-19T12:18:08Z\",\"device\":\"pc-windows\",\"config\":\"81bfac67a1fc31d87da21fcad5abd6ff15f616ff2d6eaa7991aa144e3958e346\"}",
+  "signature": "9f7cffb612fccf60fe91df497404ebf165b06d177a19110f583bc33495b5c34b534fc96416528ecd147d8cf7817b904eefa8b09b7f9ac053559e5d34268d6da0"
+}

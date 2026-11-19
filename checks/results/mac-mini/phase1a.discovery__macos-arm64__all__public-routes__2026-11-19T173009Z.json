@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "mac-mini",
+  "key": "04d63225e01c2fd84d8a4588702b08561c26da25295387d39876ea36c7f2deee75ec54bd53c9d5b09712f13f737f0ece0038931c8226886a42d77430c7c4e486ee",
+  "payload": "{\"check\":\"phase1a.discovery\",\"target\":\"macos-arm64\",\"control\":\"public-routes\",\"build\":\"366dd2b062641eed1e639b5c974e95999b8894d8+debug\",\"platform\":\"macos-aarch64\",\"outcome\":\"FAIL\",\"details\":\"3 of 13 tests failed\",\"time\":\"2026-11-19T17:30:09Z\",\"device\":\"mac-mini\",\"config\":\"0acb92041faf9872a2eac9f46854199b7a816640c9046c792dc71800c638713b\"}",
+  "signature": "9ef16f13304a16c930284efe3ecd07e360a64664d8de09e847481bde81de2bf55bff6486de6345b8cfe989989205e11499936c90fb490c79cecb1dad9928bb62"
+}

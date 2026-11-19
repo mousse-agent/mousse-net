@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "pc-windows",
+  "key": "048ad3ccda2d27fdfc98c131f2fa25bea736ec0a3e8a107dcbfa6b2f5a86b88da452c337f09925646ec76897452505e718f3f397ddf39674e9f5ad64590bc93d57",
+  "payload": "{\"check\":\"phase1a.pair-offline\",\"target\":\"pc-to-mac-lan\",\"control\":\"cable-plugged\",\"build\":\"366dd2b062641eed1e639b5c974e95999b8894d8+debug\",\"platform\":\"windows-x86_64\",\"outcome\":\"FAIL\",\"details\":\"FAIL phase1a.pair-offline reason=internet_reachable\",\"time\":\"2026-11-19T18:59:46Z\",\"device\":\"pc-windows\",\"config\":\"701e5a5eafea43df9e7302ad93f2637e3e97e7a7eaf81deb112f46877d0e0af3\",\"extra\":{\"app_build\":\"9621efca899d24ff23261bef7b7dc0519cffb02d\",\"host_app_build\":\"9621efca899d24ff23261bef7b7dc0519cffb02d\",\"host_build\":\"366dd2b062641eed1e639b5c974e95999b8894d8+debug\",\"reason\":\"internet_reachable\"}}",
+  "signature": "3435c2be1363d779ad1c096fe5063bb3d98853b66a5f6a43c53885b7bf4bfb87094f965dbbd5cbcc85192a4eec896006fde0a06c14270d73f54485faf6d93adc"
+}

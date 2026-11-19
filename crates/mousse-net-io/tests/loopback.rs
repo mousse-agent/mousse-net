@@ -56,7 +56,9 @@ async fn join_with(
 async fn dial_refused(caller: &Caller, host: &TestHost) -> NetError {
     let before = host.accepted.load(Ordering::SeqCst);
     let pipe = connect_tcp(&host.route()).await.unwrap();
-    let conn = caller.connect(pipe, host.identity()).await.unwrap();
+    let conn = within("connect", caller.connect(pipe, host.identity()))
+        .await
+        .unwrap();
     wait_until("host accepted", || {
         host.accepted.load(Ordering::SeqCst) > before
     })
@@ -88,8 +90,8 @@ async fn pair_in_person_open_a_terminal_then_removal_closes_it_at_once() {
         "{:?}",
         started.elapsed()
     );
-    assert!(stream.reader.read().await.is_err());
-    assert!(stream.writer.write(b"more").await.is_err());
+    assert!(within("read", stream.reader.read()).await.is_err());
+    assert!(within("write", stream.writer.write(b"more")).await.is_err());
     assert_eq!(host.host.connections_for(grant), 0);
 
     // The device is no longer known: a new connection is refused.
@@ -127,10 +129,11 @@ async fn a_wrong_host_identity_on_reconnect_fails_before_any_data() {
     real.stop().await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_ungranted_identity_cannot_open_streams() {
-    let host = TestHost::start(new_signer()).await;
-    // A peer that skips the client-side checks and writes mux frames itself.
+/// A peer that skips the client-side checks and writes mux frames itself:
+/// HELLO, then a terminal stream with `id\n` on it.
+async fn raw_peer_opening_a_stream(
+    host: &TestHost,
+) -> (tokio_rustls::TlsStream<tokio::net::TcpStream>, Mux) {
     let clock = Arc::new(ManualClock::new());
     let certs = CertManager::new(new_signer(), clock.clone());
     let own = certs.current().unwrap();
@@ -155,24 +158,43 @@ async fn an_ungranted_identity_cannot_open_streams() {
         tls.write_all(&bytes).await.unwrap();
     }
     tls.flush().await.unwrap();
+    (tls, mux)
+}
 
+/// Everything the host sends until it closes, and how the read ended.
+async fn read_to_end(
+    tls: &mut tokio_rustls::TlsStream<tokio::net::TcpStream>,
+    mux: &mut Mux,
+) -> (Vec<MuxEvent>, String) {
     let mut events = Vec::new();
     let mut buf = [0u8; 4096];
-    loop {
+    let end = loop {
         match within("host reply", tls.read(&mut buf)).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => events.extend(mux.receive(&buf[..n], Millis(1)).unwrap_or_default()),
+            Ok(0) => break "end of stream".to_string(),
+            Err(e) => break format!("{e:?}"),
+            Ok(n) => events.extend(mux.receive(&buf[..n], Millis(1)).unwrap()),
         }
-    }
-    assert!(
-        events.iter().any(|e| matches!(
+    };
+    (events, end)
+}
+
+fn refused_as_not_authorized(events: &[MuxEvent]) -> bool {
+    events.iter().any(|e| {
+        matches!(
             e,
             MuxEvent::GoAway {
                 code: ErrorCode::NotAuthorized
             }
-        )),
-        "{events:?}"
-    );
+        )
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ungranted_identity_cannot_open_streams() {
+    let host = TestHost::start(new_signer()).await;
+    let (mut tls, mut mux) = raw_peer_opening_a_stream(&host).await;
+    let (events, end) = read_to_end(&mut tls, &mut mux).await;
+    assert!(refused_as_not_authorized(&events), "{events:?}, then {end}");
     // Nothing but the host's HELLO came back: no AUTHORIZED, no stream.
     for event in &events {
         match event {
@@ -188,6 +210,23 @@ async fn an_ungranted_identity_cannot_open_streams() {
         }
     }
     assert_eq!(host.streams.load(Ordering::SeqCst), 0);
+    host.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_peer_that_keeps_sending_still_reads_why() {
+    let host = TestHost::start(new_signer()).await;
+    let (mut tls, mut mux) = raw_peer_opening_a_stream(&host).await;
+    // The host has refused and closed its side by now. More data arrives
+    // after that, and the peer reads late. A host that closed its socket
+    // with that data unread would reset the connection, which can destroy
+    // the GOAWAY before the peer reads it.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let _ = tls.write_all(&[0u8; 512]).await;
+    let _ = tls.flush().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (events, end) = read_to_end(&mut tls, &mut mux).await;
+    assert!(refused_as_not_authorized(&events), "{events:?}, then {end}");
     host.stop().await;
 }
 
@@ -277,7 +316,9 @@ async fn traffic_runs_through_the_deadline_second_and_stops_right_after_it() {
         "{:?}",
         refused.err()
     );
-    assert!(stream.writer.write(b"too late").await.is_err());
+    assert!(within("write", stream.writer.write(b"too late"))
+        .await
+        .is_err());
     assert_eq!(close_code(&conn).await, Some(ErrorCode::CertExpired));
     assert_eq!(host.streams.load(Ordering::SeqCst), opened);
 
@@ -432,6 +473,31 @@ async fn a_removal_that_cannot_be_saved_reports_it_and_still_ends_access_at_once
     host.stop().await;
     drop(endpoint);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A pause closes every connection, and also one whose handshake began
+/// before the pause and ends after it: the pause and the registration of
+/// connections take the same lock. After a resume the host serves again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pause_also_closes_a_connection_whose_handshake_ends_after_it() {
+    let mut host = TestHost::start(new_signer()).await;
+    let caller = new_caller(new_signer());
+    let conn = pair(&caller, &mut host, "laptop").await;
+    // Connected before the pause; the host waits for its TLS handshake.
+    let pipe = connect_tcp(&host.route()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    host.host.pause(ErrorCode::InternalError);
+    assert_eq!(close_code(&conn).await, Some(ErrorCode::InternalError));
+
+    match within("the late handshake", caller.dial(pipe, host.identity())).await {
+        Ok(late) => assert_eq!(close_code(&late).await, Some(ErrorCode::InternalError)),
+        Err(e) => assert!(closed_with(&e, ErrorCode::InternalError), "{e:?}"),
+    }
+
+    host.host.resume();
+    let again = dial(&caller, &host.route(), host.identity()).await.unwrap();
+    open_echo(&again).await;
+    host.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

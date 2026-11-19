@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "wsl-linux",
+  "key": "042f0974403d57624956aebbe7cd72f01b86773fdee66ffba37429d70a320ccb692f06069a9174535d971428932d86132cc89eef54954c5f9c5c6ed605fea234bb",
+  "payload": "{\"check\":\"phase1a.app-channel\",\"target\":\"linux-x64\",\"control\":\"fifo-writer\",\"build\":\"366dd2b062641eed1e639b5c974e95999b8894d8+debug\",\"platform\":\"linux-x86_64\",\"outcome\":\"FAIL\",\"details\":\"1 of 18 tests failed\",\"time\":\"2026-11-19T15:22:41Z\",\"device\":\"wsl-linux\",\"config\":\"ba1b5bf5217bfa327025c0c20f5f37e890b0b8814726201b3bbbc8a499238ec4\"}",
+  "signature": "885f9d3855b073a578d7553c1de5217e0e58ff63027fe755e9ff7117789ab39822072a57bc692c333de8a4e5736ced18bc3054e1a3870628ed36291223e2e44e"
+}

@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "pc-windows",
+  "key": "048ad3ccda2d27fdfc98c131f2fa25bea736ec0a3e8a107dcbfa6b2f5a86b88da452c337f09925646ec76897452505e718f3f397ddf39674e9f5ad64590bc93d57",
+  "payload": "{\"check\":\"phase1a.pair-offline\",\"target\":\"linux-x64-offline-sim\",\"control\":\"cable-plugged\",\"build\":\"366dd2b062641eed1e639b5c974e95999b8894d8+debug\",\"platform\":\"Docker Desktop on the Windows 11 PC: two Ubuntu 24.04 containers on an internal Docker network (no route to the internet)\",\"outcome\":\"FAIL\",\"details\":\"FAIL phase1a.pair-offline reason=internet_reachable\",\"time\":\"2026-11-19T18:49:10Z\",\"device\":\"pc-windows\",\"config\":\"25d3466f002f5017e22e915c51ffa2103fc7ef5e45832a5a7c2fab88bb7b59fa\",\"extra\":{\"app_build\":\"9621efca899d24ff23261bef7b7dc0519cffb02d\",\"host_app_build\":\"9621efca899d24ff23261bef7b7dc0519cffb02d\",\"host_build\":\"366dd2b062641eed1e639b5c974e95999b8894d8+debug\",\"reason\":\"internet_reachable\"}}",
+  "signature": "b9bbdb7547f8676eb079a7a259142970f2e2bf5f99b4940b3af20bf9e08dcadb2ea59311ea092fa601d4e58b2e3daff907d890149743375adbeb12e026222b97"
+}

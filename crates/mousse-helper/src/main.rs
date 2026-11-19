@@ -8,7 +8,14 @@
         mousse_control = "skip-pin-check",
         mousse_control = "keep-removed-grant",
         mousse_control = "shared-endpoint-state",
-        mousse_control = "allow-break-env"
+        mousse_control = "allow-break-env",
+        mousse_control = "read-without-credit",
+        mousse_control = "fifo-writer",
+        mousse_control = "fin-overtakes",
+        mousse_control = "no-revoke-journal",
+        mousse_control = "stop-on-mismatch",
+        mousse_control = "public-routes",
+        mousse_control = "no-rediscovery"
     )
 ))]
 compile_error!("a mousse_control build has a deliberate defect and is for tests only; build it without --release");
@@ -24,6 +31,13 @@ compile_error!("test-in-person lets a typed ticket count as scanned from the hos
     mousse_control = "keep-removed-grant",
     mousse_control = "shared-endpoint-state",
     mousse_control = "allow-break-env",
+    mousse_control = "read-without-credit",
+    mousse_control = "fifo-writer",
+    mousse_control = "fin-overtakes",
+    mousse_control = "no-revoke-journal",
+    mousse_control = "stop-on-mismatch",
+    mousse_control = "public-routes",
+    mousse_control = "no-rediscovery",
     feature = "test-in-person"
 ))]
 const _: () = {
@@ -41,9 +55,12 @@ const _: () = {
     );
 };
 
+mod app;
+mod applog;
 mod ipc;
 mod limits;
 mod peer;
+mod revoke;
 
 /// This build: `<commit>[-dirty]+<profile>`, fixed at compile time (see
 /// `build.rs`; `MOUSSE_BUILD_ID` overrides it).
@@ -62,7 +79,7 @@ mod serve;
 mod term;
 
 use std::collections::VecDeque;
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -96,6 +113,11 @@ enum Command {
         /// An opaque profile id (default: a new random one).
         #[arg(long)]
         profile: Option<String>,
+        /// Run for the Mousse app: exit at once when stdin closes (the app
+        /// is gone), so an app killed during a first start leaves no
+        /// `init` behind.
+        #[arg(long)]
+        app: bool,
     },
     /// Show this endpoint's device id and port.
     Id,
@@ -114,6 +136,12 @@ enum Command {
         /// The name paired devices see (default: this computer's name).
         #[arg(long)]
         name: Option<String>,
+        /// Talk to the Mousse app on stdin and stdout (framed; see
+        /// docs/phase1a-design.md §2). The helper's own lines go to
+        /// `helper.log` in the state directory, and it exits when stdin
+        /// closes.
+        #[arg(long)]
+        app: bool,
     },
     /// Make an invitation on the running host and print the ticket and a QR
     /// code. In person (the default), answer "Is the device next to you?";
@@ -368,6 +396,26 @@ fn offline_remove(dir: &Path, grant: u64, deny: bool) -> Result<(), String> {
     store.save(&table).map_err(|e| e.to_string())
 }
 
+/// Ends the process when stdin closes or fails: the app that started this
+/// helper is gone, whether it stopped or was killed outright.
+fn exit_when_stdin_closes() {
+    std::thread::spawn(|| {
+        let mut buf = [0u8; 256];
+        let mut stdin = std::io::stdin();
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) | Err(_) => {
+                    // Not `eprintln!`: it panics when stderr is a pipe
+                    // to the app that is gone, and the process would stay.
+                    let _ = writeln!(std::io::stderr(), "error: the app is gone");
+                    std::process::exit(3);
+                }
+                Ok(_) => {}
+            }
+        }
+    });
+}
+
 fn ask_yes_no(question: &str) -> bool {
     print!("{question} [y/N] ");
     let _ = std::io::stdout().flush();
@@ -514,7 +562,14 @@ async fn run(cli: Cli) -> Result<i32, String> {
     let dir = cli.state.unwrap_or_else(serve::default_state_dir);
     let insecure = cli.insecure_file_key;
     match cli.command {
-        Command::Init { profile } => {
+        Command::Init { profile, app } => {
+            if app {
+                exit_when_stdin_closes();
+            }
+            let hold = crate::limits::helper().init_hold_ms();
+            if hold > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(hold)).await;
+            }
             let (endpoint, _) = Endpoint::create(&dir, profile.as_deref(), storage(insecure))
                 .map_err(|e| e.to_string())?;
             println!(
@@ -549,12 +604,14 @@ async fn run(cli: Cli) -> Result<i32, String> {
             port,
             no_mdns,
             name,
+            app,
         } => {
             let opts = serve::ServeOptions {
                 name: name.unwrap_or_else(computer_name),
                 listen_ip,
                 port,
                 mdns: !no_mdns,
+                app,
             };
             serve::run(&dir, insecure, opts).await?;
         }
@@ -652,6 +709,10 @@ fn main() {
             std::process::exit(2);
         }
     };
+    // In app mode stdout carries the channel. Its writer may be blocked on a
+    // full pipe the app stopped reading, holding stdout's lock: a final flush
+    // would wait for it forever. What it had not written is lost either way.
+    let app_mode = matches!(cli.command, Command::Serve { app: true, .. });
     let code = match runtime.block_on(run(cli)) {
         Ok(code) => code,
         Err(e) => {
@@ -659,7 +720,9 @@ fn main() {
             2
         }
     };
-    let _ = std::io::stdout().flush();
+    if !app_mode {
+        let _ = std::io::stdout().flush();
+    }
     // Exit now: a pending stdin read must not keep the process alive.
     std::process::exit(code)
 }
