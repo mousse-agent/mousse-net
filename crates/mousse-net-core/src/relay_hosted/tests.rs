@@ -11,6 +11,7 @@ use rand_core::SeedableRng;
 use super::records::issuer_key_id;
 use super::*;
 use crate::identity::SoftwareKey;
+use crate::time::UnixTime;
 
 const RELAY: RelayId = [0x11; 32];
 const BOOT: BootId = [0x22; 16];

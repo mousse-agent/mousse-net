@@ -21,7 +21,7 @@ mod report;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 
-use crate::time::{Millis, UnixTime};
+use crate::time::Millis;
 
 pub use clock::PlusClock;
 pub use records::{
@@ -80,15 +80,8 @@ pub const CLOSE_ADMISSION_EXPIRED: u16 = 4004;
 /// The lowest and highest status threshold a `REGISTER` may give (§B.3).
 pub const THRESHOLD_PERCENT: core::ops::RangeInclusive<u64> = 10..=90;
 
-/// Both clocks, read together by the caller.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Now {
-    /// Monotonic time, for every timer and the Plus clock.
-    pub mono: Millis,
-    /// Wall clock. Used only for admission windows before the boot's first
-    /// Plus answer, and for report `sent at` until then.
-    pub wall: UnixTime,
-}
+/// Both clocks, read together by the caller: the relay machine's.
+pub use crate::relay::machine::Now;
 
 /// Which way a spliced message goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -1,12 +1,14 @@
 //! The relay's admission state machine (spec `relay.md` sections 6 to 11),
-//! self-hosted mode. No I/O: the caller passes events, both clocks and the
-//! randomness, and carries out the [`Output`]s in order.
+//! in self-hosted mode and, with a [`Hosted`] state, in hosted mode
+//! (`docs/phase34-design.md` §B.10). No I/O: the caller passes events, both
+//! clocks and the randomness, and carries out the [`Output`]s in order.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use rand_core::CryptoRng;
 
 use crate::identity::PublicKey;
+use crate::relay_hosted::{self, Direction, Hosted};
 use crate::time::{Millis, UnixTime};
 
 use super::limits::RelayLimits;
@@ -137,6 +139,28 @@ pub enum Output {
         /// `H(code)`.
         hash: [u8; 32],
     },
+    /// Hosted: the rate bucket of this leg's class is short. Hand the same
+    /// peer message to [`Relay::data`] again at `until`, reading nothing
+    /// more from `conn` meanwhile.
+    Hold {
+        /// The leg.
+        conn: ConnId,
+        /// Monotonic time to try again.
+        until: Millis,
+    },
+    /// Hosted: no lease covers this leg's message. Hand it to
+    /// [`Relay::data`] again after [`Output::Resume`] for `conn`, reading
+    /// nothing more from `conn` meanwhile (the circuit closes with 4001 if
+    /// no lease comes in time).
+    Pause {
+        /// The leg.
+        conn: ConnId,
+    },
+    /// Hosted: a paused leg may try its message again.
+    Resume {
+        /// The leg.
+        conn: ConnId,
+    },
 }
 
 /// The relay's fixed configuration.
@@ -233,6 +257,8 @@ pub struct Relay {
     registrations: BTreeMap<[u8; 32], Registration>,
     circuits: BTreeMap<[u8; 16], Circuit>,
     stopped: bool,
+    /// Hosted mode's admission tokens, leases and reports.
+    hosted: Option<Hosted>,
 }
 
 impl core::fmt::Debug for Relay {
@@ -277,7 +303,45 @@ impl Relay {
             registrations: BTreeMap::new(),
             circuits: BTreeMap::new(),
             stopped: false,
+            hosted: None,
         }
+    }
+
+    /// A relay in hosted mode: no authorized list; targets register with
+    /// admission tokens and circuits forward against leases. `hosted` must
+    /// be for this relay and boot.
+    pub fn new_hosted(config: RelayConfig, hosted: Hosted) -> Self {
+        let mut relay = Self::new(config, &[], &[]);
+        debug_assert_eq!(hosted.relay_id(), relay.relay_id.0);
+        debug_assert_eq!(hosted.boot_id(), relay.config.boot_id);
+        relay.hosted = Some(hosted);
+        relay
+    }
+
+    /// The hosted state, in hosted mode.
+    pub fn hosted(&self) -> Option<&Hosted> {
+        self.hosted.as_ref()
+    }
+
+    /// The hosted state, in hosted mode: the relay's Plus link feeds Plus's
+    /// answers in and takes report parts out.
+    pub fn hosted_mut(&mut self) -> Option<&mut Hosted> {
+        self.hosted.as_mut()
+    }
+
+    /// The mode in `RELAY_HELLO`.
+    pub fn mode(&self) -> Mode {
+        if self.hosted.is_some() {
+            Mode::Hosted
+        } else {
+            Mode::SelfHosted
+        }
+    }
+
+    /// Hosted: the earliest monotonic time a lease, refill or admission wait
+    /// fires. Call [`Relay::tick`] then too.
+    pub fn next_hosted_wake(&self, now: Now) -> Option<Millis> {
+        self.hosted.as_ref().and_then(|h| h.next_wakeup(now))
     }
 
     /// The relay id.
@@ -404,7 +468,7 @@ impl Relay {
                 version: RELAY_VERSION,
                 nonce,
                 boot_id: self.config.boot_id,
-                mode: Mode::SelfHosted,
+                mode: self.mode(),
             }
             .encode(),
         });
@@ -426,6 +490,7 @@ impl Relay {
         };
         if let Some(true) = self.spliced_leg(conn) {
             out.extend(self.data_inner(conn, bytes.len(), now));
+            self.fire_hosted(now, &mut out);
             return out;
         }
         let msg = match RelayMessage::decode(bytes) {
@@ -435,14 +500,22 @@ impl Relay {
                 return out;
             }
         };
+        let hosted_mode = self.hosted.is_some();
         match role {
             Role::Fresh { .. } => match msg {
                 RelayMessage::Register {
                     key,
                     proof,
                     hosted: None,
-                } => self.register(conn, key, proof, now, &mut out),
-                RelayMessage::Enroll { key, proof, code } => {
+                } if !hosted_mode => self.register(conn, key, proof, now, &mut out),
+                RelayMessage::Register {
+                    key,
+                    proof,
+                    hosted: Some((token, threshold)),
+                } if hosted_mode => {
+                    self.register_hosted(conn, key, proof, &token, threshold, now, &mut out)
+                }
+                RelayMessage::Enroll { key, proof, code } if !hosted_mode => {
                     self.enroll(conn, key, proof, code, now, &mut out)
                 }
                 RelayMessage::Call {
@@ -478,7 +551,26 @@ impl Relay {
                         key,
                         new_proof,
                         current_proof,
-                    } => self.successor(conn, handle, key, new_proof, current_proof, now, &mut out),
+                    } if !hosted_mode => {
+                        self.successor(conn, handle, key, new_proof, current_proof, now, &mut out)
+                    }
+                    RelayMessage::Lease { block } if hosted_mode => {
+                        self.lease(handle, &block, now, &mut out)
+                    }
+                    RelayMessage::Admit { token } if hosted_mode => {
+                        // A refused ADMIT changes nothing: the registration
+                        // keeps its token, and lives on while funded.
+                        if let Some(h) = self.hosted.as_mut() {
+                            let _ = h.admit(handle, &token, now);
+                        }
+                    }
+                    RelayMessage::Release { leases } if hosted_mode => {
+                        // A RELEASE naming another handle's lease changes
+                        // nothing.
+                        if let Some(h) = self.hosted.as_mut() {
+                            let _ = h.release(handle, &leases, now);
+                        }
+                    }
                     RelayMessage::Ping { data } => {
                         self.send_registration(handle, RelayMessage::Pong { data }, now, &mut out)
                     }
@@ -490,6 +582,7 @@ impl Relay {
                 self.protocol_error(conn, &mut out)
             }
         }
+        self.fire_hosted(now, &mut out);
         out
     }
 
@@ -510,6 +603,7 @@ impl Relay {
             return out;
         }
         out.extend(self.data_inner(conn, len, now));
+        self.fire_hosted(now, &mut out);
         out
     }
 
@@ -522,6 +616,7 @@ impl Relay {
     ) -> Vec<Output> {
         let mut out = self.fire(now, rng);
         self.forget(conn, &mut out);
+        self.fire_hosted(now, &mut out);
         out
     }
 
@@ -573,6 +668,19 @@ impl Relay {
         out
     }
 
+    /// Hosted: a graceful stop begins. Nothing more is forwarded and no
+    /// `LEASE` is taken; every lease is final, and the stopping snapshot is
+    /// taken for the Plus link to send (§A.9 duty 11). Call [`Relay::stop`]
+    /// once it is stored or the final report wait has passed.
+    pub fn begin_stop(&mut self, now: Now) -> Vec<Output> {
+        let mut out = Vec::new();
+        if let Some(h) = self.hosted.as_mut() {
+            h.stop(now);
+        }
+        self.fire_hosted(now, &mut out);
+        out
+    }
+
     /// The relay stops: every circuit and connection closes with 4003.
     pub fn stop(&mut self) -> Vec<Output> {
         let mut out = Vec::new();
@@ -609,6 +717,7 @@ impl Relay {
             );
         }
         self.fire_wall(now, &mut out);
+        self.fire_hosted(now, &mut out);
         out
     }
 
@@ -663,6 +772,9 @@ impl Relay {
         for handle in due {
             if let Some(reg) = self.registrations.remove(&handle) {
                 self.close_conn(reg.conn, close::IDLE, out);
+                if let Some(h) = self.hosted.as_mut() {
+                    h.unregister(&handle);
+                }
             }
         }
         // 5. Keepalive.
@@ -788,6 +900,114 @@ impl Relay {
             out.push(Output::Authorize { fingerprint });
         }
         self.install_registration(conn, handle, key, now, out);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_hosted(
+        &mut self,
+        conn: ConnId,
+        key: PublicKey,
+        proof: crate::identity::RawSignature,
+        token: &[u8],
+        threshold: u8,
+        now: Now,
+        out: &mut Vec<Output>,
+    ) {
+        let binding = self.conns[&conn].binding;
+        let handle = proof::handle(&self.relay_id, &key);
+        let record = proof::register_record(&self.relay_id, &handle, &binding);
+        if proof::verify(&key, &record, &proof).is_err() {
+            return self.refuse(conn, RefuseReason::NotAuthorized, out);
+        }
+        if self.registration_limit_reached(&handle) {
+            return self.refuse(conn, RefuseReason::Limit, out);
+        }
+        let admitted = match self.hosted.as_mut() {
+            Some(h) => h.register(handle, token, Some(u64::from(threshold)), now),
+            None => return self.protocol_error(conn, out),
+        };
+        if admitted.is_err() {
+            return self.refuse(conn, RefuseReason::Admission, out);
+        }
+        self.install_registration(conn, handle, key, now, out);
+    }
+
+    /// Hosted: a `LEASE` on the registration of `handle`. Only a refusal is
+    /// answered (`LEASE_STATUS` with state 3).
+    fn lease(&mut self, handle: [u8; 32], block: &[u8], now: Now, out: &mut Vec<Output>) {
+        let Some(h) = self.hosted.as_mut() else {
+            return;
+        };
+        if let Err(refused) = h.lease(handle, block, now) {
+            if let Some(status) = refused.status {
+                self.send_registration(
+                    handle,
+                    RelayMessage::LeaseStatus {
+                        entries: vec![status.into()],
+                    },
+                    now,
+                    out,
+                );
+            }
+        }
+    }
+
+    /// Hosted: carry out what the hosted state asks for (§B.10).
+    fn fire_hosted(&mut self, now: Now, out: &mut Vec<Output>) {
+        let Some(h) = self.hosted.as_mut() else {
+            return;
+        };
+        for event in h.poll(now) {
+            match event {
+                relay_hosted::Event::Status { handle, entries } => self.send_registration(
+                    handle,
+                    RelayMessage::LeaseStatus {
+                        entries: entries.into_iter().map(Into::into).collect(),
+                    },
+                    now,
+                    out,
+                ),
+                relay_hosted::Event::Resumed { handle, class } => {
+                    for id in self.circuits_of(&handle, Some(class)) {
+                        if let CircuitState::Spliced { accept, .. } = self.circuits[&id].state {
+                            out.push(Output::Resume {
+                                conn: self.circuits[&id].caller_conn,
+                            });
+                            out.push(Output::Resume { conn: accept });
+                        }
+                    }
+                }
+                relay_hosted::Event::CloseClass {
+                    handle,
+                    class,
+                    code,
+                } => {
+                    for id in self.circuits_of(&handle, Some(class)) {
+                        self.close_circuit(&id, code, out);
+                    }
+                }
+                relay_hosted::Event::CloseHandle { handle, code } => {
+                    if let Some(reg) = self.registrations.remove(&handle) {
+                        self.close_conn(reg.conn, code, out);
+                    }
+                    for id in self.circuits_of(&handle, None) {
+                        self.close_circuit(&id, code, out);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Circuits of `handle` (of `class`, if given), in order of their
+    /// caller's connection.
+    fn circuits_of(&self, handle: &[u8; 32], class: Option<Class>) -> Vec<[u8; 16]> {
+        self.circuits_by_caller()
+            .into_iter()
+            .filter(|id| {
+                let c = &self.circuits[id];
+                c.handle == *handle && class.is_none_or(|k| c.class == k)
+            })
+            .collect()
     }
 
     fn install_registration(
@@ -962,7 +1182,12 @@ impl Relay {
             .filter(|c| c.handle == handle && c.kind_caller() == Some(caller))
             .count() as u64;
         let under_cap = open < self.config.limits.circuits_per_caller();
-        if proof_ok && listed && under_cap {
+        // Hosted: the class needs a usable lease. Same answer, same time.
+        let funded = self
+            .hosted
+            .as_mut()
+            .is_none_or(|h| h.can_call(&handle, class, now));
+        if proof_ok && listed && under_cap && funded {
             self.admit(conn, handle, Kind::Call { caller }, class, now, rng, out);
         } else {
             self.refused(conn, deadline, out);
@@ -994,8 +1219,13 @@ impl Relay {
             .count() as u64;
         let under_cap = cfg!(mousse_control = "relay-no-preaccept-budget")
             || joins < self.config.limits.preaccept_per_target();
+        // Hosted: pre-accept bytes are charged to the interactive lease.
+        let funded = self
+            .hosted
+            .as_mut()
+            .is_none_or(|h| h.can_call(&handle, Class::Interactive, now));
         match entry {
-            Some(i) if under_cap => self.admit(
+            Some(i) if under_cap && funded => self.admit(
                 conn,
                 handle,
                 Kind::Join {
@@ -1152,30 +1382,68 @@ impl Relay {
             _ => return out,
         };
         let budget = self.config.limits.preaccept_bytes();
-        let Some(c) = self.circuits.get_mut(&circuit) else {
+        let Some(c) = self.circuits.get(&circuit) else {
             return out;
         };
         let CircuitState::Spliced { accept, .. } = c.state else {
             return out;
         };
-        if let Kind::Join { sent, .. } = &mut c.kind {
-            let dir = usize::from(!from_caller);
-            let total = sent[dir].saturating_add(len as u64);
+        let (handle, class, caller_conn) = (c.handle, c.class, c.caller_conn);
+        let dir = usize::from(!from_caller);
+        let join_total = match c.kind {
+            Kind::Join { sent, .. } => Some(sent[dir].saturating_add(len as u64)),
+            Kind::Call { .. } => None,
+        };
+        if let Some(total) = join_total {
             // Must-fail control (phase3.relay-limits `no-preaccept-budget`).
             if total > budget && !cfg!(mousse_control = "relay-no-preaccept-budget") {
                 self.close_circuit(&circuit, close::LIMIT, &mut out);
                 return out;
             }
-            sent[dir] = total;
         }
-        c.state = CircuitState::Spliced {
-            accept,
-            last_activity: now.mono,
-        };
+        // Hosted: count the message against the class's leases and its
+        // rate group, or hold it.
+        if let Some(h) = self.hosted.as_mut() {
+            let direction = if from_caller {
+                Direction::ToTarget
+            } else {
+                Direction::ToCaller
+            };
+            let mut socket = [0u8; 8];
+            socket.copy_from_slice(&circuit[..8]);
+            match h.forward(
+                handle,
+                class,
+                u64::from_be_bytes(socket),
+                direction,
+                len as u64,
+                now,
+            ) {
+                relay_hosted::Forward::Go => {}
+                relay_hosted::Forward::Wait { until } => {
+                    out.push(Output::Hold { conn, until });
+                    return out;
+                }
+                relay_hosted::Forward::Paused => {
+                    out.push(Output::Pause { conn });
+                    return out;
+                }
+                relay_hosted::Forward::Stopped => return out,
+            }
+        }
+        if let Some(c) = self.circuits.get_mut(&circuit) {
+            if let (Kind::Join { sent, .. }, Some(total)) = (&mut c.kind, join_total) {
+                sent[dir] = total;
+            }
+            c.state = CircuitState::Spliced {
+                accept,
+                last_activity: now.mono,
+            };
+        }
         let (from, to) = if from_caller {
-            (c.caller_conn, accept)
+            (caller_conn, accept)
         } else {
-            (accept, c.caller_conn)
+            (accept, caller_conn)
         };
         out.push(Output::Forward { from, to, len });
         out
@@ -1285,6 +1553,9 @@ impl Relay {
                     .is_some_and(|r| r.conn == conn)
                 {
                     self.registrations.remove(&handle);
+                    if let Some(h) = self.hosted.as_mut() {
+                        h.unregister(&handle);
+                    }
                 }
             }
             Role::Leg { circuit } | Role::AcceptLeg { circuit } => {

@@ -91,6 +91,9 @@ fn summary(outs: &[Output]) -> Vec<String> {
             Output::Supersede { .. } => "supersede".into(),
             Output::Drop { .. } => "drop".into(),
             Output::ConsumeCode { .. } => "consume_code".into(),
+            Output::Hold { conn, .. } => format!("hold {}", conn.0),
+            Output::Pause { conn } => format!("pause {}", conn.0),
+            Output::Resume { conn } => format!("resume {}", conn.0),
         })
         .collect()
 }
@@ -151,6 +154,10 @@ fn output_json(o: &Output) -> J {
         } => json!({ "supersede": hex(fingerprint), "drop_at": drop_at.0 }),
         Output::Drop { fingerprint } => json!({ "drop": hex(fingerprint) }),
         Output::ConsumeCode { hash } => json!({ "consume_code": hex(hash) }),
+        // Hosted mode only; the vectors cover self mode.
+        Output::Hold { conn, until } => json!({ "hold": conn.0, "until": until.0 }),
+        Output::Pause { conn } => json!({ "pause": conn.0 }),
+        Output::Resume { conn } => json!({ "resume": conn.0 }),
     }
 }
 

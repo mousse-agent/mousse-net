@@ -386,6 +386,8 @@ impl<'a> Drive<'a> {
                     self.authorized.remove(&fingerprint);
                 }
                 Output::ConsumeCode { .. } => {}
+                // Hosted mode only; the drill runs self mode.
+                Output::Hold { .. } | Output::Pause { .. } | Output::Resume { .. } => {}
             }
         }
     }

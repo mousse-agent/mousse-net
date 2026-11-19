@@ -221,6 +221,8 @@ impl Shared {
                 Output::Drop { fingerprint } => {
                     self.persist(|l| l.authorized.retain(|k| k.fingerprint != fingerprint))
                 }
+                // Hosted mode only; a self-hosted relay never sees them.
+                Output::Hold { .. } | Output::Pause { .. } | Output::Resume { .. } => {}
                 Output::ConsumeCode { hash } => {
                     self.persist(|l| l.codes.retain(|c| c.hash != hash))
                 }
