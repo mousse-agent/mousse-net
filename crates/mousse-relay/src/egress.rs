@@ -52,7 +52,12 @@ impl Egress {
                 let elapsed = now.duration_since(s.last).as_secs_f64();
                 s.tokens = (s.tokens + elapsed * self.rate).min(self.rate);
                 s.last = now;
-                if !interactive && s.interactive_waiting > 0 {
+                // Must-fail control (phase4.relay-leases `fifo-egress`):
+                // bulk does not wait for interactive writes.
+                if !interactive
+                    && s.interactive_waiting > 0
+                    && !cfg!(mousse_control = "fifo-egress")
+                {
                     None
                 } else if s.tokens > 0.0 {
                     // A message may take the bucket below zero; the next

@@ -17,23 +17,21 @@ title = "Hosted relay: leases, sequences, aggregate rates, splitting, pause, rel
 plan = "docs/phase34-design.md G.2 phase4.relay-leases; A.9 duties; B.10"
 targets = ["linux-x64", "macos-arm64"]
 judge = "cargo-test"
-min_tests = 60
-# Today this runs the hosted state machine and the relay's link to Plus
-# against the test issuer stand-in. The relay-level cases (circuits through
-# a pause with the peer session alive, interactive written before bulk)
-# join when the relay itself (E-R2) lands; until then it is a placeholder.
-placeholder = "the relay-level cases need the relay itself (E-R2)"
+min_tests = 280
+# The hosted state machine, the relay machine in hosted mode, the relay's
+# link to Plus and `mousse-relay run --hosted` over loopback, all against
+# the test issuer stand-in (to be replaced by the Plus team's double, P8).
 device_steps = "on that machine: mousse-check run phase4.relay-leases --sign-with <key>, then the same with --control"
 
 [[check.local]]
 target = "linux-x64"
 host = "linux-x86_64"
-command = ["cargo", "test", "-p", "mousse-net-core", "-p", "mousse-relay-plus", "--no-fail-fast"]
+command = ["cargo", "test", "-p", "mousse-net-core", "-p", "mousse-relay-plus", "-p", "mousse-relay", "--no-fail-fast"]
 
 [[check.local]]
 target = "macos-arm64"
 host = "macos-aarch64"
-command = ["cargo", "test", "-p", "mousse-net-core", "-p", "mousse-relay-plus", "--no-fail-fast"]
+command = ["cargo", "test", "-p", "mousse-net-core", "-p", "mousse-relay-plus", "-p", "mousse-relay", "--no-fail-fast"]
 
 [[check.control]]
 name = "per-socket-rate"
@@ -43,7 +41,12 @@ env = { RUSTFLAGS = '--cfg mousse_control="per-socket-rate"' }
 [[check.control]]
 name = "fifo-egress"
 breaks = "the relay's shared egress writes in arrival order instead of interactive before bulk"
-missing = "the shared egress comes with the relay itself (E-R2), which has not landed"
+env = { RUSTFLAGS = '--cfg mousse_control="fifo-egress"' }
+
+[[check.control]]
+name = "relay-clock-pauses-in-sleep"
+breaks = "the relay's monotonic time stops while the machine sleeps, so a lease outlives its expiry on the Plus clock after a suspend"
+env = { RUSTFLAGS = '--cfg mousse_control="relay-clock-pauses-in-sleep"' }
 
 [[check.control]]
 name = "accept-replayed-lease"
