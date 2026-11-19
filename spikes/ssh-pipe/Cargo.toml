@@ -1,0 +1,21 @@
+[package]
+name = "ssh-pipe"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+rust-version = "1.96"
+description = "Phase 1b spike S1: the system OpenSSH client through the constrained config, against a russh test server."
+
+# Its own workspace: the engine workspace excludes spikes/.
+[workspace]
+
+[dependencies]
+russh = { version = "=0.65.2", default-features = false, features = ["aws-lc-rs"] }
+tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "process", "sync", "time"] }
+rand = "=0.10.3"
+# Only to turn on prebuilt NASM objects on Windows (as spikes/tls-matrix does).
+aws-lc-rs = { version = "=1.19.0", default-features = false, features = ["aws-lc-sys", "prebuilt-nasm"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization"] }

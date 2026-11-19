@@ -127,12 +127,20 @@ fn repo(name: &str, with_weak_check: bool) -> Repo {
 }
 
 fn run(dir: &Path, args: &[&str]) -> Output {
-    Command::new(BIN)
-        .args(args)
+    run_with(dir, args, None)
+}
+
+/// `run` with `MOUSSE_APP_DIR` set to `app_dir`, or unset.
+fn run_with(dir: &Path, args: &[&str], app_dir: Option<&Path>) -> Output {
+    let mut cmd = Command::new(BIN);
+    cmd.args(args)
         .current_dir(dir)
         .env_remove("CARGO_TARGET_DIR")
-        .output()
-        .expect("mousse-check runs")
+        .env_remove("MOUSSE_APP_DIR");
+    if let Some(a) = app_dir {
+        cmd.env("MOUSSE_APP_DIR", a);
+    }
+    cmd.output().expect("mousse-check runs")
 }
 
 fn text(o: &Output) -> String {
@@ -418,4 +426,306 @@ fn attestations_on_automated_checks_do_not_pass() {
     let out = text(&o);
     assert_eq!(o.status.code(), Some(1), "{out}");
     assert!(row(&out, "phase9.device").contains("ATTESTED"), "{out}");
+}
+
+// --- App checks ---
+
+/// An app check whose probe prints the app checkout's commit as
+/// `app_build=`, the way the app's check script does.
+fn app_check(h: &str) -> String {
+    let cmd = if cfg!(windows) {
+        "[\"cmd\", \"/C\", '{root}\\app_probe.cmd', \"phase9.app\"]".to_string()
+    } else {
+        "[\"sh\", \"app_probe.sh\", \"phase9.app\"]".to_string()
+    };
+    format!(
+        r#"
+[[check]]
+id = "phase9.app"
+title = "an app check"
+plan = "test"
+targets = ["here"]
+judge = "marker"
+app = true
+[[check.local]]
+target = "here"
+host = "{h}"
+command = {cmd}
+[[check.control]]
+name = "break"
+breaks = "everything"
+env = {{ PROBE_MODE = "break" }}
+"#
+    )
+}
+
+/// A throwaway app checkout with one commit. Returns it and its commit.
+fn app_checkout(name: &str) -> (Repo, String) {
+    let dir = std::env::temp_dir().join(format!(
+        "mousse-check-cli-{}-{name}-app",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("README"), "the app\n").unwrap();
+    git(&dir, &["init", "-q"]);
+    git(&dir, &["config", "user.name", "Tester"]);
+    git(&dir, &["config", "user.email", "tester@example.invalid"]);
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-q", "-m", "app"]);
+    let rev = head(&dir);
+    (Repo { dir }, rev)
+}
+
+fn head(dir: &Path) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[test]
+fn app_checks_run_only_against_a_clean_app_checkout_at_the_pinned_revision() {
+    let r = repo("app", false);
+    let d = &r.dir;
+    let (app, rev) = app_checkout("app");
+    let manifest =
+        std::fs::read_to_string(d.join("checks/phase9.toml")).unwrap() + &app_check(&host());
+    std::fs::write(d.join("checks/phase9.toml"), manifest).unwrap();
+    std::fs::write(
+        d.join("app_probe.cmd"),
+        "@echo off\r\nfor /f %%i in ('git -C \"%MOUSSE_APP_DIR%\" rev-parse HEAD') do echo app_build=%%i\r\nif \"%PROBE_MODE%\"==\"break\" (echo FAIL %1& exit /b 1)\r\necho PASS %1\r\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d.join("app_probe.sh"),
+        "echo \"app_build=$(git -C \"$MOUSSE_APP_DIR\" rev-parse HEAD)\"\nif [ \"$PROBE_MODE\" = break ]; then echo \"FAIL $1\"; exit 1; fi\necho \"PASS $1\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(d.join("app")).unwrap();
+    std::fs::write(d.join("app/MOUSSE_REVISION"), format!("{rev}\n")).unwrap();
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-q", "-m", "an app check"]);
+    let record = d.join("checks/runs/phase9.app__here__normal.json");
+    let only = ["phase9", "--only", "phase9.app"];
+
+    // No app checkout named: not run.
+    let o = run_with(d, &only, None);
+    let out = text(&o);
+    assert!(out.contains("MOUSSE_APP_DIR"), "{out}");
+    assert!(row(&out, "phase9.app").contains("INCOMPLETE"), "{out}");
+    assert!(!record.exists());
+
+    // A dirty app checkout: not run.
+    std::fs::write(app.dir.join("scratch.txt"), "local change\n").unwrap();
+    let o = run_with(d, &only, Some(&app.dir));
+    let out = text(&o);
+    assert!(out.contains("uncommitted"), "{out}");
+    assert!(!record.exists(), "{out}");
+    std::fs::remove_file(app.dir.join("scratch.txt")).unwrap();
+
+    // An app checkout at another revision: not run.
+    std::fs::write(app.dir.join("README"), "the app, later\n").unwrap();
+    git(&app.dir, &["commit", "-q", "-am", "later"]);
+    let o = run_with(d, &only, Some(&app.dir));
+    let out = text(&o);
+    assert!(out.contains("pins"), "{out}");
+    assert!(!record.exists(), "{out}");
+
+    // Clean, at the pinned revision: runs, records the app build, passes.
+    git(&app.dir, &["checkout", "-q", &rev]);
+    let o = run_with(d, &only, Some(&app.dir));
+    let out = text(&o);
+    assert!(row(&out, "phase9.app").contains("PASS"), "{out}");
+    let rec: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap();
+    assert_eq!(rec["app_build"], serde_json::Value::String(rev.clone()));
+
+    // Results signed from a run keep the app build where the kit reads it.
+    let o = run(d, &["device", "keygen", "--out", "pc.key"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let signed = d.with_extension("signed");
+    let o = run_with(
+        d,
+        &[
+            "run",
+            "phase9.app",
+            "--sign-with",
+            "pc.key",
+            "--device",
+            "pc",
+            "--out",
+            signed.to_str().unwrap(),
+        ],
+        Some(&app.dir),
+    );
+    assert!(o.status.success(), "{}", text(&o));
+    let file = std::fs::read_dir(&signed)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let s: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    let payload: serde_json::Value = serde_json::from_str(s["payload"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        payload["extra"]["app_build"],
+        serde_json::Value::String(rev)
+    );
+    let _ = std::fs::remove_dir_all(&signed);
+
+    // A control's environment, for runs made outside the kit.
+    let o = run(d, &["control-env", "phase9.app", "--control", "break"]);
+    assert_eq!(
+        String::from_utf8_lossy(&o.stdout).trim(),
+        "{\"PROBE_MODE\":\"break\"}"
+    );
+}
+
+#[test]
+fn a_signed_app_result_counts_only_with_the_pinned_app_build() {
+    let r = repo("app-device", false);
+    let d = &r.dir;
+    let rev = "8789ae66461fc994b4e19164d2ac8a721ee1a748";
+    let path = d.join("checks/phase9.toml");
+    let m = std::fs::read_to_string(&path).unwrap().replacen(
+        "targets = [\"phone\"]\n",
+        "targets = [\"phone\"]\napp = true\n",
+        1,
+    );
+    std::fs::write(&path, m).unwrap();
+    std::fs::create_dir_all(d.join("app")).unwrap();
+    std::fs::write(d.join("app/MOUSSE_REVISION"), format!("{rev}\n")).unwrap();
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-q", "-m", "the device check runs the app"]);
+    trust_phone(d);
+    // The phone's normal and control results, naming `app_build`. Returns
+    // what `sign` printed.
+    let sign_both = |app_build: &str| -> String {
+        let mut said = String::new();
+        for (control, outcome) in [(None, "PASS"), (Some("break"), "FAIL")] {
+            let mut args = vec!["phase9.device"];
+            if let Some(c) = control {
+                args.extend(["--control", c]);
+            }
+            let file = d.with_extension(format!("{outcome}.json"));
+            let v = serde_json::json!({
+                "check": "phase9.device", "target": "phone", "outcome": outcome,
+                "details": "probe", "config": digest(d, &args), "app_build": app_build,
+                "control": control,
+            });
+            std::fs::write(&file, v.to_string()).unwrap();
+            let o = sign(d, &[file.to_str().unwrap()]);
+            assert!(o.status.success(), "{}", text(&o));
+            std::fs::remove_file(&file).unwrap();
+            said.push_str(&text(&o));
+        }
+        said
+    };
+    // Another app build: signed with a note, and it does not count.
+    let said = sign_both(&"1".repeat(40));
+    assert!(said.contains("will not count"), "{said}");
+    let o = run(d, &["report", "phase9", "--full"]);
+    let out = text(&o);
+    assert!(row(&out, "phase9.device").contains("INCOMPLETE"), "{out}");
+    // The pinned app build: PASS.
+    let said = sign_both(rev);
+    assert!(!said.contains("will not count"), "{said}");
+    let o = run(d, &["report", "phase9", "--full"]);
+    let out = text(&o);
+    assert!(row(&out, "phase9.device").contains("PASS"), "{out}");
+}
+
+/// A check with named cases: the probe gets the case as its second
+/// argument and in `MOUSSE_CHECK_CASE`, and fails a case whose two disagree.
+fn add_route_check(d: &Path) {
+    std::fs::write(
+        d.join("route.cmd"),
+        "@echo off\r\nif not \"%MOUSSE_CHECK_CASE%\"==\"%2\" (echo FAIL %1 reason=wrong_case& exit /b 1)\r\nif \"%PROBE_MODE%\"==\"break\" (echo FAIL %1 reason=route_mismatch& exit /b 1)\r\necho ran %2>> \"%ROUTE_LOG%\"\r\necho PASS %1\r\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d.join("route.sh"),
+        "if [ \"$MOUSSE_CHECK_CASE\" != \"$2\" ]; then echo \"FAIL $1 reason=wrong_case\"; exit 1; fi\nif [ \"$PROBE_MODE\" = break ]; then echo \"FAIL $1 reason=route_mismatch\"; exit 1; fi\necho \"ran $2\" >> \"$ROUTE_LOG\"\necho \"PASS $1\"\n",
+    )
+    .unwrap();
+    let cmd = if cfg!(windows) {
+        "[\"cmd\", \"/C\", '{root}\\route.cmd', \"phase9.routes\", \"{case}\"]".to_string()
+    } else {
+        "[\"sh\", \"route.sh\", \"phase9.routes\", \"{case}\"]".to_string()
+    };
+    let check = format!(
+        r#"
+[[check]]
+id = "phase9.routes"
+title = "one result per route"
+plan = "test"
+targets = ["here"]
+judge = "marker"
+cases = ["tcp", "ws", "ssh"]
+waits = [{{ slice = "E9", paths = ["ssh.rs"], case = "ssh" }}]
+[[check.local]]
+target = "here"
+host = "{h}"
+command = {cmd}
+env = {{ ROUTE_LOG = "{{root}}/route.log" }}
+[[check.control]]
+name = "leak"
+breaks = "another route wins"
+env = {{ PROBE_MODE = "break" }}
+expect_reason = "route_mismatch"
+"#,
+        h = host()
+    );
+    let path = d.join("checks/phase9.toml");
+    let m = std::fs::read_to_string(&path).unwrap() + &check;
+    std::fs::write(&path, m).unwrap();
+    std::fs::write(d.join(".gitignore"), "route.log\n").unwrap();
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-q", "-m", "a check with routes"]);
+}
+
+#[test]
+fn each_case_runs_on_its_own_and_a_waiting_case_keeps_the_check_incomplete() {
+    let r = repo("cases", false);
+    let d = &r.dir;
+    add_route_check(d);
+    let o = run(d, &["run", "phase9.routes"]);
+    let out = text(&o);
+    assert!(o.status.success(), "{out}");
+    assert!(out.contains("[ssh]: not run: waits for E9"), "{out}");
+    let o = run(d, &["run", "phase9.routes", "--control"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let ran = std::fs::read_to_string(d.join("route.log")).unwrap();
+    let ran: Vec<&str> = ran.lines().map(str::trim).collect();
+    assert_eq!(ran, ["ran tcp", "ran ws"], "the control runs print nothing");
+    let o = run(d, &["report", "phase9", "--full"]);
+    let out = text(&o);
+    let line = row(&out, "phase9.routes");
+    assert!(line.contains("INCOMPLETE"), "{out}");
+    assert!(out.contains("[ssh] waits for E9"), "{out}");
+
+    // The slice lands: the ssh case runs, and the check passes.
+    std::fs::write(d.join("ssh.rs"), "// E9\n").unwrap();
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-q", "-m", "E9 lands"]);
+    let o = run(d, &["run", "phase9.routes", "--case", "ssh"]);
+    assert!(o.status.success(), "{}", text(&o));
+    // Runs for the earlier commit are for another build.
+    let o = run(d, &["report", "phase9", "--full"]);
+    assert!(row(&text(&o), "phase9.routes").contains("INCOMPLETE"));
+    let o = run(d, &["run", "phase9.routes"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let o = run(d, &["run", "phase9.routes", "--control"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let o = run(d, &["report", "phase9", "--full"]);
+    let out = text(&o);
+    assert!(row(&out, "phase9.routes").contains("PASS"), "{out}");
+    let o = run(d, &["run", "phase9.routes", "--case", "udp"]);
+    assert!(!o.status.success());
+    assert!(text(&o).contains("no case udp"), "{}", text(&o));
 }

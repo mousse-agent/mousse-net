@@ -4,10 +4,9 @@
 # Owner check: `mousse-check phase3` shows PASS in every target cell and no
 # INCOMPLETE. Format: checks/README.md.
 #
-# This file holds the relay engine's checks (E-R0, E-R1, E-R2, E-R7). The
-# helper and release slices add theirs (phase3.relay-routes,
-# phase3.relay-rotation, phase3.headless, phase3.reproducible,
-# phase3.install, phase3.vps-demo, phase3.outside-template) when they land.
+# The relay engine's checks (E-R0, E-R1, E-R2, E-R7), the headless daemon's
+# (E-R5) and the release checks (E-R6). The helper's relay client adds its own
+# (phase3.relay-routes, phase3.relay-rotation, phase3.vps-demo) when it lands.
 
 phase = "phase3"
 title = "Self-hosted relay"
@@ -186,6 +185,97 @@ name = "marker-in-relay-memory"
 breaks = "memory positive control: the relay copies the marker into its heap, so the memory sample must find it"
 env = { RUSTFLAGS = '--cfg mousse_control="marker-in-relay-memory"' }
 expect_reason = "memory"
+
+# ---------------------------------------------------------------------------
+# Headless daemon (E-R5; docs/headless.md)
+
+[[check]]
+id = "phase3.headless"
+title = "serve --headless makes its endpoint with an owner-only key file; a second process for the same endpoint refuses to start while another profile's endpoint starts; the terminal QR code pairs a device; the shipped systemd unit starts the daemon"
+plan = "design §B.13; Part G.1; PLAN Phase 3 exit (a second profile's endpoint starts)"
+targets = ["linux-x64", "macos-arm64"]
+judge = "cargo-test"
+min_tests = 5
+device_steps = "on that machine: mousse-check run phase3.headless --sign-with <key>, then the same with --control no-endpoint-lock"
+
+[[check.local]]
+target = "linux-x64"
+host = "linux-x86_64"
+command = ["cargo", "test", "-p", "mousse-helper", "--features", "test-in-person", "--test", "headless", "--no-fail-fast"]
+
+[[check.local]]
+target = "macos-arm64"
+host = "macos-aarch64"
+command = ["cargo", "test", "-p", "mousse-helper", "--features", "test-in-person", "--test", "headless", "--no-fail-fast"]
+
+[[check.control]]
+name = "no-endpoint-lock"
+breaks = "the endpoint takes no lock, so a second process runs the same endpoint"
+env = { RUSTFLAGS = '--cfg mousse_control="no-endpoint-lock"' }
+
+# ---------------------------------------------------------------------------
+# Releases, install and the template (E-R6; docs/release.md)
+#
+# Both run on any machine with Docker: the PC's Docker Desktop (only on an
+# --internal network), or a Linux host. They need git, cargo (to vendor the
+# crates once per Cargo.lock) and node; the minisign release tool and the
+# Ubuntu cloud image are fetched once by pinned hash.
+
+[[check]]
+id = "phase3.reproducible"
+title = "Two independent builds of the relay give the same hash; the minisign signature verifies; install.sh refuses an unsigned, tampered, re-signed or replayed download"
+plan = "design §B.15 \"Reproducible builds\" and \"Signed\"; Part G.1"
+targets = ["linux-x64"]
+judge = "marker"
+timeout_secs = 3600
+
+[[check.local]]
+target = "linux-x64"
+host = "windows-x86_64"
+command = ["node", "release/tests/check.mjs", "reproducible", "--out", "{out}"]
+
+[[check.local]]
+target = "linux-x64"
+host = "linux-x86_64"
+command = ["node", "release/tests/check.mjs", "reproducible", "--out", "{out}"]
+
+[[check.control]]
+name = "unsigned-accepted"
+breaks = "install.sh's signature check accepts anything, so an attacker's binary with matching checksums and no signatures is accepted"
+args = ["--control", "unsigned-accepted"]
+expect_reason = "unsigned-accepted"
+
+[[check]]
+id = "phase3.install"
+title = "Fresh Ubuntu cloud image to an enrollment link with install.sh (hardened unit, upgrade keeps the identity) and with the cloud-init template; a tampered download installs nothing; the relay image runs read-only, without a shell, as an unprivileged user, and keeps its identity in its state volume"
+plan = "design §B.15 \"Docker\", \"One-command install\" and \"The template\"; Part G.1"
+targets = ["linux-x64"]
+judge = "marker"
+timeout_secs = 3600
+
+[[check.local]]
+target = "linux-x64"
+host = "windows-x86_64"
+command = ["node", "release/tests/check.mjs", "install", "--out", "{out}"]
+
+[[check.local]]
+target = "linux-x64"
+host = "linux-x86_64"
+command = ["node", "release/tests/check.mjs", "install", "--out", "{out}"]
+
+[[check.control]]
+name = "skip-verify"
+breaks = "install.sh skips the release check, so a tampered download is installed"
+args = ["--control", "skip-verify"]
+expect_reason = "tampered-installed"
+
+[[check]]
+id = "phase3.outside-template"
+title = "An independent tester deploys the cloud-init template on their own VPS, gets an enrollment link, and upgrades it with the identity kept"
+plan = "PLAN Phase 3 \"the first template\"; design §B.15 \"The template\""
+targets = ["manual"]
+manual = true
+steps = "someone outside the team pastes dist/cloud-init.yaml of a signed release as user data on a VPS of their choice, opens TCP 443, reads the enrollment link from /root/mousse-relay.txt, enrolls an endpoint, then upgrades with `sudo mousse-relay-install --version <next>` and confirms the endpoint still registers without a new link; attest with the tester, the provider, the image and the two versions"
 
 # ---------------------------------------------------------------------------
 # Manual steps.

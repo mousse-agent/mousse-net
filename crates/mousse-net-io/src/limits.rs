@@ -28,12 +28,14 @@ mousse_net_core::define_limits! {
         clock_recheck_ms = "CLOCK_RECHECK_MS": 1_000, [10, 1_000];
         /// How often a write still pending checks the connection deadline.
         deadline_poll_ms = "DEADLINE_POLL_MS": 50, [1, 1_000];
-        /// How long a closing connection may take to send its last frame and shut the pipe down.
+        /// How long a closing connection may take to send its last frame and shut the pipe down, reading and dropping what the peer still sends meanwhile.
         close_linger_ms = "CLOSE_LINGER_MS": 2_000, [100, 30_000];
         /// Queued bytes per stream above which a write waits.
         write_high_water_bytes = "WRITE_HIGH_WATER_BYTES": 262_144, [16_384, 67_108_864];
         /// Bytes read from the pipe at a time.
         read_buffer_bytes = "READ_BUFFER_BYTES": 32_768, [1_024, 1_048_576];
+        /// Size of the buffers received DATA frames share until read: a peer's tiny frames fill one buffer instead of an allocation each.
+        rx_chunk_bytes = "RX_CHUNK_BYTES": 16_384, [1_024, 65_536];
         /// How long a TLS handshake may take.
         handshake_timeout_ms = "HANDSHAKE_TIMEOUT_MS": 10_000, [1_000, 60_000];
         /// How long a TCP connect may take.
@@ -44,6 +46,32 @@ mousse_net_core::define_limits! {
         mdns_rotate_ms = "MDNS_ROTATE_MS": 900_000, [60_000, 900_000];
         /// How often the advertiser checks whether the name is due to change.
         mdns_rotate_check_ms = "MDNS_ROTATE_CHECK_MS": 5_000, [100, 30_000];
+        /// Streams one connection may have open, both directions counted; a peer's open beyond it is refused with REFUSED_STREAM. Each holds up to 256 KiB of received data before it is read (wire.md 9.2; at most the spec's 1 024).
+        streams_per_connection = "STREAMS_PER_CONNECTION": 32, [1, 1_024];
+        /// Streams all connections of one endpoint (one helper) may have open together, both directions counted; a peer's open beyond it is refused with REFUSED_STREAM.
+        streams_per_endpoint = "STREAMS_PER_ENDPOINT": 128, [1, 1_024];
+        /// Caller: candidate addresses for one host dialled at once (Phase 1a §6).
+        dial_parallel = "DIAL_PARALLEL": 4, [1, 64];
+        /// Caller: how long one candidate address may take to connect and pass step 1 before the next is tried (Phase 1a §6).
+        dial_timeout_ms = "DIAL_TIMEOUT_MS": 2_000, [100, 60_000];
+        /// How long an mDNS browse listens for answers (Phase 1a §6).
+        browse_wait_ms = "BROWSE_WAIT_MS": 1_500, [100, 30_000];
+        /// How long browse results are reused before the next browse (Phase 1a §6; 0 browses every time).
+        browse_cache_ms = "BROWSE_CACHE_MS": 60_000, [0, 3_600_000];
+        /// How often the network watcher lists the interfaces and reads the monotonic clock (Phase 1a §6 and §8).
+        iface_poll_ms = "IFACE_POLL_MS": 5_000, [100, 60_000];
+        /// How far the monotonic clock may run past one watcher poll before the gap counts as a sleep and wake (Phase 1a §8).
+        wake_jump_ms = "WAKE_JUMP_MS": 10_000, [1_000, 600_000];
+        /// After a wake or an interface change, how long each connection has to answer a PING before it is closed as dead (Phase 1a §8).
+        wake_ping_ms = "WAKE_PING_MS": 2_000, [100, 30_000];
+        /// Host: TCP connections not yet live (from accept, before any read, until live or closed), per endpoint; one more is closed at accept (Phase 1b §6.2; tighten only).
+        preauth_tcp = "PREAUTH_TCP": 48, [1, 48];
+        /// Host: `ws` connections not yet live, per endpoint (Phase 1b §6.2; tighten only).
+        preauth_ws = "PREAUTH_WS": 16, [1, 16];
+        /// Host: pipe connections (an SSH login's `mousse-helper pipe`) not yet live, per endpoint (Phase 1b §6.2; tighten only).
+        preauth_pipe = "PREAUTH_PIPE": 4, [1, 4];
+        /// Host: of the TCP ones, connections from one IPv4 address or one IPv6 /64 (Phase 1b §6.2; tighten only).
+        preauth_per_source = "PREAUTH_PER_SOURCE": 8, [1, 8];
     }
     agree(io) {
         if io.outcome_retry_max_ms < io.outcome_retry_first_ms {
@@ -148,6 +176,10 @@ mod tests {
         // wire.md 6: a connection closes in the first second after its
         // deadline, so the clocks are read at least once a second.
         assert_eq!(d.clock_recheck_ms(), 1_000);
+        // Phase 1a §2.2: 32 streams a connection and 128 an endpoint keep
+        // initial credit at 8 MiB a connection and 32 MiB an endpoint.
+        assert_eq!(d.streams_per_connection(), 32);
+        assert_eq!(d.streams_per_endpoint(), 128);
         assert_eq!(Limits::DEFAULT.with_overrides(&[]), Ok(Limits::DEFAULT));
         assert_eq!(Limits::default(), Limits::DEFAULT);
     }

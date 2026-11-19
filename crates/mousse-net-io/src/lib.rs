@@ -16,10 +16,12 @@
 //!   locks, kept port and profile id.
 //! - [`keystore`] and [`store`]: the identity key and the local state files.
 //! - [`discovery`]: mDNS with a rotating random instance name.
+//! - [`watch`]: interface changes and wakes, for the caller to redial.
 //! - [`limits`]: every limit, its default and allowed range.
 // Only `private` (the Windows security calls) may use unsafe code.
 #![deny(unsafe_code)]
 
+pub mod admission;
 pub mod caller;
 pub mod certs;
 pub mod clock;
@@ -31,18 +33,22 @@ pub mod host;
 pub mod keystore;
 pub mod limits;
 pub mod pipe;
+pub mod preauth;
 pub mod private;
 pub mod rng;
 pub mod store;
 pub mod tls;
+pub mod watch;
 
+pub use admission::StreamAdmission;
 pub use caller::{Caller, CodeEntry, JoinOutcome, NoCode, PathEvent, Step1Failures};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use conn::{CloseReason, ConnStatus, Connection, MuxStream, StreamReader, StreamWriter};
 pub use endpoint::{Endpoint, PortChoice};
 pub use error::NetError;
-pub use host::{ApprovalRequest, Host, HostConfig, HostEvent};
+pub use host::{ApprovalRequest, Host, HostConfig, HostEvent, Refusal};
 pub use limits::Limits;
+pub use preauth::{ListenerKind, PreAuthSlot, PreAuthStats};
 pub use tls::TlsPolicy;
 
 use std::sync::Arc;
@@ -58,7 +64,19 @@ pub type SharedSigner = Arc<dyn IdentitySigner + Send + Sync>;
         mousse_control = "skip-pin-check",
         mousse_control = "keep-removed-grant",
         mousse_control = "shared-endpoint-state",
-        mousse_control = "allow-break-env"
+        mousse_control = "allow-break-env",
+        mousse_control = "no-stream-cap",
+        mousse_control = "stop-on-mismatch",
+        mousse_control = "no-preauth-budget",
+        mousse_control = "shared-preauth-pool",
+        mousse_control = "join-only-frees-slot",
+        mousse_control = "join-only-outlives-invitation",
+        mousse_control = "fence-at-accept-only",
+        mousse_control = "fence-tcp-only",
+        mousse_control = "enroll-while-paused",
+        mousse_control = "repair-skips-slot",
+        mousse_control = "repair-skips-fence",
+        mousse_control = "no-endpoint-lock"
     )
 ))]
 compile_error!("a mousse_control build has a deliberate defect and is for tests only; build it without --release");
@@ -69,7 +87,19 @@ compile_error!("a mousse_control build has a deliberate defect and is for tests 
     mousse_control = "skip-pin-check",
     mousse_control = "keep-removed-grant",
     mousse_control = "shared-endpoint-state",
-    mousse_control = "allow-break-env"
+    mousse_control = "allow-break-env",
+    mousse_control = "no-stream-cap",
+    mousse_control = "stop-on-mismatch",
+    mousse_control = "no-preauth-budget",
+    mousse_control = "shared-preauth-pool",
+    mousse_control = "join-only-frees-slot",
+    mousse_control = "join-only-outlives-invitation",
+    mousse_control = "fence-at-accept-only",
+    mousse_control = "fence-tcp-only",
+    mousse_control = "enroll-while-paused",
+    mousse_control = "repair-skips-slot",
+    mousse_control = "repair-skips-fence",
+    mousse_control = "no-endpoint-lock"
 ))]
 const _: () = {
     let profile = env!("MOUSSE_BUILD_PROFILE").as_bytes();
@@ -94,6 +124,28 @@ pub const CONTROL: Option<&str> = if cfg!(mousse_control = "skip-pin-check") {
     Some("shared-endpoint-state")
 } else if cfg!(mousse_control = "allow-break-env") {
     Some("allow-break-env")
+} else if cfg!(mousse_control = "no-stream-cap") {
+    Some("no-stream-cap")
+} else if cfg!(mousse_control = "no-preauth-budget") {
+    Some("no-preauth-budget")
+} else if cfg!(mousse_control = "shared-preauth-pool") {
+    Some("shared-preauth-pool")
+} else if cfg!(mousse_control = "join-only-frees-slot") {
+    Some("join-only-frees-slot")
+} else if cfg!(mousse_control = "join-only-outlives-invitation") {
+    Some("join-only-outlives-invitation")
+} else if cfg!(mousse_control = "fence-at-accept-only") {
+    Some("fence-at-accept-only")
+} else if cfg!(mousse_control = "fence-tcp-only") {
+    Some("fence-tcp-only")
+} else if cfg!(mousse_control = "no-endpoint-lock") {
+    Some("no-endpoint-lock")
+} else if cfg!(mousse_control = "enroll-while-paused") {
+    Some("enroll-while-paused")
+} else if cfg!(mousse_control = "repair-skips-slot") {
+    Some("repair-skips-slot")
+} else if cfg!(mousse_control = "repair-skips-fence") {
+    Some("repair-skips-fence")
 } else {
     None
 };

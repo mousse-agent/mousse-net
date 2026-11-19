@@ -24,7 +24,7 @@ The phase passes when every cell is PASS, an allowed DEFERRED, or an ATTESTED ma
 
 `<commit>[-dirty]+<profile>`. The commit is the last one that changed anything outside `checks/`, so committing results, attestations, manifests or the device list does not make results stale. Any other change, including a new commit to the code, needs fresh results.
 
-Evidence must also match the check's current configuration. Every local run record and signed result carries `config`, a SHA-256 digest of what decides what the run proves: the judge, `min_tests`, the markers, the profile, the matrix cases, the target's `[[check.local]]` commands (`command`, `cwd`, `env`) and, for a control, its `command`, `args`, `env` and `expect_reason`. A committed change to any of these makes that check's old results INCOMPLETE until it runs again. `title`, `plan`, `breaks` and `device_steps` are descriptions and do not count. Uncommitted changes outside `checks/results/` and `checks/runs/` make the tree dirty; no cell passes on a dirty tree without `--allow-dirty` (shown in the table and the verdict).
+Evidence must also match the check's current configuration. Every local run record and signed result carries `config`, a SHA-256 digest of what decides what the run proves: the judge, `min_tests`, the markers, the profile, the matrix cases, whether it is an app check, the target's `[[check.local]]` commands (`command`, `cwd`, `env`) and, for a control, its `command`, `args`, `env` and `expect_reason`. A committed change to any of these makes that check's old results INCOMPLETE until it runs again. `title`, `plan`, `breaks` and `device_steps` are descriptions and do not count. Uncommitted changes outside `checks/results/` and `checks/runs/` make the tree dirty; no cell passes on a dirty tree without `--allow-dirty` (shown in the table and the verdict).
 
 ## Manifests (`<phase>.toml`)
 
@@ -42,11 +42,14 @@ Each `[[check]]`:
 | `pass_marker`, `fail_marker` | default `PASS <id>` / `FAIL <id>`; must be a whole line |
 | `profile` | profile results must carry. A local run records the profile its command actually builds with, read from the cargo command (`--release`, `-r`, `--profile <name>`; none means `debug`; `unknown` for a command that is not `cargo build`, `run`, `test` or `bench`). With `profile` set, every local command and control must be a cargo command with that profile, or the manifest is refused |
 | `cross_machine` | one machine dials another: each result must name the host's build in `extra.host_build`, and both builds must be the build under test |
+| `app` | an app check: runs the Mousse app at the revision pinned in `app/MOUSSE_REVISION` (see "App checks") |
 | `placeholder` | not wired yet: cells are INCOMPLETE and the phase run skips it (`run` still runs it) |
 | `deferred` | deferred; only counts if `[defer]` lists it |
 | `manual`, `steps` | a manual step; cells can only be ATTESTED |
 | `device_steps` | how a device produces its result, shown while the cell is INCOMPLETE |
 | `timeout_secs` | per run, default 3600 |
+| `cases` | named cases, such as routes (`["tcp", "ws", "ssh"]`). Each case is its own run and its own result; the cell passes only when every case passes, and every control must fail in every case. Not with `[check.matrix]` or `manual`. Each local command (or its `env`) must name `{case}`; the kit also sets `MOUSSE_CHECK_CASE` |
+| `[[check.waits]]` | `slice`, `paths` (relative to the root) and optional `case`. Until every path exists, the check (or only that case) is INCOMPLETE with "waits for <slice>" and is not run. Lets a check land before the engine slice it tests. Waits do not count in `config` |
 | `[[check.local]]` | `target`, `host` (`windows-x86_64`, `macos-aarch64`, `linux-x86_64`, ...), `command`, optional `cwd`, `env`, `placeholder`. Runs when the kit is on that host. `{root}`, `{out}` (a fresh folder per run) and `{build}` are replaced; `MOUSSE_BUILD_ID` is set. |
 | `[[check.control]]` | `name`, `breaks` (what is broken), and `args` (appended), `env` (added) or `command` (replaces). `missing = "reason"` while the control does not exist: the check is FAIL until it does. `expect_reason = "<word>"`: the control must fail for this reason (see below). |
 | `[check.matrix]` | `providers`, `providers_for` (per target), `legacy_results` (unsigned files shown but never counted) |
@@ -67,9 +70,9 @@ A control with `expect_reason` must also show that reason. A local run must prin
 
 Device results are JSON payloads `{check, target, case?, control?, build, platform, outcome, details, time, device, config, extra?}` signed with the device's P-256 key (ECDSA/SHA-256, raw r‖s, over `"mousse-check-result-v1\0" ‖ payload`). The file keeps the exact signed payload text. The kit checks the key is in `devices.toml`, the payload names that device, the device is trusted for that target, the build is the build under test and `config` matches the check's current configuration. The digest is recorded when the result is produced, never when it is signed. `run --sign-with` records it from the run. A device that produces results any other way (the helper's slice check, matrix logs, a phone) first runs `mousse-check config-digest <check> --target <cell> [--control <name>]`, then passes the printed digest as a `config` field in the result file or as `sign --config <digest>`. `sign` refuses a result without one, refuses one `--config` for results from more than one run, and warns when the digest differs from this checkout's manifest (such a result counts only for that configuration).
 
-`sign` also keeps these top-level fields of a result file in `extra`: `reason`, `host_build` and `caller_build` (and `reason` inside an object `details`). For a `cross_machine` check, `build` is the caller's build and `extra.host_build` the host's; both, and `extra.caller_build` if present, must be the build under test. A result without `extra.host_build` does not count.
+`sign` also keeps these top-level fields of a result file in `extra`: `reason`, `host_build`, `caller_build`, `app_build` and `host_app_build` (and `reason` inside an object `details`). For a `cross_machine` check, `build` is the caller's build and `extra.host_build` the host's; both, and `extra.caller_build` if present, must be the build under test. A result without `extra.host_build` does not count.
 
-A cell from devices passes when, for this build, every case (one, or every matrix pair) has a PASS, no result says FAIL, and every control has at least one result and all of them say FAIL. A changed or forged file is listed as TAMPERED and blocks the verdict.
+A cell from devices passes when, for this build, every case (one, every named case, or every matrix pair) has a PASS, no result says FAIL, and every control has at least one result and all of them say FAIL (with named cases: at least one result in each case). A changed or forged file is listed as TAMPERED and blocks the verdict.
 
     # on the device, once
     mousse-check device keygen --out ~/.mousse/device.key
@@ -88,6 +91,34 @@ A cell from devices passes when, for this build, every case (one, or every matri
     mousse-check sign --device-key ~/.mousse/device.key --config <control digest> --control break-pin phone-control.log
 
 Signed files go to `checks/results/<device>/`; commit them.
+
+## App checks
+
+A check with `app = true` runs the Mousse app against the helper built from this checkout. `app/MOUSSE_REVISION` pins the app revision, as one full commit hash. The file is outside `checks/`, so changing the pin changes the build under test.
+
+- The kit runs an app check only if `MOUSSE_APP_DIR` names a clean checkout of the app at that revision. Otherwise it prints why and runs nothing.
+- The run must print `app_build=<commit>[-dirty]`. A local run record keeps it as `app_build`; `run --sign-with` signs it as `extra.app_build`.
+- A record or signed result counts only if its app build is the pinned revision. A dirty app build never counts. Without the pin, every app cell is INCOMPLETE.
+- For a cross-machine app check, the result must also carry `extra.host_app_build`, the host's app build, and it must be the pinned revision too.
+
+`tools/app-check/run.mjs <check> [--out <dir>]` is the local command of the app checks.
+
+1. It builds the debug helper from this checkout with `cargo build -p mousse-helper`, so a control's `RUSTFLAGS` apply.
+2. It runs `node scripts/net-engine-check.mjs <check> --out <dir>` in `MOUSSE_APP_DIR`, with `MOUSSE_NET_HELPER` set to that helper and `MOUSSE_NET_ENGINE_HELPER_BUILD` set to its build.
+3. It prints `helper_build=`, then the app's `app_build=` line and its marker line.
+
+App controls set `MOUSSE_NET_ENGINE_CONTROL`, which only unpackaged app builds read.
+
+A cross-machine app check runs outside the kit on both machines:
+
+    # host (Mac)
+    MOUSSE_APP_DIR=<app checkout> node tools/app-check/run.mjs phase1a.pair-offline --role host
+    # caller (PC)
+    mousse-check config-digest phase1a.pair-offline --target pc-to-mac-lan                      # prints <digest>
+    MOUSSE_APP_DIR=<app checkout> node tools/app-check/run.mjs phase1a.pair-offline --role caller --target pc-to-mac-lan --result r.json
+    mousse-check sign --device-key <key> --config <digest> r.json
+
+With `--control <name>`, `run.mjs` adds that control's environment, which it reads with `mousse-check control-env <check> --control <name>`. Pass the same `--control` to `config-digest` and `sign`. `--role` and `--topology` pass through to the app script. With `--result`, `run.mjs` writes `build` (the helper build) and `app_build`. It also writes `host_build` and `host_app_build` when the app printed `host_build=` and `host_app_build=` lines, which a caller does with the builds its host reported over the test link.
 
 ## Manual steps
 

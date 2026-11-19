@@ -51,6 +51,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 use tokio_rustls::TlsStream;
 
+use crate::admission::{ConnStreams, StreamAdmission, StreamPermit};
 use crate::clock::Clock;
 use crate::error::NetError;
 use crate::limits::{ms, Limits};
@@ -72,6 +73,8 @@ pub(crate) struct DriverLimits {
     recheck: Duration,
     /// Bytes read from the pipe at a time.
     read_buffer: usize,
+    /// Size of the buffers small received DATA frames share.
+    rx_chunk: usize,
 }
 
 impl DriverLimits {
@@ -83,6 +86,7 @@ impl DriverLimits {
             deadline_poll: ms(io.deadline_poll_ms()),
             recheck: ms(io.clock_recheck_ms()),
             read_buffer: usize::try_from(io.read_buffer_bytes()).unwrap_or(usize::MAX),
+            rx_chunk: usize::try_from(io.rx_chunk_bytes()).unwrap_or(usize::MAX),
         }
     }
 }
@@ -237,22 +241,133 @@ pub(crate) enum Cmd {
     Close(ErrorCode),
     Status(ConnStatus),
     Code(PairingCode),
+    /// Answered when the peer's next `PONG` arrives.
+    Ping(oneshot::Sender<()>),
 }
 
-enum StreamEvent {
-    Data(Vec<u8>),
+/// How a stream's receive side ended.
+enum StreamEnd {
     Fin,
     Reset(ErrorCode),
     ConnectionClosed(CloseReason),
 }
 
-/// The receiving half of a stream.
+/// What each receive buffer costs besides its bytes: the vector, its place
+/// in the queue, and the allocator's share.
+const RX_BUFFER_OVERHEAD: u64 = 64;
+
+/// One stream's received bytes, not yet read, and how the stream ended.
+/// Bytes from small DATA frames share a buffer of `RX_CHUNK_BYTES`, so a
+/// peer sending many tiny frames leaves few allocations: what waits costs
+/// at most its bytes twice over plus one buffer, and a buffer's overhead
+/// for every `RX_CHUNK_BYTES`.
+#[derive(Default)]
+struct RxState {
+    chunks: VecDeque<Vec<u8>>,
+    end: Option<StreamEnd>,
+    /// The reader is gone: nothing more is kept.
+    gone: bool,
+}
+
+struct RxQueue {
+    state: std::sync::Mutex<RxState>,
+    ready: tokio::sync::Notify,
+    admission: Arc<StreamAdmission>,
+}
+
+impl RxQueue {
+    fn lock(&self) -> std::sync::MutexGuard<'_, RxState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Keep `bytes` for the reader. False if the reader is gone.
+    fn push(&self, bytes: Vec<u8>, chunk: usize) -> bool {
+        let mut st = self.lock();
+        if st.gone {
+            return false;
+        }
+        let n = bytes.len();
+        let admission = &self.admission;
+        // Counted before the reader can take it.
+        admission.add_queued(n as u64);
+        match st.chunks.back_mut() {
+            Some(last) if last.capacity() - last.len() >= n => last.extend_from_slice(&bytes),
+            _ if n >= chunk => {
+                admission.add_held(bytes.capacity() as u64 + RX_BUFFER_OVERHEAD);
+                st.chunks.push_back(bytes);
+            }
+            _ => {
+                let mut buf = Vec::with_capacity(chunk);
+                buf.extend_from_slice(&bytes);
+                admission.add_held(buf.capacity() as u64 + RX_BUFFER_OVERHEAD);
+                st.chunks.push_back(buf);
+            }
+        }
+        drop(st);
+        self.ready.notify_one();
+        true
+    }
+
+    /// The stream ended; the first end counts.
+    fn end(&self, end: StreamEnd) {
+        let mut st = self.lock();
+        if st.end.is_none() {
+            st.end = Some(end);
+        }
+        drop(st);
+        self.ready.notify_one();
+    }
+
+    /// The reader let go: drop what waits.
+    fn close(&self) {
+        let mut st = self.lock();
+        st.gone = true;
+        for chunk in st.chunks.drain(..) {
+            self.admission.sub_queued(chunk.len() as u64);
+            self.admission
+                .sub_held(chunk.capacity() as u64 + RX_BUFFER_OVERHEAD);
+        }
+    }
+}
+
+/// The driver's end of one stream's receive side. A peer reset is also
+/// posted on `reset`, so a reader that is holding back still learns of it
+/// ([`StreamReader::reset_by_peer`]). Kept until the mux is done with the
+/// stream: after the peer's FIN this side's half may still be open, and a
+/// RESET may follow.
+struct StreamTx {
+    rx: Arc<RxQueue>,
+    reset: watch::Sender<Option<ErrorCode>>,
+    /// The peer finished its half.
+    fin: bool,
+}
+
+impl StreamTx {
+    fn end(&self, end: StreamEnd) {
+        if let StreamEnd::Reset(code) = &end {
+            self.reset.send_replace(Some(*code));
+        }
+        self.rx.end(end);
+    }
+}
+
+/// The receiving half of a stream. It holds the stream's place (see
+/// [`crate::admission`]) until it is dropped.
 pub struct StreamReader {
     id: StreamId,
-    rx: mpsc::UnboundedReceiver<StreamEvent>,
+    rx: Arc<RxQueue>,
     cmd: mpsc::UnboundedSender<Cmd>,
     ended: Option<Result<(), NetError>>,
     closing: watch::Receiver<bool>,
+    _permit: Arc<StreamPermit>,
+    reset: watch::Receiver<Option<ErrorCode>>,
+}
+
+impl Drop for StreamReader {
+    fn drop(&mut self) {
+        // Bytes nobody will read leave the gauges.
+        self.rx.close();
+    }
 }
 
 impl StreamReader {
@@ -266,16 +381,27 @@ impl StreamReader {
                 Err(e) => Err(clone_err(e)),
             };
         }
-        let event = self.rx.recv().await;
-        let result = match event {
-            Some(StreamEvent::Data(bytes)) => {
-                let _ = self.cmd.send(Cmd::Release(self.id, bytes.len() as u64));
-                return Ok(Some(bytes));
+        let result = loop {
+            {
+                let mut st = self.rx.lock();
+                if let Some(bytes) = st.chunks.pop_front() {
+                    drop(st);
+                    let admission = &self.rx.admission;
+                    admission.sub_queued(bytes.len() as u64);
+                    admission.sub_held(bytes.capacity() as u64 + RX_BUFFER_OVERHEAD);
+                    let _ = self.cmd.send(Cmd::Release(self.id, bytes.len() as u64));
+                    return Ok(Some(bytes));
+                }
+                if let Some(end) = st.end.take() {
+                    break match end {
+                        StreamEnd::Fin => Ok(()),
+                        StreamEnd::Reset(code) => Err(NetError::StreamReset(code)),
+                        StreamEnd::ConnectionClosed(reason) => Err(NetError::Closed(reason)),
+                    };
+                }
             }
-            Some(StreamEvent::Fin) => Ok(()),
-            Some(StreamEvent::Reset(code)) => Err(NetError::StreamReset(code)),
-            Some(StreamEvent::ConnectionClosed(reason)) => Err(NetError::Closed(reason)),
-            None => Err(NetError::Closed(CloseReason::PipeClosed)),
+            // One reader: a wake sent before this wait is kept for it.
+            self.rx.ready.notified().await;
         };
         let out = match &result {
             Ok(()) => Ok(None),
@@ -289,6 +415,23 @@ impl StreamReader {
     /// [`StreamWriter::closing`]).
     pub async fn closing(&self) {
         wait_closing(self.closing.clone()).await;
+    }
+
+    /// Wait until the peer resets the stream, and return its code. Unlike
+    /// [`StreamReader::read`], this does not take bytes off the queue, so
+    /// a reader that holds back (for example for want of credit further
+    /// on) still learns of a reset at once. Never returns for a stream that
+    /// ends any other way.
+    pub async fn reset_by_peer(&self) -> ErrorCode {
+        let mut rx = self.reset.clone();
+        let code = match rx.wait_for(Option::is_some).await {
+            Ok(code) => *code,
+            Err(_) => None,
+        };
+        match code {
+            Some(code) => code,
+            None => std::future::pending().await,
+        }
     }
 }
 
@@ -523,6 +666,16 @@ impl Connection {
         self.incoming.lock().await.recv().await
     }
 
+    /// Whether the peer answers a `PING` within `within`: false when it
+    /// does not, or the connection closed first.
+    pub async fn ping(&self, within: Duration) -> bool {
+        let (reply, rx) = oneshot::channel();
+        if self.cmd.send(Cmd::Ping(reply)).is_err() {
+            return false;
+        }
+        matches!(tokio::time::timeout(within, rx).await, Ok(Ok(())))
+    }
+
     /// Close with `code`.
     pub fn close(&self, code: ErrorCode) {
         let _ = self.cmd.send(Cmd::Close(code));
@@ -545,6 +698,8 @@ pub(crate) struct Start<P: Pipe> {
     pub deadline: UnixTime,
     pub clock: Arc<dyn Clock>,
     pub limits: Limits,
+    /// The endpoint's stream places, shared by all its connections.
+    pub streams: Arc<StreamAdmission>,
 }
 
 /// A command sender for a driver that is about to start. The host registers
@@ -575,6 +730,8 @@ pub(crate) fn spawn<P: Pipe>(
     let driver = Driver {
         mux: Mux::with_limits(start.side, start.clock.mono(), start.limits.core()),
         limits: DriverLimits::new(&start.limits),
+        admit: start.streams.connection(),
+        permits: HashMap::new(),
         deadline: Deadline::new(start.deadline, &*start.clock),
         clock: start.clock,
         role,
@@ -583,7 +740,9 @@ pub(crate) fn spawn<P: Pipe>(
         closing: closing_tx,
         accept: accept_tx,
         streams: HashMap::new(),
+        finished: Vec::new(),
         blocked: Vec::new(),
+        pings: Vec::new(),
         hello: HelloState::new(VersionSupport::LOCAL),
         reason: None,
         before_close: VecDeque::new(),
@@ -602,8 +761,18 @@ struct Driver {
     status: watch::Sender<ConnStatus>,
     closing: watch::Sender<bool>,
     accept: mpsc::UnboundedSender<MuxStream>,
-    streams: HashMap<u32, mpsc::UnboundedSender<StreamEvent>>,
+    streams: HashMap<u32, StreamTx>,
+    /// Streams the peer finished whose receive side waits for the mux to
+    /// be done with them.
+    finished: Vec<u32>,
+    /// This connection's stream places.
+    admit: ConnStreams,
+    /// The places of the streams the mux still has. A stream's reader
+    /// holds its place too, so it frees once both are done.
+    permits: HashMap<u32, Arc<StreamPermit>>,
     blocked: Vec<(StreamId, oneshot::Sender<Result<(), NetError>>)>,
+    /// Who waits for the next `PONG`.
+    pings: Vec<oneshot::Sender<()>>,
     /// The peer's `HELLO`s so far.
     hello: HelloState,
     reason: Option<CloseReason>,
@@ -682,6 +851,8 @@ impl Driver {
                 }
             }
             self.release_blocked();
+            self.sweep_permits();
+            self.sweep_finished();
             if self.before_close.is_empty() && self.mux.is_closed() {
                 break;
             }
@@ -734,7 +905,7 @@ impl Driver {
         self.mark_closing();
         let reason = self.reason.clone().unwrap_or(CloseReason::PipeClosed);
         for (_, tx) in self.streams.drain() {
-            let _ = tx.send(StreamEvent::ConnectionClosed(reason.clone()));
+            tx.end(StreamEnd::ConnectionClosed(reason.clone()));
         }
         for (_, reply) in self.blocked.drain(..) {
             let _ = reply.send(Err(NetError::Closed(reason.clone())));
@@ -746,7 +917,13 @@ impl Driver {
         // stopped, so the pipe does not stay open.
         drop(slot);
         drop(ask_rx);
-        if tokio::time::timeout(self.limits.close_linger, &mut writer)
+        // Meanwhile, what the peer still sends is read and dropped until it
+        // closes too, within the same linger. A socket closed with unread
+        // data resets the connection, and the reset can destroy what the
+        // peer has not read yet: the GOAWAY that says why.
+        let drain = async { while matches!(rd.read(&mut buf).await, Ok(n) if n > 0) {} };
+        let linger = async { tokio::join!(&mut writer, drain) };
+        if tokio::time::timeout(self.limits.close_linger, linger)
             .await
             .is_err()
         {
@@ -895,11 +1072,13 @@ impl Driver {
                     ))
                 } else if !self.role.may_open() {
                     Err(NetError::Refused("the connection is not authorized".into()))
-                } else {
+                } else if let Some(permit) = self.admit.try_admit() {
                     self.mux
                         .open_stream(class, &label)
-                        .map(|id| self.new_stream(id, class, label))
+                        .map(|id| self.new_stream(id, class, label, permit))
                         .map_err(stream_err)
+                } else {
+                    Err(NetError::StreamLimit)
                 };
                 let _ = reply.send(result);
             }
@@ -941,7 +1120,54 @@ impl Driver {
                 self.role.on_code(code, &mut out);
                 self.apply(out);
             }
+            Cmd::Ping(reply) => {
+                // Closing: the reply drops, which answers false.
+                if !self.mux.is_closing() {
+                    self.mux.ping();
+                    self.pings.push(reply);
+                }
+            }
         }
+    }
+
+    /// A place for a stream the peer opened, if the caps allow one.
+    fn admit_peer_stream(&self) -> Option<Arc<StreamPermit>> {
+        #[cfg(mousse_control = "no-stream-cap")]
+        {
+            Some(self.admit.admit_anyway())
+        }
+        #[cfg(not(mousse_control = "no-stream-cap"))]
+        {
+            self.admit.try_admit()
+        }
+    }
+
+    /// Let go of the places of streams the mux is done with. Their readers
+    /// may still hold them.
+    fn sweep_permits(&mut self) {
+        if self.permits.is_empty() {
+            return;
+        }
+        let mux = &self.mux;
+        self.permits.retain(|id, _| mux.has_stream(StreamId(*id)));
+    }
+
+    /// Let go of the receive sides of streams the peer finished, once the
+    /// mux is done with them (both halves ended).
+    fn sweep_finished(&mut self) {
+        if self.finished.is_empty() {
+            return;
+        }
+        let (mux, streams) = (&self.mux, &mut self.streams);
+        self.finished.retain(|id| {
+            if mux.has_stream(StreamId(*id)) {
+                return true;
+            }
+            if streams.get(id).is_some_and(|tx| tx.fin) {
+                streams.remove(id);
+            }
+            false
+        });
     }
 
     fn release_blocked(&mut self) {
@@ -969,9 +1195,28 @@ impl Driver {
         self.blocked = still;
     }
 
-    fn new_stream(&mut self, id: StreamId, class: PriorityClass, label: String) -> MuxStream {
-        let (tx, rx) = mpsc::unbounded_channel();
-        self.streams.insert(id.0, tx);
+    fn new_stream(
+        &mut self,
+        id: StreamId,
+        class: PriorityClass,
+        label: String,
+        permit: Arc<StreamPermit>,
+    ) -> MuxStream {
+        let rx = Arc::new(RxQueue {
+            state: std::sync::Mutex::new(RxState::default()),
+            ready: tokio::sync::Notify::new(),
+            admission: self.admit.admission().clone(),
+        });
+        let (reset, reset_rx) = watch::channel(None);
+        self.streams.insert(
+            id.0,
+            StreamTx {
+                rx: rx.clone(),
+                reset,
+                fin: false,
+            },
+        );
+        self.permits.insert(id.0, permit.clone());
         MuxStream {
             reader: StreamReader {
                 id,
@@ -979,6 +1224,8 @@ impl Driver {
                 cmd: self.cmd_tx.clone(),
                 ended: None,
                 closing: self.closing.subscribe(),
+                _permit: permit,
+                reset: reset_rx,
             },
             writer: StreamWriter {
                 id,
@@ -1067,29 +1314,41 @@ impl Driver {
                 class,
                 label,
             } => {
-                let s = self.new_stream(stream, class, label);
+                // Admission: a stream past either cap is refused before
+                // anything is queued for it (Phase 1a §2.2).
+                let Some(permit) = self.admit_peer_stream() else {
+                    self.admit.refused();
+                    let _ = self.mux.reset(stream, ErrorCode::RefusedStream);
+                    return;
+                };
+                let s = self.new_stream(stream, class, label, permit);
                 if self.accept.send(s).is_err() {
                     self.streams.remove(&stream.0);
                     let _ = self.mux.reset(stream, ErrorCode::RefusedStream);
                 }
             }
             MuxEvent::Data { stream, bytes } => {
+                let chunk = self.limits.rx_chunk;
                 let delivered = self
                     .streams
                     .get(&stream.0)
-                    .is_some_and(|tx| tx.send(StreamEvent::Data(bytes)).is_ok());
+                    .is_some_and(|tx| tx.rx.push(bytes, chunk));
                 if !delivered && self.streams.remove(&stream.0).is_some() {
                     let _ = self.mux.reset(stream, ErrorCode::Cancelled);
                 }
             }
             MuxEvent::Finished { stream } => {
-                if let Some(tx) = self.streams.remove(&stream.0) {
-                    let _ = tx.send(StreamEvent::Fin);
+                // Kept: the peer may still reset the stream while this
+                // side's half is open (see `sweep_finished`).
+                if let Some(tx) = self.streams.get_mut(&stream.0) {
+                    tx.fin = true;
+                    tx.end(StreamEnd::Fin);
+                    self.finished.push(stream.0);
                 }
             }
             MuxEvent::Reset { stream, code } => {
                 if let Some(tx) = self.streams.remove(&stream.0) {
-                    let _ = tx.send(StreamEvent::Reset(code));
+                    tx.end(StreamEnd::Reset(code));
                 }
             }
             MuxEvent::Control(bytes) => {
@@ -1104,7 +1363,11 @@ impl Driver {
                 self.role.on_control(message, &mut out);
                 self.apply(out);
             }
-            MuxEvent::Pong { .. } => {}
+            MuxEvent::Pong { .. } => {
+                for reply in self.pings.drain(..) {
+                    let _ = reply.send(());
+                }
+            }
             MuxEvent::GoAway { code } => {
                 self.reason.get_or_insert(CloseReason::Peer(code));
             }
@@ -1398,6 +1661,14 @@ mod tests {
     /// Our driver (caller side) and a raw peer over TLS on an in-memory
     /// pipe. Our deadline is `deadline_in` seconds from now.
     async fn connected(deadline_in: u64) -> (Connection, Peer, Valve, Arc<ManualClock>) {
+        connected_with(deadline_in, StreamAdmission::new(&Limits::DEFAULT)).await
+    }
+
+    /// [`connected`], counting streams and received bytes in `streams`.
+    async fn connected_with(
+        deadline_in: u64,
+        streams: Arc<StreamAdmission>,
+    ) -> (Connection, Peer, Valve, Arc<ManualClock>) {
         let clock = Arc::new(ManualClock::new());
         let cert = |clock: Arc<ManualClock>| {
             CertManager::new(Arc::new(SoftwareKey::generate(&mut os_rng())), clock)
@@ -1434,6 +1705,7 @@ mod tests {
                 deadline: UnixTime(clock.now().0 + deadline_in),
                 clock: clock.clone(),
                 limits: Limits::DEFAULT,
+                streams,
             },
             Box::new(OpenRole),
             cmd_tx,
@@ -1499,6 +1771,36 @@ mod tests {
                 "wall: {wall}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_ping_is_true_only_when_the_peer_answers_in_time() {
+        let (conn, mut peer, _valve, _clock) = connected(3_600).await;
+        let asked = conn.ping(Duration::from_secs(5));
+        let answer = async {
+            assert!(peer.read_until(|f| matches!(f, Frame::Ping { .. })).await);
+            // Reading the PING queued the PONG.
+            peer.flush().await;
+        };
+        let (answered, ()) = within("the ping", async { tokio::join!(asked, answer) }).await;
+        assert!(answered);
+
+        // The peer reads the next PING and never answers.
+        let asked = conn.ping(Duration::from_millis(200));
+        let ignore = async {
+            assert!(peer.read_until(|f| matches!(f, Frame::Ping { .. })).await);
+        };
+        let (answered, ()) = within("the ping", async { tokio::join!(asked, ignore) }).await;
+        assert!(!answered);
+
+        conn.close(ErrorCode::NoError);
+        assert!(
+            !within(
+                "a ping on a closed connection",
+                conn.ping(Duration::from_secs(5))
+            )
+            .await
+        );
     }
 
     #[tokio::test]
@@ -1675,5 +1977,100 @@ mod tests {
                 .any(|f| matches!(f, Frame::Credit { stream, .. } if *stream == id)),
             "credit after the FIN: {after:?}"
         );
+    }
+
+    /// The peer finishes its half, then resets the stream while this side's
+    /// half is open and idle: the reader still learns of the reset, so
+    /// whoever holds the stream can let it and its credit go.
+    #[tokio::test]
+    async fn a_reset_after_the_peers_fin_reaches_the_reader() {
+        let (conn, mut peer, _valve, _clock) = connected(3_600).await;
+        let mut stream = conn
+            .open_stream(PriorityClass::Interactive, "terminal")
+            .await
+            .unwrap();
+        let id = stream.id();
+        stream.writer.write(b"open").await.unwrap();
+        assert!(
+            within(
+                "the open",
+                peer.read_until(|f| matches!(f, Frame::Data { .. }))
+            )
+            .await
+        );
+        peer.mux.finish(id).unwrap();
+        peer.flush().await;
+        assert_eq!(within("the FIN", stream.reader.read()).await.unwrap(), None);
+        // The driver runs on with the stream half open.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        peer.mux.reset(id, ErrorCode::Cancelled).unwrap();
+        peer.flush().await;
+        assert_eq!(
+            within("the reset", stream.reader.reset_by_peer()).await,
+            ErrorCode::Cancelled
+        );
+    }
+
+    /// A peer splitting its data into one-byte DATA frames while nobody
+    /// reads: the frames share receive buffers, so what waits costs about
+    /// its bytes, not an allocation per frame. Every byte still arrives in
+    /// order.
+    #[tokio::test]
+    async fn tiny_data_frames_share_receive_buffers() {
+        const FRAMES: usize = 100_000;
+        let admission = StreamAdmission::new(&Limits::DEFAULT);
+        let (conn, mut peer, _valve, _clock) = connected_with(3_600, admission.clone()).await;
+        let mut stream = conn
+            .open_stream(PriorityClass::Interactive, "terminal")
+            .await
+            .unwrap();
+        let id = stream.id();
+        stream.writer.write(b"open").await.unwrap();
+        assert!(
+            within(
+                "the open",
+                peer.read_until(|f| matches!(f, Frame::Data { .. }))
+            )
+            .await
+        );
+        let mut wire = Vec::new();
+        for i in 0..FRAMES {
+            peer.mux.send(id, &[i as u8]).unwrap();
+            while let Some(frame) = peer.mux.poll_transmit(Millis(0)) {
+                wire.extend_from_slice(&frame);
+            }
+        }
+        peer.tls.write_all(&wire).await.unwrap();
+        peer.tls.flush().await.unwrap();
+        within("every byte queued", async {
+            while admission.queued_bytes() < FRAMES as u64 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+
+        let chunk = Limits::DEFAULT.io().rx_chunk_bytes();
+        let held = admission.held_bytes();
+        let bound = FRAMES as u64 + 2 * chunk;
+        assert!(
+            held <= bound,
+            "{held} bytes held for {FRAMES} bytes, bound {bound}"
+        );
+        assert!(admission.peak_held_bytes() <= bound);
+
+        let mut got = Vec::new();
+        while got.len() < FRAMES {
+            got.extend(
+                within("a read", stream.reader.read())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        let want: Vec<u8> = (0..FRAMES).map(|i| i as u8).collect();
+        assert!(got == want, "the bytes differ");
+        assert_eq!(admission.queued_bytes(), 0);
+        assert_eq!(admission.held_bytes(), 0);
     }
 }

@@ -75,7 +75,7 @@ fn parse_routes(list: &[String]) -> Result<Vec<Route>, String> {
 
 /// Routes from a ticket or the peer store: hints this version cannot use
 /// (unknown or reserved schemes, mDNS names without a browser) are skipped.
-fn usable_routes(hints: &[String]) -> Vec<Route> {
+pub(crate) fn usable_routes(hints: &[String]) -> Vec<Route> {
     hints
         .iter()
         .filter_map(|h| Route::parse(h).ok())
@@ -237,22 +237,63 @@ pub async fn join(
             "no_route",
         ));
     }
-    // A send link may end "already paired" only for a host pinned before.
-    let pinned = side.peers().load().is_ok_and(|ps| {
-        ps.iter()
-            .any(|p| p.pin().ok() == Some(ticket.host_identity))
-    });
     if ticket.kind == InvitationKind::SendLink {
         println!("joining with a link; the code is shown on the host");
     } else {
         println!("joining; the host owner is asked to confirm");
     }
+    let (conn, record, already_paired) = join_routes(
+        &side.caller,
+        &side.peers(),
+        ticket,
+        arrival,
+        name,
+        &candidates,
+        false,
+        &mut TypedCode,
+        |_| {},
+    )
+    .await?;
+    Ok(Joined {
+        conn,
+        record,
+        already_paired,
+    })
+}
+
+/// Pair with the host in `ticket`, trying each of `candidates` in turn.
+/// Stores the host's pin on success and returns the connection, the stored
+/// record and whether the device was already paired (the role this ticket
+/// offered is then not in effect).
+///
+/// `consented`: the app recorded this join before starting it (Phase 1a
+/// §5.1), so the ticket's host counts as pinned and a join past the
+/// ticket's expiry learns whether a lost `PAIRED` enrolled it. Otherwise a
+/// send link may end "already paired" only for a host pinned before.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn join_routes<C: CodeEntry>(
+    caller: &Caller,
+    peers: &PeerStore,
+    ticket: &Ticket,
+    arrival: Arrival,
+    name: &str,
+    candidates: &[Route],
+    consented: bool,
+    codes: &mut C,
+    mut progress: impl FnMut(&str),
+) -> Result<(Connection, PeerRecord, bool), Failure> {
+    let pinned = consented
+        || peers.load().is_ok_and(|ps| {
+            ps.iter()
+                .any(|p| p.pin().ok() == Some(ticket.host_identity))
+        });
     let mut last = Failure::new("no route answered", "unreachable");
     // Any step 1 failure on an address means "try the next one"; one is
     // shown only when no address passed (wire.md 5.4).
     let mut step1 = Step1Failures::default();
-    for route in &candidates {
+    for route in candidates {
         let hint = route_uri(route);
+        progress(&hint);
         let pipe = match connect_tcp_within(route, connect_timeout()).await {
             Ok(p) => p,
             Err(e) => {
@@ -263,23 +304,28 @@ pub async fn join(
         // If the connection drops before PAIRED, the join reconnects here
         // to learn whether the host enrolled this device.
         let redial = || connect_tcp_within(route, connect_timeout());
-        match side
-            .caller
-            .join_with_redial(pipe, ticket, arrival, name, &mut TypedCode, pinned, redial)
-            .await
-        {
+        let joined = if consented {
+            caller
+                .join_pinned_with_redial(pipe, ticket, arrival, name, codes, redial)
+                .await
+        } else {
+            caller
+                .join_with_redial(pipe, ticket, arrival, name, codes, pinned, redial)
+                .await
+        };
+        match joined {
             Ok((conn, outcome)) => {
-                let already_paired = matches!(outcome, JoinOutcome::AlreadyPaired);
+                let already = matches!(outcome, JoinOutcome::AlreadyPaired);
                 // Built from the stored record as it is under the lock, so
                 // a write by another process meanwhile is not undone.
                 let mut stored = None;
-                side.peers()
+                peers
                     .update(|peers| {
                         let existing = peers
                             .iter()
                             .find(|p| p.pin().ok() == Some(ticket.host_identity));
                         let (host_name, role) = match outcome {
-                            JoinOutcome::Paired(host) => (host.name, format!("{:?}", host.role)),
+                            JoinOutcome::Paired(host) => (host.name, host.role.as_str().to_owned()),
                             JoinOutcome::AlreadyPaired => match existing {
                                 Some(p) => (p.name.clone(), p.role.clone()),
                                 None => (short_id(&ticket.host_identity), "unknown".into()),
@@ -291,6 +337,7 @@ pub async fn join(
                             role,
                             routes: ticket.routes.clone(),
                             last_route: Some(hint.clone()),
+                            addresses: existing.map(|p| p.addresses.clone()).unwrap_or_default(),
                             paired_at: now_secs(),
                         };
                         peers.retain(|p| p.pin().ok() != Some(ticket.host_identity));
@@ -300,16 +347,11 @@ pub async fn join(
                     .map_err(|e| Failure::new(e.to_string(), "store"))?;
                 let record = stored.expect("the update ran");
                 // The pin is stored: the join's outcome is no longer pending.
-                side.caller
+                caller
                     .pin_stored(ticket)
                     .map_err(|e| Failure::new(e.to_string(), "store"))?;
-                side.caller
-                    .remember_routes(ticket.host_identity, vec![route.clone()]);
-                return Ok(Joined {
-                    conn,
-                    record,
-                    already_paired,
-                });
+                caller.remember_routes(ticket.host_identity, vec![route.clone()]);
+                return Ok((conn, record, already));
             }
             // Another endpoint at this address: try the next one.
             Err(NetError::PeerCertificate(CertError::PinMismatch)) => {
@@ -798,6 +840,7 @@ mod tests {
             limits: Limits::DEFAULT,
             clock: Arc::new(SystemClock::new()),
             ticket_identity: None,
+            streams: None,
         };
         let key = Arc::new(SoftwareKey::generate(&mut os_rng()));
         let (host, mut events) = Host::new(key, config, CpaceExchangeFactory).unwrap();

@@ -10,9 +10,13 @@
 //! - results from other machines are signed with a per-device P-256 key and
 //!   checked against `checks/devices.toml` and the build under test;
 //! - manual steps are ATTESTED, never PASS; DEFERRED only where the phase
-//!   allows it; a dirty tree never passes without `--allow-dirty`.
+//!   allows it; a dirty tree never passes without `--allow-dirty`;
+//! - app checks (`app = true`) run only against a clean app checkout at the
+//!   revision pinned in `app/MOUSSE_REVISION`, and count only with that app
+//!   build.
 #![forbid(unsafe_code)]
 
+pub mod app;
 pub mod build;
 pub mod eval;
 pub mod evidence;

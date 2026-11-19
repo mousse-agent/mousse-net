@@ -15,7 +15,8 @@
 //!    `[[check.local]]` entry for this machine's host, and only if that entry
 //!    produced them with the check's profile. Every other cell needs signed
 //!    device results. Cross-machine cells also need the host's build to be
-//!    the build under test. Any FAIL, any control that did not fail, printed
+//!    the build under test. App checks also need the app build pinned in
+//!    `app/MOUSSE_REVISION` (and, cross-machine, the host's app build). Any FAIL, any control that did not fail, printed
 //!    no FAIL line or failed for another reason than its `expect_reason` is
 //!    FAIL. Missing parts are INCOMPLETE.
 //! 6. On a dirty tree, PASS becomes INCOMPLETE unless `--allow-dirty`.
@@ -30,6 +31,7 @@ use std::path::PathBuf;
 
 use serde::Serialize;
 
+use crate::app::app_build_counts;
 use crate::build::{check_build, BuildState, Commits};
 use crate::evidence::{Attestation, Evidence, ResultPayload};
 use crate::manifest::{Check, Judge, LocalRun, Manifest};
@@ -111,6 +113,12 @@ pub struct Inputs<'a> {
     pub rejected_paths: &'a [(PathBuf, String, bool)],
     /// Notes about old unsigned results, keyed by (check, target).
     pub legacy: &'a BTreeMap<(String, String), String>,
+    /// The app revision pinned in `app/MOUSSE_REVISION`; `None` if the file
+    /// is missing or unreadable, which leaves every app check INCOMPLETE.
+    pub app_revision: Option<&'a str>,
+    /// Whether a path (relative to the repository root) is in the tree:
+    /// what a check's `waits` look for.
+    pub exists: &'a dyn Fn(&str) -> bool,
 }
 
 struct Outcome {
@@ -313,6 +321,21 @@ fn eval_automated(inp: &Inputs<'_>, check: &Check, target: &str) -> Outcome {
     if let Some(why) = &check.placeholder {
         return out(Status::Incomplete, format!("not wired yet: {why}"));
     }
+    if let Some((w, path)) = check.waiting(None, inp.exists) {
+        return out(
+            Status::Incomplete,
+            format!("waits for {} ({path} is not in this tree)", w.slice),
+        );
+    }
+    if check.app && inp.app_revision.is_none() {
+        return out(
+            Status::Incomplete,
+            format!(
+                "an app check, but {} is missing or not a full commit",
+                crate::app::REVISION_FILE
+            ),
+        );
+    }
     let local = check.local_for(target);
     if let Some(why) = local.and_then(|l| l.placeholder.as_ref()) {
         return out(
@@ -379,10 +402,12 @@ fn record<'a>(
     target: &str,
     local: &LocalRun,
     part: &str,
+    case: Option<&str>,
 ) -> Option<&'a RunRecord> {
     inp.records
         .iter()
         .filter(|r| r.check == check.id && r.target == target && r.part == part)
+        .filter(|r| r.case.as_deref() == case)
         .filter(|r| from_runner(r, local))
         .max_by(|a, b| a.time.cmp(&b.time))
 }
@@ -401,66 +426,91 @@ fn eval_local(inp: &Inputs<'_>, check: &Check, target: &str, local: &LocalRun) -
         if r.config != inp.manifest.config_digest(check, target, control) {
             return Err(CONFIG_CHANGED.into());
         }
+        if check.app {
+            app_build_counts(r.app_build.as_deref(), inp.app_revision)?;
+        }
         Ok(())
     };
-    let normal = record(inp, check, target, local, "normal");
-    let mut normal_total = None;
+    let named = check.controls_per_case();
+    let cases = if named {
+        check.cases(target)
+    } else {
+        vec![None]
+    };
     let mut normal_summary = String::new();
-    match normal {
-        None => gaps.push("not run for this build".to_string()),
-        Some(r) => match usable(r, None) {
-            Err(why) => gaps.push(format!("last run does not count: {why}")),
-            Ok(_) => match r.verdict {
-                RunVerdict::Pass => {
-                    normal_total = r.tests_total;
-                    normal_summary = r.summary.clone();
-                }
-                _ => fails.push(format!("run failed: {}", r.summary)),
-            },
-        },
-    }
-    for k in &check.control {
-        match record(inp, check, target, local, &k.name) {
-            None => gaps.push(format!("control {} not run", k.name)),
-            Some(r) => match usable(r, Some(k)) {
-                Err(why) => gaps.push(format!("control {} does not count: {why}", k.name)),
+    for case in &cases {
+        let case = case.as_deref();
+        // In a check with named cases, every message names its case.
+        let at = case.map(|c| format!("[{c}] ")).unwrap_or_default();
+        if let Some((w, path)) = check.waiting(case, inp.exists) {
+            gaps.push(format!(
+                "{at}waits for {} ({path} is not in this tree)",
+                w.slice
+            ));
+            continue;
+        }
+        let mut case_fails = Vec::new();
+        let mut case_gaps = Vec::new();
+        let normal = record(inp, check, target, local, "normal", case);
+        let mut normal_total = None;
+        match normal {
+            None => case_gaps.push("not run for this build".to_string()),
+            Some(r) => match usable(r, None) {
+                Err(why) => case_gaps.push(format!("last run does not count: {why}")),
                 Ok(_) => match r.verdict {
-                    RunVerdict::FailedAsRequired => {
-                        if let Some(want) = &k.expect_reason {
-                            if r.reason.as_ref() != Some(want) {
-                                fails.push(format!(
-                                    "control {} failed with reason {}, it must fail with reason={want}",
-                                    k.name,
-                                    r.reason.as_deref().unwrap_or("(none given)")
-                                ));
-                            }
-                        }
-                        if check.judge == Judge::CargoTest {
-                            if let (Some(a), Some(b)) = (normal_total, r.tests_total) {
-                                if a != b {
-                                    fails.push(format!(
-                                        "control {} ran {b} tests, the check ran {a}; a control must run the same tests (use --no-fail-fast)",
-                                        k.name
-                                    ));
-                                }
-                            }
-                        }
+                    RunVerdict::Pass => {
+                        normal_total = r.tests_total;
+                        normal_summary = r.summary.clone();
                     }
-                    RunVerdict::DidNotFail => fails.push(format!(
-                        "control did not fail: {} ({}): {}",
-                        k.name, k.breaks, r.summary
-                    )),
-                    RunVerdict::WrongReason => fails.push(format!(
-                        "control {} failed for the wrong reason: {}",
-                        k.name, r.summary
-                    )),
-                    _ => fails.push(format!(
-                        "control {} did not print FAIL: {}",
-                        k.name, r.summary
-                    )),
+                    _ => case_fails.push(format!("run failed: {}", r.summary)),
                 },
             },
         }
+        for k in &check.control {
+            match record(inp, check, target, local, &k.name, case) {
+                None => case_gaps.push(format!("control {} not run", k.name)),
+                Some(r) => match usable(r, Some(k)) {
+                    Err(why) => case_gaps.push(format!("control {} does not count: {why}", k.name)),
+                    Ok(_) => match r.verdict {
+                        RunVerdict::FailedAsRequired => {
+                            if let Some(want) = &k.expect_reason {
+                                if r.reason.as_ref() != Some(want) {
+                                    case_fails.push(format!(
+                                        "control {} failed with reason {}, it must fail with reason={want}",
+                                        k.name,
+                                        r.reason.as_deref().unwrap_or("(none given)")
+                                    ));
+                                }
+                            }
+                            if check.judge == Judge::CargoTest {
+                                if let (Some(a), Some(b)) = (normal_total, r.tests_total) {
+                                    if a != b {
+                                        case_fails.push(format!(
+                                            "control {} ran {b} tests, the check ran {a}; a control must run the same tests (use --no-fail-fast)",
+                                            k.name
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        RunVerdict::DidNotFail => case_fails.push(format!(
+                            "control did not fail: {} ({}): {}",
+                            k.name, k.breaks, r.summary
+                        )),
+                        RunVerdict::WrongReason => case_fails.push(format!(
+                            "control {} failed for the wrong reason: {}",
+                            k.name, r.summary
+                        )),
+                        _ => case_fails.push(format!(
+                            "control {} did not print FAIL: {}",
+                            k.name, r.summary
+                        )),
+                    },
+                },
+            }
+        }
+        fails.extend(case_fails.into_iter().map(|f| format!("{at}{f}")));
+        gaps.extend(case_gaps.into_iter().map(|g| format!("{at}{g}")));
     }
     if !fails.is_empty() {
         return out(Status::Fail, fails.join("; "));
@@ -468,13 +518,19 @@ fn eval_local(inp: &Inputs<'_>, check: &Check, target: &str, local: &LocalRun) -
     if !gaps.is_empty() {
         return out(Status::Incomplete, gaps.join("; "));
     }
-    out(
-        Status::Pass,
+    let summary = if named {
+        format!(
+            "{} case(s) passed; {} control(s) failed as required in each",
+            cases.len(),
+            check.control.len()
+        )
+    } else {
         format!(
             "{normal_summary}; {} control(s) failed as required",
             check.control.len()
-        ),
-    )
+        )
+    };
+    out(Status::Pass, summary)
 }
 
 fn legacy_note(inp: &Inputs<'_>, check: &Check, target: &str) -> String {
@@ -564,13 +620,36 @@ fn eval_device(inp: &Inputs<'_>, check: &Check, target: &str) -> Outcome {
             )
         });
     }
+    // Named cases: every control must have failed in every case. Other
+    // checks: at least one result per control, all of them FAIL.
+    let control_cases: Vec<Option<String>> = if check.controls_per_case() {
+        expected.clone()
+    } else {
+        vec![None]
+    };
+    for case in check.cases.iter() {
+        if let Some((w, path)) = check.waiting(Some(case), inp.exists) {
+            gaps.push(format!(
+                "[{case}] waits for {} ({path} is not in this tree)",
+                w.slice
+            ));
+        }
+    }
     for k in &check.control {
         let rs: Vec<&&ResultPayload> = ok
             .iter()
             .filter(|r| r.control.as_deref() == Some(k.name.as_str()))
             .collect();
-        if rs.is_empty() {
-            gaps.push(format!("no result for control {}", k.name));
+        for case in &control_cases {
+            let Some(case) = case else {
+                if rs.is_empty() {
+                    gaps.push(format!("no result for control {}", k.name));
+                }
+                continue;
+            };
+            if !rs.iter().any(|r| r.case.as_ref() == Some(case)) {
+                gaps.push(format!("[{case}] no result for control {}", k.name));
+            }
         }
         for r in rs.iter().filter(|r| r.outcome != "FAIL") {
             fails.push(format!(
@@ -621,7 +700,8 @@ fn eval_device(inp: &Inputs<'_>, check: &Check, target: &str) -> Outcome {
 
 /// Why a verified device result does not count for this cell: another
 /// build (the caller's, and for a cross-machine cell the host's), another
-/// check configuration, or an unknown control.
+/// check configuration, an unknown control, or for an app check another app
+/// build than the pinned one (on both machines for a cross-machine cell).
 fn device_result_counts(
     inp: &Inputs<'_>,
     check: &Check,
@@ -654,6 +734,13 @@ fn device_result_counts(
         build(host).map_err(|why| format!("host: {why}"))?;
         if let Some(caller) = r.extra_str("caller_build") {
             build(caller).map_err(|why| format!("caller: {why}"))?;
+        }
+    }
+    if check.app {
+        app_build_counts(r.extra_str("app_build"), inp.app_revision)?;
+        if check.cross_machine {
+            app_build_counts(r.extra_str("host_app_build"), inp.app_revision)
+                .map_err(|why| format!("host: {why}"))?;
         }
     }
     Ok(())

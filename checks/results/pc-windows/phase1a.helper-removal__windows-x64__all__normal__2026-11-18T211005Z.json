@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "pc-windows",
+  "key": "048ad3ccda2d27fdfc98c131f2fa25bea736ec0a3e8a107dcbfa6b2f5a86b88da452c337f09925646ec76897452505e718f3f397ddf39674e9f5ad64590bc93d57",
+  "payload": "{\"check\":\"phase1a.helper-removal\",\"target\":\"windows-x64\",\"build\":\"47af3a64125fc21917db67bfcea9c220132b33ce+debug\",\"platform\":\"windows-x86_64\",\"outcome\":\"PASS\",\"details\":\"8 tests passed\",\"time\":\"2026-11-18T21:10:05Z\",\"device\":\"pc-windows\",\"config\":\"3e859a2c1c08ea0a4d099221e9c62571eec526c7dce5ea8400334bc494902348\"}",
+  "signature": "273895e629314a6716f4d989b9cb4991a2e0ac7105c3a170ea76980368ec44dee11278f0f887341988bd2dd73aae9bb66a4f1e4cc3cb87df7934ad76a1763f27"
+}

@@ -105,6 +105,7 @@ fn rec(part: &str, verdict: RunVerdict, total: Option<u64>) -> RunRecord {
         check: "phase9.local".into(),
         target: "pc".into(),
         part: part.into(),
+        case: None,
         build: release(HEAD),
         time: "2026-11-18T00:00:00Z".into(),
         verdict,
@@ -115,6 +116,7 @@ fn rec(part: &str, verdict: RunVerdict, total: Option<u64>) -> RunRecord {
         runner: AUTO.into(),
         config: AUTO.into(),
         reason: None,
+        app_build: None,
     }
 }
 
@@ -161,6 +163,9 @@ struct Case {
     records: Vec<RunRecord>,
     evidence: Evidence,
     rejected: Vec<(PathBuf, String, bool)>,
+    app_revision: Option<String>,
+    /// Paths in the tree, for `waits`.
+    present: Vec<String>,
 }
 
 impl Case {
@@ -177,6 +182,8 @@ impl Case {
             ],
             evidence: Evidence::default(),
             rejected: vec![],
+            app_revision: Some(APP_REV.into()),
+            present: vec![],
         }
     }
 
@@ -226,6 +233,7 @@ impl Case {
     fn report(&self) -> Report {
         let legacy = BTreeMap::new();
         let (records, evidence) = self.filled();
+        let exists = |p: &str| self.present.iter().any(|x| x == p);
         evaluate(&Inputs {
             manifest: &self.manifest,
             host: HOST,
@@ -236,6 +244,8 @@ impl Case {
             evidence: &evidence,
             rejected_paths: &self.rejected,
             legacy: &legacy,
+            app_revision: self.app_revision.as_deref(),
+            exists: &exists,
         })
     }
 
@@ -806,4 +816,289 @@ fn a_cross_machine_cell_needs_the_host_build_under_test_too() {
     ];
     let c = case.cell("phase9.slice");
     assert_eq!(c.status, Status::Pass, "{}", c.details);
+}
+
+// --- App checks: the pinned app build ---
+
+/// The app revision `app/MOUSSE_REVISION` pins in these tests.
+const APP_REV: &str = "4444444444444444444444444444444444444444";
+
+const APP_CHECK: &str = r#"
+[[check]]
+id = "phase9.app"
+title = "app check"
+plan = "item 6"
+targets = ["pc"]
+judge = "marker"
+app = true
+[[check.local]]
+target = "pc"
+host = "windows-x86_64"
+command = ["cargo", "run", "--release", "-p", "app-check"]
+[[check.control]]
+name = "break-app"
+breaks = "the app's deliberate defect"
+env = { MOUSSE_NET_ENGINE_CONTROL = "break-app" }
+"#;
+
+fn app_case(app_build: Option<&str>) -> Case {
+    let mut case = Case::new(APP_CHECK);
+    for (part, verdict) in [
+        ("normal", RunVerdict::Pass),
+        ("break-app", RunVerdict::FailedAsRequired),
+    ] {
+        case.records.push(RunRecord {
+            app_build: app_build.map(str::to_string),
+            ..rec_for("phase9.app", "pc", part, verdict)
+        });
+    }
+    case
+}
+
+#[test]
+fn app_runs_count_only_with_the_pinned_clean_app_build() {
+    let c = app_case(Some(APP_REV)).cell("phase9.app");
+    assert_eq!(c.status, Status::Pass, "{}", c.details);
+
+    let dirty = format!("{APP_REV}-dirty");
+    let other = "5".repeat(40);
+    for (claimed, why) in [
+        (None, "app_build"),
+        (Some(dirty.as_str()), "dirty"),
+        (Some(other.as_str()), "pins"),
+    ] {
+        let c = app_case(claimed).cell("phase9.app");
+        assert_eq!(c.status, Status::Incomplete, "{claimed:?}: {}", c.details);
+        assert!(c.details.contains(why), "{claimed:?}: {}", c.details);
+    }
+    // Only the normal run names the app build: the control does not count.
+    let mut case = app_case(Some(APP_REV));
+    case.records.last_mut().unwrap().app_build = None;
+    assert_eq!(case.cell("phase9.app").status, Status::Incomplete);
+    // No pin: no app check can pass.
+    let mut case = app_case(Some(APP_REV));
+    case.app_revision = None;
+    let c = case.cell("phase9.app");
+    assert_eq!(c.status, Status::Incomplete, "{}", c.details);
+    assert!(c.details.contains("MOUSSE_REVISION"), "{}", c.details);
+    // Checks that are not app checks do not need the pin.
+    assert_eq!(case.cell("phase9.local").status, Status::Pass);
+}
+
+#[test]
+fn app_device_results_need_the_pinned_app_build_on_both_machines() {
+    let app_slice = PIN_CHECK.replace(
+        "cross_machine = true\n",
+        "cross_machine = true\napp = true\n",
+    );
+    let host = release(HEAD);
+    let control = slice(
+        Some("wrong-identity"),
+        "FAIL",
+        serde_json::json!({
+            "host_build": host, "reason": "pin_mismatch",
+            "app_build": APP_REV, "host_app_build": APP_REV,
+        }),
+    );
+    let normal = |extra: serde_json::Value| slice(None, "PASS", extra);
+    let mut case = Case::new(&app_slice);
+    case.evidence.results = vec![
+        normal(serde_json::json!({
+            "host_build": host, "app_build": APP_REV, "host_app_build": APP_REV,
+        })),
+        control.clone(),
+    ];
+    let c = case.cell("phase9.slice");
+    assert_eq!(c.status, Status::Pass, "{}", c.details);
+
+    let other = "5".repeat(40);
+    for extra in [
+        serde_json::json!({ "host_build": host, "app_build": APP_REV }),
+        serde_json::json!({ "host_build": host, "host_app_build": APP_REV }),
+        serde_json::json!({ "host_build": host, "app_build": APP_REV, "host_app_build": other }),
+        serde_json::json!({ "host_build": host, "app_build": other, "host_app_build": APP_REV }),
+    ] {
+        case.evidence.results = vec![normal(extra.clone()), control.clone()];
+        let c = case.cell("phase9.slice");
+        assert_eq!(c.status, Status::Incomplete, "{extra}: {}", c.details);
+    }
+}
+
+const ROUTE_CHECK: &str = r#"
+[[check]]
+id = "phase9.routes"
+title = "routes"
+plan = "item 6"
+targets = ["pc"]
+judge = "marker"
+cases = ["tcp", "ws"]
+[[check.local]]
+target = "pc"
+host = "windows-x86_64"
+command = ["cargo", "run", "--release", "-p", "probe", "--", "--route", "{case}"]
+[[check.control]]
+name = "leak"
+breaks = "another route wins"
+env = { MOUSSE_NET_ENGINE_CONTROL = "route-leak" }
+expect_reason = "route_mismatch"
+"#;
+
+fn route_rec(case: &str, part: &str, verdict: RunVerdict) -> RunRecord {
+    RunRecord {
+        case: Some(case.into()),
+        reason: (verdict == RunVerdict::FailedAsRequired).then(|| "route_mismatch".into()),
+        ..rec_for("phase9.routes", "pc", part, verdict)
+    }
+}
+
+fn route_case() -> Case {
+    let mut case = Case::new(ROUTE_CHECK);
+    for route in ["tcp", "ws"] {
+        case.records
+            .push(route_rec(route, "normal", RunVerdict::Pass));
+        case.records
+            .push(route_rec(route, "leak", RunVerdict::FailedAsRequired));
+    }
+    case
+}
+
+fn is(r: &RunRecord, case: &str, part: &str) -> bool {
+    r.check == "phase9.routes" && r.case.as_deref() == Some(case) && r.part == part
+}
+
+#[test]
+fn every_case_must_pass_and_every_control_must_fail_in_each_case() {
+    let c = route_case().cell("phase9.routes");
+    assert_eq!(c.status, Status::Pass, "{}", c.details);
+
+    // A case not run is INCOMPLETE, and the message names it.
+    let mut case = route_case();
+    case.records.retain(|r| !is(r, "ws", "normal"));
+    let c = case.cell("phase9.routes");
+    assert_eq!(c.status, Status::Incomplete, "{}", c.details);
+    assert!(c.details.contains("[ws] not run"), "{}", c.details);
+
+    // A control that failed in one case only is not enough.
+    let mut case = route_case();
+    case.records.retain(|r| !is(r, "tcp", "leak"));
+    let c = case.cell("phase9.routes");
+    assert_eq!(c.status, Status::Incomplete, "{}", c.details);
+    assert!(
+        c.details.contains("[tcp] control leak not run"),
+        "{}",
+        c.details
+    );
+
+    // A control that passed in one case fails the check.
+    let mut case = route_case();
+    for r in &mut case.records {
+        if is(r, "ws", "leak") {
+            r.verdict = RunVerdict::DidNotFail;
+        }
+    }
+    let c = case.cell("phase9.routes");
+    assert_eq!(c.status, Status::Fail, "{}", c.details);
+    assert!(
+        c.details.contains("[ws] control did not fail"),
+        "{}",
+        c.details
+    );
+
+    // A failed case fails the check while the other passes.
+    let mut case = route_case();
+    for r in &mut case.records {
+        if is(r, "tcp", "normal") {
+            r.verdict = RunVerdict::Fail;
+        }
+    }
+    assert_eq!(case.cell("phase9.routes").status, Status::Fail);
+
+    // A record without a case stands for no case.
+    let mut case = route_case();
+    for r in &mut case.records {
+        if r.check == "phase9.routes" {
+            r.case = None;
+        }
+    }
+    assert_eq!(case.cell("phase9.routes").status, Status::Incomplete);
+}
+
+#[test]
+fn device_controls_must_fail_in_every_named_case() {
+    let device = ROUTE_CHECK
+        .replace("targets = [\"pc\"]", "targets = [\"mac\"]")
+        .replace("target = \"pc\"", "target = \"mac\"")
+        .replace("host = \"windows-x86_64\"", "host = \"macos-aarch64\"");
+    let mut case = Case::new(&device);
+    let res = |route: &str, control: Option<&str>, outcome: &str| {
+        let mut r = result(
+            "phase9.routes",
+            "mac",
+            Some(route),
+            control,
+            outcome,
+            &release(HEAD),
+        );
+        if control.is_some() {
+            r.extra = serde_json::json!({ "reason": "route_mismatch" });
+        }
+        r
+    };
+    case.evidence.results = vec![
+        res("tcp", None, "PASS"),
+        res("ws", None, "PASS"),
+        res("tcp", Some("leak"), "FAIL"),
+        res("ws", Some("leak"), "FAIL"),
+    ];
+    let c = case.cell("phase9.routes");
+    assert_eq!(c.status, Status::Pass, "{}", c.details);
+
+    case.evidence.results.pop();
+    let c = case.cell("phase9.routes");
+    assert_eq!(c.status, Status::Incomplete, "{}", c.details);
+    assert!(
+        c.details.contains("[ws] no result for control leak"),
+        "{}",
+        c.details
+    );
+}
+
+#[test]
+fn a_check_or_case_waiting_for_its_slice_is_incomplete_until_it_lands() {
+    let waiting = format!(
+        "{ROUTE_CHECK}[[check.waits]]\nslice = \"E8\"\npaths = [\"crates/x/ws.rs\"]\ncase = \"ws\"\n"
+    );
+    // The ws case waits: the cell is INCOMPLETE with every run passing.
+    let mut case = route_case();
+    case.manifest = Manifest::parse(&format!("{MANIFEST}{waiting}")).unwrap();
+    let c = case.cell("phase9.routes");
+    assert_eq!(c.status, Status::Incomplete, "{}", c.details);
+    assert!(c.details.contains("[ws] waits for E8"), "{}", c.details);
+    // A failure in a case that has landed still shows.
+    for r in &mut case.records {
+        if is(r, "tcp", "normal") {
+            r.verdict = RunVerdict::Fail;
+        }
+    }
+    assert_eq!(case.cell("phase9.routes").status, Status::Fail);
+    for r in &mut case.records {
+        if is(r, "tcp", "normal") {
+            r.verdict = RunVerdict::Pass;
+        }
+    }
+    // Once the path is in the tree the case counts.
+    case.present = vec!["crates/x/ws.rs".into()];
+    assert_eq!(case.cell("phase9.routes").status, Status::Pass);
+
+    // A wait without a case holds the whole check, whatever was recorded.
+    let whole =
+        format!("{ROUTE_CHECK}[[check.waits]]\nslice = \"E7\"\npaths = [\"crates/x/routes.rs\"]\n");
+    let mut case = route_case();
+    case.manifest = Manifest::parse(&format!("{MANIFEST}{whole}")).unwrap();
+    let c = case.cell("phase9.routes");
+    assert_eq!(c.status, Status::Incomplete, "{}", c.details);
+    assert!(c.details.contains("waits for E7"), "{}", c.details);
+    // A wait never hides a check without a control.
+    case.manifest.checks[1].control.clear();
+    assert_eq!(case.cell("phase9.routes").status, Status::Fail);
 }
