@@ -1411,6 +1411,7 @@ dependencies = [
  "mousse-net-core",
  "mousse-net-io",
  "rand_core 0.10.1",
+ "rustix",
  "rustls",
  "serde",
  "serde_json",

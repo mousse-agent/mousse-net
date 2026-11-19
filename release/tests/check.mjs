@@ -752,6 +752,19 @@ async function install() {
       if (st.sha256 !== sha256) fail("build-hash", `image relay ${st.sha256}, release ${sha256}`);
     }
     say("The relay image keeps its identity in the state volume across restarts");
+
+    // Core dumps stay off even when the container allows them: the relay
+    // sets its own limit, since the image has no shell to do it.
+    const loose = `mousse-release-relay-core-${RUN}`;
+    const allowing = hardened.map((a) => (a === "core=0" ? "core=-1" : a));
+    docker(["run", "-d", "--name", loose, ...allowing, tag]);
+    cleanups.push(() => docker(["rm", "-f", loose], { allowFail: true, quiet: true }));
+    sleep(2000);
+    const limits = docker(["run", "--rm", "--pid", `container:${loose}`, "--network", "none", UBUNTU.tag, "cat", "/proc/1/limits"]).stdout;
+    const core = limits.split("\n").find((l) => l.startsWith("Max core file size")) ?? "";
+    if (!/^Max core file size\s+0\s+0\s/.test(core)) fail("core-dumps", `relay limits: ${core || "none"}`);
+    docker(["rm", "-f", loose], { quiet: true });
+    say("The relay turns core dumps off itself");
   }
 }
 
