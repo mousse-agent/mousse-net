@@ -16,7 +16,8 @@ use mousse_net_core::identity::{IdentityPublicKey, SoftwareKey};
 use mousse_net_core::pairing::{CpaceExchangeFactory, InvitationId, InvitationKind};
 use mousse_net_core::ErrorCode;
 use mousse_net_io::discovery::{Advertiser, CachedBrowse};
-use mousse_net_io::pipe::{accept_tcp, route_from_addr, route_uri};
+use mousse_net_io::pipe::ws::{self, WsTarget};
+use mousse_net_io::pipe::{accept_tcp, route_from_addr, route_uri, Pipe};
 use mousse_net_io::rng::{os_rng, random_bytes};
 use mousse_net_io::store::{hex, short_id};
 use mousse_net_io::{
@@ -38,6 +39,13 @@ pub struct ServeOptions {
     pub mdns: bool,
     /// `--app`: the app channel on stdin and stdout.
     pub app: bool,
+    /// `--ws-port`: run the loopback `ws` listener for a tunnel client on
+    /// this port (0: any; Phase 1b §4.1). It also runs, on the kept ws
+    /// port, while `tunnels` is not empty.
+    pub ws_port: Option<u16>,
+    /// `--tunnel`: public `wss` URLs of the owner's tunnels to this
+    /// listener, advertised in tickets.
+    pub tunnels: Vec<String>,
 }
 
 /// A deliberate defect for the cross-machine must-fail control, read from
@@ -95,9 +103,9 @@ fn print_line(line: impl AsRef<str>) {
 /// Run step 1 and step 2 on an inbound pipe that holds `slot`; the host
 /// keeps the place until the connection is live or closed. `None` if it
 /// was refused.
-async fn accept_holding(
+async fn accept_holding<P: Pipe>(
     host: &Host,
-    pipe: TcpStream,
+    pipe: P,
     addr: SocketAddr,
     slot: PreAuthSlot,
 ) -> Option<mousse_net_io::Connection> {
@@ -159,7 +167,30 @@ pub async fn run(
         .await
         .map_err(|e| format!("listen: {e}"))?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
-    let routes = route_hints(opts.listen_ip, port);
+    let mut routes = route_hints(opts.listen_ip, port);
+    for tunnel in &opts.tunnels {
+        let target = WsTarget::parse(tunnel)
+            .filter(|t| t.secure)
+            .ok_or_else(|| {
+                format!("--tunnel {tunnel}: not a wss://<host>[:<port>]<path>/mousse-net/1 URL")
+            })?;
+        routes.push(target.uri());
+    }
+    // The loopback ws listener, for the owner's tunnel client (§4.1).
+    let ws_listener = if opts.ws_port.is_some() || !opts.tunnels.is_empty() {
+        Some(
+            endpoint
+                .bind_ws(opts.ws_port)
+                .await
+                .map_err(|e| format!("ws listen: {e}"))?,
+        )
+    } else {
+        None
+    };
+    let ws_port = match &ws_listener {
+        Some(l) => Some(l.local_addr().map_err(|e| e.to_string())?.port()),
+        None => None,
+    };
     let advertiser = if opts.mdns && !opts.listen_ip.is_loopback() {
         Some(
             Advertiser::start(port, clock.clone(), crate::limits::get().net.io())
@@ -190,13 +221,17 @@ pub async fn run(
         stop: Notify::new(),
     });
     print_line(format!(
-        "ready {} port {} build {} routes {}{}",
+        "ready {} port {} build {} routes {}{}{}",
         short_id(&real_identity),
         port,
         crate::BUILD,
         routes.join(" "),
         match &advertiser {
             Some(a) => format!(" mdns {}", a.current_name()),
+            None => String::new(),
+        },
+        match ws_port {
+            Some(p) => format!(" ws_port {p}"),
             None => String::new(),
         }
     ));
@@ -226,6 +261,7 @@ pub async fn run(
             name: opts.name.clone(),
             profile: endpoint.profile_id().to_owned(),
             port,
+            ws_port,
             routes: routes.clone(),
             state_dir: endpoint.dir().to_path_buf(),
             // mDNS only where the helper advertises too (never on
@@ -280,6 +316,27 @@ pub async fn run(
                 },
                 Err(e) => print_line(format!("accept failed: {e}")),
             },
+            accepted = accept_ws(&ws_listener) => match accepted {
+                // A place in the ws pool before anything is read. Control
+                // (tests only): the place is taken after the upgrade.
+                Ok((stream, addr)) => {
+                    let slot = if cfg!(mousse_control = "ws-slot-after-headers") {
+                        Ok(None)
+                    } else {
+                        host.admit(ListenerKind::Ws, None).map(Some)
+                    };
+                    match slot {
+                        Err(why) => {
+                            print_line(format!("dropped ws {addr}: {why}"));
+                            drop(stream);
+                        }
+                        Ok(slot) => {
+                            tokio::spawn(ws_connection(host.clone(), app.clone(), stream, addr, slot));
+                        }
+                    }
+                }
+                Err(e) => print_line(format!("ws accept failed: {e}")),
+            },
             end = &mut app_end => {
                 print_line(format!("app channel ended: {end:?}"));
                 ended = Some(end);
@@ -324,6 +381,56 @@ pub async fn run(
     }
 }
 
+/// The next connection to the ws listener; never without one.
+async fn accept_ws(
+    listener: &Option<tokio::net::TcpListener>,
+) -> Result<(TcpStream, SocketAddr), mousse_net_io::NetError> {
+    match listener {
+        Some(listener) => accept_tcp(listener).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// One connection to the ws listener: the upgrade under its caps and
+/// checks, then step 1 and step 2 over the ws pipe.
+async fn ws_connection(
+    host: Host,
+    app: Option<crate::app::App>,
+    stream: TcpStream,
+    addr: SocketAddr,
+    slot: Option<PreAuthSlot>,
+) {
+    let fence = host.clone();
+    let accepted = ws::accept(stream, crate::limits::get().net.io(), move || {
+        fence.fence_covers(ListenerKind::Ws)
+    })
+    .await;
+    let pipe = match accepted {
+        Ok(pipe) => pipe,
+        Err(refusal) => {
+            print_line(format!("refused ws {addr}: {refusal}"));
+            return;
+        }
+    };
+    let slot = match slot {
+        Some(slot) => slot,
+        None => match host.admit(ListenerKind::Ws, None) {
+            Ok(slot) => slot,
+            Err(why) => {
+                print_line(format!("dropped ws {addr}: {why}"));
+                return;
+            }
+        },
+    };
+    let Some(conn) = accept_holding(&host, pipe, addr, slot).await else {
+        return;
+    };
+    match app {
+        Some(app) => app.inbound(conn).await,
+        None => serve_streams(conn, addr).await,
+    }
+}
+
 /// The next control connection; never, in app mode.
 async fn accept_control(control: &mut Option<ControlListener>) -> Result<Channel, String> {
     match control {
@@ -349,6 +456,11 @@ async fn handle_connection(host: Host, pipe: TcpStream, addr: SocketAddr, slot: 
     let Some(conn) = accept_holding(&host, pipe, addr, slot).await else {
         return;
     };
+    serve_streams(conn, addr).await;
+}
+
+/// Standalone `serve`: terminals and `helper-info` for a live connection.
+async fn serve_streams(conn: mousse_net_io::Connection, addr: SocketAddr) {
     let peer = short_id(conn.peer());
     print_line(format!("connected {peer} from {addr}"));
     while let Some(stream) = conn.accept_stream().await {

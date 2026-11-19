@@ -1008,6 +1008,12 @@ where
         lock(&self.shared).paused
     }
 
+    /// Whether the admission fence stops connections of `kind` now: the
+    /// `ws` upgrade answers 503 when it does (Phase 1b §4.1).
+    pub fn fence_covers(&self, kind: ListenerKind) -> bool {
+        lock(&self.shared).fenced(kind)
+    }
+
     /// Stop serving: set the admission fence and close every connection
     /// with `code`, under one lock.
     pub fn pause(&self, code: ErrorCode) {

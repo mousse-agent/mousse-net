@@ -8,6 +8,7 @@
 //! [`classify`] is the one address classifier (§1.2).
 
 mod classify;
+pub mod ws;
 
 pub use classify::{classify, AddrClass};
 
