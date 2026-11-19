@@ -27,6 +27,8 @@ use crate::limits::Limits;
 pub struct StreamAdmission {
     per_connection: usize,
     per_endpoint: usize,
+    /// Engine streams per connection, apart from the two caps.
+    engine_per_connection: usize,
     open: Mutex<usize>,
     queued: AtomicU64,
     peak_queued: AtomicU64,
@@ -43,6 +45,8 @@ impl StreamAdmission {
         Arc::new(Self {
             per_connection: usize::try_from(io.streams_per_connection()).unwrap_or(usize::MAX),
             per_endpoint: usize::try_from(io.streams_per_endpoint()).unwrap_or(usize::MAX),
+            engine_per_connection: usize::try_from(io.engine_streams_per_connection())
+                .unwrap_or(usize::MAX),
             open: Mutex::new(0),
             queued: AtomicU64::new(0),
             peak_queued: AtomicU64::new(0),
@@ -91,6 +95,7 @@ impl StreamAdmission {
         ConnStreams {
             admission: self.clone(),
             open: Arc::new(AtomicUsize::new(0)),
+            engine_open: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -126,6 +131,8 @@ pub(crate) struct ConnStreams {
     admission: Arc<StreamAdmission>,
     /// Changed only under the admission's lock.
     open: Arc<AtomicUsize>,
+    /// Engine streams open on this connection.
+    engine_open: Arc<AtomicUsize>,
 }
 
 impl ConnStreams {
@@ -146,6 +153,25 @@ impl ConnStreams {
         Some(self.permit())
     }
 
+    /// A place for an engine stream (label `mousse-`), counted apart from
+    /// the app's caps.
+    pub(crate) fn try_admit_engine(&self) -> Option<Arc<StreamPermit>> {
+        let _guard = self
+            .admission
+            .open
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if self.engine_open.load(Ordering::Relaxed) >= self.admission.engine_per_connection {
+            return None;
+        }
+        self.engine_open.fetch_add(1, Ordering::Relaxed);
+        Some(Arc::new(StreamPermit {
+            admission: self.admission.clone(),
+            conn: self.engine_open.clone(),
+            engine: true,
+        }))
+    }
+
     /// The `no-stream-cap` control: a place whatever the caps say.
     #[cfg(mousse_control = "no-stream-cap")]
     pub(crate) fn admit_anyway(&self) -> Arc<StreamPermit> {
@@ -163,6 +189,7 @@ impl ConnStreams {
         Arc::new(StreamPermit {
             admission: self.admission.clone(),
             conn: self.open.clone(),
+            engine: false,
         })
     }
 
@@ -181,6 +208,8 @@ impl ConnStreams {
 pub(crate) struct StreamPermit {
     admission: Arc<StreamAdmission>,
     conn: Arc<AtomicUsize>,
+    /// An engine stream's place: not counted in the endpoint's total.
+    engine: bool,
 }
 
 impl Drop for StreamPermit {
@@ -190,7 +219,9 @@ impl Drop for StreamPermit {
             .open
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        *open = open.saturating_sub(1);
+        if !self.engine {
+            *open = open.saturating_sub(1);
+        }
         let _ = self
             .conn
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
@@ -228,6 +259,23 @@ mod tests {
         assert!(b.try_admit().is_none(), "still held by the reader");
         drop(held);
         assert!(b.try_admit().is_some());
+    }
+
+    #[test]
+    fn engine_streams_have_their_own_places() {
+        let admission = StreamAdmission::new(&limits(1, 1));
+        let a = admission.connection();
+        let _app = a.try_admit().unwrap();
+        assert!(a.try_admit().is_none());
+        let engine: Vec<_> = (0..4).map(|_| a.try_admit_engine().unwrap()).collect();
+        assert!(a.try_admit_engine().is_none(), "engine cap");
+        assert_eq!(
+            admission.open_streams(),
+            1,
+            "engine streams leave the app's count"
+        );
+        drop(engine);
+        assert!(a.try_admit_engine().is_some());
     }
 
     #[test]

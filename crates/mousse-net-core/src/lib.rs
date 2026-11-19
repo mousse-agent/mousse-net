@@ -18,6 +18,10 @@
 //! - [`pairing`]: tickets, join proofs, host and joiner pairing state machines.
 //! - [`mux`]: frame codec, per-stream credit, priority scheduler, keepalive.
 //! - [`session`]: certificate-driven session lifetime and path switching.
+//! - [`pairmail`]: per-pairing directory and mailbox material from the pair
+//!   secret, sealing, and the manifest pin check.
+//! - [`removal`]: "remove on all my hosts": grant lists, signed removals
+//!   and the host's checks.
 //! - [`relay`]: the relay protocol and the relay's admission state machine.
 //! - [`relay_hosted`]: the relay's hosted mode: admission tokens, leases,
 //!   the Plus clock and reports.
@@ -39,6 +43,12 @@
         mousse_control = "break-raw-signature",
         mousse_control = "break-cpace-confirm",
         mousse_control = "break-cpace-sid",
+        mousse_control = "removal-unsigned",
+        mousse_control = "accept-any-signer",
+        mousse_control = "ignore-owner",
+        mousse_control = "ignore-grant-id",
+        mousse_control = "resend-refused",
+        mousse_control = "unpinned-manifest",
         mousse_control = "limits-raise",
         mousse_control = "no-pin-relay",
         mousse_control = "relay-skip-allow-set",
@@ -70,6 +80,12 @@ compile_error!("mousse_control plants a bug for tests; it is not allowed in rele
     mousse_control = "break-raw-signature",
     mousse_control = "break-cpace-confirm",
     mousse_control = "break-cpace-sid",
+    mousse_control = "removal-unsigned",
+    mousse_control = "accept-any-signer",
+    mousse_control = "ignore-owner",
+    mousse_control = "ignore-grant-id",
+    mousse_control = "resend-refused",
+    mousse_control = "unpinned-manifest",
     mousse_control = "limits-raise",
     mousse_control = "no-pin-relay",
     mousse_control = "relay-skip-allow-set",
@@ -118,9 +134,11 @@ pub mod limits;
 pub mod manifest;
 pub mod mux;
 pub mod pairing;
+pub mod pairmail;
 pub mod relay;
 pub mod relay_endpoint;
 pub mod relay_hosted;
+pub mod removal;
 pub mod session;
 pub mod session_cert;
 pub mod time;
@@ -139,7 +157,7 @@ pub const PROTOCOL_VERSION: u64 = 1;
 /// Minor protocol version this build speaks. Peers exchange it in `HELLO`
 /// and use the lower of the two. The current and previous minor versions are
 /// supported.
-pub const PROTOCOL_MINOR_VERSION: u64 = 1;
+pub const PROTOCOL_MINOR_VERSION: u64 = 2;
 
 /// TLS ALPN protocol identifier for peer sessions. It carries the major
 /// version only.

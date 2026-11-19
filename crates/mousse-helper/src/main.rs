@@ -16,6 +16,14 @@
         mousse_control = "stop-on-mismatch",
         mousse_control = "public-routes",
         mousse_control = "no-rediscovery",
+        mousse_control = "auto-send-unknown",
+        mousse_control = "new-request-id-on-retry",
+        mousse_control = "no-prefetch",
+        mousse_control = "pause-all-classes",
+        mousse_control = "fund-two-relays",
+        mousse_control = "keep-removed-slot",
+        mousse_control = "unpinned-manifest",
+        mousse_control = "trust-from-plus",
         mousse_control = "no-preauth-budget",
         mousse_control = "shared-preauth-pool",
         mousse_control = "ws-slot-after-headers",
@@ -75,6 +83,14 @@ compile_error!("test-in-person lets a typed ticket count as scanned from the hos
     mousse_control = "stop-on-mismatch",
     mousse_control = "public-routes",
     mousse_control = "no-rediscovery",
+    mousse_control = "auto-send-unknown",
+    mousse_control = "new-request-id-on-retry",
+    mousse_control = "no-prefetch",
+    mousse_control = "pause-all-classes",
+    mousse_control = "fund-two-relays",
+    mousse_control = "keep-removed-slot",
+    mousse_control = "unpinned-manifest",
+    mousse_control = "trust-from-plus",
     mousse_control = "no-preauth-budget",
     mousse_control = "shared-preauth-pool",
     mousse_control = "ws-slot-after-headers",
@@ -131,9 +147,11 @@ const _: () = {
 
 mod app;
 mod applog;
+mod engine;
 mod ipc;
 mod limits;
 mod peer;
+mod plus;
 mod revoke;
 
 /// This build: `<commit>[-dirty]+<profile>`, fixed at compile time (see

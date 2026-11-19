@@ -80,6 +80,7 @@ fn now() -> UnixTime {
 }
 
 fn main() -> ExitCode {
+    no_core_dumps();
     let cli = Cli::parse();
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
@@ -200,6 +201,24 @@ fn run(cli: Cli) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Core dumps off before anything else runs (design §B.15, §B.16): a crash
+/// must not write the identity key or spliced bytes to disk, wherever the
+/// relay runs (the image has no shell to set `ulimit -c 0`). The hard limit
+/// goes to 0 too, so nothing in the process can raise it again.
+fn no_core_dumps() {
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::process::{setrlimit, Resource, Rlimit};
+        let none = Rlimit {
+            current: Some(0),
+            maximum: Some(0),
+        };
+        if let Err(e) = setrlimit(Resource::Core, none) {
+            eprintln!("mousse-relay: cannot turn core dumps off: {e}");
+        }
+    }
 }
 
 /// SHA-256 of the running executable, as `SHA256SUMS` lists it.

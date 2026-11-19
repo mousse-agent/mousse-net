@@ -261,6 +261,24 @@ pub async fn run(
     // anything is accepted (Phase 1a §5.4). If that fails, networking
     // starts paused.
     let removal = crate::revoke::Removal::start(host.clone(), &endpoint.grants_dir());
+    let (engine, engine_events) = crate::engine::Engine::new(
+        host.clone(),
+        removal.clone(),
+        signer.clone(),
+        clock.clone(),
+        endpoint.dir().to_path_buf(),
+    );
+    // Plus (Phase 4): nothing is fetched before ready; the client starts
+    // its background work once attached.
+    let plus = crate::plus::Plus::open(
+        crate::limits::settings().plus_url.as_deref(),
+        endpoint.dir(),
+        clock.clone(),
+        key_storage,
+        endpoint.plus_key_store(),
+        endpoint.endpoint_id(),
+        engine.events(),
+    )?;
     // `routes.json` decides where to listen; without it, `--listen-ip`.
     let stored = RoutesStore::in_dir(state_dir)
         .load()
@@ -446,10 +464,23 @@ pub async fn run(
             Arc::new(caller),
             removal.clone(),
             info,
+            engine.clone(),
+            engine_events,
         ))
     } else {
+        // No app: engine events are only logged.
+        let mut engine_events = engine_events;
+        tokio::spawn(async move {
+            while let Some(event) = engine_events.recv().await {
+                print_line(format!("engine: {event}"));
+            }
+        });
         None
     };
+    // After the app, so the relay client's pairings are there (Phase 4).
+    if let Some(plus) = plus {
+        engine.set_plus(plus);
+    }
     let app_end = async {
         match &app {
             Some(app) => app.ended().await,

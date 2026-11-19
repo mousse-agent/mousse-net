@@ -231,9 +231,10 @@ impl std::error::Error for SignerError {}
 
 /// Every domain string an identity key may sign under (spec `wire.md` 4.1).
 /// A new signed record needs a new, unique entry here.
-pub const IDENTITY_DOMAINS: [&str; 2] = [
+pub const IDENTITY_DOMAINS: [&str; 3] = [
     crate::session_cert::SESSION_DOMAIN,
     crate::manifest::MANIFEST_DOMAIN,
+    crate::removal::REMOVAL_DOMAIN,
 ];
 
 /// A record the identity key is allowed to sign: canonical CBOR, a map

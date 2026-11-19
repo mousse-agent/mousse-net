@@ -32,6 +32,7 @@
 
 mod budget;
 mod changes;
+mod engine_ops;
 mod frame;
 mod out;
 mod pairing;
@@ -43,6 +44,11 @@ mod routes;
 pub use changes::{clock, interface_ips, interface_source};
 pub use paths::{browse_source, StoreCandidates};
 pub(crate) use relay::dial_join_route;
+
+/// Whether a stored role (a peer record's) is `owner`.
+pub fn role_is_owner(stored: &str) -> bool {
+    engine_ops::is_owner(stored)
+}
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -66,6 +72,7 @@ use self::budget::Budget;
 use self::frame::Frame;
 use self::out::{Meta, Out};
 use crate::applog;
+use crate::engine::{Engine, ENGINE_PREFIX};
 use crate::limits::HelperLimits;
 use crate::revoke::Removal;
 
@@ -157,6 +164,7 @@ struct Shared {
     relay: relay::State,
     info: AppInfo,
     limits: HelperLimits,
+    engine: Arc<Engine>,
 }
 
 /// One chunk from the app for the engine.
@@ -275,7 +283,14 @@ fn error(id: &Value, error: &str, reason: impl Into<String>) -> Value {
 
 impl App {
     /// Start the channel on stdin and stdout.
-    pub fn start(host: Host, caller: Arc<Caller>, removal: Arc<Removal>, info: AppInfo) -> Self {
+    pub fn start(
+        host: Host,
+        caller: Arc<Caller>,
+        removal: Arc<Removal>,
+        info: AppInfo,
+        engine: Arc<Engine>,
+        mut engine_events: mpsc::UnboundedReceiver<Value>,
+    ) -> Self {
         let limits = *crate::limits::helper();
         let (ended, _) = watch::channel(None);
         let shared = Arc::new(Shared {
@@ -308,6 +323,7 @@ impl App {
             relay: relay::State::new(&info),
             info,
             limits,
+            engine,
         });
         tokio::spawn(read_stdin(shared.clone()));
         tokio::spawn(write_stdout(shared.clone()));
@@ -315,7 +331,17 @@ impl App {
         tokio::spawn(pairing::prune_completions(shared.clone()));
         tokio::spawn(paths::keep_connected(shared.clone()));
         tokio::spawn(changes::forward_renewals(shared.clone()));
+        // Phase 4's mailbox reads pair secrets and the manifest from here.
+        shared
+            .engine
+            .set_pairs(Arc::new(relay::Pairs(Arc::downgrade(&shared))));
         tokio::spawn(relay::run(shared.clone()));
+        let events_to = shared.clone();
+        tokio::spawn(async move {
+            while let Some(event) = engine_events.recv().await {
+                events_to.event(event);
+            }
+        });
         Self { shared }
     }
 
@@ -781,6 +807,8 @@ impl Shared {
                         .get(&c)
                         .map(|e| (c, e.conn.clone(), e.identity, e.via.clone()))
                 });
+                // Engine stream labels belong to the helper.
+                let label = label.filter(|l| !l.starts_with(ENGINE_PREFIX));
                 match (entry, label, class) {
                     (Some((no, conn, pin, via)), Some(label), Some(class)) => {
                         drop(core);
@@ -842,6 +870,10 @@ impl Shared {
             op if relay::OPS.contains(&op) => {
                 drop(core);
                 relay::on_request(self, id, op, &map);
+            }
+            op if engine_ops::OPS.contains(&op) => {
+                drop(core);
+                engine_ops::on_request(self, id, op, &map);
             }
             other => {
                 let reason = format!("unknown op {other:?}");
@@ -1154,11 +1186,17 @@ async fn write_stdout(shared: Arc<Shared>) {
 /// Watch one connection: hand its peer's streams to the app (or refuse
 /// them), and report its end.
 async fn conn_task(shared: Arc<Shared>, no: u64, conn: Arc<Connection>, inbound: bool) {
+    // Inbound: the host opens engine streams only once the caller has
+    // opened one.
+    let (opened, opened_rx) = watch::channel(false);
+    if inbound {
+        shared.engine.on_inbound(conn.clone(), opened_rx);
+    } else {
+        shared.engine.on_outbound(conn.clone());
+    }
     let accept = async {
         while let Some(stream) = conn.accept_stream().await {
-            // The peer's HELLO comes before any of its streams, so the
-            // minor is known here (a host may be live before it).
-            let keys = conn.minor().unwrap_or(0) >= relay::KEYS_MINOR;
+            opened.send_replace(true);
             if inbound {
                 // The engine lets a host open streams only once its caller
                 // has opened one.
@@ -1172,15 +1210,21 @@ async fn conn_task(shared: Arc<Shared>, no: u64, conn: Arc<Connection>, inbound:
                     relay::send_manifest(&shared, no, conn.clone());
                 }
             }
-            if !inbound {
-                if keys && stream.label() == relay::MANIFEST_LABEL {
-                    tokio::spawn(relay::read_manifest(shared.clone(), *conn.peer(), stream));
-                } else {
-                    // The host opens no other stream to its caller.
-                    stream.writer.reset(ErrorCode::RefusedStream);
+            if stream.label().starts_with(ENGINE_PREFIX) {
+                // The relay's engine streams (minor 1), then Phase 4's.
+                let keys = conn.minor().unwrap_or(0) >= relay::KEYS_MINOR;
+                match stream.label() {
+                    relay::MANIFEST_LABEL if keys && !inbound => {
+                        tokio::spawn(relay::read_manifest(shared.clone(), *conn.peer(), stream));
+                    }
+                    relay::KEYS_LABEL if keys && inbound => {
+                        tokio::spawn(relay::serve_keys(shared.clone(), conn.clone(), stream));
+                    }
+                    _ => shared.engine.on_stream(conn.clone(), inbound, stream),
                 }
-            } else if keys && stream.label() == relay::KEYS_LABEL {
-                tokio::spawn(relay::serve_keys(shared.clone(), conn.clone(), stream));
+            } else if !inbound {
+                // Not in 1.0: the host opens no streams to its caller.
+                stream.writer.reset(ErrorCode::RefusedStream);
             } else if LABELS.contains(&stream.label()) {
                 let label = stream.label().to_owned();
                 let class = stream.class();

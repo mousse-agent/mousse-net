@@ -38,7 +38,7 @@ The code exchange used by "Send link" pairing (CPace) is specified in
 | Name | Value | Where |
 |---|---|---|
 | Major protocol version | `1` | Session certificate (record and extension), pairing ticket, `HELLO` |
-| Minor protocol version | `1` | `HELLO` |
+| Minor protocol version | `2` | `HELLO` |
 | TLS ALPN | `mousse/1` | TLS ClientHello and ServerHello |
 
 - A peer MUST reject a certificate or ticket whose major version it does not
@@ -78,9 +78,10 @@ When the peer's `HELLO` arrives, each side decides on its own:
 When both sides accept, they reach the same `agreed`.
 
 **What each minor adds.** Minor `1` adds two engine streams (9.5),
-`mousse-keys` and `mousse-manifest`, for relays. Each is opened only on a
-connection whose `agreed` minor is at least the one that added it; a minor
-`0` peer never sees them.
+`mousse-keys` and `mousse-manifest`, for relays; minor `2` adds
+`mousse-grants` and `mousse-removal`. Each is opened only on a connection
+whose `agreed` minor is at least the one that added it; a minor `0` peer
+never sees them.
 
 **Only the first `HELLO` counts.** The peer's first `HELLO` on a connection
 fixes `agreed` or closes the connection. A later `HELLO` on the same
@@ -157,9 +158,10 @@ display and indexing value; it does not appear on the wire.
 
 **What the identity key signs (frozen).** The identity key signs only
 canonical CBOR maps (section 3) whose key `1` is a text domain string, and
-each domain string names exactly one record type. Major version 1 has one
-domains: `mousse-session-v1`, the session record (5.1), and
-`mousse-manifest-v1`, the relay manifest (9.5). A new signed record
+each domain string names exactly one record type. Major version 1 has
+these domains: `mousse-session-v1`, the session record (5.1),
+`mousse-manifest-v1`, a host's relay manifest (9.5), and
+`mousse-removal-v1`, a removal from an owner-role device (9.5). A new signed record
 needs a new domain string that no other record uses; the identity key MUST
 never sign raw bytes, a hash supplied from outside, or a record without its
 domain at key 1. This keeps any two signed things from ever being confused,
@@ -502,7 +504,9 @@ Rules:
   effect on other endpoints of the same device.
 - Grant ids are local and never reused, also across restarts: an endpoint
   stores the next grant id with its grants, because the grant that last
-  used an id may already be gone.
+  used an id may already be gone. A grant that replaces another (a new
+  pairing of the same device) takes a new id, so a grant id names exactly
+  one pairing.
 
 **Removal from another device (later phases).** Phase 0 removes grants only
 locally. When removal messages are added, an endpoint accepts one only from
@@ -706,39 +710,78 @@ An unknown error code in `RESET` or `GOAWAY` is not a frame error; treat it as
 - **GOAWAY** ends the connection: the sender sends nothing after it and closes
   the pipe; the receiver stops sending and closes too.
 
-### 9.5 Engine streams (minor 1)
+### 9.5 Engine streams
 
-Labels starting `mousse-` are the engine's own: an endpoint handles them
-itself and never passes them to the application. Each needs the agreed
-minor version that added it (section 2); on an older connection it is
-never opened. A side that gets one it does not handle resets it with
-`REFUSED_STREAM`.
+Streams whose label starts with `mousse-` belong to the engine: an
+implementation handles them itself and never passes them to an
+application, and an application cannot open them. Each is opened only when
+the connection's agreed minor version (section 2) allows it; any other
+`mousse-` stream is answered with `RESET REFUSED_STREAM`.
 
-- **`mousse-keys`** (caller opens it, after its first live connection to a
-  host and again whenever the host's answer is missing). The caller sends
-  `{1: caller relay public key (65 bytes, SEC1)}` and `FIN`; the host
-  answers `{1: pair secret (32 bytes)}` and `FIN`. The caller key is one
-  P-256 key per caller and host; a relay admits a call by its fingerprint.
-  The host answers only on a connection bound to a live grant.
-- **`mousse-manifest`** (host opens it, on a connection where the caller
-  has opened a stream, and again on every change). The payload is a signed
-  envelope `{1: record, 2: raw signature}` by the host's identity key over
-  the manifest record:
+Each message on an engine stream is a 4-byte big-endian length followed by
+that many bytes of one canonical CBOR map (section 3). A message is at most
+**262 144** bytes; a longer declared length is a protocol error on that
+stream (`RESET PROTOCOL_ERROR`).
 
-  | Key | Value |
-  |---|---|
-  | 1 | text `"mousse-manifest-v1"` |
-  | 2 | bytes: host identity key (65) |
-  | 3 | uint: sequence (grows) |
-  | 4 | uint: issued at |
-  | 5 | uint: expires at |
-  | 6 | array of at most 4 routes `{1: relay identity key (65), 2: 1 to 4 endpoint texts host:port, 3: handle (32), 4: region text (0 to 32 bytes)}` |
+| Label | Minor | Opened by | Carries |
+|---|---|---|---|
+| `mousse-keys` | 1 | caller, on every new connection to a host, as its first stream | caller → host: `{1: caller relay public key (65, SEC1)}`; host → caller: `{1: pair secret (32)}`; then both finish. The host answers only on a connection bound to a live grant |
+| `mousse-manifest` | 1 | host, once the caller has opened a stream, and again on every change | one signed manifest envelope (below); then the host finishes |
+| `mousse-grants` | 2 | host, to a caller whose live grant has role `owner` | `{1: [{1: identity key (65), 2: grant id (uint), 3: role (text), 4: name (text)}]}`: every grant on the host, at the stream's start and again on every change |
+| `mousse-removal` | 2 | caller | caller → host: one signed removal envelope; host → caller: `{1: removal id (16), 2: result (0 applied, 1 stale, 2 refused)}`; then both finish |
 
-  A caller keeps a manifest only if the identity key at key 2 is the pinned
-  host and the signature verifies under it, and only if its sequence is
-  above the one it keeps. Endpoint texts follow the `tcp` hint host and
-  port rules (10.2.1), lower case. Past `expires at` the manifest is stale:
-  its routes are still tried, after every other route.
+**The caller key** is one P-256 key per caller and host; a relay admits a
+call by its fingerprint (`relay.md`). The pair secret is one 32-byte
+random value per grant; the host keeps it for that grant.
+
+**The manifest record** (domain `mousse-manifest-v1`), signed by the
+host's identity key; the envelope is `{1: record bytes, 2: raw signature
+(64)}` over the record bytes:
+
+| Key | Value |
+|---|---|
+| 1 | text `"mousse-manifest-v1"` |
+| 2 | bytes: host identity key (65) |
+| 3 | uint: sequence (grows) |
+| 4 | uint: issued at |
+| 5 | uint: expires at |
+| 6 | array of at most 4 routes `{1: relay identity key (65), 2: 1 to 4 endpoint texts host:port, 3: handle (32), 4: region text (0 to 32 bytes)}` |
+
+A caller keeps a manifest only if the identity key at key 2 is the pinned
+host and the signature verifies under it, and only if its sequence is above
+the one it keeps. Endpoint texts follow the `tcp` hint host and port rules
+(10.2.1), lower case. Past `expires at` the manifest is stale: its routes
+are still tried, after every other route.
+
+**The removal record** (domain `mousse-removal-v1`), signed by the admin
+device's identity key: `{1: "mousse-removal-v1", 2: signer identity key
+(65), 3: recipient host identity key (65), 4: removed identity key (65), 5:
+grant id on the recipient (uint), 6: removal id (16, random), 7: issued at
+(Unix seconds)}`. The envelope is `{1: record bytes, 2: raw signature (64)}`
+over the record bytes. A removal is signed once; every resend carries the
+same bytes.
+
+**What a host accepts**, under the lock under which it admits connections
+and enrolls devices, in order; a failure answers `refused` or `stale` and
+changes nothing else:
+
+1. The signature verifies under key 2, and that signer holds a live grant
+   with role `owner` on this endpoint.
+2. Key 3 is this endpoint's identity.
+3. The removal id is new. A known id whose record bytes hash (SHA-256) to
+   the stored hash returns the stored result and does nothing else; a known
+   id with other bytes is `refused`. `issued at` is at most the removal
+   maximum age plus the clock skew in the past, and at most the clock skew
+   in the future.
+4. Key 4 holds a grant whose id equals key 5; otherwise `stale` (a newer
+   pairing of that device stays).
+5. That grant's authorizing owner equals the signer's grant's authorizing
+   owner; otherwise `refused`.
+
+The host stores the removal id, the record hash and the result durably for
+every result from check 3 on, before it acts; for `applied` it then removes
+the grant, whose connections close with `GRANT_REVOKED`. It keeps removal
+ids for the maximum age plus the skew.
 
 ## 10. Pairing
 

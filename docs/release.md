@@ -101,7 +101,8 @@ made. More enrollment links: `sudo -u mousse-relay mousse-relay enroll --state
 root, all capabilities dropped (Docker lets an unprivileged process bind 443
 inside the container), `no-new-privileges`, core dumps off and one named
 volume at `/state`. The image is `scratch` plus the static binary: no shell,
-no package manager, user 65532.
+no package manager, user 65532. The relay sets its own core-dump limit
+to 0 at start, so dumps stay off without a shell to run `ulimit -c 0`.
 
     docker compose run --rm relay init --state /state --public <ip or name>:443
     docker compose up -d
@@ -136,7 +137,8 @@ and minisign 0.12 are fetched once, by pinned SHA-256.
   linked relay, and an upgrade keeps it; a tampered download leaves no
   binary, unit or user; the cloud-init template does the same on first boot;
   the image has no shell and an unprivileged user, runs read-only, accepts on
-  443 and keeps its identity in the volume across restarts. Control
-  `skip-verify`.
+  443 and keeps its identity in the volume across restarts; the relay
+  sets its own core-dump limit to 0 even where the container allows dumps.
+  Control `skip-verify`.
 - `phase3.outside-template` is a manual step: an independent tester deploys
   and upgrades the template on their own VPS.

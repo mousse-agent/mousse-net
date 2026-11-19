@@ -44,10 +44,12 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use mousse_net_core::grants::GrantId;
 use mousse_net_core::identity::{IdentityPublicKey, IdentityRecord, PublicKey};
 use mousse_net_core::manifest::{Envelope, Manifest, ManifestRoute, MANIFEST_ROUTES_MAX};
 use mousse_net_core::mux::PriorityClass;
 use mousse_net_core::pairing::{InvitationId, Ticket};
+use mousse_net_core::pairmail::PairSecret;
 use mousse_net_core::relay::msg::{
     InvitationEntry, ALLOW_CALLERS_MAX, ALLOW_INVITATIONS_MAX, RELAY_MESSAGE_MAX,
 };
@@ -65,6 +67,8 @@ use mousse_net_io::relay::{
     TargetLink, WsPipe,
 };
 use mousse_net_io::rng::random_bytes;
+
+use crate::engine::stream as engine_stream;
 use mousse_net_io::store::{
     hex, identity_from_hex, short_id, unhex, Approval, ApprovalStore, PeerStore,
 };
@@ -411,7 +415,7 @@ pub async fn run(shared: Arc<Shared>) {
         }
     }
     rebuild_manifest(&shared);
-    let mut removals = shared.removal.removals();
+    let mut removals = shared.removal.removed();
     let mut tick = tokio::time::interval(crate::limits::ms(limits().via_relay_check_ms()));
     loop {
         tokio::select! {
@@ -949,33 +953,75 @@ pub fn on_invitation_ended(shared: &Shared, invitation: &InvitationId) {
 }
 
 // ---------------------------------------------------------------------------
+// Pairings for the Plus mailbox (Phase 4)
+
+/// What the relay client knows that Phase 4's mailbox needs: each grant's
+/// pair secret, the secret each host sent, and this host's manifest.
+pub struct Pairs(pub std::sync::Weak<Shared>);
+
+impl crate::engine::mailbox::PairSource for Pairs {
+    fn host_pairings(&self) -> Vec<(GrantId, IdentityPublicKey, PairSecret)> {
+        let Some(shared) = self.0.upgrade() else {
+            return Vec::new();
+        };
+        let Ok(seed) = shared.relay.seed() else {
+            return Vec::new();
+        };
+        let keys = shared.relay.files.grants().unwrap_or_default().keys;
+        shared
+            .host
+            .grants()
+            .into_iter()
+            .filter_map(|g| {
+                let identity = hex(g.identity.as_bytes());
+                let k = keys
+                    .iter()
+                    .find(|k| k.grant == g.id.0 && k.identity == identity)?;
+                let salt = unhex(&k.salt).ok()?;
+                let secret = derive_secret(seed, PAIR_SECRET_INFO, &salt);
+                Some((g.id, g.identity, PairSecret::from_bytes(*secret)))
+            })
+            .collect()
+    }
+
+    fn caller_secret(&self, pin: &IdentityPublicKey) -> Option<PairSecret> {
+        let shared = self.0.upgrade()?;
+        let key = hex(pin.as_bytes());
+        let file = shared.relay.files.peers().ok()?;
+        let entry = file.peers.iter().find(|p| p.identity == key)?;
+        let secret = Zeroizing::new(fixed::<32>(entry.pair_secret.as_deref()?)?);
+        Some(PairSecret::from_bytes(*secret))
+    }
+
+    fn manifest(&self) -> Option<Vec<u8>> {
+        let shared = self.0.upgrade()?;
+        let manifest = guard(&shared.relay.manifest);
+        manifest.as_ref().map(|(_, envelope)| envelope.encode())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // `mousse-keys` and `mousse-manifest`
 
-async fn read_all(stream: &mut mousse_net_io::StreamReader, max: usize) -> Option<Vec<u8>> {
-    let mut out = Vec::new();
-    loop {
-        match tokio::time::timeout(dial_within(), stream.read()).await {
-            Ok(Ok(Some(chunk))) => {
-                out.extend_from_slice(&chunk);
-                if out.len() > max {
-                    return None;
-                }
-            }
-            Ok(Ok(None)) => return Some(out),
-            _ => return None,
-        }
+/// The one message (wire.md 9.5: length-prefixed CBOR) the peer sends on
+/// an engine stream, if it comes in time and is at most `max` bytes.
+async fn read_one(stream: mousse_net_io::StreamReader, max: usize) -> Option<Vec<u8>> {
+    let mut reader = engine_stream::MessageReader::new(stream);
+    match reader.next_within(dial_within()).await {
+        Ok(Some(message)) if message.len() <= max => Some(message),
+        _ => None,
     }
 }
 
 /// Host: a caller enrolls its caller key for this pairing.
 pub async fn serve_keys(shared: Arc<Shared>, conn: Arc<Connection>, stream: MuxStream) {
-    let (mut reader, writer) = stream.split();
+    let (reader, writer) = stream.split();
     let peer = short_id(conn.peer());
     let refuse = |code: ErrorCode, why: &str| {
         applog::line(format!("refused a caller key from {peer}: {why}"));
         writer.reset(code);
     };
-    let Some(request) = read_all(&mut reader, 256).await else {
+    let Some(request) = read_one(reader, 256).await else {
         refuse(ErrorCode::ProtocolError, "no complete request");
         return;
     };
@@ -1031,7 +1077,10 @@ pub async fn serve_keys(shared: Arc<Shared>, conn: Arc<Connection>, stream: MuxS
         return;
     };
     let secret = derive_secret(seed, PAIR_SECRET_INFO, &salt_bytes);
-    if writer.write(&encode_keys_answer(&secret)).await.is_ok() {
+    if engine_stream::write(&writer, &encode_keys_answer(&secret))
+        .await
+        .is_ok()
+    {
         writer.finish();
     }
     refresh_allow(&shared);
@@ -1144,13 +1193,12 @@ pub async fn ensure_keys(shared: &Arc<Shared>, conn: &Connection) {
             .open_stream(PriorityClass::Interactive, KEYS_LABEL)
             .await
             .map_err(|e| e.to_string())?;
-        let (mut reader, writer) = stream.split();
-        writer
-            .write(&encode_keys_request(&key.public_key()))
+        let (reader, writer) = stream.split();
+        engine_stream::write(&writer, &encode_keys_request(&key.public_key()))
             .await
             .map_err(|e| e.to_string())?;
         writer.finish();
-        read_all(&mut reader, 256)
+        read_one(reader, 256)
             .await
             .ok_or_else(|| "no answer".to_owned())
     };
@@ -1202,7 +1250,10 @@ pub fn send_manifest(shared: &Arc<Shared>, no: u64, conn: Arc<Connection>) {
             .await
         {
             let (_reader, writer) = stream.split();
-            if writer.write(&envelope.encode()).await.is_ok() {
+            if engine_stream::write(&writer, &envelope.encode())
+                .await
+                .is_ok()
+            {
                 writer.finish();
             }
         }
@@ -1326,8 +1377,8 @@ fn issue_manifest(shared: &Arc<Shared>, routes: Vec<ManifestRoute>) {
 /// Caller: the host sent its manifest. Kept if it is signed by the pin and
 /// newer than the one kept.
 pub async fn read_manifest(shared: Arc<Shared>, pin: IdentityPublicKey, stream: MuxStream) {
-    let (mut reader, writer) = stream.split();
-    let Some(bytes) = read_all(&mut reader, RELAY_MESSAGE_MAX).await else {
+    let (reader, writer) = stream.split();
+    let Some(bytes) = read_one(reader, RELAY_MESSAGE_MAX).await else {
         writer.reset(ErrorCode::ProtocolError);
         return;
     };
