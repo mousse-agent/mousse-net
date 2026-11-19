@@ -14,6 +14,7 @@ use mousse_check::kit::{payload_from, SignArgs};
 const FAKE_CHECK: &str = r#"
 import { execSync, spawnSync } from 'node:child_process'
 import { existsSync, writeFileSync } from 'node:fs'
+import net from 'node:net'
 const args = process.argv.slice(2)
 const id = args[0]
 const flag = (n) => { const i = args.indexOf(n); return i >= 0 ? args[i + 1] : undefined }
@@ -38,6 +39,29 @@ if (flag('--role') === 'caller') {
   console.log(`host_app_build=${head}`)
 }
 const control = process.env.MOUSSE_NET_ENGINE_CONTROL
+// Phase 1b: the route case and the kit's stand-ins. The kit's controls
+// stand for an app that breaks the rule and still prints PASS.
+const route = flag('--route')
+console.log(`seen_route=${route ?? 'none'}`)
+console.log(`seen_plus=${process.env.MOUSSE_PLUS_ORIGIN ? 'set' : 'unset'}`)
+const probe = process.env.MOUSSE_CHECK_PROBE_BIN
+console.log(`seen_probe=${probe && existsSync(probe) ? 'exists' : 'missing'}`)
+if (route) {
+  const kind = control === 'route-leak' ? (route === 'tcp' ? 'ws' : 'tcp') : route
+  const ups = route === 'tcp' ? [{ kind, class: 'tailnet' }, { kind, class: 'public' }] : [{ kind }]
+  const lines = ups.map((r) => JSON.stringify({ ev: 'conn.up', route: r }) + String.fromCharCode(10))
+  writeFileSync(`${flag('--out')}/conn-up.jsonl`, lines.join(''))
+}
+if (control === 'plus-probe') {
+  await fetch(`${process.env.MOUSSE_PLUS_ORIGIN}/v1/session`).catch(() => {})
+}
+if (control === 'egress-probe') {
+  await new Promise((done) => net.connect(443, '192.0.2.7').on('error', done).on('connect', done))
+}
+if (['plus-probe', 'egress-probe', 'route-leak'].includes(control)) {
+  console.log(`PASS ${id}`)
+  process.exit(0)
+}
 // FAKE_ENDING: how a broken check script might end instead.
 const ending = process.env.FAKE_ENDING
 if (ending === 'fail-exit-0') {
@@ -196,7 +220,21 @@ fn a_caller_run_builds_the_helper_runs_the_app_check_and_keeps_every_build() {
     assert!(out_dir.join("ran").exists());
     // The app's lines pass through.
     assert_eq!(value(&out, "app_build"), head);
-    assert!(out.lines().any(|l| l.trim() == "PASS phase1a.pair-offline"));
+    // The app's verdict line is shown as the app's; the run's verdict comes
+    // last.
+    assert!(out
+        .lines()
+        .any(|l| l.trim() == "app: PASS phase1a.pair-offline"));
+    assert_eq!(
+        String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .last()
+            .map(str::trim),
+        Some("PASS phase1a.pair-offline"),
+        "{out}"
+    );
+    // Phase 1a checks run as they were signed: no stand-ins.
+    assert_eq!(value(&out, "seen_plus"), "unset", "{out}");
 
     // The result names both machines' helper and app builds, and signing
     // keeps them where the kit reads them.
@@ -293,6 +331,72 @@ fn a_device_result_is_judged_like_a_local_run() {
             "ending {ending:?}, control {control}:
 {out}"
         );
+        let _ = std::fs::remove_file(&result);
+    }
+}
+
+/// A Phase 1b route case: the app gets the kit's Plus recorder, the egress
+/// guard and the probe, and the run passes only when every connection used
+/// the route.
+#[test]
+fn a_route_case_runs_with_the_stand_ins_and_passes_on_its_own_route() {
+    let (app, _head) = fake_app("route");
+    let out_dir = app.0.with_extension("route-out");
+    let o = run_mjs(
+        Some(&app.0),
+        &[
+            "phase1b.routes-app",
+            "--route",
+            "tcp",
+            "--out",
+            out_dir.to_str().unwrap(),
+        ],
+    );
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out}");
+    assert_eq!(value(&out, "seen_route"), "tcp", "{out}");
+    assert_eq!(value(&out, "seen_plus"), "set", "{out}");
+    assert_eq!(value(&out, "seen_probe"), "exists", "{out}");
+    assert!(out.contains("fence="), "{out}");
+    assert!(
+        out.lines().any(|l| l.trim() == "PASS phase1b.routes-app"),
+        "{out}"
+    );
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+/// Each kit control stands for an app that breaks a rule and still prints
+/// PASS: the run fails, with the kit's reason.
+#[test]
+fn the_kits_controls_fail_with_the_kits_reasons() {
+    let (app, _head) = fake_app("kitctl");
+    for (control, reason) in [
+        ("plus-probe", "plus_contacted"),
+        ("egress-probe", "egress_attempted"),
+        ("route-leak", "route_mismatch"),
+    ] {
+        let result = app.0.with_extension(format!("{control}.json"));
+        let o = run_mjs(
+            Some(&app.0),
+            &[
+                "phase1b.routes-app",
+                "--route",
+                "ws",
+                "--control",
+                control,
+                "--target",
+                "windows-x64",
+                "--result",
+                result.to_str().unwrap(),
+            ],
+        );
+        let out = text(&o);
+        assert_eq!(o.status.code(), Some(1), "{control}: {out}");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&result).unwrap()).unwrap();
+        assert_eq!(v["outcome"], "FAIL", "{control}: {out}");
+        assert_eq!(v["reason"], reason, "{control}: {out}");
+        assert_eq!(v["case"], "ws", "{control}: {out}");
         let _ = std::fs::remove_file(&result);
     }
 }

@@ -17,7 +17,12 @@ const APP_PREFIX: &str = "ENGINE_";
 /// Debug-build test hooks read by the network crates, not limits
 /// (Phase 1b §1.2 and §4.2). Release builds never read them, so there they
 /// count as unknown names.
-const DEBUG_HOOKS: [&str; 2] = ["TEST_EXTRA_ROOT", "TEST_CLASS_MAP"];
+const DEBUG_HOOKS: [&str; 4] = [
+    "TEST_EXTRA_ROOT",
+    "TEST_CLASS_MAP",
+    "TEST_EGRESS",
+    "TEST_EGRESS_LOG",
+];
 
 /// After [`ENV_PREFIX`]: the Mousse app's helper path in unpackaged builds.
 const APP_HELPER_PATH: &str = "HELPER";
