@@ -639,3 +639,93 @@ fn a_signed_app_result_counts_only_with_the_pinned_app_build() {
     let out = text(&o);
     assert!(row(&out, "phase9.device").contains("PASS"), "{out}");
 }
+
+/// A check with named cases: the probe gets the case as its second
+/// argument and in `MOUSSE_CHECK_CASE`, and fails a case whose two disagree.
+fn add_route_check(d: &Path) {
+    std::fs::write(
+        d.join("route.cmd"),
+        "@echo off\r\nif not \"%MOUSSE_CHECK_CASE%\"==\"%2\" (echo FAIL %1 reason=wrong_case& exit /b 1)\r\nif \"%PROBE_MODE%\"==\"break\" (echo FAIL %1 reason=route_mismatch& exit /b 1)\r\necho ran %2>> \"%ROUTE_LOG%\"\r\necho PASS %1\r\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d.join("route.sh"),
+        "if [ \"$MOUSSE_CHECK_CASE\" != \"$2\" ]; then echo \"FAIL $1 reason=wrong_case\"; exit 1; fi\nif [ \"$PROBE_MODE\" = break ]; then echo \"FAIL $1 reason=route_mismatch\"; exit 1; fi\necho \"ran $2\" >> \"$ROUTE_LOG\"\necho \"PASS $1\"\n",
+    )
+    .unwrap();
+    let cmd = if cfg!(windows) {
+        "[\"cmd\", \"/C\", '{root}\\route.cmd', \"phase9.routes\", \"{case}\"]".to_string()
+    } else {
+        "[\"sh\", \"route.sh\", \"phase9.routes\", \"{case}\"]".to_string()
+    };
+    let check = format!(
+        r#"
+[[check]]
+id = "phase9.routes"
+title = "one result per route"
+plan = "test"
+targets = ["here"]
+judge = "marker"
+cases = ["tcp", "ws", "ssh"]
+waits = [{{ slice = "E9", paths = ["ssh.rs"], case = "ssh" }}]
+[[check.local]]
+target = "here"
+host = "{h}"
+command = {cmd}
+env = {{ ROUTE_LOG = "{{root}}/route.log" }}
+[[check.control]]
+name = "leak"
+breaks = "another route wins"
+env = {{ PROBE_MODE = "break" }}
+expect_reason = "route_mismatch"
+"#,
+        h = host()
+    );
+    let path = d.join("checks/phase9.toml");
+    let m = std::fs::read_to_string(&path).unwrap() + &check;
+    std::fs::write(&path, m).unwrap();
+    std::fs::write(d.join(".gitignore"), "route.log\n").unwrap();
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-q", "-m", "a check with routes"]);
+}
+
+#[test]
+fn each_case_runs_on_its_own_and_a_waiting_case_keeps_the_check_incomplete() {
+    let r = repo("cases", false);
+    let d = &r.dir;
+    add_route_check(d);
+    let o = run(d, &["run", "phase9.routes"]);
+    let out = text(&o);
+    assert!(o.status.success(), "{out}");
+    assert!(out.contains("[ssh]: not run: waits for E9"), "{out}");
+    let o = run(d, &["run", "phase9.routes", "--control"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let ran = std::fs::read_to_string(d.join("route.log")).unwrap();
+    let ran: Vec<&str> = ran.lines().map(str::trim).collect();
+    assert_eq!(ran, ["ran tcp", "ran ws"], "the control runs print nothing");
+    let o = run(d, &["report", "phase9", "--full"]);
+    let out = text(&o);
+    let line = row(&out, "phase9.routes");
+    assert!(line.contains("INCOMPLETE"), "{out}");
+    assert!(out.contains("[ssh] waits for E9"), "{out}");
+
+    // The slice lands: the ssh case runs, and the check passes.
+    std::fs::write(d.join("ssh.rs"), "// E9\n").unwrap();
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-q", "-m", "E9 lands"]);
+    let o = run(d, &["run", "phase9.routes", "--case", "ssh"]);
+    assert!(o.status.success(), "{}", text(&o));
+    // Runs for the earlier commit are for another build.
+    let o = run(d, &["report", "phase9", "--full"]);
+    assert!(row(&text(&o), "phase9.routes").contains("INCOMPLETE"));
+    let o = run(d, &["run", "phase9.routes"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let o = run(d, &["run", "phase9.routes", "--control"]);
+    assert!(o.status.success(), "{}", text(&o));
+    let o = run(d, &["report", "phase9", "--full"]);
+    let out = text(&o);
+    assert!(row(&out, "phase9.routes").contains("PASS"), "{out}");
+    let o = run(d, &["run", "phase9.routes", "--case", "udp"]);
+    assert!(!o.status.success());
+    assert!(text(&o).contains("no case udp"), "{}", text(&o));
+}

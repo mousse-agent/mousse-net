@@ -48,6 +48,8 @@ Each `[[check]]`:
 | `manual`, `steps` | a manual step; cells can only be ATTESTED |
 | `device_steps` | how a device produces its result, shown while the cell is INCOMPLETE |
 | `timeout_secs` | per run, default 3600 |
+| `cases` | named cases, such as routes (`["tcp", "ws", "ssh"]`). Each case is its own run and its own result; the cell passes only when every case passes, and every control must fail in every case. Not with `[check.matrix]` or `manual`. Each local command (or its `env`) must name `{case}`; the kit also sets `MOUSSE_CHECK_CASE` |
+| `[[check.waits]]` | `slice`, `paths` (relative to the root) and optional `case`. Until every path exists, the check (or only that case) is INCOMPLETE with "waits for <slice>" and is not run. Lets a check land before the engine slice it tests. Waits do not count in `config` |
 | `[[check.local]]` | `target`, `host` (`windows-x86_64`, `macos-aarch64`, `linux-x86_64`, ...), `command`, optional `cwd`, `env`, `placeholder`. Runs when the kit is on that host. `{root}`, `{out}` (a fresh folder per run) and `{build}` are replaced; `MOUSSE_BUILD_ID` is set. |
 | `[[check.control]]` | `name`, `breaks` (what is broken), and `args` (appended), `env` (added) or `command` (replaces). `missing = "reason"` while the control does not exist: the check is FAIL until it does. `expect_reason = "<word>"`: the control must fail for this reason (see below). |
 | `[check.matrix]` | `providers`, `providers_for` (per target), `legacy_results` (unsigned files shown but never counted) |
@@ -70,7 +72,7 @@ Device results are JSON payloads `{check, target, case?, control?, build, platfo
 
 `sign` also keeps these top-level fields of a result file in `extra`: `reason`, `host_build`, `caller_build`, `app_build` and `host_app_build` (and `reason` inside an object `details`). For a `cross_machine` check, `build` is the caller's build and `extra.host_build` the host's; both, and `extra.caller_build` if present, must be the build under test. A result without `extra.host_build` does not count.
 
-A cell from devices passes when, for this build, every case (one, or every matrix pair) has a PASS, no result says FAIL, and every control has at least one result and all of them say FAIL. A changed or forged file is listed as TAMPERED and blocks the verdict.
+A cell from devices passes when, for this build, every case (one, every named case, or every matrix pair) has a PASS, no result says FAIL, and every control has at least one result and all of them say FAIL (with named cases: at least one result in each case). A changed or forged file is listed as TAMPERED and blocks the verdict.
 
     # on the device, once
     mousse-check device keygen --out ~/.mousse/device.key
