@@ -112,9 +112,38 @@ fn stored_candidates(record: &PeerRecord) -> Vec<Route> {
     out
 }
 
-/// Reach `record`'s host: the stored candidates, then what the browse
-/// source finds. Returns the live connection and the route it used.
-async fn reach(shared: &Shared, record: &PeerRecord) -> Result<(Connection, Route), NetError> {
+/// How a dial reached its host.
+enum Reached {
+    Direct(Route),
+    Relay(mousse_net_core::relay_wire::RelayRoute),
+}
+
+/// Reach `record`'s host: direct routes and browse first, then its relay
+/// routes (Phase 3 B.6, B.11). A refusal by the host itself ends it.
+async fn reach(shared: &Shared, record: &PeerRecord) -> Result<(Connection, Reached), NetError> {
+    let direct = reach_direct(shared, record).await;
+    let first = match direct {
+        Ok((conn, route)) => return Ok((conn, Reached::Direct(route))),
+        Err(e @ NetError::Closed(_)) => return Err(e),
+        Err(e) => e,
+    };
+    let pin = record.pin()?;
+    if super::relay::candidates(shared, &pin).is_empty() {
+        return Err(first);
+    }
+    match super::relay::reach(shared, &pin).await {
+        Ok((conn, route)) => Ok((conn, Reached::Relay(route))),
+        Err(e @ NetError::Closed(_)) => Err(e),
+        Err(_) => Err(first),
+    }
+}
+
+/// Reach `record`'s host directly: the stored candidates, then what the
+/// browse source finds. Returns the live connection and the route it used.
+async fn reach_direct(
+    shared: &Shared,
+    record: &PeerRecord,
+) -> Result<(Connection, Route), NetError> {
     let pin = record.pin()?;
     let stored = stored_candidates(record);
     let first = match shared.caller.dial_candidates(&stored, pin).await {
@@ -328,21 +357,39 @@ pub async fn dial(
         .keep
         .note_end(pin, reached.as_ref().err().map(Failure::of));
     let (conn, used) = reached.map_err(DialError::Failed)?;
-    // Only the route is noted, on the record as stored now.
-    let _ = PeerStore::in_dir(&shared.info.state_dir).note_route(&pin, route_uri(&used));
-    applog::line(format!(
-        "connected {} (out) at {}",
-        short_id(&pin),
-        route_uri(&used)
-    ));
     let role = super::pairing::role_text(&record.role);
-    let no = match shared.add_outbound(conn, gen, json!({"dir": "out", "role": role})) {
+    let mut fields = json!({"dir": "out", "role": role});
+    let via = match used {
+        Reached::Direct(used) => {
+            // Only the route is noted, on the record as stored now.
+            let _ = PeerStore::in_dir(&shared.info.state_dir).note_route(&pin, route_uri(&used));
+            applog::line(format!(
+                "connected {} (out) at {}",
+                short_id(&pin),
+                route_uri(&used)
+            ));
+            None
+        }
+        Reached::Relay(route) => {
+            applog::line(format!(
+                "connected {} (out) through relay {}",
+                short_id(&pin),
+                route.endpoint
+            ));
+            fields["route"] = super::relay::route_json(&route, false);
+            Some(route)
+        }
+    };
+    let no = match shared.add_outbound(conn, gen, fields) {
         Ok(no) => no,
         Err(super::Stale::Paused) => return Err(DialError::Paused),
         Err(super::Stale::Forgotten) => {
             return Err(DialError::NoPeer("forgotten while the path opened".into()))
         }
     };
+    if let Some(route) = via {
+        shared.set_via(no, route);
+    }
     Ok(Dialled {
         conn: no,
         already: false,

@@ -83,6 +83,55 @@ pub(crate) fn usable_routes(hints: &[String]) -> Vec<Route> {
         .collect()
 }
 
+/// Where a join dials: a `tcp` route, or a relay with the ticket's
+/// invitation tag (Phase 3 B.7).
+pub(crate) enum JoinRoute {
+    Tcp(Route),
+    Relay {
+        route: mousse_net_core::relay_wire::RelayRoute,
+        tag: [u8; 32],
+    },
+}
+
+impl JoinRoute {
+    fn hint(&self) -> String {
+        match self {
+            JoinRoute::Tcp(route) => route_uri(route),
+            JoinRoute::Relay { route, .. } => route.to_hint(),
+        }
+    }
+}
+
+/// One join attempt on `pipe`, redialling the same way if it drops.
+#[allow(clippy::too_many_arguments)]
+async fn join_on<P, C, D, Fut>(
+    caller: &Caller,
+    pipe: P,
+    ticket: &Ticket,
+    arrival: Arrival,
+    name: &str,
+    codes: &mut C,
+    consented: bool,
+    pinned: bool,
+    redial: D,
+) -> Result<(Connection, JoinOutcome), NetError>
+where
+    P: mousse_net_io::pipe::Pipe,
+    C: CodeEntry,
+    D: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<P, NetError>>,
+{
+    if consented {
+        caller
+            .join_pinned_with_redial(pipe, ticket, arrival, name, codes, redial)
+            .await
+    } else {
+        caller
+            .join_with_redial(pipe, ticket, arrival, name, codes, pinned, redial)
+            .await
+    }
+}
+
 /// Asks for the send-link code on the terminal.
 pub struct TypedCode;
 
@@ -160,6 +209,7 @@ pub fn reason_of(e: &NetError) -> String {
         NetError::Tls(_) => "tls".into(),
         NetError::Timeout(_) => "timeout".into(),
         NetError::Io(_) => "unreachable".into(),
+        NetError::Relay(e) => e.word().into(),
         _ => "error".into(),
     }
 }
@@ -226,11 +276,14 @@ pub async fn join(
             "pairing_failed",
         ));
     }
-    let candidates = if routes.is_empty() {
+    let candidates: Vec<JoinRoute> = if routes.is_empty() {
         usable_routes(&ticket.routes)
     } else {
         parse_routes(routes).map_err(|e| Failure::new(e, "bad_route"))?
-    };
+    }
+    .into_iter()
+    .map(JoinRoute::Tcp)
+    .collect();
     if candidates.is_empty() {
         return Err(Failure::new(
             "the ticket has no usable address; pass --route tcp://host:port",
@@ -277,7 +330,7 @@ pub(crate) async fn join_routes<C: CodeEntry>(
     ticket: &Ticket,
     arrival: Arrival,
     name: &str,
-    candidates: &[Route],
+    candidates: &[JoinRoute],
     consented: bool,
     codes: &mut C,
     mut progress: impl FnMut(&str),
@@ -291,27 +344,40 @@ pub(crate) async fn join_routes<C: CodeEntry>(
     // Any step 1 failure on an address means "try the next one"; one is
     // shown only when no address passed (wire.md 5.4).
     let mut step1 = Step1Failures::default();
-    for route in candidates {
-        let hint = route_uri(route);
+    for candidate in candidates {
+        let hint = candidate.hint();
         progress(&hint);
-        let pipe = match connect_tcp_within(route, connect_timeout()).await {
-            Ok(p) => p,
-            Err(e) => {
-                last = Failure::new(format!("{hint}: {e}"), "unreachable");
-                continue;
+        // If the connection drops before PAIRED, the join reconnects the
+        // same way to learn whether the host enrolled this device.
+        let joined = match candidate {
+            JoinRoute::Tcp(route) => {
+                let pipe = match connect_tcp_within(route, connect_timeout()).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        last = Failure::new(format!("{hint}: {e}"), "unreachable");
+                        continue;
+                    }
+                };
+                let redial = || connect_tcp_within(route, connect_timeout());
+                join_on(
+                    caller, pipe, ticket, arrival, name, codes, consented, pinned, redial,
+                )
+                .await
             }
-        };
-        // If the connection drops before PAIRED, the join reconnects here
-        // to learn whether the host enrolled this device.
-        let redial = || connect_tcp_within(route, connect_timeout());
-        let joined = if consented {
-            caller
-                .join_pinned_with_redial(pipe, ticket, arrival, name, codes, redial)
+            JoinRoute::Relay { route, tag } => {
+                let pipe = match crate::app::dial_join_route(route, *tag).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        last = Failure::new(format!("{hint}: {e}"), &reason_of(&e));
+                        continue;
+                    }
+                };
+                let redial = || crate::app::dial_join_route(route, *tag);
+                join_on(
+                    caller, pipe, ticket, arrival, name, codes, consented, pinned, redial,
+                )
                 .await
-        } else {
-            caller
-                .join_with_redial(pipe, ticket, arrival, name, codes, pinned, redial)
-                .await
+            }
         };
         match joined {
             Ok((conn, outcome)) => {
@@ -350,7 +416,9 @@ pub(crate) async fn join_routes<C: CodeEntry>(
                 caller
                     .pin_stored(ticket)
                     .map_err(|e| Failure::new(e.to_string(), "store"))?;
-                caller.remember_routes(ticket.host_identity, vec![route.clone()]);
+                if let JoinRoute::Tcp(route) = candidate {
+                    caller.remember_routes(ticket.host_identity, vec![route.clone()]);
+                }
                 return Ok((conn, record, already));
             }
             // Another endpoint at this address: try the next one.

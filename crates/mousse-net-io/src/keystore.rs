@@ -21,7 +21,6 @@ use zeroize::Zeroizing;
 
 use crate::error::NetError;
 use crate::rng::os_rng;
-#[cfg(test)]
 use crate::rng::random_bytes;
 use crate::store::{hex, identity_from_hex, unhex, write_atomic};
 
@@ -246,6 +245,63 @@ impl IdentityStore {
 /// The keystore entry name for an endpoint.
 pub fn keyring_user(endpoint_id: &str) -> String {
     format!("endpoint-{endpoint_id}")
+}
+
+/// The plain file of the relay seed, beside an insecure-file identity.
+const RELAY_SEED_FILE: &str = "relay-seed.key";
+
+/// The keystore entry name of an endpoint's relay seed.
+pub fn relay_seed_user(endpoint_id: &str) -> String {
+    format!("relay-seed-{endpoint_id}")
+}
+
+/// The endpoint's relay seed: 32 random bytes, kept where its identity is
+/// kept (`storage`), made on first use. Registration keys, caller keys and
+/// pair secrets are derived from it with salts kept in the helper's state
+/// files, so no other relay secret is ever written to a plain file.
+pub fn relay_seed(
+    dir: &Path,
+    endpoint_id: &str,
+    storage: KeyStorage,
+) -> Result<Zeroizing<[u8; 32]>, NetError> {
+    let parse = |secret: &[u8]| -> Result<Zeroizing<[u8; 32]>, NetError> {
+        let bytes: [u8; 32] = secret
+            .try_into()
+            .map_err(|_| NetError::Store("the relay seed has the wrong length".into()))?;
+        Ok(Zeroizing::new(bytes))
+    };
+    match storage {
+        KeyStorage::OsKeystore => {
+            let entry = keyring_entry(&relay_seed_user(endpoint_id))?;
+            match entry.get_secret() {
+                Ok(secret) => parse(&Zeroizing::new(secret)),
+                Err(keyring::Error::NoEntry) => {
+                    let seed = Zeroizing::new(random_bytes::<32>());
+                    entry
+                        .set_secret(seed.as_slice())
+                        .map_err(|e| NetError::Store(format!("keystore: {e}")))?;
+                    Ok(seed)
+                }
+                Err(e) => Err(NetError::Store(format!("keystore: {e}"))),
+            }
+        }
+        KeyStorage::InsecureFile => {
+            let path = dir.join(RELAY_SEED_FILE);
+            match fs::read_to_string(&path) {
+                Ok(text) => {
+                    let text = Zeroizing::new(text);
+                    parse(&Zeroizing::new(unhex(text.trim())?))
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    let seed = Zeroizing::new(random_bytes::<32>());
+                    let text = Zeroizing::new(hex(seed.as_slice()));
+                    write_atomic(&path, text.as_bytes())?;
+                    Ok(seed)
+                }
+                Err(e) => Err(NetError::Store(format!("{}: {e}", path.display()))),
+            }
+        }
+    }
 }
 
 fn keyring_entry(user: &str) -> Result<keyring::Entry, NetError> {

@@ -142,6 +142,8 @@ pub struct RelayLink<S = ClientTls> {
     binding: Binding,
     mode: Mode,
     boot_id: [u8; 16],
+    /// The relay's identity key, from its pinned certificate.
+    relay_key: Option<PublicKey>,
 }
 
 impl<S> fmt::Debug for RelayLink<S> {
@@ -187,6 +189,10 @@ impl RelayLink<ClientTls> {
                 }
             })?;
         let conn = tls.get_ref().1;
+        let relay_key = conn
+            .peer_certificates()
+            .and_then(|certs| certs.first())
+            .and_then(|cert| certificate_key(cert.as_ref()));
         let group = conn.negotiated_key_exchange_group().map(|g| g.name());
         if group != Some(NamedGroup::X25519MLKEM768) {
             return Err(RelayError::Tls(format!(
@@ -232,6 +238,7 @@ impl RelayLink<ClientTls> {
             },
             mode: Mode::SelfHosted,
             boot_id: [0; 16],
+            relay_key,
         };
         match link.recv().await? {
             RelayMessage::Hello {
@@ -264,7 +271,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> RelayLink<S> {
             binding,
             mode,
             boot_id: [0; 16],
+            relay_key: None,
         }
+    }
+
+    /// The relay's identity key (its id is the pinned one). Known on the
+    /// dialling side only.
+    pub fn relay_key(&self) -> Option<PublicKey> {
+        self.relay_key
     }
 
     /// What this connection's proofs are bound to.

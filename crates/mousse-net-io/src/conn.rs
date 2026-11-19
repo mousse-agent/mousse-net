@@ -539,6 +539,8 @@ pub struct Connection {
     cmd: mpsc::UnboundedSender<Cmd>,
     status: watch::Receiver<ConnStatus>,
     incoming: tokio::sync::Mutex<mpsc::UnboundedReceiver<MuxStream>>,
+    /// The minor version both sides agreed, once the peer's `HELLO` came.
+    minor: Arc<std::sync::OnceLock<u64>>,
 }
 
 impl fmt::Debug for Connection {
@@ -567,6 +569,12 @@ impl Connection {
     /// effective deadline of the two certificates.
     pub fn deadline(&self) -> UnixTime {
         self.deadline
+    }
+
+    /// The wire minor version both sides use, once the peer's first
+    /// `HELLO` was accepted (always so on a live connection).
+    pub fn minor(&self) -> Option<u64> {
+        self.minor.get().copied()
     }
 
     /// The current status.
@@ -718,6 +726,7 @@ pub(crate) fn spawn<P: Pipe>(
     let (status_tx, status_rx) = watch::channel(ConnStatus::Pending);
     let (closing_tx, _) = watch::channel(false);
     let (accept_tx, accept_rx) = mpsc::unbounded_channel();
+    let minor = Arc::new(std::sync::OnceLock::new());
     let connection = Connection {
         id: start.conn,
         peer: start.peer,
@@ -726,6 +735,7 @@ pub(crate) fn spawn<P: Pipe>(
         cmd: cmd_tx.clone(),
         status: status_rx,
         incoming: tokio::sync::Mutex::new(accept_rx),
+        minor: minor.clone(),
     };
     let driver = Driver {
         mux: Mux::with_limits(start.side, start.clock.mono(), start.limits.core()),
@@ -744,6 +754,7 @@ pub(crate) fn spawn<P: Pipe>(
         blocked: Vec::new(),
         pings: Vec::new(),
         hello: HelloState::new(VersionSupport::LOCAL),
+        minor,
         reason: None,
         before_close: VecDeque::new(),
     };
@@ -775,6 +786,8 @@ struct Driver {
     pings: Vec<oneshot::Sender<()>>,
     /// The peer's `HELLO`s so far.
     hello: HelloState,
+    /// Where the agreed minor version is published for the handle.
+    minor: Arc<std::sync::OnceLock<u64>>,
     reason: Option<CloseReason>,
     /// Encoded frames a closing step produced, sent before the GOAWAY.
     before_close: VecDeque<Vec<u8>>,
@@ -1295,7 +1308,9 @@ impl Driver {
                     return Verdict::Close(ErrorCode::ProtocolError);
                 };
                 match self.hello.on_hello(*major_version, *minor_version) {
-                    HelloOutcome::Agreed(_) => {}
+                    HelloOutcome::Agreed(minor) => {
+                        let _ = self.minor.set(minor);
+                    }
                     HelloOutcome::Ignored => return Verdict::Ignore,
                     HelloOutcome::Close(code) => return Verdict::Close(code),
                 }

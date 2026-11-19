@@ -67,7 +67,16 @@ pub type SharedSigner = Arc<dyn IdentitySigner + Send + Sync>;
         mousse_control = "allow-break-env",
         mousse_control = "no-stream-cap",
         mousse_control = "stop-on-mismatch",
-        mousse_control = "no-pin-relay"
+        mousse_control = "no-pin-relay",
+        mousse_control = "shared-caller-key",
+        mousse_control = "close-all-on-removal",
+        mousse_control = "manifest-unapproved",
+        mousse_control = "blanket-approval",
+        mousse_control = "no-pairing-recovery",
+        mousse_control = "recovery-makes-grant",
+        mousse_control = "no-overlap",
+        mousse_control = "stale-manifest-dropped",
+        mousse_control = "prompt-on-key-change"
     )
 ))]
 compile_error!("a mousse_control build has a deliberate defect and is for tests only; build it without --release");
@@ -81,7 +90,16 @@ compile_error!("a mousse_control build has a deliberate defect and is for tests 
     mousse_control = "allow-break-env",
     mousse_control = "no-stream-cap",
     mousse_control = "stop-on-mismatch",
-    mousse_control = "no-pin-relay"
+    mousse_control = "no-pin-relay",
+    mousse_control = "shared-caller-key",
+    mousse_control = "close-all-on-removal",
+    mousse_control = "manifest-unapproved",
+    mousse_control = "blanket-approval",
+    mousse_control = "no-pairing-recovery",
+    mousse_control = "recovery-makes-grant",
+    mousse_control = "no-overlap",
+    mousse_control = "stale-manifest-dropped",
+    mousse_control = "prompt-on-key-change"
 ))]
 const _: () = {
     let profile = env!("MOUSSE_BUILD_PROFILE").as_bytes();
@@ -110,6 +128,24 @@ pub const CONTROL: Option<&str> = if cfg!(mousse_control = "skip-pin-check") {
     Some("no-stream-cap")
 } else if cfg!(mousse_control = "no-pin-relay") {
     Some("no-pin-relay")
+} else if cfg!(mousse_control = "shared-caller-key") {
+    Some("shared-caller-key")
+} else if cfg!(mousse_control = "close-all-on-removal") {
+    Some("close-all-on-removal")
+} else if cfg!(mousse_control = "manifest-unapproved") {
+    Some("manifest-unapproved")
+} else if cfg!(mousse_control = "blanket-approval") {
+    Some("blanket-approval")
+} else if cfg!(mousse_control = "no-pairing-recovery") {
+    Some("no-pairing-recovery")
+} else if cfg!(mousse_control = "recovery-makes-grant") {
+    Some("recovery-makes-grant")
+} else if cfg!(mousse_control = "no-overlap") {
+    Some("no-overlap")
+} else if cfg!(mousse_control = "stale-manifest-dropped") {
+    Some("stale-manifest-dropped")
+} else if cfg!(mousse_control = "prompt-on-key-change") {
+    Some("prompt-on-key-change")
 } else {
     None
 };

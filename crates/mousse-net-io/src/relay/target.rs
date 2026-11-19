@@ -55,7 +55,7 @@ pub enum TargetEvent {
         kind: IncomingKind,
         class: Class,
         caller: Option<Fingerprint>,
-        pipe: WsPipe,
+        pipe: Box<WsPipe>,
     },
     /// An accept leg failed; the caller gets `UNREACHABLE`.
     AcceptFailed {
@@ -159,6 +159,11 @@ impl TargetLink {
         self.handle
     }
 
+    /// The relay's identity key, from its pinned certificate.
+    pub fn relay_key(&self) -> Option<mousse_net_core::identity::PublicKey> {
+        self.link.relay_key()
+    }
+
     /// Keep the registration until it ends; returns why. The allow-set is
     /// pushed at once and again on every change of `allow`.
     pub async fn run(
@@ -199,6 +204,19 @@ impl TargetLink {
                     }
                 },
                 cmd = commands.recv(), if commands_open => {
+                    // A command follows the allow-set it depends on: a
+                    // `PROMOTE` names a caller the set just listed.
+                    if allow.has_changed().unwrap_or(false) {
+                        let set = allow.borrow_and_update().clone();
+                        let msg = RelayMessage::AllowSet {
+                            sequence: next_sequence(),
+                            callers: set.callers,
+                            invitations: set.invitations,
+                        };
+                        if let Err(e) = self.link.send(&msg).await {
+                            return e;
+                        }
+                    }
                     let msg = match cmd {
                         None => { commands_open = false; continue }
                         Some(TargetCommand::Promote { circuit, caller }) => {
@@ -298,7 +316,7 @@ async fn accept_leg(
             kind,
             class,
             caller,
-            pipe,
+            pipe: Box::new(pipe),
         },
         Err(error) => TargetEvent::AcceptFailed { circuit, error },
     };

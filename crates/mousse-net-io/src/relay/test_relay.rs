@@ -72,7 +72,7 @@ impl Default for TestRelayConfig {
 }
 
 enum ToReg {
-    Send(RelayMessage),
+    Send(Box<RelayMessage>),
     Close(u16),
 }
 
@@ -312,6 +312,8 @@ impl TestRelay {
     }
 }
 
+// The upgrade callback's error type is tungstenite's.
+#[allow(clippy::result_large_err)]
 async fn connection(inner: Arc<Inner>, acceptor: tokio_rustls::TlsAcceptor, tcp: TcpStream) {
     inner.lock().connections += 1;
     let Ok(Ok(tls)) = tokio::time::timeout(Duration::from_secs(5), acceptor.accept(tcp)).await
@@ -567,7 +569,7 @@ async fn registration(
                         }
                         reg.sequence = sequence;
                         reg.allow = AllowSet { callers: callers.clone(), invitations };
-                        let _ = reg.tx.send(ToReg::Send(RelayMessage::AllowSetOk { sequence }));
+                        let _ = reg.tx.send(ToReg::Send(Box::new(RelayMessage::AllowSetOk { sequence })));
                         // Exactly the circuits whose caller left the set.
                         for c in st.circuits.values() {
                             if c.handle == h && c.caller.is_some_and(|fp| !callers.contains(&fp)) {
@@ -651,12 +653,12 @@ async fn circuit(
             },
         );
         st.regs.get(&h).map(|r| {
-            r.tx.send(ToReg::Send(RelayMessage::Incoming {
+            r.tx.send(ToReg::Send(Box::new(RelayMessage::Incoming {
                 circuit: id,
                 kind,
                 class,
                 caller,
-            }))
+            })))
             .is_ok()
         })
     };

@@ -18,6 +18,7 @@
 //! - [`pairing`]: tickets, join proofs, host and joiner pairing state machines.
 //! - [`mux`]: frame codec, per-stream credit, priority scheduler, keepalive.
 //! - [`session`]: certificate-driven session lifetime and path switching.
+//! - [`manifest`]: the host-signed list of relay routes.
 //! - [`relay_wire`]: the relay protocol as an endpoint speaks it.
 //! - [`limits`]: every tunable limit, its default and allowed range.
 #![forbid(unsafe_code)]
@@ -74,6 +75,7 @@ pub mod cpace;
 pub mod grants;
 pub mod identity;
 pub mod limits;
+pub mod manifest;
 pub mod mux;
 pub mod pairing;
 pub mod relay_wire;
@@ -95,7 +97,7 @@ pub const PROTOCOL_VERSION: u64 = 1;
 /// Minor protocol version this build speaks. Peers exchange it in `HELLO`
 /// and use the lower of the two. The current and previous minor versions are
 /// supported.
-pub const PROTOCOL_MINOR_VERSION: u64 = 0;
+pub const PROTOCOL_MINOR_VERSION: u64 = 1;
 
 /// TLS ALPN protocol identifier for peer sessions. It carries the major
 /// version only.

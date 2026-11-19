@@ -215,6 +215,7 @@ pub async fn run(
         .load_identity(insecure_file_key)
         .map_err(|e| e.to_string())?;
     let real_identity = endpoint.identity();
+    let key_storage = key.storage();
     let (clock, manual_clock) = crate::app::clock();
     let mut config = HostConfig::for_endpoint(&endpoint, opts.name.clone(), clock.clone())
         .map_err(|e| e.to_string())?;
@@ -320,6 +321,9 @@ pub async fn run(
                 },
             ),
             manual_clock,
+            signer: signer.clone(),
+            endpoint_id: endpoint.endpoint_id().to_owned(),
+            key_storage,
         };
         Some(crate::app::App::start(
             host.clone(),

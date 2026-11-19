@@ -14,7 +14,8 @@ unit means a count). A value that is not a whole number, is out of range,
 or disagrees with another limit stops startup with a message that names the
 variable and its allowed range. An unknown `MOUSSE_NET_*` name stops startup
 too, except the app's own names, which reach the helper it starts:
-`MOUSSE_NET_ENGINE_*` and `MOUSSE_NET_HELPER`.
+`MOUSSE_NET_ENGINE_*` and `MOUSSE_NET_HELPER`, and the relay's
+(`MOUSSE_NET_RELAY_*`, read only by `mousse-relay`).
 
 Where the peer or a security bound depends on a limit, its range ends at the
 spec's value: it can only be tightened.
@@ -100,6 +101,15 @@ spec's value: it can only be tightened.
 | `MOUSSE_NET_KEEP_RETRY_MAX_MS` | 60000 | 10 to 3600000 | App mode: longest wait between those redials; not below the first. |
 | `MOUSSE_NET_PREAUTH_CONNECTIONS` | 64 | 1 to 64 | Host: inbound connections not yet past step 2 (the TLS handshake, then authorization or pairing), from all addresses together. One more is dropped before its handshake starts, so slow or stalled handshakes cannot use up sockets and memory. |
 | `MOUSSE_NET_PREAUTH_PER_SOURCE` | 8 | 1 to 8 | Host: of those, connections from one source address; not above `PREAUTH_CONNECTIONS`. |
+| `MOUSSE_NET_VIA_RELAY_DIAL_MS` | 10000 | 1000 to 60000 | Through a relay: connect, outer TLS, upgrade, `CALL` or `JOIN`, the splice and step 1, for one try. Above the relay's refusal deadline, so an unlisted caller hears `UNREACHABLE` before it gives up (Phase 3 §B.6). |
+| `MOUSSE_NET_VIA_RELAY_RETRY_FIRST_MS` | 1000 | 100 to 60000 | App mode: wait before registering on one of this computer's relays again after a registration ended or failed; each next wait doubles. |
+| `MOUSSE_NET_VIA_RELAY_RETRY_MAX_MS` | 60000 | 1000 to 600000 | App mode: longest such wait; not below the first. |
+| `MOUSSE_NET_VIA_RELAY_KEEPALIVE_MS` | 20000 | 1000 to 120000 | App mode: a relay registration sends `PING` after this long without sending. |
+| `MOUSSE_NET_VIA_RELAY_IDLE_MS` | 60000 | 3000 to 600000 | App mode: a relay registration that hears nothing for this long is dropped and made again; above the keepalive. |
+| `MOUSSE_NET_VIA_RELAY_CHECK_MS` | 30000 | 100 to 600000 | App mode: how often the helper checks relay invitation and recovery expiry, the end of rotation overlaps and manifest renewal. |
+| `MOUSSE_NET_MANIFEST_OVERLAP_SECS` | 604800 | 86400 to 2592000 | How long an old relay route or registration key stays in the manifest, and registered, after a rotation (Phase 3 §B.4 and §B.11). |
+| `MOUSSE_NET_MANIFEST_LIFETIME_SECS` | 2592000 | 604800 to 7776000 | When a manifest becomes stale. A stale manifest's routes are still dialled, after every other route. Above the overlap. |
+| `MOUSSE_NET_VIA_RELAY_REJOIN_SECS` | 86400 | 600 to 86400 | Host: how long a consumed invitation's tag stays in the relay allow-set, so a joiner whose circuit dropped can finish (Phase 3 §B.7). Tighten only: the tag is a capability. |
 | `MOUSSE_NET_INIT_HOLD_MS` | 0 | 0 to 60000 | Checks only: how long `init` waits before it makes the endpoint, so the hard-kill check can stop the app during a first start. Run for the app (`--app`), its stdin closing still ends it at once. |
 
 ## Fixed on purpose
@@ -120,3 +130,8 @@ These are protocol constants, not limits, so they are not settings:
   can only issue shorter certificates (`CERT_LIFETIME_SECS`).
 - The joiner record's bound of 3 attempts: the stored format rejects more.
 - The mDNS name format (`mousse-` and 12 random characters, privacy.md).
+- The relay protocol's fixed values (Phase 3 Part H): `RELAY_MESSAGE_MAX`
+  16 384, `ALLOW_CALLERS_MAX` 256, `ALLOW_INVITATIONS_MAX` 8,
+  `MANIFEST_ROUTES_MAX` 4, the 65 536-byte WebSocket message maximum, the
+  `/mousse-relay/1` path, the `mousse-relay.1` subprotocol, the close
+  codes, and every domain string and exporter label.

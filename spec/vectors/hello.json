@@ -3,7 +3,7 @@
     {
       "local": {
         "major": 1,
-        "minor": 0,
+        "minor": 1,
         "oldest_minor": 0
       },
       "name": "same_version",
@@ -16,7 +16,7 @@
     {
       "local": {
         "major": 1,
-        "minor": 0,
+        "minor": 1,
         "oldest_minor": 0
       },
       "name": "peer_newer_minor",
@@ -24,12 +24,12 @@
         "major": 1,
         "minor": 7
       },
-      "result": 0
+      "result": 1
     },
     {
       "local": {
         "major": 1,
-        "minor": 0,
+        "minor": 1,
         "oldest_minor": 0
       },
       "name": "peer_major_2",
@@ -42,7 +42,7 @@
     {
       "local": {
         "major": 1,
-        "minor": 0,
+        "minor": 1,
         "oldest_minor": 0
       },
       "name": "peer_major_0",
@@ -119,7 +119,7 @@
     }
   ],
   "description": "HELLO version negotiation (spec wire.md, \"Versions\"). `local` is what the receiving side speaks (its newest and oldest minor version), `peer` is the HELLO it received. `result` is the minor version both sides use, or the close code. `this_build` is what mousse-net-core version 1.0 speaks; `hello` is its HELLO. `repeated`: several HELLOs arrive on one connection, as control-message bytes, in order. Only the first counts; each later one is `ignored`, whatever it holds. `agreed` is the connection's minor version at the end (null if the first HELLO closed it).",
-  "hello": "a3000101010200",
+  "hello": "a3000101010201",
   "repeated": [
     {
       "agreed": 0,
@@ -135,7 +135,7 @@
       ],
       "local": {
         "major": 1,
-        "minor": 0,
+        "minor": 1,
         "oldest_minor": 0
       },
       "name": "second_hello_same"
@@ -173,7 +173,7 @@
       ],
       "local": {
         "major": 1,
-        "minor": 0,
+        "minor": 1,
         "oldest_minor": 0
       },
       "name": "second_hello_other_major"
@@ -192,7 +192,7 @@
       ],
       "local": {
         "major": 1,
-        "minor": 0,
+        "minor": 1,
         "oldest_minor": 0
       },
       "name": "first_hello_refused"
@@ -200,7 +200,7 @@
   ],
   "this_build": {
     "major": 1,
-    "minor": 0,
+    "minor": 1,
     "oldest_minor": 0
   }
 }

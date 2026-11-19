@@ -921,6 +921,7 @@ fn ticket_vectors() -> J {
             { "name": "fragment_unused_bits_set", "fragment": dirty_fragment(&fragment), "result": "encoding" },
         ],
         "route_hints": route_hint_vectors(),
+        "relay_hints": relay_hint_vectors(),
         "joiner_freshness": {
             "description": "The joiner accepts the ticket while now < expires_at + 600.",
             "expires_at": T + 600,
@@ -1021,6 +1022,48 @@ fn route_hint_vectors() -> J {
         .collect();
     json!({
         "description": "Route hints (spec wire.md, \"Route hints\"). Each hint reads as a tcp route (host as ipv4 in dotted decimal, ipv6 as its 16 bytes in hex, or a dns name lowercased, and a port), an mdns instance, or is skipped with a reason: reserved, unknown_scheme or malformed.",
+        "cases": cases,
+    })
+}
+
+fn relay_hint_vectors() -> J {
+    use crate::base64url;
+    use crate::relay_wire::RelayRoute;
+    let id = base64url::encode(&[0x11; 32]);
+    let handle = base64url::encode(&[0x22; 32]);
+    let short = base64url::encode(&[0x11; 31]);
+    let hints = vec![
+        format!("relay://relay.example:443/{id}/{handle}"),
+        format!("relay://203.0.113.5:7000/{id}/{handle}"),
+        format!("relay://[2001:db8::5]:443/{id}/{handle}"),
+        format!("relay://Relay.Example:443/{id}/{handle}"),
+        format!("relay://relay.example/{id}/{handle}"),
+        format!("relay://relay.example:443/{short}/{handle}"),
+        format!("relay://relay.example:443/{id}"),
+        format!("relay://relay.example:443/{id}/{handle}/x"),
+        format!("relay://relay.example:443/{id}={handle}"),
+        format!("relay://relay.example:0/{id}/{handle}"),
+        format!("relay://relay.example:443/+{}/{handle}", &id[1..]),
+        format!("relay:relay.example:443/{id}/{handle}"),
+        format!("relay://relay.example:443/{id}/{handle}{}", "a".repeat(200)),
+    ];
+    let cases: Vec<J> = hints
+        .iter()
+        .map(|hint| {
+            let result = match RelayRoute::parse_hint(hint) {
+                Some(r) => json!({
+                    "endpoint": r.endpoint.to_string(),
+                    "destination": r.endpoint.destination(),
+                    "relay": hex(&r.relay),
+                    "handle": hex(&r.handle),
+                }),
+                None => json!("malformed"),
+            };
+            json!({ "hint": hint, "result": result })
+        })
+        .collect();
+    json!({
+        "description": "Relay route hints (spec wire.md, \"Route hints\", relay; Phase 3). relay://<host>:<port>/<base64url relay id>/<base64url handle>, host and port as in a tcp hint, both ids 32 bytes in base64url without padding, at most 255 bytes. The destination an owner approves is relay://<lower-case host>:<port>. A reader that does not dial relays skips the hint as reserved (route_hints).",
         "cases": cases,
     })
 }

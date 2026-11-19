@@ -17,6 +17,10 @@ const APP_PREFIX: &str = "ENGINE_";
 /// After [`ENV_PREFIX`]: the Mousse app's helper path in unpackaged builds.
 const APP_HELPER_PATH: &str = "HELPER";
 
+/// After [`ENV_PREFIX`]: `mousse-relay`'s own limits, which may be set in
+/// the same environment and are not the helper's.
+const RELAY_PREFIX: &str = "RELAY_";
+
 mousse_net_core::define_limits! {
     /// The helper's own limits.
     pub struct HelperLimits {
@@ -82,6 +86,24 @@ mousse_net_core::define_limits! {
         preauth_per_source = "PREAUTH_PER_SOURCE": 8, [1, 8];
         /// Checks only: how long `init` waits before it makes the endpoint, so a check can stop the app during the first start. Run for the app (`--app`), its stdin closing still ends it at once.
         init_hold_ms = "INIT_HOLD_MS": 0, [0, 60_000];
+        /// Through a relay: connect, outer TLS, upgrade, `CALL` or `JOIN`, the splice and step 1, for one try; above the relay's refusal deadline (Phase 3 §B.6).
+        via_relay_dial_ms = "VIA_RELAY_DIAL_MS": 10_000, [1_000, 60_000];
+        /// Own relays: first wait before registering again after a registration ended or failed; each next wait doubles.
+        via_relay_retry_first_ms = "VIA_RELAY_RETRY_FIRST_MS": 1_000, [100, 60_000];
+        /// Own relays: longest wait between registrations; not below the first.
+        via_relay_retry_max_ms = "VIA_RELAY_RETRY_MAX_MS": 60_000, [1_000, 600_000];
+        /// Own relays: a registration sends `PING` after this long without sending.
+        via_relay_keepalive_ms = "VIA_RELAY_KEEPALIVE_MS": 20_000, [1_000, 120_000];
+        /// Own relays: a registration that hears nothing for this long is dropped and made again; above the keepalive.
+        via_relay_idle_ms = "VIA_RELAY_IDLE_MS": 60_000, [3_000, 600_000];
+        /// How often the helper checks relay invitation and recovery expiry, rotation overlaps and manifest renewal.
+        via_relay_check_ms = "VIA_RELAY_CHECK_MS": 30_000, [100, 600_000];
+        /// How long an old relay route or registration key stays in the manifest after a rotation (Phase 3 §B.4, §B.11).
+        manifest_overlap_secs = "MANIFEST_OVERLAP_SECS": 604_800, [86_400, 2_592_000];
+        /// When a manifest becomes stale (still dialled, last); above the overlap.
+        manifest_lifetime_secs = "MANIFEST_LIFETIME_SECS": 2_592_000, [604_800, 7_776_000];
+        /// How long a consumed invitation's tag stays in the allow-set for relay-only pairing recovery (Phase 3 §B.7; tighten only).
+        via_relay_rejoin_secs = "VIA_RELAY_REJOIN_SECS": 86_400, [600, 86_400];
     }
     agree(h) {
         if h.app_credit_interactive_reserve_bytes >= h.app_credit_budget_bytes {
@@ -103,6 +125,24 @@ mousse_net_core::define_limits! {
             return Err(LimitError::Conflict(format!(
                 "PREAUTH_PER_SOURCE ({}) is above PREAUTH_CONNECTIONS ({})",
                 h.preauth_per_source, h.preauth_connections
+            )));
+        }
+        if h.via_relay_retry_max_ms < h.via_relay_retry_first_ms {
+            return Err(LimitError::Conflict(format!(
+                "VIA_RELAY_RETRY_MAX_MS ({}) is below VIA_RELAY_RETRY_FIRST_MS ({})",
+                h.via_relay_retry_max_ms, h.via_relay_retry_first_ms
+            )));
+        }
+        if h.via_relay_idle_ms <= h.via_relay_keepalive_ms {
+            return Err(LimitError::Conflict(format!(
+                "VIA_RELAY_IDLE_MS ({}) is not above VIA_RELAY_KEEPALIVE_MS ({})",
+                h.via_relay_idle_ms, h.via_relay_keepalive_ms
+            )));
+        }
+        if h.manifest_lifetime_secs <= h.manifest_overlap_secs {
+            return Err(LimitError::Conflict(format!(
+                "MANIFEST_LIFETIME_SECS ({}) is not above MANIFEST_OVERLAP_SECS ({})",
+                h.manifest_lifetime_secs, h.manifest_overlap_secs
             )));
         }
         if h.keep_retry_max_ms < h.keep_retry_first_ms {
@@ -182,12 +222,14 @@ impl Limits {
     /// Mousse app's own variables (`MOUSSE_NET_ENGINE_*`, and
     /// `MOUSSE_NET_HELPER`, the helper's path) are not the helper's and are
     /// not reported: the app's environment reaches the helper it spawns.
+    /// Nor are the relay's (`MOUSSE_NET_RELAY_*`).
     pub fn unknown_names(names: impl Iterator<Item = OsString>) -> Vec<String> {
         names
             .filter_map(|n| n.into_string().ok())
             .filter(|n| {
                 n.strip_prefix(ENV_PREFIX).is_some_and(|rest| {
                     !rest.starts_with(APP_PREFIX)
+                        && !rest.starts_with(RELAY_PREFIX)
                         && rest != APP_HELPER_PATH
                         && !Self::specs().any(|s| s.name == rest)
                 })
@@ -276,6 +318,21 @@ mod tests {
             .map(|(k, v)| ((*k).to_owned(), OsString::from(*v)))
             .collect();
         move |k| map.get(k).cloned()
+    }
+
+    /// The recovery window keeps a consumed invitation's tag listed at a
+    /// relay: it can be shortened, never made longer.
+    #[test]
+    fn the_rejoin_window_can_only_be_tightened() {
+        let spec = HelperLimits::SPECS
+            .iter()
+            .find(|s| s.name == "VIA_RELAY_REJOIN_SECS")
+            .unwrap();
+        assert_eq!(spec.max, spec.default);
+        assert!(Limits::from_vars(vars(&[("MOUSSE_NET_VIA_RELAY_REJOIN_SECS", "86401")])).is_err());
+        assert!(
+            Limits::from_vars(vars(&[("MOUSSE_NET_MANIFEST_OVERLAP_SECS", "2592000")])).is_err()
+        );
     }
 
     #[test]
@@ -391,6 +448,8 @@ mod tests {
             "MOUSSE_NET_ENGINE_MAX_MESSAGE_BYTES",
             "MOUSSE_NET_ENGINE_CONTROL",
             "MOUSSE_NET_HELPER",
+            // The relay's, set beside a relay on the same machine.
+            "MOUSSE_NET_RELAY_REFUSE_MS",
         ]
         .map(OsString::from);
         assert_eq!(

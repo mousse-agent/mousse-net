@@ -38,7 +38,7 @@ The code exchange used by "Send link" pairing (CPace) is specified in
 | Name | Value | Where |
 |---|---|---|
 | Major protocol version | `1` | Session certificate (record and extension), pairing ticket, `HELLO` |
-| Minor protocol version | `0` | `HELLO` |
+| Minor protocol version | `1` | `HELLO` |
 | TLS ALPN | `mousse/1` | TLS ClientHello and ServerHello |
 
 - A peer MUST reject a certificate or ticket whose major version it does not
@@ -76,6 +76,11 @@ When the peer's `HELLO` arrives, each side decides on its own:
 4. Otherwise the connection uses `agreed`.
 
 When both sides accept, they reach the same `agreed`.
+
+**What each minor adds.** Minor `1` adds two engine streams (9.5),
+`mousse-keys` and `mousse-manifest`, for relays. Each is opened only on a
+connection whose `agreed` minor is at least the one that added it; a minor
+`0` peer never sees them.
 
 **Only the first `HELLO` counts.** The peer's first `HELLO` on a connection
 fixes `agreed` or closes the connection. A later `HELLO` on the same
@@ -153,7 +158,8 @@ display and indexing value; it does not appear on the wire.
 **What the identity key signs (frozen).** The identity key signs only
 canonical CBOR maps (section 3) whose key `1` is a text domain string, and
 each domain string names exactly one record type. Major version 1 has one
-domain: `mousse-session-v1`, the session record (5.1). A new signed record
+domains: `mousse-session-v1`, the session record (5.1), and
+`mousse-manifest-v1`, the relay manifest (9.5). A new signed record
 needs a new domain string that no other record uses; the identity key MUST
 never sign raw bytes, a hash supplied from outside, or a record without its
 domain at key 1. This keeps any two signed things from ever being confused,
@@ -470,6 +476,11 @@ enrolled_by, granted_at, expires_at?}`:
   `PAIRED` was lost (10.6 rule 7).
 - `expires_at`: optional. At that second the grant is already expired.
 
+Local fields a host keeps with a grant, never sent: the **caller key
+fingerprint** and the **pair secret** a caller enrolled on `mousse-keys`
+(9.5). A new pairing of the same device replaces both, and removing the
+grant deletes them.
+
 Rules:
 
 - At most one grant per identity on an endpoint. A new grant for the same
@@ -688,6 +699,40 @@ An unknown error code in `RESET` or `GOAWAY` is not a frame error; treat it as
 - **GOAWAY** ends the connection: the sender sends nothing after it and closes
   the pipe; the receiver stops sending and closes too.
 
+### 9.5 Engine streams (minor 1)
+
+Labels starting `mousse-` are the engine's own: an endpoint handles them
+itself and never passes them to the application. Each needs the agreed
+minor version that added it (section 2); on an older connection it is
+never opened. A side that gets one it does not handle resets it with
+`REFUSED_STREAM`.
+
+- **`mousse-keys`** (caller opens it, after its first live connection to a
+  host and again whenever the host's answer is missing). The caller sends
+  `{1: caller relay public key (65 bytes, SEC1)}` and `FIN`; the host
+  answers `{1: pair secret (32 bytes)}` and `FIN`. The caller key is one
+  P-256 key per caller and host; a relay admits a call by its fingerprint.
+  The host answers only on a connection bound to a live grant.
+- **`mousse-manifest`** (host opens it, on a connection where the caller
+  has opened a stream, and again on every change). The payload is a signed
+  envelope `{1: record, 2: raw signature}` by the host's identity key over
+  the manifest record:
+
+  | Key | Value |
+  |---|---|
+  | 1 | text `"mousse-manifest-v1"` |
+  | 2 | bytes: host identity key (65) |
+  | 3 | uint: sequence (grows) |
+  | 4 | uint: issued at |
+  | 5 | uint: expires at |
+  | 6 | array of at most 4 routes `{1: relay identity key (65), 2: 1 to 4 endpoint texts host:port, 3: handle (32), 4: region text (0 to 32 bytes)}` |
+
+  A caller keeps a manifest only if the identity key at key 2 is the pinned
+  host and the signature verifies under it, and only if its sequence is
+  above the one it keeps. Endpoint texts follow the `tcp` hint host and
+  port rules (10.2.1), lower case. Past `expires at` the manifest is stale:
+  its routes are still tried, after every other route.
+
 ## 10. Pairing
 
 Pairing turns an unknown endpoint (the **joiner**) into one with a grant on
@@ -788,7 +833,8 @@ A skipped hint is not an error: the joiner tries the next one.
 |---|---|---|
 | `tcp` | `tcp://<host>:<port>` | A direct TLS connection. |
 | `mdns` | `mdns:<instance>` | Browse for this service instance on the local network. |
-| `ssh`, `ws`, `wss`, `relay` | reserved | Kept for later transports. Skipped as `reserved`. |
+| `relay` | `relay://<host>:<port>/<relay id>/<handle>` | Through a relay (Phase 3). Readers that do not dial relays skip it as `reserved`. |
+| `ssh`, `ws`, `wss` | reserved | Kept for later transports. Skipped as `reserved`. |
 | anything else, or no `:` | | Skipped as `unknown_scheme`. |
 
 A `tcp` or `mdns` hint that breaks its grammar is skipped as `malformed`:
@@ -815,6 +861,14 @@ address (upper or lower case hex, leading zeros in a group, `::`, an
 embedded IPv4 part) is the same host, and the text form is not kept.
 Vectors give it as the 16 address bytes in hex. An IPv4 host is given in
 dotted decimal, and a DNS name lowercased.
+
+A `relay` hint names a relay and the host's handle there: `<host>:<port>`
+by the `tcp` rules, then the relay id and the handle, each 32 bytes in
+base64url without padding, the whole hint at most 255 bytes. The relay id
+pins the relay's own TLS key; the host is still checked against the
+ticket's pin inside. A joiner dials it only if the owner approved its
+destination, `relay://<lower-case host>:<port>`. Vectors: `ticket.json`
+`relay_hints`.
 
 Whichever route reaches it, the host is checked against the ticket's pin. A
 pin mismatch on a LAN candidate means another endpoint holds that address

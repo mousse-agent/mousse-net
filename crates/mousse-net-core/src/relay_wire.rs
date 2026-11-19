@@ -900,6 +900,43 @@ pub fn invitation_tag(invitation: &InvitationId, secret: &TicketSecret) -> [u8; 
     out
 }
 
+/// HKDF info of a registration key derived from the relay seed.
+pub const REGISTRATION_KEY_INFO: &str = "mousse-relay-registration-key-v1";
+/// HKDF info of a caller key derived from the relay seed.
+pub const CALLER_KEY_INFO: &str = "mousse-relay-caller-key-v1";
+/// HKDF info of a pair secret derived from the relay seed.
+pub const PAIR_SECRET_INFO: &str = "mousse-pair-secret-v1";
+
+/// 32 bytes from `seed` for `info` and `salt` (HKDF-SHA256). Local only:
+/// nothing on the wire depends on how an endpoint makes its keys.
+pub fn derive_secret(seed: &[u8; 32], info: &str, salt: &[u8]) -> zeroize::Zeroizing<[u8; 32]> {
+    let hk = Hkdf::<Sha256>::new(Some(salt), seed);
+    let mut out = zeroize::Zeroizing::new([0u8; 32]);
+    hk.expand(info.as_bytes(), out.as_mut())
+        .expect("32 bytes is a valid HKDF-SHA256 length");
+    out
+}
+
+/// A P-256 key from `seed` for `info` and `salt`. The rare output that is
+/// not a valid scalar moves to the next counter byte.
+pub fn derive_key(
+    seed: &[u8; 32],
+    info: &str,
+    salt: &[u8],
+) -> Result<SoftwareKey, crate::identity::KeyError> {
+    let mut last = None;
+    for counter in 0u8..=255 {
+        let mut salted = salt.to_vec();
+        salted.push(counter);
+        let secret = derive_secret(seed, info, &salted);
+        match SoftwareKey::from_secret_bytes(&secret) {
+            Ok(key) => return Ok(key),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or(crate::identity::KeyError::NotOnCurve))
+}
+
 /// What the allow-set lists for a tag.
 pub fn tag_hash(tag: &[u8; 32]) -> [u8; 32] {
     Sha256::digest(tag).into()
