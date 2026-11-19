@@ -343,3 +343,39 @@ fn a_connection_that_never_becomes_live_is_never_announced() {
     assert!(a.events("conn.up").is_empty(), "{:?}", a.events("conn.up"));
     a.assert_clean();
 }
+
+/// Under a check's egress fence (debug builds, Phase 1b §14), a dial off
+/// loopback to an address the fence does not list is refused before any
+/// packet and logged for the kit.
+#[test]
+fn under_the_egress_fence_a_dial_off_loopback_is_refused_and_logged() {
+    let a_end = Endpoint::init("fence-a");
+    let b_end = Endpoint::init("fence-b");
+    let log = b_end.dir.join("egress.jsonl");
+    let mut a = a_end.app("hostA", &[]);
+    let mut b = b_end.app(
+        "peerB",
+        &[
+            ("TEST_EGRESS", "10.255.255.2"),
+            ("TEST_EGRESS_LOG", log.to_str().unwrap()),
+        ],
+    );
+    a.hello();
+    b.hello();
+    let (identity, name) = (a.identity.clone(), a.name.clone());
+    // A private address no test network uses; the fence stops the dial first.
+    b.call(
+        "peer.add",
+        json!({"identity": identity, "name": name, "routes": ["tcp://10.255.255.1:9"]}),
+    );
+    let deadline = Instant::now() + WAIT;
+    let logged = loop {
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        if text.contains("10.255.255.1:9") || Instant::now() > deadline {
+            break text;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(logged.contains("\"helper\""), "{logged}");
+    assert!(logged.contains("10.255.255.1:9"), "{logged}");
+}
