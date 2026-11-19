@@ -78,7 +78,8 @@ pub type SharedSigner = Arc<dyn IdentitySigner + Send + Sync>;
         mousse_control = "repair-skips-fence",
         mousse_control = "ws-allow-origin",
         mousse_control = "plain-ws-off-loopback",
-        mousse_control = "release-test-root"
+        mousse_control = "release-test-root",
+        mousse_control = "pin-stored-memory-only"
     )
 ))]
 compile_error!("a mousse_control build has a deliberate defect and is for tests only; build it without --release");
@@ -103,7 +104,8 @@ compile_error!("a mousse_control build has a deliberate defect and is for tests 
     mousse_control = "repair-skips-fence",
     mousse_control = "ws-allow-origin",
     mousse_control = "plain-ws-off-loopback",
-    mousse_control = "release-test-root"
+    mousse_control = "release-test-root",
+    mousse_control = "pin-stored-memory-only"
 ))]
 const _: () = {
     let profile = env!("MOUSSE_BUILD_PROFILE").as_bytes();

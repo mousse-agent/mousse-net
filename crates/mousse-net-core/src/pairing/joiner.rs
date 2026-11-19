@@ -745,6 +745,11 @@ impl<F: CodeExchangeFactory> JoinerPairing<F> {
             JoinerState::AwaitingApproval => self.ticket.kind == InvitationKind::InPerson,
             // Only after this side verified the host's confirmation.
             JoinerState::AwaitingPaired => self.ticket.kind == InvitationKind::SendLink,
+            // Must-fail control: `PAIRED` taken mid-exchange, before this
+            // side verified the host's key confirmation.
+            JoinerState::Exchanging if cfg!(mousse_control = "skip-code-confirm") => {
+                self.ticket.kind == InvitationKind::SendLink
+            }
             _ => false,
         };
         if !ok {

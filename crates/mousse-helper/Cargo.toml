@@ -36,6 +36,8 @@ serde_json = "=1.0.154"
 rustls = { version = "=0.23.46", default-features = false, features = ["std", "logging", "aws_lc_rs"] }
 tokio-rustls = { version = "=0.26.6", default-features = false, features = ["logging", "aws_lc_rs"] }
 rcgen = { version = "=0.14.10", default-features = false, features = ["aws_lc_rs"] }
+# `app_link` runs a host whose code exchange skips the key confirmation.
+rand_core = { version = "=0.10.1", default-features = false }
 
 [[test]]
 name = "loopback"

@@ -138,6 +138,8 @@ pub enum HostEvent {
         invitation: InvitationId,
         /// The code.
         code: PairingCode,
+        /// Code attempts the invitation has left, this one's included.
+        attempts_left: u8,
     },
     /// A device was paired.
     Enrolled {
@@ -540,7 +542,12 @@ where
                         }));
                 }
                 HostAction::ShowCode { invitation, code } => {
-                    let _ = self.events.send(HostEvent::ShowCode { invitation, code });
+                    let attempts_left = self.pairing.attempts_left(&invitation).unwrap_or(0);
+                    let _ = self.events.send(HostEvent::ShowCode {
+                        invitation,
+                        code,
+                        attempts_left,
+                    });
                 }
                 HostAction::Enrolled {
                     invitation,
@@ -783,6 +790,14 @@ where
             .pairing
             .create(params, self.shared.clock.now(), &mut os_rng())
             .map_err(|e| NetError::Refused(e.to_string()))
+    }
+
+    /// A send-link invitation's code on show now and the attempts it has
+    /// left; `None` once it is no longer open (or for an in-person one).
+    pub fn invitation_code(&self, invitation: &InvitationId) -> Option<(PairingCode, u8)> {
+        let inner = lock(&self.shared);
+        let code = inner.pairing.code(invitation)?.clone();
+        Some((code, inner.pairing.attempts_left(invitation)?))
     }
 
     /// Where an invitation stands.
