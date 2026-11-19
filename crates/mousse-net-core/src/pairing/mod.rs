@@ -42,7 +42,8 @@ pub use proof::{
     JOIN_PROOF_KEY_INFO, PAIR_EXPORTER_LABEL, PAIR_TRANSCRIPT_DOMAIN, SID_DOMAIN, SID_LEN,
 };
 pub use route::{
-    Route, RouteHost, RouteSkip, MAX_DNS_NAME_LEN, MAX_MDNS_INSTANCE_LEN, RESERVED_SCHEMES,
+    parse_host, parse_port, parse_wss_path, Route, RouteHost, RouteSkip, MAX_DNS_NAME_LEN,
+    MAX_MDNS_INSTANCE_LEN, MAX_WSS_PATH_LEN, RESERVED_SCHEMES, WSS_DEFAULT_PORT, WSS_PATH_SUFFIX,
 };
 pub use ticket::{Ticket, TicketError, TicketSecret, MAX_ROUTES, MAX_ROUTE_LEN, TICKET_VERSION};
 

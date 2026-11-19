@@ -9,9 +9,19 @@ use core::fmt;
 use core::net::{Ipv4Addr, Ipv6Addr};
 use core::str::FromStr;
 
-/// Schemes kept for transports that are not defined yet. Hints with them are
-/// skipped.
-pub const RESERVED_SCHEMES: [&str; 4] = ["ssh", "ws", "wss", "relay"];
+/// Schemes kept for transports that are not defined on the wire. Hints with
+/// them are skipped: `ssh` and plain `ws` are owner-entered only (Phase 1b
+/// §1.1), never read from a ticket.
+pub const RESERVED_SCHEMES: [&str; 3] = ["ssh", "ws", "relay"];
+
+/// Every `wss` path ends with this.
+pub const WSS_PATH_SUFFIX: &str = "/mousse-net/1";
+
+/// Longest `wss` path, in bytes.
+pub const MAX_WSS_PATH_LEN: usize = 200;
+
+/// The port a `wss` hint without one uses.
+pub const WSS_DEFAULT_PORT: u16 = 443;
 
 /// Longest DNS name in a `tcp` hint, in bytes.
 pub const MAX_DNS_NAME_LEN: usize = 253;
@@ -39,6 +49,17 @@ pub enum Route {
         host: RouteHost,
         /// TCP port, 1 to 65535.
         port: u16,
+    },
+    /// `wss://<host>[:<port>]<path>`: TLS 1.3 inside a WebSocket over TLS,
+    /// through a tunnel the host's owner runs.
+    Wss {
+        /// Where to connect (also the name for SNI and `Host`).
+        host: RouteHost,
+        /// TCP port, 1 to 65535 (443 when the hint gives none).
+        port: u16,
+        /// The request path: `/`, ASCII `[A-Za-z0-9._~/-]`, at most 200
+        /// bytes, ending in `/mousse-net/1`.
+        path: String,
     },
     /// `mdns:<instance>`: browse for this service instance on the local
     /// network.
@@ -85,6 +106,7 @@ impl Route {
         };
         match scheme {
             "tcp" => parse_tcp(rest).ok_or(RouteSkip::Malformed),
+            "wss" => parse_wss(rest).ok_or(RouteSkip::Malformed),
             "mdns" => parse_mdns(rest).ok_or(RouteSkip::Malformed),
             s if RESERVED_SCHEMES.contains(&s) => Err(RouteSkip::Reserved),
             _ => Err(RouteSkip::UnknownScheme),
@@ -96,7 +118,58 @@ fn parse_tcp(rest: &str) -> Option<Route> {
     let authority = rest.strip_prefix("//")?;
     let (host, port) = authority.rsplit_once(':')?;
     let port = parse_port(port)?;
-    let host = if let Some(inner) = host.strip_prefix('[') {
+    let host = parse_host(host)?;
+    Some(Route::Tcp { host, port })
+}
+
+/// `//<host>[:<port>]<path>`.
+fn parse_wss(rest: &str) -> Option<Route> {
+    let rest = rest.strip_prefix("//")?;
+    let slash = rest.find('/')?;
+    let (authority, path) = rest.split_at(slash);
+    let (host, port) = split_host_port(authority)?;
+    let port = match port {
+        Some(port) => parse_port(port)?,
+        None => WSS_DEFAULT_PORT,
+    };
+    Some(Route::Wss {
+        host: parse_host(host)?,
+        port,
+        path: parse_wss_path(path)?,
+    })
+}
+
+/// `<host>` or `<host>:<port>`, with an IPv6 host in brackets.
+fn split_host_port(authority: &str) -> Option<(&str, Option<&str>)> {
+    if authority.starts_with('[') {
+        let end = authority.find(']')?;
+        let (host, after) = authority.split_at(end + 1);
+        match after {
+            "" => Some((host, None)),
+            _ => Some((host, Some(after.strip_prefix(':')?))),
+        }
+    } else {
+        match authority.rsplit_once(':') {
+            Some((host, port)) => Some((host, Some(port))),
+            None => Some((authority, None)),
+        }
+    }
+}
+
+/// A path the `wss` grammar allows (Phase 1b §1.1).
+pub fn parse_wss_path(path: &str) -> Option<String> {
+    let ok = path.starts_with('/')
+        && path.len() <= MAX_WSS_PATH_LEN
+        && path.ends_with(WSS_PATH_SUFFIX)
+        && path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'~' | b'/' | b'-'));
+    ok.then(|| path.to_owned())
+}
+
+/// The host of a `tcp` or `wss` hint, read by its shape.
+pub fn parse_host(host: &str) -> Option<RouteHost> {
+    Some(if let Some(inner) = host.strip_prefix('[') {
         let addr = inner.strip_suffix(']')?;
         // Rust's parser takes the RFC 4291 text forms and no zone id.
         RouteHost::Ipv6(Ipv6Addr::from_str(addr).ok()?)
@@ -104,12 +177,11 @@ fn parse_tcp(rest: &str) -> Option<Route> {
         RouteHost::Ipv4(parse_ipv4(host)?)
     } else {
         RouteHost::Dns(parse_dns(host)?)
-    };
-    Some(Route::Tcp { host, port })
+    })
 }
 
 /// Decimal 1 to 65535, no sign, no leading zero.
-fn parse_port(text: &str) -> Option<u16> {
+pub fn parse_port(text: &str) -> Option<u16> {
     if text.is_empty()
         || text.len() > 5
         || text.starts_with('0')
@@ -226,6 +298,58 @@ mod tests {
     }
 
     #[test]
+    fn wss_hints_take_a_host_an_optional_port_and_the_mousse_path() {
+        let wss = |host, port, path: &str| {
+            Ok(Route::Wss {
+                host,
+                port,
+                path: path.into(),
+            })
+        };
+        assert_eq!(
+            Route::parse("wss://X.Example/mousse-net/1"),
+            wss(RouteHost::Dns("x.example".into()), 443, "/mousse-net/1")
+        );
+        assert_eq!(
+            Route::parse("wss://[fd00::1]:8443/a_b.c~d/mousse-net/1"),
+            wss(
+                RouteHost::Ipv6("fd00::1".parse().unwrap()),
+                8443,
+                "/a_b.c~d/mousse-net/1"
+            )
+        );
+        assert_eq!(
+            Route::parse("wss://203.0.113.7:7443/t/mousse-net/1"),
+            wss(
+                RouteHost::Ipv4(Ipv4Addr::new(203, 0, 113, 7)),
+                7443,
+                "/t/mousse-net/1"
+            )
+        );
+        let long = format!("wss://x.example/{}/mousse-net/1", "a".repeat(186));
+        assert_eq!(Route::parse(&long).map(|_| ()), Ok(()));
+        let too_long = format!("wss://x.example/{}/mousse-net/1", "a".repeat(187));
+        for bad in [
+            too_long.as_str(),
+            "wss://x.example",
+            "wss://x.example/",
+            "wss://x.example/mousse-net/2",
+            "wss://x.example/mousse-net/1/",
+            "wss://x.example/mousse-net/1?a=b",
+            "wss://x.example/mousse-net/1#f",
+            "wss://x.example/a%20b/mousse-net/1",
+            "wss://user@x.example/mousse-net/1",
+            "wss://x.example:0/mousse-net/1",
+            "wss://x.example:/mousse-net/1",
+            "wss://[fd00::1/mousse-net/1",
+            "wss://fd00::1/mousse-net/1",
+            "wss:x.example/mousse-net/1",
+        ] {
+            assert_eq!(Route::parse(bad), Err(RouteSkip::Malformed), "{bad}");
+        }
+    }
+
+    #[test]
     fn mdns_reserved_and_unknown_schemes() {
         assert_eq!(
             Route::parse("mdns:Desk"),
@@ -239,7 +363,7 @@ mod tests {
             Err(RouteSkip::Malformed)
         );
         assert_eq!(Route::parse("mdns:a\nb"), Err(RouteSkip::Malformed));
-        for reserved in ["ssh://h", "ws://h", "wss://h", "relay:x"] {
+        for reserved in ["ssh://h", "ws://h", "relay:x"] {
             assert_eq!(Route::parse(reserved), Err(RouteSkip::Reserved));
         }
         for unknown in ["quic://h:1", "TCP://h:1", "no-scheme", ""] {
