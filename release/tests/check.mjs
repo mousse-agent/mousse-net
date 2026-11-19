@@ -232,9 +232,12 @@ function lockHash() {
   return sha256File(path.join(devSource ?? root, "Cargo.lock")).slice(0, 16);
 }
 
-// The crates, vendored once per Cargo.lock into a Docker volume. Cargo checks
-// every vendored file against the lock's checksums during the build.
-function ensureVendor() {
+// The crates, vendored once per Cargo.lock into a Docker volume. The host's
+// cargo fetches them into its own registry cache; `cargo vendor --offline`
+// then unpacks them in a container straight into the volume, so the
+// vendored tree is never written to this machine's disk. Cargo checks every
+// vendored file against the lock's checksums during the build.
+function ensureVendor(src) {
   const name = `mousse-release-vendor-${lockHash()}`;
   const probe = docker(["run", "--rm", "--network", "none", ...vol(name, "/v", true), BUILDER, "test", "-f", "/v/.complete"], {
     allowFail: true,
@@ -242,18 +245,36 @@ function ensureVendor() {
   });
   if (probe.code === 0) return name;
   say("Vendoring crates");
-  const tmp = path.join(cacheDir, `vendor-${lockHash()}`);
-  fs.rmSync(tmp, { recursive: true, force: true });
-  const r = spawnSync("cargo", ["vendor", "--locked", "--versioned-dirs", tmp], {
+  const r = spawnSync("cargo", ["fetch", "--locked"], {
     cwd: devSource ?? root,
     encoding: "utf8",
     maxBuffer: 64 * 1024 * 1024,
   });
   log(r.stderr ?? "");
-  if (r.status !== 0) fail("setup", "cargo vendor failed");
+  if (r.status !== 0) fail("setup", "cargo fetch failed");
+  const home = process.env.CARGO_HOME ?? path.join(process.env.HOME ?? process.env.USERPROFILE ?? "", ".cargo");
+  const registry = path.join(home, "registry");
+  if (!fs.existsSync(path.join(registry, "cache"))) fail("setup", `no cargo registry cache at ${registry}`);
+  docker(["volume", "rm", "-f", name], { allowFail: true, quiet: true });
   docker(["volume", "create", name], { quiet: true });
-  docker(["run", "--rm", "--network", "none", ...bind(tmp, "/from", true), ...vol(name, "/v"), BUILDER, "sh", "-c", "cp -a /from/. /v/ && touch /v/.complete"]);
-  fs.rmSync(tmp, { recursive: true, force: true });
+  docker([
+    "run",
+    "--rm",
+    "--network",
+    "none",
+    ...bind(registry, "/host-registry", true),
+    ...bind(src, "/src", true),
+    ...vol(name, "/v"),
+    "-w",
+    "/src",
+    "-e",
+    "CARGO_HOME=/cargo-home",
+    BUILDER,
+    "sh",
+    "-c",
+    "mkdir -p /cargo-home/registry && cp -a /host-registry/index /host-registry/cache /cargo-home/registry/ && " +
+      "cargo vendor --offline --locked --versioned-dirs /v >/dev/null && touch /v/.complete",
+  ]);
   return name;
 }
 
@@ -458,7 +479,7 @@ function verifyOnly(dist) {
 async function reproducible() {
   ensureNetwork();
   const source = sourceTree();
-  const vendorVol = ensureVendor();
+  const vendorVol = ensureVendor(source.src);
   const minisignDir = await ensureMinisign();
   await ensureUbuntu();
   const ver = version();
@@ -631,7 +652,7 @@ function checkService(name, linkId, sha256) {
 async function install() {
   ensureNetwork();
   const source = sourceTree();
-  const vendorVol = ensureVendor();
+  const vendorVol = ensureVendor(source.src);
   const minisignDir = await ensureMinisign();
   await ensureUbuntu();
   const ver = version();
