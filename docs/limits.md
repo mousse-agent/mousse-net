@@ -78,6 +78,54 @@ spec's value: it can only be tightened.
 | `MOUSSE_NET_ENDPOINT_LOCK_RETRY_MS` | 100 | 1 to 1000 | Wait between tries on a held endpoint lock. |
 | `MOUSSE_NET_COMPUTER_NAME_MAX_BYTES` | 64 | 1 to 64 | Longest default device name taken from the computer name (names are at most 64 bytes). |
 
+## Relay, hosted mode
+
+`mousse-relay` reads only names that start with `MOUSSE_NET_RELAY_`, once
+at startup, with the same rules as the helper. These rows are the hosted
+mode's (`docs/phase34-design.md` §H.1); the self-hosted relay's rows join
+them with the relay itself (E-R2). `HostedLimits` in
+`crates/mousse-net-core/src/relay_hosted/mod.rs` holds them, and
+`crates/mousse-relay-plus/src/settings.rs` reads them.
+
+| Variable | Default | Allowed | What it limits |
+| --- | --- | --- | --- |
+| `MOUSSE_NET_RELAY_REFILL_WAIT_MS` | 10000 | 1000 to 10000 | A paused class waits this long for a `LEASE` before its circuits close with 4001. With the longest peer keepalive (15 s) it stays below the shortest peer idle timeout (30 s), so it can only be shortened. |
+| `MOUSSE_NET_RELAY_REPORT_MS` | 10000 | 1000 to 60000 | Snapshot interval; below Plus's boot silence time (120 s by default). |
+| `MOUSSE_NET_RELAY_REPORT_MIN_MS` | 1000 | 100 to 5000 | Longest delay from a final to its snapshot, and the shortest gap between snapshots; below `REPORT_MS`. |
+| `MOUSSE_NET_RELAY_FINAL_REPORT_WAIT_MS` | 5000 | 0 to 60000 | On a graceful stop, how long to wait for the stopping snapshot to be stored. |
+| `MOUSSE_NET_RELAY_PLUS_TIMEOUT_MS` | 10000 | 1000 to 60000 | One call to Plus. |
+| `MOUSSE_NET_RELAY_CLOCK_RTT_MS` | 2000 | 100 to 10000 | Longest round trip whose Plus answer may set the Plus clock; a longer one only ends leases earlier. |
+| `MOUSSE_NET_RELAY_PLUS_RETRY_FIRST_MS` | 1000 | 100 to 60000 | First wait before sending a boot announcement or report part again after a failed call. Each next wait doubles; a `retry after` from Plus lengthens it. |
+| `MOUSSE_NET_RELAY_PLUS_RETRY_MAX_MS` | 30000 | 1000 to 600000 | Longest such wait; not below the first. |
+| `MOUSSE_NET_RELAY_PLUS_ANSWER_MAX_BYTES` | 65536 | 16384 to 1048576 | Largest Plus answer read. |
+
+Fixed, not variables (Part A of the design): `REQUEST_MAX` 16 384,
+`REPORT_MAX` 65 536, `REPORT_ENTRIES_MAX` 1024, `BLOCK_MAX_LIFETIME`
+172 800 s, `FORWARD_MARGIN` 180 s, the one-second rate burst, the 65 536
+rate-cap floor and smallest block, and at most four lease ids per
+`RELEASE`.
+
+### Settings
+
+Settings are not limits: they have no default and no range.
+
+| Variable | Required | Value |
+| --- | --- | --- |
+| `MOUSSE_NET_RELAY_PLUS_URL` | in hosted mode | The Plus base URL, `https://host[:port][/path]`. TLS 1.3 with the platform's certificate verifier and no pin (Plus is not a trust anchor). `http://` is accepted only to a loopback IP address, for tests on one machine. No user, query or fragment. A missing or bad value stops startup with a message naming the variable. |
+
+### State directory files (hosted)
+
+| File | What |
+| --- | --- |
+| `boot-generation` | The boot generation, a decimal number. At start, under the state directory's lock, the relay adds one and writes it durably (write, fsync, rename, folder sync) before it serves. A file that does not hold a number stops startup; the count never starts over. |
+| `report-key` | The P-256 report key (hex secret, owner-only), made on first start. It signs boot and report bodies. Its public key is what an operator adds to Plus's fleet. |
+
+The pinned issuer keys are a file in the relay's configuration: one
+issuer public key per line as 130 hex digits (the 65-byte SEC1 point),
+with blank lines and `#` comments ignored. `mousse-relay reload` reads it
+again without ending the boot; a file that does not parse leaves the keys
+in force.
+
 ## Fixed on purpose
 
 These are protocol constants, not limits, so they are not settings:
