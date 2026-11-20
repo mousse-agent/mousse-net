@@ -274,7 +274,7 @@ fn parse(buf: &[u8], eof: bool, answer_max: usize) -> Result<Option<Response>, T
     }
     let rest = &buf[end + 4..];
     let body = if chunked {
-        match dechunk(rest).map_err(|_| bad("chunked body"))? {
+        match dechunk(rest, answer_max).map_err(|_| bad("chunked body"))? {
             Some(b) => b,
             None if eof => return Err(bad("chunked body cut short")),
             None => return Ok(None),
@@ -302,8 +302,10 @@ fn parse(buf: &[u8], eof: bool, answer_max: usize) -> Result<Option<Response>, T
     Ok(Some(Response { status, body }))
 }
 
-/// A whole chunked body, or `None` while more is needed.
-fn dechunk(mut rest: &[u8]) -> Result<Option<Vec<u8>>, ()> {
+/// A whole chunked body, or `None` while more is needed. A chunk size past
+/// `answer_max`, or a body growing past it, is an error before any
+/// arithmetic on it.
+fn dechunk(mut rest: &[u8], answer_max: usize) -> Result<Option<Vec<u8>>, ()> {
     let mut out = Vec::new();
     loop {
         let Some(line_end) = rest.windows(2).position(|w| w == b"\r\n") else {
@@ -316,11 +318,17 @@ fn dechunk(mut rest: &[u8]) -> Result<Option<Vec<u8>>, ()> {
         if size == 0 {
             return Ok(Some(out));
         }
-        if rest.len() < size + 2 {
+        if size > answer_max || out.len().saturating_add(size) > answer_max {
+            return Err(());
+        }
+        let Some(with_crlf) = size.checked_add(2) else {
+            return Err(());
+        };
+        if rest.len() < with_crlf {
             return Ok(None);
         }
         out.extend_from_slice(&rest[..size]);
-        rest = &rest[size + 2..];
+        rest = &rest[with_crlf..];
     }
 }
 
@@ -341,6 +349,24 @@ mod tests {
         assert_eq!((r.status, r.body.as_slice()), (409, &b"abc"[..]));
         let big = b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n";
         assert!(parse(big, false, 100).is_err());
+    }
+
+    #[test]
+    fn a_huge_or_oversized_chunk_is_refused_not_overflowed() {
+        // A chunk size of usize::MAX would wrap `size + 2` and slice past
+        // the buffer.
+        let huge = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\nab\r\n0\r\n\r\n",
+            usize::MAX
+        );
+        assert!(parse(huge.as_bytes(), false, 100).is_err());
+        assert!(parse(huge.as_bytes(), true, 100).is_err());
+        // A chunk past the cap is refused while it is still arriving, not
+        // waited for; chunks that each fit but together pass it too.
+        let over = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n40\r\n";
+        assert!(parse(over, false, 63).is_err());
+        let two = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nab\r\n2\r\ncd\r\n";
+        assert!(parse(two, false, 3).is_err());
     }
 
     #[test]

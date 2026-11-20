@@ -247,6 +247,9 @@ struct State {
     inbox_quota: usize,
     page: usize,
     slot_quota: usize,
+    /// Hostile: every fetch answers from the oldest message, whatever
+    /// `after` says, and acknowledgements delete nothing.
+    fetch_repeats: bool,
     relays: Vec<([u8; 65], String, Vec<String>)>,
 
     links: HashMap<[u8; 16], Link>,
@@ -314,6 +317,7 @@ impl State {
             inbox_quota: 64,
             page: 32,
             slot_quota: 64,
+            fetch_repeats: false,
             relays: Vec::new(),
             links: HashMap::new(),
             endpoints: HashMap::new(),
@@ -978,7 +982,7 @@ impl State {
         let mut waiting: Vec<&Message> = inbox
             .messages
             .iter()
-            .filter(|m| after.is_none_or(|a| m.seq > a))
+            .filter(|m| self.fetch_repeats || after.is_none_or(|a| m.seq > a))
             .collect();
         waiting.sort_by_key(|m| m.seq);
         let list = waiting
@@ -1011,8 +1015,11 @@ impl State {
         }
         f.finish()?;
         self.owned_inbox(ep, &inbox_id)?;
+        let repeats = self.fetch_repeats;
         let inbox = self.inboxes.get_mut(&inbox_id).unwrap();
-        inbox.messages.retain(|m| !ids.contains(&m.id));
+        if !repeats {
+            inbox.messages.retain(|m| !ids.contains(&m.id));
+        }
         for id in ids {
             if let Some(st) = self.message_states.get_mut(&id) {
                 if st.inbox == inbox_id {
@@ -1415,6 +1422,13 @@ impl PlusStandIn {
     /// Most directory slots per endpoint.
     pub fn set_slot_quota(&self, n: usize) {
         self.s().slot_quota = n;
+    }
+
+    /// Hostile: answer every inbox fetch from the oldest message, ignoring
+    /// `after`, and keep acknowledged messages, so a client that pages
+    /// until an empty page never stops.
+    pub fn set_fetch_repeats(&self, on: bool) {
+        self.s().fetch_repeats = on;
     }
 
     // --- Hostile Plus ----------------------------------------------------

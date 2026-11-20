@@ -705,14 +705,18 @@ pub async fn deliver(engine: Arc<Engine>, conn: Arc<Connection>) {
 impl Engine {
     /// Decide a signed removal that arrived on a session or by mail, and
     /// the answer to send.
-    pub fn apply_removal(&self, envelope: &[u8]) -> Result<RemovalAnswer, String> {
-        let signed = SignedRemoval::decode(envelope).map_err(|e| e.to_string())?;
-        let result = self.removal.apply_signed(
-            &signed,
-            self.clock.now().secs(),
-            helper().removal_max_age_secs(),
-            crate::limits::get().net.core().clock_skew_secs(),
-        )?;
+    pub fn apply_removal(&self, envelope: &[u8]) -> Result<RemovalAnswer, ApplyError> {
+        let signed =
+            SignedRemoval::decode(envelope).map_err(|e| ApplyError::NotARemoval(e.to_string()))?;
+        let result = self
+            .removal
+            .apply_signed(
+                &signed,
+                self.clock.now().secs(),
+                helper().removal_max_age_secs(),
+                crate::limits::get().net.core().clock_skew_secs(),
+            )
+            .map_err(ApplyError::NotNow)?;
         applog::line(format!(
             "removal of {} by {}: {}",
             short_id(&signed.removal().removed),
@@ -723,5 +727,25 @@ impl Engine {
             id: signed.removal().id,
             result,
         })
+    }
+}
+
+/// Why a removal was not decided.
+#[derive(Debug)]
+pub enum ApplyError {
+    /// Not a signed removal at all: nothing to keep it for.
+    NotARemoval(String),
+    /// A removal the host could not decide now (networking paused, the
+    /// journal not written, not serving): it stays to be tried again, and
+    /// a mailed one is not acknowledged.
+    NotNow(String),
+}
+
+impl std::fmt::Display for ApplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApplyError::NotARemoval(e) => write!(f, "not a removal: {e}"),
+            ApplyError::NotNow(e) => write!(f, "not decided now: {e}"),
+        }
     }
 }

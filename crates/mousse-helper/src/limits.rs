@@ -114,6 +114,14 @@ mousse_net_core::define_limits! {
         plus_mail_poll_secs = "PLUS_MAIL_POLL_SECS": 300, [30, 86_400];
         /// How long a hosted relay move stages the new route before cutting over.
         via_relay_move_stage_secs = "VIA_RELAY_MOVE_STAGE_SECS": 86_400, [0, 604_800];
+        /// Most inbox pages one mail round fetches; a Plus that pages without end cannot hold the round.
+        plus_mail_pages_max = "PLUS_MAIL_PAGES_MAX": 100, [1, 10_000];
+        /// Hosted relays: a new registration key (handle) this often; at least twice MANIFEST_OVERLAP_SECS, so at most two handles per relay are live (§B.4).
+        handle_rotate_secs = "HANDLE_ROTATE_SECS": 1_209_600, [172_800, 7_776_000];
+        /// Hosted relays: how often the helper reads the relay fleet from Plus (also at once when its relay cannot be reached).
+        plus_fleet_refresh_secs = "PLUS_FLEET_REFRESH_SECS": 3_600, [60, 86_400];
+        /// Caller: the least time between two reads of one host's directory slot when no route reaches it (§B.12).
+        plus_slot_read_secs = "PLUS_SLOT_READ_SECS": 300, [10, 86_400];
         /// IPC: longest line a local client may send (Phase 1b §6.2; tighten only).
         ipc_line_max_bytes = "IPC_LINE_MAX_BYTES": 65_536, [1_024, 65_536];
         /// IPC: how long a local client has to send its first line (Phase 1b §6.2; tighten only).
@@ -173,6 +181,12 @@ mousse_net_core::define_limits! {
             return Err(LimitError::Conflict(format!(
                 "MANIFEST_LIFETIME_SECS ({}) is not above MANIFEST_OVERLAP_SECS ({})",
                 h.manifest_lifetime_secs, h.manifest_overlap_secs
+            )));
+        }
+        if h.handle_rotate_secs < h.manifest_overlap_secs.saturating_mul(2) {
+            return Err(LimitError::Conflict(format!(
+                "HANDLE_ROTATE_SECS ({}) is below twice MANIFEST_OVERLAP_SECS ({})",
+                h.handle_rotate_secs, h.manifest_overlap_secs
             )));
         }
         if h.plus_retry_max_ms < h.plus_retry_first_ms {
@@ -537,6 +551,19 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(err.contains("APP_STREAM_CREDIT_BYTES"), "{err}");
+        // Hosted handles rotate at least twice an overlap apart (§B.4), so
+        // at most two handles per relay are live.
+        let err = Limits::from_vars(vars(&[
+            ("MOUSSE_NET_HANDLE_ROTATE_SECS", "172800"),
+            ("MOUSSE_NET_MANIFEST_OVERLAP_SECS", "86401"),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("HANDLE_ROTATE_SECS"), "{err}");
+        assert!(Limits::from_vars(vars(&[
+            ("MOUSSE_NET_HANDLE_ROTATE_SECS", "172800"),
+            ("MOUSSE_NET_MANIFEST_OVERLAP_SECS", "86400"),
+        ]))
+        .is_ok());
     }
 
     #[test]

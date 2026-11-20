@@ -289,3 +289,158 @@ async fn a_hostile_plus_is_refused() {
         "a message Plus made removed a grant"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mailbox_a_removed_pairing_s_slot_goes_even_at_the_slot_quota() {
+    let w = world("slotquota").await;
+    w.standin.set_slot_quota(2);
+    w.mail.sync(&w.host_plus, &*w.pairs).await.unwrap();
+    // The phone goes and a tablet pairs: at the quota, the tablet's slot
+    // can only be written once the phone's is gone.
+    w.engine.host.remove_grant(w.phone_grant).unwrap();
+    let tablet = SoftwareKey::generate(&mut os_rng()).public_key();
+    let (tablet_grant, _) = w
+        .engine
+        .host
+        .add_grant(tablet, "tablet".into(), None)
+        .unwrap();
+    {
+        let mut host = w.pairs.host.lock().unwrap();
+        host.retain(|(g, _, _)| *g != w.phone_grant);
+        host.push((tablet_grant.id, tablet, PairSecret::from_bytes([3; 32])));
+    }
+    w.mail.sync(&w.host_plus, &*w.pairs).await.unwrap();
+    match dir_get(&w.admin_plus, phone_secret().slot_id()).await {
+        Err(Failure::Plus(e)) => assert_eq!(e.code, "not_found"),
+        Err(other) => panic!("unexpected: {other:?}"),
+        Ok(_) => panic!("the removed pairing's slot is still readable"),
+    }
+    assert!(
+        dir_get(&w.admin_plus, PairSecret::from_bytes([3; 32]).slot_id())
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mailbox_a_grant_removal_wakes_the_mailbox_at_once() {
+    let w = world("kick").await;
+    w.engine.set_pairs(w.pairs.clone());
+    w.engine.set_plus(w.host_plus.clone());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while dir_get(&w.admin_plus, phone_secret().slot_id())
+        .await
+        .is_err()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the first sync never ran"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    // Removed through the journal, as the app's grant.remove and a
+    // received removal do; the poll interval is minutes away. (The real
+    // pair source reads the grants, so it drops the pairing with them.)
+    w.pairs
+        .host
+        .lock()
+        .unwrap()
+        .retain(|(g, _, _)| *g != w.phone_grant);
+    w.engine.removal.remove(w.phone_grant).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if matches!(
+            dir_get(&w.admin_plus, phone_secret().slot_id()).await,
+            Err(Failure::Plus(ref e)) if e.code == "not_found"
+        ) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the removed pairing's slot waited for the next poll"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mailbox_a_plus_that_repeats_its_pages_cannot_hold_the_fetch() {
+    let w = world("repeat").await;
+    w.mail.sync(&w.host_plus, &*w.pairs).await.unwrap();
+    let secret = admin_secret(&w);
+    let inbox = w.mail.inbox_id().unwrap();
+    deposit(&w.admin_plus, &inbox, &secret, &signed_removal(&w, 1))
+        .await
+        .unwrap();
+    w.standin.set_fetch_repeats(true);
+    let polled = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        w.mail.poll(&w.host_plus, &w.engine, &*w.pairs),
+    )
+    .await
+    .expect("the fetch round ended");
+    polled.unwrap();
+    assert!(
+        w.standin.request_count("/v1/inbox/fetch")
+            <= crate::limits::helper().plus_mail_pages_max() as usize,
+        "fetched past the page bound"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mailbox_a_removal_the_host_cannot_decide_is_not_acknowledged() {
+    let w = world("noack").await;
+    w.mail.sync(&w.host_plus, &*w.pairs).await.unwrap();
+    let secret = admin_secret(&w);
+    let inbox = w.mail.inbox_id().unwrap();
+    deposit(&w.admin_plus, &inbox, &secret, &signed_removal(&w, 1))
+        .await
+        .unwrap();
+    // The removal journal cannot be written: the host cannot decide.
+    let journal = w.host_dir.join(crate::revoke::REMOVALS_JOURNAL);
+    std::fs::create_dir_all(&journal).unwrap();
+    let acked = w
+        .mail
+        .poll(&w.host_plus, &w.engine, &*w.pairs)
+        .await
+        .unwrap();
+    assert_eq!(acked, 0, "a removal nobody applied was acknowledged");
+    assert_eq!(w.standin.inbox_messages(inbox).len(), 1);
+    assert!(w.engine.host.grants().iter().any(|g| g.identity == w.phone));
+    // Once it can be written, the next round applies and acknowledges it.
+    std::fs::remove_dir_all(&journal).unwrap();
+    let acked = w
+        .mail
+        .poll(&w.host_plus, &w.engine, &*w.pairs)
+        .await
+        .unwrap();
+    assert_eq!(acked, 1);
+    assert!(w.engine.host.grants().iter().all(|g| g.identity != w.phone));
+}
+
+#[test]
+fn mailbox_only_an_expired_or_unknown_message_is_deposited_again() {
+    use crate::plus::proto::PlusError;
+    let plus_error = |status: u16, code: &str| {
+        Err(Failure::Plus(PlusError {
+            status,
+            code: code.into(),
+            retry_after: None,
+        }))
+    };
+    assert_eq!(after_message_state(&Ok(0)), None);
+    assert_eq!(after_message_state(&Ok(1)), Some("delivered"));
+    assert_eq!(after_message_state(&Ok(2)), Some("waiting"));
+    assert_eq!(
+        after_message_state(&plus_error(404, "not_found")),
+        Some("waiting")
+    );
+    // A busy or failing Plus never gets a duplicate deposit.
+    assert_eq!(after_message_state(&plus_error(429, "rate_limited")), None);
+    assert_eq!(after_message_state(&plus_error(500, "internal")), None);
+    assert_eq!(after_message_state(&plus_error(503, "")), None);
+    assert_eq!(
+        after_message_state(&Err(Failure::Local("timeout".into()))),
+        None
+    );
+}

@@ -116,6 +116,19 @@ impl Engine {
                 .get_or_init(|| Arc::new(mailbox::NoPairs))
                 .clone();
             tokio::spawn(mailbox::run(self.clone(), plus, pairs));
+            // A grant removed anywhere (the app, a session, mail, a replay)
+            // takes its slot and deposit token away now, not at the next
+            // poll.
+            let mut removed = self.removal.removed();
+            let engine = Arc::downgrade(self);
+            tokio::spawn(async move {
+                while removed.changed().await.is_ok() {
+                    match engine.upgrade() {
+                        Some(engine) => engine.mail_kick(),
+                        None => return,
+                    }
+                }
+            });
         }
     }
 

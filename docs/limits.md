@@ -125,6 +125,10 @@ spec's value: it can only be tightened.
 | `MOUSSE_NET_PLUS_REFILL_DEADLINE_MS` | 5000 | 1000 to 9000 | After this long without a new block, relayed bulk shows paused; below the relay's default refill wait. |
 | `MOUSSE_NET_PLUS_MAIL_POLL_SECS` | 300 | 30 to 86400 | How often a host fetches its Plus inbox (also after a network change). |
 | `MOUSSE_NET_VIA_RELAY_MOVE_STAGE_SECS` | 86400 | 0 to 604800 | How long a move to another hosted relay stages the new route before cutting over. |
+| `MOUSSE_NET_PLUS_MAIL_PAGES_MAX` | 100 | 1 to 10000 | Most inbox pages one mail round fetches, so a Plus that pages without end cannot hold the round. |
+| `MOUSSE_NET_HANDLE_ROTATE_SECS` | 1209600 | 172800 to 7776000 | Hosted relays: a new registration key (handle) this often. At least twice `MANIFEST_OVERLAP_SECS`, so at most two handles per relay are live; startup refuses otherwise. |
+| `MOUSSE_NET_PLUS_FLEET_REFRESH_SECS` | 3600 | 60 to 86400 | Hosted relays: how often the relay fleet is read from Plus; also at once when this host's relay cannot be reached. |
+| `MOUSSE_NET_PLUS_SLOT_READ_SECS` | 300 | 10 to 86400 | Caller: the least time between two reads of one host's directory slot when no route reaches it (the slot's manifest brings rotated or moved routes). |
 | `MOUSSE_NET_IPC_LINE_MAX_BYTES` | 65536 | 1024 to 65536 | Local control channel: longest line a client may send; a longer one closes the channel (Phase 1b §6.2). |
 | `MOUSSE_NET_IPC_FIRST_LINE_WAIT_MS` | 2000 | 100 to 2000 | Local control channel: time a client has to send its first line before the channel is closed. |
 | `MOUSSE_NET_VIA_RELAY_DIAL_MS` | 10000 | 1000 to 60000 | Through a relay: connect, outer TLS, upgrade, `CALL` or `JOIN`, the splice and step 1, for one try. Above the relay's refusal deadline, so an unlisted caller hears `UNREACHABLE` before it gives up (Phase 3 §B.6). |

@@ -445,6 +445,8 @@ async fn on_removal(shared: &Arc<Shared>) {
     }
     prune_keys(shared);
     refresh_allow(shared);
+    // The removed pairing's slot and deposit token go now (Phase 4 E-L3).
+    shared.engine.mail_kick();
 }
 
 fn start_registration(
@@ -1372,6 +1374,8 @@ fn issue_manifest(shared: &Arc<Shared>, routes: Vec<ManifestRoute>) {
     let envelope = Manifest::seal(&record, signature);
     *guard(&shared.relay.manifest) = Some((manifest, envelope));
     broadcast_manifest(shared);
+    // Every pairing's directory slot carries the new manifest (§B.12).
+    shared.engine.mail_kick();
 }
 
 /// Caller: the host sent its manifest. Kept if it is signed by the pin and

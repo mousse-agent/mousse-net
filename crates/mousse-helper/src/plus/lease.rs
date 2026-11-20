@@ -273,6 +273,13 @@ impl Book {
                 out.push(Action::Paused(class, true));
             }
         }
+        // A refused block that expired before it could be presented again
+        // leaves its class wanting one: ask Plus.
+        for class in [Class::Interactive, Class::Bulk] {
+            if self.wants(class) && !out.contains(&Action::Request(class)) {
+                out.push(Action::Request(class));
+            }
+        }
         if cfg!(mousse_control = "pause-all-classes")
             && out
                 .iter()
@@ -581,15 +588,22 @@ mod tests {
         b.on_block(block(Class::Interactive, 1, 1000, 10_000), 0);
         b.on_status(&[status(Class::Interactive, 1, 0, 1000, 3)], 100);
         assert!(!b.wants(Class::Interactive), "the refused block comes back");
-        assert!(b.tick(900, 50).is_empty());
+        let early = b.tick(900, 50);
+        assert!(!early
+            .iter()
+            .any(|a| matches!(a, Action::Present(_) | Action::Request(Class::Interactive))));
         let out = b.tick(1_100, 50);
-        assert_eq!(
-            out,
-            vec![Action::Present(block(Class::Interactive, 1, 1000, 10_000))]
-        );
-        // An expired one is not presented again.
+        assert!(out.contains(&Action::Present(block(Class::Interactive, 1, 1000, 10_000))));
+        assert!(!out.contains(&Action::Request(Class::Interactive)));
+        // An expired one is not presented again; the class asks Plus for
+        // a new block instead of staying unfunded.
         b.on_status(&[status(Class::Interactive, 1, 0, 1000, 3)], 1_200);
-        assert!(b.tick(5_000, 10_001).is_empty());
+        let out = b.tick(5_000, 10_001);
+        assert!(!out.iter().any(|a| matches!(a, Action::Present(_))));
+        assert!(
+            out.contains(&Action::Request(Class::Interactive)),
+            "{out:?}"
+        );
     }
 
     #[test]
