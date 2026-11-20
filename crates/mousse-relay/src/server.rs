@@ -15,13 +15,14 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
-use mousse_net_core::relay::machine::{ConnId, IpKey, Now, Output, Relay, RelayConfig};
-use mousse_net_core::relay::{Class, RelayId, RelayLimits};
+use mousse_net_core::relay::machine::{close, ConnId, IpKey, Now, Output, Relay, RelayConfig};
+use mousse_net_core::relay::{Class, RelayId, RelayLimits, RelayMessage};
 use mousse_net_core::relay_hosted::{BootRecord, Hosted};
 use mousse_net_core::time::UnixTime;
 use mousse_net_io::clock::{Clock, SystemClock};
@@ -46,21 +47,24 @@ use crate::{os_rng, tls, upgrade, OsRng};
 
 type Ws = WebSocketStream<BufReader<Box<dyn crate::Io>>>;
 
-/// What a connection's writer does next.
-enum Cmd {
-    /// Send a binary message. `permits` go back to this connection's queue
-    /// once written (forwarded peer bytes).
-    Send {
-        bytes: Vec<u8>,
-        class: Class,
-        permits: usize,
-    },
-    /// Send a close frame and stop.
-    Close(u16),
+/// A binary message for a connection's writer. `permits` go back to this
+/// connection's queue once written (forwarded peer bytes); `control` marks
+/// a relay message, counted against `RELAY_CONTROL_QUEUE_MESSAGES`.
+struct Cmd {
+    bytes: Vec<u8>,
+    class: Class,
+    permits: usize,
+    control: bool,
 }
 
 struct ConnHandle {
     tx: mpsc::UnboundedSender<Cmd>,
+    /// Relay messages queued toward this connection and not yet taken by
+    /// its writer.
+    control: Arc<AtomicUsize>,
+    /// Tells the writer to close with this code, even while a write is
+    /// blocked: what is queued goes first, within `RELAY_CLOSE_LINGER_MS`.
+    close: Option<oneshot::Sender<u16>>,
     /// Bytes queued toward this connection may not exceed
     /// `RELAY_QUEUE_BYTES`: a forwarding reader takes permits first.
     queue: Arc<Semaphore>,
@@ -70,6 +74,18 @@ struct ConnHandle {
     stop: Arc<Notify>,
     /// Hosted: told when this paused leg may try its message again.
     resume: Arc<Notify>,
+}
+
+impl ConnHandle {
+    /// The relay closed this connection: its writer closes with `code`,
+    /// its reader stops, and nothing more is queued toward it.
+    fn close(mut self, code: u16) {
+        if let Some(close) = self.close.take() {
+            let _ = close.send(code);
+        }
+        self.queue.close();
+        self.stop.notify_one();
+    }
 }
 
 struct Core {
@@ -197,22 +213,31 @@ impl Shared {
     /// Carry out `outs` in order, under the core lock. `payload` is the
     /// peer message of a `Forward`, with the queue permits it took.
     fn execute(&self, core: &mut Core, outs: Vec<Output>, mut payload: Option<(Vec<u8>, usize)>) {
+        // Connections whose control queue is full; closed after these outputs.
+        let mut full = Vec::new();
         for out in outs {
             match out {
                 Output::Send { conn, message } => {
                     if let Some(h) = core.conns.get(&conn) {
-                        let _ = h.tx.send(Cmd::Send {
+                        let max = self.limits.control_queue_messages() as usize;
+                        if h.control.load(Ordering::Relaxed) >= max {
+                            if !full.contains(&conn) {
+                                full.push(conn);
+                            }
+                            continue;
+                        }
+                        h.control.fetch_add(1, Ordering::Relaxed);
+                        let _ = h.tx.send(Cmd {
                             bytes: message,
                             class: Class::Interactive,
                             permits: 0,
+                            control: true,
                         });
                     }
                 }
                 Output::Close { conn, code } => {
                     if let Some(h) = core.conns.remove(&conn) {
-                        let _ = h.tx.send(Cmd::Close(code));
-                        h.queue.close();
-                        h.stop.notify_one();
+                        h.close(code);
                     }
                 }
                 Output::Resume { conn } => {
@@ -239,18 +264,25 @@ impl Shared {
                     if let (Some((bytes, permits)), Some(h)) = (payload.take(), core.conns.get(&to))
                     {
                         let class = h.peer.map(|(_, c)| c).unwrap_or(Class::Interactive);
-                        let _ = h.tx.send(Cmd::Send {
+                        let _ = h.tx.send(Cmd {
                             bytes,
                             class,
                             permits,
+                            control: false,
                         });
                     }
                 }
-                Output::Authorize { fingerprint } => self.persist(|l| {
-                    if !l.authorized.iter().any(|k| k.fingerprint == fingerprint) {
+                Output::Authorize { fingerprint, chain } => self.persist(|l| {
+                    // A successor whose chain the operator revoked since the
+                    // last read stays out; the next read removes it from the
+                    // machine too.
+                    let revoked =
+                        chain != fingerprint && !l.authorized.iter().any(|k| k.chain == chain);
+                    if !revoked && !l.authorized.iter().any(|k| k.fingerprint == fingerprint) {
                         l.authorized.push(mousse_net_core::relay::AuthorizedKey {
                             fingerprint,
                             drop_at: None,
+                            chain,
                         });
                     }
                 }),
@@ -274,6 +306,9 @@ impl Shared {
                 }
             }
         }
+        for conn in full {
+            self.lost(core, conn);
+        }
         if core
             .relay
             .hosted_mut()
@@ -294,13 +329,27 @@ impl Shared {
         }
     }
 
+    /// The relay gives up on `conn` (a full control queue, a blocked
+    /// write): it closes with 4006 and the machine treats it as closed.
+    fn lost(&self, core: &mut Core, conn: ConnId) {
+        if let Some(h) = core.conns.remove(&conn) {
+            h.close(close::LIMIT);
+            let now = self.now();
+            let outs = core.relay.closed(conn, now, &mut core.rng);
+            self.execute(core, outs, None);
+        }
+    }
+
     /// Apply the authorized list and codes from the state directory, so
     /// `revoke` and `enroll` take effect.
     fn reload(&self) {
         // Read under the core lock: the relay's own durable changes are made
         // under it too, so a read can never be older than the machine.
         let mut guard = self.core.lock().expect("core");
-        let core = &mut *guard;
+        self.reload_locked(&mut guard);
+    }
+
+    fn reload_locked(&self, core: &mut Core) {
         self.reload_issuer_keys(core);
         let Ok(lists) = self.state.read() else {
             return;
@@ -613,6 +662,8 @@ async fn connection(shared: Arc<Shared>, acceptor: TlsAcceptor, tcp: TcpStream, 
     };
     let (sink, stream) = ws.split();
     let (tx, rx) = mpsc::unbounded_channel();
+    let (close_tx, close_rx) = oneshot::channel();
+    let control = Arc::new(AtomicUsize::new(0));
     let queue = Arc::new(Semaphore::new(shared.limits.queue_bytes() as usize));
     let stop = Arc::new(Notify::new());
     let resume = Arc::new(Notify::new());
@@ -625,6 +676,8 @@ async fn connection(shared: Arc<Shared>, acceptor: TlsAcceptor, tcp: TcpStream, 
             conn,
             ConnHandle {
                 tx,
+                control: control.clone(),
+                close: Some(close_tx),
                 queue: queue.clone(),
                 peer: None,
                 stop: stop.clone(),
@@ -636,7 +689,15 @@ async fn connection(shared: Arc<Shared>, acceptor: TlsAcceptor, tcp: TcpStream, 
         shared.execute(core, outs, None);
         conn
     };
-    let writer = tokio::spawn(writer(shared.clone(), sink, rx, queue));
+    let writer = tokio::spawn(writer(
+        shared.clone(),
+        conn,
+        sink,
+        rx,
+        queue,
+        control,
+        close_rx,
+    ));
     reader(&shared, conn, stream, stop, resume).await;
     {
         let mut guard = shared.core.lock().expect("core");
@@ -679,12 +740,10 @@ async fn reader(
         // treats it as closed by the client (relay.md 2, 4.3).
         let mut guard = shared.core.lock().expect("core");
         let core = &mut *guard;
-        if let Some(code) = close_with {
-            if let Some(h) = core.conns.get(&conn) {
-                let _ = h.tx.send(Cmd::Close(code));
+        if let Some(h) = core.conns.remove(&conn) {
+            if let Some(code) = close_with {
+                h.close(code);
             }
-        }
-        if core.conns.remove(&conn).is_some() {
             let now = shared.now();
             let outs = core.relay.closed(conn, now, &mut core.rng);
             shared.execute(core, outs, None);
@@ -716,6 +775,18 @@ async fn on_message(
         let core = &mut *guard;
         if !core.conns.contains_key(&conn) {
             return true;
+        }
+        // A SUCCESSOR is checked against the stored list as it is now, so a
+        // key the operator revoked cannot name a successor before the next
+        // read.
+        if matches!(
+            RelayMessage::decode(&bytes),
+            Ok(RelayMessage::Successor { .. })
+        ) {
+            shared.reload_locked(core);
+            if !core.conns.contains_key(&conn) {
+                return true;
+            }
         }
         let now = shared.now();
         let outs = core.relay.receive(conn, &bytes, now, &mut core.rng);
@@ -826,41 +897,104 @@ fn marker_tap(_bytes: &[u8]) {
     crate::control::tap(_bytes);
 }
 
+/// How one write ended.
+enum Sent {
+    Done,
+    /// The connection failed; its reader sees it too.
+    Broken,
+    /// No progress within `RELAY_SEND_WAIT_MS` (or the close linger).
+    Stuck,
+}
+
+async fn write_one(
+    shared: &Shared,
+    sink: &mut SplitSink<Ws, Message>,
+    cmd: Cmd,
+    control: &AtomicUsize,
+    wait: Duration,
+) -> Sent {
+    if cmd.control {
+        control.fetch_sub(1, Ordering::Relaxed);
+    }
+    shared.egress.take(cmd.bytes.len(), cmd.class).await;
+    match tokio::time::timeout(wait, sink.send(Message::Binary(cmd.bytes.into()))).await {
+        Ok(Ok(())) => Sent::Done,
+        Ok(Err(_)) => Sent::Broken,
+        Err(_) => Sent::Stuck,
+    }
+}
+
 async fn writer(
     shared: Arc<Shared>,
+    conn: ConnId,
     mut sink: SplitSink<Ws, Message>,
     mut rx: mpsc::UnboundedReceiver<Cmd>,
     queue: Arc<Semaphore>,
+    control: Arc<AtomicUsize>,
+    mut close: oneshot::Receiver<u16>,
 ) {
-    while let Some(cmd) = rx.recv().await {
-        match cmd {
-            Cmd::Send {
-                bytes,
-                class,
-                permits,
-            } => {
-                shared.egress.take(bytes.len(), class).await;
-                let sent = sink.send(Message::Binary(bytes.into())).await;
-                queue.add_permits(permits);
-                if sent.is_err() {
-                    break;
-                }
+    let send_wait = Duration::from_millis(shared.limits.send_wait_ms());
+    let linger = Duration::from_millis(shared.limits.close_linger_ms());
+    // `None`: the connection ended without a close of the relay's own.
+    let code = loop {
+        let cmd = tokio::select! {
+            biased;
+            code = &mut close => break code.ok(),
+            cmd = rx.recv() => match cmd {
+                Some(cmd) => cmd,
+                None => break None,
+            },
+        };
+        let permits = cmd.permits;
+        let write = write_one(&shared, &mut sink, cmd, &control, send_wait);
+        tokio::pin!(write);
+        // A close does not wait behind a blocked write: the write gets the
+        // close linger to finish, then the close goes ahead.
+        let (sent, closing) = tokio::select! {
+            biased;
+            sent = &mut write => (sent, None),
+            code = &mut close => {
+                let sent = tokio::time::timeout(linger, &mut write)
+                    .await
+                    .unwrap_or(Sent::Stuck);
+                (sent, Some(code.ok()))
             }
-            Cmd::Close(code) => {
-                let frame = CloseFrame {
-                    code: CloseCode::from(code),
-                    reason: "".into(),
-                };
-                let _ = tokio::time::timeout(
-                    Duration::from_secs(2),
-                    sink.send(Message::Close(Some(frame))),
-                )
-                .await;
-                let _ = tokio::time::timeout(Duration::from_secs(2), sink.close()).await;
-                break;
+        };
+        queue.add_permits(permits);
+        match (sent, closing) {
+            (Sent::Done, None) => {}
+            (Sent::Done, Some(code)) => break code,
+            (Sent::Broken, _) | (Sent::Stuck, Some(_)) => break None,
+            (Sent::Stuck, None) => {
+                // The peer stopped reading: give up on the connection.
+                let mut guard = shared.core.lock().expect("core");
+                shared.lost(&mut guard, conn);
+                break None;
             }
         }
-    }
+    };
+    let Some(code) = code else {
+        return;
+    };
+    let frame = CloseFrame {
+        code: CloseCode::from(code),
+        reason: "".into(),
+    };
+    let _ = tokio::time::timeout(linger, async {
+        // What was queued before the close goes out first (`REFUSED`, then
+        // the close).
+        while let Ok(cmd) = rx.try_recv() {
+            let permits = cmd.permits;
+            let sent = write_one(&shared, &mut sink, cmd, &control, linger).await;
+            queue.add_permits(permits);
+            if !matches!(sent, Sent::Done) {
+                return;
+            }
+        }
+        let _ = sink.send(Message::Close(Some(frame))).await;
+    })
+    .await;
+    let _ = tokio::time::timeout(linger, sink.close()).await;
 }
 
 /// Fire the machine's waits when they are due.

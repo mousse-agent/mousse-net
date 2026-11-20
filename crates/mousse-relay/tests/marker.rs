@@ -160,10 +160,9 @@ async fn the_marker_never_shows_at_the_relay() {
     let (target, caller) = (key(0x61), key(0x71));
     dir.update(now(), |l| {
         l.authorized
-            .push(mousse_net_core::relay::machine::AuthorizedKey {
-                fingerprint: target.fingerprint(),
-                drop_at: None,
-            })
+            .push(mousse_net_core::relay::machine::AuthorizedKey::listed(
+                target.fingerprint(),
+            ))
     })
     .unwrap();
     let tap = path.join("tap.bin");

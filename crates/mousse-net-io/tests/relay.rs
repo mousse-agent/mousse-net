@@ -88,10 +88,7 @@ impl TestRelay {
     async fn authorize(&self, key: &RelayClientKey) {
         self.dir
             .update(now(), |l| {
-                l.authorized.push(AuthorizedKey {
-                    fingerprint: key.fingerprint(),
-                    drop_at: None,
-                })
+                l.authorized.push(AuthorizedKey::listed(key.fingerprint()))
             })
             .unwrap();
         // The relay reads its lists every RELAY_STATE_POLL_MS.

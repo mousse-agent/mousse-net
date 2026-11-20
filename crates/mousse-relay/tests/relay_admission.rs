@@ -179,6 +179,38 @@ async fn successor_needs_the_current_key() {
     assert_eq!(relay(&mut reg).await, RelayMessage::Pong { data: [3; 8] });
 }
 
+/// A key revoked in the state directory cannot name a successor in the
+/// moments before the relay's next read: a `SUCCESSOR` is checked against
+/// the stored list as it is then, so the successor cannot register even
+/// at once, and is never stored.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_revoked_key_cannot_name_a_successor_before_the_next_read() {
+    let (target, new) = (key(0x61), key(0x63));
+    let f = Fixture::new("successor-revoked", &[], &[&target]).await;
+    let mut reg = f.register(&target).await;
+    let mut c = f.dial().await;
+    assert_eq!(f.dir.revoke(now(), &target.fingerprint()).unwrap(), 1);
+    reg.send(&RelayMessage::Successor {
+        key: new.public_key(),
+        new_proof: new.successor_proof(&f.id, &new.public_key(), &reg.binding),
+        current_proof: target.successor_proof(&f.id, &new.public_key(), &reg.binding),
+    })
+    .await
+    .unwrap();
+    // Without the check, the PING behind it would get its PONG here.
+    reg.send(&RelayMessage::Ping { data: [4; 8] }).await.ok();
+    assert_eq!(next(&mut reg).await, Received::Closed(Some(4000)));
+    c.send(&RelayMessage::Register {
+        key: new.public_key(),
+        proof: new.register_proof(&f.id, &c.binding),
+        hosted: None,
+    })
+    .await
+    .unwrap();
+    assert!(matches!(relay(&mut c).await, RelayMessage::Refused { .. }));
+    assert!(f.dir.read().unwrap().authorized.is_empty());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn enrollment_link_and_revoke_take_effect_on_the_running_relay() {
     let (target, caller) = (key(0x61), key(0x71));
@@ -214,7 +246,7 @@ async fn enrollment_link_and_revoke_take_effect_on_the_running_relay() {
     let (mut leg, mut acc) = f
         .connect(&mut reg, &target, &caller, Class::Interactive)
         .await;
-    assert!(f.dir.revoke(now(), &target.fingerprint()).unwrap());
+    assert_eq!(f.dir.revoke(now(), &target.fingerprint()).unwrap(), 1);
     assert_eq!(closed(&mut reg).await, Some(4000));
     assert_eq!(closed(&mut leg).await, Some(4000));
     assert_eq!(closed(&mut acc).await, Some(4000));

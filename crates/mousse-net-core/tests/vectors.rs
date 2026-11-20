@@ -903,7 +903,9 @@ fn relay_output(o: &mousse_net_core::relay::Output) -> J {
         Output::Forward { from, to, len } => {
             serde_json::json!({ "forward": [from.0, to.0], "len": len })
         }
-        Output::Authorize { fingerprint } => serde_json::json!({ "authorize": h(fingerprint) }),
+        Output::Authorize { fingerprint, chain } => {
+            serde_json::json!({ "authorize": h(fingerprint), "chain": h(chain) })
+        }
         Output::Supersede {
             fingerprint,
             drop_at,
@@ -1029,9 +1031,13 @@ fn relay_admission() {
         };
         let authorized: Vec<AuthorizedKey> = list(&sc["authorized"])
             .iter()
-            .map(|a| AuthorizedKey {
-                fingerprint: fixed(&a["fingerprint"]),
-                drop_at: a.get("drop_at").map(|t| UnixTime(u(t))),
+            .map(|a| {
+                let fingerprint = fixed(&a["fingerprint"]);
+                AuthorizedKey {
+                    fingerprint,
+                    drop_at: a.get("drop_at").map(|t| UnixTime(u(t))),
+                    chain: a.get("chain").map_or(fingerprint, fixed),
+                }
             })
             .collect();
         let codes: Vec<EnrollCode> = list(&sc["codes"])

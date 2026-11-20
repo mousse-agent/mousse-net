@@ -172,14 +172,18 @@ tightened. `RELAY_REFUSE_MS` must be below `RELAY_ACCEPT_WAIT_MS`
 | `MOUSSE_NET_RELAY_REFUSE_MS` | 500 | 500 to 5000 | Constant refusal deadline from a CALL or JOIN; below the accept wait. |
 | `MOUSSE_NET_RELAY_PREACCEPT_BYTES` | 65536 | 16384 to 65536 | Peer bytes per join circuit and direction before promotion (tighten only). |
 | `MOUSSE_NET_RELAY_PREACCEPT_PER_TARGET` | 4 | 1 to 4 | Join circuits per handle (tighten only). |
-| `MOUSSE_NET_RELAY_KEEPALIVE_MS` | 15000 | 1000 to 15000 | PING on a registration connection after this long without sending. |
+| `MOUSSE_NET_RELAY_KEEPALIVE_MS` | 15000 | 1000 to 15000 | PING on a registration connection after this long without sending (tighten only). |
 | `MOUSSE_NET_RELAY_REGISTRATION_IDLE_MS` | 45000 | 30000 to 45000 | Registration closed after this long without receiving (tighten only). |
 | `MOUSSE_NET_RELAY_CIRCUIT_IDLE_MS` | 60000 | 46000 to 600000 | Spliced circuit closed after this long with no bytes either way; above the peer idle timeout. |
 | `MOUSSE_NET_RELAY_QUEUE_BYTES` | 262144 | 16384 to 262144 | Bytes buffered per circuit and direction before the relay stops reading that leg (tighten only). |
 | `MOUSSE_NET_RELAY_EGRESS_BPS` | 12500000 | 125000 to 12500000000 | Shared egress ceiling in bytes per second (capacity). |
 | `MOUSSE_NET_RELAY_ENROLL_SECS` | 3600 | 60 to 3600 | Enrollment code lifetime; single use (tighten only). |
-| `MOUSSE_NET_RELAY_SUCCESSOR_OVERLAP_SECS` | 604800 | 86400 to 2592000 | After a SUCCESSOR, how long the superseded registration key stays authorized. |
-| `MOUSSE_NET_RELAY_STATE_POLL_MS` | 1000 | 100 to 60000 | How often the running relay re-reads its authorized list and enrollment codes, so `revoke` and `enroll` take effect. |
+| `MOUSSE_NET_RELAY_SUCCESSOR_OVERLAP_SECS` | 604800 | 3600 to 604800 | After a SUCCESSOR, how long the superseded registration key stays authorized (tighten only). |
+| `MOUSSE_NET_RELAY_CHAIN_KEYS_MAX` | 4 | 2 to 4 | Keys one SUCCESSOR chain may hold at once, the current key and those it superseded (tighten only). |
+| `MOUSSE_NET_RELAY_STATE_POLL_MS` | 1000 | 100 to 1000 | How often the running relay re-reads its authorized list and enrollment codes, so `revoke` and `enroll` take effect (tighten only). |
+| `MOUSSE_NET_RELAY_SEND_WAIT_MS` | 20000 | 1000 to 20000 | A write to one connection that makes no progress this long closes that connection (tighten only). |
+| `MOUSSE_NET_RELAY_CONTROL_QUEUE_MESSAGES` | 64 | 8 to 64 | Control messages (PONG, REFUSED and the like) queued to one connection; more closes it (tighten only). |
+| `MOUSSE_NET_RELAY_CLOSE_LINGER_MS` | 2000 | 100 to 2000 | Wait for the close frame and the TCP shutdown when the relay closes a connection (tighten only). |
 
 Fixed on purpose in the relay protocol: the 16 384-byte relay message, the
 65 536-byte WebSocket message, 256 caller fingerprints and 8 invitations per
