@@ -93,6 +93,9 @@ pub type SharedSigner = Arc<dyn IdentitySigner + Send + Sync>;
         mousse_control = "no-overlap",
         mousse_control = "stale-manifest-dropped",
         mousse_control = "prompt-on-key-change",
+        mousse_control = "disallow-keeps-paths",
+        mousse_control = "remove-keeps-sessions",
+        mousse_control = "accept-legs-unbounded",
         mousse_control = "ws-allow-origin",
         mousse_control = "plain-ws-off-loopback",
         mousse_control = "release-test-root",
@@ -137,6 +140,9 @@ compile_error!("a mousse_control build has a deliberate defect and is for tests 
     mousse_control = "no-overlap",
     mousse_control = "stale-manifest-dropped",
     mousse_control = "prompt-on-key-change",
+    mousse_control = "disallow-keeps-paths",
+    mousse_control = "remove-keeps-sessions",
+    mousse_control = "accept-legs-unbounded",
     mousse_control = "ws-allow-origin",
     mousse_control = "plain-ws-off-loopback",
     mousse_control = "release-test-root",
@@ -214,6 +220,12 @@ pub const CONTROL: Option<&str> = if cfg!(mousse_control = "skip-pin-check") {
     Some("stale-manifest-dropped")
 } else if cfg!(mousse_control = "prompt-on-key-change") {
     Some("prompt-on-key-change")
+} else if cfg!(mousse_control = "disallow-keeps-paths") {
+    Some("disallow-keeps-paths")
+} else if cfg!(mousse_control = "remove-keeps-sessions") {
+    Some("remove-keeps-sessions")
+} else if cfg!(mousse_control = "accept-legs-unbounded") {
+    Some("accept-legs-unbounded")
 } else if cfg!(mousse_control = "ws-allow-origin") {
     Some("ws-allow-origin")
 } else if cfg!(mousse_control = "plain-ws-off-loopback") {

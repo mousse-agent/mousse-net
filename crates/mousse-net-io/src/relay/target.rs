@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mousse_net_core::relay::msg::InvitationEntry;
-use mousse_net_core::relay::{Class, RelayClientKey, RelayId, RelayMessage};
-use tokio::sync::{mpsc, watch};
+use mousse_net_core::relay::{Class, RefuseReason, RelayClientKey, RelayId, RelayMessage};
+use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
 use super::outer::{RelayAddr, RelayLink, WsPipe};
@@ -175,7 +175,12 @@ impl TargetLink {
     }
 
     /// Keep the registration until it ends; returns why. The allow-set is
-    /// pushed at once and again on every change of `allow`.
+    /// pushed at once and again on every change of `allow`. At most
+    /// `accept_legs` accept legs are dialled at once: an `INCOMING` past
+    /// that is reported as [`TargetEvent::AcceptFailed`] and left to time
+    /// out at the relay, so a relay cannot make the target dial without
+    /// bound.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run(
         mut self,
         mut allow: watch::Receiver<AllowSet>,
@@ -183,7 +188,9 @@ impl TargetLink {
         events: mpsc::UnboundedSender<TargetEvent>,
         keepalive: Duration,
         idle: Duration,
+        accept_legs: usize,
     ) -> RelayError {
+        let legs = Arc::new(Semaphore::new(accept_legs.max(1)));
         let mut last_sent = Instant::now();
         let mut last_heard = Instant::now();
         let mut push = true;
@@ -252,7 +259,22 @@ impl TargetLink {
                             let _ = events.send(TargetEvent::AllowSetOk { sequence });
                         }
                         Ok(RelayMessage::Incoming { circuit, class, caller }) => {
+                            let permit = if cfg!(mousse_control = "accept-legs-unbounded") {
+                                None
+                            } else {
+                                match legs.clone().try_acquire_owned() {
+                                    Ok(permit) => Some(permit),
+                                    Err(_) => {
+                                        let _ = events.send(TargetEvent::AcceptFailed {
+                                            circuit,
+                                            error: RelayError::Refused(RefuseReason::Limit),
+                                        });
+                                        continue;
+                                    }
+                                }
+                            };
                             tokio::spawn(accept_leg(
+                                permit,
                                 self.addr.clone(),
                                 self.relay,
                                 self.key.clone(),
@@ -292,6 +314,8 @@ impl TargetLink {
 
 #[allow(clippy::too_many_arguments)]
 async fn accept_leg(
+    // Held until the leg is spliced or has failed.
+    _permit: Option<OwnedSemaphorePermit>,
     addr: RelayAddr,
     relay: RelayId,
     key: Arc<RelayClientKey>,

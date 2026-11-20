@@ -289,17 +289,61 @@ pub fn a_relay_route_is_dialled_only_once_its_destination_is_approved() {
         .unwrap()
         .iter()
         .all(|x| x["source"] == "manifest"));
-    // Removing the approval stops relay dials to it.
+    // Bulk rides a second call through the same relay.
+    let conn = up["conn"].as_u64().unwrap();
+    carry(&mut b, conn, &mut a, "bulk", &[7; 10_000]);
+    // Removing the approval ends the path through it at once, its bulk
+    // companion's call too, with A still there, and nothing dials it again:
+    // not the keep-connected redials, not a bulk stream.
+    let before = two.connections();
     b.call(
         "peer.relay.disallow",
         json!({"identity": a.identity, "destination": two.destination()}),
     );
-    let before = two.connections();
-    let conn = up["conn"].as_u64().unwrap();
-    a.kill();
     b.event("conn.down", |m| m["conn"] == conn);
+    let reply = b.request(
+        "stream.open",
+        json!({"conn": conn, "label": "mousse.rpc", "class": "bulk"}),
+    );
+    assert_eq!(reply["error"], "no_conn", "{reply}");
     std::thread::sleep(Duration::from_millis(1_500));
     assert_eq!(two.connections(), before);
+    let reply = b.request("dial", json!({"identity": a.identity}));
+    assert_eq!(reply["error"], "unreachable", "{reply}");
+    assert_eq!(two.connections(), before);
+}
+
+/// Removing one of a host's relays ends the sessions through it, not only
+/// its registration.
+pub fn removing_a_relay_ends_the_sessions_through_it() {
+    let relay = Relay::start();
+    let a_end = Endpoint::init("rxa");
+    let b_end = Endpoint::init("rxb");
+    let mut a = a_end.app("hostA", &FAST);
+    a.hello();
+    let id = enroll(&mut a, &relay)["relay"]["id"].clone();
+    let mut b = b_end.app("peerB", &FAST);
+    b.hello();
+    pair_apps(&mut a, &mut b);
+    wait_listed(&mut a, &b.identity.clone());
+    b.event("peer.relay.offered", |m| {
+        m["identity"] == a.identity.as_str()
+    });
+    b.call(
+        "peer.relay.allow",
+        json!({"identity": a.identity, "destination": relay.destination()}),
+    );
+    restart(&mut a, &a_end, "hostA", &FAST);
+    wait_registered(&mut a);
+    let up = dial_up(&mut b, &a.identity.clone());
+    assert_eq!(up["route"]["kind"], "relay", "{up}");
+    let conn = up["conn"].as_u64().unwrap();
+    let a_in = carry(&mut b, conn, &mut a, "interactive", b"through the relay");
+
+    let removed = a.call("relay.remove", json!({"relay": id}));
+    assert_eq!(removed["removed"], true, "{removed}");
+    a.event("conn.down", |m| m["conn"] == a_in);
+    b.event("conn.down", |m| m["conn"] == conn);
 }
 
 /// A ticket with only its relay hints: the joiner can reach the host only
@@ -499,4 +543,5 @@ pub const CASES: &[(&str, fn())] = &[
     ("relay_only_pairing_recovers_with_one_grant_and_only_for_that_grant", relay_only_pairing_recovers_with_one_grant_and_only_for_that_grant),
     ("a_grant_rides_a_recovery_circuit_only_for_its_own_invitation", a_grant_rides_a_recovery_circuit_only_for_its_own_invitation),
     ("removals_reach_the_relay_after_a_restart_too", removals_reach_the_relay_after_a_restart_too),
+    ("removing_a_relay_ends_the_sessions_through_it", removing_a_relay_ends_the_sessions_through_it),
 ];

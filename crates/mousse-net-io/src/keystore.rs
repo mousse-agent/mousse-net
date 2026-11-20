@@ -352,8 +352,10 @@ pub fn relay_seed_user(endpoint_id: &str) -> String {
 
 /// The endpoint's relay seed: 32 random bytes, kept where its identity is
 /// kept (`storage`), made on first use. Registration keys, caller keys and
-/// pair secrets are derived from it with salts kept in the helper's state
-/// files, so no other relay secret is ever written to a plain file.
+/// a host's pair secrets are derived from it with salts kept in the
+/// helper's state files, and the secrets a caller is given (a host's pair
+/// secret, a ticket's invitation tag) are stored sealed under a key derived
+/// from it, so no other relay secret is ever written to a plain file.
 pub fn relay_seed(
     dir: &Path,
     endpoint_id: &str,

@@ -321,10 +321,10 @@ steps = "on the relay machine: mousse-check relay-inspect --state <state dir> --
 
 [[check]]
 id = "phase3.relay-routes"
-title = "The app channel's cases over a relay route; bulk on its own outer connection and peer session; removing one caller closes only its circuits, also when the removal is replayed at start; caller keys per pairing; a relay route is dialled only after its destination is approved, per destination; relay-only pairing whose circuit dropped after PAIRED recovers with one grant, and only that grant rides the recovery circuit"
+title = "The app channel's cases over a relay route; bulk on its own outer connection and peer session; removing one caller closes only its circuits, also when the removal is replayed at start; caller keys per pairing; a relay route is dialled only after its destination is approved, per destination; relay-only pairing whose circuit dropped after PAIRED recovers with one grant, and only that grant rides the recovery circuit; disallowing a destination ends the paths through it, bulk included; removing an own relay ends the sessions through it; a caller's pair secret is not in a plain file"
 plan = "docs/phase34-design.md §B.5 to §B.8, §B.11, §B.12 and Part F (E-R3)"
 targets = ["windows-x64", "macos-arm64", "linux-x64"]
-min_tests = 6
+min_tests = 8
 local = [
   { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_relay", "--no-fail-fast"] },
   { target = "macos-arm64", host = "macos-aarch64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_relay", "--no-fail-fast"] },
@@ -337,14 +337,16 @@ control = [
   { name = "blanket-approval", breaks = "one approved relay destination of a host approves every other one", env = { RUSTFLAGS = '--cfg mousse_control="blanket-approval"' } },
   { name = "no-pairing-recovery", breaks = "a consumed relay invitation's tag leaves the allow-set at once", env = { RUSTFLAGS = '--cfg mousse_control="no-pairing-recovery"' } },
   { name = "recovery-makes-grant", breaks = "a join circuit admits a granted identity other than the grant its invitation made", env = { RUSTFLAGS = '--cfg mousse_control="recovery-makes-grant"' } },
+  { name = "disallow-keeps-paths", breaks = "disallowing a relay destination leaves the paths through it up", env = { RUSTFLAGS = '--cfg mousse_control="disallow-keeps-paths"' } },
+  { name = "remove-keeps-sessions", breaks = "removing an own relay leaves the sessions through it up", env = { RUSTFLAGS = '--cfg mousse_control="remove-keeps-sessions"' } },
 ]
 
 [[check]]
 id = "phase3.relay-client"
-title = "The endpoint side of the relay protocol: the peer TLS runs end to end through the splice; a wrong relay key fails in the outer TLS before any relay message; an unlisted caller and an unknown handle are refused at the constant deadline; an allow-set change closes only the removed caller's circuits; an enrollment code registers once"
+title = "The endpoint side of the relay protocol: the peer TLS runs end to end through the splice; a wrong relay key fails in the outer TLS before any relay message; an unlisted caller and an unknown handle are refused at the constant deadline; an allow-set change closes only the removed caller's circuits; an enrollment code registers once; a relay cannot make the target dial more accept legs than its limit"
 plan = "docs/phase34-design.md §B.2 to §B.9 (E-R3, client side)"
 targets = ["windows-x64", "macos-arm64", "linux-x64"]
-min_tests = 5
+min_tests = 6
 local = [
   { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-net-io", "--test", "relay", "--no-fail-fast"] },
   { target = "macos-arm64", host = "macos-aarch64", command = ["cargo", "test", "-p", "mousse-net-io", "--test", "relay", "--no-fail-fast"] },
@@ -352,14 +354,15 @@ local = [
 ]
 control = [
   { name = "no-pin-relay", breaks = "the outer TLS accepts any relay key", env = { RUSTFLAGS = '--cfg mousse_control="no-pin-relay"' } },
+  { name = "accept-legs-unbounded", breaks = "every INCOMING gets an accept leg, however many are being dialled", env = { RUSTFLAGS = '--cfg mousse_control="accept-legs-unbounded"' } },
 ]
 
 [[check]]
 id = "phase3.relay-rotation"
-title = "Manual key rotation asks nothing; a caller offline through the rotation comes back through the old route within the overlap and gets the new manifest; removal holds across the rotation; the old key leaves after the overlap; a stale manifest's routes are still dialled"
+title = "Manual key rotation asks nothing; a caller offline through the rotation comes back through the old route within the overlap and gets the new manifest; removal holds across the rotation; the old key leaves after the overlap; a stale manifest's routes are still dialled; a rotation the relay had not taken before a restart goes on after it, the old key current meanwhile"
 plan = "docs/phase34-design.md §B.4 and §B.11 (E-R4)"
 targets = ["linux-x64", "windows-x64"]
-min_tests = 3
+min_tests = 4
 local = [
   { target = "linux-x64", host = "linux-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_relay_rotation", "--no-fail-fast"] },
   { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_relay_rotation", "--no-fail-fast"] },
@@ -385,7 +388,7 @@ targets = ["pc-to-mac-lan"]
 judge = "marker"
 cross_machine = true
 waits = [{ slice = "E-R3 cross", paths = ["crates/mousse-helper/tests/app_relay_remote.rs"] }]
-device_steps = "Mac, from ~/mousse-net-runs-internal/<track> at the build under test, debug profile: cargo build -p mousse-relay; two relays, each mousse-relay --state <dir> init --public <Mac LAN IP>:<port>, then mousse-relay --state <dir> run --listen <Mac LAN IP>:<port>; five links of the first (init prints one, mousse-relay --state <dir> enroll the rest) and one of the second. The Mac only listens; the PC dials. PC: mousse-check config-digest phase3.relay-routes-cross --target pc-to-mac-lan, then cargo test -p mousse-helper --test app_relay_remote -- --ignored --exact routes_cross --nocapture with MOUSSE_RELAY_TEST_LINKS=<the six links>, MOUSSE_RELAY_TEST_HOST_BUILD=<the Mac build, <commit>+debug> and MOUSSE_RELAY_TEST_RESULT=<file>; it ends PASS phase3.relay-routes-cross or FAIL phase3.relay-routes-cross reason=<word>. Sign the file with mousse-check sign --device-key <key> --config <digest>. Controls: the same with fresh links, the control's RUSTFLAGS on the PC build (its own CARGO_TARGET_DIR) and --control <name> on config-digest; the result names the control and must say FAIL."
+device_steps = "Mac, from ~/mousse-net-runs-internal/<track> at the build under test, debug profile: cargo build -p mousse-relay; two relays, each mousse-relay --state <dir> init --public <Mac LAN IP>:<port>, then mousse-relay --state <dir> run --listen <Mac LAN IP>:<port>; six links of the first (init prints one, mousse-relay --state <dir> enroll the rest) and one of the second. The Mac only listens; the PC dials. PC: mousse-check config-digest phase3.relay-routes-cross --target pc-to-mac-lan, then cargo test -p mousse-helper --test app_relay_remote -- --ignored --exact routes_cross --nocapture with MOUSSE_RELAY_TEST_LINKS=<the seven links>, MOUSSE_RELAY_TEST_HOST_BUILD=<the Mac build, <commit>+debug> and MOUSSE_RELAY_TEST_RESULT=<file>; it ends PASS phase3.relay-routes-cross or FAIL phase3.relay-routes-cross reason=<word>. Sign the file with mousse-check sign --device-key <key> --config <digest>. Controls: the same with fresh links, the control's RUSTFLAGS on the PC build (its own CARGO_TARGET_DIR) and --control <name> on config-digest; the result names the control and must say FAIL."
 control = [
   { name = "close-all-on-removal", breaks = "a removal closes every caller's circuits", env = { RUSTFLAGS = '--cfg mousse_control="close-all-on-removal"' } },
   { name = "manifest-unapproved", breaks = "manifest relay routes are dialled without approval", env = { RUSTFLAGS = '--cfg mousse_control="manifest-unapproved"' } },
