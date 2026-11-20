@@ -146,8 +146,13 @@ impl AddrPolicy {
         }
     }
 
-    /// Whether the route names an IP literal of class `forbidden`.
+    /// Whether the route names an IP literal of class `forbidden`. A plain
+    /// `ws` route is the owner's local tunnel hop: loopback is its only
+    /// allowed address, in release builds too (§1.1, Decision 2).
     pub fn names_forbidden(&self, route: &LocalRoute) -> bool {
+        if let LocalRoute::Ws { host, .. } = route {
+            return !host.is_loopback();
+        }
         match (route.ip(), route.port()) {
             (Some(ip), Some(port)) => {
                 self.class_of(SocketAddr::new(ip, port)) == AddrClass::Forbidden
@@ -195,8 +200,16 @@ pub async fn resolve(
 ) -> Result<Vec<(SocketAddr, AddrClass)>, NetError> {
     let (host, port) = match route {
         LocalRoute::Tcp { host, port } | LocalRoute::Wss { host, port, .. } => (host, *port),
-        LocalRoute::Ws { host, port, .. } => {
-            return keep_allowed(route, policy, vec![SocketAddr::new(*host, *port)]);
+        // The owner's local tunnel hop: loopback only, in every build. Its
+        // class is the tunnel's, whatever loopback counts as for `tcp`.
+        LocalRoute::Ws { host, port, .. } if !policy.names_forbidden(route) => {
+            return Ok(vec![(SocketAddr::new(*host, *port), AddrClass::Lan)]);
+        }
+        LocalRoute::Ws { .. } => {
+            return Err(NetError::Forbidden(format!(
+                "{} is not a loopback address",
+                route.uri()
+            )));
         }
         LocalRoute::Ssh { .. } => {
             return Err(NetError::Refused("an ssh route is resolved by ssh".into()));

@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use mousse_net_core::pairing::{Arrival, InvitationKind, Route, Ticket, CODE_FAILED_MESSAGE};
 use mousse_net_core::session_cert::CertError;
 use mousse_net_core::ErrorCode;
-use mousse_net_io::pipe::{route_uri, LocalRoute, RouteKind};
+use mousse_net_io::pipe::{route_uri, AddrClass, AddrPolicy, LocalRoute, RouteKind};
 use mousse_net_io::store::{
     hex, is_stale, short_id, Approval, ApprovalStore, CompletionRecord, CompletionStore,
     PeerRecord, PeerStore, PeersLock, APPROVAL_SOURCE_TICKET, COMPLETION_PAIRED,
@@ -69,6 +69,86 @@ fn parse_routes(list: &[String]) -> Result<Vec<LocalRoute>, String> {
     list.iter()
         .map(|r| LocalRoute::parse(r).map_err(|e| e.to_string()))
         .collect()
+}
+
+/// Routes the owner typed: each must parse and name no forbidden address.
+fn owner_routes(policy: &AddrPolicy, list: &[String]) -> Result<Vec<LocalRoute>, String> {
+    let routes = parse_routes(list)?;
+    match routes.iter().find(|r| policy.names_forbidden(r)) {
+        Some(r) => Err(format!("{r} names an address that is never dialled")),
+        None => Ok(routes),
+    }
+}
+
+/// How a hint is shown when the owner is asked to approve it.
+fn hint_label(policy: &AddrPolicy, route: &LocalRoute) -> String {
+    let class = match (route, route.ip(), route.port()) {
+        (LocalRoute::Wss { .. }, _, _) => "Tunnel",
+        (_, Some(ip), Some(port)) => match policy.class_of(std::net::SocketAddr::new(ip, port)) {
+            AddrClass::Lan => "LAN",
+            AddrClass::Tailnet => "Tailnet",
+            AddrClass::Public => "Internet",
+            AddrClass::Forbidden => "never dialled",
+        },
+        _ => "a name",
+    };
+    format!("{route} ({class})")
+}
+
+/// The ticket's hints beyond the automatic rule that the owner approves
+/// (Phase 1b §1.3, §8): asked on the terminal, `y` to dial them too.
+/// Without a terminal none is approved, and the ones left out are named.
+fn approve_hints(policy: &AddrPolicy, ticket: &Ticket) -> Vec<String> {
+    use std::io::IsTerminal;
+    let all: Vec<String> = usable_routes(&ticket.routes)
+        .iter()
+        .map(LocalRoute::uri)
+        .collect();
+    let extra: Vec<LocalRoute> = crate::app::ticket_candidates(policy, &ticket.routes, &all)
+        .into_iter()
+        .filter(|r| !policy.automatic(r))
+        .collect();
+    if extra.is_empty() {
+        return Vec::new();
+    }
+    let listed: Vec<String> = extra.iter().map(|r| hint_label(policy, r)).collect();
+    if !std::io::stdin().is_terminal() {
+        println!(
+            "not dialled without approval (run on a terminal to approve): {}",
+            listed.join(", ")
+        );
+        return Vec::new();
+    }
+    println!("The ticket also lists: {}", listed.join(", "));
+    println!("Dial these too? [y/N]");
+    let mut line = String::new();
+    let yes = std::io::stdin().read_line(&mut line).is_ok() && line.trim() == "y";
+    if yes {
+        extra.iter().map(LocalRoute::uri).collect()
+    } else {
+        Vec::new()
+    }
+}
+
+/// Keep the hints the owner approved as `ticket` approvals for the host.
+fn store_approvals(
+    peers: &PeerStore,
+    ticket: &Ticket,
+    approved: &[String],
+) -> Result<(), NetError> {
+    let identity = hex(ticket.host_identity.as_bytes());
+    let at = now_secs();
+    let entries: Vec<Approval> = approved
+        .iter()
+        .map(|d| Approval {
+            identity: identity.clone(),
+            destination: d.clone(),
+            source: APPROVAL_SOURCE_TICKET.into(),
+            at,
+        })
+        .collect();
+    let held = peers.lock()?;
+    ApprovalStore::in_dir(peers.dir()).add(&held, &entries)
 }
 
 /// Routes from a ticket or the peer store: hints this version cannot use
@@ -226,10 +306,16 @@ pub async fn join(
             "pairing_failed",
         ));
     }
+    // The same policy as the app's (Phase 1b §1.3): addresses the owner
+    // typed, or the ticket's hints under the automatic rule plus the ones
+    // the owner approves here.
+    let policy = side.caller.addr_policy().clone();
+    let mut approved = Vec::new();
     let candidates = if routes.is_empty() {
-        usable_routes(&ticket.routes)
+        approved = approve_hints(&policy, ticket);
+        crate::app::ticket_candidates(&policy, &ticket.routes, &approved)
     } else {
-        parse_routes(routes).map_err(|e| Failure::new(e, "bad_route"))?
+        owner_routes(&policy, routes).map_err(|e| Failure::new(e, "bad_route"))?
     };
     if candidates.is_empty() {
         return Err(Failure::new(
@@ -256,6 +342,10 @@ pub async fn join(
         || true,
     )
     .await?;
+    if !already_paired && !approved.is_empty() {
+        store_approvals(&side.peers(), ticket, &approved)
+            .map_err(|e| Failure::new(e.to_string(), "store"))?;
+    }
     Ok(Joined {
         conn,
         record,
@@ -736,10 +826,13 @@ pub async fn dial(
     routes: &[String],
 ) -> Result<Connection, String> {
     let pin = peer.pin().map_err(|e| e.to_string())?;
+    // The same policy as the app's: the stored routes the automatic rule or
+    // an approval allows, or the addresses the owner typed.
+    let policy = side.caller.addr_policy().clone();
     let candidates = if routes.is_empty() {
-        usable_routes(&peer.routes_to_try())
+        crate::app::stored_search(&policy, side.endpoint.dir(), peer).candidates
     } else {
-        parse_routes(routes)?
+        owner_routes(&policy, routes)?
     };
     let (conn, used) = side
         .caller

@@ -77,6 +77,25 @@ pub struct ListenState {
     pub config: RoutesConfig,
     /// The port every socket listens on.
     pub port: u16,
+    /// The addresses bound now.
+    pub bound: Vec<IpAddr>,
+    /// Tunnels given on the command line (`--tunnel`), advertised besides
+    /// the config's.
+    pub extra: Vec<String>,
+}
+
+impl ListenState {
+    /// Advertise what `config` selects for the sockets bound now, plus the
+    /// command line's tunnels.
+    pub fn readvertise(&mut self, interfaces: &[IpAddr]) {
+        let mut routes = self.config.advertised(interfaces, &self.bound, self.port);
+        for t in &self.extra {
+            if !routes.contains(t) {
+                routes.push(t.clone());
+            }
+        }
+        self.routes = routes;
+    }
 }
 
 /// The listen state, shared by the accept loop and the app channel.
@@ -309,6 +328,7 @@ pub async fn run(
         Some(config) => config.advertised(&interfaces, &bound, port),
         None => route_hints(opts.listen_ip, port),
     };
+    let mut extra = Vec::new();
     for tunnel in &opts.tunnels {
         let target = WsTarget::parse(tunnel)
             .filter(|t| t.secure)
@@ -316,6 +336,7 @@ pub async fn run(
                 format!("--tunnel {tunnel}: not a wss://<host>[:<port>]<path>/mousse-net/1 URL")
             })?;
         routes.push(target.uri());
+        extra.push(target.uri());
     }
     let config = stored.clone().unwrap_or_else(|| RoutesConfig {
         lan: opts.listen_ip.is_unspecified(),
@@ -331,6 +352,8 @@ pub async fn run(
         unbound: unbound.clone(),
         config: config.clone(),
         port,
+        bound: bound.clone(),
+        extra,
     }));
     // The loopback ws listener, for the owner's tunnel client (§4.1).
     let ws_listener = if opts.ws_port.is_some() || !opts.tunnels.is_empty() || config.ws_listener()
@@ -528,20 +551,16 @@ pub async fn run(
                 }
                 // A selected address came or went: open or close only
                 // that socket (LAN on binds 0.0.0.0, which never changes).
-                if let Some(config) = &stored {
+                if stored.is_some() {
                     let interfaces = crate::app::interface_ips();
-                    let unbound = reconcile(config, &interfaces, port, &mut sockets, &accepted_tx).await;
-                    let bound: Vec<IpAddr> = sockets.keys().copied().collect();
+                    // The config in effect: list edits since the start
+                    // apply without a restart.
+                    let config = listen.lock().unwrap_or_else(|e| e.into_inner()).config.clone();
+                    let unbound = reconcile(&config, &interfaces, port, &mut sockets, &accepted_tx).await;
                     let mut st = listen.lock().unwrap_or_else(|e| e.into_inner());
-                    let tunnels = st.routes.iter().filter(|r| r.starts_with("wss:")).cloned();
-                    let mut routes = config.advertised(&interfaces, &bound, port);
-                    for t in tunnels {
-                        if !routes.contains(&t) {
-                            routes.push(t);
-                        }
-                    }
-                    st.routes = routes;
+                    st.bound = sockets.keys().copied().collect();
                     st.unbound = unbound;
+                    st.readvertise(&interfaces);
                 }
                 if let Some(app) = &app {
                     app.net_change(change);
