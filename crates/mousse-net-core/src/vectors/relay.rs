@@ -147,7 +147,9 @@ fn output_json(o: &Output) -> J {
             "class": *class as u64,
         }),
         Output::Forward { from, to, len } => json!({ "forward": [from.0, to.0], "len": len }),
-        Output::Authorize { fingerprint } => json!({ "authorize": hex(fingerprint) }),
+        Output::Authorize { fingerprint, chain } => {
+            json!({ "authorize": hex(fingerprint), "chain": hex(chain) })
+        }
         Output::Supersede {
             fingerprint,
             drop_at,
@@ -196,6 +198,7 @@ impl Sim {
             .map(|(fp, drop_at)| AuthorizedKey {
                 fingerprint: *fp,
                 drop_at: drop_at.map(UnixTime),
+                chain: *fp,
             })
             .collect();
         let codes: Vec<EnrollCode> = setup
@@ -1030,7 +1033,8 @@ fn successor_unauthorized_current() -> J {
     assert_eq!(
         outs[0],
         Output::Authorize {
-            fingerprint: new.fingerprint()
+            fingerprint: new.fingerprint(),
+            chain: target.fingerprint(),
         }
     );
     assert_eq!(
@@ -1048,6 +1052,46 @@ fn successor_unauthorized_current() -> J {
     expect(&s.send(40, 3, &msg), &["send 3 REFUSED", "close 3 1000"]);
     let msg = successor_msg(&s, 2, &target, &new);
     expect(&s.send(50, 2, &msg), &["send 2 REFUSED", "close 2 1000"]);
+    s.finish()
+}
+
+fn successor_chain() -> J {
+    let (target, new, other) = (key(&TARGET), key(&NEW_TARGET), key(&STRANGER_TARGET));
+    let mut s = Sim::new(
+        "successor_chain",
+        "A SUCCESSOR's new key joins the chain of the key it supersedes. A chain holds at most RELAY_CHAIN_KEYS_MAX keys, so with 2 the new key cannot name a further successor during the overlap. Revoking the enrolled key revokes its whole chain: the successor's registration closes with 4000 too, and neither key can register.",
+        Setup {
+            authorized: &listed(&[TARGET]),
+            limits: &[("RELAY_CHAIN_KEYS_MAX", 2)],
+            ..PLAIN
+        },
+    );
+    s.register(0, 1, 1, &target);
+    let msg = successor_msg(&s, 1, &new, &target);
+    let outs = s.send(10, 1, &msg);
+    expect(&outs, &["authorize", "supersede"]);
+    assert_eq!(
+        outs[0],
+        Output::Authorize {
+            fingerprint: new.fingerprint(),
+            chain: target.fingerprint(),
+        }
+    );
+    s.register(20, 2, 1, &new);
+    let msg = successor_msg(&s, 2, &other, &new);
+    expect(&s.send(30, 2, &msg), &["send 2 REFUSED", "close 2 1000"]);
+    s.register(40, 3, 1, &new);
+    expect(
+        &s.revoke(100, target.fingerprint()),
+        // Chain members in order of fingerprint: the new key's is lower.
+        &["close 3 4000", "close 1 4000"],
+    );
+    s.hello(200, 4, 1);
+    let msg = s.register_msg(4, &new);
+    expect(&s.send(200, 4, &msg), &["send 4 REFUSED", "close 4 1000"]);
+    s.hello(210, 5, 1);
+    let msg = s.register_msg(5, &target);
+    expect(&s.send(210, 5, &msg), &["send 5 REFUSED", "close 5 1000"]);
     s.finish()
 }
 
@@ -1290,7 +1334,8 @@ fn enrollment() -> J {
     assert_eq!(
         outs[1],
         Output::Authorize {
-            fingerprint: target.fingerprint()
+            fingerprint: target.fingerprint(),
+            chain: target.fingerprint(),
         }
     );
     s.hello(20, 3, 2);
@@ -1534,6 +1579,7 @@ fn scenarios() -> Vec<J> {
         accept_wait_expires(),
         successor_without_current_key(),
         successor_unauthorized_current(),
+        successor_chain(),
         successor_drop(),
         allow_set_lower_sequence(),
         promote_unlisted(),

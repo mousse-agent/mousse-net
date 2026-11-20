@@ -343,7 +343,16 @@ record (section 5), with the handle of the new key. The relay requires:
 3. the current key is on the authorized list and has not itself been
    superseded;
 4. the new key is not on the authorized list at all (so two keys can
-   never keep each other alive).
+   never keep each other alive);
+5. the current key's **chain** holds fewer than `RELAY_CHAIN_KEYS_MAX`
+   keys on the list.
+
+Every key on the list belongs to one chain, named by the fingerprint it
+started from: a key the operator listed or enrolled starts its own, and a
+successor joins the chain of the key that vouched for it. A self-hosted
+relay checks a `SUCCESSOR` against its stored list as it is when the
+message arrives, not as of its last read, so a key the operator just
+revoked cannot vouch for one.
 
 If any fails, the relay sends `REFUSED(not_authorized)` and closes the
 registration connection with 1000 (its circuits keep running). Otherwise it
@@ -357,7 +366,8 @@ order of section 10.3.
 
 A superseded key can still register until it is dropped, but it can never
 vouch for another successor, so a key the operator never authorized only
-arrives vouched for by a current key the operator did.
+arrives vouched for by a current key the operator did. Revoking any key
+of a chain revokes the whole chain (section 11).
 
 There is no automatic rotation in self mode.
 
@@ -509,8 +519,10 @@ its code hash with an expiry.
 - `mousse-relay init --public <host:port>` creates the identity key and the
   state directory and prints the relay id and an **enrollment link**.
 - `mousse-relay enroll` prints a new enrollment link.
-- `mousse-relay list` prints the authorized list; `mousse-relay revoke
-  <fingerprint>` removes a key. The relay then closes that key's
+- `mousse-relay list` prints the authorized list, with the chain of each
+  key a `SUCCESSOR` added; `mousse-relay revoke <fingerprint>` removes
+  that key and every key of its chain (section 7.4), so a successor never
+  outlives the key it came from. The relay then closes each removed key's
   registration and every circuit of its handle with 4000.
 
 **Enrollment link:** `mousse-relay://<host>:<port>/#<relay id>.<code>`,
@@ -541,9 +553,11 @@ route (`docs/phase34-design.md` B.11).
 
 ## 12. State
 
-The relay's state directory holds its identity key, the authorized list,
-the enrollment code hashes, its configuration and an exclusive lock, so one
-process runs per relay identity. It holds no user data, no payload, no IP
+The relay's state directory holds its identity key, the authorized list
+(with each key's chain), the enrollment code hashes, its configuration and
+an exclusive lock, so one process runs per relay identity. The directory
+and its files are owner-only, each file from its creation; the relay
+refuses an identity key file other users can read. It holds no user data, no payload, no IP
 addresses and no allow-sets. Registrations, allow-sets and circuits live in
 memory only and end with the process.
 
@@ -576,7 +590,11 @@ otherwise:
 | `RELAY_EGRESS_BPS` | 12500000 | shared egress, bytes per second |
 | `RELAY_ENROLL_SECS` | 3600 | enrollment code lifetime |
 | `RELAY_SUCCESSOR_OVERLAP_SECS` | 604800 | overlap after `SUCCESSOR` |
+| `RELAY_CHAIN_KEYS_MAX` | 4 | keys of one `SUCCESSOR` chain on the list at once |
 | `RELAY_STATE_POLL_MS` | 1000 | how often the running relay rereads its state directory |
+| `RELAY_SEND_WAIT_MS` | 20000 | one write to a connection; one that does not finish closes it with 4006 |
+| `RELAY_CONTROL_QUEUE_MESSAGES` | 64 | relay messages queued toward one connection; one more closes it with 4006 |
+| `RELAY_CLOSE_LINGER_MS` | 2000 | sending what is queued and the close frame when the relay closes a connection |
 
 **Address key.** Connections count against the **address key** of their
 peer: 16 bytes, an IPv4 address in bytes 0 to 3 with byte 15 set to 4 (an
@@ -597,7 +615,11 @@ or upgrade the same way, so handshakes cannot get around the limits.
 Interactive circuits are written before bulk ones at the relay's shared
 egress. Per circuit and direction at most `RELAY_QUEUE_BYTES` are buffered;
 above that the relay stops reading that leg, so TCP pushes back on the
-sender.
+sender. A client that stops reading is closed: a write to it that does not
+finish within `RELAY_SEND_WAIT_MS`, or a relay message beyond
+`RELAY_CONTROL_QUEUE_MESSAGES` queued toward it, closes it with 4006, and
+its circuit with it. A close never waits behind a blocked write: what is
+queued gets `RELAY_CLOSE_LINGER_MS` to go out before the close frame.
 
 Fixed on purpose: `RELAY_MESSAGE_MAX` 16 384, at most 256 caller
 fingerprints and 8 invitations per allow-set, the 65 536-byte WebSocket
@@ -614,7 +636,8 @@ reasons, every domain string and the exporter label.
   ones (section 4.2);
 - `scenarios`: scripted runs of one relay in self mode. Each lists the
   relay's setup (`relay_key`, `boot_id`, `wall_base`, the `authorized`
-  list with optional `drop_at`, enrollment `codes` as hash and expiry, and
+  list with optional `drop_at` and `chain`, a missing `chain` being the
+  key's own fingerprint, enrollment `codes` as hash and expiry, and
   `limits` that differ from the defaults), the random values it draws in
   order (`draws`, hex), and its `events`, each with the outputs (`out`) it
   must produce, byte for byte. Hosted mode is not covered here.
@@ -633,12 +656,12 @@ Connections are numbered by the scenario. Events:
 | `data` | the client on `conn` sent a peer message of `len` bytes. On a connection that is not a spliced leg this is a protocol error (close 1002). A `recv` on a spliced leg is the same as `data` with the message's length. |
 | `closed` | the client closed `conn` |
 | `tick` | nothing happens but time |
-| `revoke` | the operator revoked the registration fingerprint `fingerprint`. The operator's command has already changed the stored list, so there is no durable output, only the closes. |
+| `revoke` | the operator revoked the registration fingerprint `fingerprint`, and with it every key of its chain. The operator's command has already changed the stored list, so there is no durable output, only the closes: for each removed key in order of fingerprint, as for a dropped key. |
 
 Outputs: `{"send": conn, "message": type name, "hex": ...}`, `{"close": conn, "code": ...}`,
 `{"splice": [caller conn, accept conn], "circuit": ..., "class": ...}`, `{"forward":
 [from conn, to conn], "len": ...}`, and the durable changes to the
-authorized list and codes: `{"authorize": fingerprint}`, `{"supersede":
+authorized list and codes: `{"authorize": fingerprint, "chain": chain}`, `{"supersede":
 fingerprint, "drop_at": ...}`, `{"drop": fingerprint}`, `{"consume_code":
 code hash}`. A connection the relay closed produces no further outputs, and
 events on it are ignored.

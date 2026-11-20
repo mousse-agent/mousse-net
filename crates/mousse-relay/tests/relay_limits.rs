@@ -145,6 +145,110 @@ async fn a_full_queue_stops_reading_the_sender() {
     );
 }
 
+/// A leg that stops reading is closed once a write to it makes no progress
+/// for `RELAY_SEND_WAIT_MS`, and its circuit with it; the circuit idle wait
+/// (60 s) never comes into it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_leg_that_stops_reading_closes_at_the_send_wait() {
+    let (target, caller) = (key(0x61), key(0x71));
+    let f = Fixture::new(
+        "send-wait",
+        &[("RELAY_SEND_WAIT_MS", 1_000), ("RELAY_QUEUE_BYTES", 16_384)],
+        &[&target],
+    )
+    .await;
+    let mut reg = f.register(&target).await;
+    allow(&mut reg, 1, &[&caller]).await;
+    // The accept leg never reads.
+    let (mut leg, _acc) = f.connect(&mut reg, &target, &caller, Class::Bulk).await;
+    let start = Instant::now();
+    let mut sent = 0usize;
+    loop {
+        match tokio::time::timeout(Duration::from_millis(500), leg.send_raw(vec![1; 60_000])).await
+        {
+            Ok(Ok(())) => sent += 60_000,
+            Ok(Err(_)) | Err(_) => break,
+        }
+        assert!(sent < 256 * 1024 * 1024, "the leg never filled");
+    }
+    // The relay gives up on the accept leg; the caller's leg closes too.
+    closed(&mut leg).await;
+    let took = start.elapsed();
+    assert!(took < Duration::from_secs(8), "{took:?}");
+}
+
+/// A close does not queue behind a blocked write: when the operator
+/// revokes the target, the relay gives the accept leg that stopped reading
+/// the close linger, then drops it, instead of holding it until it reads
+/// again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_close_does_not_wait_behind_a_blocked_write() {
+    let (target, caller) = (key(0x61), key(0x71));
+    let f = Fixture::new(
+        "close-linger",
+        &[
+            ("RELAY_CLOSE_LINGER_MS", 300),
+            ("RELAY_QUEUE_BYTES", 16_384),
+        ],
+        &[&target],
+    )
+    .await;
+    let mut reg = f.register(&target).await;
+    allow(&mut reg, 1, &[&caller]).await;
+    let (mut leg, mut acc) = f.connect(&mut reg, &target, &caller, Class::Bulk).await;
+    let mut sent = 0usize;
+    loop {
+        match tokio::time::timeout(Duration::from_millis(500), leg.send_raw(vec![1; 60_000])).await
+        {
+            Ok(Ok(())) => sent += 60_000,
+            Ok(Err(_)) | Err(_) => break,
+        }
+        assert!(sent < 256 * 1024 * 1024, "the leg never filled");
+    }
+    assert_eq!(f.dir.revoke(now(), &target.fingerprint()).unwrap(), 1);
+    // Past the next state read (RELAY_STATE_POLL_MS, 1 s) and the linger
+    // (twice: the blocked write, then the close frame).
+    tokio::time::sleep(Duration::from_millis(2_000)).await;
+    // Reading now would unblock a writer still waiting; one that let go
+    // never sends its close frame.
+    let end = loop {
+        if let Received::Closed(code) = next(&mut acc).await {
+            break code;
+        }
+    };
+    assert_eq!(end, None, "the relay held the blocked leg until it read");
+}
+
+/// PINGs from a client that never reads its PONGs: the relay queues at
+/// most `RELAY_CONTROL_QUEUE_MESSAGES` toward it, then closes it, well
+/// before the send wait (20 s) would.
+#[tokio::test(flavor = "multi_thread")]
+async fn pings_without_reading_close_at_the_control_queue_bound() {
+    let target = key(0x61);
+    let f = Fixture::new("control-queue", &[], &[&target]).await;
+    let mut reg = f.register(&target).await;
+    let ping = RelayMessage::Ping { data: [9; 8] }.encode();
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(12);
+    let mut sent = 0u64;
+    let ended = loop {
+        // A send that never waits never times out: check the clock too.
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break false;
+        }
+        match tokio::time::timeout(left, reg.send_raw(ping.clone())).await {
+            Ok(Ok(())) => sent += 1,
+            Ok(Err(_)) => break true,
+            Err(_) => break false,
+        }
+    };
+    assert!(
+        ended,
+        "the relay still took PINGs after {sent} without a PONG read"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_join_circuit_closes_over_its_preaccept_budget() {
     let target = key(0x61);

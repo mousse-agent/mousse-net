@@ -1498,12 +1498,18 @@ E-R0 may lower, never raise past the range shown). Limits marked
 | `MOUSSE_NET_RELAY_REFUSE_MS` | 500 | 500 to 5000 | Constant refusal deadline from a `CALL` or `JOIN`; below `MOUSSE_NET_RELAY_ACCEPT_WAIT_MS` |
 | `MOUSSE_NET_RELAY_PREACCEPT_BYTES` | 65536 | 16384 to 65536 (tighten) | Per join circuit and direction before promotion |
 | `MOUSSE_NET_RELAY_PREACCEPT_PER_TARGET` | 4 | 1 to 4 (tighten) | Join circuits per handle |
-| `MOUSSE_NET_RELAY_KEEPALIVE_MS` | 15000 | 1000 to 15000 | `PING` on a quiet registration connection |
+| `MOUSSE_NET_RELAY_KEEPALIVE_MS` | 15000 | 1000 to 15000 (tighten) | `PING` on a quiet registration connection |
 | `MOUSSE_NET_RELAY_REGISTRATION_IDLE_MS` | 45000 | 30000 to 45000 (tighten) | Registration closed after this long without receiving |
 | `MOUSSE_NET_RELAY_CIRCUIT_IDLE_MS` | 60000 | 46000 to 600000 | Spliced circuit with no bytes either way; above the peer idle timeout |
 | `MOUSSE_NET_RELAY_QUEUE_BYTES` † | 262144 | 16384 to 262144 (tighten) | Buffered per circuit and direction |
 | `MOUSSE_NET_RELAY_EGRESS_BPS` † | 12500000 | 125000 to 12500000000 (capacity) | Shared egress ceiling |
 | `MOUSSE_NET_RELAY_ENROLL_SECS` | 3600 | 60 to 3600 (tighten) | Enrollment code lifetime (single use) |
+| `MOUSSE_NET_RELAY_SUCCESSOR_OVERLAP_SECS` | 604800 | 3600 to 604800 (tighten) | How long a key superseded by a `SUCCESSOR` stays authorized |
+| `MOUSSE_NET_RELAY_CHAIN_KEYS_MAX` | 4 | 2 to 4 (tighten) | Keys of one `SUCCESSOR` chain on the authorized list at once; `revoke` removes the whole chain |
+| `MOUSSE_NET_RELAY_STATE_POLL_MS` | 1000 | 100 to 1000 (tighten) | How often a running self-hosted relay rereads its state directory; a `SUCCESSOR` rereads it at once |
+| `MOUSSE_NET_RELAY_SEND_WAIT_MS` | 20000 | 1000 to 20000 (tighten) | One write to a connection; a client that stops reading is closed with 4006 |
+| `MOUSSE_NET_RELAY_CONTROL_QUEUE_MESSAGES` | 64 | 8 to 64 (tighten) | Relay messages queued toward one connection; one more closes it with 4006 |
+| `MOUSSE_NET_RELAY_CLOSE_LINGER_MS` | 2000 | 100 to 2000 (tighten) | What is queued and the close frame when the relay closes a connection; a close never waits behind a blocked write |
 | `MOUSSE_NET_RELAY_REFILL_WAIT_MS` | 10000 | 1000 to 10000 (tighten) | Paused class waits this long for a `LEASE` before 4001; plus the longest peer keepalive (15 s) it stays below the shortest peer idle timeout (30 s) |
 | `MOUSSE_NET_RELAY_REPORT_MS` | 10000 | 1000 to 60000 | Snapshot interval (hosted); below Plus's boot silence time (120 s by default) |
 | `MOUSSE_NET_RELAY_REPORT_MIN_MS` | 1000 | 100 to 5000 | Longest delay from a final to its snapshot, and the shortest gap between snapshots (hosted); below `REPORT_MS` |
