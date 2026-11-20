@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "pc-windows",
+  "key": "048ad3ccda2d27fdfc98c131f2fa25bea736ec0a3e8a107dcbfa6b2f5a86b88da452c337f09925646ec76897452505e718f3f397ddf39674e9f5ad64590bc93d57",
+  "payload": "{\"check\":\"phase0.thin-slice-cross-machine\",\"target\":\"pc-to-mac-lan\",\"control\":\"wrong-identity\",\"build\":\"1d28a44e5e5336b359f9e8f83b9bbf8e7f2a522e+debug\",\"platform\":\"windows-x86_64\",\"outcome\":\"FAIL\",\"details\":\"FAIL pair in person: tcp://192.168.0.59:57830: another device answered (pin mismatch) reason=pin_mismatch\",\"time\":\"2026-11-19T19:01:25Z\",\"device\":\"pc-windows\",\"config\":\"8732e25368be27ec3b67f56a75a6c91782db587bbf9087024c4a17f4c891780c\",\"extra\":{\"caller_build\":\"1d28a44e5e5336b359f9e8f83b9bbf8e7f2a522e+debug\",\"host_build\":\"366dd2b062641eed1e639b5c974e95999b8894d8+debug\",\"reason\":\"pin_mismatch\"}}",
+  "signature": "e1bb5bcc6d3ea80828dbec979bb43a3f1d79ea34a8dc619836fbc091df69ec5cb1261469cb690723761f0c23df6802fd3f40dc3266a9ae6547d1a26a782141b7"
+}

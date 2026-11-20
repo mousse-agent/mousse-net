@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "pc-windows",
+  "key": "048ad3ccda2d27fdfc98c131f2fa25bea736ec0a3e8a107dcbfa6b2f5a86b88da452c337f09925646ec76897452505e718f3f397ddf39674e9f5ad64590bc93d57",
+  "payload": "{\"check\":\"phase0.sim-shared-endpoints\",\"target\":\"windows-x64\",\"build\":\"366dd2b062641eed1e639b5c974e95999b8894d8+release\",\"platform\":\"windows-x86_64\",\"outcome\":\"PASS\",\"details\":\"printed \\\"PASS sim shared-endpoints\\\"\",\"time\":\"2026-11-19T18:12:34Z\",\"device\":\"pc-windows\",\"config\":\"78b76834fdd4f25779d6fa0a10e74d32775d11557681e8a9665867279a3fd084\"}",
+  "signature": "849fa62b10b467b3deaa2147f2ea38acfa33afccb97d77b56ac4908b8d68187dc0e31616071edadf041d135010adb6765e9fde66fc1a8715b567949fda8f2de1"
+}
