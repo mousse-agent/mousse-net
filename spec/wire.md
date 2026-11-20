@@ -796,7 +796,7 @@ A `tcp`, `wss` or `mdns` hint that breaks its grammar is skipped as
 `malformed`:
 
 - `<port>`: decimal 1 to 65535, ASCII digits only, no sign, no leading zero.
-  The port is the text after the last `:`.
+  In a `tcp` hint the port is the text after the last `:`.
 - `<host>` is read by its shape:
   - in square brackets: an IPv6 address in an RFC 4291 section 2.2 text form
     (an embedded IPv4 part follows the IPv4 rule below), with no zone id;
@@ -813,7 +813,10 @@ A `tcp`, `wss` or `mdns` hint that breaks its grammar is skipped as
 - `wss`: `<host>` as above, then an optional `:<port>` (443 when absent),
   then `<path>`: 1 to 200 bytes of ASCII letters, digits and `.`, `_`, `~`,
   `/`, `-`, starting with `/` and ending with `/mousse-net/1`. No user part,
-  query, fragment or percent-encoding. Vectors give the port explicitly.
+  query, fragment or percent-encoding. The host and port end at the first
+  `/` after `wss://`; a port is the text after a `:` that follows the host
+  (after the `]` of an IPv6 host). A vector's result always gives the port,
+  443 when the hint has none.
   The outer TLS connection verifies the tunnel's certificate for `<host>`;
   the inner one is checked against the pin like any other route.
 - `<instance>`: 1 to 63 bytes of UTF-8 with no control characters (Unicode

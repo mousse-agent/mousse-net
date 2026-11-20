@@ -18,6 +18,7 @@
 | Transport close on a failed flow | `wire.md` §10.6 rule 9 and the `pairing-e2e.json` and `pairing-attempts.json` conventions. When the joiner's flow fails with code C, it sends any message the same step produced, then one `GOAWAY(C)`, unless the host already closed the connection or it broke. The vectors do not list that `GOAWAY`; the `failed` output stands for it. A failed attempt sends only `CODE_ABORT` and keeps the connection. |
 | In-person name and profile label | `wire.md` §10.3. In-person proofs combine both fixture fields, for example `Phone (Work)`. Send-link proofs use only the computer name. |
 | Live-grant proof answer in the connect convention | `wire.md` §8 step 3. The `pairing-e2e.json` convention now says the proof gets `PAIRED` when the grant's receipt names this invitation, else a second `AUTHORIZED`. |
+| `wss` route hints | `wire.md` §10.2.1. The `<port>` rule said the port is the text after the last `:`, which does not fit a `wss` hint, whose port is optional and comes before the path; and "vectors give the port explicitly" read as if hints carried it. The spec now says the host and port end at the first `/` after `wss://`, the port follows a `:` after the host (after `]` for IPv6), and a vector's result gives the port, 443 when the hint has none. |
 | Proof timeout while learning a lost `PAIRED` | `wire.md` §10.6 rule 7. The flow ends with `NOT_AUTHORIZED` and leaves the pending mark stored. Reopening the ticket can resume recovery. |
 
 ## Open
