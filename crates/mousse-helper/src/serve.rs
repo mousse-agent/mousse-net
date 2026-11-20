@@ -276,10 +276,12 @@ pub async fn run(
     );
     // Plus (Phase 4): nothing is fetched before ready; the client starts
     // its background work once attached.
+    // Plus judges every signed request and token on its own clock, so the
+    // client keeps wall time even where a test moves the helper's clock.
     let plus = crate::plus::Plus::open(
         crate::limits::settings().plus_url.as_deref(),
         endpoint.dir(),
-        clock.clone(),
+        Arc::new(mousse_net_io::SystemClock::new()),
         key_storage,
         endpoint.plus_key_store(),
         endpoint.endpoint_id(),

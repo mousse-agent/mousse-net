@@ -4,13 +4,15 @@
 //! the enrollment code hashes, and two locks: `relay.lock`, held by the
 //! running relay so one process runs per identity, and `state.lock`, held
 //! briefly by whoever reads or rewrites the lists (the relay and the
-//! `enroll`, `list` and `revoke` commands). Every rewrite goes to a
-//! temporary file that is synced and renamed over the old one.
+//! `enroll`, `list` and `revoke` commands). The directory and every file
+//! are owner-only; every rewrite goes to a temporary file, owner-only from
+//! its creation, that is synced and renamed over the old one. An identity
+//! key other users can read is refused.
 //!
 //! No user data, payload, address or allow-set is ever written here.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use mousse_net_core::identity::SoftwareKey;
@@ -85,6 +87,9 @@ struct AuthorizedEntry {
     fingerprint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     drop_at: Option<u64>,
+    /// The key's `SUCCESSOR` chain, when it is not the key itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    chain: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -163,8 +168,8 @@ impl StateDir {
     ) -> Result<Self, StateError> {
         let dir = Self { path: path.into() };
         parse_public(public)?;
-        fs::create_dir_all(&dir.path).map_err(|e| StateError::Io(dir.path.clone(), e))?;
-        restrict_dir(&dir.path);
+        mousse_net_io::private::make_private_dir(&dir.path)
+            .map_err(|e| StateError::Io(dir.path.clone(), e))?;
         if dir.file(IDENTITY).exists() {
             return Err(StateError::AlreadyInitialized(dir.path));
         }
@@ -189,9 +194,10 @@ impl StateDir {
         self.path.join(name)
     }
 
-    /// The relay identity key.
+    /// The relay identity key. A key file other users can read is refused.
     pub fn identity(&self) -> Result<SoftwareKey, StateError> {
         let path = self.file(IDENTITY);
+        check_owner_only(&path)?;
         let text =
             Zeroizing::new(fs::read_to_string(&path).map_err(|e| StateError::Io(path.clone(), e))?);
         let secret = Zeroizing::new(
@@ -296,12 +302,19 @@ impl StateDir {
         })
     }
 
-    /// Remove a key from the authorized list. Returns whether it was there.
-    pub fn revoke(&self, now: UnixTime, fingerprint: &[u8; 32]) -> Result<bool, StateError> {
+    /// Remove a key and every key of its `SUCCESSOR` chain from the
+    /// authorized list. Returns how many keys left it.
+    pub fn revoke(&self, now: UnixTime, fingerprint: &[u8; 32]) -> Result<usize, StateError> {
         self.update(now, |l| {
             let before = l.authorized.len();
-            l.authorized.retain(|k| &k.fingerprint != fingerprint);
-            l.authorized.len() != before
+            let chain = l
+                .authorized
+                .iter()
+                .find(|k| &k.fingerprint == fingerprint)
+                .map_or(*fingerprint, |k| k.chain);
+            l.authorized
+                .retain(|k| &k.fingerprint != fingerprint && k.chain != chain);
+            before - l.authorized.len()
         })
     }
 
@@ -311,11 +324,16 @@ impl StateDir {
         let authorized = authorized
             .into_iter()
             .map(|e| {
+                let bad = || StateError::Corrupt(path.clone(), "bad fingerprint".into());
+                let fingerprint = unhex32(&e.fingerprint).ok_or_else(bad)?;
+                let chain = match &e.chain {
+                    Some(c) => unhex32(c).ok_or_else(bad)?,
+                    None => fingerprint,
+                };
                 Ok(AuthorizedKey {
-                    fingerprint: unhex32(&e.fingerprint).ok_or_else(|| {
-                        StateError::Corrupt(path.clone(), "bad fingerprint".into())
-                    })?,
+                    fingerprint,
                     drop_at: e.drop_at.map(UnixTime),
+                    chain,
                 })
             })
             .collect::<Result<Vec<_>, StateError>>()?;
@@ -341,6 +359,7 @@ impl StateDir {
             .map(|k| AuthorizedEntry {
                 fingerprint: hex(&k.fingerprint),
                 drop_at: k.drop_at.map(|t| t.0),
+                chain: (k.chain != k.fingerprint).then(|| hex(&k.chain)),
             })
             .collect();
         let codes: Vec<CodeEntry> = lists
@@ -355,18 +374,11 @@ impl StateDir {
         self.write_atomic(CODES, &json(&codes))
     }
 
+    /// Owner-only from creation, then renamed over `name`.
     fn write_atomic(&self, name: &str, bytes: &[u8]) -> Result<(), StateError> {
         let path = self.file(name);
-        let tmp = self.file(&format!("{name}.tmp"));
-        let io = |e| StateError::Io(path.clone(), e);
-        {
-            let mut f = File::create(&tmp).map_err(io)?;
-            restrict_file(&f);
-            f.write_all(bytes).map_err(io)?;
-            f.sync_all().map_err(io)?;
-        }
-        fs::rename(&tmp, &path).map_err(io)?;
-        Ok(())
+        mousse_net_io::store::write_atomic(&path, bytes)
+            .map_err(|e| StateError::Io(path.clone(), io::Error::other(e.to_string())))
     }
 
     /// Under the `relay-persist-allow-set` control only: a file of stale
@@ -392,23 +404,32 @@ fn read_json<T: for<'de> Deserialize<'de> + Default>(path: &Path) -> Result<T, S
     }
 }
 
-#[cfg(unix)]
-fn restrict_dir(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+/// A secret file must be a plain file only its owner can read (Unix).
+fn check_owner_only(path: &Path) -> Result<(), StateError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::symlink_metadata(path).map_err(|e| StateError::Io(path.to_owned(), e))?;
+        if !meta.file_type().is_file() {
+            return Err(StateError::Corrupt(
+                path.to_owned(),
+                "not a plain file".into(),
+            ));
+        }
+        if meta.mode() & 0o077 != 0 {
+            return Err(StateError::Corrupt(
+                path.to_owned(),
+                format!(
+                    "other users can read it (mode {:o}); make it 0600",
+                    meta.mode() & 0o777
+                ),
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
-
-#[cfg(not(unix))]
-fn restrict_dir(_: &Path) {}
-
-#[cfg(unix)]
-fn restrict_file(f: &File) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = f.set_permissions(fs::Permissions::from_mode(0o600));
-}
-
-#[cfg(not(unix))]
-fn restrict_file(_: &File) {}
 
 #[cfg(test)]
 mod tests {
@@ -440,20 +461,57 @@ mod tests {
         // Expired codes go on the next write.
         dir.update(now.plus(3_600), |_| ()).unwrap();
         assert!(dir.read().unwrap().codes.is_empty());
+        dir.update(now, |l| l.authorized.push(AuthorizedKey::listed([7; 32])))
+            .unwrap();
+        assert_eq!(dir.revoke(now, &[7; 32]).unwrap(), 1);
+        assert_eq!(dir.revoke(now, &[7; 32]).unwrap(), 0);
+        // A revoke takes the key's whole SUCCESSOR chain, from any member.
         dir.update(now, |l| {
             l.authorized.push(AuthorizedKey {
-                fingerprint: [7; 32],
+                fingerprint: [1; 32],
+                drop_at: Some(now.plus(60)),
+                chain: [1; 32],
+            });
+            l.authorized.push(AuthorizedKey {
+                fingerprint: [2; 32],
                 drop_at: None,
-            })
+                chain: [1; 32],
+            });
+            l.authorized.push(AuthorizedKey::listed([3; 32]));
         })
         .unwrap();
-        assert!(dir.revoke(now, &[7; 32]).unwrap());
-        assert!(!dir.revoke(now, &[7; 32]).unwrap());
+        assert_eq!(dir.read().unwrap().authorized[1].chain, [1; 32]);
+        assert_eq!(dir.revoke(now, &[2; 32]).unwrap(), 2);
+        assert_eq!(
+            dir.read().unwrap().authorized,
+            vec![AuthorizedKey::listed([3; 32])]
+        );
         let held = dir.lock_process().unwrap();
         assert!(dir.running());
         assert!(matches!(dir.lock_process(), Err(StateError::Running(_))));
         drop(held);
         assert!(!dir.running());
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    /// The identity key is written owner-only, and a key file other users
+    /// can read is refused on load.
+    #[cfg(unix)]
+    #[test]
+    fn identity_key_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp_dir("mode");
+        let dir = StateDir::init(&path, "203.0.113.5:443", &mut crate::os_rng()).unwrap();
+        let key = path.join(IDENTITY);
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&key), 0o600);
+        assert_eq!(mode(&path), 0o700);
+        for name in [CONFIG, AUTHORIZED, CODES] {
+            assert_eq!(mode(&path.join(name)), 0o600, "{name}");
+        }
+        assert!(dir.identity().is_ok());
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(dir.identity(), Err(StateError::Corrupt(..))));
         let _ = fs::remove_dir_all(&path);
     }
 }

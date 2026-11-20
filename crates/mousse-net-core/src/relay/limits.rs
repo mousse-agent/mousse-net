@@ -33,7 +33,7 @@ crate::define_limits! {
         preaccept_bytes = "RELAY_PREACCEPT_BYTES": 65_536, [16_384, 65_536];
         /// Join circuits per handle (tighten only).
         preaccept_per_target = "RELAY_PREACCEPT_PER_TARGET": 4, [1, 4];
-        /// PING on a registration connection after this long without sending.
+        /// PING on a registration connection after this long without sending (tighten only).
         keepalive_ms = "RELAY_KEEPALIVE_MS": 15_000, [1_000, 15_000];
         /// Registration closed after this long without receiving (tighten only).
         registration_idle_ms = "RELAY_REGISTRATION_IDLE_MS": 45_000, [30_000, 45_000];
@@ -45,10 +45,18 @@ crate::define_limits! {
         egress_bps = "RELAY_EGRESS_BPS": 12_500_000, [125_000, 12_500_000_000_u64];
         /// Enrollment code lifetime; single use (tighten only).
         enroll_secs = "RELAY_ENROLL_SECS": 3_600, [60, 3_600];
-        /// After a SUCCESSOR, how long the superseded registration key stays authorized.
-        successor_overlap_secs = "RELAY_SUCCESSOR_OVERLAP_SECS": 604_800, [86_400, 2_592_000];
-        /// How often the running relay re-reads its authorized list and enrollment codes, so `revoke` and `enroll` take effect.
-        state_poll_ms = "RELAY_STATE_POLL_MS": 1_000, [100, 60_000];
+        /// After a SUCCESSOR, how long the superseded registration key stays authorized (tighten only).
+        successor_overlap_secs = "RELAY_SUCCESSOR_OVERLAP_SECS": 604_800, [3_600, 604_800];
+        /// Keys one SUCCESSOR chain may hold at once, the current key and those it superseded (tighten only).
+        chain_keys_max = "RELAY_CHAIN_KEYS_MAX": 4, [2, 4];
+        /// How often the running relay re-reads its authorized list and enrollment codes, so `revoke` and `enroll` take effect (tighten only).
+        state_poll_ms = "RELAY_STATE_POLL_MS": 1_000, [100, 1_000];
+        /// A write to one connection that makes no progress this long closes that connection (tighten only).
+        send_wait_ms = "RELAY_SEND_WAIT_MS": 20_000, [1_000, 20_000];
+        /// Control messages (PONG, REFUSED and the like) queued to one connection; more closes it (tighten only).
+        control_queue_messages = "RELAY_CONTROL_QUEUE_MESSAGES": 64, [8, 64];
+        /// Wait for the close frame and the TCP shutdown when the relay closes a connection (tighten only).
+        close_linger_ms = "RELAY_CLOSE_LINGER_MS": 2_000, [100, 2_000];
     }
     agree(l) {
         if l.refuse_ms >= l.accept_wait_ms {
@@ -77,11 +85,20 @@ mod tests {
             "RELAY_ACCEPT_LEGS_PER_HANDLE",
             "RELAY_CIRCUITS_PER_CALLER",
             "RELAY_HELLO_WAIT_MS",
+            "RELAY_UPGRADE_WAIT_MS",
+            "RELAY_HEADER_MAX_BYTES",
+            "RELAY_KEEPALIVE_MS",
             "RELAY_PREACCEPT_BYTES",
             "RELAY_PREACCEPT_PER_TARGET",
             "RELAY_REGISTRATION_IDLE_MS",
             "RELAY_QUEUE_BYTES",
             "RELAY_ENROLL_SECS",
+            "RELAY_SUCCESSOR_OVERLAP_SECS",
+            "RELAY_CHAIN_KEYS_MAX",
+            "RELAY_STATE_POLL_MS",
+            "RELAY_SEND_WAIT_MS",
+            "RELAY_CONTROL_QUEUE_MESSAGES",
+            "RELAY_CLOSE_LINGER_MS",
         ] {
             let spec = RelayLimits::SPECS.iter().find(|s| s.name == name).unwrap();
             assert_eq!(spec.max, spec.default, "{name} must only tighten");

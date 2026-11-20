@@ -14,8 +14,8 @@
 //! CBOR `{1: nonce (24), 2: ciphertext}`, with no associated data; the keys
 //! are separate per use. Plus stores and serves these opaque bytes and
 //! never holds a key. Nothing read from Plus counts unless the pinned host
-//! signed it ([`check_manifest_pin`]) or, for a removal, an owner-role
-//! device signed it.
+//! signed it (`manifest::Manifest::open`, in the reader) or, for a removal,
+//! an owner-role device signed it.
 
 use std::fmt;
 
@@ -26,10 +26,6 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::cbor::{self, Fields, Value};
-use crate::identity::{IdentityPublicKey, RawSignature};
-
-/// Domain string of a manifest (design B.11), signed by the host.
-pub const MANIFEST_DOMAIN: &str = "mousse-manifest-v1";
 
 /// Length of an inbox id.
 pub const INBOX_ID_LEN: usize = 32;
@@ -162,70 +158,9 @@ pub fn split_slot(plaintext: &[u8]) -> Result<(&[u8], [u8; INBOX_ID_LEN]), SealE
     Ok((manifest, id))
 }
 
-/// Why a manifest from a slot was refused.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ManifestError {
-    /// Not a signed envelope of a manifest record.
-    Format,
-    /// The record names another host than the pin.
-    OtherHost,
-    /// The signature is not the pinned host's.
-    Signature,
-}
-
-impl fmt::Display for ManifestError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            ManifestError::Format => "not a manifest",
-            ManifestError::OtherHost => "the manifest names another host",
-            ManifestError::Signature => "the manifest is not signed by the pinned host",
-        })
-    }
-}
-
-impl std::error::Error for ManifestError {}
-
-/// Check that `envelope` (`{1: record, 2: raw signature}`) is a manifest
-/// record (domain `mousse-manifest-v1`) naming `pin` at key 2 and signed by
-/// `pin`, and return the record bytes. Whatever Plus serves, only this
-/// counts (design B.11); the record's own fields are read by the manifest
-/// code.
-pub fn check_manifest_pin(
-    envelope: &[u8],
-    pin: &IdentityPublicKey,
-) -> Result<Vec<u8>, ManifestError> {
-    let mut f = Fields::decode(envelope).map_err(|_| ManifestError::Format)?;
-    let record = f.bytes(1).map_err(|_| ManifestError::Format)?;
-    let signature = RawSignature::from_slice(&f.bytes(2).map_err(|_| ManifestError::Format)?)
-        .map_err(|_| ManifestError::Signature)?;
-    f.finish().map_err(|_| ManifestError::Format)?;
-    let value = cbor::decode(&record).map_err(|_| ManifestError::Format)?;
-    let Value::Map(entries) = value else {
-        return Err(ManifestError::Format);
-    };
-    let field = |k: u64| entries.iter().find(|(key, _)| *key == k).map(|(_, v)| v);
-    if field(1) != Some(&Value::Text(MANIFEST_DOMAIN.into())) {
-        return Err(ManifestError::Format);
-    }
-    if field(2) != Some(&Value::Bytes(pin.as_bytes().to_vec())) {
-        return Err(ManifestError::OtherHost);
-    }
-    if cfg!(mousse_control = "unpinned-manifest") {
-        // Must-fail control (tests only): the pin's signature is not
-        // checked.
-        return Ok(record);
-    }
-    pin.verify(&record, &signature)
-        .map_err(|_| ManifestError::Signature)?;
-    Ok(record)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::SoftwareKey;
-    use rand_chacha::ChaCha20Rng;
-    use rand_core::SeedableRng;
 
     fn secret(b: u8) -> PairSecret {
         PairSecret::from_bytes([b; 32])
@@ -276,38 +211,11 @@ mod tests {
         assert_eq!(open(&key, b"\xa0"), Err(SealError::Format));
     }
 
-    fn manifest(signer: &SoftwareKey, named: &SoftwareKey) -> Vec<u8> {
-        let record = cbor::encode(&Value::Map(vec![
-            (1, Value::Text(MANIFEST_DOMAIN.into())),
-            (2, Value::Bytes(named.public_key().as_bytes().to_vec())),
-            (3, Value::Uint(1)),
-        ]));
-        let sig = signer.sign_raw(&record);
-        cbor::encode(&Value::Map(vec![
-            (1, Value::Bytes(record)),
-            (2, Value::Bytes(sig.as_bytes().to_vec())),
-        ]))
-    }
-
     #[test]
-    fn only_a_manifest_the_pinned_host_signed_counts() {
-        let mut rng = ChaCha20Rng::from_seed([4; 32]);
-        let host = SoftwareKey::generate(&mut rng);
-        let other = SoftwareKey::generate(&mut rng);
-        let good = manifest(&host, &host);
-        assert!(check_manifest_pin(&good, &host.public_key()).is_ok());
-        assert_eq!(
-            check_manifest_pin(&manifest(&other, &host), &host.public_key()),
-            Err(ManifestError::Signature)
-        );
-        assert_eq!(
-            check_manifest_pin(&manifest(&other, &other), &host.public_key()),
-            Err(ManifestError::OtherHost)
-        );
-        // The slot carries the manifest then the inbox id.
-        let plain = slot_plaintext(&good, &[5; 32]);
+    fn a_slot_carries_the_manifest_then_the_inbox_id() {
+        let plain = slot_plaintext(b"manifest", &[5; 32]);
         let (m, inbox) = split_slot(&plain).unwrap();
-        assert_eq!((m, inbox), (good.as_slice(), [5; 32]));
+        assert_eq!((m, inbox), (&b"manifest"[..], [5; 32]));
         assert_eq!(split_slot(&[1; 31]), Err(SealError::Short));
     }
 }

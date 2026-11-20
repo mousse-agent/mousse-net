@@ -25,11 +25,13 @@ use std::sync::Arc;
 use mousse_net_core::cbor::Value;
 use mousse_net_core::grants::GrantId;
 use mousse_net_core::identity::IdentityPublicKey;
+use mousse_net_core::manifest::{Envelope, Manifest};
 use mousse_net_core::pairmail::{self, PairSecret};
 use mousse_net_io::rng::random_bytes;
 use mousse_net_io::store::{hex, identity_from_hex, unhex, write_atomic};
 use serde::{Deserialize, Serialize};
 
+use super::removals::ApplyError;
 use super::Engine;
 use crate::applog;
 use crate::plus::proto::{map, DEPOSIT_TOKENS_MAX, DIR_ENTRY_MAX, MAIL_ENVELOPE_MAX};
@@ -47,6 +49,9 @@ pub trait PairSource: Send + Sync {
     fn caller_secret(&self, pin: &IdentityPublicKey) -> Option<PairSecret>;
     /// This host's current signed manifest envelope.
     fn manifest(&self) -> Option<Vec<u8>>;
+    /// Caller side: a manifest the host `pin` signed, read from its
+    /// directory slot: kept if newer, so its routes reach the dialer.
+    fn keep_manifest(&self, _pin: &IdentityPublicKey, _envelope: &[u8]) {}
 }
 
 /// No pairing material yet (before the relay client provides it).
@@ -155,6 +160,11 @@ impl HostMail {
     pub async fn sync(&self, plus: &Plus, pairs: &dyn PairSource) -> Result<(), Failure> {
         let inbox = self.inbox_id()?;
         let pairings = pairs.host_pairings();
+        // Gone pairings first: their slots free their places at Plus, so a
+        // new slot at the quota cannot keep a removed pairing's slot
+        // readable, and the token set loses the removed tag before anything
+        // else can fail.
+        self.delete_gone_slots(plus, &pairings).await?;
         self.put_tokens(plus, &inbox, &pairings).await?;
         if let Some(manifest) = pairs.manifest() {
             for (grant, _, secret) in &pairings {
@@ -162,7 +172,7 @@ impl HostMail {
                     .await?;
             }
         }
-        self.delete_gone_slots(plus, &pairings).await
+        Ok(())
     }
 
     async fn put_tokens(
@@ -349,7 +359,10 @@ impl HostMail {
             .collect();
         let mut after: Option<u64> = None;
         let mut acked = 0;
-        loop {
+        // A Plus that answers the same page whatever `after` says, or pages
+        // without end, cannot hold the loop: at most this many pages a
+        // round, and each must move past the last.
+        for _ in 0..crate::limits::helper().plus_mail_pages_max() {
             let mut body = vec![(1, Value::Bytes(inbox.to_vec()))];
             if let Some(a) = after {
                 body.push((2, Value::Uint(a)));
@@ -359,10 +372,15 @@ impl HostMail {
             if messages.is_empty() {
                 return Ok(acked);
             }
+            let before = after;
             let mut ids = Vec::new();
             for m in &messages {
                 let id = m.fixed::<16>(1)?;
-                after = Some(m.uint(2)?.max(after.unwrap_or(0)));
+                let sequence = m.uint(2)?;
+                if before.is_some_and(|b| sequence <= b) {
+                    continue; // not past the last page: seen already
+                }
+                after = Some(sequence.max(after.unwrap_or(0)));
                 let tag = m.fixed::<16>(3)?;
                 let sealed = m.bytes(5)?;
                 // Only mail sealed with a pairing's own key is opened; Plus
@@ -381,19 +399,23 @@ impl HostMail {
                         Ok(answer) => {
                             applog::line(format!("mail: a removal was {}", answer.result.name()))
                         }
-                        Err(e) => {
-                            // Not applied (networking paused, or not a
-                            // removal): left for the next round only when
-                            // the host could not decide.
-                            if e.contains("paused") {
-                                continue;
-                            }
+                        // Decided by nobody yet: never acknowledged, so it
+                        // stays at Plus for the next round.
+                        Err(ApplyError::NotNow(e)) => {
+                            applog::line(format!("mail: a removal waits: {e}"));
+                            continue;
+                        }
+                        Err(e @ ApplyError::NotARemoval(_)) => {
                             applog::line(format!("mail: dropped a message: {e}"));
                         }
                     },
                     None => applog::line("mail: dropped a message no pairing's key opens"),
                 }
                 ids.push(Value::Bytes(id.to_vec()));
+            }
+            if after == before {
+                // Nothing past the last page: Plus is not moving on.
+                return Ok(acked);
             }
             if !ids.is_empty() {
                 acked += ids.len();
@@ -407,6 +429,8 @@ impl HostMail {
                 .await?;
             }
         }
+        applog::line("mail: stopped a fetch round at its page limit");
+        Ok(acked)
     }
 }
 
@@ -414,13 +438,15 @@ impl HostMail {
 // Caller side
 // ---------------------------------------------------------------------------
 
-/// The host's inbox id, from the pairing's directory slot. The slot counts
-/// only if its manifest is signed by the pinned host.
-pub async fn host_inbox(
+/// The pairing's directory slot: the host's signed manifest envelope and
+/// its inbox id. The slot counts only if it opens under this pairing's
+/// slot key and its manifest is a manifest the pinned host signed
+/// (`Manifest::open`), whatever Plus serves.
+pub async fn read_slot(
     plus: &Plus,
     pin: &IdentityPublicKey,
     secret: &PairSecret,
-) -> Result<[u8; 32], Failure> {
+) -> Result<(Vec<u8>, [u8; 32]), Failure> {
     let slot = secret.slot_id();
     let got = plus
         .post_anonymous("/v1/dir/get", &map(vec![(1, Value::Bytes(slot.to_vec()))]))
@@ -430,8 +456,24 @@ pub async fn host_inbox(
         .map_err(|e| Failure::Bad(format!("slot: {e}")))?;
     let (manifest, inbox) =
         pairmail::split_slot(&plain).map_err(|e| Failure::Bad(format!("slot: {e}")))?;
-    pairmail::check_manifest_pin(manifest, pin).map_err(|e| Failure::Bad(format!("slot: {e}")))?;
-    Ok(inbox)
+    if !cfg!(mousse_control = "unpinned-manifest") {
+        // Must-fail control (tests only): the manifest counts unchecked.
+        Envelope::decode(manifest)
+            .map_err(|e| e.to_string())
+            .and_then(|env| Manifest::open(&env, pin).map_err(|e| e.to_string()))
+            .map_err(|e| Failure::Bad(format!("slot manifest: {e}")))?;
+    }
+    Ok((manifest.to_vec(), inbox))
+}
+
+/// The host's inbox id, from the pairing's directory slot ([`read_slot`]).
+#[cfg(test)]
+pub async fn host_inbox(
+    plus: &Plus,
+    pin: &IdentityPublicKey,
+    secret: &PairSecret,
+) -> Result<[u8; 32], Failure> {
+    read_slot(plus, pin, secret).await.map(|(_, inbox)| inbox)
 }
 
 /// Deposit a removal envelope for the host, sealed with the pairing's mail
@@ -492,8 +534,12 @@ impl Engine {
             };
             match item.state.as_str() {
                 "waiting" | "quota" => {
-                    let inbox = match host_inbox(plus, &host, &secret).await {
-                        Ok(i) => i,
+                    let inbox = match read_slot(plus, &host, &secret).await {
+                        Ok((manifest, inbox)) => {
+                            // Its routes may be newer than the ones kept.
+                            pairs.keep_manifest(&host, &manifest);
+                            inbox
+                        }
                         Err(e) => {
                             applog::line(format!("mail: no inbox for a host: {e}"));
                             continue;
@@ -518,19 +564,29 @@ impl Engine {
                     else {
                         continue;
                     };
-                    match message_state(plus, &secret, &msg).await {
-                        Ok(1) => self.set_item_state(&item.id, "delivered", None, None),
-                        // Lost at Plus (A.13) or expired: deposit again; the
-                        // host deduplicates by removal id.
-                        Ok(2) | Err(Failure::Plus(_)) => {
-                            self.set_item_state(&item.id, "waiting", None, None)
-                        }
-                        _ => {}
+                    if let Some(next) =
+                        after_message_state(&message_state(plus, &secret, &msg).await)
+                    {
+                        self.set_item_state(&item.id, next, None, None);
                     }
                 }
                 _ => {}
             }
         }
+    }
+}
+
+/// What a deposited removal becomes after asking Plus for its message's
+/// state: `delivered` once fetched; `waiting` (deposit again; the host
+/// deduplicates by removal id) only when the message expired or Plus no
+/// longer knows it (404, a restore, A.13). Any other failure (a 429, a 500,
+/// a timeout) changes nothing, so a busy Plus never gets duplicates.
+fn after_message_state(state: &Result<u64, Failure>) -> Option<&'static str> {
+    match state {
+        Ok(1) => Some("delivered"),
+        Ok(2) => Some("waiting"),
+        Err(Failure::Plus(e)) if e.status == 404 || e.code == "not_found" => Some("waiting"),
+        _ => None,
     }
 }
 

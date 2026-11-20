@@ -74,6 +74,10 @@ pub struct Book {
     refill_deadline_ms: u64,
     not_before_retry_ms: u64,
     classes: [ClassBook; 2],
+    /// Plus funds only the newest handle on the one funded relay (A.8): an
+    /// older handle, or a staged relay, keeps what it holds and asks for
+    /// nothing.
+    funded: bool,
 }
 
 fn idx(class: Class) -> usize {
@@ -101,7 +105,13 @@ impl Book {
             refill_deadline_ms,
             not_before_retry_ms,
             classes: Default::default(),
+            funded: true,
         }
+    }
+
+    /// Whether this handle asks Plus for blocks.
+    pub fn set_funded(&mut self, funded: bool) {
+        self.funded = funded;
     }
 
     fn class(&mut self, class: Class) -> &mut ClassBook {
@@ -112,7 +122,7 @@ impl Book {
     /// or the current one passed the threshold and none is pending.
     pub fn wants(&self, class: Class) -> bool {
         let c = &self.classes[idx(class)];
-        if c.requesting_since.is_some() || c.retry.is_some() {
+        if !self.funded || c.requesting_since.is_some() || c.retry.is_some() {
             return false;
         }
         match (&c.current, &c.pending) {
@@ -273,6 +283,13 @@ impl Book {
                 out.push(Action::Paused(class, true));
             }
         }
+        // A refused block that expired before it could be presented again
+        // leaves its class wanting one: ask Plus.
+        for class in [Class::Interactive, Class::Bulk] {
+            if self.wants(class) && !out.contains(&Action::Request(class)) {
+                out.push(Action::Request(class));
+            }
+        }
         if cfg!(mousse_control = "pause-all-classes")
             && out
                 .iter()
@@ -286,6 +303,7 @@ impl Book {
     }
 
     /// Whether `class` shows paused.
+    #[cfg(test)]
     pub fn is_paused(&self, class: Class) -> bool {
         self.classes[idx(class)].paused
     }
@@ -372,13 +390,20 @@ fn rate(samples: &[(u64, u64)]) -> u64 {
     last.1.saturating_sub(first.1).saturating_mul(1000) / dt
 }
 
-/// What the relay registration reports to the driver.
+/// What the relay registration (and the hosted relay client) tells the
+/// driver.
 #[derive(Clone, Debug)]
 pub enum RelayEvent {
     /// A `LEASE_STATUS`.
     Status(Vec<StatusEntry>),
     /// The registration ended.
     Closed,
+    /// Ask Plus for blocks (`true`), or stop asking and keep what is held:
+    /// a newer handle or another relay is funded now (A.8).
+    Funded(bool),
+    /// `RELEASE` every held block and end: the handle is no longer used
+    /// (the end of a rotation overlap, or a relay move's cutover, §B.10).
+    ReleaseAll,
 }
 
 /// What the driver sends on the registration.
@@ -403,15 +428,30 @@ pub struct Registration {
 
 /// Keep `registration` funded from Plus until the relay says it closed or
 /// `commands` closes. App events (`plus.relay`) go to `events`.
+#[cfg(test)]
 pub async fn run(
     plus: Arc<Plus>,
     reg: Registration,
+    relay: mpsc::UnboundedReceiver<RelayEvent>,
+    commands: mpsc::UnboundedSender<RelayCommand>,
+    events: mpsc::UnboundedSender<Json>,
+    clock: Arc<dyn mousse_net_io::Clock>,
+) {
+    run_funded(plus, reg, true, relay, commands, events, clock).await
+}
+
+/// [`run`], starting funded or not (a staged relay, an older handle).
+pub async fn run_funded(
+    plus: Arc<Plus>,
+    reg: Registration,
+    funded: bool,
     mut relay: mpsc::UnboundedReceiver<RelayEvent>,
     commands: mpsc::UnboundedSender<RelayCommand>,
     events: mpsc::UnboundedSender<Json>,
     clock: Arc<dyn mousse_net_io::Clock>,
 ) {
     let mut book = Book::new();
+    book.set_funded(funded);
     let (got, mut blocks) = mpsc::unbounded_channel::<(Class, Result<Block, Failure>)>();
     let mut tick = tokio::time::interval(ms(helper().plus_not_before_retry_ms()));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -451,12 +491,32 @@ pub async fn run(
         tokio::select! {
             ev = relay.recv() => match ev {
                 Some(RelayEvent::Status(entries)) => actions = book.on_status(&entries, now_ms),
+                Some(RelayEvent::Funded(funded)) => {
+                    book.set_funded(funded);
+                    actions = [Class::Interactive, Class::Bulk]
+                        .into_iter()
+                        .filter(|c| book.wants(*c))
+                        .map(Action::Request)
+                        .collect();
+                }
+                Some(RelayEvent::ReleaseAll) => {
+                    for ids in book.held_ids().chunks(mousse_net_core::relay::msg::RELEASE_MAX) {
+                        let _ = commands.send(RelayCommand::Release(ids.to_vec()));
+                    }
+                    book.released();
+                    return;
+                }
                 Some(RelayEvent::Closed) | None => return,
             },
             Some((class, result)) = blocks.recv() => match result {
                 Ok(block) => {
                     backoff[idx(class)].reset();
                     actions = book.on_block(block, now_ms);
+                    let _ = events.send(json!({
+                        "ev": "plus.relay.block",
+                        "relay": mousse_net_io::store::hex(&reg.relay_id),
+                        "class": class.name(),
+                    }));
                 }
                 Err(e) => {
                     book.request_failed(class, &e.word());
@@ -581,15 +641,22 @@ mod tests {
         b.on_block(block(Class::Interactive, 1, 1000, 10_000), 0);
         b.on_status(&[status(Class::Interactive, 1, 0, 1000, 3)], 100);
         assert!(!b.wants(Class::Interactive), "the refused block comes back");
-        assert!(b.tick(900, 50).is_empty());
+        let early = b.tick(900, 50);
+        assert!(!early
+            .iter()
+            .any(|a| matches!(a, Action::Present(_) | Action::Request(Class::Interactive))));
         let out = b.tick(1_100, 50);
-        assert_eq!(
-            out,
-            vec![Action::Present(block(Class::Interactive, 1, 1000, 10_000))]
-        );
-        // An expired one is not presented again.
+        assert!(out.contains(&Action::Present(block(Class::Interactive, 1, 1000, 10_000))));
+        assert!(!out.contains(&Action::Request(Class::Interactive)));
+        // An expired one is not presented again; the class asks Plus for
+        // a new block instead of staying unfunded.
         b.on_status(&[status(Class::Interactive, 1, 0, 1000, 3)], 1_200);
-        assert!(b.tick(5_000, 10_001).is_empty());
+        let out = b.tick(5_000, 10_001);
+        assert!(!out.iter().any(|a| matches!(a, Action::Present(_))));
+        assert!(
+            out.contains(&Action::Request(Class::Interactive)),
+            "{out:?}"
+        );
     }
 
     #[test]

@@ -37,7 +37,14 @@
 //! **Keys.** Registration keys, caller keys and pair secrets are derived
 //! from the endpoint's relay seed (kept where its identity is kept) with
 //! salts in the state files ([`super::relay_store`]). Caller keys are per
-//! host.
+//! host. What a caller is given (a host's pair secret, a ticket's
+//! invitation tag) is sealed under a key from the same seed. A key
+//! rotation is journaled and finished across restarts: the old key stays
+//! current until the relay has registered the new one.
+//!
+//! **Ending paths.** Disallowing a relay destination closes the paths to
+//! that host through it (and every dial checks the approval as it is
+//! then); removing an own relay closes the sessions through it.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
@@ -49,7 +56,7 @@ use mousse_net_core::identity::{IdentityPublicKey, IdentityRecord, PublicKey};
 use mousse_net_core::manifest::{Envelope, Manifest, ManifestRoute, MANIFEST_ROUTES_MAX};
 use mousse_net_core::mux::PriorityClass;
 use mousse_net_core::pairing::{InvitationId, Ticket};
-use mousse_net_core::pairmail::PairSecret;
+use mousse_net_core::pairmail::{self, PairSecret};
 use mousse_net_core::relay::msg::{
     InvitationEntry, ALLOW_CALLERS_MAX, ALLOW_INVITATIONS_MAX, RELAY_MESSAGE_MAX,
 };
@@ -78,7 +85,13 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::AbortHandle;
 use zeroize::Zeroizing;
 
-use super::relay_store::{fixed, Files, GrantKey, OldKey, OwnRelay, PeerRelay, Recovery};
+use super::relay_store::{
+    fixed, Files, GrantKey, OldKey, OwnRelay, PeerRelay, PendingKey, Recovery,
+};
+
+/// Hosted relays from Plus (Phase 4).
+#[path = "hosted.rs"]
+pub mod hosted;
 use super::{error, AppInfo, Shared};
 use crate::applog;
 
@@ -88,6 +101,10 @@ pub const KEYS_LABEL: &str = "mousse-keys";
 pub const MANIFEST_LABEL: &str = "mousse-manifest";
 /// The wire minor version that has both.
 pub const KEYS_MINOR: u64 = 1;
+
+/// The clock skew every check allows (wire.md 5.3): an old key leaves the
+/// manifest this much before the relay could drop it.
+const CLOCK_SKEW_SECS: u64 = 600;
 
 /// The requests this module answers.
 pub const OPS: [&str; 6] = [
@@ -144,6 +161,11 @@ pub struct State {
     manifest_sent: Mutex<HashSet<u64>>,
     /// Bulk companions of relay connections, by the main one's number.
     bulk: tokio::sync::Mutex<HashMap<u64, Arc<Connection>>>,
+    /// Inbound sessions through each own relay (by relay id), by
+    /// connection number, so removing the relay ends them.
+    sessions: Mutex<HashMap<String, HashSet<u64>>>,
+    /// The hosted relays' registrations (Phase 4).
+    hosted: Mutex<hosted::Runtime>,
 }
 
 fn guard<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -189,6 +211,8 @@ impl State {
             manifest: Mutex::new(None),
             manifest_sent: Mutex::new(HashSet::new()),
             bulk: tokio::sync::Mutex::new(HashMap::new()),
+            sessions: Mutex::new(HashMap::new()),
+            hosted: Mutex::new(hosted::Runtime::default()),
         }
     }
 
@@ -386,6 +410,7 @@ fn status_json(shared: &Shared, relay: &OwnRelay) -> Value {
         "added_at": relay.added_at,
         "rotated_at": relay.rotated_at,
         "rotating_until": relay.old.iter().map(|o| o.until).max(),
+        "new_key_pending": relay.pending.is_some(),
     })
 }
 
@@ -412,6 +437,10 @@ pub async fn run(shared: Arc<Shared>) {
         start_registration(&shared, &relay, relay.salt.clone(), None);
         for old in relay.old.iter().filter(|o| o.until > t) {
             start_registration(&shared, &relay, old.salt.clone(), None);
+        }
+        // A rotation the relay had not taken before a restart goes on.
+        if relay.pending.is_some() {
+            tokio::spawn(finish_rotation(shared.clone(), relay.relay.clone()));
         }
     }
     rebuild_manifest(&shared);
@@ -445,6 +474,8 @@ async fn on_removal(shared: &Arc<Shared>) {
     }
     prune_keys(shared);
     refresh_allow(shared);
+    // The removed pairing's slot and deposit token go now (Phase 4 E-L3).
+    shared.engine.mail_kick();
 }
 
 fn start_registration(
@@ -612,6 +643,7 @@ async fn hold(
         events_tx,
         crate::limits::ms(h.via_relay_keepalive_ms()),
         crate::limits::ms(h.via_relay_idle_ms()),
+        h.via_relay_accept_legs() as usize,
     );
     tokio::pin!(run);
     loop {
@@ -636,6 +668,8 @@ async fn hold(
                     applog::line(format!("relay accept leg failed: {error}"));
                 }
                 TargetEvent::AllowSetOk { .. } => {}
+                // Own relays are self-hosted: no leases.
+                TargetEvent::LeaseStatus(_) => {}
             },
         }
     }
@@ -709,25 +743,72 @@ async fn accept_incoming(
     } else {
         "relay"
     };
-    app.inbound_on(
-        conn,
-        json!({"kind": "relay", "class": class, "destination": destination}),
-    )
-    .await;
+    let no = app
+        .inbound_on(
+            conn,
+            json!({"kind": "relay", "class": class, "destination": destination}),
+        )
+        .await;
     guard(&shared.relay.join_circuits).remove(&id);
+    if let Some(no) = no {
+        guard(&shared.relay.sessions)
+            .entry(relay.clone())
+            .or_default()
+            .insert(no);
+        // Removed meanwhile: the session goes with the relay.
+        if destination_of(&shared, &relay).is_none() {
+            close_sessions(&shared, &relay);
+        }
+    }
+}
+
+/// End every inbound session through the own relay `relay`.
+fn close_sessions(shared: &Shared, relay: &str) {
+    let numbers = guard(&shared.relay.sessions)
+        .remove(relay)
+        .unwrap_or_default();
+    let conns: Vec<Arc<Connection>> = {
+        let core = super::lock(&shared.core);
+        numbers
+            .iter()
+            .filter_map(|no| core.conns.get(no).map(|e| e.conn.clone()))
+            .collect()
+    };
+    for conn in conns {
+        conn.close(ErrorCode::Cancelled);
+    }
+}
+
+/// Close the outbound paths to `pin` through `destination`; their bulk
+/// companions go with them.
+fn close_relay_paths(shared: &Shared, pin: &IdentityPublicKey, destination: &str) {
+    let conns: Vec<Arc<Connection>> = super::lock(&shared.core)
+        .conns
+        .values()
+        .filter(|e| {
+            !e.inbound
+                && e.identity == *pin
+                && e.via
+                    .as_ref()
+                    .is_some_and(|r| r.endpoint.destination() == destination)
+        })
+        .map(|e| e.conn.clone())
+        .collect();
+    for conn in conns {
+        conn.close(ErrorCode::Cancelled);
+    }
 }
 
 fn destination_of(shared: &Shared, relay: &str) -> Option<String> {
-    shared
+    let own = shared
         .relay
         .files
         .relays()
-        .ok()?
-        .relays
-        .into_iter()
-        .find(|r| r.relay == relay)
+        .ok()
+        .and_then(|f| f.relays.into_iter().find(|r| r.relay == relay))
         .and_then(|r| RelayEndpoint::parse(&r.endpoint))
-        .map(|e| e.destination())
+        .map(|e| e.destination());
+    own.or_else(|| hosted::destination_of(shared, relay))
 }
 
 /// Whether a live connection on a join circuit belongs there: its grant's
@@ -953,6 +1034,54 @@ pub fn on_invitation_ended(shared: &Shared, invitation: &InvitationId) {
 }
 
 // ---------------------------------------------------------------------------
+// Sealed secrets in `relay-peers.json`
+
+/// HKDF info of the keys that seal what a caller keeps of a host's.
+const SEAL_INFO: &str = "mousse-relay-seal-v1";
+/// What is sealed: the host's pair secret.
+const SEALED_PAIR_SECRET: &str = "pair-secret";
+/// What is sealed: the ticket's invitation tag.
+const SEALED_JOIN_TAG: &str = "join-tag";
+
+/// The key sealing `what` of the host `pin`: from the relay seed, which is
+/// kept where the identity key is, so no relay secret is in a plain file.
+fn seal_key(
+    shared: &Shared,
+    pin: &IdentityPublicKey,
+    what: &str,
+) -> Result<Zeroizing<[u8; 32]>, String> {
+    let mut salt = pin.as_bytes().to_vec();
+    salt.extend_from_slice(what.as_bytes());
+    Ok(derive_secret(shared.relay.seed()?, SEAL_INFO, &salt))
+}
+
+/// `secret` sealed (XChaCha20-Poly1305, a fresh nonce), as hex.
+fn seal_secret(
+    shared: &Shared,
+    pin: &IdentityPublicKey,
+    what: &str,
+    secret: &[u8; 32],
+) -> Result<String, String> {
+    let key = seal_key(shared, pin, what)?;
+    let nonce = random_bytes::<{ pairmail::NONCE_LEN }>();
+    Ok(hex(&pairmail::seal(&key, nonce, secret)))
+}
+
+/// A secret sealed by [`seal_secret`], if it opens.
+fn open_secret(
+    shared: &Shared,
+    pin: &IdentityPublicKey,
+    what: &str,
+    sealed: Option<&str>,
+) -> Option<Zeroizing<[u8; 32]>> {
+    let key = seal_key(shared, pin, what).ok()?;
+    let bytes = unhex(sealed?).ok()?;
+    let plain = pairmail::open(&key, &bytes).ok()?;
+    let secret: [u8; 32] = plain.as_slice().try_into().ok()?;
+    Some(Zeroizing::new(secret))
+}
+
+// ---------------------------------------------------------------------------
 // Pairings for the Plus mailbox (Phase 4)
 
 /// What the relay client knows that Phase 4's mailbox needs: each grant's
@@ -985,12 +1114,13 @@ impl crate::engine::mailbox::PairSource for Pairs {
     }
 
     fn caller_secret(&self, pin: &IdentityPublicKey) -> Option<PairSecret> {
-        let shared = self.0.upgrade()?;
-        let key = hex(pin.as_bytes());
-        let file = shared.relay.files.peers().ok()?;
-        let entry = file.peers.iter().find(|p| p.identity == key)?;
-        let secret = Zeroizing::new(fixed::<32>(entry.pair_secret.as_deref()?)?);
-        Some(PairSecret::from_bytes(*secret))
+        caller_pair_secret(&*self.0.upgrade()?, pin)
+    }
+
+    fn keep_manifest(&self, pin: &IdentityPublicKey, envelope: &[u8]) {
+        if let Some(shared) = self.0.upgrade() {
+            take_manifest(&shared, pin, envelope);
+        }
     }
 
     fn manifest(&self) -> Option<Vec<u8>> {
@@ -998,6 +1128,20 @@ impl crate::engine::mailbox::PairSource for Pairs {
         let manifest = guard(&shared.relay.manifest);
         manifest.as_ref().map(|(_, envelope)| envelope.encode())
     }
+}
+
+/// Caller: the pair secret the host `pin` sent on `mousse-keys`.
+fn caller_pair_secret(shared: &Shared, pin: &IdentityPublicKey) -> Option<PairSecret> {
+    let key = hex(pin.as_bytes());
+    let file = shared.relay.files.peers().ok()?;
+    let entry = file.peers.iter().find(|p| p.identity == key)?;
+    let secret = open_secret(
+        shared,
+        pin,
+        SEALED_PAIR_SECRET,
+        entry.pair_secret.as_deref(),
+    )?;
+    Some(PairSecret::from_bytes(*secret))
 }
 
 // ---------------------------------------------------------------------------
@@ -1084,6 +1228,8 @@ pub async fn serve_keys(shared: Arc<Shared>, conn: Arc<Connection>, stream: MuxS
         writer.finish();
     }
     refresh_allow(&shared);
+    // The new pairing gets its directory slot and deposit token now.
+    shared.engine.mail_kick();
     // A join circuit becomes this caller's circuit, after the allow-set
     // that lists it (§B.7).
     let circuit = guard(&shared.relay.join_circuits).get(&conn.id()).cloned();
@@ -1176,7 +1322,7 @@ pub async fn ensure_keys(shared: &Arc<Shared>, conn: &Connection) {
         ));
     };
     let had = match peer_entry(shared, &pin) {
-        Ok(p) => p.pair_secret,
+        Ok(p) => open_secret(shared, &pin, SEALED_PAIR_SECRET, p.pair_secret.as_deref()),
         Err(e) => return failed(e),
     };
     let key = match caller_key(shared, &pin) {
@@ -1211,11 +1357,15 @@ pub async fn ensure_keys(shared: &Arc<Shared>, conn: &Connection) {
         return failed("malformed answer".into());
     };
     let secret = Zeroizing::new(secret);
-    if had.as_deref() == Some(hex(secret.as_slice()).as_str()) {
+    if had.is_some_and(|h| *h == *secret) {
         return;
     }
+    let sealed = match seal_secret(shared, &pin, SEALED_PAIR_SECRET, &secret) {
+        Ok(sealed) => sealed,
+        Err(e) => return failed(e),
+    };
     let stored = update_peer(shared, &pin, |p| {
-        p.pair_secret = Some(hex(secret.as_slice()));
+        p.pair_secret = Some(sealed);
         p.join_tag = None;
     });
     if let Err(e) = &stored {
@@ -1263,6 +1413,9 @@ pub fn send_manifest(shared: &Arc<Shared>, no: u64, conn: Arc<Connection>) {
 /// A connection went down: forget what was sent on it.
 pub fn conn_gone(shared: &Shared, no: u64) {
     guard(&shared.relay.manifest_sent).remove(&no);
+    for list in guard(&shared.relay.sessions).values_mut() {
+        list.remove(&no);
+    }
 }
 
 fn broadcast_manifest(shared: &Arc<Shared>) {
@@ -1312,6 +1465,7 @@ fn manifest_routes(shared: &Shared) -> Vec<ManifestRoute> {
             });
         }
     }
+    routes.extend(hosted::manifest_routes(shared));
     routes.truncate(MANIFEST_ROUTES_MAX);
     routes
 }
@@ -1372,6 +1526,8 @@ fn issue_manifest(shared: &Arc<Shared>, routes: Vec<ManifestRoute>) {
     let envelope = Manifest::seal(&record, signature);
     *guard(&shared.relay.manifest) = Some((manifest, envelope));
     broadcast_manifest(shared);
+    // Every pairing's directory slot carries the new manifest (§B.12).
+    shared.engine.mail_kick();
 }
 
 /// Caller: the host sent its manifest. Kept if it is signed by the pin and
@@ -1383,28 +1539,36 @@ pub async fn read_manifest(shared: Arc<Shared>, pin: IdentityPublicKey, stream: 
         return;
     };
     writer.finish();
-    let manifest = match Envelope::decode(&bytes)
+    take_manifest(&shared, &pin, &bytes);
+}
+
+/// Caller: keep `bytes`, a manifest from the session or from the host's
+/// directory slot, if the pinned host signed it and it is newer than the
+/// one kept. Returns whether it was kept.
+fn take_manifest(shared: &Shared, pin: &IdentityPublicKey, bytes: &[u8]) -> bool {
+    let pin = *pin;
+    let manifest = match Envelope::decode(bytes)
         .map_err(|e| e.to_string())
         .and_then(|env| Manifest::open(&env, &pin).map_err(|e| e.to_string()))
     {
         Ok(m) => m,
         Err(e) => {
             applog::line(format!("refused a manifest from {}: {e}", short_id(&pin)));
-            return;
+            return false;
         }
     };
     let mut newer = false;
     let mut before = None;
-    let _ = update_peer(&shared, &pin, |p| {
+    let _ = update_peer(shared, &pin, |p| {
         if manifest.sequence > p.sequence {
             before = stored_manifest(p, &pin);
             p.sequence = manifest.sequence;
-            p.manifest = Some(hex(&bytes));
+            p.manifest = Some(hex(bytes));
             newer = true;
         }
     });
     if !newer {
-        return;
+        return false;
     }
     if cfg!(mousse_control = "prompt-on-key-change") {
         // The control build treats a new relay key or handle at an
@@ -1416,7 +1580,7 @@ pub async fn read_manifest(shared: Arc<Shared>, pin: IdentityPublicKey, stream: 
         for r in &manifest.routes {
             if !known.contains(&r.handle) {
                 for e in &r.endpoints {
-                    let _ = remove_approval(&shared, &hex(pin.as_bytes()), &e.destination());
+                    let _ = remove_approval(shared, &hex(pin.as_bytes()), &e.destination());
                 }
             }
         }
@@ -1425,7 +1589,7 @@ pub async fn read_manifest(shared: Arc<Shared>, pin: IdentityPublicKey, stream: 
     for r in &manifest.routes {
         for e in &r.endpoints {
             let destination = e.destination();
-            if !approved(&shared, &pin, &destination) && !offered.contains(&destination) {
+            if !approved(shared, &pin, &destination) && !offered.contains(&destination) {
                 offered.push(destination);
             }
         }
@@ -1442,6 +1606,7 @@ pub async fn read_manifest(shared: Arc<Shared>, pin: IdentityPublicKey, stream: 
             "destination": destination,
         }));
     }
+    true
 }
 
 fn manifest_json(m: &Manifest) -> Value {
@@ -1518,12 +1683,19 @@ pub async fn dial_route(
     route: &RelayRoute,
     class: Class,
 ) -> Result<Connection, NetError> {
+    // Every dial, a bulk companion's too, needs the approval as it is now.
+    let destination = route.endpoint.destination();
+    if !cfg!(mousse_control = "manifest-unapproved") && !approved(shared, pin, &destination) {
+        return Err(NetError::Forbidden(format!(
+            "{destination} is not approved for this host"
+        )));
+    }
     let entry = peer_entry(shared, pin).map_err(NetError::Store)?;
     let key = caller_key(shared, pin).map_err(NetError::Store)?;
     let join_tag = entry
         .pair_secret
         .is_none()
-        .then(|| entry.join_tag.as_deref().and_then(fixed::<32>))
+        .then(|| open_secret(shared, pin, SEALED_JOIN_TAG, entry.join_tag.as_deref()))
         .flatten();
     let addrs = resolve(shared.caller.addr_policy(), &route.endpoint, false).await?;
     if addrs.is_empty() {
@@ -1532,8 +1704,8 @@ pub async fn dial_route(
     let mut last = NetError::Relay(RelayError::Unreachable);
     for addr in addrs {
         let pipe = match join_tag {
-            Some(tag) if class == Class::Interactive => {
-                dial_join(&addr, route.relay, route.handle, tag, dial_within()).await
+            Some(ref tag) if class == Class::Interactive => {
+                dial_join(&addr, route.relay, route.handle, **tag, dial_within()).await
             }
             _ => dial_call(&addr, route.relay, route.handle, &key, class, dial_within()).await,
         };
@@ -1650,12 +1822,13 @@ pub async fn dial_join_route(
 pub fn after_join(shared: &Shared, ticket: &Ticket, route: &RelayRoute, tag: [u8; 32]) {
     let pin = ticket.host_identity;
     let hint = route.to_hint();
+    let sealed = seal_secret(shared, &pin, SEALED_JOIN_TAG, &tag).ok();
     let _ = update_peer(shared, &pin, |p| {
         if !p.ticket_routes.contains(&hint) {
             p.ticket_routes.push(hint.clone());
         }
         if p.pair_secret.is_none() {
-            p.join_tag = Some(hex(&tag));
+            p.join_tag = sealed;
         }
     });
     let _ = add_approval(
@@ -1782,6 +1955,9 @@ pub fn on_request(shared: &Arc<Shared>, id: Value, op: &str, map: &Map<String, V
                         Ok(changed) => {
                             if op == "peer.relay.allow" {
                                 shared.keep.kick(super::paths::Kick::Reset(Some(pin)));
+                            } else if !cfg!(mousse_control = "disallow-keeps-paths") {
+                                // Paths through it end now, not only new dials.
+                                close_relay_paths(shared, &pin, &destination);
                             }
                             json!({"re": id, "changed": changed})
                         }
@@ -1865,6 +2041,7 @@ async fn enroll_inner(
         old: Vec::new(),
         added_at: now(),
         rotated_at: None,
+        pending: None,
     };
     {
         let _io = guard(&shared.relay.io);
@@ -1913,6 +2090,9 @@ fn remove_relay(shared: &Arc<Shared>, id: &Value, relay: &str) -> Value {
         return error(id, "no_relay", "No such relay");
     };
     stop_registrations(shared, &relay, None);
+    if !cfg!(mousse_control = "remove-keeps-sessions") {
+        close_sessions(shared, &relay);
+    }
     guard(&shared.relay.status).remove(&relay);
     if let Some(e) = RelayEndpoint::parse(&found.endpoint) {
         let me = hex(shared.info.identity.as_bytes());
@@ -1922,25 +2102,16 @@ fn remove_relay(shared: &Arc<Shared>, id: &Value, relay: &str) -> Value {
     json!({"re": id, "removed": true})
 }
 
-/// `relay.rotate {id}` ("New relay key"): the current key vouches for a new
-/// one with `SUCCESSOR`; both stay registered and in the manifest through
-/// `MANIFEST_OVERLAP_SECS` (§B.4, self mode).
+/// `relay.rotate {id}` ("New relay key", §B.4, self mode). The new key is
+/// journaled first (`pending`); the current key stays current. Then
+/// [`finish_rotation`] has the current key vouch for it with `SUCCESSOR`
+/// until the new key registers, and only then makes it current, with the
+/// old key kept registered and in the manifest through the overlap.
 fn rotate(shared: &Arc<Shared>, id: &Value, relay: &str) -> Value {
     let relay = relay.to_lowercase();
-    let salt = hex(&random_bytes::<16>());
-    let Ok(new_key) = shared.relay.key(REGISTRATION_KEY_INFO, &salt) else {
+    if shared.relay.seed().is_err() {
         return error(id, "unavailable", "Relays need the keystore");
-    };
-    let current = guard(&shared.relay.runs).get(&relay).and_then(|runs| {
-        let file = shared.relay.files.relays().ok()?;
-        let r = file.relays.iter().find(|r| r.relay == relay)?;
-        runs.iter()
-            .find(|run| run.salt == r.salt)
-            .map(|run| run.commands.clone())
-    });
-    let Some(commands) = current else {
-        return error(id, "no_relay", "No such relay");
-    };
+    }
     if guard(&shared.relay.status)
         .get(&relay)
         .is_none_or(|s| s.state != "registered")
@@ -1951,14 +2122,6 @@ fn rotate(shared: &Arc<Shared>, id: &Value, relay: &str) -> Value {
             "The relay isn't connected; try again once it is",
         );
     }
-    if commands
-        .send(TargetCommand::Successor {
-            new_key: new_key.clone(),
-        })
-        .is_err()
-    {
-        return error(id, "not_registered", "The relay isn't connected");
-    }
     let updated = {
         let _io = guard(&shared.relay.io);
         let Ok(mut file) = shared.relay.files.relays() else {
@@ -1967,32 +2130,121 @@ fn rotate(shared: &Arc<Shared>, id: &Value, relay: &str) -> Value {
         let Some(r) = file.relays.iter_mut().find(|r| r.relay == relay) else {
             return error(id, "no_relay", "No such relay");
         };
-        // The control build drops the old key at once: no overlap.
-        let until = if cfg!(mousse_control = "no-overlap") {
-            now()
-        } else {
-            now() + limits().manifest_overlap_secs()
-        };
-        let old = std::mem::replace(&mut r.salt, salt.clone());
-        r.old.push(OldKey { salt: old, until });
-        r.rotated_at = Some(now());
+        if r.pending.is_some() {
+            return error(id, "rotating", "A new key is already on its way");
+        }
+        r.pending = Some(PendingKey {
+            salt: hex(&random_bytes::<16>()),
+            since: now(),
+        });
         let r = r.clone();
         if let Err(e) = shared.relay.files.save_relays(file) {
             return error(id, "store_failed", e);
         }
         r
     };
-    // The old registration keeps running as an old key; the new one
-    // registers once the relay has taken the successor.
-    let shared2 = shared.clone();
-    let relay2 = updated.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        start_registration(&shared2, &relay2, relay2.salt.clone(), None);
-        end_overlaps(&shared2);
-        rebuild_manifest(&shared2);
-    });
+    tokio::spawn(finish_rotation(shared.clone(), relay));
     json!({"re": id, "relay": status_json(shared, &updated)})
+}
+
+/// Take the pending rotation of `relay` to its end: register the new key;
+/// while the relay refuses it, have the current registration send
+/// `SUCCESSOR` again; once it registers, make it current. The relay gives
+/// no other acknowledgement, and a `SUCCESSOR` it already took is refused,
+/// so one is sent only after a refusal of the new key.
+async fn finish_rotation(shared: Arc<Shared>, relay: String) {
+    let wait = crate::limits::ms(limits().via_relay_rotation_retry_ms());
+    loop {
+        let Some(r) = shared
+            .relay
+            .files
+            .relays()
+            .ok()
+            .and_then(|f| f.relays.into_iter().find(|r| r.relay == relay))
+        else {
+            return;
+        };
+        let Some(pending) = r.pending.clone() else {
+            return;
+        };
+        let (Some(endpoint), Some(id), Ok(new_key)) = (
+            RelayEndpoint::parse(&r.endpoint),
+            fixed::<32>(&r.relay).map(RelayId),
+            shared.relay.key(REGISTRATION_KEY_INFO, &pending.salt),
+        ) else {
+            return;
+        };
+        match register(&shared, &endpoint, id, new_key.clone()).await {
+            Ok(link) => {
+                commit_rotation(&shared, &relay, &pending, link);
+                return;
+            }
+            Err(RelayError::Refused(_)) => {
+                // Not taken yet: the current key vouches for it (again).
+                let registered = guard(&shared.relay.status)
+                    .get(&relay)
+                    .is_some_and(|s| s.state == "registered");
+                let current = guard(&shared.relay.runs).get(&relay).and_then(|runs| {
+                    runs.iter()
+                        .find(|run| run.salt == r.salt)
+                        .map(|run| run.commands.clone())
+                });
+                if let (true, Some(commands)) = (registered, current) {
+                    let _ = commands.send(TargetCommand::Successor { new_key });
+                }
+            }
+            Err(e) => applog::line(format!("relay {} new key: {e}", r.endpoint)),
+        }
+        tokio::time::sleep(wait).await;
+    }
+}
+
+/// The new key registered: it becomes current, and the old key stays
+/// registered and in the manifest until its overlap ends. The overlap
+/// counts from the rotation's start, before any `SUCCESSOR`, less the
+/// clock skew, so the old route leaves the manifest before the relay drops
+/// the old key (`MANIFEST_OVERLAP_SECS` is at most the relay's
+/// `RELAY_SUCCESSOR_OVERLAP_SECS`).
+fn commit_rotation(shared: &Arc<Shared>, relay: &str, pending: &PendingKey, link: TargetLink) {
+    let committed = {
+        let _io = guard(&shared.relay.io);
+        let Ok(mut file) = shared.relay.files.relays() else {
+            return;
+        };
+        let Some(r) = file.relays.iter_mut().find(|r| r.relay == relay) else {
+            return;
+        };
+        if r.pending.as_ref() != Some(pending) {
+            return;
+        }
+        // The control build drops the old key at once: no overlap.
+        let until = if cfg!(mousse_control = "no-overlap") {
+            now()
+        } else {
+            (pending.since + limits().manifest_overlap_secs()).saturating_sub(CLOCK_SKEW_SECS)
+        };
+        let old = std::mem::replace(&mut r.salt, pending.salt.clone());
+        r.old.push(OldKey { salt: old, until });
+        r.rotated_at = Some(now());
+        r.pending = None;
+        let r = r.clone();
+        if shared.relay.files.save_relays(file).is_err() {
+            return;
+        }
+        r
+    };
+    start_registration(shared, &committed, committed.salt.clone(), Some(link));
+    set_status(
+        shared,
+        relay,
+        Status {
+            state: "registered",
+            ..Status::default()
+        },
+    );
+    end_overlaps(shared);
+    rebuild_manifest(shared);
+    applog::line(format!("relay {} has the new key", committed.endpoint));
 }
 
 /// Old keys whose overlap ended leave the manifest and stop registering.

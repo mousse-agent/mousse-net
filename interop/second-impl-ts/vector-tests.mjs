@@ -504,7 +504,11 @@ function outcome(expected, fn) {
       relayKey: bytes(scenario.relay_key),
       bootId: bytes(scenario.boot_id),
       wallBase: scenario.wall_base,
-      authorized: scenario.authorized.map(entry => ({ fingerprint: bytes(entry.fingerprint), dropAt: entry.drop_at })),
+      authorized: scenario.authorized.map(entry => ({
+        fingerprint: bytes(entry.fingerprint),
+        dropAt: entry.drop_at,
+        chain: entry.chain === undefined ? undefined : bytes(entry.chain),
+      })),
       codes: scenario.codes.map(code => ({ hash: bytes(code.hash), expiresAt: code.expires_at })),
       limits: scenario.limits,
       draw(size) {

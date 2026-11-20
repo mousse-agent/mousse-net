@@ -3182,7 +3182,8 @@
           "hex": "a40012015841042ed2192f0f9275200acd34fbd8c6ce5a91a459488411320b4c6de3e6a22d7fa06f2374f60534a9009629714d063402a3c3ed60db057ef7999a7a31a78aebc0c7025840bedfb752e5db9e931f9a73c90272b1303702abb705f5ede412f463cb98d5185f9eda8397d91f4e0e177ca7ee8967ba41eecb4a16fbf06243c21bffbd34471526035840960782aa6460b986f016b366ff3cc2d378c3e248af9213aa8e818cfa471e028bb29cbe3b1a4e2533d2b35eb873091ebd2e53844faf1c0ff395d847c014362d63",
           "out": [
             {
-              "authorize": "07f9b2e3be6e3e7119a592103d62f0310144d18f7708ecbd3aef5d0ff4907a88"
+              "authorize": "07f9b2e3be6e3e7119a592103d62f0310144d18f7708ecbd3aef5d0ff4907a88",
+              "chain": "4fe55050350a82b775fd172e622170daa7c986b0db42a3b18d107273f2463378"
             },
             {
               "drop_at": 1790604800,
@@ -3300,6 +3301,222 @@
       "draws": [
         "3d237cd371514aeb3a0dfac6959bf7bb74df7986b6037e534c2e95833769029c",
         "2a107a9d443f61f01ccfd3e697954d9e8b4b11c3fa04023b95ee9f90c3ef90ba",
+        "1f6bb082f717d54c45c23b3a7d333c27b90312f7a8827ad6ff74a51b9e70983f",
+        "b1b98dcdccd8eb9a20587ef6042392f03029c8f432abba8fa919f2df0220bb3d",
+        "d2a6706b05abfe461de3089795cd9a5837fbb6b2a80434b4703cc7e024e0d860"
+      ],
+      "events": [
+        {
+          "at": 0,
+          "conn": 1,
+          "event": "open",
+          "exporter": "e46ba5975257142aa4044a95019717856a1f0ae74a10c61cf343c0269b377b04",
+          "ip": "c6336401000000000000000000000000",
+          "out": [
+            {
+              "hex": "a5000101010258203d237cd371514aeb3a0dfac6959bf7bb74df7986b6037e534c2e95833769029c03505b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b0400",
+              "message": "RELAY_HELLO",
+              "send": 1
+            }
+          ]
+        },
+        {
+          "at": 0,
+          "conn": 1,
+          "event": "recv",
+          "hex": "a30002015841049a2f9f7997a7fab2453c002b8bdc08fe4c8b6221ce689f771c0ee9067e0e039326f5aa18be3e7365b8d5cc00314c68d89892ea5eca81e56fefe0c59aa2f1326e025840dc19fe722232c85c0f1c60c602d3e0ec541f719689839226a5994255161f1f6d40287a276bf486bf5a1ec61ca86053073b9abcb860355f3970dd75f97e5b61d9",
+          "out": [
+            {
+              "hex": "a20004015820fd7af0b8cb34dfd81e9661cc70d37c0e5579ef4bdb4ff417f089f7dccf04889e",
+              "message": "REGISTERED",
+              "send": 1
+            }
+          ]
+        },
+        {
+          "at": 10,
+          "conn": 1,
+          "event": "recv",
+          "hex": "a40012015841042ed2192f0f9275200acd34fbd8c6ce5a91a459488411320b4c6de3e6a22d7fa06f2374f60534a9009629714d063402a3c3ed60db057ef7999a7a31a78aebc0c7025840bedfb752e5db9e931f9a73c90272b1303702abb705f5ede412f463cb98d5185f9eda8397d91f4e0e177ca7ee8967ba41eecb4a16fbf06243c21bffbd34471526035840960782aa6460b986f016b366ff3cc2d378c3e248af9213aa8e818cfa471e028bb29cbe3b1a4e2533d2b35eb873091ebd2e53844faf1c0ff395d847c014362d63",
+          "out": [
+            {
+              "authorize": "07f9b2e3be6e3e7119a592103d62f0310144d18f7708ecbd3aef5d0ff4907a88",
+              "chain": "4fe55050350a82b775fd172e622170daa7c986b0db42a3b18d107273f2463378"
+            },
+            {
+              "drop_at": 1790604800,
+              "supersede": "4fe55050350a82b775fd172e622170daa7c986b0db42a3b18d107273f2463378"
+            }
+          ]
+        },
+        {
+          "at": 20,
+          "conn": 2,
+          "event": "open",
+          "exporter": "ad2173ccf7374b3b39bb24c143bed434ed303502627034e99c174882f1f93735",
+          "ip": "c6336401000000000000000000000000",
+          "out": [
+            {
+              "hex": "a5000101010258202a107a9d443f61f01ccfd3e697954d9e8b4b11c3fa04023b95ee9f90c3ef90ba03505b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b0400",
+              "message": "RELAY_HELLO",
+              "send": 2
+            }
+          ]
+        },
+        {
+          "at": 20,
+          "conn": 2,
+          "event": "recv",
+          "hex": "a30002015841042ed2192f0f9275200acd34fbd8c6ce5a91a459488411320b4c6de3e6a22d7fa06f2374f60534a9009629714d063402a3c3ed60db057ef7999a7a31a78aebc0c702584022a94aac2182971574a1f4004d2e58977fd839d34b39cb7f48a9722d78c5ea81ebf836d9646a41e6af6fdfac421e4151a42df43815c84d238e42fead32637c2a",
+          "out": [
+            {
+              "hex": "a20004015820ad3d6dc7a8f97ea5307e68ffc33af6c51c4094009f481fe1716b54cddb5b1d69",
+              "message": "REGISTERED",
+              "send": 2
+            }
+          ]
+        },
+        {
+          "at": 30,
+          "conn": 2,
+          "event": "recv",
+          "hex": "a4001201584104428a824ea7cf56ad2a64ed368b71315d80cee846007cff1d2eea2c3f0f921537304ae598f98dd10d1f102811a4e2d161c3fd8bbb193d4b25bee950ac839c0f9d025840ac4c3184d1b68c09b17166eae191f543156e3fddbc057789108a91ac5537bdfaeb2ca4d6e2c00867796d7b9e8be5b3223bdf910dbf6be3b2c5b8b0d9327f331603584083097e787362b9473c8c9fb62e4683461d5f6bd82e27e5e275d8587f1e2d823885403c10c125f1dd70180c2b1db86ce722fb47ce618ec72566b325c5a2972099",
+          "out": [
+            {
+              "hex": "a20010016e6e6f745f617574686f72697a6564",
+              "message": "REFUSED",
+              "send": 2
+            },
+            {
+              "close": 2,
+              "code": 1000
+            }
+          ]
+        },
+        {
+          "at": 40,
+          "conn": 3,
+          "event": "open",
+          "exporter": "192c50e3ae8e5378ba4917222bf26fb7e9e11a7706feb27a2fda2fb486feeeb4",
+          "ip": "c6336401000000000000000000000000",
+          "out": [
+            {
+              "hex": "a5000101010258201f6bb082f717d54c45c23b3a7d333c27b90312f7a8827ad6ff74a51b9e70983f03505b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b0400",
+              "message": "RELAY_HELLO",
+              "send": 3
+            }
+          ]
+        },
+        {
+          "at": 40,
+          "conn": 3,
+          "event": "recv",
+          "hex": "a30002015841042ed2192f0f9275200acd34fbd8c6ce5a91a459488411320b4c6de3e6a22d7fa06f2374f60534a9009629714d063402a3c3ed60db057ef7999a7a31a78aebc0c702584065be8a2ad269239a6a0cafa6ac33c60589835afadcb1d61511c86c4d3a747205e4ed9583e018f982c2355634317e0730a83b915fb602393ff80d772eb47236ea",
+          "out": [
+            {
+              "hex": "a20004015820ad3d6dc7a8f97ea5307e68ffc33af6c51c4094009f481fe1716b54cddb5b1d69",
+              "message": "REGISTERED",
+              "send": 3
+            }
+          ]
+        },
+        {
+          "at": 100,
+          "event": "revoke",
+          "fingerprint": "4fe55050350a82b775fd172e622170daa7c986b0db42a3b18d107273f2463378",
+          "out": [
+            {
+              "close": 3,
+              "code": 4000
+            },
+            {
+              "close": 1,
+              "code": 4000
+            }
+          ]
+        },
+        {
+          "at": 200,
+          "conn": 4,
+          "event": "open",
+          "exporter": "ea260e75460252b68f2637bb9f145d336708654ecf2c59c1dd0fec9525556ff7",
+          "ip": "c6336401000000000000000000000000",
+          "out": [
+            {
+              "hex": "a500010101025820b1b98dcdccd8eb9a20587ef6042392f03029c8f432abba8fa919f2df0220bb3d03505b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b0400",
+              "message": "RELAY_HELLO",
+              "send": 4
+            }
+          ]
+        },
+        {
+          "at": 200,
+          "conn": 4,
+          "event": "recv",
+          "hex": "a30002015841042ed2192f0f9275200acd34fbd8c6ce5a91a459488411320b4c6de3e6a22d7fa06f2374f60534a9009629714d063402a3c3ed60db057ef7999a7a31a78aebc0c702584044987c5dc20563f646c32f7d5bffa42d47bedfcdff02beeacb336853ce9645eb8359d6c956ba896eaacd78e9cc650fe89d4c03fdc0031c2ff65b12f77efdb091",
+          "out": [
+            {
+              "hex": "a20010016e6e6f745f617574686f72697a6564",
+              "message": "REFUSED",
+              "send": 4
+            },
+            {
+              "close": 4,
+              "code": 1000
+            }
+          ]
+        },
+        {
+          "at": 210,
+          "conn": 5,
+          "event": "open",
+          "exporter": "b5f0198998dd1f3206670ae2c957fa577cdf6676891bbb21abbc4dc2cb46bed8",
+          "ip": "c6336401000000000000000000000000",
+          "out": [
+            {
+              "hex": "a500010101025820d2a6706b05abfe461de3089795cd9a5837fbb6b2a80434b4703cc7e024e0d86003505b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b0400",
+              "message": "RELAY_HELLO",
+              "send": 5
+            }
+          ]
+        },
+        {
+          "at": 210,
+          "conn": 5,
+          "event": "recv",
+          "hex": "a30002015841049a2f9f7997a7fab2453c002b8bdc08fe4c8b6221ce689f771c0ee9067e0e039326f5aa18be3e7365b8d5cc00314c68d89892ea5eca81e56fefe0c59aa2f1326e02584050be80f6c156e128e5b7dd49c0f8ca7f722b5ded940344276b64a85ccf7e3317210ba489b248dbf3731d867fbae46456cbc4250af49b6eb10298c150a0036f2e",
+          "out": [
+            {
+              "hex": "a20010016e6e6f745f617574686f72697a6564",
+              "message": "REFUSED",
+              "send": 5
+            },
+            {
+              "close": 5,
+              "code": 1000
+            }
+          ]
+        }
+      ],
+      "limits": {
+        "RELAY_CHAIN_KEYS_MAX": 2
+      },
+      "name": "successor_chain",
+      "notes": "A SUCCESSOR's new key joins the chain of the key it supersedes. A chain holds at most RELAY_CHAIN_KEYS_MAX keys, so with 2 the new key cannot name a further successor during the overlap. Revoking the enrolled key revokes its whole chain: the successor's registration closes with 4000 too, and neither key can register.",
+      "relay_key": "049a65173d48a0a0c706eeec2a75ae1f56793be988b2d407e9a7d3aba7574a9ea5101daceaadf42b661543a353e4f505ec41281df8535fecc5912ea39ed6b50568",
+      "wall_base": 1790000000
+    },
+    {
+      "authorized": [
+        {
+          "fingerprint": "4fe55050350a82b775fd172e622170daa7c986b0db42a3b18d107273f2463378"
+        }
+      ],
+      "boot_id": "5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b",
+      "codes": [],
+      "draws": [
+        "3d237cd371514aeb3a0dfac6959bf7bb74df7986b6037e534c2e95833769029c",
+        "2a107a9d443f61f01ccfd3e697954d9e8b4b11c3fa04023b95ee9f90c3ef90ba",
         "1f6bb082f717d54c",
         "45c23b3a7d333c27",
         "b90312f7a8827ad6",
@@ -3345,7 +3562,8 @@
           "hex": "a40012015841042ed2192f0f9275200acd34fbd8c6ce5a91a459488411320b4c6de3e6a22d7fa06f2374f60534a9009629714d063402a3c3ed60db057ef7999a7a31a78aebc0c7025840bedfb752e5db9e931f9a73c90272b1303702abb705f5ede412f463cb98d5185f9eda8397d91f4e0e177ca7ee8967ba41eecb4a16fbf06243c21bffbd34471526035840960782aa6460b986f016b366ff3cc2d378c3e248af9213aa8e818cfa471e028bb29cbe3b1a4e2533d2b35eb873091ebd2e53844faf1c0ff395d847c014362d63",
           "out": [
             {
-              "authorize": "07f9b2e3be6e3e7119a592103d62f0310144d18f7708ecbd3aef5d0ff4907a88"
+              "authorize": "07f9b2e3be6e3e7119a592103d62f0310144d18f7708ecbd3aef5d0ff4907a88",
+              "chain": "4fe55050350a82b775fd172e622170daa7c986b0db42a3b18d107273f2463378"
             },
             {
               "drop_at": 1790086400,
@@ -4692,7 +4910,8 @@
               "consume_code": "a67066e817349f23fff582130c887ab10b7cdcd10ee78e98ee821a1b3c11c3f4"
             },
             {
-              "authorize": "4fe55050350a82b775fd172e622170daa7c986b0db42a3b18d107273f2463378"
+              "authorize": "4fe55050350a82b775fd172e622170daa7c986b0db42a3b18d107273f2463378",
+              "chain": "4fe55050350a82b775fd172e622170daa7c986b0db42a3b18d107273f2463378"
             },
             {
               "hex": "a20004015820fd7af0b8cb34dfd81e9661cc70d37c0e5579ef4bdb4ff417f089f7dccf04889e",

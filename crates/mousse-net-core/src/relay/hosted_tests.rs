@@ -462,10 +462,7 @@ fn hosted_messages_are_protocol_errors_in_self_mode() {
             boot_id: BOOT,
             limits: RelayLimits::DEFAULT,
         },
-        &[super::machine::AuthorizedKey {
-            fingerprint: target.fingerprint(),
-            drop_at: None,
-        }],
+        &[super::machine::AuthorizedKey::listed(target.fingerprint())],
         &[],
     );
     let mut rng = ChaCha20Rng::from_seed([3; 32]);

@@ -259,6 +259,7 @@ export const relayDefaults = {
   RELAY_PREACCEPT_BYTES: 65536,
   RELAY_PREACCEPT_PER_TARGET: 4,
   RELAY_SUCCESSOR_OVERLAP_SECS: 604800,
+  RELAY_CHAIN_KEYS_MAX: 4,
   RELAY_MAX_CONNECTIONS: 1024,
   RELAY_CONNECTIONS_PER_IP: 256,
   RELAY_ACCEPT_LEGS_PER_HANDLE: 64,
@@ -272,7 +273,7 @@ export type RelayOutput =
   | { close: number; code: number }
   | { splice: [number, number]; circuit: string; class: number }
   | { forward: [number, number]; len: number }
-  | { authorize: string }
+  | { authorize: string; chain: string }
   | { supersede: string; drop_at: number }
   | { drop: string }
   | { consume_code: string };
@@ -289,7 +290,7 @@ export interface RelaySetup {
   relayKey: Uint8Array;
   bootId: Uint8Array;
   wallBase: number;
-  authorized: { fingerprint: Uint8Array; dropAt?: number }[];
+  authorized: { fingerprint: Uint8Array; dropAt?: number; chain?: Uint8Array }[];
   codes: { hash: Uint8Array; expiresAt: number }[];
   limits?: Partial<RelayLimits>;
   draw: (size: number) => Uint8Array;
@@ -335,7 +336,8 @@ export class SelfRelay {
   readonly relayId: Uint8Array;
   readonly bootId: Uint8Array;
   readonly limits: RelayLimits;
-  readonly authorized = new Map<string, { dropAt?: number }>();
+  // Each key's SUCCESSOR chain: the fingerprint it started from (section 7.4).
+  readonly authorized = new Map<string, { dropAt?: number; chain: string }>();
   readonly codes = new Map<string, number>();
   private readonly wallBase: number;
   private readonly draw: (size: number) => Uint8Array;
@@ -353,7 +355,10 @@ export class SelfRelay {
     this.wallBase = setup.wallBase;
     this.draw = setup.draw;
     this.limits = { ...relayDefaults, ...setup.limits };
-    for (const entry of setup.authorized) this.authorized.set(hex(entry.fingerprint), { dropAt: entry.dropAt });
+    for (const entry of setup.authorized) {
+      const fingerprint = hex(entry.fingerprint);
+      this.authorized.set(fingerprint, { dropAt: entry.dropAt, chain: entry.chain ? hex(entry.chain) : fingerprint });
+    }
     for (const code of setup.codes) this.codes.set(hex(code.hash), code.expiresAt);
   }
 
@@ -373,9 +378,14 @@ export class SelfRelay {
         break;
       }
       case 'revoke': {
+        // The whole chain of the revoked key, in fingerprint order.
         const fingerprint = hex(event.fingerprint);
-        this.authorized.delete(fingerprint);
-        this.closeKey(fingerprint);
+        const chain = this.authorized.get(fingerprint)?.chain ?? fingerprint;
+        const gone = new Set([fingerprint, ...this.chainMembers(chain)]);
+        for (const member of [...gone].sort()) {
+          this.authorized.delete(member);
+          this.closeKey(member);
+        }
         break;
       }
       case 'tick': break;
@@ -430,6 +440,10 @@ export class SelfRelay {
       this.out.push({ drop: fingerprint });
       this.closeKey(fingerprint);
     }
+  }
+
+  private chainMembers(chain: string): string[] {
+    return [...this.authorized].filter(([, entry]) => entry.chain === chain).map(([fingerprint]) => fingerprint);
   }
 
   private take(size: number): Uint8Array {
@@ -582,8 +596,8 @@ export class SelfRelay {
     this.codes.delete(codeHash);
     this.out.push({ consume_code: codeHash });
     const fingerprint = hex(sha256(message.key!));
-    this.authorized.set(fingerprint, {});
-    this.out.push({ authorize: fingerprint });
+    this.authorized.set(fingerprint, { chain: fingerprint });
+    this.out.push({ authorize: fingerprint, chain: fingerprint });
     this.becomeRegistration(conn, handle, message.key!);
   }
 
@@ -603,13 +617,15 @@ export class SelfRelay {
     const newKey = message.key!;
     const signed = successorRecord(this.relayId, handleOf(this.relayId, newKey), conn.nonce, conn.exporter);
     const current = this.authorized.get(hex(sha256(registration.key)));
+    // A chain holds at most RELAY_CHAIN_KEYS_MAX keys at once.
+    const room = current !== undefined && this.chainMembers(current.chain).length < this.limits.RELAY_CHAIN_KEYS_MAX;
     if (!verify(message.proof!, signed, newKey) || !verify(message.currentProof!, signed, registration.key) ||
-        !current || current.dropAt !== undefined || this.authorized.has(hex(sha256(newKey)))) {
+        !current || current.dropAt !== undefined || !room || this.authorized.has(hex(sha256(newKey)))) {
       return this.refuse(conn, 'not_authorized');
     }
     const fingerprint = hex(sha256(newKey));
-    this.authorized.set(fingerprint, {});
-    this.out.push({ authorize: fingerprint });
+    this.authorized.set(fingerprint, { chain: current.chain });
+    this.out.push({ authorize: fingerprint, chain: current.chain });
     current.dropAt = this.wall() + this.limits.RELAY_SUCCESSOR_OVERLAP_SECS;
     this.out.push({ supersede: hex(sha256(registration.key)), drop_at: current.dropAt });
   }

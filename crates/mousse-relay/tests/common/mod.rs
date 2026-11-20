@@ -57,10 +57,7 @@ impl Fixture {
         let dir = StateDir::init(&path, "127.0.0.1:443", &mut mousse_relay::os_rng()).unwrap();
         dir.update(now(), |l| {
             for k in authorized {
-                l.authorized.push(AuthorizedKey {
-                    fingerprint: k.fingerprint(),
-                    drop_at: None,
-                });
+                l.authorized.push(AuthorizedKey::listed(k.fingerprint()));
             }
         })
         .unwrap();

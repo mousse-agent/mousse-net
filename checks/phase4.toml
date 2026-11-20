@@ -107,10 +107,10 @@ missing = "a Plus-side control: it comes with the Plus double (P8)"
 
 [[check]]
 id = "phase4.remove-everywhere"
-title = "Grant lists to owners only; one removal per confirmed host and grant id; a stale grant id leaves the newer pairing; a grant learned later needs a second confirmation; a resend returns the journaled result; non-owner signers, wrong-owner grants and reused ids with other bytes are refused"
+title = "Grant lists to owners only; one removal per confirmed host and grant id; a stale grant id leaves the newer pairing; a grant learned later needs a second confirmation; a resend returns the journaled result; non-owner signers, wrong-owner grants and reused ids with other bytes are refused; nine removals by mail reach an offline host while a device fills its own share of the inbox; the other profile on a shared computer is untouched; an undecided removal is never acknowledged"
 plan = "docs/phase34-design.md Part D and F.1 (E-L4)"
 targets = ["windows-x64", "linux-x64"]
-min_tests = 23
+min_tests = 32
 
 [[check.local]]
 target = "windows-x64"
@@ -143,6 +143,11 @@ breaks = "a grant the host lists after the user acted is removed without asking 
 env = { RUSTFLAGS = '--cfg mousse_control="auto-send-unknown"' }
 
 [[check.control]]
+name = "no-tag-quota"
+breaks = "the Plus test stand-in keeps no per-pairing inbox quota, so one device fills the inbox and blocks the removals"
+env = { RUSTFLAGS = '--cfg mousse_control="no-tag-quota"' }
+
+[[check.control]]
 name = "resend-refused"
 breaks = "a resend after a lost answer is refused instead of getting its journaled result"
 env = { RUSTFLAGS = '--cfg mousse_control="resend-refused"' }
@@ -154,10 +159,10 @@ env = { RUSTFLAGS = '--cfg mousse_control="removal-unsigned"' }
 
 [[check]]
 id = "phase4.helper-plus"
-title = "Sign-in with a typed code survives a lost answer; account and usage shown from disk while Plus is down; lease request ids stored and reused across a restart; prefetch at the threshold with one current and one pending; bulk pauses alone on a failed refill; a refused block is presented again; a relay move releases before it funds the new relay"
+title = "Sign-in with a typed code survives a lost answer; account and usage shown from disk while Plus is down; lease request ids stored and reused across a restart; prefetch at the threshold with one current and one pending; bulk pauses alone on a failed refill; a refused block is presented again, or a new one asked for once it expired; a relay move releases before it funds the new relay; end to end on real hosted relays: admission, funded calls with prefetch on LEASE_STATUS, handle rotation releasing the old handle, and a move to another relay"
 plan = "docs/phase34-design.md A.3 to A.8, B.10, B.11 and F.1 (E-L2)"
 targets = ["windows-x64", "macos-arm64"]
-min_tests = 23
+min_tests = 28
 
 [[check.local]]
 target = "windows-x64"
@@ -191,10 +196,10 @@ env = { RUSTFLAGS = '--cfg mousse_control="pause-all-classes"' }
 
 [[check]]
 id = "phase4.directory"
-title = "Slots per pairing from the pair secret; a removed pairing's slot and token go and its slot id stays unreadable; a lost slot write is written again; mail reaches an offline host; a swapped slot, a manifest signed by another key and a removal Plus deposited itself are refused"
+title = "Slots per pairing from the pair secret; a removed pairing's slot and token go, also at the slot quota and at once, and its slot id stays unreadable; a lost slot write is written again; mail reaches an offline host; a swapped slot, a manifest another key signed (Manifest::open) and a removal Plus deposited itself are refused; a Plus that repeats its pages cannot hold the fetch; an offline caller finds a rotated route in its slot"
 plan = "docs/phase34-design.md A.5, A.6, A.13, B.12 and F.1 (E-L3)"
 targets = ["windows-x64", "linux-x64"]
-min_tests = 8
+min_tests = 16
 
 [[check.local]]
 target = "windows-x64"

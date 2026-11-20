@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mousse_net_core::cbor::Value;
-use mousse_net_core::identity::{PublicKey, SoftwareKey};
+use mousse_net_core::identity::SoftwareKey;
 use mousse_net_io::keystore::{IdentityStore, KeyStorage};
 use mousse_net_io::rng::random_bytes;
 use mousse_net_io::store::{hex, unhex, write_atomic};
@@ -293,13 +293,6 @@ impl Plus {
         let key = stored.software_key().clone();
         *slot = Some(key.clone());
         Ok(key)
-    }
-
-    // Used by the hosted relay client; until it lands only tests reach this.
-    #[allow(dead_code)]
-    /// The Plus key's public half (made if needed).
-    pub fn public_key(&self) -> Result<PublicKey, Failure> {
-        Ok(self.key()?.public_key())
     }
 
     fn note_reached(&self, reached: bool) {
@@ -612,8 +605,6 @@ impl Plus {
 
     // ----- Relay admission and leases (A.7, A.8) ----------------------------
 
-    // Used by the hosted relay client; until it lands only tests reach this.
-    #[allow(dead_code)]
     /// The fleet (`GET /v1/relays`): `(identity key, region, endpoints)`.
     pub async fn relays(&self) -> Result<Vec<(Vec<u8>, String, Vec<String>)>, Failure> {
         let answer = self.bearer("/v1/relays", None).await?;
@@ -632,8 +623,6 @@ impl Plus {
         Ok(out)
     }
 
-    // Used by the hosted relay client; until it lands only tests reach this.
-    #[allow(dead_code)]
     /// An admission token for `registration`'s handle on `relay_id`. The
     /// request id is stored before sending and reused until a token
     /// arrives, so a retry after a lost answer is the same request.
@@ -733,13 +722,6 @@ impl Plus {
                 .and_then(|b| <[u8; 16]>::try_from(b.as_slice()).ok())
                 .unwrap_or_default()
         })
-    }
-
-    // Used by the hosted relay client; until it lands only tests reach this.
-    #[allow(dead_code)]
-    /// Plus is unreachable since this time, if it is.
-    pub fn unreachable_since(&self) -> Option<u64> {
-        *self.outage.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Whether this endpoint is linked.

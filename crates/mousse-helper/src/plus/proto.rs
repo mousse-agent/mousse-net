@@ -13,10 +13,8 @@ pub const LINK_DOMAIN: &str = "mousse-plus-link-v1";
 /// `mousse-plus-token-v1`, signed by the Plus key for an access token.
 pub const TOKEN_DOMAIN: &str = "mousse-plus-token-v1";
 /// `mousse-plus-handle-v1`, signed by a relay registration key.
-#[allow(dead_code)] // the hosted relay client's
 pub const HANDLE_DOMAIN: &str = "mousse-plus-handle-v1";
 /// The admission token's domain (Plus-signed).
-#[allow(dead_code)] // the hosted relay client's
 pub const ADMIT_DOMAIN: &str = "mousse-relay-admit-v1";
 /// The lease block's domain (Plus-signed).
 pub const LEASE_DOMAIN: &str = "mousse-lease-v1";
@@ -220,9 +218,6 @@ pub fn token_request(
     envelope(&record, key)
 }
 
-// Used by the hosted relay client, which registers handles; until it
-// lands only tests reach this.
-#[allow(dead_code)]
 /// The handle proof: a raw signature by the registration key over
 /// `{1: "mousse-plus-handle-v1", 2: relay id, 3: endpoint id}`.
 pub fn handle_proof(
@@ -238,9 +233,6 @@ pub fn handle_proof(
     registration.sign_raw(&record)
 }
 
-// Used by the hosted relay client, which registers handles; until it
-// lands only tests reach this.
-#[allow(dead_code)]
 /// `H = SHA-256("mousse-relay-handle-v1" ‖ relay id ‖ registration key)`.
 pub fn handle(relay_id: &[u8; 32], registration: &PublicKey) -> [u8; 32] {
     use sha2::{Digest, Sha256};
@@ -360,9 +352,6 @@ impl Block {
     }
 }
 
-// Used by the hosted relay client, which registers handles; until it
-// lands only tests reach this.
-#[allow(dead_code)]
 /// The fields of a Plus-signed admission token the helper keeps.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdmissionToken {
@@ -378,9 +367,6 @@ pub struct AdmissionToken {
     pub not_after: u64,
 }
 
-// Used by the hosted relay client, which registers handles; until it
-// lands only tests reach this.
-#[allow(dead_code)]
 impl AdmissionToken {
     /// Read an admission token envelope.
     pub fn parse(envelope: &[u8]) -> Result<Self, BadAnswer> {

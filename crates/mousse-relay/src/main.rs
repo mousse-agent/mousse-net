@@ -45,9 +45,11 @@ enum Command {
     Reload,
     /// Print a new single-use enrollment link.
     Enroll,
-    /// Print the authorized registration keys.
+    /// Print the authorized registration keys, with the chain of each key
+    /// a `SUCCESSOR` added.
     List,
-    /// Remove a registration key; its registration and circuits close.
+    /// Remove a registration key and every key of its `SUCCESSOR` chain;
+    /// their registrations and circuits close.
     Revoke {
         /// The key's fingerprint, 64 hex digits (`list` prints them).
         fingerprint: String,
@@ -80,7 +82,10 @@ fn now() -> UnixTime {
 }
 
 fn main() -> ExitCode {
-    no_core_dumps();
+    if let Err(e) = no_core_dumps() {
+        eprintln!("mousse-relay: {e}");
+        return ExitCode::FAILURE;
+    }
     let cli = Cli::parse();
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
@@ -114,20 +119,25 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::List => {
             let dir = StateDir::open(&cli.state).map_err(s)?;
             for k in dir.read().map_err(s)?.authorized {
-                match k.drop_at {
-                    Some(t) => println!("{} superseded, dropped at {}", hex(&k.fingerprint), t.0),
-                    None => println!("{}", hex(&k.fingerprint)),
+                let mut line = hex(&k.fingerprint);
+                if k.chain != k.fingerprint {
+                    line += &format!(" successor in the chain of {}", hex(&k.chain));
                 }
+                if let Some(t) = k.drop_at {
+                    line += &format!(" superseded, dropped at {}", t.0);
+                }
+                println!("{line}");
             }
         }
         Command::Revoke { fingerprint } => {
             let dir = StateDir::open(&cli.state).map_err(s)?;
             let fp = unhex32(&fingerprint.to_ascii_lowercase())
                 .ok_or("a fingerprint is 64 hex digits")?;
-            if !dir.revoke(now(), &fp).map_err(s)? {
-                return Err("no such key in the authorized list".into());
+            match dir.revoke(now(), &fp).map_err(s)? {
+                0 => return Err("no such key in the authorized list".into()),
+                1 => println!("revoked"),
+                n => println!("revoked {n} keys of one successor chain"),
             }
-            println!("revoked");
         }
         Command::Status { json } => {
             let dir = StateDir::open(&cli.state).map_err(s)?;
@@ -211,10 +221,16 @@ fn run(cli: Cli) -> Result<(), String> {
 /// is also made non-dumpable (`PR_SET_DUMPABLE` 0), so other processes of
 /// the same user cannot attach to it or read its memory through `/proc`.
 ///
+/// If either step fails the relay does not run at all.
+///
 /// Debug builds only: `MOUSSE_NET_RELAY_TEST_KEEP_DUMPABLE=1` keeps the
-/// process dumpable, so `phase3.marker` can sample the relay's memory.
-/// Release builds ignore it.
-fn no_core_dumps() {
+/// process dumpable, so `phase3.marker` can sample the relay's memory, and
+/// a failed step only warns. Release builds ignore it.
+fn no_core_dumps() -> Result<(), String> {
+    #[allow(unused_mut)]
+    let mut failed: Vec<String> = Vec::new();
+    let keep = cfg!(debug_assertions)
+        && std::env::var_os(limits::TEST_KEEP_DUMPABLE).is_some_and(|v| v == "1");
     #[cfg(target_os = "linux")]
     {
         use rustix::process::{
@@ -225,17 +241,31 @@ fn no_core_dumps() {
             maximum: Some(0),
         };
         if let Err(e) = setrlimit(Resource::Core, none) {
-            eprintln!("mousse-relay: cannot turn core dumps off: {e}");
+            failed.push(format!("cannot turn core dumps off: {e}"));
         }
-        let keep = cfg!(debug_assertions)
-            && std::env::var_os(limits::TEST_KEEP_DUMPABLE).is_some_and(|v| v == "1");
         // The `relay-dumpable` control build (tests only) leaves it dumpable.
         if !keep && !cfg!(mousse_control = "relay-dumpable") {
             if let Err(e) = set_dumpable_behavior(DumpableBehavior::NotDumpable) {
-                eprintln!("mousse-relay: cannot make the process non-dumpable: {e}");
+                failed.push(format!("cannot make the process non-dumpable: {e}"));
             }
         }
     }
+    hardened(&failed, keep)
+}
+
+/// The verdict on the hardening steps that `failed`: the relay refuses to
+/// run, unless the debug-only keep-dumpable hook is set (`keep`), where a
+/// failure only warns.
+fn hardened(failed: &[String], keep: bool) -> Result<(), String> {
+    if failed.is_empty() {
+        return Ok(());
+    }
+    let what = failed.join("; ");
+    if keep {
+        eprintln!("mousse-relay: {what} (kept running: test hook)");
+        return Ok(());
+    }
+    Err(format!("{what}; not running without this hardening"))
 }
 
 /// This process's core-dump limit and whether it is dumpable (Linux), for
@@ -304,5 +334,19 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hardened;
+
+    #[test]
+    fn failed_hardening_refuses_to_run_unless_the_test_hook_keeps_it() {
+        assert!(hardened(&[], false).is_ok());
+        let failed = ["cannot turn core dumps off: EPERM".to_owned()];
+        let e = hardened(&failed, false).unwrap_err();
+        assert!(e.contains("cannot turn core dumps off"), "{e}");
+        assert!(hardened(&failed, true).is_ok());
     }
 }

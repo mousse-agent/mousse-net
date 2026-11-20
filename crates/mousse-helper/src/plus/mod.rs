@@ -3,12 +3,8 @@
 
 pub mod client;
 pub mod http;
-// Leases and relay moves are driven by the hosted relay client; until it
-// lands they run only in tests.
-#[allow(dead_code)]
 pub mod lease;
 pub mod proto;
-#[allow(dead_code)]
 pub mod relay_move;
 
 pub use client::{Failure, Plus};

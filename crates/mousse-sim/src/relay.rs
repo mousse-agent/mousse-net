@@ -98,7 +98,7 @@ struct Drive<'a> {
     legs: BTreeMap<ConnId, Leg>,
     circuits: BTreeMap<[u8; 16], Circ>,
     /// The durable authorized list, as the relay's outputs left it.
-    authorized: BTreeMap<[u8; 32], Option<UnixTime>>,
+    authorized: BTreeMap<[u8; 32], AuthorizedKey>,
     secrets: [TicketSecret; INVITATIONS],
     reboots: u32,
     /// The tag each join leg sent.
@@ -156,9 +156,12 @@ impl<'a> Drive<'a> {
             .collect::<Vec<_>>();
         let callers = (0..CALLERS).map(|_| client_key(sim)).collect();
         let secrets = std::array::from_fn(|i| TicketSecret::from_bytes([i as u8 + 1; 16]));
-        let authorized: BTreeMap<[u8; 32], Option<UnixTime>> = [0, 1]
+        let authorized: BTreeMap<[u8; 32], AuthorizedKey> = [0, 1]
             .iter()
-            .map(|&t| (targets[t].key.fingerprint(), None))
+            .map(|&t| {
+                let fp = targets[t].key.fingerprint();
+                (fp, AuthorizedKey::listed(fp))
+            })
             .collect();
         let rid = RelayId::of(&relay_key.public_key());
         let relay = Self::boot(&relay_key, limits, &authorized, 0);
@@ -198,16 +201,10 @@ impl<'a> Drive<'a> {
     fn boot(
         key: &SoftwareKey,
         limits: RelayLimits,
-        authorized: &BTreeMap<[u8; 32], Option<UnixTime>>,
+        authorized: &BTreeMap<[u8; 32], AuthorizedKey>,
         n: u32,
     ) -> Relay {
-        let list: Vec<AuthorizedKey> = authorized
-            .iter()
-            .map(|(fp, d)| AuthorizedKey {
-                fingerprint: *fp,
-                drop_at: *d,
-            })
-            .collect();
+        let list: Vec<AuthorizedKey> = authorized.values().copied().collect();
         Relay::new(
             RelayConfig {
                 relay_key: key.public_key(),
@@ -373,14 +370,23 @@ impl<'a> Drive<'a> {
                         .note("relay", format_args!("splice {} {}", caller.0, target.0));
                 }
                 Output::Forward { from: f, len, .. } => self.on_forward(f, len),
-                Output::Authorize { fingerprint } => {
-                    self.authorized.insert(fingerprint, None);
+                Output::Authorize { fingerprint, chain } => {
+                    self.authorized.insert(
+                        fingerprint,
+                        AuthorizedKey {
+                            fingerprint,
+                            drop_at: None,
+                            chain,
+                        },
+                    );
                 }
                 Output::Supersede {
                     fingerprint,
                     drop_at,
                 } => {
-                    self.authorized.insert(fingerprint, Some(drop_at));
+                    if let Some(k) = self.authorized.get_mut(&fingerprint) {
+                        k.drop_at = Some(drop_at);
+                    }
                 }
                 Output::Drop { fingerprint } => {
                     self.authorized.remove(&fingerprint);
@@ -797,7 +803,9 @@ impl Drive<'_> {
 
     fn revoke(&mut self, t: usize) {
         let fp = self.targets[t].key.fingerprint();
-        self.authorized.remove(&fp);
+        // The operator's revoke takes the key's whole SUCCESSOR chain.
+        let chain = self.authorized.get(&fp).map_or(fp, |k| k.chain);
+        self.authorized.retain(|f, k| *f != fp && k.chain != chain);
         self.sim
             .note("operator", format_args!("revokes target {t}"));
         let now = self.now();

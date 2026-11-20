@@ -69,6 +69,21 @@ pub struct AuthorizedKey {
     pub fingerprint: [u8; 32],
     /// Set when a `SUCCESSOR` superseded this key: when it is dropped.
     pub drop_at: Option<UnixTime>,
+    /// The key its `SUCCESSOR` chain started from: the fingerprint the
+    /// operator enrolled or listed. A key's own fingerprint when it was not
+    /// added by a `SUCCESSOR`. Revoking any key revokes its whole chain.
+    pub chain: [u8; 32],
+}
+
+impl AuthorizedKey {
+    /// A key the operator listed or enrolled: its own chain.
+    pub fn listed(fingerprint: [u8; 32]) -> Self {
+        Self {
+            fingerprint,
+            drop_at: None,
+            chain: fingerprint,
+        }
+    }
 }
 
 /// One stored enrollment code.
@@ -121,6 +136,8 @@ pub enum Output {
     Authorize {
         /// Registration fingerprint.
         fingerprint: [u8; 32],
+        /// Its chain ([`AuthorizedKey::chain`]).
+        chain: [u8; 32],
     },
     /// Durably mark a key superseded.
     Supersede {
@@ -251,6 +268,8 @@ pub struct Relay {
     config: RelayConfig,
     relay_id: RelayId,
     authorized: BTreeMap<[u8; 32], Option<UnixTime>>,
+    /// The chain of each authorized key ([`AuthorizedKey::chain`]).
+    chains: BTreeMap<[u8; 32], [u8; 32]>,
     codes: BTreeMap<[u8; 32], UnixTime>,
     conns: BTreeMap<ConnId, Conn>,
     per_ip: BTreeMap<IpKey, u32>,
@@ -296,6 +315,10 @@ impl Relay {
             authorized: authorized
                 .iter()
                 .map(|k| (k.fingerprint, k.drop_at))
+                .collect(),
+            chains: authorized
+                .iter()
+                .map(|k| (k.fingerprint, k.chain))
                 .collect(),
             codes: codes.iter().map(|c| (c.hash, c.expires_at)).collect(),
             conns: BTreeMap::new(),
@@ -382,8 +405,30 @@ impl Relay {
             .map(|(fp, drop_at)| AuthorizedKey {
                 fingerprint: *fp,
                 drop_at: *drop_at,
+                chain: self.chain_of(fp),
             })
             .collect()
+    }
+
+    fn chain_of(&self, fingerprint: &[u8; 32]) -> [u8; 32] {
+        self.chains
+            .get(fingerprint)
+            .copied()
+            .unwrap_or(*fingerprint)
+    }
+
+    /// Every authorized key of `chain`.
+    fn chain_members(&self, chain: &[u8; 32]) -> Vec<[u8; 32]> {
+        self.authorized
+            .keys()
+            .filter(|fp| self.chain_of(fp) == *chain)
+            .copied()
+            .collect()
+    }
+
+    fn unlist(&mut self, fingerprint: &[u8; 32]) {
+        self.authorized.remove(fingerprint);
+        self.chains.remove(fingerprint);
     }
 
     /// The stored enrollment codes, in order of their hash.
@@ -652,6 +697,10 @@ impl Relay {
             .copied()
             .collect();
         self.authorized = new;
+        self.chains = authorized
+            .iter()
+            .map(|k| (k.fingerprint, k.chain))
+            .collect();
         self.codes = codes.iter().map(|c| (c.hash, c.expires_at)).collect();
         for fp in gone {
             self.remove_target(&fp, &mut out);
@@ -659,7 +708,8 @@ impl Relay {
         out
     }
 
-    /// The operator revoked one registration fingerprint.
+    /// The operator revoked a registration fingerprint: every key of its
+    /// `SUCCESSOR` chain leaves the list, in order of fingerprint.
     pub fn revoke<R: CryptoRng + ?Sized>(
         &mut self,
         fingerprint: &[u8; 32],
@@ -667,8 +717,16 @@ impl Relay {
         rng: &mut R,
     ) -> Vec<Output> {
         let mut out = self.fire(now, rng);
-        self.authorized.remove(fingerprint);
-        self.remove_target(fingerprint, &mut out);
+        let chain = self.chain_of(fingerprint);
+        let mut gone = self.chain_members(&chain);
+        if !gone.contains(fingerprint) {
+            gone.push(*fingerprint);
+            gone.sort();
+        }
+        for fp in gone {
+            self.unlist(&fp);
+            self.remove_target(&fp, &mut out);
+        }
         out
     }
 
@@ -829,7 +887,7 @@ impl Relay {
             .map(|(fp, _)| *fp)
             .collect();
         for fp in due {
-            self.authorized.remove(&fp);
+            self.unlist(&fp);
             out.push(Output::Drop { fingerprint: fp });
             self.remove_target(&fp, out);
         }
@@ -901,7 +959,11 @@ impl Relay {
         let fingerprint = key.fingerprint();
         if let std::collections::btree_map::Entry::Vacant(e) = self.authorized.entry(fingerprint) {
             e.insert(None);
-            out.push(Output::Authorize { fingerprint });
+            self.chains.insert(fingerprint, fingerprint);
+            out.push(Output::Authorize {
+                fingerprint,
+                chain: fingerprint,
+            });
         }
         self.install_registration(conn, handle, key, now, out);
     }
@@ -1072,14 +1134,21 @@ impl Relay {
             || proof::verify(&current_key, &record, &current_proof).is_ok();
         let current_listed = matches!(self.authorized.get(&current_fp), Some(None));
         let new_fp = new_key.fingerprint();
-        if !(new_ok && current_ok && current_listed) || self.authorized.contains_key(&new_fp) {
+        let chain = self.chain_of(&current_fp);
+        // A chain holds at most RELAY_CHAIN_KEYS_MAX keys at once.
+        let room = (self.chain_members(&chain).len() as u64) < self.config.limits.chain_keys_max();
+        if !(new_ok && current_ok && current_listed && room)
+            || self.authorized.contains_key(&new_fp)
+        {
             self.registrations.remove(&handle);
             self.refuse(conn, RefuseReason::NotAuthorized, out);
             return;
         }
         self.authorized.insert(new_fp, None);
+        self.chains.insert(new_fp, chain);
         out.push(Output::Authorize {
             fingerprint: new_fp,
+            chain,
         });
         let drop_at = now.wall.plus(self.config.limits.successor_overlap_secs());
         self.authorized.insert(current_fp, Some(drop_at));
