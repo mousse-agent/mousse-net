@@ -61,6 +61,11 @@ name = "successor-unchecked"
 breaks = "SUCCESSOR does not check the current key's proof"
 env = { RUSTFLAGS = '--cfg mousse_control="relay-successor-unchecked"' }
 
+[[check.control]]
+name = "chain-full-closes"
+breaks = "a SUCCESSOR whose chain is full closes the registration instead of REFUSED(chain_full)"
+env = { RUSTFLAGS = '--cfg mousse_control="relay-chain-full-closes"' }
+
 [[check]]
 id = "phase3.relay-reboot"
 title = "Relay reboot: identity kept, calls refused until re-registration and an allow-set push, removal survives, one process per state directory"
@@ -359,10 +364,10 @@ control = [
 
 [[check]]
 id = "phase3.relay-rotation"
-title = "Manual key rotation asks nothing; a caller offline through the rotation comes back through the old route within the overlap and gets the new manifest; removal holds across the rotation; the old key leaves after the overlap; a stale manifest's routes are still dialled; a rotation the relay had not taken before a restart goes on after it, the old key current meanwhile"
+title = "Manual key rotation asks nothing; a caller offline through the rotation comes back through the old route within the overlap and gets the new manifest; removal holds across the rotation; the old key leaves after the overlap; a stale manifest's routes are still dialled; a rotation the relay had not taken before a restart goes on after it, the old key current meanwhile; a full key chain ends the rotation without dropping the registration and refuses the next one at once; a pending rotation can be cancelled; the overlap is never above the relay's"
 plan = "docs/phase34-design.md §B.4 and §B.11 (E-R4)"
 targets = ["linux-x64", "windows-x64"]
-min_tests = 4
+min_tests = 7
 local = [
   { target = "linux-x64", host = "linux-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_relay_rotation", "--no-fail-fast"] },
   { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_relay_rotation", "--no-fail-fast"] },
@@ -371,6 +376,8 @@ control = [
   { name = "no-overlap", breaks = "a rotation drops the old key and its route at once", env = { RUSTFLAGS = '--cfg mousse_control="no-overlap"' } },
   { name = "stale-manifest-dropped", breaks = "routes of a manifest past its expiry are not dialled", env = { RUSTFLAGS = '--cfg mousse_control="stale-manifest-dropped"' } },
   { name = "prompt-on-key-change", breaks = "a new relay key or handle at an approved destination needs approval again", env = { RUSTFLAGS = '--cfg mousse_control="prompt-on-key-change"' } },
+  { name = "chain-full-ignored", breaks = "the helper keeps a rotation the relay refused as chain_full and sends SUCCESSOR again", env = { RUSTFLAGS = '--cfg mousse_control="chain-full-ignored"' } },
+  { name = "relay-overlap-ignored", breaks = "the overlap ignores the shorter one the relay advertises", env = { RUSTFLAGS = '--cfg mousse_control="relay-overlap-ignored"' } },
 ]
 
 # Cross-machine: the relay on the Mac, both endpoints on the PC dialling

@@ -282,7 +282,11 @@ fn a_hosted_register_needs_a_valid_token_for_its_handle() {
     let outs = w.register(0, 3, &target, P0_SECS + 3_600);
     assert!(matches!(
         sent(&outs, 3),
-        Some(RelayMessage::Registered { .. })
+        // A hosted relay does not advertise a successor overlap.
+        Some(RelayMessage::Registered {
+            successor_overlap: None,
+            ..
+        })
     ));
 }
 

@@ -172,6 +172,8 @@ struct Sim {
     last_at: u64,
     events: Vec<J>,
     bindings: BTreeMap<u64, Binding>,
+    /// RELAY_SUCCESSOR_OVERLAP_SECS, which REGISTERED carries.
+    overlap: u64,
 }
 
 struct Setup<'a> {
@@ -225,7 +227,9 @@ impl Sim {
             })).collect::<Vec<_>>(),
             "limits": setup.limits.iter().map(|(n, v)| ((*n).to_owned(), json!(v))).collect::<serde_json::Map<_, _>>(),
         });
+        let overlap = limits.successor_overlap_secs();
         Self {
+            overlap,
             relay: Relay::new(
                 RelayConfig {
                     relay_key,
@@ -385,7 +389,13 @@ impl Sim {
             summary(&outs).last().map(String::as_str),
             Some(&*format!("send {conn} REGISTERED"))
         );
-        assert_eq!(sent(&outs, conn), RelayMessage::Registered { handle });
+        assert_eq!(
+            sent(&outs, conn),
+            RelayMessage::Registered {
+                handle,
+                successor_overlap: Some(self.overlap),
+            }
+        );
         handle
     }
 
@@ -1059,7 +1069,7 @@ fn successor_chain() -> J {
     let (target, new, other) = (key(&TARGET), key(&NEW_TARGET), key(&STRANGER_TARGET));
     let mut s = Sim::new(
         "successor_chain",
-        "A SUCCESSOR's new key joins the chain of the key it supersedes. A chain holds at most RELAY_CHAIN_KEYS_MAX keys, so with 2 the new key cannot name a further successor during the overlap. Revoking the enrolled key revokes its whole chain: the successor's registration closes with 4000 too, and neither key can register.",
+        "A SUCCESSOR's new key joins the chain of the key it supersedes. A chain holds at most RELAY_CHAIN_KEYS_MAX keys, so with 2 the new key cannot name a further successor during the overlap: that SUCCESSOR is REFUSED(chain_full) and the registration stays open and working. Revoking the enrolled key revokes its whole chain: the successor's registration closes with 4000 too, and neither key can register.",
         Setup {
             authorized: &listed(&[TARGET]),
             limits: &[("RELAY_CHAIN_KEYS_MAX", 2)],
@@ -1079,12 +1089,20 @@ fn successor_chain() -> J {
     );
     s.register(20, 2, 1, &new);
     let msg = successor_msg(&s, 2, &other, &new);
-    expect(&s.send(30, 2, &msg), &["send 2 REFUSED", "close 2 1000"]);
-    s.register(40, 3, 1, &new);
+    let outs = s.send(30, 2, &msg);
+    expect(&outs, &["send 2 REFUSED"]);
+    assert_eq!(
+        sent(&outs, 2),
+        RelayMessage::Refused {
+            reason: RefuseReason::ChainFull,
+        }
+    );
+    // The registration still works.
+    expect(&s.allow(40, 2, 1, &[], &[]), &["send 2 ALLOW_SET_OK"]);
     expect(
         &s.revoke(100, target.fingerprint()),
         // Chain members in order of fingerprint: the new key's is lower.
-        &["close 3 4000", "close 1 4000"],
+        &["close 2 4000", "close 1 4000"],
     );
     s.hello(200, 4, 1);
     let msg = s.register_msg(4, &new);
@@ -1707,7 +1725,10 @@ fn messages() -> J {
             proof: sig,
             code: CODE,
         },
-        RelayMessage::Registered { handle: [2; 32] },
+        RelayMessage::Registered {
+            handle: [2; 32],
+            successor_overlap: Some(604_800),
+        },
         RelayMessage::AllowSet {
             sequence: 7,
             callers: vec![[3; 32], [4; 32]],
@@ -1758,6 +1779,9 @@ fn messages() -> J {
         },
         RelayMessage::Refused {
             reason: RefuseReason::Enrollment,
+        },
+        RelayMessage::Refused {
+            reason: RefuseReason::ChainFull,
         },
         RelayMessage::Successor {
             key: pk,

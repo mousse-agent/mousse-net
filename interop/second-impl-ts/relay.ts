@@ -112,7 +112,7 @@ export const relayTypes = [
 export type RelayType = typeof relayTypes[number];
 const typeNumber = (type: RelayType) => BigInt(relayTypes.indexOf(type) + 1);
 
-export const refusalReasons = ['not_authorized', 'enrollment', 'limit', 'admission'] as const;
+export const refusalReasons = ['not_authorized', 'enrollment', 'limit', 'admission', 'chain_full'] as const;
 export type RefusalReason = typeof refusalReasons[number];
 
 export interface Invitation { tagHash: Uint8Array; expiresAt: bigint }
@@ -124,6 +124,7 @@ export interface RelayMessage {
   code?: Uint8Array; handle?: Uint8Array; sequence?: bigint; callers?: Uint8Array[]; invitations?: Invitation[];
   class?: bigint; tag?: Uint8Array; circuit?: Uint8Array; kind?: bigint; fingerprint?: Uint8Array;
   block?: Uint8Array; leases?: LeaseStatus[]; reason?: RefusalReason; opaque?: Uint8Array; leaseIds?: Uint8Array[];
+  successorOverlap?: bigint;
 }
 type FieldName = Exclude<keyof RelayMessage, 'type'>;
 
@@ -157,7 +158,7 @@ const schemas: Record<RelayType, Schema> = {
   REGISTER: [[1, 'key', key], [2, 'proof', proof], [3, 'token', opaque, true],
     [4, 'threshold', value => uint(value) && value >= 10 && value <= 90, true]],
   ENROLL: [[1, 'key', key], [2, 'proof', proof], [3, 'code', sized(16)]],
-  REGISTERED: [[1, 'handle', sized(32)]],
+  REGISTERED: [[1, 'handle', sized(32)], [2, 'successorOverlap', anyUint, true]],
   ALLOW_SET: [[1, 'sequence', anyUint], [2, 'callers', callers], [3, 'invitations', invitations]],
   ALLOW_SET_OK: [[1, 'sequence', anyUint]],
   CALL: [[1, 'handle', sized(32)], [2, 'key', key], [3, 'proof', proof], [4, 'class', among(0n, 1n)]],
@@ -609,7 +610,8 @@ export class SelfRelay {
     conn.role = 'registration';
     conn.registration = registration;
     conn.idleAt = this.now + this.limits.RELAY_REGISTRATION_IDLE_MS;
-    this.send(conn, { type: 'REGISTERED', handle });
+    // Self mode: REGISTERED carries RELAY_SUCCESSOR_OVERLAP_SECS.
+    this.send(conn, { type: 'REGISTERED', handle, successorOverlap: BigInt(this.limits.RELAY_SUCCESSOR_OVERLAP_SECS) });
   }
 
   // Section 7.4.
@@ -620,9 +622,11 @@ export class SelfRelay {
     // A chain holds at most RELAY_CHAIN_KEYS_MAX keys at once.
     const room = current !== undefined && this.chainMembers(current.chain).length < this.limits.RELAY_CHAIN_KEYS_MAX;
     if (!verify(message.proof!, signed, newKey) || !verify(message.currentProof!, signed, registration.key) ||
-        !current || current.dropAt !== undefined || !room || this.authorized.has(hex(sha256(newKey)))) {
+        !current || current.dropAt !== undefined || this.authorized.has(hex(sha256(newKey)))) {
       return this.refuse(conn, 'not_authorized');
     }
+    // A full chain keeps the registration open.
+    if (!room) return this.send(conn, { type: 'REFUSED', reason: 'chain_full' });
     const fingerprint = hex(sha256(newKey));
     this.authorized.set(fingerprint, { chain: current.chain });
     this.out.push({ authorize: fingerprint, chain: current.chain });

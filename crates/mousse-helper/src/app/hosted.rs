@@ -940,7 +940,8 @@ async fn hold(
                 TargetEvent::AcceptFailed { error, .. } => {
                     applog::line(format!("hosted relay accept leg failed: {error}"));
                 }
-                TargetEvent::AllowSetOk { .. } => {}
+                // Hosted relays rotate handles, not by SUCCESSOR.
+                TargetEvent::AllowSetOk { .. } | TargetEvent::ChainFull => {}
                 TargetEvent::LeaseStatus(entries) => {
                     let entries = entries.iter().filter_map(status_entry).collect();
                     let _ = lease_tx.send(RelayEvent::Status(entries));

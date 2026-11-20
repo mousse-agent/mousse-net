@@ -1102,7 +1102,21 @@ impl Relay {
                 last_sent: now.mono,
             },
         );
-        self.send_registration(handle, RelayMessage::Registered { handle }, now, out);
+        // Self mode tells the target how long a superseded key stays, so
+        // it never advertises an old route past that (relay.md 7.4).
+        let successor_overlap = self
+            .hosted
+            .is_none()
+            .then(|| self.config.limits.successor_overlap_secs());
+        self.send_registration(
+            handle,
+            RelayMessage::Registered {
+                handle,
+                successor_overlap,
+            },
+            now,
+            out,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1137,11 +1151,27 @@ impl Relay {
         let chain = self.chain_of(&current_fp);
         // A chain holds at most RELAY_CHAIN_KEYS_MAX keys at once.
         let room = (self.chain_members(&chain).len() as u64) < self.config.limits.chain_keys_max();
-        if !(new_ok && current_ok && current_listed && room)
-            || self.authorized.contains_key(&new_fp)
-        {
+        if !(new_ok && current_ok && current_listed) || self.authorized.contains_key(&new_fp) {
             self.registrations.remove(&handle);
             self.refuse(conn, RefuseReason::NotAuthorized, out);
+            return;
+        }
+        if !room && cfg!(mousse_control = "relay-chain-full-closes") {
+            self.registrations.remove(&handle);
+            self.refuse(conn, RefuseReason::NotAuthorized, out);
+            return;
+        }
+        if !room {
+            // A full chain is no fault of the registration: it stays, and
+            // the target learns why its successor was not taken.
+            self.send_registration(
+                handle,
+                RelayMessage::Refused {
+                    reason: RefuseReason::ChainFull,
+                },
+                now,
+                out,
+            );
             return;
         }
         self.authorized.insert(new_fp, None);

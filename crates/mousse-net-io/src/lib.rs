@@ -91,6 +91,8 @@ pub type SharedSigner = Arc<dyn IdentitySigner + Send + Sync>;
         mousse_control = "no-pairing-recovery",
         mousse_control = "recovery-makes-grant",
         mousse_control = "no-overlap",
+        mousse_control = "relay-overlap-ignored",
+        mousse_control = "chain-full-ignored",
         mousse_control = "stale-manifest-dropped",
         mousse_control = "prompt-on-key-change",
         mousse_control = "disallow-keeps-paths",
@@ -138,6 +140,8 @@ compile_error!("a mousse_control build has a deliberate defect and is for tests 
     mousse_control = "no-pairing-recovery",
     mousse_control = "recovery-makes-grant",
     mousse_control = "no-overlap",
+    mousse_control = "relay-overlap-ignored",
+    mousse_control = "chain-full-ignored",
     mousse_control = "stale-manifest-dropped",
     mousse_control = "prompt-on-key-change",
     mousse_control = "disallow-keeps-paths",
@@ -216,6 +220,10 @@ pub const CONTROL: Option<&str> = if cfg!(mousse_control = "skip-pin-check") {
     Some("recovery-makes-grant")
 } else if cfg!(mousse_control = "no-overlap") {
     Some("no-overlap")
+} else if cfg!(mousse_control = "relay-overlap-ignored") {
+    Some("relay-overlap-ignored")
+} else if cfg!(mousse_control = "chain-full-ignored") {
+    Some("chain-full-ignored")
 } else if cfg!(mousse_control = "stale-manifest-dropped") {
     Some("stale-manifest-dropped")
 } else if cfg!(mousse_control = "prompt-on-key-change") {

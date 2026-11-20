@@ -178,7 +178,9 @@ impl Target {
                                 }
                             });
                         }
-                        TargetEvent::AcceptFailed { .. } | TargetEvent::LeaseStatus(_) => {}
+                        TargetEvent::AcceptFailed { .. }
+                        | TargetEvent::LeaseStatus(_)
+                        | TargetEvent::ChainFull => {}
                     }
                 }
             }

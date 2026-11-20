@@ -404,7 +404,7 @@ impl<'a> Drive<'a> {
 
     fn on_send(&mut self, conn: ConnId, msg: RelayMessage, from: Option<ConnId>) {
         match msg {
-            RelayMessage::Registered { handle } => {
+            RelayMessage::Registered { handle, .. } => {
                 let t = self.target_of_handle(&handle).expect("a drill target");
                 let fp = self.targets[t].key.fingerprint();
                 if !self.authorized.contains_key(&fp) {
