@@ -132,6 +132,11 @@ A cross-machine app check runs outside the kit on both machines:
 
 With `--control <name>`, `run.mjs` adds that control's environment, which it reads with `mousse-check control-env <check> --control <name>`. Pass the same `--control` to `config-digest` and `sign`. `--role` and `--topology` pass through to the app script. With `--result`, `run.mjs` writes `build` (the helper build) and `app_build`. It also writes `host_build` and `host_app_build` when the app printed `host_build=` and `host_app_build=` lines, which a caller does with the builds its host reported over the test link.
 
+### Two setup notes for signing
+
+- **Windows: run the kit from a copy.** App checks build `mousse-check` (for `MOUSSE_CHECK_PROBE_BIN`) in `CARGO_TARGET_DIR`. Windows refuses to replace a running program, so when the kit itself runs from that folder, a control whose `RUSTFLAGS` force a rebuild ends with `exit 2` and `Access is denied`, and `run.mjs: the helper did not build`. Copy `mousse-check.exe` out of the target folder after building it and run the copy.
+- **macOS: point the app harness at OpenSSL 3.** The app's checks make their tunnel stand-in's certificates with `openssl`. On macOS that is LibreSSL, whose certificates Node refuses (`ca md too weak`), so every ws and tunnel case fails. Set `MOUSSE_CHECK_OPENSSL` to an OpenSSL 3 binary, for example `/opt/homebrew/bin/openssl`.
+
 ## Hosted cells
 
 A target in a check's `hosted` list (for `phase1b.desktop-builds`, `windows-arm64`) runs on a GitHub-hosted runner, `.github/workflows/windows-arm-smoke.yml` (run by hand with the commit under test, and the app repository when the runner can read it). It smokes the build and its must-fail control and uploads one artifact. The cell counts only records `mousse-check hosted verify` wrote after checking that artifact:
