@@ -696,8 +696,14 @@ struct Retry {
     running: bool,
 }
 
-/// Whether the host itself refused this device.
+/// Whether to wait for something to change before trying again: the host
+/// itself refused this device, or an SSH login failed in a way only the
+/// owner can fix (`auth_denied`, `host_key_changed`, `host_key_unknown`;
+/// Phase 1b §1.4). Repeated denied logins trip fail2ban and `ufw limit`.
 fn refused(e: &NetError) -> bool {
+    if let NetError::Ssh { reason, .. } = e {
+        return reason.needs_owner();
+    }
     matches!(
         crate::peer::reason_of(e).as_str(),
         "not_authorized" | "grant_revoked"

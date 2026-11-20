@@ -176,6 +176,10 @@ pub struct Ssh {
     params: SshParams,
     window: Arc<SshWindow>,
     kept: Mutex<HashMap<String, Kept>>,
+    /// Held for every change to the files in `<state>/ssh`: a route's
+    /// record and the shared `known_hosts` are read, changed and written
+    /// whole, so two requests at once must not interleave.
+    files: Mutex<()>,
     setup: Duration,
     reply_max: usize,
 }
@@ -192,6 +196,7 @@ impl Ssh {
                 l.ssh_target_window_ms(),
             )),
             kept: Mutex::new(HashMap::new()),
+            files: Mutex::new(()),
             setup: crate::limits::ms(l.ssh_setup_timeout_ms()),
             reply_max: usize::try_from(l.ssh_reply_max_bytes()).unwrap_or(usize::MAX),
         }
@@ -345,6 +350,7 @@ impl Ssh {
             Some(id) => id.to_owned(),
             None => hex(&random_bytes::<ROUTE_ID_BYTES>()),
         };
+        let held = self.files_lock();
         let before = again.and_then(|id| self.route(id).ok());
         mousse_net_io::private::make_private_dir(&self.dir)
             .map_err(|e| fail("store_failed", e.to_string()))?;
@@ -376,9 +382,10 @@ impl Ssh {
         let pinned = if same {
             self.pinned_key(&id).is_some()
         } else {
-            self.write_pin(&id, None)?;
+            self.write_pin_held(&held, &id, None)?;
             false
         };
+        drop(held);
         Ok(json!({
             "route_id": id,
             "user": ssh_user,
@@ -397,11 +404,34 @@ impl Ssh {
             .map(|(_, key)| key)
     }
 
-    /// Replace route `id`'s line in `known_hosts` with `key` (or drop it),
-    /// in one atomic write.
-    fn write_pin(&self, id: &str, key: Option<&HostKey>) -> Result<(), Fail> {
+    fn files_lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.files.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Pin `key` for route `id`, which must still exist: checked under the
+    /// files lock, so a route forgotten meanwhile is not pinned again.
+    fn pin_route(&self, id: &str, key: &HostKey) -> Result<(), Fail> {
+        let held = self.files_lock();
+        self.target(id)?;
+        self.write_pin_held(&held, id, Some(key))
+    }
+
+    /// Replace route `id`'s line in `known_hosts` with `key` (or drop it)
+    /// in one atomic write. The caller holds the files lock.
+    fn write_pin_held(
+        &self,
+        _held: &std::sync::MutexGuard<'_, ()>,
+        id: &str,
+        key: Option<&HostKey>,
+    ) -> Result<(), Fail> {
         let path = self.known_hosts();
-        let old = std::fs::read_to_string(&path).unwrap_or_default();
+        // A file that cannot be read is not taken as empty: that would
+        // drop every other route's pin.
+        let old = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(fail("store_failed", e.to_string())),
+        };
         let name = alias(id);
         let mut out = String::new();
         for line in old.lines() {
@@ -550,8 +580,7 @@ impl Ssh {
             }
             key
         };
-        self.target(id)?;
-        self.write_pin(id, Some(&key))?;
+        self.pin_route(id, &key)?;
         self.kept_lock().remove(id);
         Ok(json!({"sha256": key.sha256(), "pinned": true}))
     }
@@ -620,8 +649,9 @@ impl Ssh {
     /// `ssh.forget {route_id}`: the route's config, record, pin and kept
     /// key go.
     fn forget(&self, id: &str) -> Result<(), Fail> {
+        let held = self.files_lock();
         self.kept_lock().remove(id);
-        self.write_pin(id, None)?;
+        self.write_pin_held(&held, id, None)?;
         for path in [self.conf_path(id), self.meta_path(id)] {
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
@@ -675,6 +705,7 @@ impl Ssh {
             }
             other => return Err(fail("bad_route", format!("unknown shell {other:?}"))),
         }
+        let _held = self.files_lock();
         let mut route = self.route(&id)?;
         route.selector = Some(selector.to_owned());
         route.shell = Some("sh".into());
@@ -965,6 +996,64 @@ fn b64_decode(text: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `known_hosts` is shared by every route and rewritten whole: pins
+    /// and forgets running at once must neither lose a new pin nor bring
+    /// back a forgotten one.
+    #[test]
+    fn concurrent_trusts_and_forgets_keep_every_pin_right() {
+        let dir = std::env::temp_dir().join(format!(
+            "mousse-ssh-pins-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let ssh = Arc::new(Ssh::new(&dir));
+        mousse_net_io::private::make_private_dir(&ssh.dir).unwrap();
+        let key = HostKey {
+            key_type: "ssh-ed25519".into(),
+            blob_b64: "AAAAC3NzaC1lZDI1NTE5AAAAIB52hkRAWi2+fpeCdkkuBVHTbYmRB2MYjEAUrT59HR+t".into(),
+        };
+        let id = |t: usize, n: usize| format!("{:024x}", t * 1000 + n);
+        // Every route exists, as after `ssh.resolve`.
+        for t in 0..8 {
+            for n in 0..24 {
+                std::fs::write(
+                    ssh.meta_path(&id(t, n)),
+                    br#"{"target":"h","user":"u","hostname":"h","port":22}"#,
+                )
+                .unwrap();
+            }
+        }
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let (ssh, key) = (ssh.clone(), key.clone());
+                std::thread::spawn(move || {
+                    for n in 0..24 {
+                        ssh.pin_route(&id(t, n), &key).unwrap();
+                        if n % 2 == 1 {
+                            ssh.forget(&id(t, n)).unwrap();
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().expect("a pin change failed");
+        }
+        let text = std::fs::read_to_string(ssh.known_hosts()).unwrap();
+        let pinned: Vec<&str> = text.lines().filter_map(|l| l.split(' ').next()).collect();
+        for t in 0..8 {
+            for n in 0..24 {
+                let alias = format!("mousse-{}", id(t, n));
+                assert_eq!(pinned.contains(&alias.as_str()), n % 2 == 0, "{alias}");
+            }
+        }
+        assert_eq!(pinned.len(), 8 * 12);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn base64_round_trips_and_refuses_junk() {

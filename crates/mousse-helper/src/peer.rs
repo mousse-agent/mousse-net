@@ -240,6 +240,8 @@ pub fn reason_of(e: &NetError) -> String {
         NetError::Timeout(_) => "timeout".into(),
         NetError::Io(_) => "unreachable".into(),
         NetError::Forbidden(_) => "forbidden_address".into(),
+        // An ssh try names its own reason (Phase 1b §3.5).
+        NetError::Ssh { reason, .. } => reason.name().into(),
         _ => "error".into(),
     }
 }
