@@ -138,7 +138,7 @@ and this section no longer applies to them.
 | 1 | `RELAY_HELLO` | relay → client, first | 1: version (uint, `1`), 2: nonce (32), 3: boot id (16), 4: mode (uint, 0 self, 1 hosted) |
 | 2 | `REGISTER` | target → relay | 1: registration public key (65), 2: proof (64); hosted only, both or neither: 3: admission token (bytes), 4: status threshold percent (uint, 10–90) |
 | 3 | `ENROLL` | target → relay (self) | 1: registration public key (65), 2: proof (64), 3: enrollment code (16) |
-| 4 | `REGISTERED` | relay → target | 1: handle (32) |
+| 4 | `REGISTERED` | relay → target | 1: handle (32); 2: successor overlap (uint seconds, self mode only) |
 | 5 | `ALLOW_SET` | target → relay | 1: sequence (uint), 2: caller fingerprints (array of 0–256 byte strings of 32), 3: invitations (array of 0–8 maps `{1: tag hash (32), 2: expires at (uint)}`) |
 | 6 | `ALLOW_SET_OK` | relay → target | 1: sequence (uint) |
 | 7 | `CALL` | caller → relay | 1: handle (32), 2: caller public key (65), 3: proof (64), 4: class (uint, 0 interactive, 1 bulk) |
@@ -231,8 +231,10 @@ The relay closes connections with these WebSocket close codes:
 `REFUSED` reasons (text): `not_authorized` (a registration or accept leg
 that did not prove an authorized key), `enrollment` (an enrollment code
 that is unknown, used or expired), `limit` (a local limit on registrations
-or accept legs), `admission` (hosted: no valid admission token). The relay
-sends `REFUSED`, then closes with 1000.
+or accept legs), `admission` (hosted: no valid admission token),
+`chain_full` (a `SUCCESSOR` whose chain is full, section 7.4). The relay
+sends `REFUSED`, then closes with 1000, except after `chain_full`, which
+leaves the registration connection open and working.
 
 ## 5. Proofs
 
@@ -303,7 +305,10 @@ A target opens an outer connection, reads `RELAY_HELLO`, and sends
 
 A failure of 2 or 3 is `REFUSED(not_authorized)`. On success the relay
 records the registration, sends `REGISTERED {1: handle}`, and the
-connection becomes the handle's registration connection.
+connection becomes the handle's registration connection. In self mode
+`REGISTERED` also carries key 2, the relay's `RELAY_SUCCESSOR_OVERLAP_SECS`,
+so a target knows how long a key it supersedes stays on the list and never
+advertises it for longer; a hosted relay omits key 2.
 
 **One live registration per handle.** If the handle already has a
 registration connection, the relay closes that connection with 4005 first,
@@ -354,8 +359,11 @@ relay checks a `SUCCESSOR` against its stored list as it is when the
 message arrives, not as of its last read, so a key the operator just
 revoked cannot vouch for one.
 
-If any fails, the relay sends `REFUSED(not_authorized)` and closes the
-registration connection with 1000 (its circuits keep running). Otherwise it
+If any of 1 to 4 fails, the relay sends `REFUSED(not_authorized)` and
+closes the registration connection with 1000 (its circuits keep running).
+If only 5 fails, the relay sends `REFUSED(chain_full)` and changes nothing:
+the registration connection stays open and working, and the target keeps
+its current key until the oldest key of the chain is dropped. Otherwise it
 adds the new key's fingerprint to the authorized list and marks the current
 key **superseded**, with a drop time `RELAY_SUCCESSOR_OVERLAP_SECS` after
 now on its wall clock. Nothing is sent. The new key registers on its own

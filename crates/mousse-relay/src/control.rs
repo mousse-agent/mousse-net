@@ -66,7 +66,7 @@ mod persist {
                     continue;
                 };
                 match RelayMessage::decode(message) {
-                    Ok(RelayMessage::Registered { handle }) => {
+                    Ok(RelayMessage::Registered { handle, .. }) => {
                         self.handles.insert(*c, handle);
                         if let Some(set) = self.sets.get(&handle) {
                             inject.push((*c, set.clone()));

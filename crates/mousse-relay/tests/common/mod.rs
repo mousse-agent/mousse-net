@@ -117,7 +117,8 @@ impl Fixture {
         assert_eq!(
             relay(&mut c).await,
             RelayMessage::Registered {
-                handle: self.handle(k)
+                handle: self.handle(k),
+                successor_overlap: Some(604_800),
             }
         );
         c

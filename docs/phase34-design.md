@@ -715,7 +715,7 @@ bytes (fixed). Unknown types, missing or extra keys close the connection.
 | 1 | `RELAY_HELLO` | relay → client, first | 1: version (1), 2: nonce (32, fresh per connection), 3: boot id (16), 4: mode (0 self, 1 hosted) |
 | 2 | `REGISTER` | target → relay | 1: registration public key (65), 2: proof (64), 3: admission token (hosted only), 4: status threshold percent (hosted only, 10–90) |
 | 3 | `ENROLL` | target → relay (self) | 1: registration public key (65), 2: proof (64), 3: enrollment code (16) |
-| 4 | `REGISTERED` | relay → target | 1: handle (32) |
+| 4 | `REGISTERED` | relay → target | 1: handle (32), 2: successor overlap in seconds (self mode only) |
 | 5 | `ALLOW_SET` | target → relay | 1: sequence, 2: caller key fingerprints (array of 32 bytes, at most `ALLOW_CALLERS_MAX` = 256), 3: invitations (array of `{1: invitation tag hash (32), 2: expires at}`, at most `ALLOW_INVITATIONS_MAX` = 8) |
 | 6 | `ALLOW_SET_OK` | relay → target | 1: sequence |
 | 7 | `CALL` | caller → relay | 1: handle, 2: caller public key (65), 3: proof (64), 4: class (0 interactive, 1 bulk) |
@@ -776,9 +776,15 @@ bytes (fixed). Unknown types, missing or extra keys close the connection.
     key" in the app) sends `SUCCESSOR`: signed by the new key (the
     register proof shape with domain `mousse-relay-successor-v1`) and by
     the current, authorized key over the same record. The relay adds the
-    new key to the authorized list and drops the old one after
-    `MOUSSE_NET_MANIFEST_OVERLAP_SECS`. A key the operator never authorized
-    can therefore only arrive vouched for by one they did.
+    new key to the authorized list and drops the old one after its
+    `MOUSSE_NET_RELAY_SUCCESSOR_OVERLAP_SECS`, which it sends in
+    `REGISTERED`; the helper keeps the old route for the smaller of that
+    and `MOUSSE_NET_MANIFEST_OVERLAP_SECS`. A key the operator never
+    authorized can therefore only arrive vouched for by one they did. A
+    chain already holding `MOUSSE_NET_RELAY_CHAIN_KEYS_MAX` keys gets
+    `REFUSED(chain_full)` and the registration stays up; the helper drops
+    that rotation and refuses the next until the oldest key leaves. A
+    pending rotation can be cancelled.
   - **Hosted mode:** the helper rotates every
     `MOUSSE_NET_HANDLE_ROTATE_SECS`, each new handle with its own
     admission token and its own rate group (A.12). Old and new are

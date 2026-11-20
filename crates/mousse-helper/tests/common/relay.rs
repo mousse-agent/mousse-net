@@ -60,6 +60,11 @@ impl Drop for Live {
 
 impl TestRelay {
     pub fn start() -> Self {
+        Self::start_with(&[])
+    }
+
+    /// A relay with these `RELAY_*` limits overridden.
+    pub fn start_with(overrides: &[(&'static str, u64)]) -> Self {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -68,9 +73,9 @@ impl TestRelay {
         let tag = mousse_net_io::rng::random_bytes::<6>();
         let path = std::env::temp_dir().join(format!("mousse-helper-relay-{}", hex(&tag)));
         let dir = StateDir::init(&path, "127.0.0.1:443", &mut mousse_relay::os_rng()).unwrap();
-        let limits = RelayLimits::DEFAULT
-            .with_overrides(&[("RELAY_STATE_POLL_MS", 100)])
-            .unwrap();
+        let mut all = vec![("RELAY_STATE_POLL_MS", 100)];
+        all.extend_from_slice(overrides);
+        let limits = RelayLimits::DEFAULT.with_overrides(&all).unwrap();
         let running = rt
             .block_on(server::start(ServerConfig {
                 state: dir.clone(),

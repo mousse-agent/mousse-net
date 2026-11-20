@@ -61,7 +61,7 @@ use mousse_net_core::relay::msg::{
     InvitationEntry, ALLOW_CALLERS_MAX, ALLOW_INVITATIONS_MAX, RELAY_MESSAGE_MAX,
 };
 use mousse_net_core::relay::proof::{invitation_tag, tag_hash};
-use mousse_net_core::relay::{Class, EnrollmentLink, RelayClientKey, RelayId};
+use mousse_net_core::relay::{Class, EnrollmentLink, RelayClientKey, RelayId, RelayLimits};
 use mousse_net_core::relay_endpoint::{
     decode_keys_answer, decode_keys_request, derive_key, derive_secret, encode_keys_answer,
     encode_keys_request, RelayEndpoint, RelayRoute, CALLER_KEY_INFO, PAIR_SECRET_INFO,
@@ -410,7 +410,10 @@ fn status_json(shared: &Shared, relay: &OwnRelay) -> Value {
         "added_at": relay.added_at,
         "rotated_at": relay.rotated_at,
         "rotating_until": relay.old.iter().map(|o| o.until).max(),
-        "new_key_pending": relay.pending.is_some(),
+        "new_key_pending": relay.pending.as_ref().is_some_and(|p| !p.cancelled),
+        "cancelling": relay.pending.as_ref().is_some_and(|p| p.cancelled),
+        "chain_full": relay.chain_full,
+        "chain_full_until": relay.chain_until.filter(|_| relay.chain_full),
     })
 }
 
@@ -668,11 +671,43 @@ async fn hold(
                     applog::line(format!("relay accept leg failed: {error}"));
                 }
                 TargetEvent::AllowSetOk { .. } => {}
+                TargetEvent::ChainFull => chain_full(shared, relay),
                 // Own relays are self-hosted: no leases.
                 TargetEvent::LeaseStatus(_) => {}
             },
         }
     }
+}
+
+/// The relay refused a `SUCCESSOR` as `chain_full`. That is final for
+/// the rotation: the new key is dropped (the relay took no `SUCCESSOR`,
+/// so it never knew it), the current key stays, and the owner sees why.
+/// The registration itself goes on.
+fn chain_full(shared: &Arc<Shared>, relay: &str) {
+    if cfg!(mousse_control = "chain-full-ignored") {
+        return;
+    }
+    let updated = {
+        let _io = guard(&shared.relay.io);
+        let Ok(mut file) = shared.relay.files.relays() else {
+            return;
+        };
+        let Some(r) = file.relays.iter_mut().find(|r| r.relay == relay) else {
+            return;
+        };
+        r.pending = None;
+        r.chain_full = true;
+        let r = r.clone();
+        if shared.relay.files.save_relays(file).is_err() {
+            return;
+        }
+        r
+    };
+    applog::line(format!(
+        "relay {} holds as many keys as it allows; the new key was dropped",
+        updated.endpoint
+    ));
+    shared.event(json!({"ev": "relay.state", "relay": status_json(shared, &updated)}));
 }
 
 fn note_relay_key(shared: &Arc<Shared>, relay: &str, key: Option<PublicKey>) {
@@ -1934,6 +1969,9 @@ pub fn on_request(shared: &Arc<Shared>, id: Value, op: &str, map: &Map<String, V
             None => error(&id, "bad_request", "relay.remove needs relay (its id)"),
         },
         "relay.rotate" => match str_field(map, "relay") {
+            Some(relay) if map.get("cancel").and_then(Value::as_bool) == Some(true) => {
+                cancel_rotation(shared, &id, relay)
+            }
             Some(relay) => rotate(shared, &id, relay),
             None => error(&id, "bad_request", "relay.rotate needs relay (its id)"),
         },
@@ -2042,6 +2080,8 @@ async fn enroll_inner(
         added_at: now(),
         rotated_at: None,
         pending: None,
+        chain_full: false,
+        chain_until: None,
     };
     {
         let _io = guard(&shared.relay.io);
@@ -2106,7 +2146,8 @@ fn remove_relay(shared: &Arc<Shared>, id: &Value, relay: &str) -> Value {
 /// journaled first (`pending`); the current key stays current. Then
 /// [`finish_rotation`] has the current key vouch for it with `SUCCESSOR`
 /// until the new key registers, and only then makes it current, with the
-/// old key kept registered and in the manifest through the overlap.
+/// old key kept registered and in the manifest through the overlap. While
+/// the relay's key chain is known to be full it is refused at once.
 fn rotate(shared: &Arc<Shared>, id: &Value, relay: &str) -> Value {
     let relay = relay.to_lowercase();
     if shared.relay.seed().is_err() {
@@ -2133,9 +2174,18 @@ fn rotate(shared: &Arc<Shared>, id: &Value, relay: &str) -> Value {
         if r.pending.is_some() {
             return error(id, "rotating", "A new key is already on its way");
         }
+        if r.chain_full && r.chain_until.is_some_and(|t| t > now()) {
+            return error(
+                id,
+                "chain_full",
+                "The relay holds as many keys as it allows; try again once the old key leaves",
+            );
+        }
+        r.chain_full = false;
         r.pending = Some(PendingKey {
             salt: hex(&random_bytes::<16>()),
             since: now(),
+            cancelled: false,
         });
         let r = r.clone();
         if let Err(e) = shared.relay.files.save_relays(file) {
@@ -2145,6 +2195,71 @@ fn rotate(shared: &Arc<Shared>, id: &Value, relay: &str) -> Value {
     };
     tokio::spawn(finish_rotation(shared.clone(), relay));
     json!({"re": id, "relay": status_json(shared, &updated)})
+}
+
+/// `relay.rotate {relay, cancel: true}`: stop a pending rotation. The
+/// current key stays. No more `SUCCESSOR`s are sent; [`finish_rotation`]
+/// drops the new key once the relay refuses it, and commits it if the
+/// relay took one already sent.
+fn cancel_rotation(shared: &Arc<Shared>, id: &Value, relay: &str) -> Value {
+    let relay = relay.to_lowercase();
+    let updated = {
+        let _io = guard(&shared.relay.io);
+        let Ok(mut file) = shared.relay.files.relays() else {
+            return error(id, "store_failed", "Couldn't read the relay list");
+        };
+        let Some(r) = file.relays.iter_mut().find(|r| r.relay == relay) else {
+            return error(id, "no_relay", "No such relay");
+        };
+        let Some(pending) = r.pending.as_mut() else {
+            return error(id, "not_rotating", "No new key is on its way");
+        };
+        pending.cancelled = true;
+        let r = r.clone();
+        if let Err(e) = shared.relay.files.save_relays(file) {
+            return error(id, "store_failed", e);
+        }
+        r
+    };
+    shared.event(json!({"ev": "relay.state", "relay": status_json(shared, &updated)}));
+    json!({"re": id, "relay": status_json(shared, &updated)})
+}
+
+/// The pending key of `relay`, as stored now.
+fn stored_pending(shared: &Shared, relay: &str) -> Option<PendingKey> {
+    shared
+        .relay
+        .files
+        .relays()
+        .ok()?
+        .relays
+        .into_iter()
+        .find(|r| r.relay == relay)?
+        .pending
+}
+
+/// A cancelled rotation the relay refused: it took no `SUCCESSOR`, so the
+/// new key is dropped.
+fn drop_cancelled(shared: &Arc<Shared>, relay: &str, salt: &str) {
+    let updated = {
+        let _io = guard(&shared.relay.io);
+        let Ok(mut file) = shared.relay.files.relays() else {
+            return;
+        };
+        let Some(r) = file.relays.iter_mut().find(|r| r.relay == relay) else {
+            return;
+        };
+        if r.pending.as_ref().is_none_or(|p| p.salt != salt) {
+            return;
+        }
+        r.pending = None;
+        let r = r.clone();
+        if shared.relay.files.save_relays(file).is_err() {
+            return;
+        }
+        r
+    };
+    shared.event(json!({"ev": "relay.state", "relay": status_json(shared, &updated)}));
 }
 
 /// Take the pending rotation of `relay` to its end: register the new key;
@@ -2180,7 +2295,18 @@ async fn finish_rotation(shared: Arc<Shared>, relay: String) {
                 return;
             }
             Err(RelayError::Refused(_)) => {
-                // Not taken yet: the current key vouches for it (again).
+                // Cancelled, and the relay took no SUCCESSOR: drop the key.
+                // A SUCCESSOR sent just before the cancel had a full wait
+                // to arrive before this try.
+                if pending.cancelled {
+                    drop_cancelled(&shared, &relay, &pending.salt);
+                    return;
+                }
+                // Not taken yet: the current key vouches for it (again),
+                // unless the rotation ended or was cancelled meanwhile.
+                if stored_pending(&shared, &relay) != Some(pending.clone()) {
+                    continue;
+                }
                 let registered = guard(&shared.relay.status)
                     .get(&relay)
                     .is_some_and(|s| s.state == "registered");
@@ -2203,8 +2329,10 @@ async fn finish_rotation(shared: Arc<Shared>, relay: String) {
 /// registered and in the manifest until its overlap ends. The overlap
 /// counts from the rotation's start, before any `SUCCESSOR`, less the
 /// clock skew, so the old route leaves the manifest before the relay drops
-/// the old key (`MANIFEST_OVERLAP_SECS` is at most the relay's
-/// `RELAY_SUCCESSOR_OVERLAP_SECS`).
+/// the old key: the overlap is the smaller of `MANIFEST_OVERLAP_SECS` and
+/// the relay's `RELAY_SUCCESSOR_OVERLAP_SECS`, which the new key's
+/// `REGISTERED` carries. A cancelled rotation the relay took anyway
+/// commits too: the relay will drop the current key.
 fn commit_rotation(shared: &Arc<Shared>, relay: &str, pending: &PendingKey, link: TargetLink) {
     let committed = {
         let _io = guard(&shared.relay.io);
@@ -2214,15 +2342,30 @@ fn commit_rotation(shared: &Arc<Shared>, relay: &str, pending: &PendingKey, link
         let Some(r) = file.relays.iter_mut().find(|r| r.relay == relay) else {
             return;
         };
-        if r.pending.as_ref() != Some(pending) {
+        if r.pending.as_ref().is_none_or(|p| p.salt != pending.salt) {
             return;
         }
+        let relay_overlap = link.successor_overlap();
+        let overlap = if cfg!(mousse_control = "relay-overlap-ignored") {
+            limits().manifest_overlap_secs()
+        } else {
+            limits()
+                .manifest_overlap_secs()
+                .min(relay_overlap.unwrap_or(u64::MAX))
+        };
         // The control build drops the old key at once: no overlap.
         let until = if cfg!(mousse_control = "no-overlap") {
             now()
         } else {
-            (pending.since + limits().manifest_overlap_secs()).saturating_sub(CLOCK_SKEW_SECS)
+            (pending.since + overlap).saturating_sub(CLOCK_SKEW_SECS)
         };
+        // The relay took the SUCCESSOR by now, so it drops the old key by
+        // now plus its overlap (its most when it did not say).
+        let dropped_by = now()
+            + relay_overlap.unwrap_or(RelayLimits::DEFAULT.successor_overlap_secs())
+            + CLOCK_SKEW_SECS;
+        r.chain_until = Some(r.chain_until.unwrap_or(0).max(dropped_by));
+        r.chain_full = false;
         let old = std::mem::replace(&mut r.salt, pending.salt.clone());
         r.old.push(OldKey { salt: old, until });
         r.rotated_at = Some(now());

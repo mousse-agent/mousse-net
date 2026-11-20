@@ -232,7 +232,8 @@ async fn enrollment_link_and_revoke_take_effect_on_the_running_relay() {
     assert_eq!(
         relay(&mut reg).await,
         RelayMessage::Registered {
-            handle: f.handle(&target)
+            handle: f.handle(&target),
+            successor_overlap: Some(604_800),
         }
     );
     // Stored before REGISTERED: the code is gone, the key listed.

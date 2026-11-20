@@ -65,6 +65,9 @@ pub enum TargetEvent {
     },
     /// A hosted relay's `LEASE_STATUS` (§B.10).
     LeaseStatus(Vec<LeaseStatusEntry>),
+    /// `REFUSED(chain_full)`: the relay did not take a `SUCCESSOR` because
+    /// the key chain is full. The registration goes on.
+    ChainFull,
 }
 
 /// Allow-set sequences grow for the life of the process and start from the
@@ -119,6 +122,7 @@ pub struct TargetLink {
     key: Arc<RelayClientKey>,
     handle: [u8; 32],
     within: Duration,
+    successor_overlap: Option<u64>,
 }
 
 impl std::fmt::Debug for TargetLink {
@@ -162,7 +166,10 @@ impl TargetLink {
         let got = tokio::time::timeout(left, async {
             link.send(&msg).await?;
             match link.recv().await? {
-                RelayMessage::Registered { handle } => Ok(handle),
+                RelayMessage::Registered {
+                    handle,
+                    successor_overlap,
+                } => Ok((handle, successor_overlap)),
                 RelayMessage::Refused { reason } => Err(RelayError::Refused(reason)),
                 other => Err(RelayError::Protocol(format!(
                     "expected REGISTERED, got {}",
@@ -172,6 +179,7 @@ impl TargetLink {
         })
         .await
         .map_err(|_| RelayError::Timeout)??;
+        let (got, successor_overlap) = got;
         if got != expected {
             return Err(RelayError::Protocol(
                 "the relay named another handle".into(),
@@ -184,12 +192,19 @@ impl TargetLink {
             key,
             handle: expected,
             within,
+            successor_overlap,
         })
     }
 
     /// This registration's handle.
     pub fn handle(&self) -> [u8; 32] {
         self.handle
+    }
+
+    /// The relay's `RELAY_SUCCESSOR_OVERLAP_SECS`, from `REGISTERED` (self
+    /// mode only): how long a key a `SUCCESSOR` supersedes stays listed.
+    pub fn successor_overlap(&self) -> Option<u64> {
+        self.successor_overlap
     }
 
     /// The relay's identity key, from its pinned certificate.
@@ -315,6 +330,9 @@ impl TargetLink {
                                 caller,
                                 events.clone(),
                             ));
+                        }
+                        Ok(RelayMessage::Refused { reason: RefuseReason::ChainFull }) => {
+                            let _ = events.send(TargetEvent::ChainFull);
                         }
                         Ok(RelayMessage::Refused { reason }) => return RelayError::Refused(reason),
                         Ok(RelayMessage::LeaseStatus { entries }) => {

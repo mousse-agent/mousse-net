@@ -47,6 +47,11 @@ pub struct PendingKey {
     /// When the rotation started, before any `SUCCESSOR`: the relay's
     /// overlap for the old key starts no earlier.
     pub since: u64,
+    /// `relay.rotate {cancel}`: no more `SUCCESSOR`s. The key is dropped
+    /// once the relay refuses it, which shows no `SUCCESSOR` was taken; if
+    /// one was, the key registers and the rotation completes after all.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cancelled: bool,
 }
 
 /// One of this computer's own relays.
@@ -72,6 +77,14 @@ pub struct OwnRelay {
     /// registers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending: Option<PendingKey>,
+    /// The relay refused the last `SUCCESSOR` as `chain_full`: it holds as
+    /// many of this computer's keys as it allows.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub chain_full: bool,
+    /// When the relay has dropped every key this computer rotated out, at
+    /// the latest; until then a full chain stays full.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_until: Option<u64>,
 }
 
 #[derive(Default, Serialize, Deserialize)]

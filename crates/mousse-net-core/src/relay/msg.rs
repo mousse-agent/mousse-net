@@ -63,6 +63,9 @@ pub enum RefuseReason {
     Limit,
     /// Hosted: no valid admission token.
     Admission,
+    /// Self mode: a `SUCCESSOR` whose key chain already holds
+    /// `RELAY_CHAIN_KEYS_MAX` keys. The registration stays.
+    ChainFull,
 }
 
 impl RefuseReason {
@@ -73,6 +76,7 @@ impl RefuseReason {
             Self::Enrollment => "enrollment",
             Self::Limit => "limit",
             Self::Admission => "admission",
+            Self::ChainFull => "chain_full",
         }
     }
 
@@ -82,6 +86,7 @@ impl RefuseReason {
             Self::Enrollment,
             Self::Limit,
             Self::Admission,
+            Self::ChainFull,
         ]
         .into_iter()
         .find(|r| r.as_str() == text)
@@ -148,6 +153,9 @@ pub enum RelayMessage {
     Registered {
         /// The derived handle.
         handle: [u8; 32],
+        /// Self mode: `RELAY_SUCCESSOR_OVERLAP_SECS`, how long a key a
+        /// `SUCCESSOR` supersedes stays on the list. Absent in hosted mode.
+        successor_overlap: Option<u64>,
     },
     /// 5, target → relay.
     AllowSet {
@@ -417,7 +425,15 @@ impl RelayMessage {
                 (2, b(proof.as_bytes())),
                 (3, b(code)),
             ]),
-            Self::Registered { handle } => entries.push((1, b(handle))),
+            Self::Registered {
+                handle,
+                successor_overlap,
+            } => {
+                entries.push((1, b(handle)));
+                if let Some(secs) = successor_overlap {
+                    entries.push((2, u(*secs)));
+                }
+            }
             Self::AllowSet {
                 sequence,
                 callers,
@@ -556,6 +572,11 @@ impl RelayMessage {
             },
             4 => Self::Registered {
                 handle: f.fixed(1)?,
+                successor_overlap: match f.optional(2) {
+                    None => None,
+                    Some(Value::Uint(secs)) => Some(secs),
+                    Some(_) => return Err(FieldError::WrongType(2).into()),
+                },
             },
             5 => {
                 let sequence = f.uint(1)?;
@@ -726,7 +747,14 @@ mod tests {
                 proof: sig,
                 code: [3; 16],
             },
-            RelayMessage::Registered { handle: [4; 32] },
+            RelayMessage::Registered {
+                handle: [4; 32],
+                successor_overlap: Some(604_800),
+            },
+            RelayMessage::Registered {
+                handle: [4; 32],
+                successor_overlap: None,
+            },
             RelayMessage::AllowSet {
                 sequence: 7,
                 callers: vec![[5; 32], [6; 32]],

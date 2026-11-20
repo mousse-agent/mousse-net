@@ -146,8 +146,8 @@ mousse_net_core::define_limits! {
         via_relay_accept_legs = "VIA_RELAY_ACCEPT_LEGS": 64, [1, 64];
         /// Own relays: during a key rotation, the wait between tries to register the new key (and between `SUCCESSOR`s while the relay refuses it).
         via_relay_rotation_retry_ms = "VIA_RELAY_ROTATION_RETRY_MS": 1_000, [100, 60_000];
-        /// How long an old relay route or registration key stays in the manifest after a rotation, counted from the rotation's start less the clock skew (Phase 3 §B.4, §B.11); at most the relay's `RELAY_SUCCESSOR_OVERLAP_SECS`, so the route leaves before the relay drops the key.
-        manifest_overlap_secs = "MANIFEST_OVERLAP_SECS": 604_800, [86_400, 2_592_000];
+        /// How long an old relay route or registration key stays in the manifest after a rotation, counted from the rotation's start less the clock skew (Phase 3 §B.4, §B.11); at most the relay's most `RELAY_SUCCESSOR_OVERLAP_SECS`, and the smaller of the two when the relay advertises a tighter one, so the route leaves before the relay drops the key (tighten only).
+        manifest_overlap_secs = "MANIFEST_OVERLAP_SECS": 604_800, [86_400, 604_800];
         /// When a manifest becomes stale (still dialled, last); above the overlap.
         manifest_lifetime_secs = "MANIFEST_LIFETIME_SECS": 2_592_000, [604_800, 7_776_000];
         /// How long a consumed invitation's tag stays in the allow-set for relay-only pairing recovery (Phase 3 §B.7; tighten only).
@@ -468,6 +468,23 @@ mod tests {
         assert!(
             Limits::from_vars(vars(&[("MOUSSE_NET_MANIFEST_OVERLAP_SECS", "2592000")])).is_err()
         );
+    }
+
+    #[test]
+    fn the_manifest_overlap_is_at_most_the_relay_s() {
+        // A route must leave the manifest before the relay drops its key;
+        // the relay keeps a superseded key at most this long.
+        let most = mousse_net_core::relay::RelayLimits::DEFAULT.successor_overlap_secs();
+        let spec = HelperLimits::SPECS
+            .iter()
+            .find(|s| s.name == "MANIFEST_OVERLAP_SECS")
+            .unwrap();
+        assert_eq!(spec.max, most);
+        assert!(Limits::from_vars(vars(&[
+            ("MOUSSE_NET_MANIFEST_OVERLAP_SECS", "700000"),
+            ("MOUSSE_NET_HANDLE_ROTATE_SECS", "2000000"),
+        ]))
+        .is_err());
     }
 
     #[test]
