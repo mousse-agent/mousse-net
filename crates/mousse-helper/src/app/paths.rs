@@ -338,13 +338,21 @@ async fn reach(shared: &Shared, record: &PeerRecord) -> Result<(Connection, Via)
         Err(e) => e,
     };
     let pin = record.pin()?;
-    if super::relay::candidates(shared, &pin).is_empty() {
-        return Err(first);
-    }
-    match super::relay::reach(shared, &pin).await {
-        Ok((conn, route)) => Ok((conn, Via::Relay(route))),
-        Err(e @ NetError::Closed(_)) => Err(e),
-        Err(_) => Err(first),
+    let mut read_slot = false;
+    loop {
+        if !super::relay::candidates(shared, &pin).is_empty() {
+            match super::relay::reach(shared, &pin).await {
+                Ok((conn, route)) => return Ok((conn, Via::Relay(route))),
+                Err(e @ NetError::Closed(_)) => return Err(e),
+                Err(_) => {}
+            }
+        }
+        // Every route failed: the host's directory slot may hold a newer
+        // manifest (a rotated handle or a moved relay, Phase 4 §B.12).
+        if read_slot || !super::relay::hosted::from_slot(shared, &pin).await {
+            return Err(first);
+        }
+        read_slot = true;
     }
 }
 

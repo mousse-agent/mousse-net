@@ -179,7 +179,7 @@ impl Target {
                                 }
                             });
                         }
-                        TargetEvent::AcceptFailed { .. } => {}
+                        TargetEvent::AcceptFailed { .. } | TargetEvent::LeaseStatus(_) => {}
                     }
                 }
             }

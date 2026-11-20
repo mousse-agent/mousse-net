@@ -41,6 +41,11 @@ serde_json = "=1.0.154"
 rqrr = { version = "=0.11.0", default-features = false }
 # The relay tests run the real relay in the test process.
 mousse-relay = { path = "../mousse-relay" }
+# Hosted relays in tests/app_hosted.rs: their Plus settings and the relay
+# side's issuer stand-in (a test fixture), which seeds its key with ChaCha.
+mousse-relay-plus = { path = "../mousse-relay-plus" }
+rand_chacha = "=0.10.0"
+httparse = "=1.10.1"
 tokio = { version = "=1.54.1", features = ["rt-multi-thread", "net", "macros", "sync", "time"] }
 # The TLS-terminating tunnel stand-in in tests/app_ws.rs.
 rustls = { version = "=0.23.46", default-features = false, features = ["std", "logging", "aws_lc_rs"] }

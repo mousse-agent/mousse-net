@@ -952,7 +952,13 @@ impl State {
         self.once(&hash, "/v1/inbox/deposit", id, body, |s| {
             let (tag_quota, inbox_quota) = (s.tag_quota, s.inbox_quota);
             let inbox = s.inboxes.get_mut(&inbox_id).expect("checked above");
-            let under_tag = inbox.messages.iter().filter(|m| m.tag == tag).count();
+            // Must-fail control (tests only): no per-tag quota, so one
+            // pairing can fill the whole inbox.
+            let under_tag = if cfg!(mousse_control = "no-tag-quota") {
+                0
+            } else {
+                inbox.messages.iter().filter(|m| m.tag == tag).count()
+            };
             if under_tag >= tag_quota || inbox.messages.len() >= inbox_quota {
                 return Err(fail("quota"));
             }
@@ -1195,6 +1201,10 @@ fn lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
 // ---------------------------------------------------------------------------
 // The stand-in and its test hooks
 
+/// A block the stand-in issued: `(lease id, relay id, handle, class,
+/// done)`.
+pub type IssuedLease = ([u8; 16], [u8; 32], [u8; 32], u64, bool);
+
 /// A Plus stand-in on loopback. Stops when dropped.
 pub struct PlusStandIn {
     addr: SocketAddr,
@@ -1422,6 +1432,24 @@ impl PlusStandIn {
     /// Most directory slots per endpoint.
     pub fn set_slot_quota(&self, n: usize) {
         self.s().slot_quota = n;
+    }
+
+    /// Every block issued: `(lease id, relay id, handle, class, done)`.
+    pub fn leases(&self) -> Vec<IssuedLease> {
+        self.s()
+            .leases
+            .iter()
+            .map(|(id, l)| (*id, l.relay, l.handle, l.class, l.done))
+            .collect()
+    }
+
+    /// Every handle given an admission token: `(handle, relay id)`.
+    pub fn admitted(&self) -> Vec<([u8; 32], [u8; 32])> {
+        self.s()
+            .handles
+            .iter()
+            .map(|(h, x)| (*h, x.relay))
+            .collect()
     }
 
     /// Hostile: answer every inbox fetch from the oldest message, ignoring

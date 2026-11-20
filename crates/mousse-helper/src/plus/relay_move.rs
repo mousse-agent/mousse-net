@@ -35,8 +35,9 @@ pub enum MoveState {
 /// What the driver must do.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MoveAction {
-    /// Send `RELEASE` with these lease ids on the old relay.
-    ReleaseOld(Vec<[u8; 16]>),
+    /// The old relay's registrations send `RELEASE` for every block they
+    /// hold, and end.
+    ReleaseOld,
     /// Start asking Plus for blocks on the new relay.
     FundNew([u8; 32]),
     /// Drop the old route from the manifest.
@@ -64,6 +65,7 @@ impl RelayMove {
     }
 
     /// The state.
+    #[cfg(test)]
     pub fn state(&self) -> &MoveState {
         &self.state
     }
@@ -79,9 +81,9 @@ impl RelayMove {
         Vec::new()
     }
 
-    /// Time passed, or the old relay is gone (`old_gone`). `old_blocks`
-    /// are the lease ids still held on the old relay.
-    pub fn tick(&mut self, now: u64, old_gone: bool, old_blocks: Vec<[u8; 16]>) -> Vec<MoveAction> {
+    /// Time passed, or the old relay is gone (`old_gone`: no live
+    /// registration there to send `RELEASE`).
+    pub fn tick(&mut self, now: u64, old_gone: bool) -> Vec<MoveAction> {
         let MoveState::Staged { to, since } = self.state else {
             return Vec::new();
         };
@@ -90,8 +92,8 @@ impl RelayMove {
         }
         self.state = MoveState::CuttingOver { to, at: now };
         let mut out = Vec::new();
-        if !old_gone && !old_blocks.is_empty() {
-            out.push(MoveAction::ReleaseOld(old_blocks));
+        if !old_gone {
+            out.push(MoveAction::ReleaseOld);
         }
         out.extend([
             MoveAction::DropOldRoute,
@@ -126,11 +128,11 @@ mod tests {
             m.staged(NEW, 1_000).is_empty(),
             "nothing funds the new relay while staged"
         );
-        assert!(m.tick(1_000 + 86_399, false, vec![[1; 16]]).is_empty());
-        let out = m.tick(1_000 + 86_400, false, vec![[1; 16], [2; 16]]);
+        assert!(m.tick(1_000 + 86_399, false).is_empty());
+        let out = m.tick(1_000 + 86_400, false);
         let release = out
             .iter()
-            .position(|a| matches!(a, MoveAction::ReleaseOld(ids) if ids.len() == 2))
+            .position(|a| *a == MoveAction::ReleaseOld)
             .expect("old blocks released");
         let fund = out
             .iter()
@@ -146,8 +148,8 @@ mod tests {
     fn a_gone_old_relay_cuts_over_at_once() {
         let mut m = RelayMove::new(86_400);
         m.staged(NEW, 1_000);
-        let out = m.tick(1_001, true, vec![[1; 16]]);
-        assert!(!out.iter().any(|a| matches!(a, MoveAction::ReleaseOld(_))));
+        let out = m.tick(1_001, true);
+        assert!(!out.contains(&MoveAction::ReleaseOld));
         assert!(out.contains(&MoveAction::FundNew(NEW)));
     }
 }

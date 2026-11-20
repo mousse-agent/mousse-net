@@ -25,6 +25,7 @@ use std::sync::Arc;
 use mousse_net_core::cbor::Value;
 use mousse_net_core::grants::GrantId;
 use mousse_net_core::identity::IdentityPublicKey;
+use mousse_net_core::manifest::{Envelope, Manifest};
 use mousse_net_core::pairmail::{self, PairSecret};
 use mousse_net_io::rng::random_bytes;
 use mousse_net_io::store::{hex, identity_from_hex, unhex, write_atomic};
@@ -48,6 +49,9 @@ pub trait PairSource: Send + Sync {
     fn caller_secret(&self, pin: &IdentityPublicKey) -> Option<PairSecret>;
     /// This host's current signed manifest envelope.
     fn manifest(&self) -> Option<Vec<u8>>;
+    /// Caller side: a manifest the host `pin` signed, read from its
+    /// directory slot: kept if newer, so its routes reach the dialer.
+    fn keep_manifest(&self, _pin: &IdentityPublicKey, _envelope: &[u8]) {}
 }
 
 /// No pairing material yet (before the relay client provides it).
@@ -434,13 +438,15 @@ impl HostMail {
 // Caller side
 // ---------------------------------------------------------------------------
 
-/// The host's inbox id, from the pairing's directory slot. The slot counts
-/// only if its manifest is signed by the pinned host.
-pub async fn host_inbox(
+/// The pairing's directory slot: the host's signed manifest envelope and
+/// its inbox id. The slot counts only if it opens under this pairing's
+/// slot key and its manifest is a manifest the pinned host signed
+/// (`Manifest::open`), whatever Plus serves.
+pub async fn read_slot(
     plus: &Plus,
     pin: &IdentityPublicKey,
     secret: &PairSecret,
-) -> Result<[u8; 32], Failure> {
+) -> Result<(Vec<u8>, [u8; 32]), Failure> {
     let slot = secret.slot_id();
     let got = plus
         .post_anonymous("/v1/dir/get", &map(vec![(1, Value::Bytes(slot.to_vec()))]))
@@ -450,8 +456,24 @@ pub async fn host_inbox(
         .map_err(|e| Failure::Bad(format!("slot: {e}")))?;
     let (manifest, inbox) =
         pairmail::split_slot(&plain).map_err(|e| Failure::Bad(format!("slot: {e}")))?;
-    pairmail::check_manifest_pin(manifest, pin).map_err(|e| Failure::Bad(format!("slot: {e}")))?;
-    Ok(inbox)
+    if !cfg!(mousse_control = "unpinned-manifest") {
+        // Must-fail control (tests only): the manifest counts unchecked.
+        Envelope::decode(manifest)
+            .map_err(|e| e.to_string())
+            .and_then(|env| Manifest::open(&env, pin).map_err(|e| e.to_string()))
+            .map_err(|e| Failure::Bad(format!("slot manifest: {e}")))?;
+    }
+    Ok((manifest.to_vec(), inbox))
+}
+
+/// The host's inbox id, from the pairing's directory slot ([`read_slot`]).
+#[cfg(test)]
+pub async fn host_inbox(
+    plus: &Plus,
+    pin: &IdentityPublicKey,
+    secret: &PairSecret,
+) -> Result<[u8; 32], Failure> {
+    read_slot(plus, pin, secret).await.map(|(_, inbox)| inbox)
 }
 
 /// Deposit a removal envelope for the host, sealed with the pairing's mail
@@ -512,8 +534,12 @@ impl Engine {
             };
             match item.state.as_str() {
                 "waiting" | "quota" => {
-                    let inbox = match host_inbox(plus, &host, &secret).await {
-                        Ok(i) => i,
+                    let inbox = match read_slot(plus, &host, &secret).await {
+                        Ok((manifest, inbox)) => {
+                            // Its routes may be newer than the ones kept.
+                            pairs.keep_manifest(&host, &manifest);
+                            inbox
+                        }
                         Err(e) => {
                             applog::line(format!("mail: no inbox for a host: {e}"));
                             continue;

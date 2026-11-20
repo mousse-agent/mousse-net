@@ -336,6 +336,7 @@ impl App {
             .engine
             .set_pairs(Arc::new(relay::Pairs(Arc::downgrade(&shared))));
         tokio::spawn(relay::run(shared.clone()));
+        tokio::spawn(relay::hosted::run(shared.clone()));
         let events_to = shared.clone();
         tokio::spawn(async move {
             while let Some(event) = engine_events.recv().await {

@@ -79,6 +79,10 @@ use tokio::task::AbortHandle;
 use zeroize::Zeroizing;
 
 use super::relay_store::{fixed, Files, GrantKey, OldKey, OwnRelay, PeerRelay, Recovery};
+
+/// Hosted relays from Plus (Phase 4).
+#[path = "hosted.rs"]
+pub mod hosted;
 use super::{error, AppInfo, Shared};
 use crate::applog;
 
@@ -144,6 +148,8 @@ pub struct State {
     manifest_sent: Mutex<HashSet<u64>>,
     /// Bulk companions of relay connections, by the main one's number.
     bulk: tokio::sync::Mutex<HashMap<u64, Arc<Connection>>>,
+    /// The hosted relays' registrations (Phase 4).
+    hosted: Mutex<hosted::Runtime>,
 }
 
 fn guard<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -189,6 +195,7 @@ impl State {
             manifest: Mutex::new(None),
             manifest_sent: Mutex::new(HashSet::new()),
             bulk: tokio::sync::Mutex::new(HashMap::new()),
+            hosted: Mutex::new(hosted::Runtime::default()),
         }
     }
 
@@ -638,6 +645,8 @@ async fn hold(
                     applog::line(format!("relay accept leg failed: {error}"));
                 }
                 TargetEvent::AllowSetOk { .. } => {}
+                // Own relays are self-hosted: no leases.
+                TargetEvent::LeaseStatus(_) => {}
             },
         }
     }
@@ -720,16 +729,15 @@ async fn accept_incoming(
 }
 
 fn destination_of(shared: &Shared, relay: &str) -> Option<String> {
-    shared
+    let own = shared
         .relay
         .files
         .relays()
-        .ok()?
-        .relays
-        .into_iter()
-        .find(|r| r.relay == relay)
+        .ok()
+        .and_then(|f| f.relays.into_iter().find(|r| r.relay == relay))
         .and_then(|r| RelayEndpoint::parse(&r.endpoint))
-        .map(|e| e.destination())
+        .map(|e| e.destination());
+    own.or_else(|| hosted::destination_of(shared, relay))
 }
 
 /// Whether a live connection on a join circuit belongs there: its grant's
@@ -987,12 +995,13 @@ impl crate::engine::mailbox::PairSource for Pairs {
     }
 
     fn caller_secret(&self, pin: &IdentityPublicKey) -> Option<PairSecret> {
-        let shared = self.0.upgrade()?;
-        let key = hex(pin.as_bytes());
-        let file = shared.relay.files.peers().ok()?;
-        let entry = file.peers.iter().find(|p| p.identity == key)?;
-        let secret = Zeroizing::new(fixed::<32>(entry.pair_secret.as_deref()?)?);
-        Some(PairSecret::from_bytes(*secret))
+        caller_pair_secret(&*self.0.upgrade()?, pin)
+    }
+
+    fn keep_manifest(&self, pin: &IdentityPublicKey, envelope: &[u8]) {
+        if let Some(shared) = self.0.upgrade() {
+            take_manifest(&shared, pin, envelope);
+        }
     }
 
     fn manifest(&self) -> Option<Vec<u8>> {
@@ -1000,6 +1009,15 @@ impl crate::engine::mailbox::PairSource for Pairs {
         let manifest = guard(&shared.relay.manifest);
         manifest.as_ref().map(|(_, envelope)| envelope.encode())
     }
+}
+
+/// Caller: the pair secret the host `pin` sent on `mousse-keys`.
+fn caller_pair_secret(shared: &Shared, pin: &IdentityPublicKey) -> Option<PairSecret> {
+    let key = hex(pin.as_bytes());
+    let file = shared.relay.files.peers().ok()?;
+    let entry = file.peers.iter().find(|p| p.identity == key)?;
+    let secret = Zeroizing::new(fixed::<32>(entry.pair_secret.as_deref()?)?);
+    Some(PairSecret::from_bytes(*secret))
 }
 
 // ---------------------------------------------------------------------------
@@ -1086,6 +1104,8 @@ pub async fn serve_keys(shared: Arc<Shared>, conn: Arc<Connection>, stream: MuxS
         writer.finish();
     }
     refresh_allow(&shared);
+    // The new pairing gets its directory slot and deposit token now.
+    shared.engine.mail_kick();
     // A join circuit becomes this caller's circuit, after the allow-set
     // that lists it (§B.7).
     let circuit = guard(&shared.relay.join_circuits).get(&conn.id()).cloned();
@@ -1314,6 +1334,7 @@ fn manifest_routes(shared: &Shared) -> Vec<ManifestRoute> {
             });
         }
     }
+    routes.extend(hosted::manifest_routes(shared));
     routes.truncate(MANIFEST_ROUTES_MAX);
     routes
 }
@@ -1387,28 +1408,36 @@ pub async fn read_manifest(shared: Arc<Shared>, pin: IdentityPublicKey, stream: 
         return;
     };
     writer.finish();
-    let manifest = match Envelope::decode(&bytes)
+    take_manifest(&shared, &pin, &bytes);
+}
+
+/// Caller: keep `bytes`, a manifest from the session or from the host's
+/// directory slot, if the pinned host signed it and it is newer than the
+/// one kept. Returns whether it was kept.
+fn take_manifest(shared: &Shared, pin: &IdentityPublicKey, bytes: &[u8]) -> bool {
+    let pin = *pin;
+    let manifest = match Envelope::decode(bytes)
         .map_err(|e| e.to_string())
         .and_then(|env| Manifest::open(&env, &pin).map_err(|e| e.to_string()))
     {
         Ok(m) => m,
         Err(e) => {
             applog::line(format!("refused a manifest from {}: {e}", short_id(&pin)));
-            return;
+            return false;
         }
     };
     let mut newer = false;
     let mut before = None;
-    let _ = update_peer(&shared, &pin, |p| {
+    let _ = update_peer(shared, &pin, |p| {
         if manifest.sequence > p.sequence {
             before = stored_manifest(p, &pin);
             p.sequence = manifest.sequence;
-            p.manifest = Some(hex(&bytes));
+            p.manifest = Some(hex(bytes));
             newer = true;
         }
     });
     if !newer {
-        return;
+        return false;
     }
     if cfg!(mousse_control = "prompt-on-key-change") {
         // The control build treats a new relay key or handle at an
@@ -1420,7 +1449,7 @@ pub async fn read_manifest(shared: Arc<Shared>, pin: IdentityPublicKey, stream: 
         for r in &manifest.routes {
             if !known.contains(&r.handle) {
                 for e in &r.endpoints {
-                    let _ = remove_approval(&shared, &hex(pin.as_bytes()), &e.destination());
+                    let _ = remove_approval(shared, &hex(pin.as_bytes()), &e.destination());
                 }
             }
         }
@@ -1429,7 +1458,7 @@ pub async fn read_manifest(shared: Arc<Shared>, pin: IdentityPublicKey, stream: 
     for r in &manifest.routes {
         for e in &r.endpoints {
             let destination = e.destination();
-            if !approved(&shared, &pin, &destination) && !offered.contains(&destination) {
+            if !approved(shared, &pin, &destination) && !offered.contains(&destination) {
                 offered.push(destination);
             }
         }
@@ -1446,6 +1475,7 @@ pub async fn read_manifest(shared: Arc<Shared>, pin: IdentityPublicKey, stream: 
             "destination": destination,
         }));
     }
+    true
 }
 
 fn manifest_json(m: &Manifest) -> Value {

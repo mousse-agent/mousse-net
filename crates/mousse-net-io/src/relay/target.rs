@@ -1,17 +1,19 @@
-//! A target's registration on one relay (§B.4, §B.5, §B.8).
+//! A target's registration on one relay (§B.4, §B.5, §B.8, §B.10).
 //!
 //! [`TargetLink::register`] proves the registration key on a fresh outer
-//! connection (`REGISTER`, or `ENROLL` with a code from an enrollment
-//! link). [`TargetLink::run`] then keeps it: it pushes the allow-set at
-//! once and on every change, answers and sends keepalives, and for each
-//! `INCOMING` opens an accept leg on a new connection, signed by the
-//! registration key, and hands the spliced pipe out.
+//! connection (`REGISTER`, `REGISTER` with an admission token on a hosted
+//! relay, or `ENROLL` with a code from an enrollment link).
+//! [`TargetLink::run`] then keeps it: it pushes the allow-set at once and
+//! on every change, answers and sends keepalives, for each `INCOMING` opens
+//! an accept leg on a new connection, signed by the registration key, and
+//! hands the spliced pipe out. On a hosted relay it also sends `LEASE`,
+//! `RELEASE` and `ADMIT` and reports `LEASE_STATUS`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use mousse_net_core::relay::msg::InvitationEntry;
+use mousse_net_core::relay::msg::{InvitationEntry, LeaseStatusEntry};
 use mousse_net_core::relay::{Class, RelayClientKey, RelayId, RelayMessage};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
@@ -35,6 +37,12 @@ pub enum TargetCommand {
     Promote { circuit: [u8; 16], caller: [u8; 32] },
     /// Vouch for a new registration key (self mode, §B.4).
     Successor { new_key: Arc<RelayClientKey> },
+    /// `LEASE` with a signed block (hosted, §B.10).
+    Lease(Vec<u8>),
+    /// `RELEASE` these leases (hosted, §B.10).
+    Release(Vec<[u8; 16]>),
+    /// `ADMIT` with a renewed admission token (hosted, §B.4).
+    Admit(Vec<u8>),
 }
 
 /// What a live registration reports.
@@ -55,6 +63,8 @@ pub enum TargetEvent {
         circuit: [u8; 16],
         error: RelayError,
     },
+    /// A hosted relay's `LEASE_STATUS` (§B.10).
+    LeaseStatus(Vec<LeaseStatusEntry>),
 }
 
 /// Allow-set sequences grow for the life of the process and start from the
@@ -85,12 +95,20 @@ fn allow_message(set: AllowSet) -> RelayMessage {
 }
 
 /// How a registration is proved.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum Proof {
     /// `REGISTER`: the key is already authorized.
     Register,
     /// `ENROLL` with a single-use code from an enrollment link.
     Enroll([u8; 16]),
+    /// `REGISTER` on a hosted relay: the admission token for this handle,
+    /// and the lease use (percent) at which the relay sends `LEASE_STATUS`.
+    Hosted {
+        /// The signed admission token envelope.
+        token: Vec<u8>,
+        /// The status threshold, percent.
+        threshold: u8,
+    },
 }
 
 /// One live registration connection.
@@ -128,6 +146,11 @@ impl TargetLink {
                 key: key.public_key(),
                 proof: signed,
                 hosted: None,
+            },
+            Proof::Hosted { token, threshold } => RelayMessage::Register {
+                key: key.public_key(),
+                proof: signed,
+                hosted: Some((token, threshold)),
             },
             Proof::Enroll(code) => RelayMessage::Enroll {
                 key: key.public_key(),
@@ -172,6 +195,11 @@ impl TargetLink {
     /// The relay's identity key, from its pinned certificate.
     pub fn relay_key(&self) -> Option<mousse_net_core::identity::PublicKey> {
         self.link.relay_key()
+    }
+
+    /// The relay's boot (`RELAY_HELLO`): blocks name it (§B.10).
+    pub fn boot_id(&self) -> [u8; 16] {
+        self.link.boot_id()
     }
 
     /// Keep the registration until it ends; returns why. The allow-set is
@@ -231,6 +259,9 @@ impl TargetLink {
                                 current_proof: self.key.successor_proof(&self.relay, &new_public, &binding),
                             }
                         }
+                        Some(TargetCommand::Lease(block)) => RelayMessage::Lease { block },
+                        Some(TargetCommand::Release(leases)) => RelayMessage::Release { leases },
+                        Some(TargetCommand::Admit(token)) => RelayMessage::Admit { token },
                     };
                     if let Err(e) = self.link.send(&msg).await {
                         return e;
@@ -264,8 +295,9 @@ impl TargetLink {
                             ));
                         }
                         Ok(RelayMessage::Refused { reason }) => return RelayError::Refused(reason),
-                        // Hosted-mode status is for Phase 4's client.
-                        Ok(RelayMessage::LeaseStatus { .. }) => {}
+                        Ok(RelayMessage::LeaseStatus { entries }) => {
+                            let _ = events.send(TargetEvent::LeaseStatus(entries));
+                        }
                         Ok(other) => {
                             return RelayError::Protocol(format!(
                                 "unexpected relay message {}",
