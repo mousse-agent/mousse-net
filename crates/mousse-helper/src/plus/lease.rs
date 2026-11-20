@@ -114,6 +114,33 @@ impl Book {
         self.funded = funded;
     }
 
+    /// Blocks this handle held before a restart or a dropped registration,
+    /// on the same relay boot: the relay still holds them, so they are not
+    /// presented again, but they count for prefetch and are named in
+    /// `RELEASE`. Each class's oldest is current, the next pending.
+    pub fn adopt(&mut self, mut blocks: Vec<Block>) {
+        blocks.sort_by_key(|b| (b.class, b.sequence));
+        for block in blocks {
+            let c = self.class(block.class);
+            let held = Held { block, used: 0 };
+            if c.current.is_none() {
+                c.current = Some(held);
+            } else if c.pending.is_none() {
+                c.pending = Some(held);
+            }
+        }
+    }
+
+    /// The signed blocks held now (current and pending), to keep on disk.
+    pub fn held_envelopes(&self) -> Vec<Vec<u8>> {
+        self.classes
+            .iter()
+            .flat_map(|c| [&c.current, &c.pending])
+            .flatten()
+            .map(|h| h.block.envelope.clone())
+            .collect()
+    }
+
     fn class(&mut self, class: Class) -> &mut ClassBook {
         &mut self.classes[idx(class)]
     }
@@ -437,14 +464,31 @@ pub async fn run(
     events: mpsc::UnboundedSender<Json>,
     clock: Arc<dyn mousse_net_io::Clock>,
 ) {
-    run_funded(plus, reg, true, relay, commands, events, clock).await
+    let held = HeldBlocks {
+        adopted: Vec::new(),
+        keep: Box::new(|_| {}),
+    };
+    run_funded(plus, reg, true, held, relay, commands, events, clock).await
 }
 
-/// [`run`], starting funded or not (a staged relay, an older handle).
+/// What a driver starts with and where it keeps its blocks: the blocks of
+/// an earlier run on this boot, and a sink called with the held blocks'
+/// envelopes whenever they change (so a restart can still release them).
+pub struct HeldBlocks {
+    /// Blocks held before, on this relay boot.
+    pub adopted: Vec<Block>,
+    /// Called with the held envelopes after every change.
+    pub keep: Box<dyn Fn(Vec<Vec<u8>>) + Send + Sync>,
+}
+
+/// [`run`], starting funded or not (a staged relay, an older handle), with
+/// the blocks held before.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_funded(
     plus: Arc<Plus>,
     reg: Registration,
     funded: bool,
+    held: HeldBlocks,
     mut relay: mpsc::UnboundedReceiver<RelayEvent>,
     commands: mpsc::UnboundedSender<RelayCommand>,
     events: mpsc::UnboundedSender<Json>,
@@ -452,6 +496,9 @@ pub async fn run_funded(
 ) {
     let mut book = Book::new();
     book.set_funded(funded);
+    book.adopt(held.adopted);
+    let mut kept = book.held_envelopes();
+    (held.keep)(kept.clone());
     let (got, mut blocks) = mpsc::unbounded_channel::<(Class, Result<Block, Failure>)>();
     let mut tick = tokio::time::interval(ms(helper().plus_not_before_retry_ms()));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -462,6 +509,11 @@ pub async fn run_funded(
         .map(Action::Request)
         .collect();
     loop {
+        let now_held = book.held_envelopes();
+        if now_held != kept {
+            (held.keep)(now_held.clone());
+            kept = now_held;
+        }
         for action in std::mem::take(&mut actions) {
             match action {
                 Action::Present(block) => {
@@ -504,6 +556,7 @@ pub async fn run_funded(
                         let _ = commands.send(RelayCommand::Release(ids.to_vec()));
                     }
                     book.released();
+                    (held.keep)(Vec::new());
                     return;
                 }
                 Some(RelayEvent::Closed) | None => return,

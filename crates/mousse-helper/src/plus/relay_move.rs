@@ -44,7 +44,9 @@ pub enum MoveAction {
     DropOldRoute,
     /// Tell the app: relayed calls pause until the new relay is funded.
     Interrupted,
-    /// Tell the app: the move is done.
+    /// Tell the app: the move is done. (The hosted client says so itself
+    /// once no other relay holds blocks.)
+    #[cfg(test)]
     Done([u8; 32]),
 }
 
@@ -61,6 +63,14 @@ impl RelayMove {
         Self {
             stage_secs,
             state: MoveState::Idle,
+        }
+    }
+
+    /// A move staged before a restart, from what was kept on disk.
+    pub fn resume(stage_secs: u64, to: [u8; 32], since: u64) -> Self {
+        Self {
+            stage_secs,
+            state: MoveState::Staged { to, since },
         }
     }
 
@@ -104,6 +114,7 @@ impl RelayMove {
     }
 
     /// The first block on the new relay arrived.
+    #[cfg(test)]
     pub fn funded(&mut self) -> Vec<MoveAction> {
         match self.state {
             MoveState::CuttingOver { to, .. } => {

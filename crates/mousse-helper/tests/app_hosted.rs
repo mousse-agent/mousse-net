@@ -40,12 +40,45 @@ fn manual_clock() -> [(&'static str, &'static Path); 1] {
 
 /// A helper on `end` with Plus at `url` (and the manual clock if asked).
 fn app(end: &Endpoint, name: &str, url: &str, clock: bool, extra: &[(&str, &str)]) -> App {
+    let raw: &[(&str, &Path)] = if clock { &manual_clock() } else { &[] };
+    app_raw(end, name, url, raw, extra)
+}
+
+fn app_raw(
+    end: &Endpoint,
+    name: &str,
+    url: &str,
+    raw: &[(&str, &Path)],
+    extra: &[(&str, &str)],
+) -> App {
     let mut env: Vec<(&str, &str)> = FAST.to_vec();
     env.push(("PLUS_URL", url));
     env.extend_from_slice(extra);
-    let raw: &[(&str, &Path)] = if clock { &manual_clock() } else { &[] };
     let mut a = end.app_raw(name, &env, 0, raw);
     a.hello();
+    a
+}
+
+/// A linked host on `a_end`, funded on relay 0.
+fn funded_host(
+    fleet: &Fleet,
+    a_end: &Endpoint,
+    raw: &[(&str, &Path)],
+    extra: &[(&str, &str)],
+) -> App {
+    let mut a = app_raw(a_end, "hostA", &fleet.plus.url(), raw, extra);
+    link(&mut a, fleet);
+    fleet.until("a handle admitted on relay 0", |f| {
+        f.handles_on(0).len() == 1
+    });
+    fleet.until("blocks of both classes", |f| {
+        let l = f.leases_on(0);
+        l.iter().any(|x| x.2 == 0) && l.iter().any(|x| x.2 == 1)
+    });
+    // ...and the helper holds both (it keeps them on disk as they come).
+    a.event("plus.relay", |m| {
+        m["interactive"]["state"] == "funded" && m["bulk"]["state"] == "funded"
+    });
     a
 }
 
@@ -114,7 +147,9 @@ fn dial_up(from: &mut App, to: &str) -> Value {
         if let Some(conn) = reply["conn"].as_u64() {
             return from.event("conn.up", |m| m["conn"] == conn);
         }
-        assert!(start.elapsed() < WAIT * 2, "dial never worked: {reply}");
+        // Each try waits out the local routes first; a busy machine needs
+        // several, and a slot is read at most every PLUS_SLOT_READ_SECS.
+        assert!(start.elapsed() < WAIT * 3, "dial never worked: {reply}");
         std::thread::sleep(Duration::from_millis(200));
     }
 }
@@ -301,4 +336,89 @@ fn mailbox_an_offline_caller_finds_the_rotated_route_in_its_directory_slot() {
         sequence(&mut b, &host) > seq,
         "the slot's manifest was kept"
     );
+}
+
+#[test]
+fn plus_hosted_a_restart_within_the_stage_still_cuts_over() {
+    let fleet = Fleet::start(2);
+    let stage = [("VIA_RELAY_MOVE_STAGE_SECS", "86400")];
+    let a_end = Endpoint::init("hrsa");
+    let mut a = funded_host(&fleet, &a_end, &manual_clock(), &stage);
+    // Relay 0 leaves the fleet: relay 1 is staged.
+    fleet.list(&[1]);
+    a.call("test.clock", json!({"advance_secs": 3_600}));
+    fleet.until("relay 1 staged", |f| f.handles_on(1).len() == 1);
+    assert!(
+        fleet.leases_on(1).is_empty(),
+        "a staged relay is not funded"
+    );
+    // A restart within the stage window (the clock starts again from now).
+    a.kill();
+    let mut a = app_raw(&a_end, "hostA", &fleet.plus.url(), &manual_clock(), &stage);
+    a.call("test.clock", json!({"advance_secs": 3_600 + 86_400 + 60}));
+    // The cutover still comes: relay 0's blocks, from before the restart,
+    // are released, and then relay 1 is funded.
+    fleet.until("relay 0's blocks final", |f| {
+        f.leases_on(0).iter().all(|l| l.3)
+    });
+    fleet.until("blocks on relay 1", |f| !f.leases_on(1).is_empty());
+}
+
+#[test]
+fn plus_hosted_a_crash_just_after_the_cutover_still_releases_the_old_relay_first() {
+    let fleet = Fleet::start(2);
+    let stage = [("VIA_RELAY_MOVE_STAGE_SECS", "0")];
+    let a_end = Endpoint::init("hcca");
+    let hooked = [
+        ("MOUSSE_HELPER_MANUAL_CLOCK", Path::new("1")),
+        ("MOUSSE_HELPER_TEST_EXIT_AT_CUTOVER", Path::new("1")),
+    ];
+    let mut a = funded_host(&fleet, &a_end, &hooked, &stage);
+    fleet.list(&[1]);
+    a.call("test.clock", json!({"advance_secs": 3_600}));
+    // The helper stops right after the cutover is on disk, before any
+    // RELEASE: relay 0 still holds its blocks.
+    assert!(a.exit_within(WAIT).is_some(), "the cutover never came");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(fleet.leases_on(0).iter().any(|l| !l.3));
+    assert!(fleet.leases_on(1).is_empty());
+    // After the restart the old relay's blocks are released first; only
+    // then is relay 1 funded.
+    let _a = app_raw(&a_end, "hostA", &fleet.plus.url(), &manual_clock(), &stage);
+    fleet.until("relay 0's blocks final", |f| {
+        f.leases_on(0).iter().all(|l| l.3)
+    });
+    fleet.until("blocks on relay 1", |f| !f.leases_on(1).is_empty());
+}
+
+#[test]
+fn plus_hosted_after_a_restart_the_overlap_end_releases_the_old_handle_s_blocks() {
+    let fleet = Fleet::start(1);
+    let overlap = [
+        ("HANDLE_ROTATE_SECS", "172800"),
+        ("MANIFEST_OVERLAP_SECS", "86400"),
+    ];
+    let a_end = Endpoint::init("hroa");
+    let mut a = funded_host(&fleet, &a_end, &manual_clock(), &overlap);
+    let first = fleet.handles_on(0)[0];
+    a.call("test.clock", json!({"advance_secs": 172_800}));
+    fleet.until("a second handle admitted", |f| f.handles_on(0).len() == 2);
+    let new = *fleet.handles_on(0).iter().find(|h| **h != first).unwrap();
+    fleet.until("blocks for the new handle", |f| {
+        f.leases_on(0).iter().any(|l| l.1 == new)
+    });
+    // A restart in the overlap: the old handle's blocks are on disk.
+    a.kill();
+    let mut a = app_raw(
+        &a_end,
+        "hostA",
+        &fleet.plus.url(),
+        &manual_clock(),
+        &overlap,
+    );
+    a.call("test.clock", json!({"advance_secs": 172_800 + 86_400 + 60}));
+    fleet.until("the old handle's blocks final", |f| {
+        f.leases_on(0).iter().filter(|l| l.1 == first).all(|l| l.3)
+    });
+    assert!(fleet.leases_on(0).iter().any(|l| l.1 == new && !l.3));
 }

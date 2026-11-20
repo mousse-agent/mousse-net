@@ -489,37 +489,28 @@ async fn removal_nine_by_mail_reach_an_offline_host_past_a_device_filling_the_in
     }
     w.mail.sync(&w.host_plus, &*w.pairs).await.unwrap();
     let inbox = w.mail.inbox_id().unwrap();
-    // The inbox holds 12; one pairing at most 3 (A.6).
-    w.standin.set_inbox_quota(12);
-    w.standin.set_tag_quota(3);
+    // The inbox holds 18; one pairing at most 9 (A.6).
+    w.standin.set_inbox_quota(18);
+    w.standin.set_tag_quota(9);
     // A device deposits junk with its own token until Plus refuses it.
     let mut junk = 0;
-    for _ in 0..20 {
+    for _ in 0..30 {
         match deposit(&w.admin_plus, &inbox, &phone_secret(), b"junk").await {
             Ok(_) => junk += 1,
             Err(_) => break,
         }
     }
-    assert!(junk <= 3, "one pairing filled {junk} places");
-    // The admin device's nine removals all fit, while the host is offline.
+    assert!(junk <= 9, "one pairing filled {junk} places");
+    // The host stays offline through all nine of the admin device's
+    // removals: every one is deposited and waits.
     let secret = admin_secret(&w);
-    let mut sent = 0;
     for (n, (key, grant)) in devices.iter().enumerate() {
         let env = removal_of(&w, *key, *grant, 100 + n as u8);
-        match deposit(&w.admin_plus, &inbox, &secret, &env).await {
-            Ok(_) => sent += 1,
-            Err(e) => panic!("removal {n} not deposited: {e}"),
-        }
-        if sent == 3 {
-            // A pairing's own quota: the host fetches between batches, as
-            // its poll does, and the rest follow.
-            w.mail
-                .poll(&w.host_plus, &w.engine, &*w.pairs)
-                .await
-                .unwrap();
-            sent = 0;
+        if let Err(e) = deposit(&w.admin_plus, &inbox, &secret, &env).await {
+            panic!("removal {n} not deposited: {e}");
         }
     }
+    // The host comes back and fetches once: all nine arrive.
     w.mail
         .poll(&w.host_plus, &w.engine, &*w.pairs)
         .await

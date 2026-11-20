@@ -51,7 +51,7 @@ use super::super::relay_store::{fixed, OldKey};
 use super::{guard, limits, now, resolve, Run, Shared};
 use crate::applog;
 use crate::plus::lease::{self, Registration, RelayCommand, RelayEvent, StatusEntry};
-use crate::plus::proto::{AdmissionToken, Class};
+use crate::plus::proto::{AdmissionToken, Block, Class};
 use crate::plus::relay_move::{MoveAction, RelayMove};
 use crate::plus::{Failure, Plus};
 
@@ -88,6 +88,100 @@ struct HostedFile {
     /// A move's new relay, while staged.
     #[serde(default)]
     staged: Option<HostedRelay>,
+    /// The staged move (the new relay's id and when staging began), so a
+    /// restart within the stage window still cuts over.
+    #[serde(default)]
+    moving: Option<MoveRecord>,
+}
+
+/// A staged relay move, as kept on disk.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct MoveRecord {
+    /// The new relay's id (hex).
+    to: String,
+    /// When staging began.
+    since: u64,
+}
+
+/// The hosted relays' held blocks and admission tokens, by registration
+/// salt, in the endpoint's folder: what a restart needs to `RELEASE` blocks
+/// from before it and to count them for prefetch.
+pub const HOSTED_LEASES_FILE: &str = "hosted-leases.json";
+
+/// One handle's held blocks.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct LeaseEntry {
+    /// The relay (id, key and endpoints), to register there again.
+    relay: String,
+    relay_key: String,
+    endpoints: Vec<String>,
+    /// The relay boot the blocks name (hex).
+    #[serde(default)]
+    boot: String,
+    /// The last admission token (hex): a handle holding a usable block may
+    /// register again with it, also past its window (A.9 duty 10).
+    #[serde(default)]
+    token: Option<String>,
+    /// The held blocks' signed envelopes (hex).
+    #[serde(default)]
+    blocks: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct LeasesFile {
+    version: u32,
+    #[serde(default)]
+    handles: std::collections::BTreeMap<String, LeaseEntry>,
+}
+
+/// Read-change-write steps on the leases file run one at a time.
+static LEASES_IO: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn leases_path(shared: &Shared) -> std::path::PathBuf {
+    shared.info.state_dir.join(HOSTED_LEASES_FILE)
+}
+
+fn leases_load(shared: &Shared) -> LeasesFile {
+    std::fs::read(leases_path(shared))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+fn leases_update(shared: &Shared, change: impl FnOnce(&mut LeasesFile)) {
+    let _io = LEASES_IO.lock().unwrap_or_else(|e| e.into_inner());
+    let mut file = leases_load(shared);
+    change(&mut file);
+    file.version = 1;
+    match serde_json::to_vec(&file) {
+        Ok(bytes) => {
+            if let Err(e) = write_atomic(&leases_path(shared), &bytes) {
+                applog::line(format!("hosted relays: saving held blocks failed: {e}"));
+            }
+        }
+        Err(e) => applog::line(format!("hosted relays: {e}")),
+    }
+}
+
+/// The blocks of `entry` still usable (not past their expiry, wall time).
+fn live_blocks(entry: &LeaseEntry) -> Vec<Block> {
+    let t = crate::peer::now_secs();
+    entry
+        .blocks
+        .iter()
+        .filter_map(|h| unhex(h).ok())
+        .filter_map(|e| Block::parse(&e).ok())
+        .filter(|b| b.expires_at > t)
+        .collect()
+}
+
+fn entry_for(relay: &HostedRelay) -> LeaseEntry {
+    LeaseEntry {
+        relay: relay.relay.clone(),
+        relay_key: relay.relay_key.clone(),
+        endpoints: relay.endpoints.clone(),
+        ..LeaseEntry::default()
+    }
 }
 
 /// What a registration does with blocks.
@@ -122,9 +216,9 @@ pub struct Runtime {
     /// Read the fleet again at the next step (a registration failed).
     refresh: bool,
     moving: Option<RelayMove>,
-    /// The home relay waits for these old relays' runs to end before Plus
-    /// funds it (A.8: one funded relay).
-    fund_after: Option<String>,
+    /// The home relay was waiting for another relay's blocks to be
+    /// released (to say "moved" once it no longer waits).
+    funding_waited: bool,
     /// When each host's slot was last read (caller side).
     slot_reads: HashMap<String, u64>,
 }
@@ -308,12 +402,24 @@ async fn step(shared: &Arc<Shared>, plus: &Arc<Plus>) {
     let h = limits();
     let mut file = load(shared);
     let before = file.clone_parts();
-    let mut releases: Vec<String> = Vec::new();
     let mut events = Vec::new();
+    let mut cut_over = false;
     {
         let mut rt = guard(&shared.relay.hosted);
         if file.home.is_none() {
             file.home = fleet.first().map(|f| new_relay(f, t));
+        }
+        // A move staged before a restart carries on where it was.
+        if rt.moving.is_none() {
+            if let (Some(m), Some(_)) = (&file.moving, &file.staged) {
+                if let Some(to) = fixed::<32>(&m.to) {
+                    rt.moving = Some(RelayMove::resume(
+                        h.via_relay_move_stage_secs(),
+                        to,
+                        m.since,
+                    ));
+                }
+            }
         }
         // The home relay left the fleet: stage the first other one.
         if let Some(home) = &file.home {
@@ -323,14 +429,15 @@ async fn step(shared: &Arc<Shared>, plus: &Arc<Plus>) {
                     let staged = new_relay(next, t);
                     let mut mv = RelayMove::new(h.via_relay_move_stage_secs());
                     let to = fixed::<32>(&staged.relay).unwrap_or_default();
-                    for action in mv.staged(to, t) {
-                        if let MoveAction::FundNew(_) = action {
-                            // Only the fund-two-relays control asks for this
-                            // while the old relay still holds blocks.
-                            rt.fund_after = None;
-                        }
-                    }
+                    // Staging funds nothing (only the fund-two-relays
+                    // control's unit test asks otherwise): the home relay
+                    // is funded only once no other relay holds blocks.
+                    let _ = mv.staged(to, t);
                     rt.moving = Some(mv);
+                    file.moving = Some(MoveRecord {
+                        to: staged.relay.clone(),
+                        since: t,
+                    });
                     file.staged = Some(staged);
                 }
             }
@@ -344,22 +451,29 @@ async fn step(shared: &Arc<Shared>, plus: &Arc<Plus>) {
         if let (Some(home), Some(mv)) = (file.home.clone(), rt.moving.as_mut()) {
             for action in mv.tick(t, !home_live) {
                 match action {
-                    MoveAction::ReleaseOld => {
-                        releases.push(home.salt.clone());
-                        releases.extend(home.old.iter().map(|o| o.salt.clone()));
-                    }
+                    // The old relay's handles are no longer wanted: their
+                    // registrations release what they hold (kept on disk,
+                    // so a restart now still releases it) and end.
+                    MoveAction::ReleaseOld => {}
                     MoveAction::DropOldRoute => {
                         if let Some(mut staged) = file.staged.take() {
                             staged.since = t;
                             file.home = Some(staged);
                         }
+                        file.moving = None;
+                        cut_over = true;
                     }
                     MoveAction::Interrupted => {
                         events.push(json!({"ev": "plus.relay.moving", "from": home.relay}));
                     }
-                    MoveAction::FundNew(_) => rt.fund_after = Some(home.relay.clone()),
+                    // Funded once no other relay holds blocks (below).
+                    MoveAction::FundNew(_) => {}
+                    #[cfg(test)]
                     MoveAction::Done(_) => {}
                 }
+            }
+            if cut_over {
+                rt.moving = None;
             }
         }
         // Rotation, and the end of old handles' overlaps.
@@ -372,49 +486,105 @@ async fn step(shared: &Arc<Shared>, plus: &Arc<Plus>) {
                 });
                 home.since = t;
             }
-            for o in home.old.iter().filter(|o| o.until <= t) {
-                releases.push(o.salt.clone());
-            }
+            // Overlap over: the old handle leaves the manifest; its
+            // registration releases what it holds and ends.
             home.old.retain(|o| o.until > t);
-        }
-        // Plus funds the new relay only once the old relay's runs ended
-        // (their `RELEASE` sent), so one relay holds blocks at a time.
-        if let Some(old) = rt.fund_after.clone() {
-            let old_running = rt.roles.values().any(|(relay, _)| *relay == old);
-            if !old_running {
-                rt.fund_after = None;
-                if let Some(mv) = rt.moving.as_mut() {
-                    for action in mv.funded() {
-                        if let MoveAction::Done(_) = action {
-                            events.push(json!({"ev": "plus.relay.moved"}));
-                        }
-                    }
-                }
-                rt.moving = None;
-            }
         }
     }
     if file.clone_parts() != before {
         save(shared, &file);
     }
+    if cut_over
+        && cfg!(debug_assertions)
+        && std::env::var("MOUSSE_HELPER_TEST_EXIT_AT_CUTOVER").as_deref() == Ok("1")
+    {
+        // Debug-build test hook: stop as a crash would, right after the
+        // cutover is on disk and before any `RELEASE` is sent.
+        applog::line("test hook: exiting at the cutover");
+        std::process::exit(0);
+    }
     for e in events {
         shared.event(e);
     }
-    ensure_runs(shared, plus, &file, &releases);
+    ensure_runs(shared, plus, &file);
     super::rebuild_manifest(shared);
 }
 
 impl HostedFile {
-    fn clone_parts(&self) -> (Option<HostedRelay>, Option<HostedRelay>) {
-        (self.home.clone(), self.staged.clone())
+    fn clone_parts(&self) -> (Option<HostedRelay>, Option<HostedRelay>, Option<MoveRecord>) {
+        (self.home.clone(), self.staged.clone(), self.moving.clone())
     }
 }
 
-/// Start the registrations that should run and give each its role; those
-/// in `releases` (and any no longer wanted) release and end.
-fn ensure_runs(shared: &Arc<Shared>, plus: &Arc<Plus>, file: &HostedFile, releases: &[String]) {
+/// The salts a hosted run is wanted for now: the home relay's current and
+/// overlapping handles and a staged relay's.
+fn wanted_salts(file: &HostedFile) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(home) = &file.home {
+        out.push(home.salt.clone());
+        out.extend(home.old.iter().map(|o| o.salt.clone()));
+    }
+    if let Some(staged) = &file.staged {
+        out.push(staged.salt.clone());
+    }
+    out
+}
+
+/// Start the registrations that should run and give each its role. A
+/// handle no longer wanted that still holds blocks (an old relay after a
+/// cutover, an old handle after its overlap, also from before a restart)
+/// registers to `RELEASE` them; any other run no longer wanted releases
+/// and ends. The home relay is funded only once no other relay holds
+/// blocks (A.8: one funded relay).
+fn ensure_runs(shared: &Arc<Shared>, plus: &Arc<Plus>, file: &HostedFile) {
+    let wanted_now = wanted_salts(file);
+    let leases = leases_load(shared);
+    // Forget handles that hold nothing and are not wanted.
+    let gone: Vec<String> = leases
+        .handles
+        .iter()
+        .filter(|(salt, e)| !wanted_now.contains(salt) && live_blocks(e).is_empty())
+        .map(|(salt, _)| salt.clone())
+        .collect();
+    if !gone.is_empty() {
+        let running: HashSet<String> = guard(&shared.relay.hosted).roles.keys().cloned().collect();
+        leases_update(shared, |f| {
+            for salt in &gone {
+                if !running.contains(salt) {
+                    f.handles.remove(salt);
+                }
+            }
+        });
+    }
+    let home_relay = file.home.as_ref().map(|h| h.relay.clone());
+    let others_hold = leases.handles.iter().any(|(salt, e)| {
+        !wanted_now.contains(salt)
+            && Some(&e.relay) != home_relay.as_ref()
+            && !live_blocks(e).is_empty()
+    });
+    {
+        let mut rt = guard(&shared.relay.hosted);
+        if rt.funding_waited && !others_hold {
+            shared.event(json!({"ev": "plus.relay.moved"}));
+        }
+        rt.funding_waited = others_hold;
+    }
     let mut wanted: Vec<(HostedRelay, String, Role)> = Vec::new();
-    let funding_waits = guard(&shared.relay.hosted).fund_after.is_some();
+    let funding_waits = others_hold;
+    for (salt, e) in &leases.handles {
+        if !wanted_now.contains(salt) && !live_blocks(e).is_empty() {
+            let relay = HostedRelay {
+                relay: e.relay.clone(),
+                relay_key: e.relay_key.clone(),
+                endpoints: e.endpoints.clone(),
+                region: String::new(),
+                salt: salt.clone(),
+                since: 0,
+                old: Vec::new(),
+            };
+            wanted.push((relay, salt.clone(), Role::Release));
+        }
+    }
     if let Some(home) = &file.home {
         let role = if funding_waits {
             Role::Unfunded
@@ -433,10 +603,9 @@ fn ensure_runs(shared: &Arc<Shared>, plus: &Arc<Plus>, file: &HostedFile, releas
     {
         let rt = guard(&shared.relay.hosted);
         for (salt, (_, role)) in rt.roles.iter() {
-            let keep = wanted.iter().find(|(_, s, _)| s == salt);
-            let next = match keep {
-                Some((_, _, r)) if !releases.contains(salt) => *r,
-                _ => Role::Release,
+            let next = match wanted.iter().find(|(_, s, _)| s == salt) {
+                Some((_, _, r)) => *r,
+                None => Role::Release,
             };
             if *role.borrow() != Role::Release {
                 role.send_if_modified(|r| {
@@ -447,7 +616,7 @@ fn ensure_runs(shared: &Arc<Shared>, plus: &Arc<Plus>, file: &HostedFile, releas
             }
         }
         for (relay, salt, role) in wanted {
-            if !rt.roles.contains_key(&salt) && !releases.contains(&salt) {
+            if !rt.roles.contains_key(&salt) {
                 start.push((relay, salt, role));
             }
         }
@@ -508,15 +677,33 @@ async fn registration(
     let mut wait = first_wait;
     let reg_key = Arc::new(RelayClientKey::new(key.clone()));
     let id = fixed::<32>(&relay.relay).map(RelayId);
-    let mut token: Option<AdmissionToken> = None;
+    let kept = leases_load(&shared).handles.get(&salt).cloned();
+    let mut token: Option<AdmissionToken> = kept
+        .as_ref()
+        .and_then(|e| e.token.as_deref())
+        .and_then(|t| unhex(t).ok())
+        .and_then(|t| AdmissionToken::parse(&t).ok());
     while let Some(id) = id {
-        if *role.borrow() == Role::Release {
+        let releasing = *role.borrow() == Role::Release;
+        let holds = leases_load(&shared)
+            .handles
+            .get(&salt)
+            .is_some_and(|e| !live_blocks(e).is_empty());
+        if releasing && !holds {
             break;
         }
         let t = crate::peer::now_secs();
-        if token.as_ref().is_none_or(|tk| tk.not_after <= t) {
+        // A handle that holds a usable block may register with its token
+        // past the window (A.9 duty 10): enough to release.
+        let usable = token
+            .as_ref()
+            .is_some_and(|tk| tk.not_after > t || (releasing && holds));
+        if !usable {
             match plus.admission(&id.0, &key).await {
-                Ok(tk) => token = Some(tk),
+                Ok(tk) => {
+                    keep_token(&shared, &relay, &salt, &tk);
+                    token = Some(tk);
+                }
                 Err(e) => {
                     applog::line(format!("hosted relay: no admission token: {e}"));
                     let pause = e.retry_after().unwrap_or(wait);
@@ -543,7 +730,12 @@ async fn registration(
                 )
                 .await;
                 applog::line(format!("hosted relay registration ended: {end}"));
-                if *role.borrow() == Role::Release {
+                if *role.borrow() == Role::Release
+                    && leases_load(&shared)
+                        .handles
+                        .get(&salt)
+                        .is_none_or(|e| live_blocks(e).is_empty())
+                {
                     break;
                 }
                 // Closed unfunded past the token's window: a new token.
@@ -578,6 +770,17 @@ async fn registration(
             runs.remove(&relay.relay);
         }
     }
+}
+
+/// Keep `token` as `salt`'s last admission token.
+fn keep_token(shared: &Shared, relay: &HostedRelay, salt: &str, token: &AdmissionToken) {
+    leases_update(shared, |f| {
+        let e = f
+            .handles
+            .entry(salt.to_owned())
+            .or_insert_with(|| entry_for(relay));
+        e.token = Some(hex(&token.envelope));
+    });
 }
 
 async fn register(
@@ -667,10 +870,39 @@ async fn hold(
     let (lease_tx, lease_rx) = mpsc::unbounded_channel();
     let (lcmd_tx, mut lcmd_rx) = mpsc::unbounded_channel();
     let now_role = *role.borrow_and_update();
+    let boot = hex(&reg.boot_id);
+    // Blocks held before (a restart, a dropped registration) on this boot
+    // are still the relay's; on another boot it finalized them at its stop.
+    let adopted = leases_load(shared)
+        .handles
+        .get(salt)
+        .filter(|e| e.boot == boot)
+        .map(live_blocks)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|b| b.boot_id == reg.boot_id && b.handle == reg.handle)
+        .collect();
+    let keep = {
+        let shared = shared.clone();
+        let relay = relay.clone();
+        let salt = salt.to_owned();
+        let boot = boot.clone();
+        Box::new(move |blocks: Vec<Vec<u8>>| {
+            leases_update(&shared, |f| {
+                let e = f
+                    .handles
+                    .entry(salt.clone())
+                    .or_insert_with(|| entry_for(&relay));
+                e.boot = boot.clone();
+                e.blocks = blocks.iter().map(|b| hex(b)).collect();
+            });
+        })
+    };
     tokio::spawn(lease::run_funded(
         plus.clone(),
         reg,
         now_role == Role::Funded,
+        lease::HeldBlocks { adopted, keep },
         lease_rx,
         lcmd_tx,
         shared.engine.events(),
@@ -763,6 +995,7 @@ async fn hold(
                     Ok(tk) => {
                         let _ = cmd_tx.send(TargetCommand::Admit(tk.envelope.clone()));
                         renew_at = tokio::time::Instant::now() + renew_in(&tk);
+                        keep_token(shared, relay, salt, &tk);
                         *token = Some(tk);
                     }
                     Err(e) => {
