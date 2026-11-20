@@ -269,9 +269,14 @@ fn dechunk(mut rest: &[u8], answer_max: usize) -> Result<Option<Vec<u8>>, CallEr
         if size == 0 {
             return Ok(Some(out));
         }
-        if out.len() + size > answer_max {
+        if out
+            .len()
+            .checked_add(size)
+            .is_none_or(|total| total > answer_max)
+        {
             return Err(CallError::BadAnswer("answer too large"));
         }
+        // Within the answer cap, so `size + 2` cannot overflow.
         if rest.len() < size + 2 {
             return Ok(None);
         }
@@ -303,6 +308,24 @@ mod tests {
             Some((409, b"abc".to_vec()))
         );
         assert_eq!(parse_response(&raw[..raw.len() - 5], 100).unwrap(), None);
+    }
+
+    #[test]
+    fn a_huge_chunk_size_is_refused_not_overflowed() {
+        for size in ["ffffffffffffffff", "fffffffffffffffe", "10001"] {
+            let raw = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{size}\r\nab");
+            assert!(
+                matches!(
+                    parse_response(raw.as_bytes(), 65_536),
+                    Err(CallError::BadAnswer("answer too large"))
+                ),
+                "{size}"
+            );
+        }
+        // A second chunk that would push the total over the cap.
+        let raw =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nab\r\nffffffffffffffff\r\n";
+        assert!(parse_response(raw, 65_536).is_err());
     }
 
     #[test]

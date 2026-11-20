@@ -73,6 +73,8 @@ struct State {
     down: bool,
     /// Wait this long before answering.
     delay_ms: u64,
+    /// Answer boot announcements with 200 and a body that is not CBOR.
+    bad_boot_answer: bool,
 }
 
 /// The stand-in. Dropping it stops its listener.
@@ -171,6 +173,11 @@ impl TestIssuerStandIn {
     /// Fail every request until set back.
     pub fn set_down(&self, down: bool) {
         self.state.lock().unwrap().down = down;
+    }
+
+    /// Answer boot announcements with 200 and an unreadable body.
+    pub fn set_bad_boot_answer(&self, bad: bool) {
+        self.state.lock().unwrap().bad_boot_answer = bad;
     }
 
     /// Wait `ms` before each answer.
@@ -337,6 +344,9 @@ fn open(body: &[u8], max: usize) -> Result<SignedEnvelope, (u16, Vec<u8>)> {
 fn boot(state: &Mutex<State>, body: Vec<u8>) -> (u16, Vec<u8>) {
     let mut s = state.lock().unwrap();
     s.boot_bodies.push(body.clone());
+    if s.bad_boot_answer {
+        return (200, b"not cbor".to_vec());
+    }
     let env = match open(&body, REQUEST_MAX) {
         Ok(e) => e,
         Err(e) => return e,

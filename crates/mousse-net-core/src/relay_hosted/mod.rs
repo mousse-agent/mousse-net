@@ -866,14 +866,17 @@ impl Hosted {
         if self.stopping {
             return Forward::Stopped;
         }
-        if len == 0 {
-            return Forward::Go;
-        }
         self.expire(now);
         let key = (handle, class);
         let slot = self.slots.entry(key).or_default();
         if slot.current.is_none() {
             slot.current = slot.pending.take();
+        }
+        // A paused class forwards nothing until a LEASE resumes it or its
+        // refill wait ends (§B.10): not a smaller message, not the other
+        // direction, not another circuit of the class.
+        if slot.paused_since.is_some() {
+            return Forward::Paused;
         }
         let (cur, pend) = (slot.current, slot.pending);
         let remaining = |id: Option<LeaseId>| {
@@ -881,7 +884,9 @@ impl Hosted {
                 .map_or(0, |l| l.remaining())
         };
         let (cur_left, pend_left) = (remaining(cur), remaining(pend));
-        if cur_left.saturating_add(pend_left) < len {
+        // Every message needs a usable lease, an empty one too: otherwise
+        // an unfunded circuit would live on empty frames.
+        if cur.is_none() || cur_left.saturating_add(pend_left) < len {
             let slot = self.slots.entry(key).or_default();
             slot.paused_since.get_or_insert(now.mono);
             return Forward::Paused;

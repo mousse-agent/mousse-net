@@ -202,7 +202,7 @@ pub async fn run<C: HostedCell>(rt: Arc<C>, link: PlusLink, mut stop: watch::Rec
             return;
         }
         let sent = rt.now().mono;
-        match link.http.post(BOOT_PATH, &boot).await {
+        let failed = match link.http.post(BOOT_PATH, &boot).await {
             Ok(body) => match BootAnswer::decode(&body) {
                 Ok(a) => {
                     rt.with_hosted(|h, now| h.boot_answered(&a, sent, now));
@@ -210,20 +210,22 @@ pub async fn run<C: HostedCell>(rt: Arc<C>, link: PlusLink, mut stop: watch::Rec
                     backoff.reset();
                     break;
                 }
-                Err(_) => (link.log)("plus: boot answer unreadable; retrying"),
+                Err(_) => CallError::BadAnswer("boot answer unreadable"),
             },
-            Err(e) => {
-                if e.code() == Some("stale_generation") {
-                    (link.log)("plus: boot refused as stale_generation; an operator must resolve it at Plus; retrying");
-                } else {
-                    (link.log)(&format!("plus: boot announcement failed ({e}); retrying"));
-                }
-                let wait = Duration::from_millis(backoff.after(&e));
-                tokio::select! {
-                    _ = tokio::time::sleep(wait) => {}
-                    _ = stop.changed() => {}
-                }
-            }
+            Err(e) => e,
+        };
+        if failed.code() == Some("stale_generation") {
+            (link.log)("plus: boot refused as stale_generation; an operator must resolve it at Plus; retrying");
+        } else {
+            (link.log)(&format!(
+                "plus: boot announcement failed ({failed}); retrying"
+            ));
+        }
+        // Every failure, an unreadable answer included, waits its backoff.
+        let wait = Duration::from_millis(backoff.after(&failed));
+        tokio::select! {
+            _ = tokio::time::sleep(wait) => {}
+            _ = stop.changed() => {}
         }
     }
 

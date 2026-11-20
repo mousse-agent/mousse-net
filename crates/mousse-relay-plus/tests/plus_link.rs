@@ -179,6 +179,23 @@ async fn the_same_boot_record_is_sent_again_through_an_outage() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn an_unreadable_boot_answer_is_retried_with_backoff() {
+    let plus = TestIssuerStandIn::start(11).await;
+    plus.set_bad_boot_answer(true);
+    let r = start(&plus, limits(), 1);
+    // Backoff from 100 ms, doubling: about four tries in a second; a tight
+    // loop would make hundreds.
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+    let tries = plus.boot_bodies().len();
+    assert!((2..=8).contains(&tries), "{tries} tries");
+    assert!(!r.rt.with(|h, _| h.clock().is_set()));
+    plus.set_bad_boot_answer(false);
+    wait_for("boot", || r.rt.with(|h, _| h.clock().is_set())).await;
+    r.stop.send(true).unwrap();
+    r.task.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_stale_generation_is_logged_and_retried_never_taken_as_booted() {
     let plus = TestIssuerStandIn::start(3).await;
     let identity = SoftwareKey::generate(&mut os_rng());
