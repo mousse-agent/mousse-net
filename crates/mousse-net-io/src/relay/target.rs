@@ -68,6 +68,8 @@ pub enum TargetEvent {
     /// `REFUSED(chain_full)`: the relay did not take a `SUCCESSOR` because
     /// the key chain is full. The registration goes on.
     ChainFull,
+    /// A `RELEASE` naming these leases was sent (hosted, §B.10).
+    Released(Vec<[u8; 16]>),
 }
 
 /// Allow-set sequences grow for the life of the process and start from the
@@ -289,6 +291,9 @@ impl TargetLink {
                         return e;
                     }
                     last_sent = Instant::now();
+                    if let RelayMessage::Release { leases } = msg {
+                        let _ = events.send(TargetEvent::Released(leases));
+                    }
                 }
                 got = self.link.recv() => {
                     last_heard = Instant::now();

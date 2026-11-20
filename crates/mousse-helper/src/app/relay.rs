@@ -413,7 +413,7 @@ fn status_json(shared: &Shared, relay: &OwnRelay) -> Value {
         "new_key_pending": relay.pending.as_ref().is_some_and(|p| !p.cancelled),
         "cancelling": relay.pending.as_ref().is_some_and(|p| p.cancelled),
         "chain_full": relay.chain_full,
-        "chain_full_until": relay.chain_until.filter(|_| relay.chain_full),
+        "chain_full_until": relay.chain_full_until(now()),
     })
 }
 
@@ -673,7 +673,7 @@ async fn hold(
                 TargetEvent::AllowSetOk { .. } => {}
                 TargetEvent::ChainFull => chain_full(shared, relay),
                 // Own relays are self-hosted: no leases.
-                TargetEvent::LeaseStatus(_) => {}
+                TargetEvent::LeaseStatus(_) | TargetEvent::Released(_) => {}
             },
         }
     }
@@ -696,7 +696,7 @@ fn chain_full(shared: &Arc<Shared>, relay: &str) {
             return;
         };
         r.pending = None;
-        r.chain_full = true;
+        r.chain_now_full(now());
         let r = r.clone();
         if shared.relay.files.save_relays(file).is_err() {
             return;
@@ -2081,7 +2081,7 @@ async fn enroll_inner(
         rotated_at: None,
         pending: None,
         chain_full: false,
-        chain_until: None,
+        chain_drops: Vec::new(),
     };
     {
         let _io = guard(&shared.relay.io);
@@ -2174,7 +2174,7 @@ fn rotate(shared: &Arc<Shared>, id: &Value, relay: &str) -> Value {
         if r.pending.is_some() {
             return error(id, "rotating", "A new key is already on its way");
         }
-        if r.chain_full && r.chain_until.is_some_and(|t| t > now()) {
+        if r.chain_full_until(now()).is_some() {
             return error(
                 id,
                 "chain_full",
@@ -2364,7 +2364,7 @@ fn commit_rotation(shared: &Arc<Shared>, relay: &str, pending: &PendingKey, link
         let dropped_by = now()
             + relay_overlap.unwrap_or(RelayLimits::DEFAULT.successor_overlap_secs())
             + CLOCK_SKEW_SECS;
-        r.chain_until = Some(r.chain_until.unwrap_or(0).max(dropped_by));
+        r.rotated_out(dropped_by, now());
         r.chain_full = false;
         let old = std::mem::replace(&mut r.salt, pending.salt.clone());
         r.old.push(OldKey { salt: old, until });
@@ -2435,5 +2435,35 @@ mod tests {
             relay_class_ok(AddrClass::Lan, false, true),
             cfg!(debug_assertions)
         );
+    }
+
+    /// A full chain has room again once its oldest rotated-out key leaves,
+    /// not only once the newest does.
+    #[test]
+    fn a_full_chain_frees_up_when_the_oldest_rotated_out_key_leaves() {
+        let mut r = OwnRelay {
+            endpoint: String::new(),
+            relay: String::new(),
+            relay_key: None,
+            salt: String::new(),
+            old: Vec::new(),
+            added_at: 0,
+            rotated_at: None,
+            pending: None,
+            chain_full: false,
+            chain_drops: Vec::new(),
+        };
+        r.rotated_out(1_000, 10);
+        r.rotated_out(2_000, 20);
+        assert_eq!(r.chain_full_until(30), None, "not full");
+        r.chain_now_full(30);
+        assert_eq!(r.chain_full_until(30), Some(1_000));
+        assert_eq!(r.chain_full_until(1_500), None, "the oldest left");
+        // A key dropped by now is forgotten at the next rotation.
+        r.rotated_out(3_000, 1_500);
+        assert_eq!(r.chain_drops, vec![2_000, 3_000]);
+        // Full again: the oldest key still in the chain counts.
+        r.chain_now_full(1_600);
+        assert_eq!(r.chain_full_until(1_600), Some(2_000));
     }
 }

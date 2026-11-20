@@ -175,6 +175,20 @@ fn live_blocks(entry: &LeaseEntry) -> Vec<Block> {
         .collect()
 }
 
+/// Drop `ids` from `salt`'s stored blocks once their `RELEASE` is sent.
+fn forget_released(shared: &Shared, salt: &str, ids: &[[u8; 16]]) {
+    leases_update(shared, |f| {
+        if let Some(e) = f.handles.get_mut(salt) {
+            e.blocks.retain(|h| {
+                unhex(h)
+                    .ok()
+                    .and_then(|b| Block::parse(&b).ok())
+                    .is_none_or(|b| !ids.contains(&b.lease_id))
+            });
+        }
+    });
+}
+
 fn entry_for(relay: &HostedRelay) -> LeaseEntry {
     LeaseEntry {
         relay: relay.relay.clone(),
@@ -211,6 +225,9 @@ pub struct Runtime {
     roles: HashMap<String, (String, watch::Sender<Role>)>,
     /// Salts whose registration is live.
     live: HashSet<String>,
+    /// Salts whose registration has had a try since this start (whatever
+    /// came of it): until then a relay is not taken for gone.
+    tried: HashSet<String>,
     fleet: Option<Vec<FleetRelay>>,
     fleet_at: Option<u64>,
     /// Read the fleet again at the next step (a registration failed).
@@ -442,14 +459,15 @@ async fn step(shared: &Arc<Shared>, plus: &Arc<Plus>) {
                 }
             }
         }
-        // Cut over when the stage ends, or at once if the old relay is gone.
-        let home_live = file.home.as_ref().is_some_and(|home| {
-            std::iter::once(&home.salt)
-                .chain(home.old.iter().map(|o| &o.salt))
-                .any(|s| rt.live.contains(s))
+        // Cut over when the stage ends, or at once if the old relay is gone:
+        // none of its registrations is live, and one has had a try since
+        // this start (after a restart nothing is live yet).
+        let home_gone = file.home.as_ref().is_some_and(|home| {
+            let salts = || std::iter::once(&home.salt).chain(home.old.iter().map(|o| &o.salt));
+            !salts().any(|s| rt.live.contains(s)) && salts().any(|s| rt.tried.contains(s))
         });
         if let (Some(home), Some(mv)) = (file.home.clone(), rt.moving.as_mut()) {
-            for action in mv.tick(t, !home_live) {
+            for action in mv.tick(t, home_gone) {
                 match action {
                     // The old relay's handles are no longer wanted: their
                     // registrations release what they hold (kept on disk,
@@ -706,6 +724,7 @@ async fn registration(
                 }
                 Err(e) => {
                     applog::line(format!("hosted relay: no admission token: {e}"));
+                    guard(&shared.relay.hosted).tried.insert(salt.clone());
                     let pause = e.retry_after().unwrap_or(wait);
                     tokio::time::sleep(pause).await;
                     wait = (wait * 2).min(longest);
@@ -717,6 +736,7 @@ async fn registration(
         match register(&shared, &relay, id, reg_key.clone(), tk.envelope.clone()).await {
             Ok(link) => {
                 wait = first_wait;
+                guard(&shared.relay.hosted).tried.insert(salt.clone());
                 let end = hold(
                     &shared,
                     &plus,
@@ -751,7 +771,9 @@ async fn registration(
             }
             Err(e) => {
                 applog::line(format!("hosted relay {}: {e}", relay.relay));
-                guard(&shared.relay.hosted).refresh = true;
+                let mut rt = guard(&shared.relay.hosted);
+                rt.refresh = true;
+                rt.tried.insert(salt.clone());
             }
         }
         tokio::time::sleep(wait).await;
@@ -946,6 +968,9 @@ async fn hold(
                     let entries = entries.iter().filter_map(status_entry).collect();
                     let _ = lease_tx.send(RelayEvent::Status(entries));
                 }
+                // Sent: the relay finalizes these, so they are no longer
+                // this handle's to release after a restart.
+                TargetEvent::Released(ids) => forget_released(shared, salt, &ids),
             },
             lc = lcmd_rx.recv(), if !lease_done => match lc {
                 Some(RelayCommand::Lease(block)) => {

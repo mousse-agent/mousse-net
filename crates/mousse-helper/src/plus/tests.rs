@@ -257,3 +257,52 @@ async fn bulk_pauses_alone_when_its_refill_fails() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `RELEASE` is asked for, but the kept blocks stay: the registration
+/// forgets each only once its `RELEASE` is sent, so a crash before that
+/// still releases it after the restart.
+#[tokio::test(flavor = "multi_thread")]
+async fn release_all_leaves_the_kept_blocks_for_the_registration_to_clear_once_sent() {
+    let standin = PlusStandIn::start();
+    let dir = temp_dir("release-kept");
+    let (plus, _rx) = linked(&standin, &dir).await;
+    let r = relay(&standin, &plus).await;
+    let (relay_tx, relay_rx) = mpsc::unbounded_channel();
+    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+    let (ev_tx, _ev_rx) = mpsc::unbounded_channel();
+    let kept = Arc::new(std::sync::Mutex::new(Vec::<Vec<Vec<u8>>>::new()));
+    let sink = kept.clone();
+    tokio::spawn(lease::run_funded(
+        plus.clone(),
+        r.reg,
+        true,
+        lease::HeldBlocks {
+            adopted: Vec::new(),
+            keep: Box::new(move |b| sink.lock().unwrap().push(b)),
+        },
+        relay_rx,
+        cmd_tx,
+        ev_tx,
+        Arc::new(SystemClock::new()),
+    ));
+    let first = next_lease(&mut cmd_rx).await;
+    relay_tx.send(RelayEvent::ReleaseAll).unwrap();
+    let mut released = Vec::new();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(20), cmd_rx.recv())
+            .await
+            .expect("the driver ends")
+        {
+            Some(RelayCommand::Release(ids)) => released.extend(ids),
+            Some(RelayCommand::Lease(_)) => {}
+            None => break,
+        }
+    }
+    assert!(released.contains(&first.lease_id), "RELEASE names the block");
+    let last = kept.lock().unwrap().last().cloned().unwrap_or_default();
+    assert!(
+        last.contains(&first.envelope),
+        "the kept blocks were cleared before the RELEASE was sent"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

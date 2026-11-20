@@ -555,8 +555,10 @@ pub async fn run_funded(
                     for ids in book.held_ids().chunks(mousse_net_core::relay::msg::RELEASE_MAX) {
                         let _ = commands.send(RelayCommand::Release(ids.to_vec()));
                     }
+                    // The stored blocks stay until each RELEASE is sent: the
+                    // registration forgets them then (a restart before
+                    // that still releases them).
                     book.released();
-                    (held.keep)(Vec::new());
                     return;
                 }
                 Some(RelayEvent::Closed) | None => return,

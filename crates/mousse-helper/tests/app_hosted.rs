@@ -355,7 +355,23 @@ fn plus_hosted_a_restart_within_the_stage_still_cuts_over() {
     // A restart within the stage window (the clock starts again from now).
     a.kill();
     let mut a = app_raw(&a_end, "hostA", &fleet.plus.url(), &manual_clock(), &stage);
-    a.call("test.clock", json!({"advance_secs": 3_600 + 86_400 + 60}));
+    // Still within the stage: no cutover. Relay 0 keeps its blocks and
+    // relay 1 is not funded.
+    a.call("test.clock", json!({"advance_secs": 7_200}));
+    let until = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < until {
+        assert!(
+            fleet.leases_on(0).iter().any(|l| !l.3),
+            "relay 0 released within the stage"
+        );
+        assert!(
+            fleet.leases_on(1).is_empty(),
+            "relay 1 funded within the stage"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // The stage ends.
+    a.call("test.clock", json!({"advance_secs": 86_400}));
     // The cutover still comes: relay 0's blocks, from before the restart,
     // are released, and then relay 1 is funded.
     fleet.until("relay 0's blocks final", |f| {
@@ -364,6 +380,8 @@ fn plus_hosted_a_restart_within_the_stage_still_cuts_over() {
     fleet.until("blocks on relay 1", |f| !f.leases_on(1).is_empty());
 }
 
+// The exit hook is in debug builds only.
+#[cfg(debug_assertions)]
 #[test]
 fn plus_hosted_a_crash_just_after_the_cutover_still_releases_the_old_relay_first() {
     let fleet = Fleet::start(2);

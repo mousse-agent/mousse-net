@@ -81,10 +81,36 @@ pub struct OwnRelay {
     /// many of this computer's keys as it allows.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub chain_full: bool,
-    /// When the relay has dropped every key this computer rotated out, at
-    /// the latest; until then a full chain stays full.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chain_until: Option<u64>,
+    /// When the relay drops each key this computer rotated out, at the
+    /// latest, oldest first. A full chain has room again once the oldest
+    /// leaves.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chain_drops: Vec<u64>,
+}
+
+impl OwnRelay {
+    /// A key was rotated out: the relay drops it by `dropped_by`. Keys
+    /// already dropped by `now` are forgotten.
+    pub fn rotated_out(&mut self, dropped_by: u64, now: u64) {
+        self.chain_drops.retain(|t| *t > now);
+        self.chain_drops.push(dropped_by);
+    }
+
+    /// The relay refused a `SUCCESSOR` as `chain_full` at `now`: the keys
+    /// in its chain are those not dropped by now.
+    pub fn chain_now_full(&mut self, now: u64) {
+        self.chain_full = true;
+        self.chain_drops.retain(|t| *t > now);
+    }
+
+    /// While the chain is known full: when the oldest key in it leaves,
+    /// which frees a place.
+    pub fn chain_full_until(&self, now: u64) -> Option<u64> {
+        if !self.chain_full {
+            return None;
+        }
+        self.chain_drops.iter().copied().min().filter(|t| *t > now)
+    }
 }
 
 #[derive(Default, Serialize, Deserialize)]

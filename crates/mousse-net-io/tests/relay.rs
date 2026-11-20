@@ -180,7 +180,8 @@ impl Target {
                         }
                         TargetEvent::AcceptFailed { .. }
                         | TargetEvent::LeaseStatus(_)
-                        | TargetEvent::ChainFull => {}
+                        | TargetEvent::ChainFull
+                        | TargetEvent::Released(_) => {}
                     }
                 }
             }
