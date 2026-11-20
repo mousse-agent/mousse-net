@@ -733,7 +733,17 @@ fn a_crash_after_the_completion_record_is_replayed_with_routes_and_approvals() {
     assert_eq!(s["done"]["identity"], b.identity.as_str(), "{s}");
     assert_eq!(s["done"]["name"], "hostB");
     assert_eq!(s["done"]["role"], "owner");
-    let peer = peer_of(&mut a, &b.identity.clone());
+    // The new peer enrolls a relay caller key in the background; once it
+    // has, the record is settled.
+    let start = std::time::Instant::now();
+    let peer = loop {
+        let peer = peer_of(&mut a, &b.identity.clone());
+        if peer["relay"]["keys"] == true {
+            break peer;
+        }
+        assert!(start.elapsed() < WAIT, "no caller key enrolled: {peer}");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
     assert_eq!(peer["routes"], json!(l.ticket.routes), "{peer}");
     assert_eq!(peer["last_route"], l.route().as_str());
     let kept = approvals(&a.dir);
