@@ -7,6 +7,7 @@ import { test } from 'node:test'
 import { allowedLink, page, serve as servePage } from '../chat-page.mjs'
 import { selfTest, sortRequests, startRecorder } from '../recorder.mjs'
 import { dial, limits, MAGIC, serve } from '../relay.mjs'
+import { needsSshd } from '../run.mjs'
 
 const TOKEN = 'a'.repeat(32)
 const env = {}
@@ -111,4 +112,13 @@ test('the ssh case starts one test SSH server per side and stops them', async ()
   assert.ok(routes.a.config.includes('ssh-a') && routes.b.config.includes('ssh-b'))
   assert.equal(typeof routes.a.port, 'number')
   await routes.stop()
+})
+
+test('the SSH-add checks get the test SSH server on every route case', () => {
+  for (const id of ['phase1b.ssh-add-app', 'phase1b.link-app']) {
+    for (const route of [undefined, 'tcp', 'ws', 'ssh']) assert.equal(needsSshd(id, route), true, `${id} ${route}`)
+  }
+  assert.equal(needsSshd('phase1b.routes-app', 'ssh'), true)
+  assert.equal(needsSshd('phase1b.routes-app', 'tcp'), false)
+  assert.equal(needsSshd('phase1a.removal', undefined), false)
 })

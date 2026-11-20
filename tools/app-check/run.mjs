@@ -40,9 +40,10 @@
  *   Linux, a `sandbox-exec` profile on macOS. Printed as `fence=`.
  * - MOUSSE_CHECK_PROBE_BIN: `mousse-check` built from this checkout, for the app
  *   script to run `mousse-check probe`.
- * - For `--route ssh`: MOUSSE_CHECK_TEST_SSHD, the test SSH server built
- *   from this checkout, and MOUSSE_CHECK_SSH_ROUTES, the module that starts
- *   the case's two loopback SSH routes (ssh-routes.mjs).
+ * - For `--route ssh` and the checks that add a computer over SSH
+ *   (SSH_CHECKS): MOUSSE_CHECK_TEST_SSHD, the test SSH server built from
+ *   this checkout, and MOUSSE_CHECK_SSH_ROUTES, the module that starts the
+ *   case's two loopback SSH routes (ssh-routes.mjs).
  *
  * --route tcp|ws|ssh: the route case. The app script gives the app only that
  *   route and writes every `conn.up` event it saw, one JSON object per line,
@@ -175,6 +176,14 @@ function buildTools(env, probe, sshd) {
   if (probe && !exes['mousse-check']) refuse('cargo built mousse-check but did not say where')
   if (sshd && !exes['test-sshd']) refuse('cargo built test-sshd but did not say where')
   return { helper: exes['mousse-helper'], probe: exes['mousse-check'], sshd: exes['test-sshd'] }
+}
+
+/** App checks that add a computer over SSH, whatever their route case. */
+export const SSH_CHECKS = ['phase1b.ssh-add-app', 'phase1b.link-app']
+
+/** Whether a run needs the test SSH server: the `ssh` route case, or a check in SSH_CHECKS. */
+export function needsSshd(id, route) {
+  return route === 'ssh' || SSH_CHECKS.includes(id)
 }
 
 /** Phase 0 and 1a checks run as they were signed; later ones get the stand-ins. */
@@ -335,7 +344,7 @@ async function main() {
   const env = { ...process.env, ...(flags.control ? controlEnv(id, flags.control) : {}) }
   const stand = guarded(id)
   const build = helperBuild()
-  const tools = buildTools(env, stand, flags.route === 'ssh')
+  const tools = buildTools(env, stand, needsSshd(id, flags.route))
   console.log(`helper_build=${build}`)
 
   const out = resolve(flags.out ?? mkdtempSync(join(tmpdir(), 'app-check-')))
