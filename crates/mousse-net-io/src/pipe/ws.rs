@@ -141,13 +141,22 @@ fn io_error(e: WsError) -> io::Error {
     }
 }
 
+/// Where a text message's refusal stands.
+enum Refuse {
+    /// The 1003 close is still to be queued.
+    Send(CloseFrame),
+    /// It is queued; flush it, then fail the read.
+    Flush,
+}
+
 /// A WebSocket as a byte stream.
 pub struct WsPipe<S> {
     ws: WebSocketStream<S>,
     /// A received message not read out yet, and how far it was read.
     unread: Option<(tokio_tungstenite::tungstenite::Bytes, usize)>,
-    /// The close to send for a text message before the read fails.
-    refuse: Option<CloseFrame>,
+    /// A text message arrived: the 1003 close still to send, or to flush,
+    /// before the read fails. Kept across `Pending`.
+    refuse: Option<Refuse>,
     eof: bool,
 }
 
@@ -179,19 +188,34 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for WsPipe<S> {
                 }
                 return Poll::Ready(Ok(()));
             }
-            if let Some(frame) = this.refuse.take() {
+            match this.refuse.take() {
                 // A text message: close with 1003, then fail the read.
-                let mut ws = Pin::new(&mut this.ws);
-                if let Err(e) = ready!(ws.as_mut().poll_ready(cx)) {
-                    return Poll::Ready(Err(io_error(e)));
+                Some(Refuse::Send(frame)) => {
+                    let mut ws = Pin::new(&mut this.ws);
+                    match ws.as_mut().poll_ready(cx) {
+                        Poll::Pending => {
+                            this.refuse = Some(Refuse::Send(frame));
+                            return Poll::Pending;
+                        }
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(io_error(e))),
+                        Poll::Ready(Ok(())) => {}
+                    }
+                    let _ = ws.start_send(Message::Close(Some(frame)));
+                    this.refuse = Some(Refuse::Flush);
+                    continue;
                 }
-                let _ = ws.as_mut().start_send(Message::Close(Some(frame)));
-                let _ = ready!(ws.poll_flush(cx));
-                this.eof = true;
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "a ws text message",
-                )));
+                Some(Refuse::Flush) => {
+                    if Pin::new(&mut this.ws).poll_flush(cx).is_pending() {
+                        this.refuse = Some(Refuse::Flush);
+                        return Poll::Pending;
+                    }
+                    this.eof = true;
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "a ws text message",
+                    )));
+                }
+                None => {}
             }
             if this.eof {
                 return Poll::Ready(Ok(()));
@@ -204,10 +228,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for WsPipe<S> {
                     }
                 }
                 Some(Ok(Message::Text(_))) => {
-                    this.refuse = Some(CloseFrame {
+                    this.refuse = Some(Refuse::Send(CloseFrame {
                         code: CloseCode::Unsupported,
                         reason: "binary messages only".into(),
-                    });
+                    }));
                 }
                 // Pings are answered by the library; pongs and raw frames
                 // carry nothing.
@@ -610,6 +634,88 @@ pub async fn dial(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    /// A stream whose first `stalls` writes are not ready yet.
+    struct StallFirstWrite<S> {
+        inner: S,
+        stalls: u32,
+    }
+
+    impl<S: AsyncRead + Unpin> AsyncRead for StallFirstWrite<S> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+        }
+    }
+
+    impl<S: AsyncWrite + Unpin> AsyncWrite for StallFirstWrite<S> {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            if this.stalls > 0 {
+                this.stalls -= 1;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            Pin::new(&mut this.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
+    /// A text message is refused with a 1003 close even when the close
+    /// cannot be written at once: the refusal survives `Pending`.
+    #[tokio::test]
+    async fn a_text_message_is_closed_with_1003_through_backpressure() {
+        use futures_core::Stream as _;
+        let (near, far) = tokio::io::duplex(1 << 16);
+        let host = StallFirstWrite {
+            inner: near,
+            // The queued close's write, then its flush.
+            stalls: 2,
+        };
+        let mut pipe = WsPipe::new(
+            WebSocketStream::from_raw_socket(host, Role::Server, Some(config(&IoLimits::DEFAULT)))
+                .await,
+        );
+        let mut peer = WebSocketStream::from_raw_socket(far, Role::Client, None).await;
+        Pin::new(&mut peer)
+            .start_send(Message::text("hello"))
+            .unwrap();
+        std::future::poll_fn(|cx| Pin::new(&mut peer).poll_flush(cx))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 16];
+        let read = tokio::time::timeout(std::time::Duration::from_secs(5), pipe.read(&mut buf))
+            .await
+            .expect("the read never ended");
+        assert!(read.is_err(), "{read:?}");
+        let close = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            std::future::poll_fn(|cx| Pin::new(&mut peer).poll_next(cx)),
+        )
+        .await
+        .expect("no close arrived");
+        match close {
+            Some(Ok(Message::Close(Some(frame)))) => {
+                assert_eq!(frame.code, CloseCode::Unsupported)
+            }
+            other => panic!("{other:?}"),
+        }
+    }
 
     #[test]
     fn owner_ws_addresses_are_loopback_with_a_port() {
