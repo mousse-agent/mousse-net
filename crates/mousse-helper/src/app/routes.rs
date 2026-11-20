@@ -102,15 +102,26 @@ pub fn config(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
     if let Err(e) = store.save(&next) {
         return error(id, "store_failed", e.to_string());
     }
-    let routes = next.advertised(
-        &interfaces,
-        &next.bind_plan(&interfaces),
-        next.port.unwrap_or(port),
-    );
+    let restart_needed = running.restart_needed(&next);
+    let routes = if restart_needed {
+        next.advertised(
+            &interfaces,
+            &next.bind_plan(&interfaces),
+            next.port.unwrap_or(port),
+        )
+    } else {
+        // Nothing to rebind: the next ticket carries the new lists.
+        let mut st = shared.info.listen.lock().unwrap_or_else(|e| e.into_inner());
+        if st.config.public != next.public || st.config.tunnels != next.tunnels {
+            st.config = next.clone();
+            st.readvertise(&interfaces);
+        }
+        st.routes.clone()
+    };
     json!({
         "re": id,
         "routes": routes,
-        "restart_needed": running.restart_needed(&next),
+        "restart_needed": restart_needed,
         "config": next,
     })
 }

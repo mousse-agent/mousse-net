@@ -40,6 +40,7 @@ mod routes;
 
 pub use changes::{clock, interface_ips, interface_source};
 pub use paths::{browse_source, StoreCandidates};
+pub(crate) use paths::{stored_search, ticket_candidates};
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;

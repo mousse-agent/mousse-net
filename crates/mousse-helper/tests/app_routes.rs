@@ -1322,6 +1322,151 @@ fn routes_test_confirms_its_own_route() {
     assert_eq!(refused["error"], "bad_route", "{refused}");
 }
 
+/// A plain `ws` route is the owner's local tunnel hop: under the release
+/// policy, which never dials `tcp` to loopback, it is still allowed and
+/// dialled (§1.1, Decision 2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_plain_ws_tunnel_hop_is_dialled_in_release_builds() {
+    let release = AddrPolicy::release();
+    let hop = route("ws://127.0.0.1:8080/mousse-net/1");
+    assert!(!release.names_forbidden(&hop));
+    assert!(!release.automatic(&hop), "an owner address, not automatic");
+    assert!(release.names_forbidden(&route("tcp://127.0.0.1:8080")));
+    let e = engine().await;
+    let mut caller = granted(&e, Arc::new(ManualClock::new()), &[]);
+    caller.use_addr_policy(AddrPolicy::release());
+    let seen = Seen::default();
+    caller.use_ws_dialer(standin(Instant::now(), &seen, Some(e.addr)));
+    let (_conn, reached) = within(
+        "the search",
+        Duration::from_secs(20),
+        caller.search(Search::of(vec![hop]), e.host.identity()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reached.class, RouteClass::Tunnel);
+    assert_eq!(seen.starts()[0].1, Some("127.0.0.1:8080".parse().unwrap()));
+}
+
+/// A loopback listener for the standalone cases: counts what it accepts.
+fn counting_listener() -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let count = Arc::new(AtomicUsize::new(0));
+    let seen = count.clone();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for s in listener.incoming().flatten() {
+            seen.fetch_add(1, Ordering::SeqCst);
+            held.push(s);
+        }
+    });
+    (addr, count)
+}
+
+/// Standalone `join` applies the same policy: a ticket's public hint is
+/// not dialled without the owner's approval, and an owner `--route` naming
+/// a forbidden address is refused.
+#[test]
+fn standalone_join_dials_only_what_the_policy_allows() {
+    let a_end = Endpoint::init("sja");
+    let b_end = Endpoint::init("sjb");
+    let mut a = a_end.app("hostA", &[]);
+    a.hello();
+    let invite = a.call("invite.create", json!({"kind": "link"}));
+    let (public, taken) = counting_listener();
+    let mut ticket = Ticket::from_fragment(invite["uri"].as_str().unwrap()).unwrap();
+    ticket.routes = vec![format!("tcp://{public}")];
+    let map = format!("{}=public", public.port());
+    let env = [("MOUSSE_NET_TEST_CLASS_MAP", map.as_str())];
+    let mut join = b_end.cli_env(&["join", &ticket.to_fragment()], &env);
+    join.end_stdin();
+    assert_ne!(join.exit_within(WAIT), Some(0), "{}", join.out());
+    assert!(
+        join.out().contains("not dialled without approval"),
+        "{}",
+        join.out()
+    );
+    assert_eq!(
+        taken.load(Ordering::SeqCst),
+        0,
+        "the public hint was dialled"
+    );
+    let mut typed = b_end.cli_env(
+        &[
+            "join",
+            &ticket.to_fragment(),
+            "--route",
+            "tcp://0.0.0.0:7443",
+        ],
+        &env,
+    );
+    typed.end_stdin();
+    assert_ne!(typed.exit_within(WAIT), Some(0));
+    assert!(typed.err().contains("never dialled"), "{}", typed.err());
+}
+
+/// Standalone `term` dials the stored routes the policy allows: an
+/// unapproved public route is not dialled.
+#[test]
+fn standalone_term_dials_only_stored_routes_the_policy_allows() {
+    let b_end = Endpoint::init("stb");
+    let (public, taken) = counting_listener();
+    let peers = json!({"version": 1, "peers": [{
+        "name": "far",
+        "identity": some_identity(),
+        "role": "owner",
+        "routes": [format!("tcp://{public}")],
+        "last_route": format!("tcp://{public}"),
+        "paired_at": 1,
+    }]});
+    std::fs::write(
+        b_end.dir.join("peers.json"),
+        serde_json::to_vec(&peers).unwrap(),
+    )
+    .unwrap();
+    let map = format!("{}=public", public.port());
+    let mut term = b_end.cli_env(
+        &["term", "far", "--", "echo"],
+        &[("MOUSSE_NET_TEST_CLASS_MAP", map.as_str())],
+    );
+    term.end_stdin();
+    assert_eq!(term.exit_within(WAIT), Some(2), "{}", term.err());
+    assert_eq!(
+        taken.load(Ordering::SeqCst),
+        0,
+        "an unapproved route was dialled"
+    );
+}
+
+/// A `routes.config` list edit that needs no restart reaches the next
+/// ticket at once.
+#[test]
+fn a_routes_config_list_edit_reaches_the_next_ticket() {
+    let b_end = Endpoint::init("rlb");
+    std::fs::write(
+        b_end.dir.join("routes.json"),
+        r#"{"tunnels": ["wss://a.example/mousse-net/1"]}"#,
+    )
+    .unwrap();
+    let mut b = b_end.app("peerB", &[]);
+    b.hello();
+    let edit = b.call(
+        "routes.config",
+        json!({"tunnels": ["wss://b.example/mousse-net/1"]}),
+    );
+    assert_eq!(edit["restart_needed"], false, "{edit}");
+    let invite = b.call("invite.create", json!({}));
+    assert_eq!(
+        invite["routes"],
+        json!(["wss://b.example:443/mousse-net/1"])
+    );
+    let ticket = Ticket::from_fragment(invite["uri"].as_str().unwrap()).unwrap();
+    assert_eq!(ticket.routes, ["wss://b.example:443/mousse-net/1"]);
+    let hello = b.call("hello", json!({"proto": [1, 0]}));
+    assert_eq!(hello["routes"], json!(["wss://b.example:443/mousse-net/1"]));
+}
+
 /// A fresh identity no helper here has.
 fn some_identity() -> String {
     use mousse_net_core::identity::IdentitySigner;
