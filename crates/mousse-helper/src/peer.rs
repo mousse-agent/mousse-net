@@ -473,9 +473,10 @@ pub(crate) async fn join_routes<C: CodeEntry>(
                 let store = |e: NetError| Failure::new(e.to_string(), "store");
                 let held = match peers.lock() {
                     Ok(held) if wanted() => held,
-                    Ok(_) => {
+                    Ok(held) => {
+                        drop(held);
                         conn.close(ErrorCode::Cancelled);
-                        return Err(removed_meanwhile());
+                        return Err(removed_meanwhile(caller, &ticket.hash()));
                     }
                     Err(e) => return Err(store(e)),
                 };
@@ -631,7 +632,8 @@ fn finish_link(
     let held = peers.lock().map_err(store)?;
     // Must-fail control: the host's removal during the join is not seen.
     if !wanted() && !cfg!(mousse_control = "join-ignores-removal") {
-        return Err(removed_meanwhile());
+        drop(held);
+        return Err(removed_meanwhile(caller, &hash));
     }
     // Must-fail control: the pin is saved with no completion record first.
     if cfg!(mousse_control = "no-completion-record") {
@@ -650,7 +652,8 @@ fn finish_link(
             .map_err(store)?
             .is_none()
         {
-            return Err(removed_meanwhile());
+            drop(held);
+            return Err(removed_meanwhile(caller, &hash));
         }
     }
     drop(held);
@@ -659,8 +662,17 @@ fn finish_link(
 }
 
 /// The join's host was removed (`peer.forget`) while it ran: nothing is
-/// stored and its connection is closed.
-fn removed_meanwhile() -> Failure {
+/// stored and its connection is closed. The outcome is learned all the
+/// same, so the join's pending mark is cleared and its ticket let go: a
+/// repeat of the ticket then cannot learn `PAIRED` from the host's receipt
+/// and bring the removed host back.
+fn removed_meanwhile(caller: &Caller, ticket_hash: &[u8; 32]) -> Failure {
+    // Must-fail control: the pending mark and the ticket's hold stay.
+    if !cfg!(mousse_control = "removal-leaves-pending") {
+        if let Err(e) = caller.settle_stored(ticket_hash) {
+            return Failure::new(e.to_string(), "store");
+        }
+    }
     Failure::new(
         "the host was removed while this device was joining it",
         "forgotten",

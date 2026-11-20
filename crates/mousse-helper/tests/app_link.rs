@@ -820,8 +820,23 @@ fn removed_during_the_join(tag: &str, point: &str) {
         Value::Null,
         "a removed host came back"
     );
-    assert_eq!(status(&mut a, &l.ticket)["done"], Value::Null);
+    let s = status(&mut a, &l.ticket);
+    assert_eq!(s["done"], Value::Null, "{s}");
+    assert_eq!(s["pending"], false, "the removed join stayed pending: {s}");
     assert!(approvals(&a.dir).is_empty());
+    // A repeat of the link is refused and does not bring the host back.
+    let again = a.request(
+        "join",
+        json!({"ticket": l.uri(), "arrival": "link", "approved": [l.route()]}),
+    );
+    assert!(again.get("error").is_some(), "the repeat paired: {again}");
+    assert_eq!(
+        peer_of(&mut a, &identity),
+        Value::Null,
+        "a repeat brought the removed host back"
+    );
+    assert!(approvals(&a.dir).is_empty());
+    assert_eq!(status(&mut a, &l.ticket)["pending"], false);
 }
 
 #[test]

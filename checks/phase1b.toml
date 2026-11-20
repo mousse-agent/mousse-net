@@ -138,6 +138,7 @@ control = [
   { name = "link-accepts-kind1", breaks = "a kind-1 ticket is accepted with arrival link", env = { RUSTFLAGS = '--cfg mousse_control="link-accepts-kind1"' } },
   { name = "no-completion-record", breaks = "the pin is saved without a completion record first", env = { RUSTFLAGS = '--cfg mousse_control="no-completion-record"' } },
   { name = "join-ignores-removal", breaks = "a join stores its host after peer.forget removed it during the join", env = { RUSTFLAGS = '--cfg mousse_control="join-ignores-removal"' } },
+  { name = "removal-leaves-pending", breaks = "a join whose host was removed meanwhile keeps its pending mark, so a repeat learns PAIRED and restores the host", env = { RUSTFLAGS = '--cfg mousse_control="removal-leaves-pending"' } },
   { name = "same-code-after-failure", breaks = "the host keeps showing the failed attempt's code", env = { RUSTFLAGS = '--cfg mousse_control="same-code-after-failure"' } },
 ]
 
