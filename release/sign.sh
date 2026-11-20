@@ -42,5 +42,13 @@ for f in "$dist"/mousse-relay-*-linux-musl "$dist/SHA256SUMS" "$dist/mousse-rela
   rm -f "$f.minisig"
   minisign -S -s "$key" -m "$f" -x "$f.minisig" -t "mousse-relay $version $name" -c "mousse-relay release signature"
   minisign -V -q -p "$pub" -m "$f" -x "$f.minisig"
+  # install.sh accepts only prehashed signatures ("ED"); minisign -V also
+  # accepts the legacy format, so a release signed that way is refused here.
+  alg=$(sed -n 2p "$f.minisig" | base64 -d 2>/dev/null | head -c 2)
+  if [ "$alg" != ED ]; then
+    rm -f "$f.minisig"
+    echo "release/sign.sh: $name was not signed in minisign's prehashed format; use minisign 0.11 or later without -l" >&2
+    exit 1
+  fi
 done
 echo "Signed mousse-relay $version in $dist"

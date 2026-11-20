@@ -28,4 +28,6 @@ write_files:
       @MOUSSE_INSTALL_SH@
 
 runcmd:
-  - [sh, -c, "umask 077; /usr/local/sbin/mousse-relay-install --public auto >/root/mousse-relay.txt 2>&1; status=$?; cat /root/mousse-relay.txt; exit $status"]
+  # The output holds the enrollment link, so it goes only to an owner-only
+  # file, never to the boot log or the provider's console.
+  - [sh, -c, "umask 077; if /usr/local/sbin/mousse-relay-install --public auto >/root/mousse-relay.txt 2>&1; then echo 'mousse-relay installed; the enrollment link is in /root/mousse-relay.txt (ssh in, then: sudo cat /root/mousse-relay.txt)'; else echo 'mousse-relay install failed; see /root/mousse-relay.txt'; exit 1; fi"]

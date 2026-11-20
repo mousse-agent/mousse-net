@@ -243,7 +243,7 @@ env = { RUSTFLAGS = '--cfg mousse_control="relay-dumpable"' }
 
 [[check]]
 id = "phase3.reproducible"
-title = "Two independent builds of the relay give the same hash; the minisign signature verifies; install.sh refuses an unsigned, tampered, re-signed or replayed download"
+title = "Two independent builds of the relay give the same hash and two image builds the same digest; the minisign signature verifies and sign.sh refuses the legacy format; install.sh refuses an unsigned, tampered, re-signed or replayed download"
 plan = "design §B.15 \"Reproducible builds\" and \"Signed\"; Part G.1"
 targets = ["linux-x64"]
 judge = "marker"

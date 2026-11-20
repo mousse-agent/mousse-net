@@ -226,12 +226,18 @@ async fn accept_holding<P: Pipe>(
 }
 
 /// Run until stopped (Ctrl-C or the `stop` control request).
+/// `opened` is an endpoint this process just created and still holds the
+/// locks of (a headless first start); otherwise the endpoint is opened here.
 pub async fn run(
     state_dir: &Path,
     insecure_file_key: bool,
     opts: ServeOptions,
+    opened: Option<mousse_net_io::Endpoint>,
 ) -> Result<(), String> {
-    let mut endpoint = crate::open_endpoint(state_dir, false)?;
+    let mut endpoint = match opened {
+        Some(endpoint) => endpoint,
+        None => crate::open_endpoint(state_dir, false)?,
+    };
     if opts.app {
         // stdout carries only app-channel frames from here on.
         crate::applog::to_file(state_dir)?;

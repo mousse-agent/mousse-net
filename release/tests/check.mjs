@@ -6,7 +6,9 @@
 //   node release/tests/check.mjs install      --out DIR [--control skip-verify]
 //
 // reproducible: two independent builds of the relay (separate containers,
-//   mount paths, job counts and time zones) give the same bytes; a release
+//   mount paths, job counts and time zones) give the same bytes, and two
+//   image builds in fresh builders the same digest; sign.sh refuses a
+//   legacy-format signature; a release
 //   signed by release/sign.sh with a throwaway minisign key verifies with
 //   minisign and with install.sh; install.sh refuses an unsigned, tampered,
 //   re-signed or replayed download.
@@ -73,6 +75,7 @@ const conf = Object.fromEntries(
     .map((l) => [l.slice(0, l.indexOf("=")), l.slice(l.indexOf("=") + 1)]),
 );
 const BUILDER = conf.BUILDER_IMAGE;
+const BUILDKIT = conf.BUILDKIT_IMAGE;
 const NETWORK = "mousse-release-check";
 const RUN = `${process.pid}`;
 const PUBLIC = "203.0.113.10:443"; // TEST-NET-3: never routed
@@ -371,8 +374,9 @@ function sums(dir) {
 
 // --- Keys, packaging and signing -------------------------------------------------
 
-function minisignRun(minisignDir, mounts, script) {
-  return docker([
+function minisignRun(minisignDir, mounts, script, opts = {}) {
+  return docker(
+    [
     "run",
     "--rm",
     "--network",
@@ -385,7 +389,9 @@ function minisignRun(minisignDir, mounts, script) {
     "sh",
     "-c",
     script,
-  ]);
+    ],
+    opts,
+  );
 }
 
 function makeKeys(minisignDir) {
@@ -495,6 +501,15 @@ async function reproducible() {
   }
   say("The two builds are identical");
 
+  // The image, twice, each in its own fresh builder: the same digest.
+  const ia = buildImage(a, source.epoch, "a");
+  const ib = buildImage(a, source.epoch, "b");
+  say(`image a: ${ia.digest}`);
+  say(`image b: ${ib.digest}`);
+  if (ia.digest !== ib.digest) fail("image-not-reproducible", "the two image builds differ");
+  say("The two image builds have the same digest");
+  fs.writeFileSync(path.join(a, "mousse-relay-image.digest"), `${ia.digest}  mousse-relay:${ver}\n`);
+
   const keys = makeKeys(minisignDir);
   const good = makeDist("good", a, source, ver, minisignDir, keys);
   const name = artifactName(good);
@@ -503,8 +518,31 @@ async function reproducible() {
   minisignRun(
     minisignDir,
     [...bind(good, "/dist", true), ...bind(keys, "/k", true)],
-    `cd /dist && for f in ${name} SHA256SUMS install.sh cloud-init.yaml; do minisign -V -q -p /k/release.pub -m $f || exit 1; done`,
+    `cd /dist && for f in ${name} SHA256SUMS mousse-relay-image.digest install.sh cloud-init.yaml; do minisign -V -q -p /k/release.pub -m $f || exit 1; done`,
   );
+
+  // sign.sh refuses to finish a release signed in minisign's legacy format,
+  // which install.sh would refuse (minisign -V alone accepts it).
+  {
+    const legacy = copyDist(good, "legacy");
+    for (const f of fs.readdirSync(legacy).filter((f) => f.endsWith(".minisig"))) fs.rmSync(path.join(legacy, f));
+    const wrap = path.join(out, "legacy-minisign");
+    fs.mkdirSync(wrap, { recursive: true });
+    fs.writeFileSync(
+      path.join(wrap, "minisign"),
+      ['#!/bin/sh', 'case "$1" in -S) exec /opt/minisign/minisign "$@" -l ;; *) exec /opt/minisign/minisign "$@" ;; esac', ""].join("\n"),
+      { mode: 0o755 },
+    );
+    const r = minisignRun(
+      minisignDir,
+      [...bind(release, "/release", true), ...bind(legacy, "/dist"), ...bind(keys, "/k", true), ...bind(wrap, "/opt/legacy", true)],
+      "PATH=/opt/legacy:$PATH; chmod +x /opt/legacy/minisign 2>/dev/null; sh /release/sign.sh --key /k/release.key --pubkey /k/release.pub --dist /dist",
+      { allowFail: true },
+    );
+    if (r.code === 0) fail("legacy-signed", "sign.sh finished a release signed in the legacy format");
+    if (!/prehashed/.test(r.text)) fail("setup", `sign.sh failed for another reason: ${r.text.trim().split("\n").pop()}`);
+    say("sign.sh refuses a legacy-format signature");
+  }
   plantControl(good);
 
   const cases = [];
@@ -550,27 +588,64 @@ async function reproducible() {
 
 // --- install -----------------------------------------------------------------------
 
-function loadImage(dist, epoch, ver) {
-  const ctx = path.join(out, "image");
+// The first manifest or index digest in an OCI layout tarball's index.json:
+// what users pin and what the release signs.
+function ociDigest(tarFile) {
+  const buf = fs.readFileSync(tarFile);
+  for (let off = 0; off + 512 <= buf.length; ) {
+    const name = buf.toString("utf8", off, off + 100).split(String.fromCharCode(0))[0];
+    if (!name) break;
+    const size = parseInt(buf.toString("utf8", off + 124, off + 136).split(String.fromCharCode(0))[0].trim() || "0", 8);
+    if (name === "index.json" || name === "./index.json") {
+      const index = JSON.parse(buf.toString("utf8", off + 512, off + 512 + size));
+      return index.manifests?.[0]?.digest;
+    }
+    off += 512 + Math.ceil(size / 512) * 512;
+  }
+  return undefined;
+}
+
+// The relay image from the binaries in `dist`, as release/build.sh builds it:
+// a fresh builder on the pinned BuildKit (on the internal network), no
+// cache, no provenance or SBOM, SOURCE_DATE_EPOCH and rewritten timestamps.
+function buildImage(dist, epoch, label, tag) {
+  const ctx = path.join(out, `image-${label}`);
   fs.mkdirSync(path.join(ctx, "state"), { recursive: true });
   for (const f of fs.readdirSync(dist).filter((f) => /^mousse-relay-.*-linux-musl$/.test(f))) {
     fs.copyFileSync(path.join(dist, f), path.join(ctx, f));
   }
-  const tag = `mousse-release-test/relay:${RUN}`;
+  const bx = `mousse-release-${label}-${RUN}`;
+  docker(["buildx", "create", "--name", bx, "--driver", "docker-container", "--driver-opt", `image=${BUILDKIT},network=${NETWORK}`, "--bootstrap"]);
+  cleanups.push(() => docker(["buildx", "rm", "-f", bx], { allowFail: true, quiet: true }));
+  const dest = path.join(out, `relay-image-${label}.oci.tar`);
   docker([
     "buildx",
     "build",
+    "--builder",
+    bx,
     "--network",
     "none",
+    "--no-cache",
+    "--provenance=false",
+    "--sbom=false",
     "--build-arg",
     `SOURCE_DATE_EPOCH=${epoch}`,
     "--output",
-    `type=oci,dest=${path.join(out, "relay-image.oci.tar")},rewrite-timestamp=true,name=${tag}`,
+    `type=oci,dest=${dest},rewrite-timestamp=true${tag ? `,name=${tag}` : ""}`,
     "-f",
     path.join(release, "relay.Dockerfile"),
     ctx,
   ]);
-  docker(["load", "-i", path.join(out, "relay-image.oci.tar")]);
+  docker(["buildx", "rm", "-f", bx], { allowFail: true, quiet: true });
+  const digest = ociDigest(dest);
+  if (!digest) fail("setup", `no digest in ${dest}`);
+  return { dest, digest };
+}
+
+function loadImage(dist, epoch) {
+  const tag = `mousse-release-test/relay:${RUN}`;
+  const { dest } = buildImage(dist, epoch, "load", tag);
+  docker(["load", "-i", dest]);
   cleanups.push(() => docker(["image", "rm", "-f", tag], { allowFail: true, quiet: true }));
   return tag;
 }
@@ -712,6 +787,17 @@ async function install() {
     const m = txt.match(LINK);
     if (!m || m[1] !== PUBLIC) fail("template-no-link", "the template left no enrollment link in /root/mousse-relay.txt");
     say(`cloud-init template: enrollment link for ${m[1]}`);
+    // The link stays in the owner-only file: not in the boot log, nor on the
+    // console (the container's output stands in for the provider's).
+    const mode = exec(box, ["stat", "-c", "%a %U", "/root/mousse-relay.txt"]).stdout.trim();
+    if (mode !== "600 root") fail("template-link-leak", `/root/mousse-relay.txt is ${mode}`);
+    const bootLog = exec(box, ["cat", "/var/log/cloud-init-output.log", "/var/log/cloud-init.log"]).stdout;
+    const consoleLog = docker(["logs", box], { quiet: true }).text;
+    for (const [where, text] of [["the cloud-init logs", bootLog], ["the console", consoleLog]]) {
+      if (text.includes(m[3]) || text.includes(m[2])) fail("template-link-leak", `the enrollment link is in ${where}`);
+    }
+    if (!bootLog.includes("sudo cat /root/mousse-relay.txt")) fail("template-no-hint", "the boot log does not say where the link is");
+    say("The template keeps the link out of the boot log and the console");
     checkService(box, linkRelay(m), sha256);
     const up = exec(box, ["/usr/local/sbin/mousse-relay-install", "--from", "/mnt/dist"]);
     if (up.code !== 0 || LINK.test(up.stdout)) fail("upgrade-failed", "the template's upgrade failed or made a new link");
@@ -722,7 +808,7 @@ async function install() {
 
   // 4. The relay image: read-only root, no shell, unprivileged, state volume.
   {
-    const tag = loadImage(good, source.epoch, ver);
+    const tag = loadImage(good, source.epoch);
     const cfg = JSON.parse(docker(["image", "inspect", tag, "--format", "{{json .Config}}"]).stdout);
     if (cfg.User !== "65532:65532") fail("image", `image user ${cfg.User}`);
     const sh = docker(["run", "--rm", "--network", "none", "--entrypoint", "/bin/sh", tag, "-c", "true"], { allowFail: true });

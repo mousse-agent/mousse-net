@@ -39,6 +39,7 @@ done
 
 conf() { sed -n "s/^$1=//p" "$here/toolchain.env"; }
 builder=$(conf BUILDER_IMAGE)
+buildkit=$(conf BUILDKIT_IMAGE)
 packages=$(conf PACKAGES)
 [ -n "$platforms" ] || platforms=$(conf PLATFORMS)
 
@@ -89,7 +90,13 @@ echo "Building the relay image"
 plats=$(printf '%s' "$platforms" | sed 's/^ *//; s/ \{1,\}/,/g')
 mkdir -p "$work/image/state"
 cp "$out"/mousse-relay-*-linux-musl "$work/image/"
-docker buildx build --platform "$plats" --network none \
+# A throwaway builder on the pinned BuildKit, with no network.
+bx="mousse-release-$$"
+docker buildx create --name "$bx" --driver docker-container \
+  --driver-opt "image=$buildkit,network=none" --bootstrap >/dev/null
+trap 'docker buildx rm -f "$bx" >/dev/null 2>&1; rm -rf "$work"' EXIT INT TERM
+docker buildx build --builder "$bx" --platform "$plats" --network none --no-cache \
+  --provenance=false --sbom=false \
   --build-arg SOURCE_DATE_EPOCH="$epoch" \
   --output "type=oci,dest=$(hostpath "$out")/mousse-relay-image.oci.tar,rewrite-timestamp=true" \
   -f "$(hostpath "$here")/relay.Dockerfile" "$(hostpath "$work/image")"
@@ -103,6 +110,7 @@ commit=$commit
 version=$version
 source_date_epoch=$epoch
 builder=$builder
+buildkit=$buildkit
 platforms=$platforms
 EOF
 echo "Done: $out"

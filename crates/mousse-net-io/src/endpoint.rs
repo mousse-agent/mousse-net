@@ -171,9 +171,13 @@ impl Endpoint {
         profile_id: Option<&str>,
         storage: KeyStorage,
     ) -> Result<(Self, StoredIdentity), NetError> {
-        crate::private::make_private_dir(dir)
+        // Nothing in an existing folder is touched before the lock is held:
+        // another process may be writing in it.
+        crate::private::ensure_dir_for_lock(dir)
             .map_err(|e| NetError::Store(format!("{}: {e}", dir.display())))?;
         let dir_lock = lock_file(&dir.join(DIR_LOCK_FILE), false)?;
+        crate::private::make_private_dir(dir)
+            .map_err(|e| NetError::Store(format!("{}: {e}", dir.display())))?;
         if Self::exists(dir) {
             return Err(NetError::Store(format!(
                 "an endpoint already exists in {}",
@@ -245,10 +249,14 @@ impl Endpoint {
                 dir.display()
             )));
         }
-        // Owner-only, also for a folder made before this was enforced.
-        crate::private::make_private_dir(dir)
+        // Owner-only, also for a folder made before this was enforced; but
+        // only once the lock is held, so a process that is refused never
+        // touches files the running one is writing.
+        crate::private::ensure_dir_for_lock(dir)
             .map_err(|e| NetError::Store(format!("{}: {e}", dir.display())))?;
         let dir_lock = lock_file(&dir.join(DIR_LOCK_FILE), shared)?;
+        crate::private::make_private_dir(dir)
+            .map_err(|e| NetError::Store(format!("{}: {e}", dir.display())))?;
         let path = dir.join(ENDPOINT_FILE);
         let bytes =
             fs::read(&path).map_err(|e| NetError::Store(format!("{}: {e}", path.display())))?;

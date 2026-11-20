@@ -776,9 +776,18 @@ async fn run(cli: Cli) -> Result<i32, String> {
             app,
             headless,
         } => {
+            // A headless first start keeps the endpoint it created, and
+            // with it the endpoint's locks, straight into serving: no other
+            // process can open it in between. Another first start that lost
+            // the race finds the endpoint made and refuses like any second
+            // process.
+            let mut created = None;
             if headless.headless && !Endpoint::exists(&dir) {
-                // Dropped at once: serve opens it again and takes its locks.
-                create_headless(&dir, None, headless)?;
+                match create_headless(&dir, None, headless) {
+                    Ok(endpoint) => created = Some(endpoint),
+                    Err(_) if Endpoint::exists(&dir) => {}
+                    Err(e) => return Err(e),
+                }
             }
             let opts = serve::ServeOptions {
                 name: name.unwrap_or_else(computer_name),
@@ -789,7 +798,7 @@ async fn run(cli: Cli) -> Result<i32, String> {
                 ws_port,
                 tunnels,
             };
-            serve::run(&dir, insecure, opts).await?;
+            serve::run(&dir, insecure, opts, created).await?;
         }
         Command::Invite { link, qr: _, no_qr } => invite(&dir, link, no_qr).await?,
         Command::Join {

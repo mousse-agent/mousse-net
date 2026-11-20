@@ -36,12 +36,16 @@ refused.
   remaps them (`--remap-path-prefix`, `-ffile-prefix-map`), sets
   `SOURCE_DATE_EPOCH` to the commit time, `TZ=UTC` and `LC_ALL=C`, links
   statically (`+crt-static`) and refuses a binary with a dynamic loader.
-- The image is built from the binaries with `--network none` and
+- The image is built from the binaries by a fresh builder on the BuildKit
+  pinned by digest in `release/toolchain.env`, with no network, no cache, no
+  provenance or SBOM attestations, `SOURCE_DATE_EPOCH` and
   `rewrite-timestamp=true`, so its digest is reproducible too.
 
-Anyone can rebuild a release and compare `SHA256SUMS`. The
-`phase3.reproducible` check does this with two builds in separate containers
-with different mount paths, job counts and time zones.
+Anyone can rebuild a release and compare `SHA256SUMS` and
+`mousse-relay-image.digest`. The `phase3.reproducible` check does this with
+two builds of the binaries in separate containers with different mount
+paths, job counts and time zones, and two image builds in two fresh
+builders.
 
 ## Signing (offline)
 
@@ -54,7 +58,9 @@ The release key is a minisign key kept offline. Its public key goes in
     release/sign.sh --key <offline>/mousse-relay.key --pubkey release/minisign.pub --dist dist
 
 Copy `dist/` to the offline machine for `sign.sh` and back. `sign.sh` checks
-`SHA256SUMS` first, then signs and verifies each file.
+`SHA256SUMS` first, then signs and verifies each file, and refuses a
+signature not in minisign's prehashed format (the only one `install.sh`
+accepts; `minisign -V` alone also accepts the legacy one).
 
 Publishing: upload the files to the GitHub release `relay-v<version>`, and
 push the image with its digest kept, for example
@@ -115,7 +121,9 @@ Upgrades change the digest and keep the volume.
 `cloud-init.yaml` is plain user data for any VPS that takes cloud-init
 (Ubuntu 22.04+, Debian 12+). It writes the stamped installer to
 `/usr/local/sbin/mousse-relay-install` and runs it on first boot; the output,
-with the enrollment link, is in `/root/mousse-relay.txt`. It trusts nothing
+with the enrollment link, goes only to `/root/mousse-relay.txt` (mode 0600),
+never to the boot log or the provider's console, which only say where it is
+(`sudo cat /root/mousse-relay.txt` over SSH). It trusts nothing
 it downloads that is not signed by the key in it. Platforms that end TLS at
 their own proxy cannot carry the relay's pinned key and wait for Phase 5's
 browser profile.
@@ -128,15 +136,17 @@ node; on the PC only on an `--internal` network. Signing keys are throwaway
 ones made under `<dir>`. The Ubuntu 24.04 cloud image root (what a VPS boots)
 and minisign 0.12 are fetched once, by pinned SHA-256.
 
-- `phase3.reproducible`: two builds are byte-identical; minisign and
-  `install.sh` accept the signed release; `install.sh` refuses an unsigned
+- `phase3.reproducible`: two builds of the binaries are byte-identical and
+  two image builds have the same digest; minisign and `install.sh` accept the
+  signed release; `sign.sh` refuses a signature in minisign's legacy format; `install.sh` refuses an unsigned
   download, a changed binary, a release re-signed by another key and an older
   release served as this one. Control `unsigned-accepted`.
 - `phase3.install`: on a fresh cloud image with systemd, `install.sh` gives an
   enrollment link for the public address, the service runs as
   `mousse-relay` with only `CAP_NET_BIND_SERVICE`, `status --json` names the
   linked relay, and an upgrade keeps it; a tampered download leaves no
-  binary, unit or user; the cloud-init template does the same on first boot;
+  binary, unit or user; the cloud-init template does the same on first boot,
+  and its link is in neither the boot log nor the console;
   the image has no shell and an unprivileged user, runs read-only, accepts on
   443 and keeps its identity in the volume across restarts; the relay
   sets its own core-dump limit to 0 even where the container allows dumps.

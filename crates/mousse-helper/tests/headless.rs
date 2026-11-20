@@ -230,6 +230,83 @@ fn a_loosened_key_file_is_made_owner_only_again_before_use() {
     cleanup(&[&dir]);
 }
 
+/// Several first starts at once on one empty folder: one identity, one
+/// host, and every other process refuses as a second process would.
+#[test]
+fn concurrent_first_starts_make_one_endpoint_and_the_rest_refuse() {
+    for round in 0..4 {
+        let dir = temp_dir(&format!("hl-race{round}"));
+        let mut procs: Vec<Proc> = (0..6)
+            .map(|_| {
+                let mut all = state_args(&dir);
+                all.extend(
+                    [
+                        "serve",
+                        "--headless",
+                        "--key-file",
+                        "--listen-ip",
+                        "127.0.0.1",
+                        "--no-mdns",
+                    ]
+                    .iter()
+                    .map(|a| a.to_string()),
+                );
+                let all: Vec<&str> = all.iter().map(String::as_str).collect();
+                Proc::spawn(helper(&all))
+            })
+            .collect();
+        // Every loser ends; the one host keeps running. Wait until all but
+        // one have exited and the survivor is ready (or WAIT passes).
+        let start = Instant::now();
+        let mut codes: Vec<Option<i32>> = vec![None; procs.len()];
+        while start.elapsed() < WAIT {
+            for (i, p) in procs.iter_mut().enumerate() {
+                if codes[i].is_none() {
+                    codes[i] = p.exit_within(Duration::ZERO);
+                }
+            }
+            let alive: Vec<usize> = (0..procs.len()).filter(|i| codes[*i].is_none()).collect();
+            if alive.len() <= 1 && alive.iter().all(|i| procs[*i].out().contains("ready ")) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let mut running = Vec::new();
+        for (i, p) in procs.iter_mut().enumerate() {
+            match codes[i] {
+                Some(code) => {
+                    assert_eq!(
+                        code,
+                        2,
+                        "round {round}: process {i} exited {code}\nstdout: {}\nstderr: {}",
+                        p.out(),
+                        p.err()
+                    );
+                    assert!(
+                        p.err().contains("already running this endpoint"),
+                        "round {round}: process {i} did not refuse as a second process:\nstdout: {}\nstderr: {}",
+                        p.out(),
+                        p.err()
+                    );
+                }
+                None => running.push(i),
+            }
+        }
+        assert_eq!(
+            running.len(),
+            1,
+            "round {round}: hosts running: {running:?}"
+        );
+        let host = procs.swap_remove(running[0]);
+        host.wait_for("ready ");
+        let created = host.out().matches("created endpoint").count();
+        assert!(created <= 1);
+        assert_eq!(identity_storage(&dir), "file");
+        stop(&dir, host);
+        cleanup(&[&dir]);
+    }
+}
+
 #[test]
 fn a_second_process_for_the_same_endpoint_refuses_and_another_profile_starts() {
     let a = temp_dir("hl-lock-a");
