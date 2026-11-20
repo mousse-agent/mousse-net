@@ -8,7 +8,7 @@
 //! docs/limits.md "Relay tests"):
 //!
 //! - `MOUSSE_RELAY_TEST_LINKS`: the links, each used once. `routes_cross`
-//!   needs six, five of one relay and one of a second; `rotation_cross`
+//!   needs seven, six of one relay and one of a second; `rotation_cross`
 //!   needs three.
 //! - `MOUSSE_RELAY_TEST_HOST_BUILD`: the relay's build, written as the
 //!   result's `host_build`.

@@ -661,6 +661,7 @@ async fn hold(
         events_tx,
         crate::limits::ms(h.via_relay_keepalive_ms()),
         crate::limits::ms(h.via_relay_idle_ms()),
+        h.via_relay_accept_legs() as usize,
     );
     tokio::pin!(run);
     let (lease_tx, lease_rx) = mpsc::unbounded_channel();

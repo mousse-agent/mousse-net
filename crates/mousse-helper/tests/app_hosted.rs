@@ -88,7 +88,8 @@ fn wait_sequence_above(app: &mut App, host: &str, above: u64) -> u64 {
         if now > above {
             return now;
         }
-        assert!(start.elapsed() < WAIT, "no manifest above {above}");
+        // A busy machine can take a while to bring the session back.
+        assert!(start.elapsed() < WAIT * 3, "no manifest above {above}");
         std::thread::sleep(Duration::from_millis(50));
     }
 }

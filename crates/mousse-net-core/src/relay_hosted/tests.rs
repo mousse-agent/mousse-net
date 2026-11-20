@@ -698,6 +698,70 @@ fn without_a_refill_the_class_closes_with_4001_and_the_other_class_carries_on() 
     );
 }
 
+#[test]
+fn a_paused_class_forwards_no_smaller_message_until_a_refill() {
+    let issuer = Issuer::new(1);
+    let mut h = registered(&issuer);
+    h.lease(H1, &issuer.block(1, 1, Class::Bulk, MESSAGE_MAX), at(0))
+        .unwrap();
+    // 1 000 bytes left; a 2 000-byte message pauses the class.
+    assert_eq!(
+        h.forward(
+            H1,
+            Class::Bulk,
+            1,
+            Direction::ToTarget,
+            MESSAGE_MAX - 1_000,
+            at(0)
+        ),
+        Forward::Go
+    );
+    assert_eq!(
+        h.forward(H1, Class::Bulk, 1, Direction::ToTarget, 2_000, at(0)),
+        Forward::Paused
+    );
+    // A small keepalive the other way, or on another circuit, waits too,
+    // and does not restart the refill wait.
+    assert_eq!(
+        h.forward(H1, Class::Bulk, 1, Direction::ToCaller, 100, at(5_000)),
+        Forward::Paused
+    );
+    assert_eq!(
+        h.forward(H1, Class::Bulk, 2, Direction::ToTarget, 100, at(5_000)),
+        Forward::Paused
+    );
+    assert!(h.poll(at(10_000)).contains(&Event::CloseClass {
+        handle: H1,
+        class: Class::Bulk,
+        code: CLOSE_LEASE_EXHAUSTED
+    }));
+    assert_eq!(entry(&mut h, 1, at(0)).unwrap().to_caller, 0);
+}
+
+#[test]
+fn an_empty_message_needs_a_lease_too() {
+    let issuer = Issuer::new(1);
+    let mut h = registered(&issuer);
+    h.lease(H1, &issuer.block(1, 1, Class::Bulk, MB), at(0))
+        .unwrap();
+    assert_eq!(
+        h.forward(H1, Class::Bulk, 1, Direction::ToTarget, 0, at(0)),
+        Forward::Go
+    );
+    h.release(H1, &[[1; 16]], at(0)).unwrap();
+    // Unfunded: an empty frame pauses the class, and the circuit closes at
+    // the end of the refill wait instead of living on empty frames.
+    assert_eq!(
+        h.forward(H1, Class::Bulk, 1, Direction::ToTarget, 0, at(1)),
+        Forward::Paused
+    );
+    assert!(h.poll(at(10_001)).contains(&Event::CloseClass {
+        handle: H1,
+        class: Class::Bulk,
+        code: CLOSE_LEASE_EXHAUSTED
+    }));
+}
+
 // --- Rate (§A.9 duty 8) ----------------------------------------------------
 
 #[test]

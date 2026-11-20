@@ -142,7 +142,11 @@ mousse_net_core::define_limits! {
         via_relay_idle_ms = "VIA_RELAY_IDLE_MS": 60_000, [3_000, 600_000];
         /// How often the helper checks relay invitation and recovery expiry, rotation overlaps and manifest renewal.
         via_relay_check_ms = "VIA_RELAY_CHECK_MS": 30_000, [100, 600_000];
-        /// How long an old relay route or registration key stays in the manifest after a rotation (Phase 3 §B.4, §B.11).
+        /// Own relays: accept legs being dialled at once; an `INCOMING` past it is left to time out (a relay cannot make the host dial without bound; tighten only).
+        via_relay_accept_legs = "VIA_RELAY_ACCEPT_LEGS": 64, [1, 64];
+        /// Own relays: during a key rotation, the wait between tries to register the new key (and between `SUCCESSOR`s while the relay refuses it).
+        via_relay_rotation_retry_ms = "VIA_RELAY_ROTATION_RETRY_MS": 1_000, [100, 60_000];
+        /// How long an old relay route or registration key stays in the manifest after a rotation, counted from the rotation's start less the clock skew (Phase 3 §B.4, §B.11); at most the relay's `RELAY_SUCCESSOR_OVERLAP_SECS`, so the route leaves before the relay drops the key.
         manifest_overlap_secs = "MANIFEST_OVERLAP_SECS": 604_800, [86_400, 2_592_000];
         /// When a manifest becomes stale (still dialled, last); above the overlap.
         manifest_lifetime_secs = "MANIFEST_LIFETIME_SECS": 2_592_000, [604_800, 7_776_000];
