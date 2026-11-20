@@ -58,7 +58,8 @@
         mousse_control = "link-accepts-kind1",
         mousse_control = "no-completion-record",
         mousse_control = "done-pin-only",
-        mousse_control = "replay-after-removal"
+        mousse_control = "replay-after-removal",
+        mousse_control = "join-ignores-removal"
     )
 ))]
 compile_error!("a mousse_control build has a deliberate defect and is for tests only; build it without --release");
@@ -124,6 +125,7 @@ compile_error!("test-in-person lets a typed ticket count as scanned from the hos
     mousse_control = "no-completion-record",
     mousse_control = "done-pin-only",
     mousse_control = "replay-after-removal",
+    mousse_control = "join-ignores-removal",
     feature = "test-in-person"
 ))]
 const _: () = {

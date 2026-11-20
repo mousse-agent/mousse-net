@@ -442,6 +442,11 @@ async fn join(
     let approved_routes = super::paths::canonical_list(Some(&json!(approved)));
     let candidates: Vec<LocalRoute> =
         super::paths::ticket_candidates(&policy, &ticket.routes, &approved_routes);
+    // A removal of the host while the join runs (`peer.forget`) wins: the
+    // join stores nothing, or what it stored goes with the removal.
+    let pin = ticket.host_identity;
+    let gen = shared.peer_gen(&pin);
+    let wanted = || shared.peer_gen(&pin) == gen;
     let result = if candidates.is_empty() {
         Err(crate::peer::Failure {
             text: "the ticket has no private-range address and none it lists was approved".into(),
@@ -475,6 +480,7 @@ async fn join(
                     link,
                     &mut codes,
                     progress,
+                    wanted,
                 )
                 .await
             }
@@ -490,6 +496,7 @@ async fn join(
                     link,
                     &mut NoCode,
                     progress,
+                    wanted,
                 )
                 .await
             }
@@ -520,7 +527,7 @@ async fn join(
                 "role": role,
                 "route": super::paths::route_json(&reached),
             });
-            match shared.add_conn(conn, false, fields) {
+            match shared.add_outbound(conn, gen, fields) {
                 Ok(no) => json!({
                     "re": id,
                     "identity": hex(ticket.host_identity.as_bytes()),
@@ -530,7 +537,12 @@ async fn join(
                     "conn": no,
                     "ticket_hash": hex(&ticket.hash()),
                 }),
-                Err(_) => paused(&shared, &id),
+                Err(super::Stale::Paused) => paused(&shared, &id),
+                Err(super::Stale::Forgotten) => error(
+                    &id,
+                    "forgotten",
+                    "the host was removed while this device was joining it",
+                ),
             }
         }
         Err(f) => error(&id, &f.reason, f.text),
@@ -840,6 +852,12 @@ fn forget_peer(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
             list.retain(|p| p.identity != key);
             forgotten = list.len() != before;
         })?;
+        // Under the peers lock, which a join checks the generation under
+        // before it stores the host: it stores before this or not at all.
+        *super::lock(&shared.core)
+            .peer_gen
+            .entry(identity)
+            .or_default() += 1;
         crate::peer::drop_completions(&shared.info.state_dir, &held, &key)
     });
     match updated {
@@ -849,8 +867,7 @@ fn forget_peer(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
     shared.caller.forget_routes(Some(&identity));
     // Its outbound connections go with it, and so do those still opening:
     // a dial or renewal that started before publishes nothing.
-    let mut core = super::lock(&shared.core);
-    *core.peer_gen.entry(identity).or_default() += 1;
+    let core = super::lock(&shared.core);
     for entry in core.conns.values() {
         if !entry.inbound && entry.identity == identity {
             entry.conn.close(ErrorCode::Cancelled);

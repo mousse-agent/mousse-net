@@ -253,6 +253,7 @@ pub async fn join(
         None,
         &mut TypedCode,
         |_| {},
+        || true,
     )
     .await?;
     Ok(Joined {
@@ -281,6 +282,11 @@ pub async fn join(
 /// written first, then the pin, the approvals and the settled mark. An
 /// "already paired" answer is existing access only and changes nothing
 /// stored.
+///
+/// `wanted`: false once the host was removed since the join started. It is
+/// asked under the peers lock, just before anything is stored, and a
+/// removal answers it under the same lock: a join either stores before the
+/// removal (which then removes what it stored) or stores nothing.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn join_routes<C: CodeEntry>(
     caller: &Caller,
@@ -293,6 +299,7 @@ pub(crate) async fn join_routes<C: CodeEntry>(
     link: Option<&[String]>,
     codes: &mut C,
     mut progress: impl FnMut(&str),
+    wanted: impl Fn() -> bool,
 ) -> Result<(Connection, PeerRecord, bool, Reached), Failure> {
     let held = peers.load().is_ok_and(|ps| {
         ps.iter()
@@ -356,7 +363,13 @@ pub(crate) async fn join_routes<C: CodeEntry>(
             Ok((conn, outcome)) if link.is_some() => {
                 let approved = link.unwrap_or_default();
                 let (record, already) =
-                    finish_link(caller, peers, ticket, &hint, approved, outcome)?;
+                    match finish_link(caller, peers, ticket, &hint, approved, outcome, &wanted) {
+                        Ok(done) => done,
+                        Err(f) => {
+                            conn.close(ErrorCode::Cancelled);
+                            return Err(f);
+                        }
+                    };
                 caller.remember_local_routes(ticket.host_identity, vec![route.clone()]);
                 return Ok((conn, record, already, reached));
             }
@@ -365,33 +378,42 @@ pub(crate) async fn join_routes<C: CodeEntry>(
                 // Built from the stored record as it is under the lock, so
                 // a write by another process meanwhile is not undone.
                 let mut stored = None;
-                peers
-                    .update(|peers| {
-                        let existing = peers
-                            .iter()
-                            .find(|p| p.pin().ok() == Some(ticket.host_identity));
-                        let (host_name, role) = match outcome {
-                            JoinOutcome::Paired(host) => (host.name, host.role.as_str().to_owned()),
-                            JoinOutcome::AlreadyPaired => match existing {
-                                Some(p) => (p.name.clone(), p.role.clone()),
-                                None => (short_id(&ticket.host_identity), "unknown".into()),
-                            },
-                        };
-                        let record = PeerRecord {
-                            name: host_name,
-                            identity: hex(ticket.host_identity.as_bytes()),
-                            role,
-                            routes: ticket.routes.clone(),
-                            last_route: Some(hint.clone()),
-                            addresses: existing.map(|p| p.addresses.clone()).unwrap_or_default(),
-                            offered: existing.map(|p| p.offered.clone()).unwrap_or_default(),
-                            paired_at: now_secs(),
-                        };
-                        peers.retain(|p| p.pin().ok() != Some(ticket.host_identity));
-                        peers.push(record.clone());
-                        stored = Some(record);
-                    })
-                    .map_err(|e| Failure::new(e.to_string(), "store"))?;
+                let store = |e: NetError| Failure::new(e.to_string(), "store");
+                let held = match peers.lock() {
+                    Ok(held) if wanted() => held,
+                    Ok(_) => {
+                        conn.close(ErrorCode::Cancelled);
+                        return Err(removed_meanwhile());
+                    }
+                    Err(e) => return Err(store(e)),
+                };
+                held.update(|peers| {
+                    let existing = peers
+                        .iter()
+                        .find(|p| p.pin().ok() == Some(ticket.host_identity));
+                    let (host_name, role) = match outcome {
+                        JoinOutcome::Paired(host) => (host.name, host.role.as_str().to_owned()),
+                        JoinOutcome::AlreadyPaired => match existing {
+                            Some(p) => (p.name.clone(), p.role.clone()),
+                            None => (short_id(&ticket.host_identity), "unknown".into()),
+                        },
+                    };
+                    let record = PeerRecord {
+                        name: host_name,
+                        identity: hex(ticket.host_identity.as_bytes()),
+                        role,
+                        routes: ticket.routes.clone(),
+                        last_route: Some(hint.clone()),
+                        addresses: existing.map(|p| p.addresses.clone()).unwrap_or_default(),
+                        offered: existing.map(|p| p.offered.clone()).unwrap_or_default(),
+                        paired_at: now_secs(),
+                    };
+                    peers.retain(|p| p.pin().ok() != Some(ticket.host_identity));
+                    peers.push(record.clone());
+                    stored = Some(record);
+                })
+                .map_err(store)?;
+                drop(held);
                 let record = stored.expect("the update ran");
                 // The pin is stored: the join's outcome is no longer pending.
                 caller
@@ -427,12 +449,27 @@ pub(crate) async fn join_routes<C: CodeEntry>(
     }
 }
 
-/// A test hook (debug builds): `MOUSSE_HELPER_TEST_CRASH=<point>` stops the
+/// Test hooks (debug builds): `MOUSSE_HELPER_TEST_CRASH=<point>` stops the
 /// helper at once at that point, as a crash would.
+/// `MOUSSE_HELPER_TEST_HOLD=<point>=<file>` holds it there instead: it
+/// creates `<file>` and waits until the test deletes it (60 s at most).
 pub(crate) fn crash_point(point: &str) {
     #[cfg(debug_assertions)]
-    if std::env::var("MOUSSE_HELPER_TEST_CRASH").as_deref() == Ok(point) {
-        std::process::exit(86);
+    {
+        if std::env::var("MOUSSE_HELPER_TEST_CRASH").as_deref() == Ok(point) {
+            std::process::exit(86);
+        }
+        if let Ok(hold) = std::env::var("MOUSSE_HELPER_TEST_HOLD") {
+            if let Some(file) = hold.strip_prefix(point).and_then(|r| r.strip_prefix('=')) {
+                let file = Path::new(file);
+                if std::fs::write(file, point).is_ok() {
+                    let until = std::time::Instant::now() + Duration::from_secs(60);
+                    while file.exists() && std::time::Instant::now() < until {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }
+            }
+        }
     }
     let _ = point;
 }
@@ -445,6 +482,7 @@ fn finish_link(
     hint: &str,
     approved: &[String],
     outcome: JoinOutcome,
+    wanted: &impl Fn() -> bool,
 ) -> Result<(PeerRecord, bool), Failure> {
     let store = |e: NetError| Failure::new(e.to_string(), "store");
     let hash = ticket.hash();
@@ -494,10 +532,18 @@ fn finish_link(
         expires_at: ticket.expires_at.secs(),
         at: now,
     };
+    // The record, the row and the approvals are written under one peers
+    // lock, checked against a removal of the host under it: a removal
+    // meanwhile would otherwise be undone by the replay, or drop the
+    // record before it and leave this join's path to a removed host.
+    let held = peers.lock().map_err(store)?;
+    // Must-fail control: the host's removal during the join is not seen.
+    if !wanted() && !cfg!(mousse_control = "join-ignores-removal") {
+        return Err(removed_meanwhile());
+    }
     // Must-fail control: the pin is saved with no completion record first.
     if cfg!(mousse_control = "no-completion-record") {
         crash_point("link-done-saved");
-        let held = peers.lock().map_err(store)?;
         held.update(|list| merge_peer(list, peer.clone()))
             .map_err(store)?;
         ApprovalStore::in_dir(peers.dir())
@@ -508,10 +554,25 @@ fn finish_link(
             .save(&done)
             .map_err(store)?;
         crash_point("link-done-saved");
-        replay_completion(peers.dir(), &hash, true, None).map_err(store)?;
+        if replay_held(peers.dir(), &held, &hash, true, None)
+            .map_err(store)?
+            .is_none()
+        {
+            return Err(removed_meanwhile());
+        }
     }
+    drop(held);
     caller.settle_stored(&hash).map_err(store)?;
     Ok((peer, false))
+}
+
+/// The join's host was removed (`peer.forget`) while it ran: nothing is
+/// stored and its connection is closed.
+fn removed_meanwhile() -> Failure {
+    Failure::new(
+        "the host was removed while this device was joining it",
+        "forgotten",
+    )
 }
 
 /// The approvals a link join stores: each approved destination that is one
@@ -564,6 +625,17 @@ pub(crate) fn replay_completion(
 ) -> Result<Option<CompletionRecord>, NetError> {
     let peers = PeerStore::in_dir(dir);
     let held = peers.lock()?;
+    replay_held(dir, &held, ticket_hash, full, stale)
+}
+
+/// [`replay_completion`], under the peers lock `held`.
+fn replay_held(
+    dir: &Path,
+    held: &PeersLock<'_>,
+    ticket_hash: &[u8; 32],
+    full: bool,
+    stale: Option<(u64, u64)>,
+) -> Result<Option<CompletionRecord>, NetError> {
     let records = CompletionStore::in_dir(dir);
     let Some(record) = records.load(ticket_hash)? else {
         return Ok(None);
@@ -581,7 +653,7 @@ pub(crate) fn replay_completion(
     }
     held.update(|list| merge_peer(list, peer))?;
     if full {
-        ApprovalStore::in_dir(dir).add(&held, &record.approvals)?;
+        ApprovalStore::in_dir(dir).add(held, &record.approvals)?;
     }
     Ok(Some(record))
 }
