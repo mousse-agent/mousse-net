@@ -1,18 +1,22 @@
 //! The helper's relay state files (Phase 3 §B.4, §B.5, §B.11, §B.12), all
 //! in the endpoint's private state folder and written with `write_atomic`.
-//! No secret is in them: keys and pair secrets are derived from the relay
-//! seed (kept where the identity is kept) with the salts stored here.
+//! No relay secret is in them in the clear: keys and this host's pair
+//! secrets are derived from the relay seed (kept where the identity is
+//! kept) with the salts stored here, and the two secrets a caller is given
+//! (a host's pair secret, a ticket's invitation tag) are sealed under a key
+//! derived from the same seed.
 //!
 //! - `relays.json`: this computer's own relays (pasted enrollment links):
 //!   endpoint, relay id and key, the registration key's salt, old salts
-//!   kept through a rotation's overlap, and the manifest sequence.
+//!   kept through a rotation's overlap, a rotation the relay has not taken
+//!   yet, and the manifest sequence.
 //! - `relay-grants.json` (host): per grant, the caller key fingerprint and
 //!   the pair secret's salt from `mousse-keys`; and the recovery entries of
 //!   consumed relay invitations (§B.7).
 //! - `relay-peers.json` (caller): per paired host, the caller key's salt,
-//!   the pair secret it sent, its newest manifest, the relay hints its
-//!   ticket carried, and the ticket's invitation tag until `mousse-keys`
-//!   is answered.
+//!   the pair secret it sent (sealed), its newest manifest, the relay hints
+//!   its ticket carried, and the ticket's invitation tag (sealed) until
+//!   `mousse-keys` is answered.
 //!
 //! Relay approvals are Phase 1b's (`approvals.json`, `ApprovalStore`), with
 //! `relay://host:port` destinations and the `manifest` source.
@@ -34,6 +38,17 @@ pub struct OldKey {
     pub until: u64,
 }
 
+/// A rotation the relay has not taken yet (§B.4): journaled before the
+/// first `SUCCESSOR` is sent, and kept until the new key registers.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingKey {
+    /// The new key's salt (hex).
+    pub salt: String,
+    /// When the rotation started, before any `SUCCESSOR`: the relay's
+    /// overlap for the old key starts no earlier.
+    pub since: u64,
+}
+
 /// One of this computer's own relays.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OwnRelay {
@@ -53,6 +68,10 @@ pub struct OwnRelay {
     /// When the key last changed, if ever.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rotated_at: Option<u64>,
+    /// A rotation under way: the current key stays until the new one
+    /// registers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<PendingKey>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -104,7 +123,7 @@ pub struct PeerRelay {
     pub identity: String,
     /// The caller key's salt (hex).
     pub salt: String,
-    /// The pair secret the host sent on `mousse-keys` (hex).
+    /// The pair secret the host sent on `mousse-keys`, sealed (hex).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pair_secret: Option<String>,
     /// The newest manifest envelope (hex) and its sequence.
@@ -115,7 +134,7 @@ pub struct PeerRelay {
     /// `relay://` hints from the ticket this device joined with.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ticket_routes: Vec<String>,
-    /// The ticket's invitation tag (hex), until the host answers
+    /// The ticket's invitation tag, sealed (hex), until the host answers
     /// `mousse-keys`: the way back through the relay meanwhile (§B.7).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub join_tag: Option<String>,

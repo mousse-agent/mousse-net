@@ -35,6 +35,9 @@ pub struct TestRelay {
     connections: Arc<AtomicUsize>,
     live: Arc<AtomicUsize>,
     forwarder: JoinHandle<()>,
+    /// While true the forwarder carries nothing: open connections stay
+    /// open but silent, new ones are taken and held.
+    cut: tokio::sync::watch::Sender<bool>,
 }
 
 fn now() -> UnixTime {
@@ -82,6 +85,7 @@ impl TestRelay {
         let live = Arc::new(AtomicUsize::new(0));
         let listener = rt.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
         let front = listener.local_addr().unwrap();
+        let (cut, cut_rx) = tokio::sync::watch::channel(false);
         let forwarder = rt.spawn({
             let connections = connections.clone();
             let live = live.clone();
@@ -90,10 +94,25 @@ impl TestRelay {
                     connections.fetch_add(1, Ordering::SeqCst);
                     live.fetch_add(1, Ordering::SeqCst);
                     let held = Live(live.clone());
+                    let mut cut = cut_rx.clone();
                     tokio::spawn(async move {
                         let _held = held;
-                        if let Ok(mut out) = TcpStream::connect(target).await {
-                            let _ = tokio::io::copy_bidirectional(&mut inbound, &mut out).await;
+                        let taken_while_cut = *cut.borrow_and_update();
+                        if taken_while_cut {
+                            // Taken while cut: held silent, dropped after.
+                            let _ = cut.wait_for(|c| !*c).await;
+                            return;
+                        }
+                        let Ok(mut out) = TcpStream::connect(target).await else {
+                            return;
+                        };
+                        let was_cut = tokio::select! {
+                            _ = tokio::io::copy_bidirectional(&mut inbound, &mut out) => false,
+                            r = cut.wait_for(|c| *c) => r.is_ok(),
+                        };
+                        if was_cut {
+                            // Silent until the cut ends, then dropped.
+                            let _ = cut.wait_for(|c| !*c).await;
                         }
                     });
                 }
@@ -109,7 +128,20 @@ impl TestRelay {
             connections,
             live,
             forwarder,
+            cut,
         }
+    }
+
+    /// Carry nothing more: what is sent to the relay now is lost, though
+    /// every connection stays open.
+    pub fn cut(&self) {
+        self.cut.send_replace(true);
+    }
+
+    /// End the cut: the connections held through it are dropped, new ones
+    /// are carried again.
+    pub fn resume(&self) {
+        self.cut.send_replace(false);
     }
 
     /// A fresh enrollment link naming the forwarder.

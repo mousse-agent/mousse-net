@@ -5,8 +5,9 @@
 
 mod common;
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -154,6 +155,7 @@ impl Target {
             events_tx,
             Duration::from_secs(10),
             Duration::from_secs(60),
+            64,
         ));
         let accepted = Arc::new(AtomicUsize::new(0));
         let acks = Arc::new(AtomicUsize::new(0));
@@ -375,4 +377,105 @@ async fn an_enrollment_code_registers_once() {
         Some("relay_not_authorized")
     );
     assert!(!target.task.is_finished());
+}
+
+/// A forwarder to the relay. Once `hold` is set it takes new connections
+/// and forwards nothing, so an accept leg dialled through it never
+/// finishes; `held` counts them.
+struct Front {
+    addr: SocketAddr,
+    hold: Arc<AtomicBool>,
+    held: Arc<AtomicUsize>,
+    _task: JoinHandle<()>,
+}
+
+impl Front {
+    async fn start(target: SocketAddr) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hold = Arc::new(AtomicBool::new(false));
+        let held = Arc::new(AtomicUsize::new(0));
+        let task = tokio::spawn({
+            let (hold, held) = (hold.clone(), held.clone());
+            async move {
+                let mut parked = Vec::new();
+                while let Ok((mut inbound, _)) = listener.accept().await {
+                    if hold.load(Ordering::SeqCst) {
+                        held.fetch_add(1, Ordering::SeqCst);
+                        parked.push(inbound);
+                        continue;
+                    }
+                    tokio::spawn(async move {
+                        if let Ok(mut out) = tokio::net::TcpStream::connect(target).await {
+                            let _ = tokio::io::copy_bidirectional(&mut inbound, &mut out).await;
+                        }
+                    });
+                }
+            }
+        });
+        Self {
+            addr,
+            hold,
+            held,
+            _task: task,
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_relay_cannot_make_the_target_dial_more_accept_legs_than_its_limit() {
+    let relay = TestRelay::start().await;
+    let front = Front::start(relay.running().local_addr).await;
+    let reg = key();
+    relay.authorize(&reg).await;
+    let via_front = RelayAddr {
+        addr: front.addr,
+        name: None,
+    };
+    let link = within(
+        "register",
+        TargetLink::register(&via_front, relay.relay_id(), reg, Proof::Register, WAIT),
+    )
+    .await
+    .expect("registered");
+    let handle = link.handle();
+    let callers: Vec<_> = (0..5).map(|_| key()).collect();
+    let listed: Vec<&RelayClientKey> = callers.iter().map(|k| &**k).collect();
+    let (_allow, allow_rx) = watch::channel(listing(&listed));
+    let (_commands, commands_rx) = mpsc::unbounded_channel();
+    let (events_tx, mut events) = mpsc::unbounded_channel();
+    let _task = tokio::spawn(link.run(
+        allow_rx,
+        commands_rx,
+        events_tx,
+        Duration::from_secs(10),
+        Duration::from_secs(60),
+        2,
+    ));
+    within("first allow-set", async {
+        while !matches!(events.recv().await, Some(TargetEvent::AllowSetOk { .. })) {}
+    })
+    .await;
+    // From now on every accept leg the target dials hangs.
+    front.hold.store(true, Ordering::SeqCst);
+    let id = relay.relay_id();
+    for caller in callers {
+        let direct = addr(&relay);
+        tokio::spawn(async move {
+            let _ = dial_call(&direct, id, handle, &caller, Class::Interactive, WAIT).await;
+        });
+    }
+    // Five INCOMINGs, two accept legs: the rest are refused at once.
+    let mut refused = 0;
+    within("three refused accept legs", async {
+        while refused < 3 {
+            if let Some(TargetEvent::AcceptFailed { error, .. }) = events.recv().await {
+                assert_eq!(error.word(), "relay_limit");
+                refused += 1;
+            }
+        }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(front.held.load(Ordering::SeqCst), 2);
 }

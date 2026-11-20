@@ -63,6 +63,24 @@ fn wait_registered(app: &mut App) {
     }
 }
 
+/// Wait until the relay took the new key: it is current, the old one in
+/// its overlap.
+fn wait_rotated(app: &mut App) {
+    let start = Instant::now();
+    loop {
+        let list = app.call("relay.list", json!({}));
+        let r = &list["relays"][0];
+        if r["new_key_pending"] == false && r["rotating_until"].is_u64() {
+            return;
+        }
+        assert!(
+            start.elapsed() < WAIT,
+            "the new key never registered: {list}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn dial_up(from: &mut App, to: &str) -> Value {
     let start = Instant::now();
     loop {
@@ -127,7 +145,8 @@ pub fn a_manual_rotation_asks_nothing_and_an_offline_caller_comes_back_through_t
 
     let offered = b.events("peer.relay.offered").len();
     let rotated = a.call("relay.rotate", json!({"relay": id}));
-    assert!(rotated["relay"]["rotating_until"].is_u64(), "{rotated}");
+    assert_eq!(rotated["relay"]["new_key_pending"], true, "{rotated}");
+    wait_rotated(&mut a);
     relay.wait_live(2);
     // B, online, gets the new manifest at once and is asked nothing: the
     // destination is the same.
