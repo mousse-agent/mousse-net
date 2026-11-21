@@ -30,6 +30,7 @@
 //! Every value here comes from the helper's limits through [`SshParams`].
 
 use std::collections::{HashMap, VecDeque};
+#[cfg(windows)]
 use std::ffi::OsString;
 use std::fmt;
 use std::io;
