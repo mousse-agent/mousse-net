@@ -50,8 +50,8 @@ pub struct ServeOptions {
     /// `--app`: the app channel on stdin and stdout.
     pub app: bool,
     /// `--ws-port`: run the loopback `ws` listener for a tunnel client on
-    /// this port (0: any; Phase 1b §4.1). It also runs, on the kept ws
-    /// port, while `tunnels` is not empty.
+    /// this port (0: any; Phase 1b §4.1). It also runs on the kept ws
+    /// port in app mode and when `tunnels` is configured.
     pub ws_port: Option<u16>,
     /// `--tunnel`: public `wss` URLs of the owner's tunnels to this
     /// listener, advertised in tickets.
@@ -82,6 +82,8 @@ pub struct ListenState {
     /// Tunnels given on the command line (`--tunnel`), advertised besides
     /// the config's.
     pub extra: Vec<String>,
+    /// This app's active managed tunnel, only for the lifetime of the helper.
+    pub managed_tunnel: Option<String>,
 }
 
 impl ListenState {
@@ -93,6 +95,11 @@ impl ListenState {
             if !routes.contains(t) {
                 routes.push(t.clone());
             }
+        }
+        if let Some(managed) = &self.managed_tunnel {
+            routes.retain(|route| route != managed);
+            routes.truncate(mousse_net_core::pairing::MAX_ROUTES - 1);
+            routes.push(managed.clone());
         }
         self.routes = routes;
     }
@@ -381,19 +388,20 @@ pub async fn run(
         port,
         bound: bound.clone(),
         extra,
+        managed_tunnel: None,
     }));
     // The loopback ws listener, for the owner's tunnel client (§4.1).
-    let ws_listener = if opts.ws_port.is_some() || !opts.tunnels.is_empty() || config.ws_listener()
-    {
-        Some(
-            endpoint
-                .bind_ws(opts.ws_port)
-                .await
-                .map_err(|e| format!("ws listen: {e}"))?,
-        )
-    } else {
-        None
-    };
+    let ws_listener =
+        if opts.app || opts.ws_port.is_some() || !opts.tunnels.is_empty() || config.ws_listener() {
+            Some(
+                endpoint
+                    .bind_ws(opts.ws_port)
+                    .await
+                    .map_err(|e| format!("ws listen: {e}"))?,
+            )
+        } else {
+            None
+        };
     let ws_port = match &ws_listener {
         Some(l) => Some(l.local_addr().map_err(|e| e.to_string())?.port()),
         None => None,
