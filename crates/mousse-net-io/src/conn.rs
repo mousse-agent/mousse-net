@@ -77,6 +77,30 @@ pub(crate) struct DriverLimits {
     rx_chunk: usize,
 }
 
+/// The variable that makes a debug build speak an older newest minor
+/// version, as an older peer does (tests only; release builds ignore it).
+pub const TEST_HELLO_MINOR_VAR: &str = "MOUSSE_NET_TEST_HELLO_MINOR";
+
+/// The versions this side speaks: [`VersionSupport::LOCAL`], or in a debug
+/// build with [`TEST_HELLO_MINOR_VAR`] set, that newest minor (never above
+/// the build's own) and the one before it.
+fn local_version() -> VersionSupport {
+    let local = VersionSupport::LOCAL;
+    #[cfg(debug_assertions)]
+    if let Some(minor) = std::env::var(TEST_HELLO_MINOR_VAR)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|m| *m < local.minor)
+    {
+        return VersionSupport {
+            major: local.major,
+            minor,
+            oldest_minor: minor.saturating_sub(1),
+        };
+    }
+    local
+}
+
 impl DriverLimits {
     fn new(limits: &Limits) -> Self {
         let io = limits.io();
@@ -781,7 +805,7 @@ pub(crate) fn spawn<P: Pipe>(
         finished: Vec::new(),
         blocked: Vec::new(),
         pings: Vec::new(),
-        hello: HelloState::new(VersionSupport::LOCAL),
+        hello: HelloState::new(local_version()),
         minor,
         reason: None,
         before_close: VecDeque::new(),
@@ -861,8 +885,8 @@ impl Driver {
         let mut slot: Option<oneshot::Sender<Vec<u8>>> = None;
 
         let hello = ControlMessage::Hello {
-            major_version: VersionSupport::LOCAL.major,
-            minor_version: VersionSupport::LOCAL.minor,
+            major_version: local_version().major,
+            minor_version: local_version().minor,
         };
         let _ = self.mux.send_control(hello.encode());
         let mut out = Outbox::default();

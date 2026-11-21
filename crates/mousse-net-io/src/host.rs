@@ -882,6 +882,12 @@ where
         }
     }
 
+    /// The live grant `identity` holds on this endpoint, if any.
+    pub fn live_grant(&self, identity: &IdentityPublicKey) -> Option<Grant> {
+        let now = self.shared.clock.now();
+        lock(&self.shared).grants.live_grant(identity, now).cloned()
+    }
+
     /// All grants.
     pub fn grants(&self) -> Vec<Grant> {
         lock(&self.shared).grants.grants().cloned().collect()

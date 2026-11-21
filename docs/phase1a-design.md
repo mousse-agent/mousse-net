@@ -238,6 +238,23 @@ Not in 1.0: deny lists, send links and tunnels. On an outbound connection,
 the helper resets every stream the host opens. On an inbound connection, it
 passes on only the §3.2 labels.
 
+**Both ways on one connection (protocol minor 3, added after 1.0).** Every
+`conn.up` carries `both`: `true` when the connection's agreed minor is 3 or
+more, so it carries calls both ways.
+- On an inbound connection with `both`, the app may `stream.open` toward
+  the caller (after the caller has opened a stream: wire.md 8, step 4).
+  Without it, `stream.open` there answers `one_way`.
+- On an outbound connection with `both`, a stream the host opens arrives as
+  `stream.incoming {conn, handle, label, class, grant, role}`. `grant` and
+  `role` are this computer's live grant for the host, which the app serves
+  the stream under, as it serves an inbound connection under the grant on
+  its `conn.up`. A host without a live grant here gets `REFUSED_STREAM`,
+  and the app sees nothing.
+- When that grant stops being live (a removal, an expiry, a pause), the
+  helper resets the streams served under it: `stream.reset {handle, code:
+  "grant_revoked"}`. The connection stays up.
+- A peer from before minor 3 gives `both: false`, and calls stay one way.
+
 ## 3. The engine session
 
 The session code is new, in `src/mms/netEngine/session/`. It does not
