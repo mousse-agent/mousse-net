@@ -1087,17 +1087,39 @@ fn an_ssh_failure_only_the_owner_can_fix_is_not_retried() {
     let fx = Fx::new("park");
     let r = fx.remote("b", RemoteOpts::default());
     fx.hosts(&[("box", r.port())]);
-    let (_a_end, mut a) = fx.caller("parka", &[("KEEP_RETRY_FIRST_MS", "100")]);
+    // A first wait long enough that no keeper retry falls between the
+    // steps below: each dial is the one a step starts.
+    let first = Duration::from_millis(1500);
+    let (_a_end, mut a) = fx.caller(
+        "parka",
+        &[("KEEP_RETRY_FIRST_MS", &first.as_millis().to_string())],
+    );
     let (b_end, b, _) = host_for(&mut a, "parkb");
     r.publish(&[(SEL, &b_end.dir, true)]);
     // No probe or trust: the route has no pinned key.
     let route = resolve(&mut a, "box");
     let identity = b.identity.clone();
     a.call("peer.forget", json!({"identity": identity}));
+    let failures = |st: &St| -> Vec<Value> {
+        st.messages
+            .iter()
+            .filter(|m| m["ev"] == "dial.failed" && m["identity"] == identity.as_str())
+            .cloned()
+            .collect()
+    };
+    let before = a.wait("the failures so far", WAIT, |st| Some(failures(st).len()));
     a.call(
         "peer.add",
         json!({"identity": identity, "name": "hostB", "routes": []}),
     );
+    // The dial `peer.add` starts has no route and ends before the address
+    // is set; otherwise it could read the SSH address, fail, and be
+    // followed by the dial `peer.addresses.set` asks for: two logins for
+    // one change, not a retry.
+    let no_route = a.wait("the dial peer.add starts", WAIT, |st| {
+        failures(st).get(before).cloned()
+    });
+    assert_ne!(no_route["why"], "host_key_unknown", "{no_route}");
     a.call(
         "peer.addresses.set",
         json!({"identity": identity, "routes": [{"route_id": route, "selector": SEL, "shell": "sh"}]}),
@@ -1106,8 +1128,8 @@ fn an_ssh_failure_only_the_owner_can_fix_is_not_retried() {
         m["identity"] == identity.as_str() && m["why"] == "host_key_unknown"
     });
     assert_eq!(failed["retry_ms"], Value::Null, "{failed}");
-    // Well past KEEP_RETRY_FIRST_MS: no second login.
-    std::thread::sleep(Duration::from_millis(2500));
+    // Well past the first wait: no second login.
+    std::thread::sleep(first + Duration::from_millis(1000));
     let ssh_failures = a
         .events("dial.failed")
         .into_iter()
