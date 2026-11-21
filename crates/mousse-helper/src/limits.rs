@@ -307,12 +307,13 @@ impl Limits {
             .filter_map(|n| n.into_string().ok())
             .filter(|n| {
                 n.strip_prefix(ENV_PREFIX).is_some_and(|rest| {
-                    !rest.starts_with(APP_PREFIX)
-                        && !rest.starts_with(RELAY_PREFIX)
-                        && rest != APP_HELPER_PATH
-                        && !(cfg!(debug_assertions) && DEBUG_HOOKS.contains(&rest))
-                        && !SETTINGS.contains(&rest)
-                        && !Self::specs().any(|s| s.name == rest)
+                    let debug_hook = cfg!(debug_assertions) && DEBUG_HOOKS.contains(&rest);
+                    !(rest.starts_with(APP_PREFIX)
+                        || rest.starts_with(RELAY_PREFIX)
+                        || rest == APP_HELPER_PATH
+                        || debug_hook
+                        || SETTINGS.contains(&rest)
+                        || Self::specs().any(|s| s.name == rest))
                 })
             })
             .collect()
