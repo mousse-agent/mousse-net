@@ -888,6 +888,11 @@ impl Shared {
                 let reply = routes::config(self, &id, &map);
                 self.event(reply);
             }
+            "routes.managed_tunnel" => {
+                drop(core);
+                let reply = routes::managed_tunnel(self, &id, &map);
+                self.event(reply);
+            }
             "routes.test" => {
                 drop(core);
                 let route = map.get("route").and_then(Value::as_str).map(str::to_owned);
@@ -970,6 +975,7 @@ impl Shared {
             "device": short_id(&self.info.identity),
             "port": self.info.port,
             "ws_port": self.info.ws_port,
+            "managed_tunnel": self.info.ws_port.is_some(),
             "routes": listen.routes,
             "routes_config": listen.config,
             "unbound": listen.unbound,

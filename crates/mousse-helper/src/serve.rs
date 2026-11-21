@@ -82,6 +82,8 @@ pub struct ListenState {
     /// Tunnels given on the command line (`--tunnel`), advertised besides
     /// the config's.
     pub extra: Vec<String>,
+    /// This app's active managed tunnel, only for the lifetime of the helper.
+    pub managed_tunnel: Option<String>,
 }
 
 impl ListenState {
@@ -93,6 +95,11 @@ impl ListenState {
             if !routes.contains(t) {
                 routes.push(t.clone());
             }
+        }
+        if let Some(managed) = &self.managed_tunnel {
+            routes.retain(|route| route != managed);
+            routes.truncate(mousse_net_core::pairing::MAX_ROUTES - 1);
+            routes.push(managed.clone());
         }
         self.routes = routes;
     }
@@ -381,6 +388,7 @@ pub async fn run(
         port,
         bound: bound.clone(),
         extra,
+        managed_tunnel: None,
     }));
     // The loopback ws listener, for the owner's tunnel client (§4.1).
     let ws_listener =
