@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "wsl-linux",
+  "key": "042f0974403d57624956aebbe7cd72f01b86773fdee66ffba37429d70a320ccb692f06069a9174535d971428932d86132cc89eef54954c5f9c5c6ed605fea234bb",
+  "payload": "{\"check\":\"phase1b.admission\",\"target\":\"linux-x64\",\"control\":\"ipc-unbounded-line\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+debug\",\"platform\":\"linux-x86_64\",\"outcome\":\"FAIL\",\"details\":\"2 of 23 tests failed\",\"time\":\"2026-11-20T21:06:17Z\",\"device\":\"wsl-linux\",\"config\":\"6502fb567ca31b2ba3e8a13eaceacac96dbc57201c60611dcee8599aae8621eb\"}",
+  "signature": "bfd4b001310494ee68ca83bc6e44b5a32b2bf65360d20f857c36f3535e28d8a96f50b3f0cccd76b8b8a035ad7737ac6c0404b60670f9503387df10db64f7063a"
+}

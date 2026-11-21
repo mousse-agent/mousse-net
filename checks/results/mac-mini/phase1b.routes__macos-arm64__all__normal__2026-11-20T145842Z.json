@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "mac-mini",
+  "key": "04d63225e01c2fd84d8a4588702b08561c26da25295387d39876ea36c7f2deee75ec54bd53c9d5b09712f13f737f0ece0038931c8226886a42d77430c7c4e486ee",
+  "payload": "{\"check\":\"phase1b.routes\",\"target\":\"macos-arm64\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+debug\",\"platform\":\"macos-aarch64\",\"outcome\":\"PASS\",\"details\":\"40 tests passed\",\"time\":\"2026-11-20T14:58:42Z\",\"device\":\"mac-mini\",\"config\":\"3f76333c03eda61f0efd07cade56df9b7a70a2c2316d3bf78a84ac216d76acc3\"}",
+  "signature": "990629cced38a7c200ba3e8ff7d4e87b96fb9b27b0eb2e48376c03fc63b0566a91d10d8097345771b9b42bdf9f81cfa5538946e9df33f2159a4357f458ffa7fa"
+}

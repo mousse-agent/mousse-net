@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "wsl-linux",
+  "key": "042f0974403d57624956aebbe7cd72f01b86773fdee66ffba37429d70a320ccb692f06069a9174535d971428932d86132cc89eef54954c5f9c5c6ed605fea234bb",
+  "payload": "{\"check\":\"phase1b.no-rpc-without-grant\",\"target\":\"linux-x64\",\"case\":\"ws\",\"control\":\"inbound-before-live\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+unknown\",\"platform\":\"linux-x86_64\",\"outcome\":\"FAIL\",\"details\":\"printed \\\"FAIL phase1b.no-rpc-without-grant\\\" (reason=probe_reached_app)\",\"time\":\"2026-11-20T21:31:57Z\",\"device\":\"wsl-linux\",\"config\":\"ad3576de5165c5d6d51d823f82d4e378f764bfa77689dce2e575e17fac56bd6e\",\"extra\":{\"app_build\":\"a4dd507d97c719545168c88a22a3499b2f4cc448\",\"reason\":\"probe_reached_app\"}}",
+  "signature": "b6f67f8b389241ed13c1226732c0fb756d71b324f22dfb54a825278b9667e31ca2db0b4368bee08cb8eded43009ca313d094dc39c2ce1a4f96ca1acba3437d02"
+}

@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "pc-windows",
+  "key": "048ad3ccda2d27fdfc98c131f2fa25bea736ec0a3e8a107dcbfa6b2f5a86b88da452c337f09925646ec76897452505e718f3f397ddf39674e9f5ad64590bc93d57",
+  "payload": "{\"check\":\"phase1a.removal\",\"target\":\"windows-x64\",\"control\":\"teardown-on-event-only\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+unknown\",\"platform\":\"windows-x86_64\",\"outcome\":\"FAIL\",\"details\":\"printed \\\"FAIL phase1a.removal\\\" (reason=stale_work)\",\"time\":\"2026-11-21T01:31:25Z\",\"device\":\"pc-windows\",\"config\":\"843448734b4b577188464d6efefbb810386058a22544fe48970a785a46c0458f\",\"extra\":{\"app_build\":\"a4dd507d97c719545168c88a22a3499b2f4cc448\",\"reason\":\"stale_work\"}}",
+  "signature": "5cea0374fbecd23bacb49812f37cb614b07e44e638435f9c838946283539b4edb760c15581115e56951e3fd93900b58fbf5cf4711d4334db043b2e6214647cf9"
+}

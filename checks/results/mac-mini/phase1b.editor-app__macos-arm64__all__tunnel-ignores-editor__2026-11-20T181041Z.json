@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "mac-mini",
+  "key": "04d63225e01c2fd84d8a4588702b08561c26da25295387d39876ea36c7f2deee75ec54bd53c9d5b09712f13f737f0ece0038931c8226886a42d77430c7c4e486ee",
+  "payload": "{\"check\":\"phase1b.editor-app\",\"target\":\"macos-arm64\",\"control\":\"tunnel-ignores-editor\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+unknown\",\"platform\":\"macos-aarch64\",\"outcome\":\"FAIL\",\"details\":\"printed \\\"FAIL phase1b.editor-app\\\" (reason=tunnel_without_editor)\",\"time\":\"2026-11-20T18:10:41Z\",\"device\":\"mac-mini\",\"config\":\"cb09531919333c08c468eafe5a36c70882f0f4c11b593ef195197a0279a398a2\",\"extra\":{\"app_build\":\"a4dd507d97c719545168c88a22a3499b2f4cc448\",\"reason\":\"tunnel_without_editor\"}}",
+  "signature": "fadb8f8c0a130df47eebe8052524d07c9f155611dec0bb06c385035b2430ea8760a0437d489d206d2b8f5780d0f725fd472b0d55c5f27337f021732f38ee2e33"
+}

@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "mac-mini",
+  "key": "04d63225e01c2fd84d8a4588702b08561c26da25295387d39876ea36c7f2deee75ec54bd53c9d5b09712f13f737f0ece0038931c8226886a42d77430c7c4e486ee",
+  "payload": "{\"check\":\"phase1b.link-app\",\"target\":\"macos-arm64\",\"control\":\"pin-promotes-kind2\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+unknown\",\"platform\":\"macos-aarch64\",\"outcome\":\"FAIL\",\"details\":\"printed \\\"FAIL phase1b.link-app\\\" (reason=promoted_without_completion)\",\"time\":\"2026-11-20T17:19:49Z\",\"device\":\"mac-mini\",\"config\":\"808400b6dfeaec33bab698b7bd8b9de6f7f1248a5db6fe714447adfd1624ebd9\",\"extra\":{\"app_build\":\"a4dd507d97c719545168c88a22a3499b2f4cc448\",\"reason\":\"promoted_without_completion\"}}",
+  "signature": "9e6f8023f6f351216f25a69b361601f16b1818d83461e25a7f8ccb1e715ab87aa570ebbb9dfc2f0447ea5c9801a7f2e286411b3bb0eb519c04e07b8f99018bb7"
+}

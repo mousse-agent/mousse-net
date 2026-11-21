@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "mac-mini",
+  "key": "04d63225e01c2fd84d8a4588702b08561c26da25295387d39876ea36c7f2deee75ec54bd53c9d5b09712f13f737f0ece0038931c8226886a42d77430c7c4e486ee",
+  "payload": "{\"check\":\"phase1a.shared-computer\",\"target\":\"macos-arm64\",\"control\":\"shared-endpoint-state\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+debug\",\"platform\":\"macos-aarch64\",\"outcome\":\"FAIL\",\"details\":\"FAIL phase1a.shared-computer reason=other_profile_affected\",\"time\":\"2026-11-20T18:36:01Z\",\"device\":\"mac-mini\",\"config\":\"2b9109a94cf01ca0633d41dbb3f23a449e9cfde1b181ba4d645b5f0cbbff785d\",\"extra\":{\"app_build\":\"a4dd507d97c719545168c88a22a3499b2f4cc448\",\"host_app_build\":\"a4dd507d97c719545168c88a22a3499b2f4cc448\",\"host_build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+debug\",\"reason\":\"other_profile_affected\"}}",
+  "signature": "ad046f482dd9c170a9a5a2bf433278fe92df009ea8d41e70b99fd39db2c6e9fef46d10ab9b5d620225f093a67e101b3cecccab034f8f8e6cc7a3cd112598c1db"
+}

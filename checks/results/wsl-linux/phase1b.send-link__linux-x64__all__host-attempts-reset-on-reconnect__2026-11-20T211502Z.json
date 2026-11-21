@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "wsl-linux",
+  "key": "042f0974403d57624956aebbe7cd72f01b86773fdee66ffba37429d70a320ccb692f06069a9174535d971428932d86132cc89eef54954c5f9c5c6ed605fea234bb",
+  "payload": "{\"check\":\"phase1b.send-link\",\"target\":\"linux-x64\",\"control\":\"host-attempts-reset-on-reconnect\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+debug\",\"platform\":\"linux-x86_64\",\"outcome\":\"FAIL\",\"details\":\"1 of 29 tests failed\",\"time\":\"2026-11-20T21:15:02Z\",\"device\":\"wsl-linux\",\"config\":\"ff90830ad51c6bea9b78d22fa37a86e0eed8d0400bcd6390e1ea59604903aaa9\"}",
+  "signature": "438e29c49b64124aa94fe5e905dff4bee930486505698e78b09ef5c8369d64a88c450db2aef160a7deccd3705281bfae2caf5315c3dee94119ddf7f6a31f3f22"
+}

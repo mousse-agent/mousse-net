@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "pc-windows",
+  "key": "048ad3ccda2d27fdfc98c131f2fa25bea736ec0a3e8a107dcbfa6b2f5a86b88da452c337f09925646ec76897452505e718f3f397ddf39674e9f5ad64590bc93d57",
+  "payload": "{\"check\":\"phase1b.send-link\",\"target\":\"windows-x64\",\"control\":\"pin-stored-memory-only\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+debug\",\"platform\":\"windows-x86_64\",\"outcome\":\"FAIL\",\"details\":\"2 of 29 tests failed\",\"time\":\"2026-11-20T16:06:13Z\",\"device\":\"pc-windows\",\"config\":\"c30158f0ed5ee0f605c694d62b15ea1ecb19a9bff5cf0ff7cae13a1f180f2d21\"}",
+  "signature": "d062d220d8c6a864d49bad061b7c7e3b5ef733a7368345e2c7365f6b3a522ea95dd2a78943e38a38d11d66fff336faf591ddbe20cead747d34181df91234f0d3"
+}

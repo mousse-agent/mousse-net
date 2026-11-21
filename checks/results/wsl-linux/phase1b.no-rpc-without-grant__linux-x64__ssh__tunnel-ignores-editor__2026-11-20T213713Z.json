@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "wsl-linux",
+  "key": "042f0974403d57624956aebbe7cd72f01b86773fdee66ffba37429d70a320ccb692f06069a9174535d971428932d86132cc89eef54954c5f9c5c6ed605fea234bb",
+  "payload": "{\"check\":\"phase1b.no-rpc-without-grant\",\"target\":\"linux-x64\",\"case\":\"ssh\",\"control\":\"tunnel-ignores-editor\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+unknown\",\"platform\":\"linux-x86_64\",\"outcome\":\"FAIL\",\"details\":\"printed \\\"FAIL phase1b.no-rpc-without-grant\\\" (reason=probe_reached_app)\",\"time\":\"2026-11-20T21:37:13Z\",\"device\":\"wsl-linux\",\"config\":\"78395385b4da3789677b2b00c1cc123f3cfa9524d1488aab25a4dce18d8ee683\",\"extra\":{\"app_build\":\"a4dd507d97c719545168c88a22a3499b2f4cc448\",\"reason\":\"probe_reached_app\"}}",
+  "signature": "605dc0e89c3304394ed582c2550bd6ec535041954017262b610dd64b6d91ce8a5ff513a5b3530e6d6549f3a38154814c7d2361684aa9ff8a0a861f39d349c4d6"
+}

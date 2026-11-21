@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "mac-mini",
+  "key": "04d63225e01c2fd84d8a4588702b08561c26da25295387d39876ea36c7f2deee75ec54bd53c9d5b09712f13f737f0ece0038931c8226886a42d77430c7c4e486ee",
+  "payload": "{\"check\":\"phase1b.ssh\",\"target\":\"macos-arm64\",\"control\":\"window-per-route\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+debug\",\"platform\":\"macos-aarch64\",\"outcome\":\"FAIL\",\"details\":\"1 of 22 tests failed\",\"time\":\"2026-11-20T15:16:00Z\",\"device\":\"mac-mini\",\"config\":\"bc19a668fd02f9b51776d38fcb6ede57ba155728ea40a9a72580d3e88f7ab00e\"}",
+  "signature": "a935039209016d883f8494c21f0c3b5a6cd47fc6b3a379b4a767509fb4e02d5ca1f7f4d7ee6c261b631adc9c627a07e5d58733dfd789239fc30565248066391e"
+}

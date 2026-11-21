@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "mac-mini",
+  "key": "04d63225e01c2fd84d8a4588702b08561c26da25295387d39876ea36c7f2deee75ec54bd53c9d5b09712f13f737f0ece0038931c8226886a42d77430c7c4e486ee",
+  "payload": "{\"check\":\"phase1b.send-link\",\"target\":\"macos-arm64\",\"control\":\"host-attempts-reset-on-reconnect\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+debug\",\"platform\":\"macos-aarch64\",\"outcome\":\"FAIL\",\"details\":\"1 of 29 tests failed\",\"time\":\"2026-11-20T15:19:01Z\",\"device\":\"mac-mini\",\"config\":\"5190a24446bc2bcb82d06768d64fdab36515956f4554a705fd06ec3561a32f4b\"}",
+  "signature": "0ee68aa8ace43ae81659ac146071d23199e44c790f52de40ac2a745f7af7c7051fe765ea46ddec12d35bc9a136fa7ed9cc5de86cc4c785a2a99615a74da62e00"
+}

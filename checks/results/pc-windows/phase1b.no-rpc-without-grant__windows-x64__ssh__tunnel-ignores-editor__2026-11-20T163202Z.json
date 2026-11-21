@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "pc-windows",
+  "key": "048ad3ccda2d27fdfc98c131f2fa25bea736ec0a3e8a107dcbfa6b2f5a86b88da452c337f09925646ec76897452505e718f3f397ddf39674e9f5ad64590bc93d57",
+  "payload": "{\"check\":\"phase1b.no-rpc-without-grant\",\"target\":\"windows-x64\",\"case\":\"ssh\",\"control\":\"tunnel-ignores-editor\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+unknown\",\"platform\":\"windows-x86_64\",\"outcome\":\"FAIL\",\"details\":\"printed \\\"FAIL phase1b.no-rpc-without-grant\\\" (reason=probe_reached_app)\",\"time\":\"2026-11-20T16:32:02Z\",\"device\":\"pc-windows\",\"config\":\"e80609fffd170b7f17b175e4741acf1a2ddc4758e802cc2c95f71825b09f648f\",\"extra\":{\"app_build\":\"a4dd507d97c719545168c88a22a3499b2f4cc448\",\"reason\":\"probe_reached_app\"}}",
+  "signature": "c0f998fc941b49ff5761a226ac017b0b186982f4d408a8aa9ad41ce5766004cbf357ceada48bc39a74dcd48c58a53d555cfbabacfb119793485e5e623199568b"
+}

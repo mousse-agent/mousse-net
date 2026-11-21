@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "pc-windows",
+  "key": "048ad3ccda2d27fdfc98c131f2fa25bea736ec0a3e8a107dcbfa6b2f5a86b88da452c337f09925646ec76897452505e718f3f397ddf39674e9f5ad64590bc93d57",
+  "payload": "{\"check\":\"phase1b.ws\",\"target\":\"windows-x64\",\"control\":\"release-test-root\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+debug\",\"platform\":\"windows-x86_64\",\"outcome\":\"FAIL\",\"details\":\"1 of 16 tests failed\",\"time\":\"2026-11-20T15:53:17Z\",\"device\":\"pc-windows\",\"config\":\"9a7d78406abb3a5916c2944506153f9738b1eeda03469c5d33f1ee6c7c23f391\"}",
+  "signature": "83d6604bff6a96b11df04570f6471b74744c78ac3e32fcd92ee5c2c8d14efe3acdc63709e46fa2dcd207c2e95ee10343a2e69afbf515bee5f56376b29429aec9"
+}

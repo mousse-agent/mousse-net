@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "pc-windows",
+  "key": "048ad3ccda2d27fdfc98c131f2fa25bea736ec0a3e8a107dcbfa6b2f5a86b88da452c337f09925646ec76897452505e718f3f397ddf39674e9f5ad64590bc93d57",
+  "payload": "{\"check\":\"phase1b.routes\",\"target\":\"windows-x64\",\"control\":\"ssh-races-lan\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+debug\",\"platform\":\"windows-x86_64\",\"outcome\":\"FAIL\",\"details\":\"3 of 40 tests failed\",\"time\":\"2026-11-20T15:20:12Z\",\"device\":\"pc-windows\",\"config\":\"5577247930d64aca88dacc23e8176c6a9afa53bfe0f856ad74083a3284da0327\"}",
+  "signature": "a31657312912d71b067cccec91ed82ed70d58f124a43819ac77125a5b8c25665f691f135787f4c871b79958b4a6d11de3343ba74d32816558e4d204bc2471ac2"
+}

@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "mac-mini",
+  "key": "04d63225e01c2fd84d8a4588702b08561c26da25295387d39876ea36c7f2deee75ec54bd53c9d5b09712f13f737f0ece0038931c8226886a42d77430c7c4e486ee",
+  "payload": "{\"check\":\"phase1b.send-link\",\"target\":\"macos-arm64\",\"control\":\"pin-stored-memory-only\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+debug\",\"platform\":\"macos-aarch64\",\"outcome\":\"FAIL\",\"details\":\"2 of 29 tests failed\",\"time\":\"2026-11-20T15:23:09Z\",\"device\":\"mac-mini\",\"config\":\"4337c96876842e0bdd49d9303cc4f3bb644b292035b986fcb6d83744c115bd04\"}",
+  "signature": "eb66cc667e5559e512788d8f6e207dd7a720e711d5ed165876ea1610ce04d862404e7a36f55d7ec5f8462556e61264251c2fa469cb7b2fd04ecf33287663f4a7"
+}
