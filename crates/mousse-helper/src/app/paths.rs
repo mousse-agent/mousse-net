@@ -329,18 +329,32 @@ enum Via {
     Relay(mousse_net_core::relay_endpoint::RelayRoute),
 }
 
-/// Reach `record`'s host: its own routes and the browse first, then its
-/// relay routes (Phase 3 B.6, B.11). A refusal by the host itself ends it.
+/// Reach `record`'s host. Relay first: a host with a relay route is
+/// reached through the relay, which comes up quickly and reliably, and
+/// [`upgrade`] then tries its own routes in the background. Without one,
+/// or if every relay route fails, its own routes and the browse, then its
+/// relay routes again once its directory slot was read (Phase 3 B.6,
+/// B.11). A refusal by the host itself ends it.
 async fn reach(shared: &Shared, record: &PeerRecord) -> Result<(Connection, Via), NetError> {
+    let pin = record.pin()?;
+    let relay_first = !super::relay::candidates(shared, &pin).is_empty();
+    if relay_first {
+        match super::relay::reach(shared, &pin).await {
+            Ok((conn, route)) => return Ok((conn, Via::Relay(route))),
+            Err(e @ NetError::Closed(_)) => return Err(e),
+            Err(_) => {}
+        }
+    }
     let first = match reach_local(shared, record).await {
         Ok((conn, used)) => return Ok((conn, Via::Local(used))),
         Err(e @ NetError::Closed(_)) => return Err(e),
         Err(e) => e,
     };
-    let pin = record.pin()?;
     let mut read_slot = false;
+    // The relay routes were tried just now.
+    let mut skip_relay = relay_first;
     loop {
-        if !super::relay::candidates(shared, &pin).is_empty() {
+        if !std::mem::take(&mut skip_relay) && !super::relay::candidates(shared, &pin).is_empty() {
             match super::relay::reach(shared, &pin).await {
                 Ok((conn, route)) => return Ok((conn, Via::Relay(route))),
                 Err(e @ NetError::Closed(_)) => return Err(e),
@@ -462,6 +476,9 @@ pub struct Keep {
     kicks: Mutex<Option<mpsc::UnboundedSender<Kick>>>,
     /// Per host: how many dials have ended, and how the last one failed.
     ends: Mutex<HashMap<IdentityPublicKey, (u64, Option<Failure>)>>,
+    /// Hosts reached through a relay whose direct routes are being tried
+    /// ([`upgrade`]).
+    upgrading: Mutex<HashSet<IdentityPublicKey>>,
 }
 
 /// Something the keeper should look at.
@@ -620,11 +637,151 @@ pub async fn dial(
     };
     if let Some(route) = via {
         shared.set_via(no, route);
+        tokio::spawn(upgrade(shared.clone(), pin, no, gen));
     }
     Ok(Dialled {
         conn: no,
         already: false,
     })
+}
+
+/// Relay first, then direct if it is faster: with the relayed path `relay`
+/// to `pin` up, try the host's own routes (the usual tiers) in the
+/// background. A direct path that comes up is a candidate, as any dial
+/// while a path is current (Phase 1a §2): unless the relayed path's round
+/// trip is shorter by more than `RELAY_SWITCH_MARGIN_MS`, it is announced
+/// with `conn.up` and `path.reopen {from: relay}`, and the app moves its
+/// streams with `path.reopened`; otherwise it is closed. The tries repeat
+/// on the keeper's waits while the relayed path stays up and the host is
+/// not forgotten (`gen`). If the direct path drops later, the keeper dials
+/// again, relay first.
+async fn upgrade(shared: Arc<Shared>, pin: IdentityPublicKey, relay: u64, gen: u64) {
+    if !shared
+        .keep
+        .upgrading
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(pin)
+    {
+        return;
+    }
+    struct Done<'a>(&'a Keep, IdentityPublicKey);
+    impl Drop for Done<'_> {
+        fn drop(&mut self) {
+            self.0
+                .upgrading
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&self.1);
+        }
+    }
+    let _done = Done(&shared.keep, pin);
+    let limits = shared.limits;
+    let longest = crate::limits::ms(limits.keep_retry_max_ms());
+    let margin = crate::limits::ms(limits.relay_switch_margin_ms());
+    let mut wait = crate::limits::ms(limits.keep_retry_first_ms());
+    loop {
+        let relayed = super::lock(&shared.core)
+            .conns
+            .get(&relay)
+            .map(|e| e.conn.clone());
+        let Some(relayed) = relayed else { return };
+        if shared.peer_gen(&pin) != gen || shared.removal.is_paused() {
+            return;
+        }
+        let Ok(record) = find_peer(&shared, &pin) else {
+            return;
+        };
+        let tried = {
+            // One dial at a time per host, the keeper's and `dial`'s too.
+            let lock = shared.keep.lock_for(pin);
+            let _turn = lock.lock().await;
+            reach_local(&shared, &record).await
+        };
+        match tried {
+            Ok((conn, used)) => {
+                let direct = round_trip(&conn).await;
+                let through = round_trip(&relayed).await;
+                if direct_wins(direct, through, margin) {
+                    switch_to(&shared, pin, relay, gen, conn, &used, &record);
+                    return;
+                }
+                applog::line(format!(
+                    "kept the relay to {}: {} answers in {direct:?}, the relay in {through:?}",
+                    short_id(&pin),
+                    used.route
+                ));
+                conn.close(mousse_net_core::ErrorCode::NoError);
+            }
+            // The host itself refused this device: nothing to move to.
+            Err(NetError::Closed(_)) => return,
+            Err(_) => {}
+        }
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(longest);
+    }
+}
+
+/// Whether the direct path takes over: unless the relayed one is quicker
+/// by more than `margin`. A path that did not answer is never quicker.
+fn direct_wins(direct: Option<Duration>, relayed: Option<Duration>, margin: Duration) -> bool {
+    match (direct, relayed) {
+        (None, _) => false,
+        (Some(_), None) => true,
+        (Some(d), Some(r)) => r + margin >= d,
+    }
+}
+
+/// The best of three `PING` round trips on `conn`, or `None` if it did
+/// not answer.
+async fn round_trip(conn: &Connection) -> Option<Duration> {
+    let within = crate::limits::ms(crate::limits::get().net.io().wake_ping_ms());
+    let mut best: Option<Duration> = None;
+    for _ in 0..3 {
+        let start = Instant::now();
+        if !conn.ping(within).await {
+            return None;
+        }
+        let took = start.elapsed();
+        best = Some(best.map_or(took, |b| b.min(took)));
+    }
+    best
+}
+
+/// Announce the direct path `conn` and ask the app to move its streams to
+/// it from the relayed path `from`.
+fn switch_to(
+    shared: &Arc<Shared>,
+    pin: IdentityPublicKey,
+    from: u64,
+    gen: u64,
+    conn: Connection,
+    used: &Reached,
+    record: &PeerRecord,
+) {
+    let _ = PeerStore::in_dir(&shared.info.state_dir).note_route(&pin, used.route.uri());
+    let role = super::pairing::role_text(&record.role);
+    let fields = json!({"dir": "out", "role": role, "route": route_json(used)});
+    // Checks the pause and the generation, as every new outbound path.
+    let Ok(no) = shared.add_outbound(conn, gen, fields) else {
+        return;
+    };
+    applog::line(format!(
+        "moving {} from the relay to {} (conn {no})",
+        short_id(&pin),
+        used.route
+    ));
+    let mut core = super::lock(&shared.core);
+    if let Some(entry) = core.conns.get_mut(&no) {
+        entry.reopen = true;
+        core.out.json(&json!({
+            "ev": "path.reopen",
+            "identity": hex(pin.as_bytes()),
+            "from": from,
+            "conn": no,
+        }));
+        shared.queued(&core);
+    }
 }
 
 /// `dial {identity}`.

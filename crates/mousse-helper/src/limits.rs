@@ -94,6 +94,8 @@ mousse_net_core::define_limits! {
         keep_retry_first_ms = "KEEP_RETRY_FIRST_MS": 1_000, [10, 60_000];
         /// Keep connected: longest wait between redials of a host that could not be reached; not below the first wait.
         keep_retry_max_ms = "KEEP_RETRY_MAX_MS": 60_000, [10, 3_600_000];
+        /// Relay first: a direct path takes over from a relayed one unless the relayed path's round trip is shorter by more than this.
+        relay_switch_margin_ms = "RELAY_SWITCH_MARGIN_MS": 20, [0, 1_000];
         /// Oldest removal ("remove on all my hosts") a host accepts or an admin device keeps queued; also how long a host keeps removal ids (tighten only).
         removal_max_age_secs = "REMOVAL_MAX_AGE_SECS": 2_592_000, [86_400, 2_592_000];
         /// How long one side of `mousse-removal` waits for the other's message (the removal, or the host's answer).
