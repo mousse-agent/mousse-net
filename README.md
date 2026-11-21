@@ -21,6 +21,8 @@ Connections can use the local network, your own routes (such as Tailscale, SSH, 
 - **Phases 3 and 4** added the self-hosted relay, headless daemon and the engine's side of Mousse Plus relay admission, leases and usage reporting. The relay has tooling for reproducible builds and minisign signing.
 - **On the roadmap** are native phone support (Phase 2), a browser client (Phase 5) and shared rosters (Phase 6).
 
+Mousse builds fetch a pinned commit of this repository, compile `mousse-helper` from source and bundle the binary with the app. [Pinned commit](https://github.com/mousse-agent/mousse/blob/master/native/net-helper/ENGINE_COMMIT) · [Build script](https://github.com/mousse-agent/mousse/blob/master/scripts/build-net-helper.mjs)
+
 ## What's here
 
 | Path | What it is |
