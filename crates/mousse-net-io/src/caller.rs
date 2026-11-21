@@ -233,6 +233,8 @@ pub enum PathEvent {
         from: ConnectionId,
         /// The new path.
         conn: Connection,
+        /// How it was reached, for its `conn.up` route.
+        reached: Box<Reached>,
     },
     /// A renewal try failed. The session asks again later (after 30 s,
     /// doubling up to 5 min) until the old path's deadline.
@@ -822,7 +824,7 @@ where
     /// Bring up a new path to `pin` for a renewal: live, not yet current.
     /// The search comes from the candidate source, built now; without one,
     /// from the routes kept at this generation.
-    async fn renew(&self, pin: IdentityPublicKey) -> Result<Connection, NetError> {
+    async fn renew(&self, pin: IdentityPublicKey) -> Result<(Connection, Reached), NetError> {
         let stale = cfg!(mousse_control = "stale-renewal-routes");
         let (gen, remembered) = {
             let paths = lock(&self.paths);
@@ -850,7 +852,7 @@ where
             ));
         }
         self.keep_order(pin, &reached, tried, gen);
-        Ok(conn)
+        Ok((conn, reached))
     }
 
     /// Remember the routes a search took, the winner first, if the
@@ -1678,7 +1680,12 @@ where
             let (caller, tx) = (caller.clone(), tx.clone());
             tokio::spawn(async move {
                 let event = match caller.renew(pin).await {
-                    Ok(conn) => PathEvent::Reopen { pin, from, conn },
+                    Ok((conn, reached)) => PathEvent::Reopen {
+                        pin,
+                        from,
+                        conn,
+                        reached: Box::new(reached),
+                    },
                     Err(error) => PathEvent::RenewFailed { pin, error },
                 };
                 // Nobody takes paths any more: close the new one rather than

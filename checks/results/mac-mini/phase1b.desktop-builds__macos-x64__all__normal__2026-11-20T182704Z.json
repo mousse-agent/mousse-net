@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "mac-mini",
+  "key": "04d63225e01c2fd84d8a4588702b08561c26da25295387d39876ea36c7f2deee75ec54bd53c9d5b09712f13f737f0ece0038931c8226886a42d77430c7c4e486ee",
+  "payload": "{\"check\":\"phase1b.desktop-builds\",\"target\":\"macos-x64\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+unknown\",\"platform\":\"macos-aarch64\",\"outcome\":\"PASS\",\"details\":\"printed \\\"PASS phase1b.desktop-builds\\\"\",\"time\":\"2026-11-20T18:27:04Z\",\"device\":\"mac-mini\",\"config\":\"40eb1bf3131e63bfbd710d5ff3382e8c481d953d3a5616814ca02b95544a1743\",\"extra\":{\"app_build\":\"a4dd507d97c719545168c88a22a3499b2f4cc448\"}}",
+  "signature": "a9835e4c809753d73302018b2f7f312d9a8c8fe1e5f8a22140477ced8fd487f42ee0fe83029961a54614798db2f23bf4bd7f4d8002c7d01276a4cc3f8f4221a3"
+}

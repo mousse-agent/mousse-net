@@ -23,6 +23,7 @@
 mod classify;
 mod local;
 mod policy;
+pub mod ssh;
 pub mod test_egress;
 pub mod ws;
 

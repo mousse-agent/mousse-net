@@ -462,6 +462,11 @@ async fn join(
                 tag: *tag,
             }))
             .collect();
+    // A removal of the host while the join runs (`peer.forget`) wins: the
+    // join stores nothing, or what it stored goes with the removal.
+    let pin = ticket.host_identity;
+    let gen = shared.peer_gen(&pin);
+    let wanted = || shared.peer_gen(&pin) == gen;
     let result = if candidates.is_empty() {
         Err(crate::peer::Failure {
             text: "the ticket has no private-range address and none it lists was approved".into(),
@@ -495,6 +500,7 @@ async fn join(
                     link,
                     &mut codes,
                     progress,
+                    wanted,
                 )
                 .await
             }
@@ -510,6 +516,7 @@ async fn join(
                     link,
                     &mut NoCode,
                     progress,
+                    wanted,
                 )
                 .await
             }
@@ -546,7 +553,7 @@ async fn join(
                 }
             };
             let fields = json!({"dir": "out", "role": role, "route": route});
-            match shared.add_conn(conn, false, fields) {
+            match shared.add_outbound(conn, gen, fields) {
                 Ok(no) => {
                     if let Some(route) = via {
                         shared.set_via(no, route);
@@ -561,7 +568,12 @@ async fn join(
                         "ticket_hash": hex(&ticket.hash()),
                     })
                 }
-                Err(_) => paused(&shared, &id),
+                Err(super::Stale::Paused) => paused(&shared, &id),
+                Err(super::Stale::Forgotten) => error(
+                    &id,
+                    "forgotten",
+                    "the host was removed while this device was joining it",
+                ),
             }
         }
         Err(f) => error(&id, &f.reason, f.text),
@@ -871,6 +883,12 @@ fn forget_peer(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
             list.retain(|p| p.identity != key);
             forgotten = list.len() != before;
         })?;
+        // Under the peers lock, which a join checks the generation under
+        // before it stores the host: it stores before this or not at all.
+        *super::lock(&shared.core)
+            .peer_gen
+            .entry(identity)
+            .or_default() += 1;
         crate::peer::drop_completions(&shared.info.state_dir, &held, &key)
     });
     match updated {
@@ -881,8 +899,7 @@ fn forget_peer(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
     super::relay::forget_peer(shared, &identity);
     // Its outbound connections go with it, and so do those still opening:
     // a dial or renewal that started before publishes nothing.
-    let mut core = super::lock(&shared.core);
-    *core.peer_gen.entry(identity).or_default() += 1;
+    let core = super::lock(&shared.core);
     for entry in core.conns.values() {
         if !entry.inbound && entry.identity == identity {
             entry.conn.close(ErrorCode::Cancelled);

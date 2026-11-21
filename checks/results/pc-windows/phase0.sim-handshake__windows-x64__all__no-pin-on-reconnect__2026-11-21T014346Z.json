@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "pc-windows",
+  "key": "048ad3ccda2d27fdfc98c131f2fa25bea736ec0a3e8a107dcbfa6b2f5a86b88da452c337f09925646ec76897452505e718f3f397ddf39674e9f5ad64590bc93d57",
+  "payload": "{\"check\":\"phase0.sim-handshake\",\"target\":\"windows-x64\",\"control\":\"no-pin-on-reconnect\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+release\",\"platform\":\"windows-x86_64\",\"outcome\":\"FAIL\",\"details\":\"printed \\\"FAIL sim handshake\\\"\",\"time\":\"2026-11-21T01:43:46Z\",\"device\":\"pc-windows\",\"config\":\"cec78758a04fd343be2b0ab03506905925a1a31aaf34f920d39975b7f5fe241d\"}",
+  "signature": "d39471cde70cb829ba77693b7674c85446fe4ff0087f553b5c888783511d642db8893c2259793fe7a9e6971a9f51fd93e94891b7458a844d2adbd469bb7bc586"
+}

@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "wsl-linux",
+  "key": "042f0974403d57624956aebbe7cd72f01b86773fdee66ffba37429d70a320ccb692f06069a9174535d971428932d86132cc89eef54954c5f9c5c6ed605fea234bb",
+  "payload": "{\"check\":\"phase1b.routes-app\",\"target\":\"linux-x64\",\"case\":\"ssh\",\"control\":\"egress-probe\",\"build\":\"922438fb3c947c5b8ae635b934b12ff740a3e730+unknown\",\"platform\":\"linux-x86_64\",\"outcome\":\"FAIL\",\"details\":\"printed \\\"FAIL phase1b.routes-app\\\" (reason=egress_attempted)\",\"time\":\"2026-11-21T04:56:41Z\",\"device\":\"wsl-linux\",\"config\":\"41445da5bb445a5fca140ac26f360ac1cd49287e0a976ed58d89b0e38988a5e8\",\"extra\":{\"app_build\":\"839a309b4388a88ff3c3f322fb6bf998574e0d95\",\"reason\":\"egress_attempted\"}}",
+  "signature": "f58b83f048f997f35687be698e21da04b796130ff1511cfc51bf1bad5e0089c9e522b5a537407edd258b5b98261e4e52768eca954e21aa6b01e51b439c856a38"
+}

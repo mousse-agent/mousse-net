@@ -26,9 +26,10 @@
  *    runs its wire cases over tcp and ws against it, with a Send link
  *    invitation. Any failure: `reason=probe_failed`.
  *
- * Prints `helper_version=`, `helper_build=`, `app_build=` (when the app
- * ran), and last `PASS <id>` or `FAIL <id> reason=<word>`. Exit 0 only on
- * PASS.
+ * Prints `app_build=` first (the commit MOUSSE_APP_DIR has checked out,
+ * so every outcome names the app build, also a failure before the app
+ * runs), then `helper_version=`, `helper_build=`, and last `PASS <id>` or
+ * `FAIL <id> reason=<word>`. Exit 0 only on PASS.
  *
  * How each target runs: windows-x64, windows-arm64, macos-arm64 and
  * linux-x64 natively; macos-x64 under Rosetta (built for
@@ -135,6 +136,14 @@ function commitUnderTest() {
   const commit = git('log', '-1', '--format=%H', '--', '.', ':(exclude)checks')
   const dirty = git('status', '--porcelain', '--untracked-files=all', '--', '.', ':(exclude)checks/results', ':(exclude)checks/runs')
   return `${commit}${dirty ? '-dirty' : ''}`
+}
+
+/** The commit `appDir` (MOUSSE_APP_DIR) has checked out, or undefined. */
+export function appBuild(appDir = process.env.MOUSSE_APP_DIR?.trim()) {
+  if (!appDir) return undefined
+  const r = spawnSync('git', ['-C', resolve(appDir), 'rev-parse', 'HEAD'], { encoding: 'utf8' })
+  const commit = r.status === 0 ? r.stdout.trim() : ''
+  return commit || undefined
 }
 
 /** Build the release helper and mousse-check for `target`. */
@@ -301,6 +310,10 @@ async function main() {
   const out = resolve(flags.out ?? mkdtempSync(join(tmpdir(), 'build-smoke-')))
   mkdirSync(out, { recursive: true })
   const commit = commitUnderTest()
+  // First, before any check can fail: the kit counts no outcome that does
+  // not name the app build.
+  const app0 = appBuild()
+  if (app0) console.log(`app_build=${app0}`)
   const cleanups = []
   const fail = (reason, why) => {
     for (const c of cleanups.reverse()) c()
@@ -313,7 +326,6 @@ async function main() {
     const r = containerSmoke(out, commit)
     if (r.error) fail(r.error, r.why)
     const app = packagedApp(join(out, 'mousse-helper'), target, out)
-    if (app.appBuild) console.log(`app_build=${app.appBuild}`)
     if (app.error) fail(app.error, app.why)
     console.log(`PASS ${id}`)
     process.exit(0)
@@ -351,7 +363,6 @@ async function main() {
 
   // 3. The packaged app starts, with this helper inside.
   const app = packagedApp(built.helper, target, out)
-  if (app.appBuild) console.log(`app_build=${app.appBuild}`)
   if (app.error) fail(app.error, app.why)
   if (app.packagedHelper) {
     const why = staleWhy(`${run(app.packagedHelper, ['--version']).stdout ?? ''}`.trim(), commit)
@@ -360,7 +371,7 @@ async function main() {
 
   writeFileSync(
     join(out, 'smoke.json'),
-    `${JSON.stringify({ id, target, commit, helper_version: helperVersion, app_build: app.appBuild ?? null }, null, 2)}\n`
+    `${JSON.stringify({ id, target, commit, helper_version: helperVersion, app_build: app0 ?? app.appBuild ?? null }, null, 2)}\n`
   )
   console.log(`PASS ${id}`)
   process.exit(0)

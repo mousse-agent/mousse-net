@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "pc-windows",
+  "key": "048ad3ccda2d27fdfc98c131f2fa25bea736ec0a3e8a107dcbfa6b2f5a86b88da452c337f09925646ec76897452505e718f3f397ddf39674e9f5ad64590bc93d57",
+  "payload": "{\"check\":\"phase1b.no-rpc-without-grant\",\"target\":\"windows-x64\",\"case\":\"ws\",\"control\":\"inbound-before-live\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+unknown\",\"platform\":\"windows-x86_64\",\"outcome\":\"FAIL\",\"details\":\"printed \\\"FAIL phase1b.no-rpc-without-grant\\\" (reason=probe_reached_app)\",\"time\":\"2026-11-20T16:24:58Z\",\"device\":\"pc-windows\",\"config\":\"51175a9d5fa644780b639d6339c4d54f3322128ff87affa55d48f462ec1e5128\",\"extra\":{\"app_build\":\"a4dd507d97c719545168c88a22a3499b2f4cc448\",\"reason\":\"probe_reached_app\"}}",
+  "signature": "5b418a2e205d2b5ef305248a8f80ac3c3487111300a072477246bdb1e52f4c836a743dd8ddac86d17c110fa9792d5eb80486d910b817c7f7b8ed853b24547b05"
+}

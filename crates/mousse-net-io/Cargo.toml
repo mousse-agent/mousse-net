@@ -12,7 +12,7 @@ workspace = true
 
 [dependencies]
 mousse-net-core = { path = "../mousse-net-core" }
-tokio = { version = "=1.54.1", features = ["rt", "net", "io-util", "macros", "sync", "time"] }
+tokio = { version = "=1.54.1", features = ["rt", "net", "io-util", "macros", "sync", "time", "process"] }
 tokio-rustls = { version = "=0.26.6", default-features = false, features = ["logging", "aws_lc_rs"] }
 rustls = { version = "=0.23.46", default-features = false, features = ["std", "logging", "aws_lc_rs", "prefer-post-quantum"] }
 rand_core = { version = "=0.10.1", default-features = false }

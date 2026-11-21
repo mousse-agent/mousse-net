@@ -787,6 +787,78 @@ fn a_replay_after_the_host_was_removed_restores_nothing() {
     assert!(approvals(&a.dir).is_empty());
 }
 
+/// A link join that A's owner removes the host from while A holds at
+/// `point`: the host is not stored and no path to it stays open, whether
+/// the removal comes before the join stores the host or after.
+fn removed_during_the_join(tag: &str, point: &str) {
+    let (_be, mut b) = start(&format!("{tag}-b"), "hostB");
+    let ae = Endpoint::init(&format!("{tag}-a"));
+    let held = ae.dir.join("held");
+    let hold = format!("{point}={}", held.display());
+    let mut a = ae.app_raw(
+        "peerA",
+        &[],
+        0,
+        &[("MOUSSE_HELPER_TEST_HOLD", Path::new(&hold))],
+    );
+    hello(&mut a);
+    let l = link(&mut b);
+    let id = join(&mut a, &l.uri(), json!({"approved": [l.route()]}));
+    nth(&a, "join.code_needed", &l.inv, 0);
+    type_code(&mut a, &l.inv, &l.code());
+    let until = std::time::Instant::now() + WAIT;
+    while !held.exists() {
+        assert!(std::time::Instant::now() < until, "the join never held");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let identity = b.identity.clone();
+    let forget = a.start("peer.forget", json!({"identity": identity}));
+    // The removal runs now, or waits for the join's store to finish.
+    settle_a_moment();
+    std::fs::remove_file(&held).unwrap();
+    let reply = a.reply(id);
+    if reply.get("error").is_some() {
+        assert_eq!(reply["error"], "forgotten", "{reply}");
+    } else {
+        let conn = reply["conn"].clone();
+        a.event("conn.down", |m| m["conn"] == conn);
+    }
+    let gone = a.reply(forget);
+    assert!(gone.get("error").is_none(), "{gone}");
+    assert_eq!(
+        peer_of(&mut a, &identity),
+        Value::Null,
+        "a removed host came back"
+    );
+    let s = status(&mut a, &l.ticket);
+    assert_eq!(s["done"], Value::Null, "{s}");
+    assert_eq!(s["pending"], false, "the removed join stayed pending: {s}");
+    assert!(approvals(&a.dir).is_empty());
+    // A repeat of the link is refused and does not bring the host back.
+    let again = a.request(
+        "join",
+        json!({"ticket": l.uri(), "arrival": "link", "approved": [l.route()]}),
+    );
+    assert!(again.get("error").is_some(), "the repeat paired: {again}");
+    assert_eq!(
+        peer_of(&mut a, &identity),
+        Value::Null,
+        "a repeat brought the removed host back"
+    );
+    assert!(approvals(&a.dir).is_empty());
+    assert_eq!(status(&mut a, &l.ticket)["pending"], false);
+}
+
+#[test]
+fn a_host_removed_before_the_join_stores_it_stays_removed() {
+    removed_during_the_join("lk-rm-early", "link-paired");
+}
+
+#[test]
+fn a_host_removed_while_the_join_stores_it_keeps_no_path() {
+    removed_during_the_join("lk-rm-late", "link-done-saved");
+}
+
 #[test]
 fn a_grant_removal_also_drops_the_completion_record() {
     let (_be, mut b) = start("lk-ungrant-b", "hostB");

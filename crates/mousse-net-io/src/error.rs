@@ -37,6 +37,14 @@ pub enum NetError {
     StreamLimit,
     /// Reaching the host through a relay failed before the peer TLS.
     Relay(crate::relay::RelayError),
+    /// An `ssh` call or pipe failed before the pipe carried anything
+    /// (Phase 1b §3.1). `detail` is the kept stderr, for a tooltip only.
+    Ssh {
+        /// What the app shows.
+        reason: crate::pipe::ssh::SshReason,
+        /// The stderr text or what was missing; never shown raw.
+        detail: String,
+    },
     /// The route names, or resolved only to, addresses that are never
     /// dialled (Phase 1b §1.2), or it is not approved for this peer.
     Forbidden(String),
@@ -55,6 +63,7 @@ impl NetError {
                 | NetError::Timeout(_)
                 | NetError::PeerCertificate(_)
                 | NetError::Relay(_)
+                | NetError::Ssh { .. }
                 | NetError::Forbidden(_)
         )
     }
@@ -79,6 +88,8 @@ impl fmt::Display for NetError {
             NetError::Refused(e) => write!(f, "refused: {e}"),
             NetError::StreamLimit => f.write_str("too many open streams"),
             NetError::Relay(e) => write!(f, "{e}"),
+            NetError::Ssh { reason, detail } if detail.is_empty() => write!(f, "ssh: {reason}"),
+            NetError::Ssh { reason, detail } => write!(f, "ssh: {reason} ({detail})"),
             NetError::Forbidden(e) => write!(f, "forbidden address: {e}"),
         }
     }

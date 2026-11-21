@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "pc-windows",
+  "key": "048ad3ccda2d27fdfc98c131f2fa25bea736ec0a3e8a107dcbfa6b2f5a86b88da452c337f09925646ec76897452505e718f3f397ddf39674e9f5ad64590bc93d57",
+  "payload": "{\"check\":\"phase1a.shared-computer\",\"target\":\"pc-to-mac-lan\",\"control\":\"shared-endpoint-state\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+debug\",\"platform\":\"windows-x86_64\",\"outcome\":\"FAIL\",\"details\":\"FAIL phase1a.shared-computer reason=other_profile_affected\",\"time\":\"2026-11-21T02:38:40Z\",\"device\":\"pc-windows\",\"config\":\"c6008773cf8ce3074f0b46aefe6450bfa99aa65f079e6bd599f1bf55e7e80d71\",\"extra\":{\"app_build\":\"a4dd507d97c719545168c88a22a3499b2f4cc448\",\"host_app_build\":\"a4dd507d97c719545168c88a22a3499b2f4cc448\",\"host_build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+debug\",\"reason\":\"other_profile_affected\"}}",
+  "signature": "ac5448c60d8db4f082cc781d9c3e09c0c1e6c36c96de819bdf4fd7e45de6a46d77e430e35320ac8357a0402b2d5863d3321d75d5b946efc4185fdfc056e530da"
+}

@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "mac-mini",
+  "key": "04d63225e01c2fd84d8a4588702b08561c26da25295387d39876ea36c7f2deee75ec54bd53c9d5b09712f13f737f0ece0038931c8226886a42d77430c7c4e486ee",
+  "payload": "{\"check\":\"phase0.crypto-matrix\",\"target\":\"aarch64-apple-darwin\",\"control\":\"break-pin\",\"build\":\"366dd2b062641eed1e639b5c974e95999b8894d8+release\",\"platform\":\"macos-aarch64\",\"outcome\":\"FAIL\",\"details\":\"printed \\\"FAIL phase0.crypto-matrix\\\"\",\"time\":\"2026-11-19T17:31:53Z\",\"device\":\"mac-mini\",\"config\":\"c71c994a8434f43c94ef4ba8e4b7e89ea5314719be423f58037345d36bb94f60\"}",
+  "signature": "4ac11c55dc6a9497bf15fb9b3c1d971a35e99324cc058bb098f1d0ffda46b1d7df7ded19a61406374cf0d27bc094922dcb6e91327db727f5b1ed96bf02b66653"
+}

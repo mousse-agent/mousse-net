@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "pc-windows",
+  "key": "048ad3ccda2d27fdfc98c131f2fa25bea736ec0a3e8a107dcbfa6b2f5a86b88da452c337f09925646ec76897452505e718f3f397ddf39674e9f5ad64590bc93d57",
+  "payload": "{\"check\":\"phase1b.desktop-builds\",\"target\":\"windows-x64\",\"control\":\"stale-helper\",\"build\":\"922438fb3c947c5b8ae635b934b12ff740a3e730+unknown\",\"platform\":\"windows-x86_64\",\"outcome\":\"FAIL\",\"details\":\"printed \\\"FAIL phase1b.desktop-builds\\\" (reason=stale_helper)\",\"time\":\"2026-11-21T04:51:38Z\",\"device\":\"pc-windows\",\"config\":\"f9975fdc916b4306203eb3e6d59673eee05f5fa41d6ac32781e8bcfb8561dd8d\",\"extra\":{\"app_build\":\"839a309b4388a88ff3c3f322fb6bf998574e0d95\",\"reason\":\"stale_helper\"}}",
+  "signature": "bb71a2aab74d23926b568dfe86302ab102d41907cbaf4b3e4577bccb74d9da6455b0f0565b965ae213e6cce41bdb9b1a3878847a6a1879106700f7314beb0a94"
+}

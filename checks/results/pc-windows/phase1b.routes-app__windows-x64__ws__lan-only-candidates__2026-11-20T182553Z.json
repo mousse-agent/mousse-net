@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "pc-windows",
+  "key": "048ad3ccda2d27fdfc98c131f2fa25bea736ec0a3e8a107dcbfa6b2f5a86b88da452c337f09925646ec76897452505e718f3f397ddf39674e9f5ad64590bc93d57",
+  "payload": "{\"check\":\"phase1b.routes-app\",\"target\":\"windows-x64\",\"case\":\"ws\",\"control\":\"lan-only-candidates\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+unknown\",\"platform\":\"windows-x86_64\",\"outcome\":\"FAIL\",\"details\":\"printed \\\"FAIL phase1b.routes-app\\\" (reason=route_mismatch)\",\"time\":\"2026-11-20T18:25:53Z\",\"device\":\"pc-windows\",\"config\":\"2a14bb883c2c8ce85d7c236c1012adf9626518b980cb32877367b307fd9d369d\",\"extra\":{\"app_build\":\"a4dd507d97c719545168c88a22a3499b2f4cc448\",\"reason\":\"route_mismatch\"}}",
+  "signature": "b6bddb69cdb697c9e85f65505b0a305dcb778f1112cdface4241134e068e9dea48361737ee48530d7bf3d1b82f0253700aafce3e9aef1e321e52bfad541bafe0"
+}

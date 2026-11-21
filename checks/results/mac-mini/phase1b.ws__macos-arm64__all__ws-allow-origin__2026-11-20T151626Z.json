@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "mac-mini",
+  "key": "04d63225e01c2fd84d8a4588702b08561c26da25295387d39876ea36c7f2deee75ec54bd53c9d5b09712f13f737f0ece0038931c8226886a42d77430c7c4e486ee",
+  "payload": "{\"check\":\"phase1b.ws\",\"target\":\"macos-arm64\",\"control\":\"ws-allow-origin\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+debug\",\"platform\":\"macos-aarch64\",\"outcome\":\"FAIL\",\"details\":\"1 of 16 tests failed\",\"time\":\"2026-11-20T15:16:26Z\",\"device\":\"mac-mini\",\"config\":\"b2f9a4f6bc3435c584fdc7910cb48f25e83d21a212cd646354391cf77c89a87d\"}",
+  "signature": "b232959c4d95ee0717bb5058a36d403e6f9a6f57fb410a8fef2ee8889c474b9b458dc8cdada75f5b4242520f959ca802e2253019a4981bd37464bffbb8146b96"
+}

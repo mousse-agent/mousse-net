@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "pc-windows",
+  "key": "048ad3ccda2d27fdfc98c131f2fa25bea736ec0a3e8a107dcbfa6b2f5a86b88da452c337f09925646ec76897452505e718f3f397ddf39674e9f5ad64590bc93d57",
+  "payload": "{\"check\":\"phase1b.routes\",\"target\":\"windows-x64\",\"control\":\"upgrade-trusts-routes\",\"build\":\"922438fb3c947c5b8ae635b934b12ff740a3e730+debug\",\"platform\":\"windows-x86_64\",\"outcome\":\"FAIL\",\"details\":\"2 of 40 tests failed\",\"time\":\"2026-11-21T04:35:56Z\",\"device\":\"pc-windows\",\"config\":\"6a83f9a01453150d1347797745932f4a0d2af77f5f77aa6a2e3929e276de2e97\"}",
+  "signature": "f927224e0dacde3317bebce6d86c7b9ee6441055765097970c2dd7fa089a34dc03dff39aa30dc75d1b9b9e6ba8e53202b9de2ac48b0f6c251fc8ed2d057776f1"
+}

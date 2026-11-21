@@ -8,6 +8,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config
       - run: rustup toolchain install 1.96.0 --profile minimal --component clippy,rustfmt --target wasm32-unknown-unknown && rustup default 1.96.0
       - uses: actions/cache@v4
         with:

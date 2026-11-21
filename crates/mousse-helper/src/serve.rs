@@ -77,6 +77,25 @@ pub struct ListenState {
     pub config: RoutesConfig,
     /// The port every socket listens on.
     pub port: u16,
+    /// The addresses bound now.
+    pub bound: Vec<IpAddr>,
+    /// Tunnels given on the command line (`--tunnel`), advertised besides
+    /// the config's.
+    pub extra: Vec<String>,
+}
+
+impl ListenState {
+    /// Advertise what `config` selects for the sockets bound now, plus the
+    /// command line's tunnels.
+    pub fn readvertise(&mut self, interfaces: &[IpAddr]) {
+        let mut routes = self.config.advertised(interfaces, &self.bound, self.port);
+        for t in &self.extra {
+            if !routes.contains(t) {
+                routes.push(t.clone());
+            }
+        }
+        self.routes = routes;
+    }
 }
 
 /// The listen state, shared by the accept loop and the app channel.
@@ -336,6 +355,7 @@ pub async fn run(
         Some(config) => config.advertised(&interfaces, &bound, port),
         None => route_hints(opts.listen_ip, port),
     };
+    let mut extra = Vec::new();
     for tunnel in &opts.tunnels {
         let target = WsTarget::parse(tunnel)
             .filter(|t| t.secure)
@@ -343,6 +363,7 @@ pub async fn run(
                 format!("--tunnel {tunnel}: not a wss://<host>[:<port>]<path>/mousse-net/1 URL")
             })?;
         routes.push(target.uri());
+        extra.push(target.uri());
     }
     let config = stored.clone().unwrap_or_else(|| RoutesConfig {
         lan: opts.listen_ip.is_unspecified(),
@@ -358,6 +379,8 @@ pub async fn run(
         unbound: unbound.clone(),
         config: config.clone(),
         port,
+        bound: bound.clone(),
+        extra,
     }));
     // The loopback ws listener, for the owner's tunnel client (§4.1).
     let ws_listener = if opts.ws_port.is_some() || !opts.tunnels.is_empty() || config.ws_listener()
@@ -384,12 +407,9 @@ pub async fn run(
         None
     };
 
-    // The app channel replaces the control listener in app mode.
-    let mut control = if opts.app {
-        None
-    } else {
-        Some(ControlListener::bind(state_dir).await?)
-    };
+    // In app mode the app channel carries everything else; the control
+    // listener answers only `pipe` and `status` (Phase 1b §3.3).
+    let mut control = Some(ControlListener::bind(state_dir).await?);
     let token = hex(&random_bytes::<32>());
     if let Some(control) = &control {
         ipc::write_control_file(state_dir, control.addr(), &token)?;
@@ -440,6 +460,9 @@ pub async fn run(
             caller.use_flow_records(Arc::new(endpoint.flow_records()));
         }
         caller.use_stream_admission(host.stream_admission());
+        // The ssh tier opens SSH routes set up by `ssh.resolve` (Phase 1b §3).
+        let ssh = Arc::new(crate::ssh::Ssh::new(endpoint.dir()));
+        caller.use_ssh_dialer(Arc::new(crate::ssh::Dialer(ssh.clone())));
         // Renewals search from the store as it is then (Phase 1b §1.5).
         caller.use_candidates(Arc::new(crate::app::StoreCandidates {
             dir: endpoint.dir().to_path_buf(),
@@ -466,6 +489,7 @@ pub async fn run(
             signer: signer.clone(),
             endpoint_id: endpoint.endpoint_id().to_owned(),
             key_storage,
+            ssh,
         };
         Some(crate::app::App::start(
             host.clone(),
@@ -545,9 +569,23 @@ pub async fn run(
                 break;
             }
             ctl = accept_control(&mut control) => match ctl {
-                Ok(ch) => {
-                    tokio::spawn(control_session(state.clone(), ch));
-                }
+                Ok(ch) => match &app {
+                    // A place in the pipe pool before anything is read;
+                    // none while paused.
+                    Some(app) => {
+                        let slot = host.admit(ListenerKind::Pipe, None);
+                        tokio::spawn(app_control_session(
+                            host.clone(),
+                            app.clone(),
+                            state.clone(),
+                            ch,
+                            slot,
+                        ));
+                    }
+                    None => {
+                        tokio::spawn(control_session(state.clone(), ch));
+                    }
+                },
                 Err(e) => print_line(format!("control channel: {e}")),
             },
             Some(change) = net_changes.recv() => {
@@ -556,20 +594,16 @@ pub async fn run(
                 }
                 // A selected address came or went: open or close only
                 // that socket (LAN on binds 0.0.0.0, which never changes).
-                if let Some(config) = &stored {
+                if stored.is_some() {
                     let interfaces = crate::app::interface_ips();
-                    let unbound = reconcile(config, &interfaces, port, &mut sockets, &accepted_tx).await;
-                    let bound: Vec<IpAddr> = sockets.keys().copied().collect();
+                    // The config in effect: list edits since the start
+                    // apply without a restart.
+                    let config = listen.lock().unwrap_or_else(|e| e.into_inner()).config.clone();
+                    let unbound = reconcile(&config, &interfaces, port, &mut sockets, &accepted_tx).await;
                     let mut st = listen.lock().unwrap_or_else(|e| e.into_inner());
-                    let tunnels = st.routes.iter().filter(|r| r.starts_with("wss:")).cloned();
-                    let mut routes = config.advertised(&interfaces, &bound, port);
-                    for t in tunnels {
-                        if !routes.contains(&t) {
-                            routes.push(t);
-                        }
-                    }
-                    st.routes = routes;
+                    st.bound = sockets.keys().copied().collect();
                     st.unbound = unbound;
+                    st.readvertise(&interfaces);
                 }
                 if let Some(app) = &app {
                     app.net_change(change);
@@ -647,13 +681,13 @@ async fn ws_connection(
     };
     match app {
         Some(app) => {
-            app.inbound(conn, RouteKind::Ws, None).await;
+            app.inbound(conn, RouteKind::Ws, None, None).await;
         }
         None => serve_streams(conn, addr).await,
     }
 }
 
-/// The next control connection; never, in app mode.
+/// The next control connection.
 async fn accept_control(control: &mut Option<ControlListener>) -> Result<Channel, String> {
     match control {
         Some(control) => control.accept().await,
@@ -670,8 +704,10 @@ async fn app_connection(
     slot: PreAuthSlot,
     closing: watch::Receiver<bool>,
 ) {
+    // The listener's own address: a check's class map names its port.
+    let local = pipe.local_addr().ok();
     if let Some(conn) = accept_holding(&host, pipe, addr, slot).await {
-        if let Some(no) = app.inbound(conn, RouteKind::Tcp, Some(addr)).await {
+        if let Some(no) = app.inbound(conn, RouteKind::Tcp, Some(addr), local).await {
             app.close_with_socket(no, closing);
         }
     }
@@ -896,6 +932,65 @@ async fn control_session(state: Arc<State>, mut ch: Channel) {
             return;
         }
         other => reply_error(format!("unknown command {other:?}")),
+    };
+    let _ = ch.send(&reply).await;
+}
+
+/// App mode's control connection (Phase 1b §3.3): it holds a pipe pool
+/// place from accept (`slot`), and answers only `pipe` and `status`.
+/// `pipe` hands the stream, with whatever the line reader already holds,
+/// to the host as an inbound connection; the place passes on with it.
+async fn app_control_session(
+    host: Host,
+    app: crate::app::App,
+    state: Arc<State>,
+    mut ch: Channel,
+    slot: Result<PreAuthSlot, mousse_net_io::Refusal>,
+) {
+    let slot = match slot {
+        Ok(slot) => slot,
+        Err(why) => {
+            print_line(format!("refused pipe: {why}"));
+            let _ = ch
+                .send(&json!({"error": "refused", "reason": why.to_string()}))
+                .await;
+            return;
+        }
+    };
+    let Ok(Some(request)) = ch.recv_first().await else {
+        return;
+    };
+    let token = request.get("token").and_then(Value::as_str).unwrap_or("");
+    // Control (tests only): a pipe is handed over without the token.
+    let token_ok = ipc::token_matches(token, &state.token);
+    let cmd = request.get("cmd").and_then(Value::as_str).unwrap_or("");
+    if cmd == "pipe" && (token_ok || cfg!(mousse_control = "pipe-no-token")) {
+        if ch.send(&json!({"ok": true})).await.is_err() {
+            return;
+        }
+        let pipe = ch.into_pipe();
+        let conn = match host.accept_admitted(pipe, slot).await {
+            Ok(conn) => conn,
+            Err(e) => {
+                print_line(format!("refused pipe: {e}"));
+                return;
+            }
+        };
+        app.inbound(conn, RouteKind::Ssh, None, None).await;
+        return;
+    }
+    drop(slot);
+    let reply = if !token_ok {
+        json!({"error": "refused", "reason": "bad control token"})
+    } else if cmd == "status" {
+        json!({
+            "device": short_id(&state.ticket_identity),
+            "identity": hex(state.ticket_identity.as_bytes()),
+            "build": crate::BUILD,
+            "app": true,
+        })
+    } else {
+        reply_error("This profile is run by Mousse; use mousse-cli net-engine")
     };
     let _ = ch.send(&reply).await;
 }

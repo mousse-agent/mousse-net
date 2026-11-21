@@ -40,6 +40,10 @@
  *   Linux, a `sandbox-exec` profile on macOS. Printed as `fence=`.
  * - MOUSSE_CHECK_PROBE_BIN: `mousse-check` built from this checkout, for the app
  *   script to run `mousse-check probe`.
+ * - For `--route ssh` and the checks that add a computer over SSH
+ *   (SSH_CHECKS): MOUSSE_CHECK_TEST_SSHD, the test SSH server built from
+ *   this checkout, and MOUSSE_CHECK_SSH_ROUTES, the module that starts the
+ *   case's two loopback SSH routes (ssh-routes.mjs).
  *
  * --route tcp|ws|ssh: the route case. The app script gives the app only that
  *   route and writes every `conn.up` event it saw, one JSON object per line,
@@ -160,9 +164,10 @@ function controlEnv(id, control) {
 }
 
 /** Builds the debug helper (and mousse-check when `probe`) and returns their paths. */
-function buildTools(env, probe) {
+function buildTools(env, probe, sshd) {
   const args = ['build', '-p', 'mousse-helper', '--bin', 'mousse-helper']
   if (probe) args.push('-p', 'mousse-check', '--bin', 'mousse-check')
+  if (sshd) args.push('--example', 'test-sshd')
   const r = spawnSync(cargo, [...args, '--message-format=json-render-diagnostics'], {
     cwd: root,
     env,
@@ -179,7 +184,16 @@ function buildTools(env, probe) {
   }
   if (!exes['mousse-helper'] || !existsSync(exes['mousse-helper'])) refuse('cargo built the helper but did not say where')
   if (probe && !exes['mousse-check']) refuse('cargo built mousse-check but did not say where')
-  return { helper: exes['mousse-helper'], probe: exes['mousse-check'] }
+  if (sshd && !exes['test-sshd']) refuse('cargo built test-sshd but did not say where')
+  return { helper: exes['mousse-helper'], probe: exes['mousse-check'], sshd: exes['test-sshd'] }
+}
+
+/** App checks that add a computer over SSH, whatever their route case. */
+export const SSH_CHECKS = ['phase1b.ssh-add-app', 'phase1b.link-app']
+
+/** Whether a run needs the test SSH server: the `ssh` route case, or a check in SSH_CHECKS. */
+export function needsSshd(id, route) {
+  return route === 'ssh' || SSH_CHECKS.includes(id)
 }
 
 /** Phase 0 and 1a checks run as they were signed; later ones get the stand-ins. */
@@ -382,7 +396,7 @@ async function main() {
   }
   const stand = guarded(id)
   const build = helperBuild()
-  const tools = buildTools(env, stand)
+  const tools = buildTools(env, stand, needsSshd(id, flags.route))
   console.log(`helper_build=${build}`)
 
   const out = resolve(flags.out ?? mkdtempSync(join(tmpdir(), 'app-check-')))
@@ -413,7 +427,11 @@ async function main() {
       MOUSSE_NET_TEST_EGRESS_LOG: egressLog,
       // Forward slashes: NODE_OPTIONS reads backslashes as escapes.
       NODE_OPTIONS: `${env.NODE_OPTIONS ? `${env.NODE_OPTIONS} ` : ''}--require "${GUARD.split('\\').join('/')}"`,
-      MOUSSE_CHECK_PROBE_BIN: tools.probe
+      MOUSSE_CHECK_PROBE_BIN: tools.probe,
+      // The ssh case: the test SSH server and the two-route helper.
+      ...(tools.sshd
+        ? { MOUSSE_CHECK_TEST_SSHD: tools.sshd, MOUSSE_CHECK_SSH_ROUTES: join(root, 'tools', 'app-check', 'ssh-routes.mjs') }
+        : {})
     })
     const f = fence(egress.split(',').some((a) => a.trim()))
     console.log(`fence=${f.kind}`)

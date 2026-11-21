@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "wsl-linux",
+  "key": "042f0974403d57624956aebbe7cd72f01b86773fdee66ffba37429d70a320ccb692f06069a9174535d971428932d86132cc89eef54954c5f9c5c6ed605fea234bb",
+  "payload": "{\"check\":\"phase1b.admission\",\"target\":\"linux-x64\",\"control\":\"fence-tcp-only\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+debug\",\"platform\":\"linux-x86_64\",\"outcome\":\"FAIL\",\"details\":\"4 of 23 tests failed\",\"time\":\"2026-11-20T21:08:16Z\",\"device\":\"wsl-linux\",\"config\":\"ee9704cf842c8a35b9e1a9a5443dff5fafa943c08f510ea137508a0be4ab9dd9\"}",
+  "signature": "00e80a5f7196d661f5905f443f39cf30649ad2346c6ee402f77850598d781faf2c4a76abcbbbb4bfd83bb6af47923db3f75158056a8ebcb5f0e8b37998f21522"
+}

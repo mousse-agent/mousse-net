@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "mac-mini",
+  "key": "04d63225e01c2fd84d8a4588702b08561c26da25295387d39876ea36c7f2deee75ec54bd53c9d5b09712f13f737f0ece0038931c8226886a42d77430c7c4e486ee",
+  "payload": "{\"check\":\"phase1b.routes\",\"target\":\"macos-arm64\",\"control\":\"bind-all-lan-off\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+debug\",\"platform\":\"macos-aarch64\",\"outcome\":\"FAIL\",\"details\":\"1 of 40 tests failed\",\"time\":\"2026-11-20T15:05:12Z\",\"device\":\"mac-mini\",\"config\":\"e4ab192dfc761b9e45ca25c43076bd3c29d81360a0b18378bf342929d611d0fe\"}",
+  "signature": "1ffc067a20cfe96658e6ce0cac35bd0d45d9195cd25ddd51e26c37eb06ba7a41b9586fb53e80bb738cf517ecb697ed6d469035465c49d053a54ac0ee85ad0b41"
+}

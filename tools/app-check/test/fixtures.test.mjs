@@ -7,6 +7,7 @@ import { test } from 'node:test'
 import { allowedLink, page, serve as servePage } from '../chat-page.mjs'
 import { selfTest, sortRequests, startRecorder } from '../recorder.mjs'
 import { dial, limits, MAGIC, serve } from '../relay.mjs'
+import { needsSshd } from '../run.mjs'
 
 const TOKEN = 'a'.repeat(32)
 const env = {}
@@ -92,4 +93,32 @@ test('the Plus recorder records every request, answers 403, and sorts update che
   assert.deepEqual(plus.map((x) => x.url), ['/v1/session'])
   assert.deepEqual(updates.map((x) => x.url), ['/update-feed/latest.yml'])
   await r.close()
+})
+
+test('the ssh case starts one test SSH server per side and stops them', async () => {
+  const { startSshRoutes } = await import('../ssh-routes.mjs')
+  const { mkdtempSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  // Stands in for test-sshd: prints its ready line, serves until stdin ends.
+  const fake = [
+    process.execPath,
+    '-e',
+    "const p=40000+Math.floor(Math.random()*1000);console.log('ready port '+p+' host_key SHA256:x config '+process.argv[process.argv.indexOf('--keys')+1]+'/ssh_config');process.stdin.resume();process.stdin.on('end',()=>process.exit(0))",
+    '--'
+  ]
+  const out = mkdtempSync(join(tmpdir(), 'ssh-routes-'))
+  const routes = await startSshRoutes({ out, command: fake, sides: { a: { mousseHome: join(out, 'a') }, b: { mousseHome: join(out, 'b') } } })
+  assert.ok(routes.a.config.includes('ssh-a') && routes.b.config.includes('ssh-b'))
+  assert.equal(typeof routes.a.port, 'number')
+  await routes.stop()
+})
+
+test('the SSH-add checks get the test SSH server on every route case', () => {
+  for (const id of ['phase1b.ssh-add-app', 'phase1b.link-app']) {
+    for (const route of [undefined, 'tcp', 'ws', 'ssh']) assert.equal(needsSshd(id, route), true, `${id} ${route}`)
+  }
+  assert.equal(needsSshd('phase1b.routes-app', 'ssh'), true)
+  assert.equal(needsSshd('phase1b.routes-app', 'tcp'), false)
+  assert.equal(needsSshd('phase1a.removal', undefined), false)
 })

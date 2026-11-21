@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "mac-mini",
+  "key": "04d63225e01c2fd84d8a4588702b08561c26da25295387d39876ea36c7f2deee75ec54bd53c9d5b09712f13f737f0ece0038931c8226886a42d77430c7c4e486ee",
+  "payload": "{\"check\":\"phase0.core-vectors\",\"target\":\"macos-arm64\",\"control\":\"break-raw-signature\",\"build\":\"366dd2b062641eed1e639b5c974e95999b8894d8+debug\",\"platform\":\"macos-aarch64\",\"outcome\":\"FAIL\",\"details\":\"4 of 176 tests failed\",\"time\":\"2026-11-19T17:31:48Z\",\"device\":\"mac-mini\",\"config\":\"51eb6b474f2fb37b68f616d37de0f334a39c906b8ee26e868cd02688cc390b9e\"}",
+  "signature": "003ad40af6cea11472470780a03ac1bb4a493b8699bec5c533253849cffefc42076902c8065516c9cd54bcaaa7e86bb7a931c21f66de8997181067c37dc82383"
+}

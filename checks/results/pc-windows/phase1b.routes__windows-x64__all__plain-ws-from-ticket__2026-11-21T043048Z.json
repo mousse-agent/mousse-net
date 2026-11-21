@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "pc-windows",
+  "key": "048ad3ccda2d27fdfc98c131f2fa25bea736ec0a3e8a107dcbfa6b2f5a86b88da452c337f09925646ec76897452505e718f3f397ddf39674e9f5ad64590bc93d57",
+  "payload": "{\"check\":\"phase1b.routes\",\"target\":\"windows-x64\",\"control\":\"plain-ws-from-ticket\",\"build\":\"922438fb3c947c5b8ae635b934b12ff740a3e730+debug\",\"platform\":\"windows-x86_64\",\"outcome\":\"FAIL\",\"details\":\"1 of 40 tests failed\",\"time\":\"2026-11-21T04:30:48Z\",\"device\":\"pc-windows\",\"config\":\"b23c8c001da370ccd0d2230c3dc79d91dc11e62714dd90576fdc6ba6520d5c2d\"}",
+  "signature": "2fc7015441b7d516d4915131a3d12cefe5a84b99c23f42b78b8b7a3a8b129116c2ffdb903b7085425348270de1ca29d412a9a38026fa2275b15d884dd91ac89b"
+}

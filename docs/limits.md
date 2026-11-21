@@ -142,6 +142,16 @@ spec's value: it can only be tightened.
 | `MOUSSE_NET_MANIFEST_OVERLAP_SECS` | 604800 | 86400 to 604800 | How long an old relay route or registration key stays in the manifest, and registered, after a rotation (Phase 3 §B.4 and §B.11). It counts from the rotation's start, before any `SUCCESSOR`, less the 10-minute clock skew. At most the relay's largest `MOUSSE_NET_RELAY_SUCCESSOR_OVERLAP_SECS`; a self-hosted relay sends its own in `REGISTERED`, and the helper uses the smaller of the two, so the old route leaves the manifest before the relay drops the old key. Tighten only. |
 | `MOUSSE_NET_MANIFEST_LIFETIME_SECS` | 2592000 | 604800 to 7776000 | When a manifest becomes stale. A stale manifest's routes are still dialled, after every other route. Above the overlap. |
 | `MOUSSE_NET_VIA_RELAY_REJOIN_SECS` | 86400 | 600 to 86400 | Host: how long a consumed invitation's tag stays in the relay allow-set, so a joiner whose circuit dropped can finish (Phase 3 §B.7). Tighten only: the tag is a capability. |
+| `MOUSSE_NET_SSH_CONNECT_TIMEOUT_SECS` | 10 | 1 to 120 | ssh: `ConnectTimeout` on every call, and the limit on `ssh -G` (Phase 1b §3.1). |
+| `MOUSSE_NET_SSH_ALIVE_INTERVAL_SECS` | 15 | 1 to 300 | ssh: `ServerAliveInterval`. |
+| `MOUSSE_NET_SSH_ALIVE_COUNT` | 3 | 1 to 20 | ssh: `ServerAliveCountMax`. |
+| `MOUSSE_NET_SSH_TARGET_CONNECTS` | 5 | 1 to 5 | ssh: connections per resolved host and port per `SSH_TARGET_WINDOW_MS` (key fetches, setup sessions and pipe dials alike, every route and alias for the server together), so setup plus retries stay under `ufw limit`. One over waits; a wait past its call's deadline fails with `timeout`. |
+| `MOUSSE_NET_SSH_TARGET_WINDOW_MS` | 30000 | 30000 to 600000 | ssh: the window `SSH_TARGET_CONNECTS` counts over. Tighten only, which here means longer. |
+| `MOUSSE_NET_SSH_SETUP_TIMEOUT_MS` | 60000 | 1000 to 600000 | ssh: one `ssh.run` or `ssh.probe`; also how long a probed key is kept for `ssh.trust` (Phase 1b §3.2). |
+| `MOUSSE_NET_SSH_STDERR_MAX_BYTES` | 16384 | 1024 to 1048576 | ssh: stderr kept to name the failure's reason; never shown raw. |
+| `MOUSSE_NET_SSH_PREAMBLE_MAX_BYTES` | 65536 | 0 to 65536 | ssh: output skipped before the `mousse-ssh/1` marker (a login shell's rc files); past it the try fails with `remote_failed` (Phase 1b §3.3). |
+| `MOUSSE_NET_SSH_REPLY_MAX_BYTES` | 1048576 | 1024 to 1048576 | ssh: one `ssh.run` reply after the marker; a longer one fails with `remote_failed` (Phase 1b §3.4). |
+| `MOUSSE_NET_PIPE_CONNECT_WAIT_MS` | 2000 | 100 to 60000 | Remote `mousse-helper pipe`: reach the running helper's IPC and get its `ok`; past it, `not_running` (Phase 1b §3.3). |
 | `MOUSSE_NET_JOIN_DONE_KEEP_SECS` | 86400 | 0 to 2592000 | App mode: how long a "Send link" completion record (`joins/<ticket hash>.done`) the app never acknowledged with `join.ack` is kept after its ticket expired. Until then `join.status` can replay it. |
 | `MOUSSE_NET_INIT_HOLD_MS` | 0 | 0 to 60000 | Checks only: how long `init` waits before it makes the endpoint, so the hard-kill check can stop the app during a first start. Run for the app (`--app`), its stdin closing still ends it at once. |
 
@@ -254,7 +264,9 @@ count as unknown names.
 | Variable | What it does |
 | --- | --- |
 | `MOUSSE_NET_TEST_EXTRA_ROOT` | A DER certificate file the outer `wss` TLS trusts besides the platform's roots, for a test tunnel stand-in (Phase 1b §4.2). Nothing is installed in an OS store. |
-| `MOUSSE_NET_TEST_CLASS_MAP` | Maps loopback ports to address classes, so checks can stand in for tailnet and public routes (Phase 1b §1.2): `<port>=<class>` entries (`lan`, `tailnet` or `public`) separated by commas. Unmapped loopback counts as `lan`. |
+| `MOUSSE_NET_TEST_CLASS_MAP` | Maps loopback ports to address classes, so checks can stand in for tailnet and public routes (Phase 1b §1.2): `<port>=<class>` entries (`lan`, `tailnet` or `public`) separated by commas, plus an optional `*=<class>` for every loopback port the map leaves out (otherwise `lan`). An inbound loopback connection takes the class of the listener port it arrived on when the map names that port. |
+| `MOUSSE_NET_SSH_BIN` | The `ssh` client to run instead of the system's (Phase 1b §3.1). |
+| `MOUSSE_NET_TEST_SSH_CONFIG` | The ssh config `ssh -G` reads instead of the user's own and the system's, so tests never read the owner's ssh config (Phase 1b §3.7). Every later call reads only the route's own config. |
 | `MOUSSE_NET_TEST_EGRESS` | A check's egress fence (Phase 1b §14): when set, the helper dials only loopback and the comma-separated IP literals listed (the Mac's address in cross-machine cells), and resolves no name but `localhost`. Empty means loopback only. |
 | `MOUSSE_NET_TEST_EGRESS_LOG` | A file the helper appends one JSON line to for each dial the fence refused; the check kit fails the run with `egress_attempted`. |
 
@@ -316,3 +328,6 @@ These are protocol constants, not limits, so they are not settings:
   8192, `DEPOSIT_TOKENS_MAX` 256, `BLOCK_MAX_LIFETIME` 172 800 s, the
   65 536-byte block and rate-cap floors).
 - The mDNS name format (`mousse-` and 12 random characters, privacy.md).
+- The `mousse-ssh/1` marker, the selector grammar (26 characters of
+  `[a-z2-7]`) and the remote `pipe` exit codes (`not_running` 2,
+  `no_endpoint` 3, `refused` 4): the two ends of an SSH route rely on them.

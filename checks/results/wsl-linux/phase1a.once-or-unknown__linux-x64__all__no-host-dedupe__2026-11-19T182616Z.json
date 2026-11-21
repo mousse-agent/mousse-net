@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "wsl-linux",
+  "key": "042f0974403d57624956aebbe7cd72f01b86773fdee66ffba37429d70a320ccb692f06069a9174535d971428932d86132cc89eef54954c5f9c5c6ed605fea234bb",
+  "payload": "{\"check\":\"phase1a.once-or-unknown\",\"target\":\"linux-x64\",\"control\":\"no-host-dedupe\",\"build\":\"366dd2b062641eed1e639b5c974e95999b8894d8+unknown\",\"platform\":\"linux-x86_64\",\"outcome\":\"FAIL\",\"details\":\"printed \\\"FAIL phase1a.once-or-unknown\\\" (reason=duplicate_effect)\",\"time\":\"2026-11-19T18:26:16Z\",\"device\":\"wsl-linux\",\"config\":\"a75b0dc4774001b3479dbfa3572c5d03eb120a73a0918119f69e97a1fd868b07\",\"extra\":{\"app_build\":\"9621efca899d24ff23261bef7b7dc0519cffb02d\",\"reason\":\"duplicate_effect\"}}",
+  "signature": "9b60728b1b453facdd22048cf6a058914b2e86b57a451835da81e4f0039f75b9f4b3111eb769fee259c1d86ace782a24322589ae35b020f0819a5f1630445684"
+}

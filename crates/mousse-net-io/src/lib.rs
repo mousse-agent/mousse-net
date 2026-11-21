@@ -101,6 +101,9 @@ pub type SharedSigner = Arc<dyn IdentitySigner + Send + Sync>;
         mousse_control = "ws-allow-origin",
         mousse_control = "plain-ws-off-loopback",
         mousse_control = "release-test-root",
+        mousse_control = "user-config-in-pipe",
+        mousse_control = "no-preamble-skip",
+        mousse_control = "window-per-route",
         mousse_control = "loopback-routes",
         mousse_control = "resolve-again",
         mousse_control = "unlisted-allowed",
@@ -150,6 +153,9 @@ compile_error!("a mousse_control build has a deliberate defect and is for tests 
     mousse_control = "ws-allow-origin",
     mousse_control = "plain-ws-off-loopback",
     mousse_control = "release-test-root",
+    mousse_control = "user-config-in-pipe",
+    mousse_control = "no-preamble-skip",
+    mousse_control = "window-per-route",
     mousse_control = "loopback-routes",
     mousse_control = "resolve-again",
     mousse_control = "unlisted-allowed",
@@ -240,6 +246,12 @@ pub const CONTROL: Option<&str> = if cfg!(mousse_control = "skip-pin-check") {
     Some("plain-ws-off-loopback")
 } else if cfg!(mousse_control = "release-test-root") {
     Some("release-test-root")
+} else if cfg!(mousse_control = "user-config-in-pipe") {
+    Some("user-config-in-pipe")
+} else if cfg!(mousse_control = "no-preamble-skip") {
+    Some("no-preamble-skip")
+} else if cfg!(mousse_control = "window-per-route") {
+    Some("window-per-route")
 } else if cfg!(mousse_control = "loopback-routes") {
     Some("loopback-routes")
 } else if cfg!(mousse_control = "resolve-again") {

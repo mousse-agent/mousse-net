@@ -34,7 +34,12 @@ pub async fn forward_renewals(shared: Arc<Shared>) {
     let mut events = shared.caller.start_renewals();
     while let Some(event) = events.recv().await {
         match event {
-            PathEvent::Reopen { pin, from, conn } => {
+            PathEvent::Reopen {
+                pin,
+                from,
+                conn,
+                reached,
+            } => {
                 let identity = hex(pin.as_bytes());
                 if shared.removal.is_paused() {
                     // Nothing new while networking is paused; the caller
@@ -68,8 +73,10 @@ pub async fn forward_renewals(shared: Arc<Shared>) {
                     continue;
                 }
                 let role = paths::stored_role(&shared, &pin);
-                let Ok(no) = shared.add_outbound(conn, gen, json!({"dir": "out", "role": role}))
-                else {
+                // Every conn.up carries its route, a renewed path's too.
+                let route = paths::route_json(&reached);
+                let fields = json!({"dir": "out", "role": role, "route": route});
+                let Ok(no) = shared.add_outbound(conn, gen, fields) else {
                     continue;
                 };
                 applog::line(format!("renewed path to {} (conn {no})", short_id(&pin)));

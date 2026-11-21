@@ -42,6 +42,13 @@
         mousse_control = "ws-allow-origin",
         mousse_control = "plain-ws-off-loopback",
         mousse_control = "release-test-root",
+        mousse_control = "accept-new-host-key",
+        mousse_control = "user-config-in-pipe",
+        mousse_control = "trust-unprobed-key",
+        mousse_control = "pipe-no-token",
+        mousse_control = "no-preamble-skip",
+        mousse_control = "pipe-outlives-helper",
+        mousse_control = "window-per-route",
         mousse_control = "peer-ssh-routes",
         mousse_control = "loopback-routes",
         mousse_control = "plain-ws-from-ticket",
@@ -61,7 +68,9 @@
         mousse_control = "link-accepts-kind1",
         mousse_control = "no-completion-record",
         mousse_control = "done-pin-only",
-        mousse_control = "replay-after-removal"
+        mousse_control = "replay-after-removal",
+        mousse_control = "join-ignores-removal",
+        mousse_control = "removal-leaves-pending"
     )
 ))]
 compile_error!("a mousse_control build has a deliberate defect and is for tests only; build it without --release");
@@ -110,6 +119,13 @@ compile_error!("test-in-person lets a typed ticket count as scanned from the hos
     mousse_control = "ws-allow-origin",
     mousse_control = "plain-ws-off-loopback",
     mousse_control = "release-test-root",
+    mousse_control = "accept-new-host-key",
+    mousse_control = "user-config-in-pipe",
+    mousse_control = "trust-unprobed-key",
+    mousse_control = "pipe-no-token",
+    mousse_control = "no-preamble-skip",
+    mousse_control = "pipe-outlives-helper",
+    mousse_control = "window-per-route",
     mousse_control = "peer-ssh-routes",
     mousse_control = "loopback-routes",
     mousse_control = "plain-ws-from-ticket",
@@ -130,6 +146,8 @@ compile_error!("test-in-person lets a typed ticket count as scanned from the hos
     mousse_control = "no-completion-record",
     mousse_control = "done-pin-only",
     mousse_control = "replay-after-removal",
+    mousse_control = "join-ignores-removal",
+    mousse_control = "removal-leaves-pending",
     feature = "test-in-person"
 ))]
 const _: () = {
@@ -153,8 +171,10 @@ mod engine;
 mod ipc;
 mod limits;
 mod peer;
+mod pipe;
 mod plus;
 mod revoke;
+mod ssh;
 
 /// This build: `<commit>[-dirty]+<profile>`, fixed at compile time (see
 /// `build.rs`; `MOUSSE_BUILD_ID` overrides it).
@@ -305,6 +325,15 @@ enum Command {
         /// Command to run instead of the shell.
         #[arg(last = true)]
         command: Vec<String>,
+    },
+    /// The remote end of an SSH route (run by SSH, not by hand): pass
+    /// stdin and stdout to the running helper of the profile with this
+    /// selector, after the `mousse-ssh/1` marker. Exits 2 (not running),
+    /// 3 (no such profile, or networking off) or 4 (refused).
+    Pipe {
+        /// The profile's selector, from `$MOUSSE_HOME/net-engine/endpoints.json`.
+        #[arg(long)]
+        profile: String,
     },
     /// Cross-machine slice check, run on the dialling side: pair, run a
     /// command, wait for the host to remove this device, check a new
@@ -721,6 +750,9 @@ fn validity(secs: u64) -> String {
 
 async fn run(cli: Cli) -> Result<i32, String> {
     let dir = cli.state.unwrap_or_else(serve::default_state_dir);
+    // Absolute from here on: the control socket of a long state path is
+    // reached after changing to the state directory (Phase 1b §3.3).
+    let dir = std::path::absolute(&dir).unwrap_or(dir);
     let insecure = cli.insecure_file_key;
     match cli.command {
         Command::Init {
@@ -816,6 +848,7 @@ async fn run(cli: Cli) -> Result<i32, String> {
             println!("{}", peer::joined_line(&joined, &ticket.host_identity));
         }
         Command::Peers => peer::print_peers(&dir)?,
+        Command::Pipe { profile } => return Ok(pipe::run(&profile).await),
         Command::Grants => match ipc::call(&dir, json!({"cmd": "grants"})).await? {
             Some(reply) => print_grants(&reply),
             None => print_grants(&offline_grants(&dir)?),

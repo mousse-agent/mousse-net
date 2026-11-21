@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use mousse_net_core::pairing::{Arrival, InvitationKind, Route, Ticket, CODE_FAILED_MESSAGE};
 use mousse_net_core::session_cert::CertError;
 use mousse_net_core::ErrorCode;
-use mousse_net_io::pipe::{route_uri, BoxPipe, LocalRoute, RouteKind};
+use mousse_net_io::pipe::{route_uri, AddrClass, AddrPolicy, BoxPipe, LocalRoute, RouteKind};
 use mousse_net_io::store::{
     hex, is_stale, short_id, Approval, ApprovalStore, CompletionRecord, CompletionStore,
     PeerRecord, PeerStore, PeersLock, APPROVAL_SOURCE_TICKET, COMPLETION_PAIRED,
@@ -69,6 +69,86 @@ fn parse_routes(list: &[String]) -> Result<Vec<LocalRoute>, String> {
     list.iter()
         .map(|r| LocalRoute::parse(r).map_err(|e| e.to_string()))
         .collect()
+}
+
+/// Routes the owner typed: each must parse and name no forbidden address.
+fn owner_routes(policy: &AddrPolicy, list: &[String]) -> Result<Vec<LocalRoute>, String> {
+    let routes = parse_routes(list)?;
+    match routes.iter().find(|r| policy.names_forbidden(r)) {
+        Some(r) => Err(format!("{r} names an address that is never dialled")),
+        None => Ok(routes),
+    }
+}
+
+/// How a hint is shown when the owner is asked to approve it.
+fn hint_label(policy: &AddrPolicy, route: &LocalRoute) -> String {
+    let class = match (route, route.ip(), route.port()) {
+        (LocalRoute::Wss { .. }, _, _) => "Tunnel",
+        (_, Some(ip), Some(port)) => match policy.class_of(std::net::SocketAddr::new(ip, port)) {
+            AddrClass::Lan => "LAN",
+            AddrClass::Tailnet => "Tailnet",
+            AddrClass::Public => "Internet",
+            AddrClass::Forbidden => "never dialled",
+        },
+        _ => "a name",
+    };
+    format!("{route} ({class})")
+}
+
+/// The ticket's hints beyond the automatic rule that the owner approves
+/// (Phase 1b §1.3, §8): asked on the terminal, `y` to dial them too.
+/// Without a terminal none is approved, and the ones left out are named.
+fn approve_hints(policy: &AddrPolicy, ticket: &Ticket) -> Vec<String> {
+    use std::io::IsTerminal;
+    let all: Vec<String> = usable_routes(&ticket.routes)
+        .iter()
+        .map(LocalRoute::uri)
+        .collect();
+    let extra: Vec<LocalRoute> = crate::app::ticket_candidates(policy, &ticket.routes, &all)
+        .into_iter()
+        .filter(|r| !policy.automatic(r))
+        .collect();
+    if extra.is_empty() {
+        return Vec::new();
+    }
+    let listed: Vec<String> = extra.iter().map(|r| hint_label(policy, r)).collect();
+    if !std::io::stdin().is_terminal() {
+        println!(
+            "not dialled without approval (run on a terminal to approve): {}",
+            listed.join(", ")
+        );
+        return Vec::new();
+    }
+    println!("The ticket also lists: {}", listed.join(", "));
+    println!("Dial these too? [y/N]");
+    let mut line = String::new();
+    let yes = std::io::stdin().read_line(&mut line).is_ok() && line.trim() == "y";
+    if yes {
+        extra.iter().map(LocalRoute::uri).collect()
+    } else {
+        Vec::new()
+    }
+}
+
+/// Keep the hints the owner approved as `ticket` approvals for the host.
+fn store_approvals(
+    peers: &PeerStore,
+    ticket: &Ticket,
+    approved: &[String],
+) -> Result<(), NetError> {
+    let identity = hex(ticket.host_identity.as_bytes());
+    let at = now_secs();
+    let entries: Vec<Approval> = approved
+        .iter()
+        .map(|d| Approval {
+            identity: identity.clone(),
+            destination: d.clone(),
+            source: APPROVAL_SOURCE_TICKET.into(),
+            at,
+        })
+        .collect();
+    let held = peers.lock()?;
+    ApprovalStore::in_dir(peers.dir()).add(&held, &entries)
 }
 
 /// Routes from a ticket or the peer store: hints this version cannot use
@@ -215,6 +295,8 @@ pub fn reason_of(e: &NetError) -> String {
         NetError::Io(_) => "unreachable".into(),
         NetError::Relay(e) => e.word().into(),
         NetError::Forbidden(_) => "forbidden_address".into(),
+        // An ssh try names its own reason (Phase 1b §3.5).
+        NetError::Ssh { reason, .. } => reason.name().into(),
         _ => "error".into(),
     }
 }
@@ -281,10 +363,16 @@ pub async fn join(
             "pairing_failed",
         ));
     }
+    // The same policy as the app's (Phase 1b §1.3): addresses the owner
+    // typed, or the ticket's hints under the automatic rule plus the ones
+    // the owner approves here.
+    let policy = side.caller.addr_policy().clone();
+    let mut approved = Vec::new();
     let candidates = if routes.is_empty() {
-        usable_routes(&ticket.routes)
+        approved = approve_hints(&policy, ticket);
+        crate::app::ticket_candidates(&policy, &ticket.routes, &approved)
     } else {
-        parse_routes(routes).map_err(|e| Failure::new(e, "bad_route"))?
+        owner_routes(&policy, routes).map_err(|e| Failure::new(e, "bad_route"))?
     };
     if candidates.is_empty() {
         return Err(Failure::new(
@@ -309,8 +397,13 @@ pub async fn join(
         None,
         &mut TypedCode,
         |_| {},
+        || true,
     )
     .await?;
+    if !already_paired && !approved.is_empty() {
+        store_approvals(&side.peers(), ticket, &approved)
+            .map_err(|e| Failure::new(e.to_string(), "store"))?;
+    }
     Ok(Joined {
         conn,
         record,
@@ -337,6 +430,11 @@ pub async fn join(
 /// written first, then the pin, the approvals and the settled mark. An
 /// "already paired" answer is existing access only and changes nothing
 /// stored.
+///
+/// `wanted`: false once the host was removed since the join started. It is
+/// asked under the peers lock, just before anything is stored, and a
+/// removal answers it under the same lock: a join either stores before the
+/// removal (which then removes what it stored) or stores nothing.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn join_routes<C: CodeEntry>(
     caller: &Caller,
@@ -349,6 +447,7 @@ pub(crate) async fn join_routes<C: CodeEntry>(
     link: Option<&[String]>,
     codes: &mut C,
     mut progress: impl FnMut(&str),
+    wanted: impl Fn() -> bool,
 ) -> Result<(Connection, PeerRecord, bool, JoinedVia), Failure> {
     let held = peers.load().is_ok_and(|ps| {
         ps.iter()
@@ -404,7 +503,13 @@ pub(crate) async fn join_routes<C: CodeEntry>(
             Ok((conn, outcome)) if link.is_some() => {
                 let approved = link.unwrap_or_default();
                 let (record, already) =
-                    finish_link(caller, peers, ticket, &hint, approved, outcome)?;
+                    match finish_link(caller, peers, ticket, &hint, approved, outcome, &wanted) {
+                        Ok(done) => done,
+                        Err(f) => {
+                            conn.close(ErrorCode::Cancelled);
+                            return Err(f);
+                        }
+                    };
                 if let JoinRoute::Local(route) = route {
                     caller.remember_local_routes(ticket.host_identity, vec![route.clone()]);
                 }
@@ -415,33 +520,43 @@ pub(crate) async fn join_routes<C: CodeEntry>(
                 // Built from the stored record as it is under the lock, so
                 // a write by another process meanwhile is not undone.
                 let mut stored = None;
-                peers
-                    .update(|peers| {
-                        let existing = peers
-                            .iter()
-                            .find(|p| p.pin().ok() == Some(ticket.host_identity));
-                        let (host_name, role) = match outcome {
-                            JoinOutcome::Paired(host) => (host.name, host.role.as_str().to_owned()),
-                            JoinOutcome::AlreadyPaired => match existing {
-                                Some(p) => (p.name.clone(), p.role.clone()),
-                                None => (short_id(&ticket.host_identity), "unknown".into()),
-                            },
-                        };
-                        let record = PeerRecord {
-                            name: host_name,
-                            identity: hex(ticket.host_identity.as_bytes()),
-                            role,
-                            routes: ticket.routes.clone(),
-                            last_route: Some(hint.clone()),
-                            addresses: existing.map(|p| p.addresses.clone()).unwrap_or_default(),
-                            offered: existing.map(|p| p.offered.clone()).unwrap_or_default(),
-                            paired_at: now_secs(),
-                        };
-                        peers.retain(|p| p.pin().ok() != Some(ticket.host_identity));
-                        peers.push(record.clone());
-                        stored = Some(record);
-                    })
-                    .map_err(|e| Failure::new(e.to_string(), "store"))?;
+                let store = |e: NetError| Failure::new(e.to_string(), "store");
+                let held = match peers.lock() {
+                    Ok(held) if wanted() => held,
+                    Ok(held) => {
+                        drop(held);
+                        conn.close(ErrorCode::Cancelled);
+                        return Err(removed_meanwhile(caller, &ticket.hash()));
+                    }
+                    Err(e) => return Err(store(e)),
+                };
+                held.update(|peers| {
+                    let existing = peers
+                        .iter()
+                        .find(|p| p.pin().ok() == Some(ticket.host_identity));
+                    let (host_name, role) = match outcome {
+                        JoinOutcome::Paired(host) => (host.name, host.role.as_str().to_owned()),
+                        JoinOutcome::AlreadyPaired => match existing {
+                            Some(p) => (p.name.clone(), p.role.clone()),
+                            None => (short_id(&ticket.host_identity), "unknown".into()),
+                        },
+                    };
+                    let record = PeerRecord {
+                        name: host_name,
+                        identity: hex(ticket.host_identity.as_bytes()),
+                        role,
+                        routes: ticket.routes.clone(),
+                        last_route: Some(hint.clone()),
+                        addresses: existing.map(|p| p.addresses.clone()).unwrap_or_default(),
+                        offered: existing.map(|p| p.offered.clone()).unwrap_or_default(),
+                        paired_at: now_secs(),
+                    };
+                    peers.retain(|p| p.pin().ok() != Some(ticket.host_identity));
+                    peers.push(record.clone());
+                    stored = Some(record);
+                })
+                .map_err(store)?;
+                drop(held);
                 let record = stored.expect("the update ran");
                 // The pin is stored: the join's outcome is no longer pending.
                 caller
@@ -479,12 +594,27 @@ pub(crate) async fn join_routes<C: CodeEntry>(
     }
 }
 
-/// A test hook (debug builds): `MOUSSE_HELPER_TEST_CRASH=<point>` stops the
+/// Test hooks (debug builds): `MOUSSE_HELPER_TEST_CRASH=<point>` stops the
 /// helper at once at that point, as a crash would.
+/// `MOUSSE_HELPER_TEST_HOLD=<point>=<file>` holds it there instead: it
+/// creates `<file>` and waits until the test deletes it (60 s at most).
 pub(crate) fn crash_point(point: &str) {
     #[cfg(debug_assertions)]
-    if std::env::var("MOUSSE_HELPER_TEST_CRASH").as_deref() == Ok(point) {
-        std::process::exit(86);
+    {
+        if std::env::var("MOUSSE_HELPER_TEST_CRASH").as_deref() == Ok(point) {
+            std::process::exit(86);
+        }
+        if let Ok(hold) = std::env::var("MOUSSE_HELPER_TEST_HOLD") {
+            if let Some(file) = hold.strip_prefix(point).and_then(|r| r.strip_prefix('=')) {
+                let file = Path::new(file);
+                if std::fs::write(file, point).is_ok() {
+                    let until = std::time::Instant::now() + Duration::from_secs(60);
+                    while file.exists() && std::time::Instant::now() < until {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }
+            }
+        }
     }
     let _ = point;
 }
@@ -497,6 +627,7 @@ fn finish_link(
     hint: &str,
     approved: &[String],
     outcome: JoinOutcome,
+    wanted: &impl Fn() -> bool,
 ) -> Result<(PeerRecord, bool), Failure> {
     let store = |e: NetError| Failure::new(e.to_string(), "store");
     let hash = ticket.hash();
@@ -546,10 +677,19 @@ fn finish_link(
         expires_at: ticket.expires_at.secs(),
         at: now,
     };
+    // The record, the row and the approvals are written under one peers
+    // lock, checked against a removal of the host under it: a removal
+    // meanwhile would otherwise be undone by the replay, or drop the
+    // record before it and leave this join's path to a removed host.
+    let held = peers.lock().map_err(store)?;
+    // Must-fail control: the host's removal during the join is not seen.
+    if !wanted() && !cfg!(mousse_control = "join-ignores-removal") {
+        drop(held);
+        return Err(removed_meanwhile(caller, &hash));
+    }
     // Must-fail control: the pin is saved with no completion record first.
     if cfg!(mousse_control = "no-completion-record") {
         crash_point("link-done-saved");
-        let held = peers.lock().map_err(store)?;
         held.update(|list| merge_peer(list, peer.clone()))
             .map_err(store)?;
         ApprovalStore::in_dir(peers.dir())
@@ -560,10 +700,35 @@ fn finish_link(
             .save(&done)
             .map_err(store)?;
         crash_point("link-done-saved");
-        replay_completion(peers.dir(), &hash, true, None).map_err(store)?;
+        if replay_held(peers.dir(), &held, &hash, true, None)
+            .map_err(store)?
+            .is_none()
+        {
+            drop(held);
+            return Err(removed_meanwhile(caller, &hash));
+        }
     }
+    drop(held);
     caller.settle_stored(&hash).map_err(store)?;
     Ok((peer, false))
+}
+
+/// The join's host was removed (`peer.forget`) while it ran: nothing is
+/// stored and its connection is closed. The outcome is learned all the
+/// same, so the join's pending mark is cleared and its ticket let go: a
+/// repeat of the ticket then cannot learn `PAIRED` from the host's receipt
+/// and bring the removed host back.
+fn removed_meanwhile(caller: &Caller, ticket_hash: &[u8; 32]) -> Failure {
+    // Must-fail control: the pending mark and the ticket's hold stay.
+    if !cfg!(mousse_control = "removal-leaves-pending") {
+        if let Err(e) = caller.settle_stored(ticket_hash) {
+            return Failure::new(e.to_string(), "store");
+        }
+    }
+    Failure::new(
+        "the host was removed while this device was joining it",
+        "forgotten",
+    )
 }
 
 /// The approvals a link join stores: each approved destination that is one
@@ -616,6 +781,17 @@ pub(crate) fn replay_completion(
 ) -> Result<Option<CompletionRecord>, NetError> {
     let peers = PeerStore::in_dir(dir);
     let held = peers.lock()?;
+    replay_held(dir, &held, ticket_hash, full, stale)
+}
+
+/// [`replay_completion`], under the peers lock `held`.
+fn replay_held(
+    dir: &Path,
+    held: &PeersLock<'_>,
+    ticket_hash: &[u8; 32],
+    full: bool,
+    stale: Option<(u64, u64)>,
+) -> Result<Option<CompletionRecord>, NetError> {
     let records = CompletionStore::in_dir(dir);
     let Some(record) = records.load(ticket_hash)? else {
         return Ok(None);
@@ -633,7 +809,7 @@ pub(crate) fn replay_completion(
     }
     held.update(|list| merge_peer(list, peer))?;
     if full {
-        ApprovalStore::in_dir(dir).add(&held, &record.approvals)?;
+        ApprovalStore::in_dir(dir).add(held, &record.approvals)?;
     }
     Ok(Some(record))
 }
@@ -716,10 +892,13 @@ pub async fn dial(
     routes: &[String],
 ) -> Result<Connection, String> {
     let pin = peer.pin().map_err(|e| e.to_string())?;
+    // The same policy as the app's: the stored routes the automatic rule or
+    // an approval allows, or the addresses the owner typed.
+    let policy = side.caller.addr_policy().clone();
     let candidates = if routes.is_empty() {
-        usable_routes(&peer.routes_to_try())
+        crate::app::stored_search(&policy, side.endpoint.dir(), peer).candidates
     } else {
-        parse_routes(routes)?
+        owner_routes(&policy, routes)?
     };
     let (conn, used) = side
         .caller

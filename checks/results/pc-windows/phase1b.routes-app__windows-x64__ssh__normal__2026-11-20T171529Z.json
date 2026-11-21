@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "pc-windows",
+  "key": "048ad3ccda2d27fdfc98c131f2fa25bea736ec0a3e8a107dcbfa6b2f5a86b88da452c337f09925646ec76897452505e718f3f397ddf39674e9f5ad64590bc93d57",
+  "payload": "{\"check\":\"phase1b.routes-app\",\"target\":\"windows-x64\",\"case\":\"ssh\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+unknown\",\"platform\":\"windows-x86_64\",\"outcome\":\"PASS\",\"details\":\"printed \\\"PASS phase1b.routes-app\\\"\",\"time\":\"2026-11-20T17:15:29Z\",\"device\":\"pc-windows\",\"config\":\"10309712a969bea9f8da12f224de4183d7597f1345a3eeef0d03a1cc0ea20eeb\",\"extra\":{\"app_build\":\"a4dd507d97c719545168c88a22a3499b2f4cc448\"}}",
+  "signature": "52780e5c80d82d7dad80227f61de67ac7dfd9efb009eb44ea51bfbb9e76ab5cb7d635399a02ac0887f6c15f3b0b2bfcc3257977b74b8129a1ba26e320dd79cda"
+}

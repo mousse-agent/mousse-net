@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "wsl-linux",
+  "key": "042f0974403d57624956aebbe7cd72f01b86773fdee66ffba37429d70a320ccb692f06069a9174535d971428932d86132cc89eef54954c5f9c5c6ed605fea234bb",
+  "payload": "{\"check\":\"phase1b.ssh\",\"target\":\"linux-x64\",\"control\":\"window-per-route\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+debug\",\"platform\":\"linux-x86_64\",\"outcome\":\"FAIL\",\"details\":\"2 of 22 tests failed\",\"time\":\"2026-11-20T21:13:05Z\",\"device\":\"wsl-linux\",\"config\":\"2367336b30b348166c4e8e0983f22fe77db822ddf7bebdf6cf5b2215a979861f\"}",
+  "signature": "aee430def8ac9278bf35725ae10fb68d6f42268c0975acb3cbed76befdc35592c2d061678433a914028553ce83af461d8c318d76b00a06fc36be50926d2f8a8d"
+}

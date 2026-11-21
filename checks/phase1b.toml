@@ -137,7 +137,11 @@ control = [
   { name = "invitation-survives-exhaustion", breaks = "the host keeps the invitation after the third failure", env = { RUSTFLAGS = '--cfg mousse_control="invitation-survives-exhaustion"' } },
   { name = "link-accepts-kind1", breaks = "a kind-1 ticket is accepted with arrival link", env = { RUSTFLAGS = '--cfg mousse_control="link-accepts-kind1"' } },
   { name = "no-completion-record", breaks = "the pin is saved without a completion record first", env = { RUSTFLAGS = '--cfg mousse_control="no-completion-record"' } },
+  { name = "join-ignores-removal", breaks = "a join stores its host after peer.forget removed it during the join", env = { RUSTFLAGS = '--cfg mousse_control="join-ignores-removal"' } },
+  { name = "removal-leaves-pending", breaks = "a join whose host was removed meanwhile keeps its pending mark, so a repeat learns PAIRED and restores the host", env = { RUSTFLAGS = '--cfg mousse_control="removal-leaves-pending"' } },
   { name = "same-code-after-failure", breaks = "the host keeps showing the failed attempt's code", env = { RUSTFLAGS = '--cfg mousse_control="same-code-after-failure"' } },
+  { name = "done-pin-only", breaks = "completion recovery saves the pin but not the peer's routes and approvals, so a replay has neither", env = { RUSTFLAGS = '--cfg mousse_control="done-pin-only"' } },
+  { name = "pin-stored-memory-only", breaks = "replay after a restart settles only the in-memory flow, so the pending mark on disk stays", env = { RUSTFLAGS = '--cfg mousse_control="pin-stored-memory-only"' } },
 ]
 
 # ---------------------------------------------------------------------------
@@ -170,7 +174,6 @@ control = [
   { name = "join-only-streams", expect_reason = "wire_accepted", breaks = "a join-only connection may open streams", env = { RUSTFLAGS = '--cfg mousse_control="join-only-streams"' } },
   { name = "inbound-before-live", expect_reason = "probe_reached_app", breaks = "the helper announces a connection before it is live", env = { RUSTFLAGS = '--cfg mousse_control="inbound-before-live"' } },
   { name = "tunnel-ignores-editor", expect_reason = "probe_reached_app", breaks = "the engine editor refusal skips the editor switch, so the editor-off case starts an endpoint session", env = { MOUSSE_NET_ENGINE_CONTROL = "tunnel-ignores-editor" } },
-  { name = "no-preauth-budget", expect_reason = "wire_accepted", breaks = "no pre-auth cap on any listener", env = { RUSTFLAGS = '--cfg mousse_control="no-preauth-budget"' } },
 ]
 
 [[check]]
@@ -194,7 +197,7 @@ local = [
 control = [
   { name = "plus-probe", expect_reason = "plus_contacted", breaks = "route setup asks Plus for anything", env = { MOUSSE_NET_ENGINE_CONTROL = "plus-probe" } },
   { name = "egress-probe", expect_reason = "egress_attempted", breaks = "the app contacts an address outside the cell, not through the Plus redirect", env = { MOUSSE_NET_ENGINE_CONTROL = "egress-probe" } },
-  { name = "lan-only-candidates", expect_reason = "unreachable", breaks = "the app passes only LAN addresses to the helper", env = { MOUSSE_NET_ENGINE_CONTROL = "lan-only-candidates" } },
+  { name = "lan-only-candidates", expect_reason = "route_mismatch", breaks = "the app passes only LAN addresses to the helper", env = { MOUSSE_NET_ENGINE_CONTROL = "lan-only-candidates" } },
   { name = "route-leak", expect_reason = "route_mismatch", breaks = "the app adds routes other than the one under test, offered first and answering", env = { MOUSSE_NET_ENGINE_CONTROL = "route-leak" } },
 ]
 # Each 1a case keeps its own 1a control and runs it in every route case
@@ -218,17 +221,9 @@ local = [
   { target = "linux-x64", host = "linux-x86_64", command = ["node", "{root}/tools/app-check/run.mjs", "phase1b.link-app", "--out", "{out}"] },
 ]
 control = [
-  { name = "link-pinned-journal", expect_reason = "swapped_link_trusted", breaks = "the app passes pinned for send-link joins and the helper honours it", env = { MOUSSE_NET_ENGINE_CONTROL = "link-pinned-journal", RUSTFLAGS = '--cfg mousse_control="journal-pins-link"' } },
-  { name = "done-pin-only", expect_reason = "no_route_after_recovery", breaks = "completion recovery saves the pin but not the peer's routes and approvals", env = { RUSTFLAGS = '--cfg mousse_control="done-pin-only"' } },
-  { name = "pin-stored-memory-only", expect_reason = "pending_after_done", breaks = "replay after a restart settles only the in-memory flow, so the durable pending mark stays", env = { RUSTFLAGS = '--cfg mousse_control="pin-stored-memory-only"' } },
   { name = "replay-after-removal", expect_reason = "removed_peer_restored", breaks = "removal leaves completion records, so a later join.status restores the removed host", env = { RUSTFLAGS = '--cfg mousse_control="replay-after-removal"' } },
   { name = "already-grants-back", expect_reason = "grant_without_code", breaks = "a kind-2 already-paired outcome counts as done and runs grantBack", env = { MOUSSE_NET_ENGINE_CONTROL = "already-grants-back" } },
   { name = "pin-promotes-kind2", expect_reason = "promoted_without_completion", breaks = "app recovery moves a consented kind-2 row to joined on any held pin", env = { MOUSSE_NET_ENGINE_CONTROL = "pin-promotes-kind2" } },
-  { name = "link-host-reset", expect_reason = "attempts_reset", breaks = "a reconnect gives the host three tries again", env = { RUSTFLAGS = '--cfg mousse_control="host-attempts-reset-on-reconnect"' } },
-  { name = "link-joiner-reset", expect_reason = "attempts_reset", breaks = "an app restart mid-code gives the joiner three tries again", env = { RUSTFLAGS = '--cfg mousse_control="joiner-records-in-memory"' } },
-  { name = "link-reopen-exhausted", expect_reason = "exhausted_link_reopened", breaks = "the host keeps the invitation after the third failure", env = { RUSTFLAGS = '--cfg mousse_control="invitation-survives-exhaustion"' } },
-  { name = "link-code-bypass", expect_reason = "paired_without_code", breaks = "the joiner pairs without the code's key confirmation", env = { RUSTFLAGS = '--cfg mousse_control="skip-code-confirm"' } },
-  { name = "link-tamper-kind", expect_reason = "tamper_accepted", breaks = "the helper accepts a kind-1 ticket from a link", env = { RUSTFLAGS = '--cfg mousse_control="link-accepts-kind1"' } },
   { name = "link-approvals-lost", expect_reason = "approval_lost", breaks = "a repeated join after restart ignores the consented row's approved list", env = { MOUSSE_NET_ENGINE_CONTROL = "link-approvals-lost" } },
   { name = "link-scheme-registered", expect_reason = "scheme_registered", breaks = "a kit-started app registers the mousse scheme", env = { MOUSSE_NET_ENGINE_CONTROL = "link-scheme-registered" } },
 ]

@@ -134,6 +134,11 @@ A cross-machine app check runs outside the kit on both machines:
 
 With `--control <name>`, `run.mjs` adds that control's environment, which it reads with `mousse-check control-env <check> --control <name>`. Pass the same `--control` to `config-digest` and `sign`. `--role` and `--topology` pass through to the app script. With `--result`, `run.mjs` writes `build` (the helper build) and `app_build`. It also writes `host_build` and `host_app_build` when the app printed `host_build=` and `host_app_build=` lines, which a caller does with the builds its host reported over the test link.
 
+### Two setup notes for signing
+
+- **Windows: run the kit from a copy.** App checks build `mousse-check` (for `MOUSSE_CHECK_PROBE_BIN`) in `CARGO_TARGET_DIR`. Windows refuses to replace a running program, so when the kit itself runs from that folder, a control whose `RUSTFLAGS` force a rebuild ends with `exit 2` and `Access is denied`, and `run.mjs: the helper did not build`. Copy `mousse-check.exe` out of the target folder after building it and run the copy.
+- **macOS: point the app harness at OpenSSL 3.** The app's checks make their tunnel stand-in's certificates with `openssl`. On macOS that is LibreSSL, whose certificates Node refuses (`ca md too weak`), so every ws and tunnel case fails. Set `MOUSSE_CHECK_OPENSSL` to an OpenSSL 3 binary, for example `/opt/homebrew/bin/openssl`.
+
 ## Hosted cells
 
 A target in a check's `hosted` list (for `phase1b.desktop-builds`, `windows-arm64`) runs on a GitHub-hosted runner, `.github/workflows/windows-arm-smoke.yml` (run by hand with the commit under test, and the app repository when the runner can read it). It smokes the build and its must-fail control and uploads one artifact. The cell counts only records `mousse-check hosted verify` wrote after checking that artifact:
@@ -150,7 +155,7 @@ Phase 1b §6.3: traffic that must never reach RPC, sent to a real host on one ro
     mousse-check probe key <file>        # a throwaway device key; prints its identity (hex) for grant.add
     mousse-check probe --route tcp://127.0.0.1:<port> --invite <ticket>         --grant-key <granted device, editor off> --removed-key <device whose grant was removed>         --observe http://127.0.0.1:<port>/<path> --marker phase1b.no-rpc-without-grant [--json <file>]
 
-- `--route`: `tcp://<ip>:<port>` or `ws://<loopback ip>:<port><path>`. IP literals only; the probe resolves no names. The ssh route's probe (the helper's pipe IPC) waits for E9.
+- `--route`: `tcp://<ip>:<port>`, `ws://<loopback ip>:<port><path>`, or `ssh` with `--ssh-config <file> --ssh-host <alias> --ssh-profile <selector>` (the system `ssh`, or `MOUSSE_NET_SSH_BIN`, runs the remote `mousse-helper pipe --profile <selector>` in the app's own command form; the remote helper must run in app mode). IP literals only; the probe resolves no names. On ssh, case 8 adds `pipe-wrong-token`, `pipe-long-line` (`MOUSSE_NET_IPC_LINE_MAX_BYTES`) and `pipe-not-running`, which need `--pipe-state <host helper state folder>` and `--pipe-helper <mousse-helper>`.
 - `--invite`: an open Send link invitation (kind 2; the garbage code case needs one). Its host identity is the pin unless `--pin <hex>` says otherwise.
 - Cases, in order: `not-tls`; on ws `ws-plain-get`, `ws-wrong-path`, `ws-origin`, `ws-no-subprotocol`, `ws-large-headers`, `ws-text-message`; `tls-no-cert`, `tls-1.2`, `tls-wrong-alpn`; `fresh-open-rpc`, `fresh-open-tunnel`, `fresh-bad-proof`; `join-only-open-rpc`, `join-only-open-hello`, `join-only-open-tunnel`, `join-only-garbage-code`; `removed-open-rpc`; `editor-off-tunnel`; `fresh-silence`; `admission`; on ws `ws-slow-headers`. `--cases a,b` runs some.
 - **Wire:** each case must end the way §6.3 names, at once and with nothing let through first (the flood's extra connection must be refused well before the host's own wait for a silent connection): a refusal that arrives only after the proof wait, or after any stream frame from the host (a `RESET` included), does not count. Otherwise `reason=wire_accepted`.
@@ -158,6 +163,22 @@ Phase 1b §6.3: traffic that must never reach RPC, sent to a real host on one ro
 - A case without its input (`--invite`, `--grant-key`, `--removed-key`) is `reason=probe_error`, never a pass.
 - Output: `PASS|FAIL <marker> <route>:<case> ...` per case, then `PASS <marker>` or `FAIL <marker> reason=<word>`.
 - Limits come from the host's own variables (`MOUSSE_NET_JOIN_PROOF_WAIT_MS`, `MOUSSE_NET_PREAUTH_TCP`, `_WS`, `_PER_SOURCE`, `MOUSSE_NET_WS_UPGRADE_WAIT_MS`, `MOUSSE_NET_WS_HEADER_MAX_BYTES`, `MOUSSE_NET_HANDSHAKE_TIMEOUT_MS`), so a check that tightens one for the host tightens it for the probe. The probe's own waits: `MOUSSE_CHECK_PROBE_CONNECT_MS` (5000), `MOUSSE_CHECK_PROBE_CLOSE_MS` (5000), `MOUSSE_CHECK_PROBE_SETTLE_MS` (1000).
+
+## The SSH test server (`test-sshd`)
+
+App checks that need a real `ssh` route on loopback (the `ssh` case, SSH add) use the engine's test SSH server as a program. It is a dev-only example of `mousse-helper`, never part of a release package:
+
+    cargo run -p mousse-helper --example test-sshd -- --port <n> --keys <dir> [--home <dir>] [--mousse-home <dir>] [--launcher <name>=<path>]... [--preamble <text>]
+
+- `--port <n>`: listens on `127.0.0.1:<n>` only (0 picks one).
+- `--keys <dir>`: throwaway keys, made on the first run and reused after: `host_ed25519` (host key) and `client_ed25519` (`.pub` beside it), the only client key accepted. It writes `ssh_config` there, a `Host mousse-test-sshd` entry for this server with that identity, no agent and `known_hosts` in the same folder (empty; the app probes and pins the host key). Debug helpers read it through `MOUSSE_NET_TEST_SSH_CONFIG`.
+- `--home <dir>`: the remote user's home: `HOME` (and `USERPROFILE` on Windows) and the working directory; `MOUSSE_HOME` is `<home>/.mousse` unless `--mousse-home` names another folder.
+- Commands run as the current user. On Unix they run through `/bin/sh -c`, so `<home>/.mousse/bin` must hold the real launchers. Windows remotes are not supported in 1b, so on the PC `--launcher <name>=<program>` stands in for `~/.mousse/bin/<name>` (`--launcher mousse-cli=echo` is the built-in stand-in that writes the marker and echoes stdin).
+- `--preamble <text>`: printed before the command's output, as a login shell's rc files might.
+
+It prints `ready port <port> host_key <SHA256:...> config <path>` and serves until its stdin closes or it is stopped.
+
+For `--route ssh`, `run.mjs` builds it and passes its path in `MOUSSE_CHECK_TEST_SSHD`, and `MOUSSE_CHECK_SSH_ROUTES` names `tools/app-check/ssh-routes.mjs`, whose `startSshRoutes({out, sides})` starts one server per side (`<out>/ssh-<side>`), each into that side's Mousse home: the case's two loopback SSH routes, one per direction. Cross-machine `ssh` cells run the server on the Mac, since Windows is not an SSH remote in 1b.
 
 ## Manual steps
 

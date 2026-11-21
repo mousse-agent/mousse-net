@@ -22,7 +22,8 @@ use crate::error::NetError;
 
 /// The environment variable a debug build reads its class map from:
 /// `<port>=<class>` entries (`lan`, `tailnet` or `public`) separated by
-/// commas, for loopback addresses only.
+/// commas, for loopback addresses only. A `*=<class>` entry gives the class
+/// of every loopback port the map does not name (default `lan`).
 pub const TEST_CLASS_MAP_VAR: &str = "MOUSSE_NET_TEST_CLASS_MAP";
 
 /// How this build classifies the addresses it dials.
@@ -32,6 +33,8 @@ pub struct AddrPolicy {
     loopback: bool,
     /// Loopback ports relabelled as another class.
     map: Vec<(u16, AddrClass)>,
+    /// The class of a loopback port the map does not name (`*=<class>`).
+    unmapped: Option<AddrClass>,
 }
 
 impl AddrPolicy {
@@ -45,6 +48,7 @@ impl AddrPolicy {
         Self {
             loopback: true,
             map: Vec::new(),
+            unmapped: None,
         }
     }
 
@@ -72,13 +76,17 @@ impl AddrPolicy {
             let (port, class) = entry
                 .split_once('=')
                 .ok_or_else(|| bad("entries are <port>=<class>"))?;
-            let port: u16 = port.trim().parse().map_err(|_| bad("bad port"))?;
             let class = match class.trim() {
                 "lan" => AddrClass::Lan,
                 "tailnet" => AddrClass::Tailnet,
                 "public" => AddrClass::Public,
                 _ => return Err(bad("a class is lan, tailnet or public")),
             };
+            if port.trim() == "*" {
+                self.unmapped = Some(class);
+                continue;
+            }
+            let port: u16 = port.trim().parse().map_err(|_| bad("bad port"))?;
             self.map.retain(|(p, _)| *p != port);
             self.map.push((port, class));
         }
@@ -102,9 +110,29 @@ impl AddrPolicy {
                 .map
                 .iter()
                 .find(|(port, _)| *port == addr.port())
-                .map_or(AddrClass::Lan, |(_, class)| *class);
+                .map(|(_, class)| *class)
+                .or(self.unmapped)
+                .unwrap_or(AddrClass::Lan);
         }
         classify(ip)
+    }
+
+    /// The class of an inbound connection from `from` to this host's
+    /// listener at `local`. A loopback connection takes the class the map
+    /// gives the listener's port (a check's stand-in for a tailnet or
+    /// internet listener), else the one it gives `from`'s port; otherwise
+    /// `from`'s class.
+    pub fn class_of_inbound(&self, from: SocketAddr, local: Option<SocketAddr>) -> AddrClass {
+        let mapped = local.and_then(|local| {
+            self.map
+                .iter()
+                .find(|(port, _)| *port == local.port())
+                .map(|(_, class)| *class)
+        });
+        match mapped {
+            Some(class) if canonical(from.ip()).is_loopback() && self.loopback => class,
+            _ => self.class_of(from),
+        }
     }
 
     /// 1a's automatic rule (§1.3): a `tcp` route to an IP literal of class
@@ -118,8 +146,13 @@ impl AddrPolicy {
         }
     }
 
-    /// Whether the route names an IP literal of class `forbidden`.
+    /// Whether the route names an IP literal of class `forbidden`. A plain
+    /// `ws` route is the owner's local tunnel hop: loopback is its only
+    /// allowed address, in release builds too (§1.1, Decision 2).
     pub fn names_forbidden(&self, route: &LocalRoute) -> bool {
+        if let LocalRoute::Ws { host, .. } = route {
+            return !host.is_loopback();
+        }
         match (route.ip(), route.port()) {
             (Some(ip), Some(port)) => {
                 self.class_of(SocketAddr::new(ip, port)) == AddrClass::Forbidden
@@ -167,8 +200,16 @@ pub async fn resolve(
 ) -> Result<Vec<(SocketAddr, AddrClass)>, NetError> {
     let (host, port) = match route {
         LocalRoute::Tcp { host, port } | LocalRoute::Wss { host, port, .. } => (host, *port),
-        LocalRoute::Ws { host, port, .. } => {
-            return keep_allowed(route, policy, vec![SocketAddr::new(*host, *port)]);
+        // The owner's local tunnel hop: loopback only, in every build. Its
+        // class is the tunnel's, whatever loopback counts as for `tcp`.
+        LocalRoute::Ws { host, port, .. } if !policy.names_forbidden(route) => {
+            return Ok(vec![(SocketAddr::new(*host, *port), AddrClass::Lan)]);
+        }
+        LocalRoute::Ws { .. } => {
+            return Err(NetError::Forbidden(format!(
+                "{} is not a loopback address",
+                route.uri()
+            )));
         }
         LocalRoute::Ssh { .. } => {
             return Err(NetError::Refused("an ssh route is resolved by ssh".into()));

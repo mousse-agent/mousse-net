@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "wsl-linux",
+  "key": "042f0974403d57624956aebbe7cd72f01b86773fdee66ffba37429d70a320ccb692f06069a9174535d971428932d86132cc89eef54954c5f9c5c6ed605fea234bb",
+  "payload": "{\"check\":\"phase1b.ssh-add-app\",\"target\":\"linux-x64\",\"control\":\"ssh-row-not-converted\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+unknown\",\"platform\":\"linux-x86_64\",\"outcome\":\"FAIL\",\"details\":\"printed \\\"FAIL phase1b.ssh-add-app\\\" (reason=stuck_finishing)\",\"time\":\"2026-11-21T00:42:05Z\",\"device\":\"wsl-linux\",\"config\":\"779221753b777ed2d1abfb49bf3f40e6ff36cbe4cd3a007a1494a1d71ef59dff\",\"extra\":{\"app_build\":\"a4dd507d97c719545168c88a22a3499b2f4cc448\",\"reason\":\"stuck_finishing\"}}",
+  "signature": "6e669a4aa0a724457d9ee0fbf22baf8427aac8965f2a712150b83293032ddcca531cfe24c02d04944cf66d6a047a69b110d9b1e07e83cf8dd5e6114a55af3428"
+}

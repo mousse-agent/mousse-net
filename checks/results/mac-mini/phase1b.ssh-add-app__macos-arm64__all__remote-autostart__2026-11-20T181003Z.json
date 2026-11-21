@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "mac-mini",
+  "key": "04d63225e01c2fd84d8a4588702b08561c26da25295387d39876ea36c7f2deee75ec54bd53c9d5b09712f13f737f0ece0038931c8226886a42d77430c7c4e486ee",
+  "payload": "{\"check\":\"phase1b.ssh-add-app\",\"target\":\"macos-arm64\",\"control\":\"remote-autostart\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+unknown\",\"platform\":\"macos-aarch64\",\"outcome\":\"FAIL\",\"details\":\"printed \\\"FAIL phase1b.ssh-add-app\\\" (reason=daemon_started)\",\"time\":\"2026-11-20T18:10:03Z\",\"device\":\"mac-mini\",\"config\":\"4d52c839f795ca46404b3ae40af3dd4050f03b5ef93261783605b54d9a845c6b\",\"extra\":{\"app_build\":\"a4dd507d97c719545168c88a22a3499b2f4cc448\",\"reason\":\"daemon_started\"}}",
+  "signature": "0e5f6aad42f1a23f96dfe5a18dc048f0c136b743f3d0dd1d89306f3389849e68492128a5c3d1a55006528ff64086e55865a779293f521731bbe751fd9744f034"
+}

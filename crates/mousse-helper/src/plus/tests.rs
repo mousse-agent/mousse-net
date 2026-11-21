@@ -298,7 +298,10 @@ async fn release_all_leaves_the_kept_blocks_for_the_registration_to_clear_once_s
             None => break,
         }
     }
-    assert!(released.contains(&first.lease_id), "RELEASE names the block");
+    assert!(
+        released.contains(&first.lease_id),
+        "RELEASE names the block"
+    );
     let last = kept.lock().unwrap().last().cloned().unwrap_or_default();
     assert!(
         last.contains(&first.envelope),

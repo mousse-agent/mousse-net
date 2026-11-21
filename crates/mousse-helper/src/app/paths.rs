@@ -668,7 +668,26 @@ pub fn set_addresses(shared: &Shared, id: &Value, map: &Map<String, Value>) -> V
         Some(Ok(identity)) => identity,
         _ => return error(id, "bad_request", "peer.addresses.set needs identity (hex)"),
     };
-    let routes = match parse_owner_routes(shared.caller.addr_policy(), map.get("routes")) {
+    // An SSH address set up by `ssh.resolve` comes as `{route_id,
+    // selector, shell}` (§7); it is stored as its route's own alias,
+    // `ssh://mousse-<route_id>`, which the ssh tier's dialer opens.
+    let given = match map.get("routes") {
+        Some(Value::Array(list)) => {
+            let mut out = Vec::with_capacity(list.len());
+            for entry in list {
+                match entry {
+                    Value::Object(fields) => match shared.ssh.bind(fields) {
+                        Ok(uri) => out.push(Value::String(uri)),
+                        Err(f) => return error(id, f.error, f.reason),
+                    },
+                    other => out.push(other.clone()),
+                }
+            }
+            Some(Value::Array(out))
+        }
+        other => other.cloned(),
+    };
+    let routes = match parse_owner_routes(shared.caller.addr_policy(), given.as_ref()) {
         Ok(routes) => routes,
         Err((code, e)) => return error(id, code, e),
     };
@@ -729,8 +748,14 @@ struct Retry {
     running: bool,
 }
 
-/// Whether the host itself refused this device.
+/// Whether to wait for something to change before trying again: the host
+/// itself refused this device, or an SSH login failed in a way only the
+/// owner can fix (`auth_denied`, `host_key_changed`, `host_key_unknown`;
+/// Phase 1b §1.4). Repeated denied logins trip fail2ban and `ufw limit`.
 fn refused(e: &NetError) -> bool {
+    if let NetError::Ssh { reason, .. } = e {
+        return reason.needs_owner();
+    }
     matches!(
         crate::peer::reason_of(e).as_str(),
         "not_authorized" | "grant_revoked"
@@ -868,4 +893,39 @@ pub fn browse_source(mdns: bool) -> Option<Arc<dyn BrowseSource>> {
         return Some(Arc::new(FileBrowse(path.into())));
     }
     mdns.then(|| Arc::new(mousse_net_io::discovery::MdnsBrowse) as Arc<dyn BrowseSource>)
+}
+
+/// `ssh.forget`: the route's address `uri` leaves every peer's owner
+/// addresses, and its approvals go with it (§1.3).
+pub(super) fn forget_address(shared: &Shared, uri: &str) -> Result<(), NetError> {
+    let dir = &shared.info.state_dir;
+    let mut touched: Vec<String> = Vec::new();
+    PeerStore::in_dir(dir).lock().and_then(|held| {
+        ApprovalStore::in_dir(dir).update(&held, |list| {
+            list.retain(|a| {
+                if a.destination == uri {
+                    touched.push(a.identity.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        })?;
+        held.update(|list| {
+            for p in list.iter_mut() {
+                if p.addresses.iter().any(|a| a == uri) {
+                    p.addresses.retain(|a| a != uri);
+                    touched.push(p.identity.clone());
+                }
+            }
+        })
+    })?;
+    touched.sort();
+    touched.dedup();
+    for key in touched {
+        if let Ok(identity) = identity_from_hex(&key) {
+            approvals_changed(shared, &identity);
+        }
+    }
+    Ok(())
 }

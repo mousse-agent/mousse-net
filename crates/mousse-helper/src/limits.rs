@@ -17,9 +17,11 @@ const APP_PREFIX: &str = "ENGINE_";
 /// Debug-build test hooks read by the network crates, not limits
 /// (Phase 1b §1.2 and §4.2). Release builds never read them, so there they
 /// count as unknown names.
-const DEBUG_HOOKS: [&str; 4] = [
+const DEBUG_HOOKS: [&str; 6] = [
     "TEST_EXTRA_ROOT",
     "TEST_CLASS_MAP",
+    "SSH_BIN",
+    "TEST_SSH_CONFIG",
     "TEST_EGRESS",
     "TEST_EGRESS_LOG",
 ];
@@ -126,6 +128,26 @@ mousse_net_core::define_limits! {
         ipc_line_max_bytes = "IPC_LINE_MAX_BYTES": 65_536, [1_024, 65_536];
         /// IPC: how long a local client has to send its first line (Phase 1b §6.2; tighten only).
         ipc_first_line_wait_ms = "IPC_FIRST_LINE_WAIT_MS": 2_000, [100, 2_000];
+        /// ssh: `ConnectTimeout`, and the limit on `ssh -G` (Phase 1b §3.1).
+        ssh_connect_timeout_secs = "SSH_CONNECT_TIMEOUT_SECS": 10, [1, 120];
+        /// ssh: `ServerAliveInterval` (Phase 1b §3.1).
+        ssh_alive_interval_secs = "SSH_ALIVE_INTERVAL_SECS": 15, [1, 300];
+        /// ssh: `ServerAliveCountMax` (Phase 1b §3.1).
+        ssh_alive_count = "SSH_ALIVE_COUNT": 3, [1, 20];
+        /// ssh: connections per resolved host and port per `SSH_TARGET_WINDOW_MS`, key fetches, setup sessions and pipe dials alike, so setup plus retries stay under `ufw limit` (Phase 1b §3.1; tighten only).
+        ssh_target_connects = "SSH_TARGET_CONNECTS": 5, [1, 5];
+        /// ssh: the window `SSH_TARGET_CONNECTS` counts over (Phase 1b §3.1; tighten only, which here means longer).
+        ssh_target_window_ms = "SSH_TARGET_WINDOW_MS": 30_000, [30_000, 600_000];
+        /// ssh: one `ssh.run` or `ssh.probe`, and how long a probed key is kept for `ssh.trust` (Phase 1b §3.2).
+        ssh_setup_timeout_ms = "SSH_SETUP_TIMEOUT_MS": 60_000, [1_000, 600_000];
+        /// ssh: stderr kept to name the reason (Phase 1b §3.1).
+        ssh_stderr_max_bytes = "SSH_STDERR_MAX_BYTES": 16_384, [1_024, 1_048_576];
+        /// ssh: output skipped before the `mousse-ssh/1` marker (Phase 1b §3.3; tighten only).
+        ssh_preamble_max_bytes = "SSH_PREAMBLE_MAX_BYTES": 65_536, [0, 65_536];
+        /// ssh: one `ssh.run` reply (Phase 1b §3.4; tighten only).
+        ssh_reply_max_bytes = "SSH_REPLY_MAX_BYTES": 1_048_576, [1_024, 1_048_576];
+        /// Remote `pipe`: reach the running helper's IPC and get its `ok` (Phase 1b §3.3).
+        pipe_connect_wait_ms = "PIPE_CONNECT_WAIT_MS": 2_000, [100, 60_000];
         /// App mode: how long a "Send link" completion record the app never acknowledged (`join.ack`) is kept after its ticket expired (Phase 1b §5.4).
         join_done_keep_secs = "JOIN_DONE_KEEP_SECS": 86_400, [0, 2_592_000];
         /// Checks only: how long `init` waits before it makes the endpoint, so a check can stop the app during the first start. Run for the app (`--app`), its stdin closing still ends it at once.
@@ -445,6 +467,22 @@ mod tests {
         assert_eq!(tight.net.io().preauth_tcp(), 4);
         assert_eq!(tight.net.io().preauth_per_source(), 2);
         assert_eq!(tight.helper.ipc_line_max_bytes, 2048);
+    }
+
+    /// The SSH caps an other computer's server or rc files can push on
+    /// only tighten; the connection window only lengthens (Phase 1b §13.3).
+    #[test]
+    fn ssh_caps_can_only_be_tightened() {
+        let spec = |name: &str| HelperLimits::SPECS.iter().find(|s| s.name == name).unwrap();
+        for name in [
+            "SSH_TARGET_CONNECTS",
+            "SSH_PREAMBLE_MAX_BYTES",
+            "SSH_REPLY_MAX_BYTES",
+        ] {
+            assert_eq!(spec(name).max, spec(name).default, "{name}");
+        }
+        let window = spec("SSH_TARGET_WINDOW_MS");
+        assert_eq!(window.min, window.default);
     }
 
     fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {

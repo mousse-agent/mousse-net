@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "wsl-linux",
+  "key": "042f0974403d57624956aebbe7cd72f01b86773fdee66ffba37429d70a320ccb692f06069a9174535d971428932d86132cc89eef54954c5f9c5c6ed605fea234bb",
+  "payload": "{\"check\":\"phase1b.admission\",\"target\":\"linux-x64\",\"control\":\"join-only-outlives-invitation\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+debug\",\"platform\":\"linux-x86_64\",\"outcome\":\"FAIL\",\"details\":\"3 of 23 tests failed\",\"time\":\"2026-11-20T21:07:27Z\",\"device\":\"wsl-linux\",\"config\":\"81db88204c202fb3d391588741dcbb1006cb260d5c800795b5f290fc1e222345\"}",
+  "signature": "b7b43165ff2a0869f1b97a4460df19aec76362573a107b92189adcf7aaed3a884e4968b101f9cc30b436a9067ac9b56bbc3ff849c563cb13fc8a8547d76d74b2"
+}

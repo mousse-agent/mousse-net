@@ -13,7 +13,9 @@ workspace = true
 [dependencies]
 mousse-net-core = { path = "../mousse-net-core" }
 mousse-net-io = { path = "../mousse-net-io" }
-tokio = { version = "=1.54.1", features = ["rt-multi-thread", "net", "io-util", "io-std", "macros", "sync", "time", "signal"] }
+tokio = { version = "=1.54.1", features = ["rt-multi-thread", "net", "io-util", "io-std", "macros", "sync", "time", "signal", "process"] }
+# SSH host key fingerprints (Phase 1b §3.2).
+sha2 = { version = "=0.11.1", default-features = false }
 clap = { version = "=4.6.7", features = ["derive", "env"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
@@ -25,7 +27,6 @@ gethostname = "=1.1.0"
 tokio-rustls = { version = "=0.26.6", default-features = false, features = ["logging", "aws_lc_rs"] }
 rustls = { version = "=0.23.46", default-features = false, features = ["std", "logging", "aws_lc_rs", "prefer-post-quantum"] }
 rustls-platform-verifier = "=0.7.1"
-sha2 = { version = "=0.11.1", default-features = false }
 zeroize = { version = "=1.9.2", default-features = false, features = ["alloc"] }
 
 [features]
@@ -51,6 +52,9 @@ tokio = { version = "=1.54.1", features = ["rt-multi-thread", "net", "macros", "
 rustls = { version = "=0.23.46", default-features = false, features = ["std", "logging", "aws_lc_rs"] }
 tokio-rustls = { version = "=0.26.6", default-features = false, features = ["logging", "aws_lc_rs"] }
 rcgen = { version = "=0.14.10", default-features = false, features = ["aws_lc_rs"] }
+# The SSH test server in tests/common/sshd.rs (Phase 1b §3.7), and its keys.
+russh = { version = "=0.65.2", default-features = false, features = ["aws-lc-rs"] }
+rand = "=0.10.4"
 # `app_link` runs a host whose code exchange skips the key confirmation.
 rand_core = { version = "=0.10.1", default-features = false }
 

@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "pc-windows",
+  "key": "048ad3ccda2d27fdfc98c131f2fa25bea736ec0a3e8a107dcbfa6b2f5a86b88da452c337f09925646ec76897452505e718f3f397ddf39674e9f5ad64590bc93d57",
+  "payload": "{\"check\":\"phase1b.routes-app\",\"target\":\"windows-x64\",\"case\":\"ws\",\"control\":\"plus-probe\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+unknown\",\"platform\":\"windows-x86_64\",\"outcome\":\"FAIL\",\"details\":\"printed \\\"FAIL phase1b.routes-app\\\" (reason=plus_contacted)\",\"time\":\"2026-11-20T18:10:48Z\",\"device\":\"pc-windows\",\"config\":\"e7863cc9c0e0f6c3e61b1feb6856c681825372dd028b3ee87dfbb35874de55b3\",\"extra\":{\"app_build\":\"a4dd507d97c719545168c88a22a3499b2f4cc448\",\"reason\":\"plus_contacted\"}}",
+  "signature": "7be5ef3baf67699ccdeb0f0fcf8f6c537ead462336b6d2fce087664c78e88e978cb62709940e6ba27993469ff66a5f5ff2916d345023c58dc02881002121223d"
+}

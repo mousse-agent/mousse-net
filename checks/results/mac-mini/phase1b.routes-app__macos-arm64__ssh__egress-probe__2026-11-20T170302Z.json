@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "mac-mini",
+  "key": "04d63225e01c2fd84d8a4588702b08561c26da25295387d39876ea36c7f2deee75ec54bd53c9d5b09712f13f737f0ece0038931c8226886a42d77430c7c4e486ee",
+  "payload": "{\"check\":\"phase1b.routes-app\",\"target\":\"macos-arm64\",\"case\":\"ssh\",\"control\":\"egress-probe\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+unknown\",\"platform\":\"macos-aarch64\",\"outcome\":\"FAIL\",\"details\":\"printed \\\"FAIL phase1b.routes-app\\\" (reason=egress_attempted)\",\"time\":\"2026-11-20T17:03:02Z\",\"device\":\"mac-mini\",\"config\":\"5b9289e38db8f5b4d8d7dcf3ff2961b83ae8d877e90ef796096819bb30602eb3\",\"extra\":{\"app_build\":\"a4dd507d97c719545168c88a22a3499b2f4cc448\",\"reason\":\"egress_attempted\"}}",
+  "signature": "c2308c8670161ffd67ba118182078d3e08b27bbbe323a8d2ed9173ea71ab59b05e1a64b2b5fb33270ffb1aad403d66b9ff2b97102c2b17e4b70b15e31425da08"
+}

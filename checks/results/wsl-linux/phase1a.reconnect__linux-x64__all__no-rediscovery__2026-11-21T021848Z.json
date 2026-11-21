@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "wsl-linux",
+  "key": "042f0974403d57624956aebbe7cd72f01b86773fdee66ffba37429d70a320ccb692f06069a9174535d971428932d86132cc89eef54954c5f9c5c6ed605fea234bb",
+  "payload": "{\"check\":\"phase1a.reconnect\",\"target\":\"linux-x64\",\"control\":\"no-rediscovery\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+unknown\",\"platform\":\"linux-x86_64\",\"outcome\":\"FAIL\",\"details\":\"printed \\\"FAIL phase1a.reconnect\\\" (reason=unreachable)\",\"time\":\"2026-11-21T02:18:48Z\",\"device\":\"wsl-linux\",\"config\":\"36b9f2a837a3276fb3bfc97516352bd4771219ce5f672c7d3bd95c7be5b966e1\",\"extra\":{\"app_build\":\"a4dd507d97c719545168c88a22a3499b2f4cc448\",\"reason\":\"unreachable\"}}",
+  "signature": "5d09adb8463e57b263952c8e2df266bbea74ea4b52f1b61493078c94edc2d29a3b8b99576b7206fbef64cecf1af7ba5d7b5fd2abb9cde56d3abdfa9bc4c50a3a"
+}

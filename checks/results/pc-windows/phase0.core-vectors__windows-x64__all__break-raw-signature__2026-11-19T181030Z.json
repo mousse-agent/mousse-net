@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "pc-windows",
+  "key": "048ad3ccda2d27fdfc98c131f2fa25bea736ec0a3e8a107dcbfa6b2f5a86b88da452c337f09925646ec76897452505e718f3f397ddf39674e9f5ad64590bc93d57",
+  "payload": "{\"check\":\"phase0.core-vectors\",\"target\":\"windows-x64\",\"control\":\"break-raw-signature\",\"build\":\"366dd2b062641eed1e639b5c974e95999b8894d8+debug\",\"platform\":\"windows-x86_64\",\"outcome\":\"FAIL\",\"details\":\"4 of 176 tests failed\",\"time\":\"2026-11-19T18:10:30Z\",\"device\":\"pc-windows\",\"config\":\"5d266bd846cdad6ee723411a7a36ca33f256418390d58e0e9a0ea587c159edbb\"}",
+  "signature": "fd27c0d0f4559ffd0e401d59f22bd7a0ac410930d97103e830c9727dbde6affe73527fc100733d5910abbc61c757fc8039d80df1d4dd64966b011f93e9f6e1f3"
+}

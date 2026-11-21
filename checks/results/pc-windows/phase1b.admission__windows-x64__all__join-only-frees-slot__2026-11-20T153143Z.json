@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "pc-windows",
+  "key": "048ad3ccda2d27fdfc98c131f2fa25bea736ec0a3e8a107dcbfa6b2f5a86b88da452c337f09925646ec76897452505e718f3f397ddf39674e9f5ad64590bc93d57",
+  "payload": "{\"check\":\"phase1b.admission\",\"target\":\"windows-x64\",\"control\":\"join-only-frees-slot\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+debug\",\"platform\":\"windows-x86_64\",\"outcome\":\"FAIL\",\"details\":\"5 of 23 tests failed\",\"time\":\"2026-11-20T15:31:43Z\",\"device\":\"pc-windows\",\"config\":\"7aaabc0a2cf65eb6c4997d19a4e1a82fce688ba072b1f25a6c0dfc852d98e200\"}",
+  "signature": "40975c4c144fcc19107e6296b22f26560b3efd272408f281085f8dda396289beae7cd4d69fcb33ff87f8ab939e20816e35652fd42d8a30370dee14f0442c1742"
+}

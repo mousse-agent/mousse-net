@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "mac-mini",
+  "key": "04d63225e01c2fd84d8a4588702b08561c26da25295387d39876ea36c7f2deee75ec54bd53c9d5b09712f13f737f0ece0038931c8226886a42d77430c7c4e486ee",
+  "payload": "{\"check\":\"phase1b.routes-app\",\"target\":\"macos-arm64\",\"case\":\"tcp\",\"control\":\"route-leak\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+unknown\",\"platform\":\"macos-aarch64\",\"outcome\":\"FAIL\",\"details\":\"printed \\\"FAIL phase1b.routes-app\\\" (reason=route_mismatch)\",\"time\":\"2026-11-20T16:34:36Z\",\"device\":\"mac-mini\",\"config\":\"5d2a1da9a1d161a771c593a59eff60e021e3aa55b39cc2c19e111a3a020d83a2\",\"extra\":{\"app_build\":\"a4dd507d97c719545168c88a22a3499b2f4cc448\",\"reason\":\"route_mismatch\"}}",
+  "signature": "ace760314d4df23939f47221e75e33d3b0eb6699f50c6eddc956461e8561fbf735ba5da61e388d56cf14cd62c1b28a176c634eef43de1e2221a725419eafea40"
+}
