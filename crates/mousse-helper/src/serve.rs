@@ -98,6 +98,7 @@ impl ListenState {
         }
         if let Some(managed) = &self.managed_tunnel {
             routes.retain(|route| route != managed);
+            // Reserve one ticket slot without changing the saved owner routes.
             routes.truncate(mousse_net_core::pairing::MAX_ROUTES - 1);
             routes.push(managed.clone());
         }
@@ -391,17 +392,19 @@ pub async fn run(
         managed_tunnel: None,
     }));
     // The loopback ws listener, for the owner's tunnel client (§4.1).
-    let ws_listener =
-        if opts.app || opts.ws_port.is_some() || !opts.tunnels.is_empty() || config.ws_listener() {
-            Some(
-                endpoint
-                    .bind_ws(opts.ws_port)
-                    .await
-                    .map_err(|e| format!("ws listen: {e}"))?,
-            )
-        } else {
-            None
-        };
+    let ws_required = opts.ws_port.is_some() || !opts.tunnels.is_empty() || config.ws_listener();
+    let ws_listener = if opts.app || ws_required {
+        match endpoint.bind_ws(opts.ws_port).await {
+            Ok(listener) => Some(listener),
+            Err(error) if ws_required => return Err(format!("ws listen: {error}")),
+            Err(error) => {
+                eprintln!("optional local tunnel origin unavailable: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let ws_port = match &ws_listener {
         Some(l) => Some(l.local_addr().map_err(|e| e.to_string())?.port()),
         None => None,
