@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "pc-windows",
+  "key": "048ad3ccda2d27fdfc98c131f2fa25bea736ec0a3e8a107dcbfa6b2f5a86b88da452c337f09925646ec76897452505e718f3f397ddf39674e9f5ad64590bc93d57",
+  "payload": "{\"check\":\"phase1b.routes-cross\",\"target\":\"pc-to-mac-lan\",\"case\":\"ssh\",\"build\":\"922438fb3c947c5b8ae635b934b12ff740a3e730+debug\",\"platform\":\"windows-x86_64\",\"outcome\":\"PASS\",\"details\":\"PASS phase1b.routes-cross\",\"time\":\"2026-11-21T04:54:42Z\",\"device\":\"pc-windows\",\"config\":\"c77594507f75ce842a60cca9d9dccf8a6a4b6280c77ac3f3b9319b9cc6ce7785\",\"extra\":{\"app_build\":\"839a309b4388a88ff3c3f322fb6bf998574e0d95\",\"host_app_build\":\"839a309b4388a88ff3c3f322fb6bf998574e0d95\",\"host_build\":\"922438fb3c947c5b8ae635b934b12ff740a3e730+debug\"}}",
+  "signature": "19709c3282a2047d6147ed74a36753f882a0b7374330f0901fa6eb5c5ba17bb2ff076043cd562c0c9705442d0080316cdcd52b73c8d50ac907645dc0ab6cf089"
+}

@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "pc-windows",
+  "key": "048ad3ccda2d27fdfc98c131f2fa25bea736ec0a3e8a107dcbfa6b2f5a86b88da452c337f09925646ec76897452505e718f3f397ddf39674e9f5ad64590bc93d57",
+  "payload": "{\"check\":\"phase1b.routes-cross\",\"target\":\"pc-to-mac-lan\",\"case\":\"tcp\",\"control\":\"route-leak\",\"build\":\"922438fb3c947c5b8ae635b934b12ff740a3e730+debug\",\"platform\":\"windows-x86_64\",\"outcome\":\"FAIL\",\"details\":\"FAIL phase1b.routes-cross reason=route_mismatch\",\"time\":\"2026-11-21T04:53:20Z\",\"device\":\"pc-windows\",\"config\":\"36ec0b21e504868f92784c66ccb937518a5eeb2dd2e24513389d5ca2edd841d2\",\"extra\":{\"app_build\":\"839a309b4388a88ff3c3f322fb6bf998574e0d95\",\"host_app_build\":\"839a309b4388a88ff3c3f322fb6bf998574e0d95\",\"host_build\":\"922438fb3c947c5b8ae635b934b12ff740a3e730+debug\",\"reason\":\"route_mismatch\"}}",
+  "signature": "57940e198faf57780823d26eaf1d618817f926062911bd962c12462fb0a1e8db17bc6fb276de058901090416e1c4b314b670f8de63db80c7eb70c0c2abefbb97"
+}
