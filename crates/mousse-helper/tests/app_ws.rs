@@ -139,6 +139,24 @@ fn upgraded(port: u16) -> TcpStream {
 }
 
 #[test]
+fn the_app_origin_is_available_before_a_tunnel_is_configured() {
+    let end = Endpoint::init("ws-origin");
+    let mut app = end.app("hostA", &[]);
+    let hello = app.hello();
+    let port = u16::try_from(hello["ws_port"].as_u64().expect("no local origin")).unwrap();
+    assert!(hello["routes_config"]["tunnels"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    drop(upgraded(port));
+    drop(app);
+
+    let mut restarted = end.app("hostA", &[]);
+    assert_eq!(restarted.hello()["ws_port"], port);
+    drop(upgraded(port));
+}
+
+#[test]
 fn an_upgrade_offering_mousse_1_is_accepted_and_selects_it() {
     let (_end, _a, port) = ws_app("wsok", &[]);
     let mut s = connect(port);
