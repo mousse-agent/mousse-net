@@ -399,7 +399,7 @@ async function main() {
   const tools = buildTools(env, stand, needsSshd(id, flags.route))
   console.log(`helper_build=${build}`)
 
-  const run = { id, flags, appDir, relays, tools, build }
+  const run = { id, flags, appDir, script, relays, tools, build }
   if (stand) {
     const egress = withEgress(env.MOUSSE_NET_TEST_EGRESS, relays?.remote ?? [])
     const f = fence(egress.split(',').some((address) => address.trim()))
@@ -420,7 +420,7 @@ async function main() {
   await runCheck(run, env)
 }
 
-async function runCheck({ id, flags, appDir, relays, tools, build }, env) {
+async function runCheck({ id, flags, appDir, script, relays, tools, build }, env) {
   const out = resolve(flags.out ?? mkdtempSync(join(tmpdir(), 'app-check-')))
   mkdirSync(out, { recursive: true })
   const args = [script, id, '--out', out]
