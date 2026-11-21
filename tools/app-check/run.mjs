@@ -399,6 +399,28 @@ async function main() {
   const tools = buildTools(env, stand, needsSshd(id, flags.route))
   console.log(`helper_build=${build}`)
 
+  const run = { id, flags, appDir, script, relays, tools, build }
+  if (stand) {
+    const egress = withEgress(env.MOUSSE_NET_TEST_EGRESS, relays?.remote ?? [])
+    const f = fence(egress.split(',').some((address) => address.trim()))
+    console.log(`fence=${f.kind}`)
+    if (f.wrap) {
+      // The recorder and the app need the same loopback interface. Build
+      // outside the fence, then run both inside it.
+      const [cmd, args] = f.wrap(process.execPath, [fileURLToPath(import.meta.url), '--inside-fence'])
+      const child = spawnSync(cmd, args, {
+        env,
+        input: JSON.stringify(run),
+        stdio: ['pipe', 'inherit', 'inherit']
+      })
+      if (child.error) refuse(child.error.message)
+      process.exit(child.status ?? 2)
+    }
+  }
+  await runCheck(run, env)
+}
+
+async function runCheck({ id, flags, appDir, script, relays, tools, build }, env) {
   const out = resolve(flags.out ?? mkdtempSync(join(tmpdir(), 'app-check-')))
   mkdirSync(out, { recursive: true })
   const args = [script, id, '--out', out]
@@ -409,8 +431,7 @@ async function main() {
   const childEnv = { ...env, MOUSSE_NET_HELPER: tools.helper, MOUSSE_NET_ENGINE_HELPER_BUILD: build }
   const egressLog = join(out, 'egress-refused.jsonl')
   let recorder
-  let wrap
-  if (stand) {
+  if (guarded(id)) {
     recorder = await startRecorder({ log: join(out, 'plus-requests.jsonl') })
     await recorderSelfTest(recorder).catch((e) => refuse(e.message))
     guardSelfTest(out)
@@ -433,13 +454,9 @@ async function main() {
         ? { MOUSSE_CHECK_TEST_SSHD: tools.sshd, MOUSSE_CHECK_SSH_ROUTES: join(root, 'tools', 'app-check', 'ssh-routes.mjs') }
         : {})
     })
-    const f = fence(egress.split(',').some((a) => a.trim()))
-    console.log(`fence=${f.kind}`)
-    wrap = f.wrap
   }
 
-  const [cmd, cmdArgs] = wrap ? wrap(process.execPath, args) : [process.execPath, args]
-  const child = spawn(cmd, cmdArgs, { cwd: resolve(appDir), env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] })
+  const child = spawn(process.execPath, args, { cwd: resolve(appDir), env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] })
   let text = ''
   const keep = (d) => {
     text += d
@@ -547,4 +564,7 @@ async function main() {
 }
 
 // Run only as a script, so the self-tests can import the route assertion.
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main()
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  if (process.argv[2] === '--inside-fence') runCheck(JSON.parse(readFileSync(0, 'utf8')), process.env)
+  else main()
+}
