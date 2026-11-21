@@ -59,7 +59,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use mousse_net_core::identity::IdentityPublicKey;
 use mousse_net_core::mux::PriorityClass;
-use mousse_net_core::ErrorCode;
+use mousse_net_core::{ErrorCode, BOTH_WAYS_MIN_MINOR};
 use mousse_net_io::pipe::RouteKind;
 use mousse_net_io::store::{hex, short_id};
 use mousse_net_io::{
@@ -224,6 +224,10 @@ struct StreamEntry {
     /// budget).
     tx_window: u64,
     tx_done: bool,
+    /// A stream the host opened on this computer's own connection to it
+    /// (minor 3): the grant of this computer's it is served under. It is
+    /// reset when that grant stops being live.
+    served: Option<u64>,
 }
 
 struct Core {
@@ -338,6 +342,7 @@ impl App {
         tokio::spawn(pairing::prune_completions(shared.clone()));
         tokio::spawn(paths::keep_connected(shared.clone()));
         tokio::spawn(changes::forward_renewals(shared.clone()));
+        tokio::spawn(watch_served(shared.clone()));
         // Phase 4's mailbox reads pair secrets and the manifest from here.
         shared
             .engine
@@ -566,6 +571,8 @@ impl Shared {
             fields["conn"] = json!(no);
             fields["identity"] = json!(hex(identity.as_bytes()));
             fields["deadline"] = json!(conn.deadline().secs());
+            // Minor 3: calls go both ways on this connection.
+            fields["both"] = json!(both_ways(&conn));
             core.out.conn_event(no, &fields);
             self.queued(&core);
             tokio::spawn(conn_task(self.clone(), no, conn.clone(), inbound));
@@ -648,6 +655,7 @@ impl Shared {
                 tx_credit: 0,
                 tx_window: 0,
                 tx_done: false,
+                served: None,
             },
         );
         tokio::spawn(rx_pump(self.clone(), handle, reader, wake));
@@ -821,12 +829,23 @@ impl Shared {
                 let entry = conn.and_then(|c| {
                     core.conns
                         .get(&c)
-                        .map(|e| (c, e.conn.clone(), e.identity, e.via.clone()))
+                        .map(|e| (c, e.conn.clone(), e.identity, e.via.clone(), e.inbound))
                 });
                 // Engine stream labels belong to the helper.
                 let label = label.filter(|l| !l.starts_with(ENGINE_PREFIX));
                 match (entry, label, class) {
-                    (Some((no, conn, pin, via)), Some(label), Some(class)) => {
+                    // Calls toward the caller ride its connection only from
+                    // minor 3 (`conn.up {both}`).
+                    (Some((_, conn, _, _, true)), Some(_), Some(_)) if !both_ways(&conn) => self
+                        .reply(
+                            &mut core,
+                            error(
+                                &id,
+                                "one_way",
+                                "the caller on this connection does not take calls on it",
+                            ),
+                        ),
+                    (Some((no, conn, pin, via, _)), Some(label), Some(class)) => {
                         drop(core);
                         let shared = self.clone();
                         tokio::spawn(async move {
@@ -1208,6 +1227,89 @@ async fn write_stdout(shared: Arc<Shared>) {
     }
 }
 
+/// Whether `conn` carries calls both ways: its agreed minor is 3 or more.
+fn both_ways(conn: &Connection) -> bool {
+    conn.minor().unwrap_or(0) >= BOTH_WAYS_MIN_MINOR
+}
+
+/// A stream the host opened on this computer's connection to it: passed
+/// to the app as `stream.incoming` with the grant it is served under, if
+/// the connection's minor allows it, its label is an app label, networking
+/// is not paused and the host holds a live grant here. Otherwise it is
+/// refused. The grant is read under the core lock [`watch_served`] resets
+/// under, so a removal either sees the stream or is seen here.
+fn serve_host_stream(shared: &Arc<Shared>, no: u64, conn: &Connection, stream: MuxStream) {
+    let both = both_ways(conn) && LABELS.contains(&stream.label());
+    let mut core = lock(&shared.core);
+    let grant = if both && !shared.removal.is_paused() {
+        shared.host.live_grant(conn.peer())
+    } else {
+        None
+    };
+    let Some(grant) = grant else {
+        drop(core);
+        stream.writer.reset(ErrorCode::RefusedStream);
+        return;
+    };
+    let label = stream.label().to_owned();
+    let class = stream.class();
+    let Some(handle) = shared.add_stream(&mut core, no, stream, false) else {
+        return;
+    };
+    if let Some(entry) = core.streams.get_mut(&handle) {
+        entry.served = Some(grant.id.0);
+    }
+    let event = json!({
+        "ev": "stream.incoming",
+        "conn": no,
+        "handle": handle,
+        "label": label,
+        "class": class_name(class),
+        "grant": grant.id.0,
+        "role": grant.role.as_str(),
+    });
+    core.out.json(&event);
+    shared.queued(&core);
+}
+
+/// Reset every host-opened stream whose grant here is no longer live (a
+/// removal, an expiry, a pause), on every change to the grant table and
+/// when networking pauses.
+async fn watch_served(shared: Arc<Shared>) {
+    let mut grants = shared.host.grants_changed();
+    let mut pause = shared.removal.watch();
+    loop {
+        tokio::select! {
+            changed = grants.changed() => if changed.is_err() { return },
+            changed = pause.changed() => if changed.is_err() { return },
+        }
+        let mut core = lock(&shared.core);
+        let paused = shared.removal.is_paused();
+        let gone: Vec<(u32, StreamWriter)> = core
+            .streams
+            .iter()
+            .filter_map(|(h, s)| {
+                let grant = s.served?;
+                let identity = core.conns.get(&s.conn)?.identity;
+                let live = !paused
+                    && shared
+                        .host
+                        .live_grant(&identity)
+                        .is_some_and(|g| g.id.0 == grant);
+                (!live).then(|| (*h, s.writer.clone()))
+            })
+            .collect();
+        for (handle, writer) in gone {
+            writer.reset(ErrorCode::GrantRevoked);
+            drop_stream(&mut core, handle);
+            let event = json!({"ev": "stream.reset", "handle": handle, "code": ErrorCode::GrantRevoked.name()});
+            core.out.json(&event);
+        }
+        core.regrant(&shared.limits);
+        shared.queued(&core);
+    }
+}
+
 /// Watch one connection: hand its peer's streams to the app (or refuse
 /// them), and report its end.
 async fn conn_task(shared: Arc<Shared>, no: u64, conn: Arc<Connection>, inbound: bool) {
@@ -1248,8 +1350,10 @@ async fn conn_task(shared: Arc<Shared>, no: u64, conn: Arc<Connection>, inbound:
                     _ => shared.engine.on_stream(conn.clone(), inbound, stream),
                 }
             } else if !inbound {
-                // Not in 1.0: the host opens no streams to its caller.
-                stream.writer.reset(ErrorCode::RefusedStream);
+                // From minor 3 the host may call this computer over this
+                // computer's own connection, under this computer's grant
+                // for it (wire.md 8, step 5). Before, it opens none.
+                serve_host_stream(&shared, no, &conn, stream);
             } else if LABELS.contains(&stream.label()) {
                 let label = stream.label().to_owned();
                 let class = stream.class();

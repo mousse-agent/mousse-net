@@ -157,7 +157,13 @@ pub const PROTOCOL_VERSION: u64 = 1;
 /// Minor protocol version this build speaks. Peers exchange it in `HELLO`
 /// and use the lower of the two. The current and previous minor versions are
 /// supported.
-pub const PROTOCOL_MINOR_VERSION: u64 = 2;
+pub const PROTOCOL_MINOR_VERSION: u64 = 3;
+
+/// The minor version from which a caller passes application streams its
+/// host opens to its application, which serves them under the caller's own
+/// grant for the host (wire.md 2 and 8, step 5): one connection carries
+/// calls both ways.
+pub const BOTH_WAYS_MIN_MINOR: u64 = 3;
 
 /// TLS ALPN protocol identifier for peer sessions. It carries the major
 /// version only.

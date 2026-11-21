@@ -38,7 +38,7 @@ The code exchange used by "Send link" pairing (CPace) is specified in
 | Name | Value | Where |
 |---|---|---|
 | Major protocol version | `1` | Session certificate (record and extension), pairing ticket, `HELLO` |
-| Minor protocol version | `2` | `HELLO` |
+| Minor protocol version | `3` | `HELLO` |
 | TLS ALPN | `mousse/1` | TLS ClientHello and ServerHello |
 
 - A peer MUST reject a certificate or ticket whose major version it does not
@@ -81,7 +81,11 @@ When both sides accept, they reach the same `agreed`.
 `mousse-keys` and `mousse-manifest`, for relays; minor `2` adds
 `mousse-grants` and `mousse-removal`. Each is opened only on a connection
 whose `agreed` minor is at least the one that added it; a minor `0` peer
-never sees them.
+never sees them. Minor `3` makes one connection carry calls both ways: on a
+connection whose `agreed` minor is at least `3`, the host may open
+application streams, and the caller serves them under its own grant for the
+host (8, step 5). Below minor `3` a host opens no application stream, and a
+caller resets any it receives with `REFUSED_STREAM`.
 
 **Only the first `HELLO` counts.** The peer's first `HELLO` on a connection
 fixes `agreed` or closes the connection. A later `HELLO` on the same
@@ -566,7 +570,13 @@ the TLS client and the **host** is the TLS server.
    operation must fit that grant's role. Without one, the caller refuses the
    operation (for example by resetting the stream) and the connection stays
    up. A pairing creates no grant on the joiner, so a joiner's host has no
-   authority on it unless the joiner's owner grants it separately. Vectors:
+   authority on it unless the joiner's owner grants it separately. From
+   minor `3` (section 2) this is how the host calls the caller: an
+   application stream the host opens is served under the caller's live
+   grant for the host, read when the stream arrives; without one it is
+   reset with `REFUSED_STREAM`, and when that grant stops being live the
+   streams served under it are reset with `GRANT_REVOKED`. The connection
+   stays up either way: it is the caller's access to the host. Vectors:
    `authz.json` `host_opened_stream_needs_the_callers_grant`.
 
 ### 8.1 What the host accepts

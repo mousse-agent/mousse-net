@@ -17,8 +17,9 @@ const APP_PREFIX: &str = "ENGINE_";
 /// Debug-build test hooks read by the network crates, not limits
 /// (Phase 1b §1.2 and §4.2). Release builds never read them, so there they
 /// count as unknown names.
-const DEBUG_HOOKS: [&str; 6] = [
+const DEBUG_HOOKS: [&str; 7] = [
     "TEST_EXTRA_ROOT",
+    "TEST_HELLO_MINOR",
     "TEST_CLASS_MAP",
     "SSH_BIN",
     "TEST_SSH_CONFIG",
