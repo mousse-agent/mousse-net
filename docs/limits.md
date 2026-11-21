@@ -114,6 +114,7 @@ spec's value: it can only be tightened.
 | `MOUSSE_NET_REMOVAL_RETRY_MS` | 1000 | 10 to 60000 | While networking is paused because a removal (`grant.remove`) could not be saved, how often the helper tries the save again (Phase 1a §5.4). |
 | `MOUSSE_NET_KEEP_RETRY_FIRST_MS` | 1000 | 10 to 60000 | App mode: wait before redialling a paired host that could not be reached; each next wait doubles (Phase 1a §6). |
 | `MOUSSE_NET_KEEP_RETRY_MAX_MS` | 60000 | 10 to 3600000 | App mode: longest wait between those redials; not below the first. |
+| `MOUSSE_NET_RELAY_SWITCH_MARGIN_MS` | 20 | 0 to 1000 | App mode, relay first: a host with a relay route is dialled through the relay first, then its direct routes are tried in the background. A direct path that comes up takes over (`path.reopen`) unless the relayed path's round trip (best of three `PING`s on each) is shorter by more than this. A tie goes to the direct path. The tries repeat on the `KEEP_RETRY_*` waits while the relayed path stays up. |
 | `MOUSSE_NET_REMOVAL_MAX_AGE_SECS` | 2592000 | 86400 to 2592000 | "Remove on all my hosts" (Phase 4 Part D): the oldest removal a host accepts and an admin device keeps queued, and how long a host keeps removal ids. Tighten only. |
 | `MOUSSE_NET_REMOVAL_ANSWER_WAIT_MS` | 10000 | 1000 to 120000 | How long one side of `mousse-removal` waits for the other's message (the signed removal, or the host's answer). |
 | `MOUSSE_NET_PLUS_TIMEOUT_MS` | 10000 | 1000 to 60000 | One Plus request. |
