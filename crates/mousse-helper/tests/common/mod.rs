@@ -146,6 +146,19 @@ impl Endpoint {
         self.app_raw(name, env, port, &browse)
     }
 
+    /// `serve --app` with extra `serve` arguments (for example
+    /// `--ws-port 0`) and `MOUSSE_NET_<name>` overrides.
+    pub fn app_args(&self, name: &str, env: &[(&str, &str)], args: &[&str]) -> App {
+        let mut all = vec!["serve", "--app", "--no-mdns", "--port", "0", "--name", name];
+        all.extend_from_slice(args);
+        let mut cmd = self.command(&all);
+        cmd.stdin(Stdio::piped());
+        for (k, v) in env {
+            cmd.env(format!("MOUSSE_NET_{k}"), v);
+        }
+        App::spawn(cmd, self.dir.clone(), name)
+    }
+
     /// [`Endpoint::app_with`], with other variables set as given (the
     /// debug-build test hooks).
     pub fn app_raw(
@@ -986,4 +999,53 @@ impl Gate {
             std::thread::sleep(Duration::from_millis(20));
         }
     }
+}
+
+/// A raw connection to the local control channel (IPC) of the helper in
+/// `dir`, and its token.
+#[cfg(windows)]
+pub fn ipc_raw(dir: &Path) -> (std::fs::File, String) {
+    let file: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("control.json")).unwrap()).unwrap();
+    let pipe = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(file["addr"].as_str().unwrap())
+        .unwrap();
+    (pipe, file["token"].as_str().unwrap().to_owned())
+}
+
+/// A raw connection to the local control channel (IPC) of the helper in
+/// `dir`, and its token. A path too long for a socket is reached by its
+/// relative name, as the helper bound it.
+#[cfg(not(windows))]
+pub fn ipc_raw(dir: &Path) -> (std::os::unix::net::UnixStream, String) {
+    let file: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("control.json")).unwrap()).unwrap();
+    let sock = std::os::unix::net::UnixStream::connect(dir.join("control.sock")).unwrap();
+    (sock, file["token"].as_str().unwrap().to_owned())
+}
+
+/// The first line a read on `conn` gives within `limit`: `Some(bytes)`
+/// (empty at the end of the stream or on an error), `None` if it still
+/// waits.
+pub fn read_line_within<R: Read + Send + 'static>(mut conn: R, limit: Duration) -> Option<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut got = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            match conn.read(&mut byte) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    got.push(byte[0]);
+                    if byte[0] == b'\n' {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = tx.send(got);
+    });
+    rx.recv_timeout(limit).ok()
 }

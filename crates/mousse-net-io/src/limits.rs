@@ -54,6 +54,18 @@ mousse_net_core::define_limits! {
         dial_parallel = "DIAL_PARALLEL": 4, [1, 64];
         /// Caller: how long one candidate address may take to connect and pass step 1 before the next is tried (Phase 1a §6).
         dial_timeout_ms = "DIAL_TIMEOUT_MS": 2_000, [100, 60_000];
+        /// Caller: candidates kept for one search, in order: the last working route, the owner's addresses, approved hints, then browse results (Phase 1b §1.4).
+        dial_max_candidates = "DIAL_MAX_CANDIDATES": 16, [1, 64];
+        /// Caller: wait after the `tcp` tier starts before `ws`/`wss` candidates start (at once when there is no `tcp` candidate; Phase 1b §1.4).
+        tier_head_start_ms = "TIER_HEAD_START_MS": 500, [0, 10_000];
+        /// Caller: latest start of the `ssh` tier, from the start of the search; it starts earlier once the `tcp` and `ws` tiers are done (Phase 1b §1.4).
+        dial_fast_tiers_ms = "DIAL_FAST_TIERS_MS": 12_000, [1_000, 60_000];
+        /// Caller: one whole search across every tier; past it the search ends unreachable (Phase 1b §1.4).
+        dial_search_ms = "DIAL_SEARCH_MS": 45_000, [5_000, 300_000];
+        /// Caller: one `ws`/`wss` try: connect, outer TLS, upgrade and step 1 (Phase 1b §1.4).
+        ws_dial_timeout_ms = "WS_DIAL_TIMEOUT_MS": 10_000, [500, 60_000];
+        /// Caller: one `ssh` try: login, marker, remote `pipe` and step 1 (Phase 1b §1.4).
+        ssh_dial_timeout_ms = "SSH_DIAL_TIMEOUT_MS": 20_000, [1_000, 120_000];
         /// How long an mDNS browse listens for answers (Phase 1a §6).
         browse_wait_ms = "BROWSE_WAIT_MS": 1_500, [100, 30_000];
         /// How long browse results are reused before the next browse (Phase 1a §6; 0 browses every time).
@@ -64,6 +76,20 @@ mousse_net_core::define_limits! {
         wake_jump_ms = "WAKE_JUMP_MS": 10_000, [1_000, 600_000];
         /// After a wake or an interface change, how long each connection has to answer a PING before it is closed as dead (Phase 1a §8).
         wake_ping_ms = "WAKE_PING_MS": 2_000, [100, 30_000];
+        /// Host: TCP connections not yet live (from accept, before any read, until live or closed), per endpoint; one more is closed at accept (Phase 1b §6.2; tighten only).
+        preauth_tcp = "PREAUTH_TCP": 48, [1, 48];
+        /// Host: `ws` connections not yet live, per endpoint (Phase 1b §6.2; tighten only).
+        preauth_ws = "PREAUTH_WS": 16, [1, 16];
+        /// Host: pipe connections (an SSH login's `mousse-helper pipe`) not yet live, per endpoint (Phase 1b §6.2; tighten only).
+        preauth_pipe = "PREAUTH_PIPE": 4, [1, 4];
+        /// Host: of the TCP ones, connections from one IPv4 address or one IPv6 /64 (Phase 1b §6.2; tighten only).
+        preauth_per_source = "PREAUTH_PER_SOURCE": 8, [1, 8];
+        /// Host: time a `ws` connection has for its whole upgrade request (Phase 1b §4.1; tighten only).
+        ws_upgrade_wait_ms = "WS_UPGRADE_WAIT_MS": 5_000, [100, 5_000];
+        /// Host: size of a `ws` upgrade request (Phase 1b §4.1; tighten only).
+        ws_header_max_bytes = "WS_HEADER_MAX_BYTES": 8_192, [1_024, 8_192];
+        /// One received `ws` message; not below the 16 KiB a sender writes per message (Phase 1b §4.1; tighten only).
+        ws_message_max_bytes = "WS_MESSAGE_MAX_BYTES": 65_536, [16_384, 65_536];
     }
     agree(io) {
         if io.outcome_retry_max_ms < io.outcome_retry_first_ms {

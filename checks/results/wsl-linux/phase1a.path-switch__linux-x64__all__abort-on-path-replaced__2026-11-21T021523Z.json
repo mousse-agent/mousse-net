@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "wsl-linux",
+  "key": "042f0974403d57624956aebbe7cd72f01b86773fdee66ffba37429d70a320ccb692f06069a9174535d971428932d86132cc89eef54954c5f9c5c6ed605fea234bb",
+  "payload": "{\"check\":\"phase1a.path-switch\",\"target\":\"linux-x64\",\"control\":\"abort-on-path-replaced\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+unknown\",\"platform\":\"linux-x86_64\",\"outcome\":\"FAIL\",\"details\":\"printed \\\"FAIL phase1a.path-switch\\\" (reason=false_outcome)\",\"time\":\"2026-11-21T02:15:23Z\",\"device\":\"wsl-linux\",\"config\":\"d30f61da0633be9252276bfa7f64a1721cef0a234648c3583a583802a1fab4d6\",\"extra\":{\"app_build\":\"a4dd507d97c719545168c88a22a3499b2f4cc448\",\"reason\":\"false_outcome\"}}",
+  "signature": "3340184a974b72c8dc9e7e1fb9873462f40f3bdcb23122c2a52e80a2b5a6df4cd1146f61f7e22f9cef5af4a227ec181f8c3c3b44d148af61990c2283300694f9"
+}

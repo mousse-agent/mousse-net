@@ -33,20 +33,26 @@ pub mod host;
 pub mod keystore;
 pub mod limits;
 pub mod pipe;
+pub mod preauth;
 pub mod private;
 pub mod rng;
+pub mod routes;
 pub mod store;
 pub mod tls;
 pub mod watch;
 
 pub use admission::StreamAdmission;
-pub use caller::{Caller, CodeEntry, JoinOutcome, NoCode, PathEvent, Step1Failures};
+pub use caller::{
+    Caller, CandidateSource, CodeEntry, JoinOutcome, LaterCandidates, NoCode, PathEvent, Reached,
+    RouteClass, Search, Step1Failures,
+};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use conn::{CloseReason, ConnStatus, Connection, MuxStream, StreamReader, StreamWriter};
 pub use endpoint::{Endpoint, PortChoice};
 pub use error::NetError;
-pub use host::{ApprovalRequest, Host, HostConfig, HostEvent};
+pub use host::{ApprovalRequest, Host, HostConfig, HostEvent, Refusal};
 pub use limits::Limits;
+pub use preauth::{ListenerKind, PreAuthSlot, PreAuthStats};
 pub use tls::TlsPolicy;
 
 use std::sync::Arc;
@@ -64,7 +70,30 @@ pub type SharedSigner = Arc<dyn IdentitySigner + Send + Sync>;
         mousse_control = "shared-endpoint-state",
         mousse_control = "allow-break-env",
         mousse_control = "no-stream-cap",
-        mousse_control = "stop-on-mismatch"
+        mousse_control = "stop-on-mismatch",
+        mousse_control = "no-preauth-budget",
+        mousse_control = "shared-preauth-pool",
+        mousse_control = "join-only-frees-slot",
+        mousse_control = "join-only-outlives-invitation",
+        mousse_control = "fence-at-accept-only",
+        mousse_control = "fence-tcp-only",
+        mousse_control = "enroll-while-paused",
+        mousse_control = "repair-skips-slot",
+        mousse_control = "repair-skips-fence",
+        mousse_control = "ws-allow-origin",
+        mousse_control = "plain-ws-off-loopback",
+        mousse_control = "release-test-root",
+        mousse_control = "user-config-in-pipe",
+        mousse_control = "no-preamble-skip",
+        mousse_control = "window-per-route",
+        mousse_control = "loopback-routes",
+        mousse_control = "resolve-again",
+        mousse_control = "unlisted-allowed",
+        mousse_control = "stale-renewal-routes",
+        mousse_control = "unbounded-candidates",
+        mousse_control = "ssh-races-lan",
+        mousse_control = "bind-all-lan-off",
+        mousse_control = "pin-stored-memory-only"
     )
 ))]
 compile_error!("a mousse_control build has a deliberate defect and is for tests only; build it without --release");
@@ -77,7 +106,30 @@ compile_error!("a mousse_control build has a deliberate defect and is for tests 
     mousse_control = "shared-endpoint-state",
     mousse_control = "allow-break-env",
     mousse_control = "no-stream-cap",
-    mousse_control = "stop-on-mismatch"
+    mousse_control = "stop-on-mismatch",
+    mousse_control = "no-preauth-budget",
+    mousse_control = "shared-preauth-pool",
+    mousse_control = "join-only-frees-slot",
+    mousse_control = "join-only-outlives-invitation",
+    mousse_control = "fence-at-accept-only",
+    mousse_control = "fence-tcp-only",
+    mousse_control = "enroll-while-paused",
+    mousse_control = "repair-skips-slot",
+    mousse_control = "repair-skips-fence",
+    mousse_control = "ws-allow-origin",
+    mousse_control = "plain-ws-off-loopback",
+    mousse_control = "release-test-root",
+    mousse_control = "user-config-in-pipe",
+    mousse_control = "no-preamble-skip",
+    mousse_control = "window-per-route",
+    mousse_control = "loopback-routes",
+    mousse_control = "resolve-again",
+    mousse_control = "unlisted-allowed",
+    mousse_control = "stale-renewal-routes",
+    mousse_control = "unbounded-candidates",
+    mousse_control = "ssh-races-lan",
+    mousse_control = "bind-all-lan-off",
+    mousse_control = "pin-stored-memory-only"
 ))]
 const _: () = {
     let profile = env!("MOUSSE_BUILD_PROFILE").as_bytes();
@@ -104,6 +156,50 @@ pub const CONTROL: Option<&str> = if cfg!(mousse_control = "skip-pin-check") {
     Some("allow-break-env")
 } else if cfg!(mousse_control = "no-stream-cap") {
     Some("no-stream-cap")
+} else if cfg!(mousse_control = "no-preauth-budget") {
+    Some("no-preauth-budget")
+} else if cfg!(mousse_control = "shared-preauth-pool") {
+    Some("shared-preauth-pool")
+} else if cfg!(mousse_control = "join-only-frees-slot") {
+    Some("join-only-frees-slot")
+} else if cfg!(mousse_control = "join-only-outlives-invitation") {
+    Some("join-only-outlives-invitation")
+} else if cfg!(mousse_control = "fence-at-accept-only") {
+    Some("fence-at-accept-only")
+} else if cfg!(mousse_control = "fence-tcp-only") {
+    Some("fence-tcp-only")
+} else if cfg!(mousse_control = "enroll-while-paused") {
+    Some("enroll-while-paused")
+} else if cfg!(mousse_control = "repair-skips-slot") {
+    Some("repair-skips-slot")
+} else if cfg!(mousse_control = "repair-skips-fence") {
+    Some("repair-skips-fence")
+} else if cfg!(mousse_control = "ws-allow-origin") {
+    Some("ws-allow-origin")
+} else if cfg!(mousse_control = "plain-ws-off-loopback") {
+    Some("plain-ws-off-loopback")
+} else if cfg!(mousse_control = "release-test-root") {
+    Some("release-test-root")
+} else if cfg!(mousse_control = "user-config-in-pipe") {
+    Some("user-config-in-pipe")
+} else if cfg!(mousse_control = "no-preamble-skip") {
+    Some("no-preamble-skip")
+} else if cfg!(mousse_control = "window-per-route") {
+    Some("window-per-route")
+} else if cfg!(mousse_control = "loopback-routes") {
+    Some("loopback-routes")
+} else if cfg!(mousse_control = "resolve-again") {
+    Some("resolve-again")
+} else if cfg!(mousse_control = "unlisted-allowed") {
+    Some("unlisted-allowed")
+} else if cfg!(mousse_control = "stale-renewal-routes") {
+    Some("stale-renewal-routes")
+} else if cfg!(mousse_control = "unbounded-candidates") {
+    Some("unbounded-candidates")
+} else if cfg!(mousse_control = "ssh-races-lan") {
+    Some("ssh-races-lan")
+} else if cfg!(mousse_control = "bind-all-lan-off") {
+    Some("bind-all-lan-off")
 } else {
     None
 };

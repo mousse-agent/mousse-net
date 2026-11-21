@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "mac-mini",
+  "key": "04d63225e01c2fd84d8a4588702b08561c26da25295387d39876ea36c7f2deee75ec54bd53c9d5b09712f13f737f0ece0038931c8226886a42d77430c7c4e486ee",
+  "payload": "{\"check\":\"phase1b.routes-app\",\"target\":\"macos-arm64\",\"case\":\"ws\",\"control\":\"route-leak\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+unknown\",\"platform\":\"macos-aarch64\",\"outcome\":\"FAIL\",\"details\":\"printed \\\"FAIL phase1b.routes-app\\\" (reason=route_mismatch)\",\"time\":\"2026-11-20T16:54:29Z\",\"device\":\"mac-mini\",\"config\":\"5d2a1da9a1d161a771c593a59eff60e021e3aa55b39cc2c19e111a3a020d83a2\",\"extra\":{\"app_build\":\"a4dd507d97c719545168c88a22a3499b2f4cc448\",\"reason\":\"route_mismatch\"}}",
+  "signature": "d62fd34213f52a148be41b04f6a2f4156922ebaf106129296b1d5870b77278c4d7a968fe45c96a9812f2c3ced0d634a492ef98065a9da2827edffeec43e48c23"
+}

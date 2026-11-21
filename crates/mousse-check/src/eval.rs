@@ -116,6 +116,9 @@ pub struct Inputs<'a> {
     /// The app revision pinned in `app/MOUSSE_REVISION`; `None` if the file
     /// is missing or unreadable, which leaves every app check INCOMPLETE.
     pub app_revision: Option<&'a str>,
+    /// Whether a path (relative to the repository root) is in the tree:
+    /// what a check's `waits` look for.
+    pub exists: &'a dyn Fn(&str) -> bool,
 }
 
 struct Outcome {
@@ -318,6 +321,12 @@ fn eval_automated(inp: &Inputs<'_>, check: &Check, target: &str) -> Outcome {
     if let Some(why) = &check.placeholder {
         return out(Status::Incomplete, format!("not wired yet: {why}"));
     }
+    if let Some((w, path)) = check.waiting(None, inp.exists) {
+        return out(
+            Status::Incomplete,
+            format!("waits for {} ({path} is not in this tree)", w.slice),
+        );
+    }
     if check.app && inp.app_revision.is_none() {
         return out(
             Status::Incomplete,
@@ -326,6 +335,9 @@ fn eval_automated(inp: &Inputs<'_>, check: &Check, target: &str) -> Outcome {
                 crate::app::REVISION_FILE
             ),
         );
+    }
+    if check.hosted.iter().any(|h| h == target) {
+        return eval_hosted(inp, check, target);
     }
     let local = check.local_for(target);
     if let Some(why) = local.and_then(|l| l.placeholder.as_ref()) {
@@ -393,10 +405,12 @@ fn record<'a>(
     target: &str,
     local: &LocalRun,
     part: &str,
+    case: Option<&str>,
 ) -> Option<&'a RunRecord> {
     inp.records
         .iter()
         .filter(|r| r.check == check.id && r.target == target && r.part == part)
+        .filter(|r| r.case.as_deref() == case)
         .filter(|r| from_runner(r, local))
         .max_by(|a, b| a.time.cmp(&b.time))
 }
@@ -420,64 +434,86 @@ fn eval_local(inp: &Inputs<'_>, check: &Check, target: &str, local: &LocalRun) -
         }
         Ok(())
     };
-    let normal = record(inp, check, target, local, "normal");
-    let mut normal_total = None;
+    let named = check.controls_per_case();
+    let cases = if named {
+        check.cases(target)
+    } else {
+        vec![None]
+    };
     let mut normal_summary = String::new();
-    match normal {
-        None => gaps.push("not run for this build".to_string()),
-        Some(r) => match usable(r, None) {
-            Err(why) => gaps.push(format!("last run does not count: {why}")),
-            Ok(_) => match r.verdict {
-                RunVerdict::Pass => {
-                    normal_total = r.tests_total;
-                    normal_summary = r.summary.clone();
-                }
-                _ => fails.push(format!("run failed: {}", r.summary)),
-            },
-        },
-    }
-    for k in &check.control {
-        match record(inp, check, target, local, &k.name) {
-            None => gaps.push(format!("control {} not run", k.name)),
-            Some(r) => match usable(r, Some(k)) {
-                Err(why) => gaps.push(format!("control {} does not count: {why}", k.name)),
+    for case in &cases {
+        let case = case.as_deref();
+        // In a check with named cases, every message names its case.
+        let at = case.map(|c| format!("[{c}] ")).unwrap_or_default();
+        if let Some((w, path)) = check.waiting(case, inp.exists) {
+            gaps.push(format!(
+                "{at}waits for {} ({path} is not in this tree)",
+                w.slice
+            ));
+            continue;
+        }
+        let mut case_fails = Vec::new();
+        let mut case_gaps = Vec::new();
+        let normal = record(inp, check, target, local, "normal", case);
+        let mut normal_total = None;
+        match normal {
+            None => case_gaps.push("not run for this build".to_string()),
+            Some(r) => match usable(r, None) {
+                Err(why) => case_gaps.push(format!("last run does not count: {why}")),
                 Ok(_) => match r.verdict {
-                    RunVerdict::FailedAsRequired => {
-                        if let Some(want) = &k.expect_reason {
-                            if r.reason.as_ref() != Some(want) {
-                                fails.push(format!(
-                                    "control {} failed with reason {}, it must fail with reason={want}",
-                                    k.name,
-                                    r.reason.as_deref().unwrap_or("(none given)")
-                                ));
-                            }
-                        }
-                        if check.judge == Judge::CargoTest {
-                            if let (Some(a), Some(b)) = (normal_total, r.tests_total) {
-                                if a != b {
-                                    fails.push(format!(
-                                        "control {} ran {b} tests, the check ran {a}; a control must run the same tests (use --no-fail-fast)",
-                                        k.name
-                                    ));
-                                }
-                            }
-                        }
+                    RunVerdict::Pass => {
+                        normal_total = r.tests_total;
+                        normal_summary = r.summary.clone();
                     }
-                    RunVerdict::DidNotFail => fails.push(format!(
-                        "control did not fail: {} ({}): {}",
-                        k.name, k.breaks, r.summary
-                    )),
-                    RunVerdict::WrongReason => fails.push(format!(
-                        "control {} failed for the wrong reason: {}",
-                        k.name, r.summary
-                    )),
-                    _ => fails.push(format!(
-                        "control {} did not print FAIL: {}",
-                        k.name, r.summary
-                    )),
+                    _ => case_fails.push(format!("run failed: {}", r.summary)),
                 },
             },
         }
+        for k in &check.control {
+            match record(inp, check, target, local, &k.name, case) {
+                None => case_gaps.push(format!("control {} not run", k.name)),
+                Some(r) => match usable(r, Some(k)) {
+                    Err(why) => case_gaps.push(format!("control {} does not count: {why}", k.name)),
+                    Ok(_) => match r.verdict {
+                        RunVerdict::FailedAsRequired => {
+                            if let Some(want) = &k.expect_reason {
+                                if r.reason.as_ref() != Some(want) {
+                                    case_fails.push(format!(
+                                        "control {} failed with reason {}, it must fail with reason={want}",
+                                        k.name,
+                                        r.reason.as_deref().unwrap_or("(none given)")
+                                    ));
+                                }
+                            }
+                            if check.judge == Judge::CargoTest {
+                                if let (Some(a), Some(b)) = (normal_total, r.tests_total) {
+                                    if a != b {
+                                        case_fails.push(format!(
+                                            "control {} ran {b} tests, the check ran {a}; a control must run the same tests (use --no-fail-fast)",
+                                            k.name
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        RunVerdict::DidNotFail => case_fails.push(format!(
+                            "control did not fail: {} ({}): {}",
+                            k.name, k.breaks, r.summary
+                        )),
+                        RunVerdict::WrongReason => case_fails.push(format!(
+                            "control {} failed for the wrong reason: {}",
+                            k.name, r.summary
+                        )),
+                        _ => case_fails.push(format!(
+                            "control {} did not print FAIL: {}",
+                            k.name, r.summary
+                        )),
+                    },
+                },
+            }
+        }
+        fails.extend(case_fails.into_iter().map(|f| format!("{at}{f}")));
+        gaps.extend(case_gaps.into_iter().map(|g| format!("{at}{g}")));
     }
     if !fails.is_empty() {
         return out(Status::Fail, fails.join("; "));
@@ -485,13 +521,19 @@ fn eval_local(inp: &Inputs<'_>, check: &Check, target: &str, local: &LocalRun) -
     if !gaps.is_empty() {
         return out(Status::Incomplete, gaps.join("; "));
     }
-    out(
-        Status::Pass,
+    let summary = if named {
+        format!(
+            "{} case(s) passed; {} control(s) failed as required in each",
+            cases.len(),
+            check.control.len()
+        )
+    } else {
         format!(
             "{normal_summary}; {} control(s) failed as required",
             check.control.len()
-        ),
-    )
+        )
+    };
+    out(Status::Pass, summary)
 }
 
 fn legacy_note(inp: &Inputs<'_>, check: &Check, target: &str) -> String {
@@ -499,6 +541,107 @@ fn legacy_note(inp: &Inputs<'_>, check: &Check, target: &str) -> String {
         .get(&(check.id.clone(), target.to_string()))
         .map(|n| format!("; {n}"))
         .unwrap_or_default()
+}
+
+/// A hosted cell: records `mousse-check hosted verify` wrote. They count
+/// like device results (this build, the pinned app, this configuration),
+/// and the cell passes only with a PASS run and every control failing for
+/// its reason.
+fn eval_hosted(inp: &Inputs<'_>, check: &Check, target: &str) -> Outcome {
+    let profile = inp.manifest.device_profile(check);
+    let counts = |r: &&crate::evidence::HostedRecord| -> Result<(), String> {
+        check_build(inp.commits, inp.build, &r.build, profile, inp.allow_dirty)?;
+        if check.app && r.app_build.as_deref() != inp.app_revision {
+            return Err(format!(
+                "app build {} is not the pinned app",
+                r.app_build.as_deref().unwrap_or("(none)")
+            ));
+        }
+        let control = match &r.control {
+            None => None,
+            Some(n) => Some(
+                check
+                    .control_named(n)
+                    .ok_or_else(|| format!("names no control of this check ({n})"))?,
+            ),
+        };
+        if r.config != inp.manifest.config_digest(check, target, control) {
+            return Err("was made for another configuration of this check".into());
+        }
+        Ok(())
+    };
+    let all: Vec<&crate::evidence::HostedRecord> = inp
+        .evidence
+        .hosted
+        .iter()
+        .filter(|r| r.check == check.id && r.target == target)
+        .collect();
+    let mut stale = Vec::new();
+    let ok: Vec<_> = all
+        .iter()
+        .filter(|r| match counts(r) {
+            Ok(()) => true,
+            Err(why) => {
+                stale.push(why);
+                false
+            }
+        })
+        .collect();
+    let hint = "a GitHub-hosted run, checked with `mousse-check hosted verify`";
+    let normal: Vec<_> = ok.iter().filter(|r| r.control.is_none()).collect();
+    if let Some(f) = normal.iter().find(|r| r.outcome != "PASS") {
+        return out(
+            Status::Fail,
+            format!("hosted run {} reported {}: {}", f.run, f.outcome, f.details),
+        );
+    }
+    let Some(pass) = normal.first() else {
+        let why = stale.first().map(|w| format!(": {w}")).unwrap_or_default();
+        return out(
+            Status::Incomplete,
+            format!(
+                "no hosted result for this build ({hint}); {} record(s) do not count{why}",
+                stale.len()
+            ),
+        );
+    };
+    let mut gaps = Vec::new();
+    for k in &check.control {
+        let mine: Vec<_> = ok
+            .iter()
+            .filter(|r| r.control.as_deref() == Some(k.name.as_str()))
+            .collect();
+        if mine.is_empty() {
+            gaps.push(format!("no hosted result for control {}", k.name));
+        } else if let Some(bad) = mine.iter().find(|r| {
+            r.outcome != "FAIL"
+                || k.expect_reason
+                    .as_ref()
+                    .is_some_and(|want| r.reason.as_ref() != Some(want))
+        }) {
+            return out(
+                Status::Fail,
+                format!(
+                    "control {} did not fail as required on the hosted run ({} reason={})",
+                    k.name,
+                    bad.outcome,
+                    bad.reason.as_deref().unwrap_or("none")
+                ),
+            );
+        }
+    }
+    if !gaps.is_empty() {
+        return out(Status::Incomplete, gaps.join("; "));
+    }
+    out(
+        Status::Pass,
+        format!(
+            "hosted: {} (artifact {}); {} control(s) failed as required",
+            pass.run,
+            pass.artifact_digest,
+            check.control.len()
+        ),
+    )
 }
 
 fn eval_device(inp: &Inputs<'_>, check: &Check, target: &str) -> Outcome {
@@ -581,13 +724,36 @@ fn eval_device(inp: &Inputs<'_>, check: &Check, target: &str) -> Outcome {
             )
         });
     }
+    // Named cases: every control must have failed in every case. Other
+    // checks: at least one result per control, all of them FAIL.
+    let control_cases: Vec<Option<String>> = if check.controls_per_case() {
+        expected.clone()
+    } else {
+        vec![None]
+    };
+    for case in check.cases.iter() {
+        if let Some((w, path)) = check.waiting(Some(case), inp.exists) {
+            gaps.push(format!(
+                "[{case}] waits for {} ({path} is not in this tree)",
+                w.slice
+            ));
+        }
+    }
     for k in &check.control {
         let rs: Vec<&&ResultPayload> = ok
             .iter()
             .filter(|r| r.control.as_deref() == Some(k.name.as_str()))
             .collect();
-        if rs.is_empty() {
-            gaps.push(format!("no result for control {}", k.name));
+        for case in &control_cases {
+            let Some(case) = case else {
+                if rs.is_empty() {
+                    gaps.push(format!("no result for control {}", k.name));
+                }
+                continue;
+            };
+            if !rs.iter().any(|r| r.case.as_ref() == Some(case)) {
+                gaps.push(format!("[{case}] no result for control {}", k.name));
+            }
         }
         for r in rs.iter().filter(|r| r.outcome != "FAIL") {
             fails.push(format!(

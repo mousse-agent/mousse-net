@@ -105,6 +105,7 @@ fn rec(part: &str, verdict: RunVerdict, total: Option<u64>) -> RunRecord {
         check: "phase9.local".into(),
         target: "pc".into(),
         part: part.into(),
+        case: None,
         build: release(HEAD),
         time: "2026-11-18T00:00:00Z".into(),
         verdict,
@@ -163,6 +164,8 @@ struct Case {
     evidence: Evidence,
     rejected: Vec<(PathBuf, String, bool)>,
     app_revision: Option<String>,
+    /// Paths in the tree, for `waits`.
+    present: Vec<String>,
 }
 
 impl Case {
@@ -180,6 +183,7 @@ impl Case {
             evidence: Evidence::default(),
             rejected: vec![],
             app_revision: Some(APP_REV.into()),
+            present: vec![],
         }
     }
 
@@ -216,8 +220,14 @@ impl Case {
         let mut evidence = Evidence {
             results: self.evidence.results.clone(),
             attestations: self.evidence.attestations.clone(),
+            hosted: self.evidence.hosted.clone(),
             rejected: self.evidence.rejected.clone(),
         };
+        for h in &mut evidence.hosted {
+            if h.config == AUTO {
+                h.config = digest(&h.check, &h.target, h.control.as_deref());
+            }
+        }
         for r in &mut evidence.results {
             if r.config.as_deref() == Some(AUTO) {
                 r.config = Some(digest(&r.check, &r.target, r.control.as_deref()));
@@ -229,6 +239,7 @@ impl Case {
     fn report(&self) -> Report {
         let legacy = BTreeMap::new();
         let (records, evidence) = self.filled();
+        let exists = |p: &str| self.present.iter().any(|x| x == p);
         evaluate(&Inputs {
             manifest: &self.manifest,
             host: HOST,
@@ -240,6 +251,7 @@ impl Case {
             rejected_paths: &self.rejected,
             legacy: &legacy,
             app_revision: self.app_revision.as_deref(),
+            exists: &exists,
         })
     }
 
@@ -916,4 +928,273 @@ fn app_device_results_need_the_pinned_app_build_on_both_machines() {
         let c = case.cell("phase9.slice");
         assert_eq!(c.status, Status::Incomplete, "{extra}: {}", c.details);
     }
+}
+
+const ROUTE_CHECK: &str = r#"
+[[check]]
+id = "phase9.routes"
+title = "routes"
+plan = "item 6"
+targets = ["pc"]
+judge = "marker"
+cases = ["tcp", "ws"]
+[[check.local]]
+target = "pc"
+host = "windows-x86_64"
+command = ["cargo", "run", "--release", "-p", "probe", "--", "--route", "{case}"]
+[[check.control]]
+name = "leak"
+breaks = "another route wins"
+env = { MOUSSE_NET_ENGINE_CONTROL = "route-leak" }
+expect_reason = "route_mismatch"
+"#;
+
+fn route_rec(case: &str, part: &str, verdict: RunVerdict) -> RunRecord {
+    RunRecord {
+        case: Some(case.into()),
+        reason: (verdict == RunVerdict::FailedAsRequired).then(|| "route_mismatch".into()),
+        ..rec_for("phase9.routes", "pc", part, verdict)
+    }
+}
+
+fn route_case() -> Case {
+    let mut case = Case::new(ROUTE_CHECK);
+    for route in ["tcp", "ws"] {
+        case.records
+            .push(route_rec(route, "normal", RunVerdict::Pass));
+        case.records
+            .push(route_rec(route, "leak", RunVerdict::FailedAsRequired));
+    }
+    case
+}
+
+fn is(r: &RunRecord, case: &str, part: &str) -> bool {
+    r.check == "phase9.routes" && r.case.as_deref() == Some(case) && r.part == part
+}
+
+#[test]
+fn every_case_must_pass_and_every_control_must_fail_in_each_case() {
+    let c = route_case().cell("phase9.routes");
+    assert_eq!(c.status, Status::Pass, "{}", c.details);
+
+    // A case not run is INCOMPLETE, and the message names it.
+    let mut case = route_case();
+    case.records.retain(|r| !is(r, "ws", "normal"));
+    let c = case.cell("phase9.routes");
+    assert_eq!(c.status, Status::Incomplete, "{}", c.details);
+    assert!(c.details.contains("[ws] not run"), "{}", c.details);
+
+    // A control that failed in one case only is not enough.
+    let mut case = route_case();
+    case.records.retain(|r| !is(r, "tcp", "leak"));
+    let c = case.cell("phase9.routes");
+    assert_eq!(c.status, Status::Incomplete, "{}", c.details);
+    assert!(
+        c.details.contains("[tcp] control leak not run"),
+        "{}",
+        c.details
+    );
+
+    // A control that passed in one case fails the check.
+    let mut case = route_case();
+    for r in &mut case.records {
+        if is(r, "ws", "leak") {
+            r.verdict = RunVerdict::DidNotFail;
+        }
+    }
+    let c = case.cell("phase9.routes");
+    assert_eq!(c.status, Status::Fail, "{}", c.details);
+    assert!(
+        c.details.contains("[ws] control did not fail"),
+        "{}",
+        c.details
+    );
+
+    // A failed case fails the check while the other passes.
+    let mut case = route_case();
+    for r in &mut case.records {
+        if is(r, "tcp", "normal") {
+            r.verdict = RunVerdict::Fail;
+        }
+    }
+    assert_eq!(case.cell("phase9.routes").status, Status::Fail);
+
+    // A record without a case stands for no case.
+    let mut case = route_case();
+    for r in &mut case.records {
+        if r.check == "phase9.routes" {
+            r.case = None;
+        }
+    }
+    assert_eq!(case.cell("phase9.routes").status, Status::Incomplete);
+}
+
+#[test]
+fn device_controls_must_fail_in_every_named_case() {
+    let device = ROUTE_CHECK
+        .replace("targets = [\"pc\"]", "targets = [\"mac\"]")
+        .replace("target = \"pc\"", "target = \"mac\"")
+        .replace("host = \"windows-x86_64\"", "host = \"macos-aarch64\"");
+    let mut case = Case::new(&device);
+    let res = |route: &str, control: Option<&str>, outcome: &str| {
+        let mut r = result(
+            "phase9.routes",
+            "mac",
+            Some(route),
+            control,
+            outcome,
+            &release(HEAD),
+        );
+        if control.is_some() {
+            r.extra = serde_json::json!({ "reason": "route_mismatch" });
+        }
+        r
+    };
+    case.evidence.results = vec![
+        res("tcp", None, "PASS"),
+        res("ws", None, "PASS"),
+        res("tcp", Some("leak"), "FAIL"),
+        res("ws", Some("leak"), "FAIL"),
+    ];
+    let c = case.cell("phase9.routes");
+    assert_eq!(c.status, Status::Pass, "{}", c.details);
+
+    case.evidence.results.pop();
+    let c = case.cell("phase9.routes");
+    assert_eq!(c.status, Status::Incomplete, "{}", c.details);
+    assert!(
+        c.details.contains("[ws] no result for control leak"),
+        "{}",
+        c.details
+    );
+}
+
+#[test]
+fn a_check_or_case_waiting_for_its_slice_is_incomplete_until_it_lands() {
+    let waiting = format!(
+        "{ROUTE_CHECK}[[check.waits]]\nslice = \"E8\"\npaths = [\"crates/x/ws.rs\"]\ncase = \"ws\"\n"
+    );
+    // The ws case waits: the cell is INCOMPLETE with every run passing.
+    let mut case = route_case();
+    case.manifest = Manifest::parse(&format!("{MANIFEST}{waiting}")).unwrap();
+    let c = case.cell("phase9.routes");
+    assert_eq!(c.status, Status::Incomplete, "{}", c.details);
+    assert!(c.details.contains("[ws] waits for E8"), "{}", c.details);
+    // A failure in a case that has landed still shows.
+    for r in &mut case.records {
+        if is(r, "tcp", "normal") {
+            r.verdict = RunVerdict::Fail;
+        }
+    }
+    assert_eq!(case.cell("phase9.routes").status, Status::Fail);
+    for r in &mut case.records {
+        if is(r, "tcp", "normal") {
+            r.verdict = RunVerdict::Pass;
+        }
+    }
+    // Once the path is in the tree the case counts.
+    case.present = vec!["crates/x/ws.rs".into()];
+    assert_eq!(case.cell("phase9.routes").status, Status::Pass);
+
+    // A wait without a case holds the whole check, whatever was recorded.
+    let whole =
+        format!("{ROUTE_CHECK}[[check.waits]]\nslice = \"E7\"\npaths = [\"crates/x/routes.rs\"]\n");
+    let mut case = route_case();
+    case.manifest = Manifest::parse(&format!("{MANIFEST}{whole}")).unwrap();
+    let c = case.cell("phase9.routes");
+    assert_eq!(c.status, Status::Incomplete, "{}", c.details);
+    assert!(c.details.contains("waits for E7"), "{}", c.details);
+    // A wait never hides a check without a control.
+    case.manifest.checks[1].control.clear();
+    assert_eq!(case.cell("phase9.routes").status, Status::Fail);
+}
+
+const HOSTED_CHECK: &str = r#"
+[[check]]
+id = "phase9.builds"
+title = "builds"
+plan = "x"
+targets = ["windows-arm64"]
+judge = "marker"
+hosted = ["windows-arm64"]
+
+[[check.control]]
+name = "stale-helper"
+breaks = "the helper is not the build under test"
+env = { MOUSSE_BUILD_ID = "0000000+release" }
+expect_reason = "stale_helper"
+"#;
+
+fn hosted(
+    control: Option<&str>,
+    outcome: &str,
+    reason: Option<&str>,
+) -> crate::evidence::HostedRecord {
+    crate::evidence::HostedRecord {
+        format: crate::evidence::HOSTED_FORMAT.into(),
+        check: "phase9.builds".into(),
+        target: "windows-arm64".into(),
+        control: control.map(Into::into),
+        outcome: outcome.into(),
+        reason: reason.map(Into::into),
+        details: "x".into(),
+        build: format!("{HEAD}+release"),
+        app_build: None,
+        config: AUTO.into(),
+        run: "https://github.com/o/r/actions/runs/1".into(),
+        artifact_digest: "sha256:ab".into(),
+        helper_sha256: "cd".into(),
+        time: "2026-11-19T00:00:00Z".into(),
+    }
+}
+
+#[test]
+fn a_hosted_cell_counts_only_verified_hosted_records_for_this_build_and_its_control() {
+    let mut case = Case::new(HOSTED_CHECK);
+    let c = case.cell("phase9.builds");
+    assert_eq!(c.status, Status::Incomplete, "{}", c.details);
+
+    case.evidence.hosted.push(hosted(None, "PASS", None));
+    let c = case.cell("phase9.builds");
+    assert_eq!(c.status, Status::Incomplete, "{}", c.details);
+    assert!(c.details.contains("control stale-helper"), "{}", c.details);
+
+    case.evidence
+        .hosted
+        .push(hosted(Some("stale-helper"), "FAIL", Some("stale_helper")));
+    let c = case.cell("phase9.builds");
+    assert_eq!(c.status, Status::Pass, "{}", c.details);
+    assert!(c.details.starts_with("hosted:"), "{}", c.details);
+
+    // Another build, or another configuration, does not count.
+    let mut old = case.evidence.hosted.clone();
+    for h in &mut old {
+        h.build = format!("{OLD}+release");
+    }
+    let mut stale = Case::new(HOSTED_CHECK);
+    stale.evidence.hosted = old;
+    assert_eq!(stale.cell("phase9.builds").status, Status::Incomplete);
+    let mut other = Case::new(HOSTED_CHECK);
+    other.evidence.hosted = case.evidence.hosted.clone();
+    other.evidence.hosted[0].config = "0".repeat(64);
+    assert_eq!(other.cell("phase9.builds").status, Status::Incomplete);
+
+    // A control that failed for another reason fails the cell.
+    let mut wrong = Case::new(HOSTED_CHECK);
+    wrong.evidence.hosted = vec![
+        hosted(None, "PASS", None),
+        hosted(Some("stale-helper"), "FAIL", Some("probe_failed")),
+    ];
+    assert_eq!(wrong.cell("phase9.builds").status, Status::Fail);
+}
+
+#[test]
+fn a_hosted_target_cannot_also_run_locally() {
+    let bad = HOSTED_CHECK.replace(
+        "hosted = [\"windows-arm64\"]",
+        "hosted = [\"windows-arm64\"]
+local = [{ target = \"windows-arm64\", host = \"windows-aarch64\", command = [\"x\"] }]",
+    );
+    let err = Manifest::parse(&format!("{MANIFEST}{bad}")).unwrap_err();
+    assert!(err.contains("hosted"), "{err}");
 }

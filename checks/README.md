@@ -48,6 +48,9 @@ Each `[[check]]`:
 | `manual`, `steps` | a manual step; cells can only be ATTESTED |
 | `device_steps` | how a device produces its result, shown while the cell is INCOMPLETE |
 | `timeout_secs` | per run, default 3600 |
+| `cases` | named cases, such as routes (`["tcp", "ws", "ssh"]`). Each case is its own run and its own result; the cell passes only when every case passes, and every control must fail in every case. Not with `[check.matrix]` or `manual`. Each local command (or its `env`) must name `{case}`; the kit also sets `MOUSSE_CHECK_CASE` |
+| `hosted` | targets run on a GitHub-hosted runner; see "Hosted cells" |
+| `[[check.waits]]` | `slice`, `paths` (relative to the root) and optional `case`. Until every path exists, the check (or only that case) is INCOMPLETE with "waits for <slice>" and is not run. Lets a check land before the engine slice it tests. Waits do not count in `config` |
 | `[[check.local]]` | `target`, `host` (`windows-x86_64`, `macos-aarch64`, `linux-x86_64`, ...), `command`, optional `cwd`, `env`, `placeholder`. Runs when the kit is on that host. `{root}`, `{out}` (a fresh folder per run) and `{build}` are replaced; `MOUSSE_BUILD_ID` is set. |
 | `[[check.control]]` | `name`, `breaks` (what is broken), and `args` (appended), `env` (added) or `command` (replaces). `missing = "reason"` while the control does not exist: the check is FAIL until it does. `expect_reason = "<word>"`: the control must fail for this reason (see below). |
 | `[check.matrix]` | `providers`, `providers_for` (per target), `legacy_results` (unsigned files shown but never counted) |
@@ -70,7 +73,7 @@ Device results are JSON payloads `{check, target, case?, control?, build, platfo
 
 `sign` also keeps these top-level fields of a result file in `extra`: `reason`, `host_build`, `caller_build`, `app_build` and `host_app_build` (and `reason` inside an object `details`). For a `cross_machine` check, `build` is the caller's build and `extra.host_build` the host's; both, and `extra.caller_build` if present, must be the build under test. A result without `extra.host_build` does not count.
 
-A cell from devices passes when, for this build, every case (one, or every matrix pair) has a PASS, no result says FAIL, and every control has at least one result and all of them say FAIL. A changed or forged file is listed as TAMPERED and blocks the verdict.
+A cell from devices passes when, for this build, every case (one, every named case, or every matrix pair) has a PASS, no result says FAIL, and every control has at least one result and all of them say FAIL (with named cases: at least one result in each case). A changed or forged file is listed as TAMPERED and blocks the verdict.
 
     # on the device, once
     mousse-check device keygen --out ~/.mousse/device.key
@@ -99,13 +102,24 @@ A check with `app = true` runs the Mousse app against the helper built from this
 - A record or signed result counts only if its app build is the pinned revision. A dirty app build never counts. Without the pin, every app cell is INCOMPLETE.
 - For a cross-machine app check, the result must also carry `extra.host_app_build`, the host's app build, and it must be the pinned revision too.
 
-`tools/app-check/run.mjs <check> [--out <dir>]` is the local command of the app checks.
+`tools/app-check/run.mjs <check> [--out <dir>] [--route <case>]` is the local command of the app checks.
 
 1. It builds the debug helper from this checkout with `cargo build -p mousse-helper`, so a control's `RUSTFLAGS` apply.
 2. It runs `node scripts/net-engine-check.mjs <check> --out <dir>` in `MOUSSE_APP_DIR`, with `MOUSSE_NET_HELPER` set to that helper and `MOUSSE_NET_ENGINE_HELPER_BUILD` set to its build.
 3. It prints `helper_build=`, then the app's `app_build=` line and its marker line.
 
 App controls set `MOUSSE_NET_ENGINE_CONTROL`, which only unpackaged app builds read.
+
+Phase 1b and later app checks run with the kit's stand-ins (Phase 1b §14, "Plus and egress"); Phase 0 and 1a checks run as they were signed.
+
+- **Plus recorder** (`tools/app-check/recorder.mjs`): `MOUSSE_ID_ORIGIN` and `MOUSSE_PLUS_ORIGIN` point at a loopback server that records each request (`<out>/plus-requests.jsonl`) and answers 403; `MOUSSE_UPDATE_FEED_URL` points under it at `/update-feed`. It proves it records before each run. A Plus request fails the run with `plus_contacted`, an update check with `egress_attempted`.
+- **Egress guard** (`tools/app-check/egress-guard.cjs`): loaded into every node process of the check through `NODE_OPTIONS`, and named in `MOUSSE_CHECK_EGRESS_GUARD` for the app's check mode to load first. It refuses and logs (`MOUSSE_CHECK_EGRESS_LOG`, `<out>/egress-refused.jsonl`) TCP, TLS and UDP outside loopback and `MOUSSE_NET_TEST_EGRESS`, and name lookups other than `localhost`. Debug helpers read `MOUSSE_NET_TEST_EGRESS` and log to `MOUSSE_NET_TEST_EGRESS_LOG` the same way. Any refusal fails the run with `egress_attempted`. The guard proves it refuses before each run.
+- **OS fence** where no admin rights are needed and nothing outside loopback is allowed: a network namespace on Linux, a `sandbox-exec` profile on macOS; Windows relies on the two guards. Printed as `fence=`.
+- `MOUSSE_CHECK_PROBE_BIN` is `mousse-check` built from this checkout, for `mousse-check probe`.
+
+`--route tcp|ws|ssh` is a route case (`cases` in the manifest; the kit passes `--route {case}`). The app script gives the app only that route and writes every `conn.up` event, one JSON object per line, to `<out>/conn-up.jsonl`. Each event's `route` is `{kind, class}` or a route hint; its kind (or the hint's scheme, `wss` counting as `ws`) must be the case's route, or the run fails with `route_mismatch`. On a single machine, `tcp` must show both the `tailnet` and the `public` class. `--result` writes the route as the result's `case`.
+
+The app's own `PASS <id>` and `FAIL <id>` lines are shown as `app: ...`, and `run.mjs` prints the run's verdict line last: `FAIL <id> reason=<word>` with the first of `plus_contacted`, `egress_attempted` and `route_mismatch` that applies, else the app's clean verdict. An app that neither passes nor fails cleanly (exit code and lines disagree) gets no verdict line.
 
 A cross-machine app check runs outside the kit on both machines:
 
@@ -117,6 +131,52 @@ A cross-machine app check runs outside the kit on both machines:
     mousse-check sign --device-key <key> --config <digest> r.json
 
 With `--control <name>`, `run.mjs` adds that control's environment, which it reads with `mousse-check control-env <check> --control <name>`. Pass the same `--control` to `config-digest` and `sign`. `--role` and `--topology` pass through to the app script. With `--result`, `run.mjs` writes `build` (the helper build) and `app_build`. It also writes `host_build` and `host_app_build` when the app printed `host_build=` and `host_app_build=` lines, which a caller does with the builds its host reported over the test link.
+
+### Two setup notes for signing
+
+- **Windows: run the kit from a copy.** App checks build `mousse-check` (for `MOUSSE_CHECK_PROBE_BIN`) in `CARGO_TARGET_DIR`. Windows refuses to replace a running program, so when the kit itself runs from that folder, a control whose `RUSTFLAGS` force a rebuild ends with `exit 2` and `Access is denied`, and `run.mjs: the helper did not build`. Copy `mousse-check.exe` out of the target folder after building it and run the copy.
+- **macOS: point the app harness at OpenSSL 3.** The app's checks make their tunnel stand-in's certificates with `openssl`. On macOS that is LibreSSL, whose certificates Node refuses (`ca md too weak`), so every ws and tunnel case fails. Set `MOUSSE_CHECK_OPENSSL` to an OpenSSL 3 binary, for example `/opt/homebrew/bin/openssl`.
+
+## Hosted cells
+
+A target in a check's `hosted` list (for `phase1b.desktop-builds`, `windows-arm64`) runs on a GitHub-hosted runner, `.github/workflows/windows-arm-smoke.yml` (run by hand with the commit under test, and the app repository when the runner can read it). It smokes the build and its must-fail control and uploads one artifact. The cell counts only records `mousse-check hosted verify` wrote after checking that artifact:
+
+    gh run download <run id> -n windows-arm64-smoke   # or download the zip from the run page
+    mousse-check hosted verify phase1b.desktop-builds --target windows-arm64         --zip windows-arm64-smoke.zip --digest sha256:<the artifact digest GitHub shows> --run <run URL>
+
+It checks the archive against GitHub's digest, the engine commit against the build under test, the app build against `app/MOUSSE_REVISION`, the helper's SHA-256, that the smoke ended `PASS` and each control ended `FAIL` with its `expect_reason`, then writes one unsigned record per run to `checks/results/hosted/`. The cell counts them like device results (this build, the pinned app, this configuration) and shows `hosted: <run> (artifact <digest>)`. A hosted target has no local run.
+
+## The route probe (`mousse-check probe`)
+
+Phase 1b §6.3: traffic that must never reach RPC, sent to a real host on one route. The app script of `phase1b.no-rpc-without-grant` sets up the host and runs it; `tools/build-smoke.mjs` runs its wire cases against a release helper.
+
+    mousse-check probe key <file>        # a throwaway device key; prints its identity (hex) for grant.add
+    mousse-check probe --route tcp://127.0.0.1:<port> --invite <ticket>         --grant-key <granted device, editor off> --removed-key <device whose grant was removed>         --observe http://127.0.0.1:<port>/<path> --marker phase1b.no-rpc-without-grant [--json <file>]
+
+- `--route`: `tcp://<ip>:<port>`, `ws://<loopback ip>:<port><path>`, or `ssh` with `--ssh-config <file> --ssh-host <alias> --ssh-profile <selector>` (the system `ssh`, or `MOUSSE_NET_SSH_BIN`, runs the remote `mousse-helper pipe --profile <selector>` in the app's own command form; the remote helper must run in app mode). IP literals only; the probe resolves no names. On ssh, case 8 adds `pipe-wrong-token`, `pipe-long-line` (`MOUSSE_NET_IPC_LINE_MAX_BYTES`) and `pipe-not-running`, which need `--pipe-state <host helper state folder>` and `--pipe-helper <mousse-helper>`.
+- `--invite`: an open Send link invitation (kind 2; the garbage code case needs one). Its host identity is the pin unless `--pin <hex>` says otherwise.
+- Cases, in order: `not-tls`; on ws `ws-plain-get`, `ws-wrong-path`, `ws-origin`, `ws-no-subprotocol`, `ws-large-headers`, `ws-text-message`; `tls-no-cert`, `tls-1.2`, `tls-wrong-alpn`; `fresh-open-rpc`, `fresh-open-tunnel`, `fresh-bad-proof`; `join-only-open-rpc`, `join-only-open-hello`, `join-only-open-tunnel`, `join-only-garbage-code`; `removed-open-rpc`; `editor-off-tunnel`; `fresh-silence`; `admission`; on ws `ws-slow-headers`. `--cases a,b` runs some.
+- **Wire:** each case must end the way §6.3 names, at once and with nothing let through first (the flood's extra connection must be refused well before the host's own wait for a silent connection): a refusal that arrives only after the proof wait, or after any stream frame from the host (a `RESET` included), does not count. Otherwise `reason=wire_accepted`.
+- **App:** `--observe` names a loopback HTTP endpoint the app script serves. `GET` answers a JSON object with the totals `conn_up`, `streams`, `authorized_calls`, `endpoint_sessions`, `ledger_rows` and `refusals`. The probe reads it before and after each case (after `MOUSSE_CHECK_PROBE_SETTLE_MS`). Every case must leave all six unchanged, except `editor-off-tunnel`: one `conn_up`, one stream, one refusal, at most one ledger row, nothing else. Otherwise `reason=probe_reached_app`, which wins over `wire_accepted`. `--no-app` skips the app side (build smoke only).
+- A case without its input (`--invite`, `--grant-key`, `--removed-key`) is `reason=probe_error`, never a pass.
+- Output: `PASS|FAIL <marker> <route>:<case> ...` per case, then `PASS <marker>` or `FAIL <marker> reason=<word>`.
+- Limits come from the host's own variables (`MOUSSE_NET_JOIN_PROOF_WAIT_MS`, `MOUSSE_NET_PREAUTH_TCP`, `_WS`, `_PER_SOURCE`, `MOUSSE_NET_WS_UPGRADE_WAIT_MS`, `MOUSSE_NET_WS_HEADER_MAX_BYTES`, `MOUSSE_NET_HANDSHAKE_TIMEOUT_MS`), so a check that tightens one for the host tightens it for the probe. The probe's own waits: `MOUSSE_CHECK_PROBE_CONNECT_MS` (5000), `MOUSSE_CHECK_PROBE_CLOSE_MS` (5000), `MOUSSE_CHECK_PROBE_SETTLE_MS` (1000).
+
+## The SSH test server (`test-sshd`)
+
+App checks that need a real `ssh` route on loopback (the `ssh` case, SSH add) use the engine's test SSH server as a program. It is a dev-only example of `mousse-helper`, never part of a release package:
+
+    cargo run -p mousse-helper --example test-sshd -- --port <n> --keys <dir> [--home <dir>] [--mousse-home <dir>] [--launcher <name>=<path>]... [--preamble <text>]
+
+- `--port <n>`: listens on `127.0.0.1:<n>` only (0 picks one).
+- `--keys <dir>`: throwaway keys, made on the first run and reused after: `host_ed25519` (host key) and `client_ed25519` (`.pub` beside it), the only client key accepted. It writes `ssh_config` there, a `Host mousse-test-sshd` entry for this server with that identity, no agent and `known_hosts` in the same folder (empty; the app probes and pins the host key). Debug helpers read it through `MOUSSE_NET_TEST_SSH_CONFIG`.
+- `--home <dir>`: the remote user's home: `HOME` (and `USERPROFILE` on Windows) and the working directory; `MOUSSE_HOME` is `<home>/.mousse` unless `--mousse-home` names another folder.
+- Commands run as the current user. On Unix they run through `/bin/sh -c`, so `<home>/.mousse/bin` must hold the real launchers. Windows remotes are not supported in 1b, so on the PC `--launcher <name>=<program>` stands in for `~/.mousse/bin/<name>` (`--launcher mousse-cli=echo` is the built-in stand-in that writes the marker and echoes stdin).
+- `--preamble <text>`: printed before the command's output, as a login shell's rc files might.
+
+It prints `ready port <port> host_key <SHA256:...> config <path>` and serves until its stdin closes or it is stopped.
+
+For `--route ssh`, `run.mjs` builds it and passes its path in `MOUSSE_CHECK_TEST_SSHD`, and `MOUSSE_CHECK_SSH_ROUTES` names `tools/app-check/ssh-routes.mjs`, whose `startSshRoutes({out, sides})` starts one server per side (`<out>/ssh-<side>`), each into that side's Mousse home: the case's two loopback SSH routes, one per direction. Cross-machine `ssh` cells run the server on the Mac, since Windows is not an SSH remote in 1b.
 
 ## Manual steps
 

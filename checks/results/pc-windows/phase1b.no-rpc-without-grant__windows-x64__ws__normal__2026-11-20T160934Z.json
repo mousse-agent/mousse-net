@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "pc-windows",
+  "key": "048ad3ccda2d27fdfc98c131f2fa25bea736ec0a3e8a107dcbfa6b2f5a86b88da452c337f09925646ec76897452505e718f3f397ddf39674e9f5ad64590bc93d57",
+  "payload": "{\"check\":\"phase1b.no-rpc-without-grant\",\"target\":\"windows-x64\",\"case\":\"ws\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+unknown\",\"platform\":\"windows-x86_64\",\"outcome\":\"PASS\",\"details\":\"printed \\\"PASS phase1b.no-rpc-without-grant\\\"\",\"time\":\"2026-11-20T16:09:34Z\",\"device\":\"pc-windows\",\"config\":\"ad21769970a2ed0affc43cfb6631e4e9740af5c7e84a1cbdbff6b43576687fbe\",\"extra\":{\"app_build\":\"a4dd507d97c719545168c88a22a3499b2f4cc448\"}}",
+  "signature": "081a9e34090b4fb2504de6c3abaee0f00c7fcfc4d0109078d3ae89b58e59f9e0a30560211f7ef1a7732ece447360d3900e20d1a960daf8b2a75b2d60f57c5004"
+}

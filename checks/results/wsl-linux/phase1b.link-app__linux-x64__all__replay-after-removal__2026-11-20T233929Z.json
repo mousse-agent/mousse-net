@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "wsl-linux",
+  "key": "042f0974403d57624956aebbe7cd72f01b86773fdee66ffba37429d70a320ccb692f06069a9174535d971428932d86132cc89eef54954c5f9c5c6ed605fea234bb",
+  "payload": "{\"check\":\"phase1b.link-app\",\"target\":\"linux-x64\",\"control\":\"replay-after-removal\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+unknown\",\"platform\":\"linux-x86_64\",\"outcome\":\"FAIL\",\"details\":\"printed \\\"FAIL phase1b.link-app\\\" (reason=removed_peer_restored)\",\"time\":\"2026-11-20T23:39:29Z\",\"device\":\"wsl-linux\",\"config\":\"1d53eca3c19b2f9b3273b327ef4c0f5aa31f1c3b6bb90305c25ebcc007f5fe06\",\"extra\":{\"app_build\":\"a4dd507d97c719545168c88a22a3499b2f4cc448\",\"reason\":\"removed_peer_restored\"}}",
+  "signature": "46e3f29b35adaaeab4cc2eec5b5a37ce4cf54fc6f936d36d742983f2e6d5f4799d82378b5937e5579e4dfc05ba67c0dcf4d79174a2892dfe7257a29e927aaa74"
+}

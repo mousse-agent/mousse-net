@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "mac-mini",
+  "key": "04d63225e01c2fd84d8a4588702b08561c26da25295387d39876ea36c7f2deee75ec54bd53c9d5b09712f13f737f0ece0038931c8226886a42d77430c7c4e486ee",
+  "payload": "{\"check\":\"phase1b.ssh-add-app\",\"target\":\"macos-arm64\",\"control\":\"overwrite-1a-row\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+unknown\",\"platform\":\"macos-aarch64\",\"outcome\":\"FAIL\",\"details\":\"printed \\\"FAIL phase1b.ssh-add-app\\\" (reason=1a_row_lost)\",\"time\":\"2026-11-20T17:48:24Z\",\"device\":\"mac-mini\",\"config\":\"dcafc65119d5e733612719e1eb83510499e136d480730315383627892735faac\",\"extra\":{\"app_build\":\"a4dd507d97c719545168c88a22a3499b2f4cc448\",\"reason\":\"1a_row_lost\"}}",
+  "signature": "66f0f08a5835bcc9b8ccd61e1d3797fcddc7733c78b4184742234ec8185e4dc3f6a859ddf5e05bbd4e9b5b77749c48d9cff50fc1f6703c723c8a6ec95c942d86"
+}

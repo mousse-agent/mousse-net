@@ -24,7 +24,7 @@ fn hello_comes_first_and_the_helpers_own_lines_go_to_its_log() {
     );
     // The lower minor wins.
     let hello = a.call("hello", json!({"proto": [1, 7], "name": "x"}));
-    assert_eq!(hello["proto"], json!([1, 0]));
+    assert_eq!(hello["proto"], json!([1, 1]));
     let identity = hello["identity"].as_str().unwrap();
     assert!(
         !identity.is_empty() && identity.chars().all(|c| c.is_ascii_hexdigit()),
@@ -233,7 +233,13 @@ fn inbound_passes_only_app_labels_and_outbound_refuses_host_opened_streams() {
     let reset = p.b.event("stream.reset", |m| m["handle"] == h);
     assert_eq!(reset["code"], "cancelled");
 
-    assert_eq!(p.a.events("stream.incoming").len(), 1);
+    // One editor tunnel (Phase 1b §9.2) reaches the app with its label.
+    p.b.open(p.b_conn, "mousse.tunnel", "interactive");
+    let tunnel = p.a.incoming(p.a_conn, 1);
+    let incoming = p.a.event("stream.incoming", |m| m["handle"] == tunnel);
+    assert_eq!(incoming["label"], "mousse.tunnel");
+
+    assert_eq!(p.a.events("stream.incoming").len(), 2);
     assert!(p.b.events("stream.incoming").is_empty());
     p.a.assert_clean();
     p.b.assert_clean();
@@ -287,128 +293,6 @@ fn an_app_that_stops_reading_does_not_keep_the_helper_alive() {
     drop(writer);
 }
 
-/// A TCP connection to `port` that sends nothing: a handshake that never
-/// starts.
-fn silent_to(port: u16) -> std::net::TcpStream {
-    let s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-    s.set_read_timeout(Some(Duration::from_millis(400)))
-        .unwrap();
-    s
-}
-
-fn port_of(route: &str) -> u16 {
-    route.rsplit(':').next().unwrap().parse().unwrap()
-}
-
-/// Whether the helper dropped `s` (true) or still holds it open waiting
-/// for its handshake (false).
-fn dropped(mut s: &std::net::TcpStream) -> bool {
-    use std::io::Read as _;
-    let start = Instant::now();
-    loop {
-        match s.read(&mut [0u8; 64]) {
-            Ok(0) => return true,
-            Ok(_) => {}
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                return false
-            }
-            Err(_) => return true,
-        }
-        if start.elapsed() > WAIT {
-            return false;
-        }
-    }
-}
-
-/// A silent connection to `port` that the helper holds, once a place
-/// is free; fails if none frees up within WAIT.
-fn admitted_soon(port: u16) -> std::net::TcpStream {
-    let start = Instant::now();
-    loop {
-        let next = silent_to(port);
-        if !dropped(&next) {
-            return next;
-        }
-        assert!(start.elapsed() < WAIT, "the place never came back");
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
-/// Inbound connections that have not passed step 2 hold a place from
-/// before their handshake until they are live or closed, at most
-/// PREAUTH_PER_SOURCE from one address and PREAUTH_CONNECTIONS in all; one
-/// more is dropped before any handshake work.
-#[test]
-fn connections_waiting_for_authorization_are_capped_per_source_and_in_all() {
-    // From one address: a peer with no grant waiting out its join-proof
-    // time is past its handshake but not past step 2, and keeps its place.
-    let a_end = Endpoint::init("preauth");
-    let mut a = a_end.app(
-        "hostA",
-        &[("PREAUTH_PER_SOURCE", "1"), ("JOIN_PROOF_WAIT_MS", "3000")],
-    );
-    a.hello();
-    let a_route = route_of(&mut a);
-    let port = port_of(&a_route);
-    let c_end = Endpoint::init("preauthc");
-    let mut c = c_end.app("peerC", &[]);
-    c.hello();
-    // C stores A, but A never granted C.
-    c.call(
-        "peer.add",
-        json!({"identity": a.identity, "name": a.name, "routes": [a_route]}),
-    );
-    let dial = c.start("dial", json!({"identity": a.identity}));
-    // Past the handshake, waiting for step 2.
-    std::thread::sleep(Duration::from_millis(1000));
-    assert!(
-        c.st().messages.iter().all(|m| m["re"] != dial),
-        "C's dial ended early"
-    );
-    let late = silent_to(port);
-    assert!(
-        dropped(&late),
-        "a second connection from the address got in"
-    );
-    assert!(
-        a_end.log().contains("PREAUTH_PER_SOURCE"),
-        "{}",
-        a_end.log()
-    );
-    // Step 2 ends (refused): the place is free again.
-    let reply = c.reply(dial);
-    assert!(reply.get("error").is_some(), "{reply}");
-    let _again = admitted_soon(port);
-
-    // In all: two places, both taken by handshakes that never start.
-    let b_end = Endpoint::init("preauthb");
-    let mut b = b_end.app(
-        "hostB",
-        &[("PREAUTH_CONNECTIONS", "2"), ("PREAUTH_PER_SOURCE", "2")],
-    );
-    b.hello();
-    let port = port_of(&route_of(&mut b));
-    let first = silent_to(port);
-    let second = silent_to(port);
-    assert!(!dropped(&first) && !dropped(&second));
-    let third = silent_to(port);
-    assert!(dropped(&third), "a third connection got in");
-    assert!(
-        b_end.log().contains("PREAUTH_CONNECTIONS"),
-        "{}",
-        b_end.log()
-    );
-    drop(first);
-    // The helper sees the end of the first one's handshake and frees its
-    // place.
-    let _next = admitted_soon(port);
-}
-
 /// `init --app` (the app's first start) ends with its stdin, as `serve
 /// --app` does: an app killed during it leaves no `init` behind. The hold
 /// stands for an init still busy, a keystore that is slow to answer.
@@ -434,4 +318,64 @@ fn init_for_the_app_exits_when_its_stdin_closes() {
     let mut init = end.cli_env(&["init", "--app"], &[]);
     assert_eq!(init.exit_within(WAIT), Some(0), "{}", init.err());
     assert!(init.out().contains("created endpoint"), "{}", init.out());
+}
+
+/// A device with no grant dials in and waits for a proof it never sends:
+/// the host's app hears nothing of it, before or after the proof wait
+/// closes it (Phase 1b §6.1, the helper's `inbound`).
+#[test]
+fn a_connection_that_never_becomes_live_is_never_announced() {
+    let a_end = Endpoint::init("unlive-a");
+    let b_end = Endpoint::init("unlive-b");
+    let mut a = a_end.app("hostA", &[("JOIN_PROOF_WAIT_MS", "1000")]);
+    let mut b = b_end.app("peerB", &[]);
+    a.hello();
+    b.hello();
+    let route = route_of(&mut a);
+    // B pins A, but A never grants B.
+    let (identity, name) = (a.identity.clone(), a.name.clone());
+    b.call(
+        "peer.add",
+        json!({"identity": identity, "name": name, "routes": [route]}),
+    );
+    // Long enough for B's dial, A's proof wait and its close.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert!(a.events("conn.up").is_empty(), "{:?}", a.events("conn.up"));
+    a.assert_clean();
+}
+
+/// Under a check's egress fence (debug builds, Phase 1b §14), a dial off
+/// loopback to an address the fence does not list is refused before any
+/// packet and logged for the kit.
+#[test]
+fn under_the_egress_fence_a_dial_off_loopback_is_refused_and_logged() {
+    let a_end = Endpoint::init("fence-a");
+    let b_end = Endpoint::init("fence-b");
+    let log = b_end.dir.join("egress.jsonl");
+    let mut a = a_end.app("hostA", &[]);
+    let mut b = b_end.app(
+        "peerB",
+        &[
+            ("TEST_EGRESS", "10.255.255.2"),
+            ("TEST_EGRESS_LOG", log.to_str().unwrap()),
+        ],
+    );
+    a.hello();
+    b.hello();
+    let (identity, name) = (a.identity.clone(), a.name.clone());
+    // A private address no test network uses; the fence stops the dial first.
+    b.call(
+        "peer.add",
+        json!({"identity": identity, "name": name, "routes": ["tcp://10.255.255.1:9"]}),
+    );
+    let deadline = Instant::now() + WAIT;
+    let logged = loop {
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        if text.contains("10.255.255.1:9") || Instant::now() > deadline {
+            break text;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(logged.contains("\"helper\""), "{logged}");
+    assert!(logged.contains("10.255.255.1:9"), "{logged}");
 }

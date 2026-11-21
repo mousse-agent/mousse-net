@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "wsl-linux",
+  "key": "042f0974403d57624956aebbe7cd72f01b86773fdee66ffba37429d70a320ccb692f06069a9174535d971428932d86132cc89eef54954c5f9c5c6ed605fea234bb",
+  "payload": "{\"check\":\"phase1b.no-rpc-without-grant\",\"target\":\"linux-x64\",\"case\":\"ws\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+unknown\",\"platform\":\"linux-x86_64\",\"outcome\":\"PASS\",\"details\":\"printed \\\"PASS phase1b.no-rpc-without-grant\\\"\",\"time\":\"2026-11-20T21:20:21Z\",\"device\":\"wsl-linux\",\"config\":\"abe4c4a319c3f7d76037fd791e529e36d7db516bb0f8b216f889aee502be2132\",\"extra\":{\"app_build\":\"a4dd507d97c719545168c88a22a3499b2f4cc448\"}}",
+  "signature": "be2baf182fa6b7c572dbf9cbaa0362517581094148a13f49d802a06cbfee9184af0f5d5ed5b6d0a4c0d67789b65d9e69b936ffb1e53cc421cfd4830805a39528"
+}

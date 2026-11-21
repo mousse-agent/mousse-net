@@ -10,7 +10,7 @@ use mousse_check::evidence::{
     DeviceList, ATTEST_FORMAT,
 };
 use mousse_check::kit::{
-    host, payload_from, public_hex, read_unsigned, write_signed, Kit, Parts, SignArgs, Signer,
+    host, payload_from, public_hex, read_unsigned, write_signed, Kit, Only, Parts, SignArgs, Signer,
 };
 use mousse_check::report::table;
 use mousse_check::util::now_rfc3339;
@@ -23,9 +23,10 @@ USAGE
       Run this machine's local checks and their must-fail controls, collect
       signed device results and attestations, print the table. Exit 0 only if
       the phase passes. Example: mousse-check phase0
-  mousse-check run <check-id> [--control] [--target <cell>]
+  mousse-check run <check-id> [--control] [--target <cell>] [--case <name>]
                    [--sign-with <key file> [--device <name>] [--platform <text>] [--out <dir>]]
-      Run one check here (or, with --control, its controls). With --sign-with,
+      Run one check here (or, with --control, its controls). A check with
+      named cases runs once per case, or only --case. With --sign-with,
       also write signed results, for a machine whose results another machine
       evaluates.
   mousse-check sign --device-key <key file> [--device <name>] [--check <id>] [--target <cell>]
@@ -50,6 +51,16 @@ USAGE
   mousse-check device list
   mousse-check report [<phase>] [--allow-dirty] [--full] [--json]
       Print the table from stored runs and results without running anything.
+  mousse-check probe --route <hint> (--observe <url> | --no-app) [--invite <ticket>] ...
+      Send traffic that must never reach RPC to a host on one route, and
+      check each close on the wire and in the app (probe --help).
+  mousse-check hosted verify <check-id> --target <cell> --zip <artifact.zip>
+                             --digest sha256:<hex> --run <run url>
+      Count a GitHub-hosted run: check the artifact against GitHub's digest,
+      the build under test and the pinned app, the smoke's PASS and each
+      control's FAIL, then write records to checks/results/hosted/.
+  mousse-check probe key <file>
+      Write a throwaway device key for the probe and print its identity.
 
 Global: --root <dir> (default: the git checkout containing the current folder).
 App checks (app = true) run only with MOUSSE_APP_DIR set to a clean checkout of
@@ -90,6 +101,10 @@ const VALUE_FLAGS: &[&str] = &[
     "--key",
     "--targets",
     "--config",
+    "--case",
+    "--zip",
+    "--digest",
+    "--run",
 ];
 
 impl Args {
@@ -150,6 +165,10 @@ fn real_main(raw: Vec<String>) -> Result<ExitCode, String> {
         return Ok(ExitCode::from(2));
     };
     let rest = raw[1..].to_vec();
+    // The probe talks to a host, not to a checkout: no kit root needed.
+    if cmd == "probe" {
+        return mousse_check::probe::main(&rest).map(ExitCode::from);
+    }
     let a = Args::parse(
         rest,
         matches!(cmd.as_str(), "sign" | "config-digest" | "control-env"),
@@ -166,6 +185,7 @@ fn real_main(raw: Vec<String>) -> Result<ExitCode, String> {
         "config-digest" => cmd_config_digest(&kit, &a),
         "control-env" => cmd_control_env(&kit, &a),
         "device" => cmd_device(&kit, &a),
+        "hosted" => cmd_hosted(&kit, &a),
         "report" => cmd_report(&kit, &a, None),
         phase if kit.has_phase(phase) => cmd_report(&kit, &a, Some(phase)),
         other => Err(format!(
@@ -204,7 +224,7 @@ fn cmd_report(kit: &Kit, a: &Args, run_phase: Option<&str>) -> Result<ExitCode, 
             if !only.is_empty() && !only.contains(&c.id.as_str()) {
                 continue;
             }
-            kit.run_local(&m, c, None, Parts::Both, false, None)?;
+            kit.run_local(&m, c, Only::default(), Parts::Both, false, None)?;
         }
         eprintln!();
     }
@@ -236,6 +256,7 @@ fn cmd_run(kit: &Kit, a: &Args) -> Result<ExitCode, String> {
     a.only_known(&[
         "--control",
         "--target",
+        "--case",
         "--sign-with",
         "--device",
         "--platform",
@@ -275,7 +296,29 @@ fn cmd_run(kit: &Kit, a: &Args) -> Result<ExitCode, String> {
     } else {
         Parts::Normal
     };
-    let ok = kit.run_local(&m, &c, a.get("--target"), parts, true, signer.as_ref())?;
+    if let Some(case) = a.get("--case") {
+        if !c.cases.iter().any(|k| k == case) {
+            return Err(format!(
+                "{id} has no case {case} (cases: {})",
+                if c.cases.is_empty() {
+                    "none".to_string()
+                } else {
+                    c.cases.join(", ")
+                }
+            ));
+        }
+    }
+    let ok = kit.run_local(
+        &m,
+        &c,
+        Only {
+            target: a.get("--target"),
+            case: a.get("--case"),
+        },
+        parts,
+        true,
+        signer.as_ref(),
+    )?;
     Ok(if ok {
         ExitCode::SUCCESS
     } else {
@@ -458,6 +501,40 @@ fn config_for(
         ),
     };
     Ok(m.config_digest(&c, target, control))
+}
+
+/// `hosted verify`: check a hosted run's artifact and record it.
+fn cmd_hosted(kit: &Kit, a: &Args) -> Result<ExitCode, String> {
+    a.only_known(&["--target", "--zip", "--digest", "--run"])?;
+    if a.positional.first().map(String::as_str) != Some("verify") {
+        return Err("usage: mousse-check hosted verify <check-id> --target <cell> --zip <file> --digest sha256:<hex> --run <url>".into());
+    }
+    let id = a
+        .positional
+        .get(1)
+        .ok_or("hosted verify needs a check id")?;
+    let (m, c) = kit.find_check(id)?;
+    let need = |f: &str| a.get(f).ok_or_else(|| format!("hosted verify needs {f}"));
+    let state = kit.state()?;
+    let app = mousse_check::app::read_revision(kit.root()).ok();
+    let scratch = std::env::temp_dir().join(format!("mousse-check-hosted-{}", std::process::id()));
+    let paths = mousse_check::hosted::verify(&mousse_check::hosted::VerifyArgs {
+        check: &c,
+        manifest: &m,
+        target: need("--target")?,
+        zip: Path::new(need("--zip")?),
+        digest: need("--digest")?,
+        run: need("--run")?,
+        commit: &state.commit,
+        app_revision: app.as_deref(),
+        out: &kit.results_dir().join("hosted"),
+        scratch: &scratch,
+    });
+    let _ = std::fs::remove_dir_all(&scratch);
+    for p in paths? {
+        println!("wrote {}", p.display());
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// `control-env`: what a control adds to the environment, for runs made

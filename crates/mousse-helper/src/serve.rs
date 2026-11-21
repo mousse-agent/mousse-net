@@ -5,6 +5,15 @@
 //! An approval question names one request: the joining connection and the
 //! device shown. The answer must name the same request, so an answer never
 //! applies to a different device or a newer request.
+//!
+//! **Where it listens (Phase 1b §1.5).** With `<state>/routes.json`, the
+//! listener binds the addresses it selects, one TCP socket each, all on the
+//! kept port ([`RoutesConfig::bind_plan`]); the ones that do not bind are
+//! listed as `unbound` and tried again when the interfaces change. When the
+//! interface watcher sees a selected address appear or go (LAN off), only
+//! that socket opens or closes, and closing it closes the connections it
+//! accepted. Only served addresses are advertised. Without the file the
+//! listener binds `--listen-ip`, as in 1a.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -16,15 +25,18 @@ use mousse_net_core::identity::{IdentityPublicKey, SoftwareKey};
 use mousse_net_core::pairing::{CpaceExchangeFactory, InvitationId, InvitationKind};
 use mousse_net_core::ErrorCode;
 use mousse_net_io::discovery::{Advertiser, CachedBrowse};
-use mousse_net_io::pipe::{accept_tcp, route_from_addr, route_uri};
+use mousse_net_io::pipe::ws::{self, WsTarget};
+use mousse_net_io::pipe::{accept_tcp, route_from_addr, route_uri, Pipe, RouteKind};
 use mousse_net_io::rng::{os_rng, random_bytes};
+use mousse_net_io::routes::{RoutesConfig, RoutesStore};
 use mousse_net_io::store::{hex, short_id};
 use mousse_net_io::{
-    ApprovalRequest, Caller, Host, HostConfig, HostEvent, PortChoice, SharedSigner,
+    ApprovalRequest, Caller, Host, HostConfig, HostEvent, ListenerKind, PortChoice, PreAuthSlot,
+    SharedSigner,
 };
 use serde_json::{json, Value};
-use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Notify};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, watch, Notify};
 
 use crate::ipc::{self, Channel, ControlListener};
 use crate::term;
@@ -37,6 +49,13 @@ pub struct ServeOptions {
     pub mdns: bool,
     /// `--app`: the app channel on stdin and stdout.
     pub app: bool,
+    /// `--ws-port`: run the loopback `ws` listener for a tunnel client on
+    /// this port (0: any; Phase 1b §4.1). It also runs, on the kept ws
+    /// port, while `tunnels` is not empty.
+    pub ws_port: Option<u16>,
+    /// `--tunnel`: public `wss` URLs of the owner's tunnels to this
+    /// listener, advertised in tickets.
+    pub tunnels: Vec<String>,
 }
 
 /// A deliberate defect for the cross-machine must-fail control, read from
@@ -46,9 +65,121 @@ fn break_mode() -> Option<String> {
     std::env::var("MOUSSE_HELPER_BREAK").ok()
 }
 
+/// What the listener serves now, for `hello`, tickets and `routes.config`.
+#[derive(Clone, Debug, Default)]
+pub struct ListenState {
+    /// The routes advertised in tickets and pairback routes.
+    pub routes: Vec<String>,
+    /// Selected addresses that could not be bound.
+    pub unbound: Vec<IpAddr>,
+    /// The routes config in effect: `routes.json`, or what the command line
+    /// gave when there is none.
+    pub config: RoutesConfig,
+    /// The port every socket listens on.
+    pub port: u16,
+    /// The addresses bound now.
+    pub bound: Vec<IpAddr>,
+    /// Tunnels given on the command line (`--tunnel`), advertised besides
+    /// the config's.
+    pub extra: Vec<String>,
+}
+
+impl ListenState {
+    /// Advertise what `config` selects for the sockets bound now, plus the
+    /// command line's tunnels.
+    pub fn readvertise(&mut self, interfaces: &[IpAddr]) {
+        let mut routes = self.config.advertised(interfaces, &self.bound, self.port);
+        for t in &self.extra {
+            if !routes.contains(t) {
+                routes.push(t.clone());
+            }
+        }
+        self.routes = routes;
+    }
+}
+
+/// The listen state, shared by the accept loop and the app channel.
+pub type SharedListen = Arc<Mutex<ListenState>>;
+
+/// One accepted TCP connection: the pipe, the peer, and a signal that its
+/// socket closed.
+type Accepted = (TcpStream, SocketAddr, watch::Receiver<bool>);
+
+/// One listening TCP socket. Dropping it stops accepting and tells the
+/// connections it accepted to close.
+struct Socket {
+    task: tokio::task::JoinHandle<()>,
+    closing: watch::Sender<bool>,
+}
+
+impl Socket {
+    fn open(listener: TcpListener, accepted: mpsc::UnboundedSender<Accepted>) -> Self {
+        let (closing, signal) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            loop {
+                match accept_tcp(&listener).await {
+                    Ok((pipe, addr)) => {
+                        if accepted.send((pipe, addr, signal.clone())).is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        print_line(format!("accept failed: {e}"));
+                        tokio::task::yield_now().await;
+                    }
+                }
+            }
+        });
+        Self { task, closing }
+    }
+}
+
+impl Drop for Socket {
+    fn drop(&mut self) {
+        self.task.abort();
+        let _ = self.closing.send(true);
+    }
+}
+
+/// Open the sockets `config` selects for `interfaces` that are not open
+/// yet, close the ones it no longer selects. Returns the unbound ones.
+async fn reconcile(
+    config: &RoutesConfig,
+    interfaces: &[IpAddr],
+    port: u16,
+    sockets: &mut HashMap<IpAddr, Socket>,
+    accepted: &mpsc::UnboundedSender<Accepted>,
+) -> Vec<IpAddr> {
+    let want = config.bind_plan(interfaces);
+    sockets.retain(|ip, _| {
+        let keep = want.contains(ip);
+        if !keep {
+            print_line(format!("stopped listening on {ip}"));
+        }
+        keep
+    });
+    let mut unbound = Vec::new();
+    for ip in want {
+        if sockets.contains_key(&ip) {
+            continue;
+        }
+        match TcpListener::bind(SocketAddr::new(ip, port)).await {
+            Ok(listener) => {
+                print_line(format!("listening on {ip}:{port}"));
+                sockets.insert(ip, Socket::open(listener, accepted.clone()));
+            }
+            Err(e) => {
+                print_line(format!("could not listen on {ip}:{port}: {e}"));
+                unbound.push(ip);
+            }
+        }
+    }
+    unbound
+}
+
 struct State {
     host: Host,
-    routes: Vec<String>,
+    listen: SharedListen,
     token: String,
     /// The identity tickets name. Differs from the TLS identity only in the
     /// `wrong-identity` control.
@@ -91,102 +222,16 @@ fn print_line(line: impl AsRef<str>) {
     crate::applog::line(line);
 }
 
-/// Inbound connections that have not passed step 2 yet: the TLS handshake,
-/// then authorization or pairing. Each holds a place from before its
-/// handshake starts until its connection is live or closed: at most
-/// `PREAUTH_CONNECTIONS` in all and `PREAUTH_PER_SOURCE` from one address.
-/// A connection past either is dropped at once, before any work is spent on
-/// it, so slow or stalled handshakes cannot use up sockets, tasks and memory.
-pub(crate) struct PreAuth {
-    total: usize,
-    per_source: usize,
-    state: Mutex<PreAuthState>,
-}
-
-#[derive(Default)]
-struct PreAuthState {
-    open: usize,
-    by_source: HashMap<IpAddr, usize>,
-}
-
-/// Why a connection was dropped before its handshake.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum PreAuthFull {
-    /// `PREAUTH_CONNECTIONS` are waiting.
-    Endpoint,
-    /// `PREAUTH_PER_SOURCE` from this address are waiting.
-    Source,
-}
-
-/// A place in [`PreAuth`]; freed when dropped.
-pub(crate) struct PreAuthPermit {
-    admission: Arc<PreAuth>,
-    source: IpAddr,
-}
-
-impl PreAuth {
-    pub(crate) fn new(total: u64, per_source: u64) -> Arc<Self> {
-        Arc::new(Self {
-            total: usize::try_from(total).unwrap_or(usize::MAX),
-            per_source: usize::try_from(per_source).unwrap_or(usize::MAX),
-            state: Mutex::new(PreAuthState::default()),
-        })
-    }
-
-    fn from_limits() -> Arc<Self> {
-        let h = crate::limits::helper();
-        Self::new(h.preauth_connections(), h.preauth_per_source())
-    }
-
-    /// A place for a connection from `source`, if both caps allow one.
-    pub(crate) fn try_admit(
-        self: &Arc<Self>,
-        source: IpAddr,
-    ) -> Result<PreAuthPermit, PreAuthFull> {
-        let source = source.to_canonical();
-        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if st.open >= self.total {
-            return Err(PreAuthFull::Endpoint);
-        }
-        let from_source = st.by_source.entry(source).or_default();
-        if *from_source >= self.per_source {
-            return Err(PreAuthFull::Source);
-        }
-        *from_source += 1;
-        st.open += 1;
-        Ok(PreAuthPermit {
-            admission: self.clone(),
-            source,
-        })
-    }
-}
-
-impl Drop for PreAuthPermit {
-    fn drop(&mut self) {
-        let mut st = self
-            .admission
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        st.open = st.open.saturating_sub(1);
-        if let Some(n) = st.by_source.get_mut(&self.source) {
-            *n -= 1;
-            if *n == 0 {
-                st.by_source.remove(&self.source);
-            }
-        }
-    }
-}
-
-/// Run step 1 and step 2 on an inbound pipe, holding `permit` until the
-/// connection is live or closed. `None` if it was refused.
-async fn accept_holding(
+/// Run step 1 and step 2 on an inbound pipe that holds `slot`; the host
+/// keeps the place until the connection is live or closed. `None` if it
+/// was refused.
+async fn accept_holding<P: Pipe>(
     host: &Host,
-    pipe: TcpStream,
+    pipe: P,
     addr: SocketAddr,
-    permit: PreAuthPermit,
+    slot: PreAuthSlot,
 ) -> Option<mousse_net_io::Connection> {
-    let conn = match host.accept(pipe).await {
+    let conn = match host.accept_admitted(pipe, slot).await {
         Ok(conn) => conn,
         Err(e) => {
             print_line(format!("refused {addr}: {e}"));
@@ -196,7 +241,6 @@ async fn accept_holding(
     // Bounded: the handshake by HANDSHAKE_TIMEOUT_MS, step 2 by
     // JOIN_PROOF_WAIT_MS and the invitation's own limits.
     let _ = conn.settled(true).await;
-    drop(permit);
     Some(conn)
 }
 
@@ -235,18 +279,99 @@ pub async fn run(
     // anything is accepted (Phase 1a §5.4). If that fails, networking
     // starts paused.
     let removal = crate::revoke::Removal::start(host.clone(), &endpoint.grants_dir());
-    let choice = match opts.port {
-        None => PortChoice::Kept,
-        Some(0) => PortChoice::Auto,
-        Some(p) => PortChoice::Fixed(p),
+    // `routes.json` decides where to listen; without it, `--listen-ip`.
+    let stored = RoutesStore::in_dir(state_dir)
+        .load()
+        .map_err(|e| e.to_string())?;
+    let interfaces = crate::app::interface_ips();
+    let choice = match (stored.as_ref().and_then(|c| c.port), opts.port) {
+        (Some(p), _) => PortChoice::Fixed(p),
+        (None, None) => PortChoice::Kept,
+        (None, Some(0)) => PortChoice::Auto,
+        (None, Some(p)) => PortChoice::Fixed(p),
     };
-    let listener = endpoint
-        .bind(opts.listen_ip, choice)
-        .await
-        .map_err(|e| format!("listen: {e}"))?;
-    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
-    let routes = route_hints(opts.listen_ip, port);
-    let advertiser = if opts.mdns && !opts.listen_ip.is_loopback() {
+    let plan = match &stored {
+        Some(config) => config.bind_plan(&interfaces),
+        None => vec![opts.listen_ip],
+    };
+    let (accepted_tx, mut accepted_rx) = mpsc::unbounded_channel::<Accepted>();
+    let mut sockets: HashMap<IpAddr, Socket> = HashMap::new();
+    let mut unbound: Vec<IpAddr> = Vec::new();
+    let mut bound_port = None;
+    for ip in &plan {
+        let listener = match bound_port {
+            None => endpoint.bind(*ip, choice).await,
+            Some(port) => TcpListener::bind(SocketAddr::new(*ip, port))
+                .await
+                .map_err(mousse_net_io::NetError::from),
+        };
+        match listener {
+            Ok(listener) => {
+                let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+                bound_port.get_or_insert(port);
+                sockets.insert(*ip, Socket::open(listener, accepted_tx.clone()));
+            }
+            // A selected address that is not there: the watcher retries it.
+            Err(e) if stored.is_some() => {
+                print_line(format!("could not listen on {ip}: {e}"));
+                unbound.push(*ip);
+            }
+            Err(e) => return Err(format!("listen: {e}")),
+        }
+    }
+    let port = bound_port
+        .or(endpoint.fixed_port())
+        .or(endpoint.kept_port())
+        .ok_or("listen: no selected address could be bound and no port is kept yet")?;
+    let bound: Vec<IpAddr> = sockets.keys().copied().collect();
+    let mut routes = match &stored {
+        Some(config) => config.advertised(&interfaces, &bound, port),
+        None => route_hints(opts.listen_ip, port),
+    };
+    let mut extra = Vec::new();
+    for tunnel in &opts.tunnels {
+        let target = WsTarget::parse(tunnel)
+            .filter(|t| t.secure)
+            .ok_or_else(|| {
+                format!("--tunnel {tunnel}: not a wss://<host>[:<port>]<path>/mousse-net/1 URL")
+            })?;
+        routes.push(target.uri());
+        extra.push(target.uri());
+    }
+    let config = stored.clone().unwrap_or_else(|| RoutesConfig {
+        lan: opts.listen_ip.is_unspecified(),
+        ..RoutesConfig::default()
+    });
+    // mDNS only with LAN on (never on loopback).
+    let lan_on = match &stored {
+        Some(config) => config.lan,
+        None => !opts.listen_ip.is_loopback(),
+    };
+    let listen: SharedListen = Arc::new(Mutex::new(ListenState {
+        routes: routes.clone(),
+        unbound: unbound.clone(),
+        config: config.clone(),
+        port,
+        bound: bound.clone(),
+        extra,
+    }));
+    // The loopback ws listener, for the owner's tunnel client (§4.1).
+    let ws_listener = if opts.ws_port.is_some() || !opts.tunnels.is_empty() || config.ws_listener()
+    {
+        Some(
+            endpoint
+                .bind_ws(opts.ws_port)
+                .await
+                .map_err(|e| format!("ws listen: {e}"))?,
+        )
+    } else {
+        None
+    };
+    let ws_port = match &ws_listener {
+        Some(l) => Some(l.local_addr().map_err(|e| e.to_string())?.port()),
+        None => None,
+    };
+    let advertiser = if opts.mdns && lan_on {
         Some(
             Advertiser::start(port, clock.clone(), crate::limits::get().net.io())
                 .map_err(|e| format!("mDNS: {e}"))?,
@@ -255,12 +380,9 @@ pub async fn run(
         None
     };
 
-    // The app channel replaces the control listener in app mode.
-    let mut control = if opts.app {
-        None
-    } else {
-        Some(ControlListener::bind(state_dir).await?)
-    };
+    // In app mode the app channel carries everything else; the control
+    // listener answers only `pipe` and `status` (Phase 1b §3.3).
+    let mut control = Some(ControlListener::bind(state_dir).await?);
     let token = hex(&random_bytes::<32>());
     if let Some(control) = &control {
         ipc::write_control_file(state_dir, control.addr(), &token)?;
@@ -268,7 +390,7 @@ pub async fn run(
 
     let state = Arc::new(State {
         host: host.clone(),
-        routes: routes.clone(),
+        listen: listen.clone(),
         token,
         ticket_identity: real_identity,
         waiters: Mutex::new(HashMap::new()),
@@ -276,13 +398,17 @@ pub async fn run(
         stop: Notify::new(),
     });
     print_line(format!(
-        "ready {} port {} build {} routes {}{}",
+        "ready {} port {} build {} routes {}{}{}",
         short_id(&real_identity),
         port,
         crate::BUILD,
         routes.join(" "),
         match &advertiser {
             Some(a) => format!(" mdns {}", a.current_name()),
+            None => String::new(),
+        },
+        match ws_port {
+            Some(p) => format!(" ws_port {p}"),
             None => String::new(),
         }
     ));
@@ -299,27 +425,41 @@ pub async fn run(
         // Outbound connections for the app: the same key, flow records and
         // stream places as the host.
         let mut caller = Caller::new(signer.clone(), clock.clone(), crate::limits::get().net);
-        caller.use_flow_records(Arc::new(endpoint.flow_records()));
+        // Must-fail control: flow records in memory, so a restart gives a
+        // send link its tries back.
+        if cfg!(mousse_control = "joiner-records-in-memory") {
+            caller.use_flow_records(Arc::new(mousse_net_io::store::MemoryFlowRecords::default()));
+        } else {
+            caller.use_flow_records(Arc::new(endpoint.flow_records()));
+        }
         caller.use_stream_admission(host.stream_admission());
+        // The ssh tier opens SSH routes set up by `ssh.resolve` (Phase 1b §3).
+        let ssh = Arc::new(crate::ssh::Ssh::new(endpoint.dir()));
+        caller.use_ssh_dialer(Arc::new(crate::ssh::Dialer(ssh.clone())));
+        // Renewals search from the store as it is then (Phase 1b §1.5).
+        caller.use_candidates(Arc::new(crate::app::StoreCandidates {
+            dir: endpoint.dir().to_path_buf(),
+            policy: caller.addr_policy().clone(),
+        }));
         let info = crate::app::AppInfo {
             identity: real_identity,
             name: opts.name.clone(),
             profile: endpoint.profile_id().to_owned(),
             port,
-            routes: routes.clone(),
+            ws_port,
+            listen: listen.clone(),
             state_dir: endpoint.dir().to_path_buf(),
             // mDNS only where the helper advertises too (never on
             // loopback); debug builds may read a browse file instead.
-            browse: crate::app::browse_source(opts.mdns && !opts.listen_ip.is_loopback()).map(
-                |source| {
-                    Arc::new(CachedBrowse::new(
-                        source,
-                        clock.clone(),
-                        crate::limits::get().net.io(),
-                    ))
-                },
-            ),
+            browse: crate::app::browse_source(opts.mdns && lan_on).map(|source| {
+                Arc::new(CachedBrowse::new(
+                    source,
+                    clock.clone(),
+                    crate::limits::get().net.io(),
+                ))
+            }),
             manual_clock,
+            ssh,
         };
         Some(crate::app::App::start(
             host.clone(),
@@ -338,34 +478,47 @@ pub async fn run(
     };
     tokio::pin!(app_end);
     let mut ended = None;
-    let preauth = PreAuth::from_limits();
 
     loop {
         tokio::select! {
-            accepted = accept_tcp(&listener) => match accepted {
-                // Paused: nothing is admitted until the removal is saved.
-                Ok((pipe, addr)) if removal.is_paused() => {
-                    print_line(format!("dropped {addr}: networking is paused"));
-                    drop(pipe);
-                }
-                Ok((pipe, addr)) => match preauth.try_admit(addr.ip()) {
-                    Err(full) => {
-                        print_line(format!("dropped {addr}: {}", match full {
-                            PreAuthFull::Endpoint => "too many connections waiting for authorization (PREAUTH_CONNECTIONS)",
-                            PreAuthFull::Source => "too many connections from its address waiting for authorization (PREAUTH_PER_SOURCE)",
-                        }));
+            Some((pipe, addr, closing)) = accepted_rx.recv() => {
+                // A place in the TCP pool before anything is read; none
+                // while paused (the removal is not saved yet).
+                match host.admit(ListenerKind::Tcp, Some(addr.ip())) {
+                    Err(why) => {
+                        print_line(format!("dropped {addr}: {why}"));
                         drop(pipe);
                     }
-                    Ok(permit) => match &app {
+                    Ok(slot) => match &app {
                         Some(app) => {
-                            tokio::spawn(app_connection(host.clone(), app.clone(), pipe, addr, permit));
+                            tokio::spawn(app_connection(host.clone(), app.clone(), pipe, addr, slot, closing));
                         }
                         None => {
-                            tokio::spawn(handle_connection(host.clone(), pipe, addr, permit));
+                            tokio::spawn(handle_connection(host.clone(), pipe, addr, slot, closing));
                         }
                     },
-                },
-                Err(e) => print_line(format!("accept failed: {e}")),
+                }
+            },
+            accepted = accept_ws(&ws_listener) => match accepted {
+                // A place in the ws pool before anything is read. Control
+                // (tests only): the place is taken after the upgrade.
+                Ok((stream, addr)) => {
+                    let slot = if cfg!(mousse_control = "ws-slot-after-headers") {
+                        Ok(None)
+                    } else {
+                        host.admit(ListenerKind::Ws, None).map(Some)
+                    };
+                    match slot {
+                        Err(why) => {
+                            print_line(format!("dropped ws {addr}: {why}"));
+                            drop(stream);
+                        }
+                        Ok(slot) => {
+                            tokio::spawn(ws_connection(host.clone(), app.clone(), stream, addr, slot));
+                        }
+                    }
+                }
+                Err(e) => print_line(format!("ws accept failed: {e}")),
             },
             end = &mut app_end => {
                 print_line(format!("app channel ended: {end:?}"));
@@ -373,14 +526,41 @@ pub async fn run(
                 break;
             }
             ctl = accept_control(&mut control) => match ctl {
-                Ok(ch) => {
-                    tokio::spawn(control_session(state.clone(), ch));
-                }
+                Ok(ch) => match &app {
+                    // A place in the pipe pool before anything is read;
+                    // none while paused.
+                    Some(app) => {
+                        let slot = host.admit(ListenerKind::Pipe, None);
+                        tokio::spawn(app_control_session(
+                            host.clone(),
+                            app.clone(),
+                            state.clone(),
+                            ch,
+                            slot,
+                        ));
+                    }
+                    None => {
+                        tokio::spawn(control_session(state.clone(), ch));
+                    }
+                },
                 Err(e) => print_line(format!("control channel: {e}")),
             },
             Some(change) = net_changes.recv() => {
                 if let Some(advertiser) = &advertiser {
                     advertiser.refresh();
+                }
+                // A selected address came or went: open or close only
+                // that socket (LAN on binds 0.0.0.0, which never changes).
+                if stored.is_some() {
+                    let interfaces = crate::app::interface_ips();
+                    // The config in effect: list edits since the start
+                    // apply without a restart.
+                    let config = listen.lock().unwrap_or_else(|e| e.into_inner()).config.clone();
+                    let unbound = reconcile(&config, &interfaces, port, &mut sockets, &accepted_tx).await;
+                    let mut st = listen.lock().unwrap_or_else(|e| e.into_inner());
+                    st.bound = sockets.keys().copied().collect();
+                    st.unbound = unbound;
+                    st.readvertise(&interfaces);
                 }
                 if let Some(app) = &app {
                     app.net_change(change);
@@ -397,6 +577,7 @@ pub async fn run(
     if let Some(app) = &app {
         app.close_all();
     }
+    drop(sockets);
     host.close_all(ErrorCode::NoError);
     tokio::time::sleep(crate::limits::ms(crate::limits::helper().stop_linger_ms())).await;
     ipc::remove_control_file(state_dir);
@@ -411,7 +592,59 @@ pub async fn run(
     }
 }
 
-/// The next control connection; never, in app mode.
+/// The next connection to the ws listener; never without one.
+async fn accept_ws(
+    listener: &Option<tokio::net::TcpListener>,
+) -> Result<(TcpStream, SocketAddr), mousse_net_io::NetError> {
+    match listener {
+        Some(listener) => accept_tcp(listener).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// One connection to the ws listener: the upgrade under its caps and
+/// checks, then step 1 and step 2 over the ws pipe.
+async fn ws_connection(
+    host: Host,
+    app: Option<crate::app::App>,
+    stream: TcpStream,
+    addr: SocketAddr,
+    slot: Option<PreAuthSlot>,
+) {
+    let fence = host.clone();
+    let accepted = ws::accept(stream, crate::limits::get().net.io(), move || {
+        fence.fence_covers(ListenerKind::Ws)
+    })
+    .await;
+    let pipe = match accepted {
+        Ok(pipe) => pipe,
+        Err(refusal) => {
+            print_line(format!("refused ws {addr}: {refusal}"));
+            return;
+        }
+    };
+    let slot = match slot {
+        Some(slot) => slot,
+        None => match host.admit(ListenerKind::Ws, None) {
+            Ok(slot) => slot,
+            Err(why) => {
+                print_line(format!("dropped ws {addr}: {why}"));
+                return;
+            }
+        },
+    };
+    let Some(conn) = accept_holding(&host, pipe, addr, slot).await else {
+        return;
+    };
+    match app {
+        Some(app) => {
+            app.inbound(conn, RouteKind::Ws, None, None).await;
+        }
+        None => serve_streams(conn, addr).await,
+    }
+}
+
+/// The next control connection.
 async fn accept_control(control: &mut Option<ControlListener>) -> Result<Channel, String> {
     match control {
         Some(control) => control.accept().await,
@@ -425,17 +658,37 @@ async fn app_connection(
     app: crate::app::App,
     pipe: TcpStream,
     addr: SocketAddr,
-    permit: PreAuthPermit,
+    slot: PreAuthSlot,
+    closing: watch::Receiver<bool>,
 ) {
-    if let Some(conn) = accept_holding(&host, pipe, addr, permit).await {
-        app.inbound(conn).await;
+    // The listener's own address: a check's class map names its port.
+    let local = pipe.local_addr().ok();
+    if let Some(conn) = accept_holding(&host, pipe, addr, slot).await {
+        if let Some(no) = app.inbound(conn, RouteKind::Tcp, Some(addr), local).await {
+            app.close_with_socket(no, closing);
+        }
     }
 }
 
-async fn handle_connection(host: Host, pipe: TcpStream, addr: SocketAddr, permit: PreAuthPermit) {
-    let Some(conn) = accept_holding(&host, pipe, addr, permit).await else {
+async fn handle_connection(
+    host: Host,
+    pipe: TcpStream,
+    addr: SocketAddr,
+    slot: PreAuthSlot,
+    mut closing: watch::Receiver<bool>,
+) {
+    let Some(conn) = accept_holding(&host, pipe, addr, slot).await else {
         return;
     };
+    // The socket that accepted it closing ends it too.
+    tokio::select! {
+        () = serve_streams(conn, addr) => {}
+        _ = closing.wait_for(|closed| *closed) => {}
+    }
+}
+
+/// Standalone `serve`: terminals and `helper-info` for a live connection.
+async fn serve_streams(conn: mousse_net_io::Connection, addr: SocketAddr) {
     let peer = short_id(conn.peer());
     print_line(format!("connected {peer} from {addr}"));
     while let Some(stream) = conn.accept_stream().await {
@@ -513,7 +766,9 @@ fn on_event(state: &State, event: HostEvent) {
                 }
             }
         }
-        HostEvent::ShowCode { invitation, code } => {
+        HostEvent::ShowCode {
+            invitation, code, ..
+        } => {
             // Only the inviting command shows the code; it is never logged.
             if let Some(tx) = waiter(&invitation) {
                 let _ = tx.send(json!({"event": "code", "code": code.as_str()}));
@@ -574,7 +829,7 @@ fn grants_json(host: &Host) -> Value {
 }
 
 async fn control_session(state: Arc<State>, mut ch: Channel) {
-    let Ok(Some(request)) = ch.recv().await else {
+    let Ok(Some(request)) = ch.recv_first().await else {
         return;
     };
     let token = request.get("token").and_then(Value::as_str).unwrap_or("");
@@ -587,7 +842,7 @@ async fn control_session(state: Arc<State>, mut ch: Channel) {
         "status" => json!({
             "device": short_id(&state.ticket_identity),
             "identity": hex(state.ticket_identity.as_bytes()),
-            "routes": state.routes,
+            "routes": state.listen.lock().unwrap_or_else(|e| e.into_inner()).routes,
             "build": crate::BUILD,
         }),
         "grants" => grants_json(&state.host),
@@ -638,6 +893,65 @@ async fn control_session(state: Arc<State>, mut ch: Channel) {
     let _ = ch.send(&reply).await;
 }
 
+/// App mode's control connection (Phase 1b §3.3): it holds a pipe pool
+/// place from accept (`slot`), and answers only `pipe` and `status`.
+/// `pipe` hands the stream, with whatever the line reader already holds,
+/// to the host as an inbound connection; the place passes on with it.
+async fn app_control_session(
+    host: Host,
+    app: crate::app::App,
+    state: Arc<State>,
+    mut ch: Channel,
+    slot: Result<PreAuthSlot, mousse_net_io::Refusal>,
+) {
+    let slot = match slot {
+        Ok(slot) => slot,
+        Err(why) => {
+            print_line(format!("refused pipe: {why}"));
+            let _ = ch
+                .send(&json!({"error": "refused", "reason": why.to_string()}))
+                .await;
+            return;
+        }
+    };
+    let Ok(Some(request)) = ch.recv_first().await else {
+        return;
+    };
+    let token = request.get("token").and_then(Value::as_str).unwrap_or("");
+    // Control (tests only): a pipe is handed over without the token.
+    let token_ok = ipc::token_matches(token, &state.token);
+    let cmd = request.get("cmd").and_then(Value::as_str).unwrap_or("");
+    if cmd == "pipe" && (token_ok || cfg!(mousse_control = "pipe-no-token")) {
+        if ch.send(&json!({"ok": true})).await.is_err() {
+            return;
+        }
+        let pipe = ch.into_pipe();
+        let conn = match host.accept_admitted(pipe, slot).await {
+            Ok(conn) => conn,
+            Err(e) => {
+                print_line(format!("refused pipe: {e}"));
+                return;
+            }
+        };
+        app.inbound(conn, RouteKind::Ssh, None, None).await;
+        return;
+    }
+    drop(slot);
+    let reply = if !token_ok {
+        json!({"error": "refused", "reason": "bad control token"})
+    } else if cmd == "status" {
+        json!({
+            "device": short_id(&state.ticket_identity),
+            "identity": hex(state.ticket_identity.as_bytes()),
+            "build": crate::BUILD,
+            "app": true,
+        })
+    } else {
+        reply_error("This profile is run by Mousse; use mousse-cli net-engine")
+    };
+    let _ = ch.send(&reply).await;
+}
+
 /// One invitation, from ticket to enrolment. In person, the approval
 /// question is answered over the control channel; with a send link, each
 /// fresh code is sent to the inviting command to show.
@@ -647,7 +961,13 @@ async fn invite_session(state: &State, ch: &mut Channel, link: bool) {
     } else {
         InvitationKind::InPerson
     };
-    let created = match state.host.invite(kind, state.routes.clone()) {
+    let routes = state
+        .listen
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .routes
+        .clone();
+    let created = match state.host.invite(kind, routes.clone()) {
         Ok(c) => c,
         Err(e) => {
             let _ = ch.send(&reply_error(e.to_string())).await;
@@ -661,7 +981,7 @@ async fn invite_session(state: &State, ch: &mut Channel, link: bool) {
         w.insert(invitation, tx);
     }
     let sent = ch
-        .send(&json!({"ticket": fragment, "routes": state.routes, "expires_at": created.ticket.expires_at.secs()}))
+        .send(&json!({"ticket": fragment, "routes": routes, "expires_at": created.ticket.expires_at.secs()}))
         .await;
     let mut finished = sent.is_err();
     while !finished {
@@ -725,36 +1045,4 @@ pub fn default_state_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     home.join(".mousse-helper")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn ip(text: &str) -> IpAddr {
-        text.parse().unwrap()
-    }
-
-    #[test]
-    fn preauth_caps_count_all_sources_and_each_source_and_free_on_drop() {
-        let admission = PreAuth::new(3, 2);
-        let a1 = admission.try_admit(ip("10.0.0.1")).unwrap();
-        let _a2 = admission.try_admit(ip("10.0.0.1")).unwrap();
-        // The same address written as an IPv4-mapped IPv6 one.
-        assert_eq!(
-            admission.try_admit(ip("::ffff:10.0.0.1")).err(),
-            Some(PreAuthFull::Source)
-        );
-        let _b1 = admission.try_admit(ip("10.0.0.2")).unwrap();
-        assert_eq!(
-            admission.try_admit(ip("10.0.0.3")).err(),
-            Some(PreAuthFull::Endpoint)
-        );
-        drop(a1);
-        let _c1 = admission.try_admit(ip("10.0.0.3")).unwrap();
-        assert_eq!(
-            admission.try_admit(ip("10.0.0.1")).err(),
-            Some(PreAuthFull::Endpoint)
-        );
-    }
 }

@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "wsl-linux",
+  "key": "042f0974403d57624956aebbe7cd72f01b86773fdee66ffba37429d70a320ccb692f06069a9174535d971428932d86132cc89eef54954c5f9c5c6ed605fea234bb",
+  "payload": "{\"check\":\"phase1b.routes\",\"target\":\"linux-x64\",\"control\":\"bind-all-lan-off\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+debug\",\"platform\":\"linux-x86_64\",\"outcome\":\"FAIL\",\"details\":\"1 of 40 tests failed\",\"time\":\"2026-11-20T21:04:57Z\",\"device\":\"wsl-linux\",\"config\":\"8f745a4c67c5e9126bbe68aa23c1e087e9f2470189eb55782088bb59131e44b0\"}",
+  "signature": "cf9b4fe026ad66aa7b3f61e7324376780efe9a5379c42dc31f846804299ce448e3db8e83dc110a112ab6adb6b097293165621089fafe221fbbe0eca1d2fec20e"
+}

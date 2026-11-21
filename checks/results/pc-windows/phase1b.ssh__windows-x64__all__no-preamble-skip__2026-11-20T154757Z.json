@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "pc-windows",
+  "key": "048ad3ccda2d27fdfc98c131f2fa25bea736ec0a3e8a107dcbfa6b2f5a86b88da452c337f09925646ec76897452505e718f3f397ddf39674e9f5ad64590bc93d57",
+  "payload": "{\"check\":\"phase1b.ssh\",\"target\":\"windows-x64\",\"control\":\"no-preamble-skip\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+debug\",\"platform\":\"windows-x86_64\",\"outcome\":\"FAIL\",\"details\":\"7 of 22 tests failed\",\"time\":\"2026-11-20T15:47:57Z\",\"device\":\"pc-windows\",\"config\":\"ef7421e7bb6c4a553f110078cc2e471be615ef53896d7e7c2e93cbf7c102e81e\"}",
+  "signature": "34a2cec632718d0c584c4ff5a54681cd2d6f67807db9ff291af87b1bee9917e5079fe407be54ce5f91079f2963ed5f619a0d4fa80b300c27eb6d9a7ffa0e60c8"
+}

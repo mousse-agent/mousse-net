@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "pc-windows",
+  "key": "048ad3ccda2d27fdfc98c131f2fa25bea736ec0a3e8a107dcbfa6b2f5a86b88da452c337f09925646ec76897452505e718f3f397ddf39674e9f5ad64590bc93d57",
+  "payload": "{\"check\":\"phase1a.pair-both-ways\",\"target\":\"windows-x64\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+unknown\",\"platform\":\"windows-x86_64\",\"outcome\":\"PASS\",\"details\":\"printed \\\"PASS phase1a.pair-both-ways\\\"\",\"time\":\"2026-11-21T01:24:36Z\",\"device\":\"pc-windows\",\"config\":\"19c8d00ba9e6be950248292c6099e2d354251037e0f3977d76558a8d344661f3\",\"extra\":{\"app_build\":\"a4dd507d97c719545168c88a22a3499b2f4cc448\"}}",
+  "signature": "977478ca10165e3ac8119955baaeaeee61bfde93ecaa08d47e1d0f60f097584fdd32918b45675824f2f631ef8e6f302959b9e1cc2ae09e78f4c87c82ff78db21"
+}

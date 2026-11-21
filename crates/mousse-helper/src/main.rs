@@ -15,7 +15,52 @@
         mousse_control = "no-revoke-journal",
         mousse_control = "stop-on-mismatch",
         mousse_control = "public-routes",
-        mousse_control = "no-rediscovery"
+        mousse_control = "no-rediscovery",
+        mousse_control = "no-preauth-budget",
+        mousse_control = "shared-preauth-pool",
+        mousse_control = "ws-slot-after-headers",
+        mousse_control = "ipc-unbounded-line",
+        mousse_control = "ipc-handoff-drops-buffer",
+        mousse_control = "join-only-frees-slot",
+        mousse_control = "join-only-outlives-invitation",
+        mousse_control = "fence-at-accept-only",
+        mousse_control = "fence-tcp-only",
+        mousse_control = "enroll-while-paused",
+        mousse_control = "repair-skips-slot",
+        mousse_control = "repair-skips-fence",
+        mousse_control = "limits-raise",
+        mousse_control = "ws-allow-origin",
+        mousse_control = "plain-ws-off-loopback",
+        mousse_control = "release-test-root",
+        mousse_control = "accept-new-host-key",
+        mousse_control = "user-config-in-pipe",
+        mousse_control = "trust-unprobed-key",
+        mousse_control = "pipe-no-token",
+        mousse_control = "no-preamble-skip",
+        mousse_control = "pipe-outlives-helper",
+        mousse_control = "window-per-route",
+        mousse_control = "peer-ssh-routes",
+        mousse_control = "loopback-routes",
+        mousse_control = "plain-ws-from-ticket",
+        mousse_control = "unapproved-public",
+        mousse_control = "unapproved-last-route",
+        mousse_control = "upgrade-trusts-routes",
+        mousse_control = "resolve-again",
+        mousse_control = "unlisted-allowed",
+        mousse_control = "stale-renewal-routes",
+        mousse_control = "unbounded-candidates",
+        mousse_control = "ssh-races-lan",
+        mousse_control = "bind-all-lan-off",
+        mousse_control = "inbound-before-live",
+        mousse_control = "journal-pins-link",
+        mousse_control = "fabricate-pending-kind2",
+        mousse_control = "joiner-records-in-memory",
+        mousse_control = "link-accepts-kind1",
+        mousse_control = "no-completion-record",
+        mousse_control = "done-pin-only",
+        mousse_control = "replay-after-removal",
+        mousse_control = "join-ignores-removal",
+        mousse_control = "removal-leaves-pending"
     )
 ))]
 compile_error!("a mousse_control build has a deliberate defect and is for tests only; build it without --release");
@@ -38,6 +83,51 @@ compile_error!("test-in-person lets a typed ticket count as scanned from the hos
     mousse_control = "stop-on-mismatch",
     mousse_control = "public-routes",
     mousse_control = "no-rediscovery",
+    mousse_control = "no-preauth-budget",
+    mousse_control = "shared-preauth-pool",
+    mousse_control = "ws-slot-after-headers",
+    mousse_control = "ipc-unbounded-line",
+    mousse_control = "ipc-handoff-drops-buffer",
+    mousse_control = "join-only-frees-slot",
+    mousse_control = "join-only-outlives-invitation",
+    mousse_control = "fence-at-accept-only",
+    mousse_control = "fence-tcp-only",
+    mousse_control = "enroll-while-paused",
+    mousse_control = "repair-skips-slot",
+    mousse_control = "repair-skips-fence",
+    mousse_control = "limits-raise",
+    mousse_control = "ws-allow-origin",
+    mousse_control = "plain-ws-off-loopback",
+    mousse_control = "release-test-root",
+    mousse_control = "accept-new-host-key",
+    mousse_control = "user-config-in-pipe",
+    mousse_control = "trust-unprobed-key",
+    mousse_control = "pipe-no-token",
+    mousse_control = "no-preamble-skip",
+    mousse_control = "pipe-outlives-helper",
+    mousse_control = "window-per-route",
+    mousse_control = "peer-ssh-routes",
+    mousse_control = "loopback-routes",
+    mousse_control = "plain-ws-from-ticket",
+    mousse_control = "unapproved-public",
+    mousse_control = "unapproved-last-route",
+    mousse_control = "upgrade-trusts-routes",
+    mousse_control = "resolve-again",
+    mousse_control = "unlisted-allowed",
+    mousse_control = "stale-renewal-routes",
+    mousse_control = "unbounded-candidates",
+    mousse_control = "ssh-races-lan",
+    mousse_control = "bind-all-lan-off",
+    mousse_control = "inbound-before-live",
+    mousse_control = "journal-pins-link",
+    mousse_control = "fabricate-pending-kind2",
+    mousse_control = "joiner-records-in-memory",
+    mousse_control = "link-accepts-kind1",
+    mousse_control = "no-completion-record",
+    mousse_control = "done-pin-only",
+    mousse_control = "replay-after-removal",
+    mousse_control = "join-ignores-removal",
+    mousse_control = "removal-leaves-pending",
     feature = "test-in-person"
 ))]
 const _: () = {
@@ -60,7 +150,9 @@ mod applog;
 mod ipc;
 mod limits;
 mod peer;
+mod pipe;
 mod revoke;
+mod ssh;
 
 /// This build: `<commit>[-dirty]+<profile>`, fixed at compile time (see
 /// `build.rs`; `MOUSSE_BUILD_ID` overrides it).
@@ -133,6 +225,15 @@ enum Command {
         /// Don't advertise on mDNS (it is off anyway on loopback).
         #[arg(long)]
         no_mdns: bool,
+        /// Run the loopback ws listener for a tunnel client on this port
+        /// (0: any). Without it the listener runs, on its kept port, only
+        /// with --tunnel.
+        #[arg(long)]
+        ws_port: Option<u16>,
+        /// The public wss URL of a tunnel to the ws listener, advertised in
+        /// tickets (repeatable).
+        #[arg(long = "tunnel")]
+        tunnels: Vec<String>,
         /// The name paired devices see (default: this computer's name).
         #[arg(long)]
         name: Option<String>,
@@ -194,6 +295,15 @@ enum Command {
         /// Command to run instead of the shell.
         #[arg(last = true)]
         command: Vec<String>,
+    },
+    /// The remote end of an SSH route (run by SSH, not by hand): pass
+    /// stdin and stdout to the running helper of the profile with this
+    /// selector, after the `mousse-ssh/1` marker. Exits 2 (not running),
+    /// 3 (no such profile, or networking off) or 4 (refused).
+    Pipe {
+        /// The profile's selector, from `$MOUSSE_HOME/net-engine/endpoints.json`.
+        #[arg(long)]
+        profile: String,
     },
     /// Cross-machine slice check, run on the dialling side: pair, run a
     /// command, wait for the host to remove this device, check a new
@@ -560,6 +670,9 @@ fn validity(secs: u64) -> String {
 
 async fn run(cli: Cli) -> Result<i32, String> {
     let dir = cli.state.unwrap_or_else(serve::default_state_dir);
+    // Absolute from here on: the control socket of a long state path is
+    // reached after changing to the state directory (Phase 1b §3.3).
+    let dir = std::path::absolute(&dir).unwrap_or(dir);
     let insecure = cli.insecure_file_key;
     match cli.command {
         Command::Init { profile, app } => {
@@ -603,6 +716,8 @@ async fn run(cli: Cli) -> Result<i32, String> {
             listen_ip,
             port,
             no_mdns,
+            ws_port,
+            tunnels,
             name,
             app,
         } => {
@@ -612,6 +727,8 @@ async fn run(cli: Cli) -> Result<i32, String> {
                 port,
                 mdns: !no_mdns,
                 app,
+                ws_port,
+                tunnels,
             };
             serve::run(&dir, insecure, opts).await?;
         }
@@ -629,6 +746,7 @@ async fn run(cli: Cli) -> Result<i32, String> {
             println!("{}", peer::joined_line(&joined, &ticket.host_identity));
         }
         Command::Peers => peer::print_peers(&dir)?,
+        Command::Pipe { profile } => return Ok(pipe::run(&profile).await),
         Command::Grants => match ipc::call(&dir, json!({"cmd": "grants"})).await? {
             Some(reply) => print_grants(&reply),
             None => print_grants(&offline_grants(&dir)?),

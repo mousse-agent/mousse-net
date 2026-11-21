@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "pc-windows",
+  "key": "048ad3ccda2d27fdfc98c131f2fa25bea736ec0a3e8a107dcbfa6b2f5a86b88da452c337f09925646ec76897452505e718f3f397ddf39674e9f5ad64590bc93d57",
+  "payload": "{\"check\":\"phase1b.admission\",\"target\":\"windows-x64\",\"control\":\"ipc-handoff-drops-buffer\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+debug\",\"platform\":\"windows-x86_64\",\"outcome\":\"FAIL\",\"details\":\"1 of 23 tests failed\",\"time\":\"2026-11-20T15:30:20Z\",\"device\":\"pc-windows\",\"config\":\"d1a48ac2a789aa4e72717f747b2344ae213ee9db5f59b420cbe71a8fdc7acd89\"}",
+  "signature": "51a8e4b337c96be7465818e9ebb074389e2e48f09bac921644cb9ba30a7af393c381082bb3537a38abddee66105ba79be0eec2318c4edff81b2d79ad13a3262c"
+}

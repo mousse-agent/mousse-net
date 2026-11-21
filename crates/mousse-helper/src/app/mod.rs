@@ -36,9 +36,11 @@ mod frame;
 mod out;
 mod pairing;
 mod paths;
+mod routes;
 
-pub use changes::{clock, interface_source};
-pub use paths::browse_source;
+pub use changes::{clock, interface_ips, interface_source};
+pub use paths::{browse_source, StoreCandidates};
+pub(crate) use paths::{stored_search, ticket_candidates};
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -48,10 +50,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use mousse_net_core::identity::IdentityPublicKey;
 use mousse_net_core::mux::PriorityClass;
 use mousse_net_core::ErrorCode;
+use mousse_net_io::pipe::RouteKind;
 use mousse_net_io::store::{hex, short_id};
 use mousse_net_io::{
-    Caller, CloseReason, Connection, Host, HostEvent, MuxStream, NetError, StreamAdmission,
-    StreamReader, StreamWriter,
+    Caller, CloseReason, Connection, Host, HostEvent, ListenerKind, MuxStream, NetError,
+    RouteClass, StreamAdmission, StreamReader, StreamWriter,
 };
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -64,16 +67,19 @@ use crate::applog;
 use crate::limits::HelperLimits;
 use crate::revoke::Removal;
 
-/// The protocol this helper speaks: 1.0.
-const PROTO: (u64, u64) = (1, 0);
+/// The protocol this helper speaks: 1.1 (Phase 1b §7), which serves a 1.0
+/// app too.
+const PROTO: (u64, u64) = (1, 1);
 
 /// The stream labels an inbound connection passes on to the app (§3.2).
-pub const LABELS: [&str; 5] = [
+pub const LABELS: [&str; 6] = [
     "mousse.hello",
     "mousse.rpc",
     "mousse.sub",
     "mousse.blob",
     "mousse.put",
+    // One editor tunnel (Phase 1b §9.2).
+    "mousse.tunnel",
 ];
 
 /// What the app learns in the `hello` reply.
@@ -84,7 +90,11 @@ pub struct AppInfo {
     pub name: String,
     pub profile: String,
     pub port: u16,
-    pub routes: Vec<String>,
+    /// The loopback ws listener's port, while it runs (Phase 1b §4.1).
+    pub ws_port: Option<u16>,
+    /// What the listener serves now (Phase 1b §1.5): the routes tickets
+    /// carry, the unbound addresses and the routes config in effect.
+    pub listen: crate::serve::SharedListen,
     pub state_dir: PathBuf,
     /// Where to look for paired hosts that moved (Phase 1a §6).
     pub browse: Option<Arc<mousse_net_io::discovery::CachedBrowse>>,
@@ -92,6 +102,8 @@ pub struct AppInfo {
     /// `test.clock` moves.
     #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub manual_clock: Option<Arc<mousse_net_io::ManualClock>>,
+    /// SSH routes (Phase 1b §3), shared with the caller's `ssh` tier.
+    pub ssh: Arc<crate::ssh::Ssh>,
 }
 
 /// Why the channel ended.
@@ -136,6 +148,8 @@ struct Shared {
     admission: Arc<StreamAdmission>,
     pairing: Mutex<pairing::State>,
     keep: paths::Keep,
+    /// SSH routes: `ssh.*` and the connection window (Phase 1b §3).
+    ssh: Arc<crate::ssh::Ssh>,
     info: AppInfo,
     limits: HelperLimits,
 }
@@ -282,12 +296,14 @@ impl App {
             removal,
             pairing: Mutex::new(pairing::State::new(info.name.clone())),
             keep: paths::Keep::default(),
+            ssh: info.ssh.clone(),
             info,
             limits,
         });
         tokio::spawn(read_stdin(shared.clone()));
         tokio::spawn(write_stdout(shared.clone()));
         tokio::spawn(pairing::watch_pause(shared.clone()));
+        tokio::spawn(pairing::prune_completions(shared.clone()));
         tokio::spawn(paths::keep_connected(shared.clone()));
         tokio::spawn(changes::forward_renewals(shared.clone()));
         Self { shared }
@@ -303,22 +319,63 @@ impl App {
         end.unwrap_or(End::Eof)
     }
 
-    /// An inbound connection: announced once it is live.
-    pub async fn inbound(&self, conn: Connection) {
+    /// An inbound connection that came over a `kind` listener from
+    /// `from` to the listener's address `local`: announced once it is live,
+    /// with its route. Returns its number.
+    pub async fn inbound(
+        &self,
+        conn: Connection,
+        kind: RouteKind,
+        from: Option<std::net::SocketAddr>,
+        local: Option<std::net::SocketAddr>,
+    ) -> Option<u64> {
         let peer = short_id(conn.peer());
-        if !conn.settled(true).await.is_live() {
+        // Must-fail control: announce the connection before step 2 settles.
+        let wait_for_live = !cfg!(mousse_control = "inbound-before-live");
+        if wait_for_live && !conn.settled(true).await.is_live() {
             applog::line(format!("refused {peer}: not live"));
-            return;
+            return None;
         }
+        let class = match (kind, from) {
+            (RouteKind::Tcp, Some(from)) => RouteClass::of_tcp(
+                self.shared
+                    .caller
+                    .addr_policy()
+                    .class_of_inbound(from, local),
+            ),
+            (RouteKind::Ssh, _) => RouteClass::Ssh,
+            _ => RouteClass::Tunnel,
+        };
         let grant = self.shared.host.grant_of(conn.id());
-        let mut fields = json!({"dir": "in"});
+        let mut fields = json!({
+            "dir": "in",
+            "route": {"kind": kind.name(), "class": class.name()},
+        });
         if let Some(g) = &grant {
             fields["grant"] = json!(g.id.0);
             fields["role"] = json!(g.role.as_str());
         }
-        if self.shared.add_conn(conn, true, fields).is_ok() {
-            applog::line(format!("connected {peer} (in)"));
-        }
+        let no = self.shared.add_conn(conn, true, fields).ok()?;
+        applog::line(format!("connected {peer} (in)"));
+        Some(no)
+    }
+
+    /// Close inbound connection `no` when the socket that accepted it
+    /// closes (`closing` turns true or its sender goes).
+    pub fn close_with_socket(&self, no: u64, mut closing: tokio::sync::watch::Receiver<bool>) {
+        let Some(conn) = lock(&self.shared.core)
+            .conns
+            .get(&no)
+            .map(|e| e.conn.clone())
+        else {
+            return;
+        };
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = closing.wait_for(|closed| *closed) => conn.close(ErrorCode::Cancelled),
+                _ = conn.closed() => {}
+            }
+        });
     }
 
     /// The network changed (an interface, or a wake): check every
@@ -624,7 +681,16 @@ impl Shared {
             }
             "stats" => {
                 let a = &self.admission;
+                let pre = self.host.preauth_stats();
+                let per_kind = |n: fn(&mousse_net_io::PreAuthStats, ListenerKind) -> u64| {
+                    ListenerKind::ALL
+                        .iter()
+                        .map(|k| (k.name().to_owned(), Value::from(n(&pre, *k))))
+                        .collect::<Map<String, Value>>()
+                };
                 let reply = json!({
+                    "preauth_open": per_kind(mousse_net_io::PreAuthStats::open),
+                    "preauth_refused": per_kind(mousse_net_io::PreAuthStats::refused),
                     "re": id,
                     "open_streams": a.open_streams(),
                     "queued_bytes": a.queued_bytes(),
@@ -709,10 +775,29 @@ impl Shared {
                 let reply = changes::reopened(self, &mut core, &id, &map);
                 self.reply(&mut core, reply);
             }
+            "routes.config" => {
+                drop(core);
+                let reply = routes::config(self, &id, &map);
+                self.event(reply);
+            }
+            "routes.test" => {
+                drop(core);
+                let route = map.get("route").and_then(Value::as_str).map(str::to_owned);
+                tokio::spawn(routes::test(self.clone(), id, route));
+            }
             #[cfg(debug_assertions)]
             "test.clock" => {
                 let reply = changes::test_clock(self, &id, &map);
                 self.reply(&mut core, reply);
+            }
+            #[cfg(debug_assertions)]
+            "test.ssh_dial" => {
+                drop(core);
+                tokio::spawn(ssh_dial_op(self.clone(), id, map));
+            }
+            op if crate::ssh::OPS.contains(&op) => {
+                drop(core);
+                tokio::spawn(ssh_op(self.clone(), id, op.to_owned(), map));
             }
             op if pairing::OPS.contains(&op) => {
                 drop(core);
@@ -755,6 +840,12 @@ impl Shared {
                 return error(id, "bad_name", e);
             }
         }
+        let listen = self
+            .info
+            .listen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         json!({
             "re": id,
             "proto": [PROTO.0, minor.min(PROTO.1)],
@@ -762,7 +853,10 @@ impl Shared {
             "identity": hex(self.info.identity.as_bytes()),
             "device": short_id(&self.info.identity),
             "port": self.info.port,
-            "routes": self.info.routes,
+            "ws_port": self.info.ws_port,
+            "routes": listen.routes,
+            "routes_config": listen.config,
+            "unbound": listen.unbound,
             "paused": self.removal.paused_reason(),
         })
     }
@@ -1151,4 +1245,91 @@ async fn tx_pump(
         }
     }
     shared.tx_ended(handle);
+}
+
+/// `ssh.*` (Phase 1b §3, §7): run off the reader, the reply queued when
+/// done. A wait in the connection window is announced as `ssh.waiting`.
+async fn ssh_op(shared: Arc<Shared>, id: Value, op: String, map: Map<String, Value>) {
+    let ssh = shared.ssh.clone();
+    let events = shared.clone();
+    let mut done = ssh.handle(&op, &map, move |ev| events.event(ev)).await;
+    if op == "ssh.forget" && done.is_ok() {
+        // The route's address and approvals go too (§1.3).
+        let id = map.get("route_id").and_then(Value::as_str).unwrap_or("");
+        if let Err(e) = paths::forget_address(&shared, &format!("ssh://mousse-{id}")) {
+            done = Err(crate::ssh::Fail {
+                error: "store_failed",
+                reason: e.to_string(),
+            });
+        }
+    }
+    let reply = match done {
+        Ok(mut reply) => {
+            if let Some(obj) = reply.as_object_mut() {
+                obj.insert("re".into(), id);
+            }
+            reply
+        }
+        Err(f) => error(&id, f.error, f.reason),
+    };
+    shared.event(reply);
+}
+
+/// Debug builds only: `test.ssh_dial {route_id, selector, identity,
+/// within_ms?}` opens an outbound path to the paired host `identity` over
+/// the SSH route alone, as the caller's `ssh` tier will, and announces it
+/// with `conn.up`. Checks use it to drive `ssh-stdio` end to end.
+#[cfg(debug_assertions)]
+async fn ssh_dial_op(shared: Arc<Shared>, id: Value, map: Map<String, Value>) {
+    let field = |k: &str| map.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
+    let pin = match mousse_net_io::store::identity_from_hex(&field("identity")) {
+        Ok(pin) => pin,
+        Err(_) => {
+            shared.event(error(
+                &id,
+                "bad_request",
+                "test.ssh_dial needs identity (hex)",
+            ));
+            return;
+        }
+    };
+    let within = std::time::Duration::from_millis(
+        map.get("within_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(20_000),
+    );
+    let deadline = tokio::time::Instant::now() + within;
+    let route_id = field("route_id");
+    let events = shared.clone();
+    let host = route_id.clone();
+    let opened = shared
+        .ssh
+        .dial(&route_id, &field("selector"), within, move |wait| {
+            events.event(json!({
+                "ev": "ssh.waiting",
+                "route_id": host,
+                "ms": u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+            }))
+        })
+        .await;
+    let gen = shared.peer_gen(&pin);
+    let dialled = match opened {
+        Ok(pipe) => match tokio::time::timeout_at(deadline, shared.caller.dial(pipe, pin)).await {
+            Ok(got) => got,
+            Err(_) => Err(NetError::Timeout("ssh dial")),
+        },
+        Err(e) => Err(e),
+    };
+    let reply = match dialled {
+        Ok(conn) => {
+            let fields = json!({"dir": "out", "route": {"kind": "ssh", "class": "ssh"}});
+            match shared.add_outbound(conn, gen, fields) {
+                Ok(no) => json!({"re": id, "conn": no}),
+                Err(_) => error(&id, "paused", "networking is paused"),
+            }
+        }
+        Err(NetError::Ssh { reason, detail }) => error(&id, reason.name(), detail),
+        Err(e) => error(&id, "unreachable", e.to_string()),
+    };
+    shared.event(reply);
 }

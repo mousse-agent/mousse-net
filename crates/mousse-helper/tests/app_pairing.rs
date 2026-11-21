@@ -403,19 +403,21 @@ fn a_removal_that_cannot_be_journaled_changes_nothing() {
     );
 }
 
-/// The app channel replaces the Phase 0 control listener: an app-mode
-/// helper writes no control file, so `invite` on the command line finds
-/// no host.
+/// The app channel carries everything but the remote `pipe`: an app-mode
+/// helper's control listener answers only `pipe` and `status` (Phase 1b
+/// §3.3), so `invite` on the command line is pointed at the app's CLI.
 #[test]
-fn an_app_mode_helper_has_no_control_listener() {
+fn an_app_mode_helper_answers_only_pipe_and_status_on_its_control_listener() {
     let end = Endpoint::init("noctl");
     let mut a = end.app("hostA", &[]);
     a.hello();
-    assert!(!end.dir.join("control.json").exists());
+    assert!(end.dir.join("control.json").exists());
     let mut invite = end.cli(&["invite", "--no-qr"], false);
     assert_ne!(invite.exit_within(WAIT), Some(0));
     assert!(
-        invite.err().contains("no host is running"),
+        invite
+            .err()
+            .contains("run by Mousse; use mousse-cli net-engine"),
         "{}",
         invite.err()
     );

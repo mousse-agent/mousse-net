@@ -34,7 +34,12 @@ pub async fn forward_renewals(shared: Arc<Shared>) {
     let mut events = shared.caller.start_renewals();
     while let Some(event) = events.recv().await {
         match event {
-            PathEvent::Reopen { pin, from, conn } => {
+            PathEvent::Reopen {
+                pin,
+                from,
+                conn,
+                reached,
+            } => {
                 let identity = hex(pin.as_bytes());
                 if shared.removal.is_paused() {
                     // Nothing new while networking is paused; the caller
@@ -68,8 +73,10 @@ pub async fn forward_renewals(shared: Arc<Shared>) {
                     continue;
                 }
                 let role = paths::stored_role(&shared, &pin);
-                let Ok(no) = shared.add_outbound(conn, gen, json!({"dir": "out", "role": role}))
-                else {
+                // Every conn.up carries its route, a renewed path's too.
+                let route = paths::route_json(&reached);
+                let fields = json!({"dir": "out", "role": role, "route": route});
+                let Ok(no) = shared.add_outbound(conn, gen, fields) else {
                     continue;
                 };
                 applog::line(format!("renewed path to {} (conn {no})", short_id(&pin)));
@@ -179,6 +186,26 @@ pub fn interface_source() -> Arc<dyn InterfaceSource> {
         return Arc::new(FileInterfaces(path.into()));
     }
     Arc::new(mousse_net_io::watch::SystemInterfaces)
+}
+
+/// This computer's interface addresses, loopback included: from the
+/// computer, or in debug builds from the file named by
+/// `MOUSSE_HELPER_INTERFACES_FILE` (the address is each line's second
+/// word).
+pub fn interface_ips() -> Vec<std::net::IpAddr> {
+    #[cfg(debug_assertions)]
+    if let Some(path) = std::env::var_os("MOUSSE_HELPER_INTERFACES_FILE") {
+        return std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.split_whitespace().nth(1)?.parse().ok())
+            .collect();
+    }
+    if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|i| i.ip())
+        .collect()
 }
 
 /// The helper's clock, and in debug builds with

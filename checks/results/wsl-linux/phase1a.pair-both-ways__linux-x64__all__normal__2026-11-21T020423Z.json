@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "wsl-linux",
+  "key": "042f0974403d57624956aebbe7cd72f01b86773fdee66ffba37429d70a320ccb692f06069a9174535d971428932d86132cc89eef54954c5f9c5c6ed605fea234bb",
+  "payload": "{\"check\":\"phase1a.pair-both-ways\",\"target\":\"linux-x64\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+unknown\",\"platform\":\"linux-x86_64\",\"outcome\":\"PASS\",\"details\":\"printed \\\"PASS phase1a.pair-both-ways\\\"\",\"time\":\"2026-11-21T02:04:23Z\",\"device\":\"wsl-linux\",\"config\":\"8036daec0a65fbc6b95fecc1ad9d857d40296e9145826a22eb59f9f864e6cfed\",\"extra\":{\"app_build\":\"a4dd507d97c719545168c88a22a3499b2f4cc448\"}}",
+  "signature": "b631aa1ad7e6a3ff0e0d269de82e8ca98e82a170969f31f579be533a9144ac3c8394b0ed1c2635e67d5da4c6e95cc2a366956a79ed5c2dcf55c34f12716d9d86"
+}

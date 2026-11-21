@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "mac-mini",
+  "key": "04d63225e01c2fd84d8a4588702b08561c26da25295387d39876ea36c7f2deee75ec54bd53c9d5b09712f13f737f0ece0038931c8226886a42d77430c7c4e486ee",
+  "payload": "{\"check\":\"phase1b.no-rpc-without-grant\",\"target\":\"macos-arm64\",\"case\":\"tcp\",\"control\":\"inbound-before-live\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+unknown\",\"platform\":\"macos-aarch64\",\"outcome\":\"FAIL\",\"details\":\"printed \\\"FAIL phase1b.no-rpc-without-grant\\\" (reason=probe_reached_app)\",\"time\":\"2026-11-20T15:31:24Z\",\"device\":\"mac-mini\",\"config\":\"9ba85c8f4f838a985f80d472f0460f610e3beb0f9dcaf5b0f0a435067393b07e\",\"extra\":{\"app_build\":\"a4dd507d97c719545168c88a22a3499b2f4cc448\",\"reason\":\"probe_reached_app\"}}",
+  "signature": "596aaef2ecd622bed74e4ab79ae8185d17deaf85cddbbba40e1692df6dd884d6143ace1f2896679ce5c5dd25b09670f01dbbe0a22e707667ef97d7aef5d42ad6"
+}

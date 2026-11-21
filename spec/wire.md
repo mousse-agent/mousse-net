@@ -787,14 +787,16 @@ A skipped hint is not an error: the joiner tries the next one.
 | Scheme | Form | Meaning |
 |---|---|---|
 | `tcp` | `tcp://<host>:<port>` | A direct TLS connection. |
+| `wss` | `wss://<host>[:<port>]<path>` | The same TLS connection, carried in WebSocket binary messages inside an outer TLS connection to a tunnel the host's owner runs. |
 | `mdns` | `mdns:<instance>` | Browse for this service instance on the local network. |
-| `ssh`, `ws`, `wss`, `relay` | reserved | Kept for later transports. Skipped as `reserved`. |
+| `ssh`, `ws`, `relay` | reserved | Kept for transports that never appear on the wire (`ssh`, plain `ws`) or later ones. Skipped as `reserved`. |
 | anything else, or no `:` | | Skipped as `unknown_scheme`. |
 
-A `tcp` or `mdns` hint that breaks its grammar is skipped as `malformed`:
+A `tcp`, `wss` or `mdns` hint that breaks its grammar is skipped as
+`malformed`:
 
 - `<port>`: decimal 1 to 65535, ASCII digits only, no sign, no leading zero.
-  The port is the text after the last `:`.
+  In a `tcp` hint the port is the text after the last `:`.
 - `<host>` is read by its shape:
   - in square brackets: an IPv6 address in an RFC 4291 section 2.2 text form
     (an embedded IPv4 part follows the IPv4 rule below), with no zone id;
@@ -806,7 +808,17 @@ A `tcp` or `mdns` hint that breaks its grammar is skipped as `malformed`:
     bytes; no trailing dot; the last label is not all digits. A reader
     lowercases the name (ASCII letters only) and uses and compares only the
     lowercased form.
-- Nothing else may appear: no user part, path, query or fragment.
+- Nothing else may appear in a `tcp` hint: no user part, path, query or
+  fragment.
+- `wss`: `<host>` as above, then an optional `:<port>` (443 when absent),
+  then `<path>`: 1 to 200 bytes of ASCII letters, digits and `.`, `_`, `~`,
+  `/`, `-`, starting with `/` and ending with `/mousse-net/1`. No user part,
+  query, fragment or percent-encoding. The host and port end at the first
+  `/` after `wss://`; a port is the text after a `:` that follows the host
+  (after the `]` of an IPv6 host). A vector's result always gives the port,
+  443 when the hint has none.
+  The outer TLS connection verifies the tunnel's certificate for `<host>`;
+  the inner one is checked against the pin like any other route.
 - `<instance>`: 1 to 63 bytes of UTF-8 with no control characters (Unicode
   general category Cc).
 

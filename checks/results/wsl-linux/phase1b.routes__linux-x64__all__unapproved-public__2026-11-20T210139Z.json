@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "wsl-linux",
+  "key": "042f0974403d57624956aebbe7cd72f01b86773fdee66ffba37429d70a320ccb692f06069a9174535d971428932d86132cc89eef54954c5f9c5c6ed605fea234bb",
+  "payload": "{\"check\":\"phase1b.routes\",\"target\":\"linux-x64\",\"control\":\"unapproved-public\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+debug\",\"platform\":\"linux-x86_64\",\"outcome\":\"FAIL\",\"details\":\"2 of 40 tests failed\",\"time\":\"2026-11-20T21:01:39Z\",\"device\":\"wsl-linux\",\"config\":\"a4451905b736aea840c8f5aba09a2e3b5f22cc1262d895d0f4402db6e2c16163\"}",
+  "signature": "1518521d963230649288d95d7abdfd969612faa0a02ce340ec54b979e852283aa677ccd043224e07b00a0911f43cb3fff9a7e9c657e7b2ff7e56d77228318831"
+}

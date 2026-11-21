@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "pc-windows",
+  "key": "048ad3ccda2d27fdfc98c131f2fa25bea736ec0a3e8a107dcbfa6b2f5a86b88da452c337f09925646ec76897452505e718f3f397ddf39674e9f5ad64590bc93d57",
+  "payload": "{\"check\":\"phase1a.pair-both-ways\",\"target\":\"windows-x64\",\"control\":\"no-consent-journal\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+unknown\",\"platform\":\"windows-x86_64\",\"outcome\":\"FAIL\",\"details\":\"printed \\\"FAIL phase1a.pair-both-ways\\\" (reason=one_way_stuck)\",\"time\":\"2026-11-21T01:27:29Z\",\"device\":\"pc-windows\",\"config\":\"78bd3120d479cf249c2ff9b84ce7c79851aa8843209ee0535a533d89d9101477\",\"extra\":{\"app_build\":\"a4dd507d97c719545168c88a22a3499b2f4cc448\",\"reason\":\"one_way_stuck\"}}",
+  "signature": "01bd9c086d23518cbdf9fcdc6ba338189e9073f8b0f6b3476fafce6ba1593921c4b7bf79647dba3872498c586e6fa315145f560bdd9b9a28b814f47b89e6341d"
+}

@@ -1,0 +1,341 @@
+# Phase 1b: user routes, the CLI and "Send link" (docs/PLAN.md, "Phase 1b";
+# docs/phase1b-design.md §14).
+#
+# Owner check: `mousse-check phase1b` shows PASS in every target cell, with
+# ATTESTED only for the manual steps, and no INCOMPLETE. Format:
+# checks/README.md.
+#
+# A check (or one of its route cases) that `waits` for an engine slice is
+# INCOMPLETE, and is not run, until that slice's files are in the tree. App
+# checks (`app = true`) also need app/MOUSSE_REVISION at the app branch that
+# carries their M slice.
+#
+# Route cases (`cases`): each case is its own run and its own result, with
+# `--route <case>` passed to tools/app-check/run.mjs. Every case must pass,
+# and every control must print FAIL in every case.
+
+phase = "phase1b"
+title = "User routes, CLI and Send link"
+plan = "docs/PLAN.md#phase-1b-user-routes-cli-and-send-link"
+
+# ---------------------------------------------------------------------------
+# Engine checks
+
+[[check]]
+id = "phase1b.routes"
+title = "Route grammar (wss path, loopback-only ws); allowlist classify; approval policy and stored provenance; resolve once and dial the classified address; bounded tiered dial; renewals and last_route filtered by approvals; only selected interfaces bound and served addresses advertised; routes.test"
+plan = "docs/phase1b-design.md §1, §2 and §15 (E7)"
+targets = ["windows-x64", "macos-arm64", "linux-x64"]
+min_tests = 30
+waits = [{ slice = "E7", paths = ["crates/mousse-helper/tests/app_routes.rs"] }]
+local = [
+  { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_routes", "--no-fail-fast"] },
+  { target = "macos-arm64", host = "macos-aarch64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_routes", "--no-fail-fast"] },
+  { target = "linux-x64", host = "linux-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_routes", "--no-fail-fast"] },
+]
+control = [
+  { name = "peer-ssh-routes", breaks = "a peer's routes may name ssh targets", env = { RUSTFLAGS = '--cfg mousse_control="peer-ssh-routes"' } },
+  { name = "loopback-routes", breaks = "a release-policy build dials a ticket's loopback hint", env = { RUSTFLAGS = '--cfg mousse_control="loopback-routes"' } },
+  { name = "plain-ws-from-ticket", breaks = "a ticket's plain ws hint is dialled", env = { RUSTFLAGS = '--cfg mousse_control="plain-ws-from-ticket"' } },
+  { name = "unapproved-public", breaks = "a ticket's public hint is dialled without approval", env = { RUSTFLAGS = '--cfg mousse_control="unapproved-public"' } },
+  { name = "unapproved-last-route", breaks = "last_route and renewals skip the approval filter", env = { RUSTFLAGS = '--cfg mousse_control="unapproved-last-route"' } },
+  { name = "upgrade-trusts-routes", breaks = "a 1.0 store's routes count as approved", env = { RUSTFLAGS = '--cfg mousse_control="upgrade-trusts-routes"' } },
+  { name = "resolve-again", breaks = "the pipe resolves the name again instead of dialling the classified address", env = { RUSTFLAGS = '--cfg mousse_control="resolve-again"' } },
+  { name = "unlisted-allowed", breaks = "classify treats unlisted ranges as public", env = { RUSTFLAGS = '--cfg mousse_control="unlisted-allowed"' } },
+  { name = "stale-renewal-routes", breaks = "renewals dial the remembered list after an edit", env = { RUSTFLAGS = '--cfg mousse_control="stale-renewal-routes"' } },
+  { name = "unbounded-candidates", breaks = "the search ignores DIAL_MAX_CANDIDATES and DIAL_SEARCH_MS", env = { RUSTFLAGS = '--cfg mousse_control="unbounded-candidates"' } },
+  { name = "ssh-races-lan", breaks = "ssh candidates start with tcp ones", env = { RUSTFLAGS = '--cfg mousse_control="ssh-races-lan"' } },
+  { name = "bind-all-lan-off", breaks = "the listener binds 0.0.0.0 with LAN off", env = { RUSTFLAGS = '--cfg mousse_control="bind-all-lan-off"' } },
+]
+
+[[check]]
+id = "phase1b.admission"
+title = "Per-kind pre-auth pools taken at accept; ws upgrade and IPC line caps; slot held through join-only until the invitation ends; a re-pair from live takes a slot and meets the fence; the fence at gate registration and enrollment on every transport, raced against TLS completion; buffer-keeping IPC handoff; IPv6 per /64; tighten-only overrides"
+plan = "docs/phase1b-design.md §6.2 and §15 (E10)"
+targets = ["windows-x64", "macos-arm64", "linux-x64"]
+min_tests = 18
+waits = [{ slice = "E10", paths = ["crates/mousse-helper/tests/app_admission.rs"] }]
+local = [
+  { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_admission", "--no-fail-fast"] },
+  { target = "macos-arm64", host = "macos-aarch64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_admission", "--no-fail-fast"] },
+  { target = "linux-x64", host = "linux-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_admission", "--no-fail-fast"] },
+]
+control = [
+  { name = "no-preauth-budget", breaks = "no pre-auth cap on any listener", env = { RUSTFLAGS = '--cfg mousse_control="no-preauth-budget"' } },
+  { name = "shared-preauth-pool", breaks = "one pool for all listener kinds, so a ws flood blocks the pipe", env = { RUSTFLAGS = '--cfg mousse_control="shared-preauth-pool"' } },
+  { name = "ws-slot-after-headers", breaks = "the ws slot is taken after the upgrade is read", env = { RUSTFLAGS = '--cfg mousse_control="ws-slot-after-headers"' } },
+  { name = "ipc-unbounded-line", breaks = "IPC lines are read with no size or time cap", env = { RUSTFLAGS = '--cfg mousse_control="ipc-unbounded-line"' } },
+  { name = "ipc-handoff-drops-buffer", breaks = "the pipe handoff drops bytes the line reader had buffered", env = { RUSTFLAGS = '--cfg mousse_control="ipc-handoff-drops-buffer"' } },
+  { name = "join-only-frees-slot", breaks = "a join-only connection releases its slot before enrollment", env = { RUSTFLAGS = '--cfg mousse_control="join-only-frees-slot"' } },
+  { name = "join-only-outlives-invitation", breaks = "a join-only connection stays after its invitation ends", env = { RUSTFLAGS = '--cfg mousse_control="join-only-outlives-invitation"' } },
+  { name = "fence-at-accept-only", breaks = "the fence is checked at accept but not at gate registration, so a handshake finishing during the pause gets in", env = { RUSTFLAGS = '--cfg mousse_control="fence-at-accept-only"' } },
+  { name = "fence-tcp-only", breaks = "the fence covers TCP but not ws and pipe", env = { RUSTFLAGS = '--cfg mousse_control="fence-tcp-only"' } },
+  { name = "enroll-while-paused", breaks = "enrollment commits a grant while paused", env = { RUSTFLAGS = '--cfg mousse_control="enroll-while-paused"' } },
+  { name = "repair-skips-slot", breaks = "an already-granted peer's re-pair proof goes join-only with that kind's pool full", env = { RUSTFLAGS = '--cfg mousse_control="repair-skips-slot"' } },
+  { name = "repair-skips-fence", breaks = "an already-granted peer's re-pair proof goes join-only while removal is paused", env = { RUSTFLAGS = '--cfg mousse_control="repair-skips-fence"' } },
+  { name = "limits-raise", breaks = "an override may raise a tighten-only limit", env = { RUSTFLAGS = '--cfg mousse_control="limits-raise"' } },
+]
+
+[[check]]
+id = "phase1b.ssh"
+title = "ssh-stdio through the system client and a local test server: one constrained config per route with the kept ssh -G options, strict pinned host keys written from the probed bytes, atomic rotation, marker and preamble, pipe --profile to the running helper ending when the helper closes, the window per resolved host and port"
+plan = "docs/phase1b-design.md §3 and §15 (E9)"
+targets = ["windows-x64", "macos-arm64", "linux-x64"]
+min_tests = 16
+waits = [{ slice = "E9", paths = ["crates/mousse-helper/tests/app_ssh.rs"] }]
+local = [
+  { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_ssh", "--no-fail-fast"] },
+  { target = "macos-arm64", host = "macos-aarch64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_ssh", "--no-fail-fast"] },
+  { target = "linux-x64", host = "linux-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_ssh", "--no-fail-fast"] },
+]
+control = [
+  { name = "accept-new-host-key", breaks = "ssh runs with StrictHostKeyChecking=accept-new", env = { RUSTFLAGS = '--cfg mousse_control="accept-new-host-key"' } },
+  { name = "user-config-in-pipe", breaks = "the pipe dial reads the user's ssh config instead of the route's", env = { RUSTFLAGS = '--cfg mousse_control="user-config-in-pipe"' } },
+  { name = "trust-unprobed-key", breaks = "ssh.trust writes a key other than the probed bytes", env = { RUSTFLAGS = '--cfg mousse_control="trust-unprobed-key"' } },
+  { name = "pipe-no-token", breaks = "the IPC hands over a pipe without the token", env = { RUSTFLAGS = '--cfg mousse_control="pipe-no-token"' } },
+  { name = "no-preamble-skip", breaks = "the client feeds output before the marker to TLS", env = { RUSTFLAGS = '--cfg mousse_control="no-preamble-skip"' } },
+  { name = "pipe-outlives-helper", breaks = "the remote pipe waits for stdin to end after the helper closed", env = { RUSTFLAGS = '--cfg mousse_control="pipe-outlives-helper"' } },
+  { name = "window-per-route", breaks = "the connection window is kept per route, not per resolved host and port", env = { RUSTFLAGS = '--cfg mousse_control="window-per-route"' } },
+]
+
+[[check]]
+id = "phase1b.ws"
+title = "Loopback ws listener refuses non-upgrade, wrong path, Origin, missing subprotocol, slow or large headers and text frames; wss client with the platform verifier plus a debug-only root through a TLS-terminating stand-in"
+plan = "docs/phase1b-design.md §4 and §15 (E8)"
+targets = ["windows-x64", "macos-arm64", "linux-x64"]
+min_tests = 12
+waits = [{ slice = "E8", paths = ["crates/mousse-helper/tests/app_ws.rs"] }]
+local = [
+  { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_ws", "--no-fail-fast"] },
+  { target = "macos-arm64", host = "macos-aarch64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_ws", "--no-fail-fast"] },
+  { target = "linux-x64", host = "linux-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_ws", "--no-fail-fast"] },
+]
+control = [
+  { name = "ws-allow-origin", breaks = "the ws listener accepts requests with Origin", env = { RUSTFLAGS = '--cfg mousse_control="ws-allow-origin"' } },
+  { name = "plain-ws-off-loopback", breaks = "the client dials plain ws to a non-loopback address", env = { RUSTFLAGS = '--cfg mousse_control="plain-ws-off-loopback"' } },
+  { name = "release-test-root", breaks = "a release build reads the extra test root", env = { RUSTFLAGS = '--cfg mousse_control="release-test-root"' } },
+]
+
+[[check]]
+id = "phase1b.send-link"
+title = "Pair by link and code; every tampered field fails as §5.5; three wrong codes end the invitation and the flow, and reopening fails on both sides; fresh and expired swapped links never end already-paired; completion records; crashes after confirmation, after the completion record and with a pre-existing pin recover correctly"
+plan = "docs/phase1b-design.md §5 and §15 (E11)"
+targets = ["windows-x64", "macos-arm64", "linux-x64"]
+min_tests = 22
+waits = [{ slice = "E11", paths = ["crates/mousse-helper/tests/app_link.rs"] }]
+local = [
+  { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_link", "--no-fail-fast"] },
+  { target = "macos-arm64", host = "macos-aarch64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_link", "--no-fail-fast"] },
+  { target = "linux-x64", host = "linux-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_link", "--no-fail-fast"] },
+]
+control = [
+  { name = "journal-pins-link", breaks = "a consented send-link join counts the ticket's host as pinned", env = { RUSTFLAGS = '--cfg mousse_control="journal-pins-link"' } },
+  { name = "fabricate-pending-kind2", breaks = "an expired kind-2 join makes up a pending outcome", env = { RUSTFLAGS = '--cfg mousse_control="fabricate-pending-kind2"' } },
+  { name = "skip-code-confirm", breaks = "the joiner accepts PAIRED without CPace key confirmation", env = { RUSTFLAGS = '--cfg mousse_control="skip-code-confirm"' } },
+  { name = "host-attempts-reset-on-reconnect", breaks = "a new connection resets the host's attempt count", env = { RUSTFLAGS = '--cfg mousse_control="host-attempts-reset-on-reconnect"' } },
+  { name = "joiner-records-in-memory", breaks = "app mode keeps joiner flow records in memory, so a restart restores three tries", env = { RUSTFLAGS = '--cfg mousse_control="joiner-records-in-memory"' } },
+  { name = "invitation-survives-exhaustion", breaks = "the host keeps the invitation after the third failure", env = { RUSTFLAGS = '--cfg mousse_control="invitation-survives-exhaustion"' } },
+  { name = "link-accepts-kind1", breaks = "a kind-1 ticket is accepted with arrival link", env = { RUSTFLAGS = '--cfg mousse_control="link-accepts-kind1"' } },
+  { name = "no-completion-record", breaks = "the pin is saved without a completion record first", env = { RUSTFLAGS = '--cfg mousse_control="no-completion-record"' } },
+  { name = "join-ignores-removal", breaks = "a join stores its host after peer.forget removed it during the join", env = { RUSTFLAGS = '--cfg mousse_control="join-ignores-removal"' } },
+  { name = "removal-leaves-pending", breaks = "a join whose host was removed meanwhile keeps its pending mark, so a repeat learns PAIRED and restores the host", env = { RUSTFLAGS = '--cfg mousse_control="removal-leaves-pending"' } },
+  { name = "same-code-after-failure", breaks = "the host keeps showing the failed attempt's code", env = { RUSTFLAGS = '--cfg mousse_control="same-code-after-failure"' } },
+  { name = "done-pin-only", breaks = "completion recovery saves the pin but not the peer's routes and approvals, so a replay has neither", env = { RUSTFLAGS = '--cfg mousse_control="done-pin-only"' } },
+  { name = "pin-stored-memory-only", breaks = "replay after a restart settles only the in-memory flow, so the pending mark on disk stays", env = { RUSTFLAGS = '--cfg mousse_control="pin-stored-memory-only"' } },
+]
+
+# ---------------------------------------------------------------------------
+# App checks (`app = true`): the Mousse app at app/MOUSSE_REVISION, from the
+# clean checkout named by MOUSSE_APP_DIR, against the helper built from this
+# checkout (tools/app-check/run.mjs). Every app check points Plus at the
+# kit's recorder and runs behind the egress guards (checks/README.md, "Route
+# cases, Plus and egress").
+
+[[check]]
+id = "phase1b.no-rpc-without-grant"
+title = "The §6.3 probe on every route (tcp, ws, ssh): each case gets its own wire close and its own app-side record; the editor-off case is delivered, then refused"
+plan = "docs/phase1b-design.md §6.3 and §15 (E12, M13)"
+targets = ["windows-x64", "macos-arm64", "linux-x64"]
+judge = "marker"
+app = true
+cases = ["tcp", "ws", "ssh"]
+waits = [
+  { slice = "E10", paths = ["crates/mousse-helper/tests/app_admission.rs"] },
+  { slice = "E8", paths = ["crates/mousse-helper/tests/app_ws.rs"], case = "ws" },
+  { slice = "E9", paths = ["crates/mousse-helper/tests/app_ssh.rs"], case = "ssh" },
+]
+local = [
+  { target = "windows-x64", host = "windows-x86_64", command = ["node", "{root}/tools/app-check/run.mjs", "phase1b.no-rpc-without-grant", "--route", "{case}", "--out", "{out}"] },
+  { target = "macos-arm64", host = "macos-aarch64", command = ["node", "{root}/tools/app-check/run.mjs", "phase1b.no-rpc-without-grant", "--route", "{case}", "--out", "{out}"] },
+  { target = "linux-x64", host = "linux-x86_64", command = ["node", "{root}/tools/app-check/run.mjs", "phase1b.no-rpc-without-grant", "--route", "{case}", "--out", "{out}"] },
+]
+control = [
+  { name = "admit-ungranted", expect_reason = "wire_accepted", breaks = "the host gate treats an identity awaiting a proof as live", env = { RUSTFLAGS = '--cfg mousse_control="admit-ungranted"' } },
+  { name = "join-only-streams", expect_reason = "wire_accepted", breaks = "a join-only connection may open streams", env = { RUSTFLAGS = '--cfg mousse_control="join-only-streams"' } },
+  { name = "inbound-before-live", expect_reason = "probe_reached_app", breaks = "the helper announces a connection before it is live", env = { RUSTFLAGS = '--cfg mousse_control="inbound-before-live"' } },
+  { name = "tunnel-ignores-editor", expect_reason = "probe_reached_app", breaks = "the engine editor refusal skips the editor switch, so the editor-off case starts an endpoint session", env = { MOUSSE_NET_ENGINE_CONTROL = "tunnel-ignores-editor" } },
+]
+
+[[check]]
+id = "phase1b.routes-app"
+title = "1a's app cases (picker-v1-off, private-streams, pair-both-ways, removal, once-or-unknown, reconnect, path-switch, shared-computer) over tcp (tailnet and public classes), ws and ssh (two loopback SSH routes, one per direction), route asserted, Plus recorded and egress denied"
+plan = "docs/phase1b-design.md §14 and §15 (M8, M10, M11)"
+targets = ["windows-x64", "macos-arm64", "linux-x64"]
+judge = "marker"
+app = true
+cases = ["tcp", "ws", "ssh"]
+waits = [
+  { slice = "E7", paths = ["crates/mousse-helper/tests/app_routes.rs"] },
+  { slice = "E8", paths = ["crates/mousse-helper/tests/app_ws.rs"], case = "ws" },
+  { slice = "E9", paths = ["crates/mousse-helper/tests/app_ssh.rs"], case = "ssh" },
+]
+local = [
+  { target = "windows-x64", host = "windows-x86_64", command = ["node", "{root}/tools/app-check/run.mjs", "phase1b.routes-app", "--route", "{case}", "--out", "{out}"] },
+  { target = "macos-arm64", host = "macos-aarch64", command = ["node", "{root}/tools/app-check/run.mjs", "phase1b.routes-app", "--route", "{case}", "--out", "{out}"] },
+  { target = "linux-x64", host = "linux-x86_64", command = ["node", "{root}/tools/app-check/run.mjs", "phase1b.routes-app", "--route", "{case}", "--out", "{out}"] },
+]
+control = [
+  { name = "plus-probe", expect_reason = "plus_contacted", breaks = "route setup asks Plus for anything", env = { MOUSSE_NET_ENGINE_CONTROL = "plus-probe" } },
+  { name = "egress-probe", expect_reason = "egress_attempted", breaks = "the app contacts an address outside the cell, not through the Plus redirect", env = { MOUSSE_NET_ENGINE_CONTROL = "egress-probe" } },
+  { name = "lan-only-candidates", expect_reason = "route_mismatch", breaks = "the app passes only LAN addresses to the helper", env = { MOUSSE_NET_ENGINE_CONTROL = "lan-only-candidates" } },
+  { name = "route-leak", expect_reason = "route_mismatch", breaks = "the app adds routes other than the one under test, offered first and answering", env = { MOUSSE_NET_ENGINE_CONTROL = "route-leak" } },
+]
+# Each 1a case keeps its own 1a control and runs it in every route case
+# (the app script runs them inside the check).
+
+[[check]]
+id = "phase1b.link-app"
+title = "Link pairing through the daemon's methods: argv activation in an isolated user-data folder into the selected profile, destinations approved and stored, code typed, Connected both ways; three wrong codes end both dialogs and reopening fails on both sides; restart mid-code keeps the count; every §5.5 tamper refused; a pre-existing pin promotes nothing; a crash before peers.json is saved, with WSS the only route, is replayed with routes and approvals; replay settles the on-disk mark after a restart and restores nothing after a removal; a damaged link after a one-way SSH add changes no grant on either side"
+plan = "docs/phase1b-design.md §5 and §15 (E11, M9)"
+targets = ["windows-x64", "macos-arm64", "linux-x64"]
+judge = "marker"
+app = true
+waits = [
+  { slice = "E11", paths = ["crates/mousse-helper/tests/app_link.rs"] },
+  { slice = "E8", paths = ["crates/mousse-helper/tests/app_ws.rs"] },
+  { slice = "E9", paths = ["crates/mousse-helper/tests/app_ssh.rs"] },
+]
+local = [
+  { target = "windows-x64", host = "windows-x86_64", command = ["node", "{root}/tools/app-check/run.mjs", "phase1b.link-app", "--out", "{out}"] },
+  { target = "macos-arm64", host = "macos-aarch64", command = ["node", "{root}/tools/app-check/run.mjs", "phase1b.link-app", "--out", "{out}"] },
+  { target = "linux-x64", host = "linux-x86_64", command = ["node", "{root}/tools/app-check/run.mjs", "phase1b.link-app", "--out", "{out}"] },
+]
+control = [
+  { name = "replay-after-removal", expect_reason = "removed_peer_restored", breaks = "removal leaves completion records, so a later join.status restores the removed host", env = { RUSTFLAGS = '--cfg mousse_control="replay-after-removal"' } },
+  { name = "already-grants-back", expect_reason = "grant_without_code", breaks = "a kind-2 already-paired outcome counts as done and runs grantBack", env = { MOUSSE_NET_ENGINE_CONTROL = "already-grants-back" } },
+  { name = "pin-promotes-kind2", expect_reason = "promoted_without_completion", breaks = "app recovery moves a consented kind-2 row to joined on any held pin", env = { MOUSSE_NET_ENGINE_CONTROL = "pin-promotes-kind2" } },
+  { name = "link-approvals-lost", expect_reason = "approval_lost", breaks = "a repeated join after restart ignores the consented row's approved list", env = { MOUSSE_NET_ENGINE_CONTROL = "link-approvals-lost" } },
+  { name = "link-scheme-registered", expect_reason = "scheme_registered", breaks = "a kit-started app registers the mousse scheme", env = { MOUSSE_NET_ENGINE_CONTROL = "link-scheme-registered" } },
+]
+
+[[check]]
+id = "phase1b.ssh-add-app"
+title = "Add over SSH (test server, second Mousse home): existing profile, a profile paired elsewhere, a new one; never refused; one way only; B's row connected on A's first inbound; a crash at each prepare step resumes with one profile and one grant; a removal on B survives A's retries; an existing 1a row is kept and a lost existing reply is returned again; a crash between the row and its grant id resumes; a crash after the grant is saved, then a removal, then a restart with no retry leaves no grant and no row; a later Send link converts the rows and ends connected both ways; no daemon autostart"
+plan = "docs/phase1b-design.md §3.4 to §3.6 and §15 (E9, M10)"
+targets = ["windows-x64", "macos-arm64", "linux-x64"]
+judge = "marker"
+app = true
+waits = [
+  { slice = "E9", paths = ["crates/mousse-helper/tests/app_ssh.rs"] },
+  { slice = "E11", paths = ["crates/mousse-helper/tests/app_link.rs"] },
+]
+local = [
+  { target = "windows-x64", host = "windows-x86_64", command = ["node", "{root}/tools/app-check/run.mjs", "phase1b.ssh-add-app", "--out", "{out}"] },
+  { target = "macos-arm64", host = "macos-aarch64", command = ["node", "{root}/tools/app-check/run.mjs", "phase1b.ssh-add-app", "--out", "{out}"] },
+  { target = "linux-x64", host = "linux-x86_64", command = ["node", "{root}/tools/app-check/run.mjs", "phase1b.ssh-add-app", "--out", "{out}"] },
+]
+control = [
+  { name = "refuse-if-paired", expect_reason = "refused_paired_profile", breaks = "SSH setup hides or refuses a profile paired elsewhere", env = { MOUSSE_NET_ENGINE_CONTROL = "refuse-if-paired" } },
+  { name = "ssh-row-pairback", expect_reason = "ssh_row_pairback", breaks = "1a's advance, recovery or grantBack acts on a source ssh row", env = { MOUSSE_NET_ENGINE_CONTROL = "ssh-row-pairback" } },
+  { name = "profile-before-journal", expect_reason = "duplicate_after_crash", breaks = "B creates the profile before journaling the request", env = { MOUSSE_NET_ENGINE_CONTROL = "profile-before-journal" } },
+  { name = "grant-id-not-checked", expect_reason = "removed_grant_reported_live", breaks = "B answers a done request from its stored reply without checking the stored grant id", env = { MOUSSE_NET_ENGINE_CONTROL = "grant-id-not-checked" } },
+  { name = "retry-after-connected", expect_reason = "removal_undone", breaks = "A repeats prepare after NOT_AUTHORIZED on a row that was connected", env = { MOUSSE_NET_ENGINE_CONTROL = "retry-after-connected" } },
+  { name = "overwrite-1a-row", expect_reason = "1a_row_lost", breaks = "prepare overwrites an existing row for A", env = { MOUSSE_NET_ENGINE_CONTROL = "overwrite-1a-row" } },
+  { name = "own-row-not-resumed", expect_reason = "stuck_granting", breaks = "a repeat after a crash treats the request's own ssh_granting row as another pairing's", env = { MOUSSE_NET_ENGINE_CONTROL = "own-row-not-resumed" } },
+  { name = "existing-reply-not-kept", expect_reason = "existing_reply_lost", breaks = "a repeat after a lost existing reply answers removed", env = { MOUSSE_NET_ENGINE_CONTROL = "existing-reply-not-kept" } },
+  { name = "removal-skips-unsaved-grant", expect_reason = "grant_survived_removal", breaks = "removal of a row with no grant id leaves the helper's grant, which reconciliation turns into a pairing", env = { MOUSSE_NET_ENGINE_CONTROL = "removal-skips-unsaved-grant" } },
+  { name = "ssh-row-not-converted", expect_reason = "stuck_finishing", breaks = "a code-confirmed ticket join keeps source ssh on the row, so pairing never finishes", env = { MOUSSE_NET_ENGINE_CONTROL = "ssh-row-not-converted" } },
+  { name = "remote-autostart", expect_reason = "daemon_started", breaks = "net-engine ssh starts the daemon", env = { MOUSSE_NET_ENGINE_CONTROL = "remote-autostart" } },
+]
+
+[[check]]
+id = "phase1b.editor-app"
+title = "Editor tunnel over the engine with v1 off: the engine's own EditorEndpoint with pinned host keys; refused with editor off; editor off, block or removal closes an open tunnel and sweeps"
+plan = "docs/phase1b-design.md §9.2 and §15 (M13)"
+targets = ["windows-x64", "macos-arm64", "linux-x64"]
+judge = "marker"
+app = true
+local = [
+  { target = "windows-x64", host = "windows-x86_64", command = ["node", "{root}/tools/app-check/run.mjs", "phase1b.editor-app", "--out", "{out}"] },
+  { target = "macos-arm64", host = "macos-aarch64", command = ["node", "{root}/tools/app-check/run.mjs", "phase1b.editor-app", "--out", "{out}"] },
+  { target = "linux-x64", host = "linux-x86_64", command = ["node", "{root}/tools/app-check/run.mjs", "phase1b.editor-app", "--out", "{out}"] },
+]
+control = [
+  { name = "tunnel-ignores-editor", expect_reason = "tunnel_without_editor", breaks = "the engine editor refusal skips the editor switch", env = { MOUSSE_NET_ENGINE_CONTROL = "tunnel-ignores-editor" } },
+  { name = "no-reconcile", expect_reason = "tunnel_outlived_right", breaks = "engine rights changes do not run reconcile", env = { MOUSSE_NET_ENGINE_CONTROL = "no-reconcile" } },
+]
+
+[[check]]
+id = "phase1b.routes-cross"
+title = "PC dials the Mac over tcp (Mac LAN listener, tailnet class by stand-in map), ws (tunnel stand-in on the Mac) and ssh (test server on the Mac), one signed result per route, route asserted, Plus recorded and egress denied; terminal and remote thread on the Mac from the PC"
+plan = "docs/phase1b-design.md §14 (cross-machine) and §15 order step 7"
+targets = ["pc-to-mac-lan"]
+judge = "marker"
+cross_machine = true
+app = true
+cases = ["tcp", "ws", "ssh"]
+waits = [
+  { slice = "E7", paths = ["crates/mousse-helper/tests/app_routes.rs"] },
+  { slice = "E8", paths = ["crates/mousse-helper/tests/app_ws.rs"], case = "ws" },
+  { slice = "E9", paths = ["crates/mousse-helper/tests/app_ssh.rs"], case = "ssh" },
+]
+device_steps = "As phase1a.pair-offline, once per case, with phase1b.routes-cross --route <case> on both run.mjs commands; the Mac runs --role host and is the only side listening off loopback. tcp and ws pair by kit fixture (the app script grants the PC on the Mac and pins the Mac on the PC, as phase1a.pair-offline does); ssh by a real SSH add from the PC. The PC runs with MOUSSE_NET_TEST_EGRESS=<mac LAN ip>. Controls run per case, and each result names its case."
+control = [
+  { name = "plus-probe", expect_reason = "plus_contacted", breaks = "route setup asks Plus for anything", env = { MOUSSE_NET_ENGINE_CONTROL = "plus-probe" } },
+  { name = "egress-probe", expect_reason = "egress_attempted", breaks = "the app contacts an address outside the cell", env = { MOUSSE_NET_ENGINE_CONTROL = "egress-probe" } },
+  { name = "route-leak", expect_reason = "route_mismatch", breaks = "the app adds routes other than the one under test", env = { MOUSSE_NET_ENGINE_CONTROL = "route-leak" } },
+]
+
+[[check]]
+id = "phase1b.desktop-builds"
+title = "Release helper and packaged app for six targets: --version names the build; the packaged app starts; release serve answers mousse-check probe over tcp and ws on loopback"
+plan = "docs/phase1b-design.md §14 and §15 (M14, E12)"
+targets = ["windows-x64", "windows-arm64", "macos-arm64", "macos-x64", "linux-x64", "linux-arm64"]
+judge = "marker"
+app = true
+waits = [{ slice = "E8", paths = ["crates/mousse-helper/tests/app_ws.rs"] }]
+hosted = ["windows-arm64"]
+# macos-x64 runs under Rosetta and linux-arm64 in a container on the Mac.
+# windows-arm64 runs natively on a GitHub-hosted windows-11-arm runner
+# (.github/workflows/windows-arm-smoke.yml). The kit counts it, shown as
+# hosted, only after `mousse-check hosted verify` checked the smoke and its
+# must-fail control against both pinned commits and the artifact digest.
+local = [
+  { target = "windows-x64", host = "windows-x86_64", command = ["node", "{root}/tools/build-smoke.mjs", "phase1b.desktop-builds", "--target", "windows-x64", "--out", "{out}"] },
+  { target = "macos-arm64", host = "macos-aarch64", command = ["node", "{root}/tools/build-smoke.mjs", "phase1b.desktop-builds", "--target", "macos-arm64", "--out", "{out}"] },
+  { target = "macos-x64", host = "macos-aarch64", command = ["node", "{root}/tools/build-smoke.mjs", "phase1b.desktop-builds", "--target", "macos-x64", "--out", "{out}"] },
+  { target = "linux-x64", host = "linux-x86_64", command = ["node", "{root}/tools/build-smoke.mjs", "phase1b.desktop-builds", "--target", "linux-x64", "--out", "{out}"] },
+  { target = "linux-arm64", host = "macos-aarch64", command = ["node", "{root}/tools/build-smoke.mjs", "phase1b.desktop-builds", "--target", "linux-arm64", "--out", "{out}"] },
+]
+control = [
+  { name = "stale-helper", expect_reason = "stale_helper", breaks = "the packaged helper is not the build under test", env = { MOUSSE_BUILD_ID = "0000000+release" } },
+]
+
+# ---------------------------------------------------------------------------
+# Manual steps (attested with both app and helper builds)
+
+[[check]]
+id = "phase1b.pair-by-chat-link"
+title = "Mac: Send link; post it in the kit's loopback chat page; PC opens the page in the default browser, clicks the link, types the code, connected both ways (Mac to PC through the kit relay). A second link with one character changed fails. Afterwards the installed Mousse is the mousse handler again."
+plan = "docs/phase1b-design.md §14 (chat fixture, deep link) and §15 order step 7"
+targets = ["pc-to-mac-lan"]
+manual = true
+steps = "Attest with both app and helper builds. The same throwaway token file (32+ hex digits) on both. Mac: node tools/app-check/relay.mjs serve --listen <mac LAN ip>:<port> --control <mac LAN ip>:<port> --token-file <file>. PC: node tools/app-check/relay.mjs dial --relay <mac LAN ip>:<control port> --to 127.0.0.1:<PC helper port> --token-file <file>, and share the relay listen address in pairback. Mac: Send link; PC: node tools/app-check/chat-page.mjs --link <link>, open the printed page in the default browser and click the link."
+
+[[check]]
+id = "phase1b.login-start"
+title = "With the existing startup entry installed, reboot the Mac and log in without opening Mousse: the PC's row reads Connected within 30 s"
+plan = "docs/phase1b-design.md §10"
+targets = ["pc-to-mac-lan"]
+manual = true
+steps = "Attest with both app and helper builds."

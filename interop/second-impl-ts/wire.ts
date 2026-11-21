@@ -137,8 +137,9 @@ export const checkJoinerExpiry = (expires: UInt, now: UInt) => {
   requireThat(BigInt(now) < BigInt(expires) + 600n, 'expired');
 };
 
+type Host = { ipv4: string } | { ipv6: string } | { dns: string };
 type Route = { skip: 'malformed' | 'unknown_scheme' | 'reserved' } | { mdns: string } |
-  { tcp: { host: { ipv4: string } | { ipv6: string } | { dns: string }; port: number } };
+  { tcp: { host: Host; port: number } } | { wss: { host: Host; port: number; path: string } };
 
 function ipv6Hex(address: string): string {
   // The URL parser serializes a validated IPv6 host with hex groups, including IPv4 tails.
@@ -152,29 +153,60 @@ function ipv6Hex(address: string): string {
   return groups.map(group => group.padStart(4, '0')).join('');
 }
 
+// `<host>` by its shape (wire.md 10.2.1), or null when it breaks the grammar.
+function routeHost(host: string): Host | null {
+  if (/\s/.test(host)) return null;
+  if (host.startsWith('[') && host.endsWith(']')) {
+    const ipv6 = host.slice(1, -1);
+    if (ipv6.includes('%') || isIP(ipv6) !== 6) return null;
+    return { ipv6: ipv6Hex(ipv6) };
+  }
+  if (/^[0-9.]+$/.test(host)) return isIP(host) === 4 ? { ipv4: host } : null;
+  const labels = host.split('.');
+  if (host.length > 253 || /^\d+$/.test(labels.at(-1)!) ||
+      !labels.every(label => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(label))) return null;
+  return { dns: host.toLowerCase() };
+}
+
+// `<port>`: decimal 1 to 65535, no sign, no leading zero.
+const routePort = (digits: string): number | null =>
+  /^[1-9][0-9]{0,4}$/.test(digits) && Number(digits) <= 65535 ? Number(digits) : null;
+
 export function routeHint(hint: string): Route {
   const colon = hint.indexOf(':');
   const scheme = colon < 0 ? '' : hint.slice(0, colon);
   const tail = hint.slice(colon + 1);
   const malformed = { skip: 'malformed' } as const;
-  if (['ssh', 'ws', 'wss', 'relay'].includes(scheme)) return { skip: 'reserved' };
+  if (['ssh', 'ws', 'relay'].includes(scheme)) return { skip: 'reserved' };
   if (scheme === 'mdns') return textString(tail, 1, 63) && !/\p{Cc}/u.test(tail) ? { mdns: tail } : malformed;
-  if (scheme !== 'tcp') return { skip: 'unknown_scheme' };
-  const match = tail.match(/^\/\/(\[[^\[\]]+\]|[^:]+):([1-9][0-9]{0,4})$/);
-  if (!match || /\s/.test(tail)) return malformed;
-  const [, host, digits] = match;
-  const port = Number(digits);
-  if (port > 65535) return malformed;
-  if (host.startsWith('[') && host.endsWith(']')) {
-    const ipv6 = host.slice(1, -1);
-    if (ipv6.includes('%') || isIP(ipv6) !== 6) return malformed;
-    return { tcp: { host: { ipv6: ipv6Hex(ipv6) }, port } };
+  if (scheme === 'wss') {
+    // The host and port end at the path's first `/`; no host form holds one.
+    if (!tail.startsWith('//')) return malformed;
+    const slash = tail.indexOf('/', 2);
+    if (slash < 0) return malformed;
+    const authority = tail.slice(2, slash);
+    const path = tail.slice(slash);
+    if (path.length > 200 || !/^\/[A-Za-z0-9._~\/-]*$/.test(path) || !path.endsWith('/mousse-net/1')) {
+      return malformed;
+    }
+    // A port follows the host's last `:` outside the IPv6 brackets.
+    const close = authority.lastIndexOf(']');
+    const portColon = authority.lastIndexOf(':');
+    let hostText = authority;
+    let port: number | null = 443;
+    if (portColon > close) {
+      hostText = authority.slice(0, portColon);
+      port = routePort(authority.slice(portColon + 1));
+    }
+    const host = routeHost(hostText);
+    return host && port ? { wss: { host, port, path } } : malformed;
   }
-  if (/^[0-9.]+$/.test(host)) return isIP(host) === 4 ? { tcp: { host: { ipv4: host }, port } } : malformed;
-  const labels = host.split('.');
-  if (host.length > 253 || /^\d+$/.test(labels.at(-1)!) ||
-      !labels.every(label => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(label))) return malformed;
-  return { tcp: { host: { dns: host.toLowerCase() }, port } };
+  if (scheme !== 'tcp') return { skip: 'unknown_scheme' };
+  const match = tail.match(/^\/\/(\[[^\[\]]+\]|[^:]+):([^:]*)$/);
+  if (!match) return malformed;
+  const host = routeHost(match[1]);
+  const port = routePort(match[2]);
+  return host && port ? { tcp: { host, port } } : malformed;
 }
 
 export interface PeerBinding { host: Uint8Array; joiner: Uint8Array; exporter: Uint8Array }

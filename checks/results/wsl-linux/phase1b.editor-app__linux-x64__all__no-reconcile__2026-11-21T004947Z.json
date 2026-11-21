@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "wsl-linux",
+  "key": "042f0974403d57624956aebbe7cd72f01b86773fdee66ffba37429d70a320ccb692f06069a9174535d971428932d86132cc89eef54954c5f9c5c6ed605fea234bb",
+  "payload": "{\"check\":\"phase1b.editor-app\",\"target\":\"linux-x64\",\"control\":\"no-reconcile\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+unknown\",\"platform\":\"linux-x86_64\",\"outcome\":\"FAIL\",\"details\":\"printed \\\"FAIL phase1b.editor-app\\\" (reason=tunnel_outlived_right)\",\"time\":\"2026-11-21T00:49:47Z\",\"device\":\"wsl-linux\",\"config\":\"3148aa0c0f937d090bbffca3246fa10e6a22016eddd30d426e0f8c5e2cadcc26\",\"extra\":{\"app_build\":\"a4dd507d97c719545168c88a22a3499b2f4cc448\",\"reason\":\"tunnel_outlived_right\"}}",
+  "signature": "9283aa50659629ba9bfeccf7bf098866aab3c3697b2029e25c4c408da0a34717761a0c6f7f85975d685585642aa945d1f4d642315016f11c8d569e50d5aaa708"
+}

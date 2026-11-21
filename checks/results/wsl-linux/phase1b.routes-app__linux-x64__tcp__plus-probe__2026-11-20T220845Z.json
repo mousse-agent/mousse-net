@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "wsl-linux",
+  "key": "042f0974403d57624956aebbe7cd72f01b86773fdee66ffba37429d70a320ccb692f06069a9174535d971428932d86132cc89eef54954c5f9c5c6ed605fea234bb",
+  "payload": "{\"check\":\"phase1b.routes-app\",\"target\":\"linux-x64\",\"case\":\"tcp\",\"control\":\"plus-probe\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+unknown\",\"platform\":\"linux-x86_64\",\"outcome\":\"FAIL\",\"details\":\"printed \\\"FAIL phase1b.routes-app\\\" (reason=plus_contacted)\",\"time\":\"2026-11-20T22:08:45Z\",\"device\":\"wsl-linux\",\"config\":\"0f948af2e1f2f78341cacd546ecb3047bf7b114c8cd9a99e3fd51b018b239579\",\"extra\":{\"app_build\":\"a4dd507d97c719545168c88a22a3499b2f4cc448\",\"reason\":\"plus_contacted\"}}",
+  "signature": "520f3d9bd44f6d7385062688544fa20f38d35ee3f7d72a15f1bef241b7c9899977205e5863d467df574faec337f45b95fd0143c68d00d9867e800940f86396b5"
+}

@@ -1,0 +1,7 @@
+{
+  "format": "mousse-check-signed-result-v1",
+  "device": "pc-windows",
+  "key": "048ad3ccda2d27fdfc98c131f2fa25bea736ec0a3e8a107dcbfa6b2f5a86b88da452c337f09925646ec76897452505e718f3f397ddf39674e9f5ad64590bc93d57",
+  "payload": "{\"check\":\"phase1b.ssh-add-app\",\"target\":\"windows-x64\",\"control\":\"own-row-not-resumed\",\"build\":\"61d34bf7ea01a02916b4e8997fe1e64458a91b06+unknown\",\"platform\":\"windows-x86_64\",\"outcome\":\"FAIL\",\"details\":\"printed \\\"FAIL phase1b.ssh-add-app\\\" (reason=stuck_granting)\",\"time\":\"2026-11-20T20:39:12Z\",\"device\":\"pc-windows\",\"config\":\"39e03be2d183c2b9516d57468580f728062d2caf247773f97c4bf8fb3b9a7d26\",\"extra\":{\"app_build\":\"a4dd507d97c719545168c88a22a3499b2f4cc448\",\"reason\":\"stuck_granting\"}}",
+  "signature": "9817efb4d7e4ee49249bf7426fb1042c7c8fdd8a730b39f0fc77a0137e0725fc4d6aa99b2004f0dc093b046c4367cd279ccb8d039c8db0e2f7708c15c0843713"
+}
