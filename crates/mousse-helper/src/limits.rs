@@ -29,6 +29,12 @@ const DEBUG_HOOKS: [&str; 6] = [
 /// After [`ENV_PREFIX`]: the Mousse app's helper path in unpackaged builds.
 const APP_HELPER_PATH: &str = "HELPER";
 
+/// After [`ENV_PREFIX`]: `mousse-relay`'s own limits, which may be set in
+/// the same environment and are not the helper's.
+const RELAY_PREFIX: &str = "RELAY_";
+/// After [`ENV_PREFIX`]: settings that are not limits ([`settings`]).
+const SETTINGS: [&str; 1] = ["PLUS_URL"];
+
 mousse_net_core::define_limits! {
     /// The helper's own limits.
     pub struct HelperLimits {
@@ -88,6 +94,36 @@ mousse_net_core::define_limits! {
         keep_retry_first_ms = "KEEP_RETRY_FIRST_MS": 1_000, [10, 60_000];
         /// Keep connected: longest wait between redials of a host that could not be reached; not below the first wait.
         keep_retry_max_ms = "KEEP_RETRY_MAX_MS": 60_000, [10, 3_600_000];
+        /// Oldest removal ("remove on all my hosts") a host accepts or an admin device keeps queued; also how long a host keeps removal ids (tighten only).
+        removal_max_age_secs = "REMOVAL_MAX_AGE_SECS": 2_592_000, [86_400, 2_592_000];
+        /// How long one side of `mousse-removal` waits for the other's message (the removal, or the host's answer).
+        removal_answer_wait_ms = "REMOVAL_ANSWER_WAIT_MS": 10_000, [1_000, 120_000];
+        /// One request to Plus.
+        plus_timeout_ms = "PLUS_TIMEOUT_MS": 10_000, [1_000, 60_000];
+        /// Largest answer from Plus the helper reads.
+        plus_answer_max_bytes = "PLUS_ANSWER_MAX_BYTES": 4_194_304, [65_536, 67_108_864];
+        /// First wait before retrying a Plus request; each next wait doubles.
+        plus_retry_first_ms = "PLUS_RETRY_FIRST_MS": 1_000, [100, 60_000];
+        /// Longest wait before retrying a Plus request; not below the first.
+        plus_retry_max_ms = "PLUS_RETRY_MAX_MS": 300_000, [1_000, 3_600_000];
+        /// Use of the current lease, in percent, at which the next block is asked for (and the threshold the relay reports at).
+        plus_prefetch_percent = "PLUS_PREFETCH_PERCENT": 50, [10, 90];
+        /// Wait before presenting a block or admission token again that a relay refused for `not before`, or for having no Plus clock yet.
+        plus_not_before_retry_ms = "PLUS_NOT_BEFORE_RETRY_MS": 1_000, [1_000, 10_000];
+        /// After this long without a new block, relayed bulk shows paused; below the relay's default refill wait.
+        plus_refill_deadline_ms = "PLUS_REFILL_DEADLINE_MS": 5_000, [1_000, 9_000];
+        /// How often a host fetches its Plus inbox.
+        plus_mail_poll_secs = "PLUS_MAIL_POLL_SECS": 300, [30, 86_400];
+        /// How long a hosted relay move stages the new route before cutting over.
+        via_relay_move_stage_secs = "VIA_RELAY_MOVE_STAGE_SECS": 86_400, [0, 604_800];
+        /// Most inbox pages one mail round fetches; a Plus that pages without end cannot hold the round.
+        plus_mail_pages_max = "PLUS_MAIL_PAGES_MAX": 100, [1, 10_000];
+        /// Hosted relays: a new registration key (handle) this often; at least twice MANIFEST_OVERLAP_SECS, so at most two handles per relay are live (§B.4).
+        handle_rotate_secs = "HANDLE_ROTATE_SECS": 1_209_600, [172_800, 7_776_000];
+        /// Hosted relays: how often the helper reads the relay fleet from Plus (also at once when its relay cannot be reached).
+        plus_fleet_refresh_secs = "PLUS_FLEET_REFRESH_SECS": 3_600, [60, 86_400];
+        /// Caller: the least time between two reads of one host's directory slot when no route reaches it (§B.12).
+        plus_slot_read_secs = "PLUS_SLOT_READ_SECS": 300, [10, 86_400];
         /// IPC: longest line a local client may send (Phase 1b §6.2; tighten only).
         ipc_line_max_bytes = "IPC_LINE_MAX_BYTES": 65_536, [1_024, 65_536];
         /// IPC: how long a local client has to send its first line (Phase 1b §6.2; tighten only).
@@ -116,6 +152,28 @@ mousse_net_core::define_limits! {
         join_done_keep_secs = "JOIN_DONE_KEEP_SECS": 86_400, [0, 2_592_000];
         /// Checks only: how long `init` waits before it makes the endpoint, so a check can stop the app during the first start. Run for the app (`--app`), its stdin closing still ends it at once.
         init_hold_ms = "INIT_HOLD_MS": 0, [0, 60_000];
+        /// Through a relay: connect, outer TLS, upgrade, `CALL` or `JOIN`, the splice and step 1, for one try; above the relay's refusal deadline (Phase 3 §B.6).
+        via_relay_dial_ms = "VIA_RELAY_DIAL_MS": 10_000, [1_000, 60_000];
+        /// Own relays: first wait before registering again after a registration ended or failed; each next wait doubles.
+        via_relay_retry_first_ms = "VIA_RELAY_RETRY_FIRST_MS": 1_000, [100, 60_000];
+        /// Own relays: longest wait between registrations; not below the first.
+        via_relay_retry_max_ms = "VIA_RELAY_RETRY_MAX_MS": 60_000, [1_000, 600_000];
+        /// Own relays: a registration sends `PING` after this long without sending.
+        via_relay_keepalive_ms = "VIA_RELAY_KEEPALIVE_MS": 20_000, [1_000, 120_000];
+        /// Own relays: a registration that hears nothing for this long is dropped and made again; above the keepalive.
+        via_relay_idle_ms = "VIA_RELAY_IDLE_MS": 60_000, [3_000, 600_000];
+        /// How often the helper checks relay invitation and recovery expiry, rotation overlaps and manifest renewal.
+        via_relay_check_ms = "VIA_RELAY_CHECK_MS": 30_000, [100, 600_000];
+        /// Own relays: accept legs being dialled at once; an `INCOMING` past it is left to time out (a relay cannot make the host dial without bound; tighten only).
+        via_relay_accept_legs = "VIA_RELAY_ACCEPT_LEGS": 64, [1, 64];
+        /// Own relays: during a key rotation, the wait between tries to register the new key (and between `SUCCESSOR`s while the relay refuses it).
+        via_relay_rotation_retry_ms = "VIA_RELAY_ROTATION_RETRY_MS": 1_000, [100, 60_000];
+        /// How long an old relay route or registration key stays in the manifest after a rotation, counted from the rotation's start less the clock skew (Phase 3 §B.4, §B.11); at most the relay's most `RELAY_SUCCESSOR_OVERLAP_SECS`, and the smaller of the two when the relay advertises a tighter one, so the route leaves before the relay drops the key (tighten only).
+        manifest_overlap_secs = "MANIFEST_OVERLAP_SECS": 604_800, [86_400, 604_800];
+        /// When a manifest becomes stale (still dialled, last); above the overlap.
+        manifest_lifetime_secs = "MANIFEST_LIFETIME_SECS": 2_592_000, [604_800, 7_776_000];
+        /// How long a consumed invitation's tag stays in the allow-set for relay-only pairing recovery (Phase 3 §B.7; tighten only).
+        via_relay_rejoin_secs = "VIA_RELAY_REJOIN_SECS": 86_400, [600, 86_400];
     }
     agree(h) {
         if h.app_credit_interactive_reserve_bytes >= h.app_credit_budget_bytes {
@@ -131,6 +189,36 @@ mousse_net_core::define_limits! {
                 h.app_stream_credit_bytes,
                 h.app_credit_budget_bytes,
                 h.app_credit_interactive_reserve_bytes
+            )));
+        }
+        if h.via_relay_retry_max_ms < h.via_relay_retry_first_ms {
+            return Err(LimitError::Conflict(format!(
+                "VIA_RELAY_RETRY_MAX_MS ({}) is below VIA_RELAY_RETRY_FIRST_MS ({})",
+                h.via_relay_retry_max_ms, h.via_relay_retry_first_ms
+            )));
+        }
+        if h.via_relay_idle_ms <= h.via_relay_keepalive_ms {
+            return Err(LimitError::Conflict(format!(
+                "VIA_RELAY_IDLE_MS ({}) is not above VIA_RELAY_KEEPALIVE_MS ({})",
+                h.via_relay_idle_ms, h.via_relay_keepalive_ms
+            )));
+        }
+        if h.manifest_lifetime_secs <= h.manifest_overlap_secs {
+            return Err(LimitError::Conflict(format!(
+                "MANIFEST_LIFETIME_SECS ({}) is not above MANIFEST_OVERLAP_SECS ({})",
+                h.manifest_lifetime_secs, h.manifest_overlap_secs
+            )));
+        }
+        if h.handle_rotate_secs < h.manifest_overlap_secs.saturating_mul(2) {
+            return Err(LimitError::Conflict(format!(
+                "HANDLE_ROTATE_SECS ({}) is below twice MANIFEST_OVERLAP_SECS ({})",
+                h.handle_rotate_secs, h.manifest_overlap_secs
+            )));
+        }
+        if h.plus_retry_max_ms < h.plus_retry_first_ms {
+            return Err(LimitError::Conflict(format!(
+                "PLUS_RETRY_MAX_MS ({}) is below PLUS_RETRY_FIRST_MS ({})",
+                h.plus_retry_max_ms, h.plus_retry_first_ms
             )));
         }
         if h.keep_retry_max_ms < h.keep_retry_first_ms {
@@ -210,14 +298,17 @@ impl Limits {
     /// Mousse app's own variables (`MOUSSE_NET_ENGINE_*`, and
     /// `MOUSSE_NET_HELPER`, the helper's path) are not the helper's and are
     /// not reported: the app's environment reaches the helper it spawns.
+    /// Nor are the relay's (`MOUSSE_NET_RELAY_*`).
     pub fn unknown_names(names: impl Iterator<Item = OsString>) -> Vec<String> {
         names
             .filter_map(|n| n.into_string().ok())
             .filter(|n| {
                 n.strip_prefix(ENV_PREFIX).is_some_and(|rest| {
                     !rest.starts_with(APP_PREFIX)
+                        && !rest.starts_with(RELAY_PREFIX)
                         && rest != APP_HELPER_PATH
                         && !(cfg!(debug_assertions) && DEBUG_HOOKS.contains(&rest))
+                        && !SETTINGS.contains(&rest)
                         && !Self::specs().any(|s| s.name == rest)
                 })
             })
@@ -246,6 +337,8 @@ pub fn init_from_env() -> Result<(), String> {
     }
     let limits = Limits::from_vars(|key| std::env::var_os(key))?;
     let _ = LIMITS.set(limits);
+    let settings = Settings::from_vars(|key| std::env::var_os(key))?;
+    let _ = SETTINGS_READ.set(settings);
     Ok(())
 }
 
@@ -257,6 +350,71 @@ pub fn get() -> &'static Limits {
 /// The helper's own limits.
 pub fn helper() -> &'static HelperLimits {
     &get().helper
+}
+
+/// Settings that are not limits: text values read once at startup
+/// (`docs/limits.md`, "Settings").
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Settings {
+    /// `MOUSSE_NET_PLUS_URL`: the Plus origin, `https://host[:port]` with
+    /// no path. Unset: no Plus. Debug builds also take `http://` on a
+    /// loopback address, for the test stand-in.
+    pub plus_url: Option<String>,
+}
+
+impl Settings {
+    /// From the variables `var` returns. An invalid value is an error that
+    /// names the variable.
+    pub fn from_vars(var: impl Fn(&str) -> Option<OsString>) -> Result<Self, String> {
+        let key = format!("{ENV_PREFIX}PLUS_URL");
+        let plus_url = match var(&key) {
+            None => None,
+            Some(raw) => {
+                let text = raw
+                    .into_string()
+                    .map_err(|_| format!("{key} is not valid text"))?;
+                Some(check_plus_url(&text).map_err(|why| format!("{key}={text:?}: {why}"))?)
+            }
+        };
+        Ok(Self { plus_url })
+    }
+}
+
+/// Check a Plus origin: `https://host[:port]`, no path, query or user.
+/// Debug builds also take `http://` on a loopback address.
+pub fn check_plus_url(text: &str) -> Result<String, String> {
+    let text = text.strip_suffix('/').unwrap_or(text);
+    let (scheme, rest) = text
+        .split_once("://")
+        .ok_or_else(|| "needs https://host".to_string())?;
+    if rest.is_empty() || rest.contains(['/', '?', '#', '@', ' ']) {
+        return Err("must be an origin: https://host[:port], with no path".into());
+    }
+    match scheme {
+        "https" => Ok(text.to_owned()),
+        "http" if cfg!(debug_assertions) && is_loopback_authority(rest) => Ok(text.to_owned()),
+        "http" => Err("must use https (http only on loopback, in debug builds)".into()),
+        _ => Err("must use https".into()),
+    }
+}
+
+fn is_loopback_authority(authority: &str) -> bool {
+    let host = match authority.rsplit_once(':') {
+        Some((h, port)) if port.bytes().all(|b| b.is_ascii_digit()) => h,
+        _ => authority,
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+static SETTINGS_READ: OnceLock<Settings> = OnceLock::new();
+
+/// The settings read at startup (none before that).
+pub fn settings() -> &'static Settings {
+    SETTINGS_READ.get_or_init(Settings::default)
 }
 
 /// `ms` milliseconds.
@@ -333,6 +491,38 @@ mod tests {
             .map(|(k, v)| ((*k).to_owned(), OsString::from(*v)))
             .collect();
         move |k| map.get(k).cloned()
+    }
+
+    /// The recovery window keeps a consumed invitation's tag listed at a
+    /// relay: it can be shortened, never made longer.
+    #[test]
+    fn the_rejoin_window_can_only_be_tightened() {
+        let spec = HelperLimits::SPECS
+            .iter()
+            .find(|s| s.name == "VIA_RELAY_REJOIN_SECS")
+            .unwrap();
+        assert_eq!(spec.max, spec.default);
+        assert!(Limits::from_vars(vars(&[("MOUSSE_NET_VIA_RELAY_REJOIN_SECS", "86401")])).is_err());
+        assert!(
+            Limits::from_vars(vars(&[("MOUSSE_NET_MANIFEST_OVERLAP_SECS", "2592000")])).is_err()
+        );
+    }
+
+    #[test]
+    fn the_manifest_overlap_is_at_most_the_relay_s() {
+        // A route must leave the manifest before the relay drops its key;
+        // the relay keeps a superseded key at most this long.
+        let most = mousse_net_core::relay::RelayLimits::DEFAULT.successor_overlap_secs();
+        let spec = HelperLimits::SPECS
+            .iter()
+            .find(|s| s.name == "MANIFEST_OVERLAP_SECS")
+            .unwrap();
+        assert_eq!(spec.max, most);
+        assert!(Limits::from_vars(vars(&[
+            ("MOUSSE_NET_MANIFEST_OVERLAP_SECS", "700000"),
+            ("MOUSSE_NET_HANDLE_ROTATE_SECS", "2000000"),
+        ]))
+        .is_err());
     }
 
     #[test]
@@ -420,6 +610,19 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(err.contains("APP_STREAM_CREDIT_BYTES"), "{err}");
+        // Hosted handles rotate at least twice an overlap apart (§B.4), so
+        // at most two handles per relay are live.
+        let err = Limits::from_vars(vars(&[
+            ("MOUSSE_NET_HANDLE_ROTATE_SECS", "172800"),
+            ("MOUSSE_NET_MANIFEST_OVERLAP_SECS", "86401"),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("HANDLE_ROTATE_SECS"), "{err}");
+        assert!(Limits::from_vars(vars(&[
+            ("MOUSSE_NET_HANDLE_ROTATE_SECS", "172800"),
+            ("MOUSSE_NET_MANIFEST_OVERLAP_SECS", "86400"),
+        ]))
+        .is_ok());
     }
 
     #[test]
@@ -448,6 +651,8 @@ mod tests {
             "MOUSSE_NET_ENGINE_MAX_MESSAGE_BYTES",
             "MOUSSE_NET_ENGINE_CONTROL",
             "MOUSSE_NET_HELPER",
+            // The relay's, set beside a relay on the same machine.
+            "MOUSSE_NET_RELAY_REFUSE_MS",
         ]
         .map(OsString::from);
         assert_eq!(
@@ -495,6 +700,32 @@ mod tests {
                 "docs/limits.md has no row starting {row}"
             );
         }
+    }
+
+    #[test]
+    fn the_plus_url_is_an_https_origin() {
+        assert_eq!(
+            check_plus_url("https://plus.example/"),
+            Ok("https://plus.example".into())
+        );
+        assert!(check_plus_url("https://plus.example/v1").is_err());
+        assert!(check_plus_url("https://user@plus.example").is_err());
+        assert!(check_plus_url("ftp://plus.example").is_err());
+        assert!(check_plus_url("http://plus.example").is_err());
+        // The test stand-in, on loopback, in debug builds only.
+        assert_eq!(
+            check_plus_url("http://127.0.0.1:4000").is_ok(),
+            cfg!(debug_assertions)
+        );
+        let names = ["MOUSSE_NET_PLUS_URL", "MOUSSE_NET_PLUS_URLS"].map(OsString::from);
+        assert_eq!(
+            Limits::unknown_names(names.into_iter()),
+            vec!["MOUSSE_NET_PLUS_URLS".to_string()]
+        );
+        let bad = Settings::from_vars(|k| {
+            (k == "MOUSSE_NET_PLUS_URL").then(|| OsString::from("plus.example"))
+        });
+        assert!(bad.unwrap_err().contains("MOUSSE_NET_PLUS_URL"));
     }
 
     #[test]

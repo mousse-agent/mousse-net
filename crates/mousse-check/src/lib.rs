@@ -21,6 +21,7 @@ pub mod build;
 pub mod eval;
 pub mod evidence;
 pub mod hosted;
+pub mod inspect;
 pub mod kit;
 pub mod manifest;
 pub mod probe;

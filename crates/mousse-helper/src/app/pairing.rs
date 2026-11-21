@@ -33,7 +33,6 @@ use std::sync::{Arc, MutexGuard};
 use mousse_net_core::grants::{Grant, GrantId};
 use mousse_net_core::pairing::{Arrival, InvitationId, InvitationKind, PairingCode, Ticket};
 use mousse_net_core::ErrorCode;
-use mousse_net_io::pipe::LocalRoute;
 use mousse_net_io::store::{
     hex, identity_from_hex, short_id, unhex, Approval, ApprovalStore, CompletionStore, PeerRecord,
     PeerStore, APPROVAL_SOURCE_TICKET,
@@ -45,6 +44,7 @@ use tokio::task::JoinHandle;
 
 use super::{error, Shared};
 use crate::applog;
+use crate::peer::{JoinRoute, JoinedVia};
 use crate::revoke::Removed;
 
 /// The requests this module answers.
@@ -140,6 +140,7 @@ fn request_id(req: &ApprovalRequest) -> String {
 
 fn grant_json(shared: &Shared, g: &Grant) -> Value {
     json!({
+        "relay": super::relay::grant_status(shared, g.id.0),
         "grant": g.id.0,
         "identity": hex(g.identity.as_bytes()),
         "name": g.name,
@@ -151,8 +152,9 @@ fn grant_json(shared: &Shared, g: &Grant) -> Value {
     })
 }
 
-fn peer_json(p: &PeerRecord) -> Value {
+fn peer_json(shared: &Shared, p: &PeerRecord) -> Value {
     json!({
+        "relay": p.pin().map(|pin| super::relay::peer_json(shared, &pin)).unwrap_or(Value::Null),
         "identity": p.identity,
         "name": p.name,
         "role": role_text(&p.role),
@@ -215,7 +217,9 @@ pub fn on_request(shared: &Arc<Shared>, id: Value, op: &str, map: &Map<String, V
         "grant.remove" => remove_grant(shared, &id, map),
         "approvals.list" => super::paths::list_approvals(shared, &id, map),
         "peers.list" => match peers(shared).load() {
-            Ok(list) => json!({"re": id, "peers": list.iter().map(peer_json).collect::<Vec<_>>()}),
+            Ok(list) => {
+                json!({"re": id, "peers": list.iter().map(|p| peer_json(shared, p)).collect::<Vec<_>>()})
+            }
             Err(e) => error(&id, "store_failed", e.to_string()),
         },
         "peer.add" => add_peer(shared, &id, map),
@@ -254,15 +258,22 @@ fn invite(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
         Some(_) => return error(id, "bad_request", "kind is in_person or link"),
     };
     // What the listener serves now (Phase 1b §1.5).
-    let routes = shared
+    let mut routes = shared
         .info
         .listen
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .routes
         .clone();
+    // This computer's registered relays, as `relay` hints (Phase 3 B.11).
+    for hint in super::relay::ticket_hints(shared) {
+        if routes.len() < mousse_net_core::pairing::MAX_ROUTES {
+            routes.push(hint);
+        }
+    }
     match shared.host.invite(kind, routes.clone()) {
         Ok(created) => {
+            super::relay::on_invite(shared, &created.ticket);
             let invitation = created.ticket.invitation;
             state(shared).invitations.push(invitation);
             let mut reply = json!({
@@ -440,8 +451,17 @@ async fn join(
     // Private-range hints, and the ones the owner approved (§1.3).
     let policy = shared.caller.addr_policy().clone();
     let approved_routes = super::paths::canonical_list(Some(&json!(approved)));
-    let candidates: Vec<LocalRoute> =
-        super::paths::ticket_candidates(&policy, &ticket.routes, &approved_routes);
+    // Then the ticket's relay routes the owner approved (Phase 3 B.7).
+    let relays = super::relay::join_candidates(&ticket, &approved);
+    let candidates: Vec<JoinRoute> =
+        super::paths::ticket_candidates(&policy, &ticket.routes, &approved_routes)
+            .into_iter()
+            .map(JoinRoute::Local)
+            .chain(relays.iter().map(|(route, tag)| JoinRoute::Relay {
+                route: route.clone(),
+                tag: *tag,
+            }))
+            .collect();
     // A removal of the host while the join runs (`peer.forget`) wins: the
     // join stores nothing, or what it stored goes with the removal.
     let pin = ticket.host_identity;
@@ -522,21 +542,32 @@ async fn join(
                 store_ticket_approvals(&shared, &ticket, &approved_routes);
             }
             shared.caller.forget_routes(Some(&ticket.host_identity));
-            let fields = json!({
-                "dir": "out",
-                "role": role,
-                "route": super::paths::route_json(&reached),
-            });
+            super::relay::approve_ticket_routes(&shared, &ticket, &approved);
+            let (route, via) = match reached {
+                JoinedVia::Local(reached) => (super::paths::route_json(&reached), None),
+                JoinedVia::Relay(route) => {
+                    if let Some((_, tag)) = relays.iter().find(|(r, _)| *r == route) {
+                        super::relay::after_join(&shared, &ticket, &route, *tag);
+                    }
+                    (super::relay::route_json(&route, false), Some(route))
+                }
+            };
+            let fields = json!({"dir": "out", "role": role, "route": route});
             match shared.add_outbound(conn, gen, fields) {
-                Ok(no) => json!({
-                    "re": id,
-                    "identity": hex(ticket.host_identity.as_bytes()),
-                    "name": record.name,
-                    "role": role,
-                    "already": already,
-                    "conn": no,
-                    "ticket_hash": hex(&ticket.hash()),
-                }),
+                Ok(no) => {
+                    if let Some(route) = via {
+                        shared.set_via(no, route);
+                    }
+                    json!({
+                        "re": id,
+                        "identity": hex(ticket.host_identity.as_bytes()),
+                        "name": record.name,
+                        "role": role,
+                        "already": already,
+                        "conn": no,
+                        "ticket_hash": hex(&ticket.hash()),
+                    })
+                }
                 Err(super::Stale::Paused) => paused(&shared, &id),
                 Err(super::Stale::Forgotten) => error(
                     &id,
@@ -865,6 +896,7 @@ fn forget_peer(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
         Err(e) => return error(id, "store_failed", e.to_string()),
     }
     shared.caller.forget_routes(Some(&identity));
+    super::relay::forget_peer(shared, &identity);
     // Its outbound connections go with it, and so do those still opening:
     // a dial or renewal that started before publishes nothing.
     let core = super::lock(&shared.core);
@@ -925,6 +957,7 @@ pub fn host_event(shared: &Shared, event: HostEvent) {
                 grant.0,
                 short_id(&identity)
             ));
+            super::relay::on_enrolled(shared, &invitation, grant.0);
             let mut st = state(shared);
             st.invitations.retain(|i| *i != invitation);
             st.approvals.retain(|_, r| r.invitation != invitation);
@@ -936,6 +969,7 @@ pub fn host_event(shared: &Shared, event: HostEvent) {
             })
         }
         HostEvent::InvitationEnded { invitation, reason } => {
+            super::relay::on_invitation_ended(shared, &invitation);
             let mut st = state(shared);
             st.invitations.retain(|i| *i != invitation);
             st.approvals.retain(|_, r| r.invitation != invitation);

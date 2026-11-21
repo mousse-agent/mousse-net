@@ -46,11 +46,19 @@ console.log(`seen_route=${route ?? 'none'}`)
 console.log(`seen_plus=${process.env.MOUSSE_PLUS_ORIGIN ? 'set' : 'unset'}`)
 const probe = process.env.MOUSSE_CHECK_PROBE_BIN
 console.log(`seen_probe=${probe && existsSync(probe) ? 'exists' : 'missing'}`)
+console.log(`seen_egress=${process.env.MOUSSE_NET_TEST_EGRESS ?? 'unset'}`)
 if (route) {
   const kind = control === 'route-leak' ? (route === 'tcp' ? 'ws' : 'tcp') : route
-  const ups = route === 'tcp' ? [{ kind, class: 'tailnet' }, { kind, class: 'public' }] : [{ kind }]
+  // A relay connection names the relay of the first link it was given.
+  const link = (process.env.MOUSSE_RELAY_TEST_LINKS ?? '').split(/[ ,]+/)[0]
+  const destination = 'relay://' + (link.split('//')[1] ?? '').split('/')[0]
+  const ups =
+    route === 'tcp' ? [{ kind, class: 'tailnet' }, { kind, class: 'public' }]
+    : kind === 'relay' ? [{ kind, destination }]
+    : [{ kind }]
   const lines = ups.map((r) => JSON.stringify({ ev: 'conn.up', route: r }) + String.fromCharCode(10))
-  writeFileSync(`${flag('--out')}/conn-up.jsonl`, lines.join(''))
+  // FAKE_CONN_UP: the connections a broken app would report instead.
+  writeFileSync(`${flag('--out')}/conn-up.jsonl`, process.env.FAKE_CONN_UP ?? lines.join(''))
 }
 if (control === 'plus-probe') {
   await fetch(`${process.env.MOUSSE_PLUS_ORIGIN}/v1/session`).catch(() => {})
@@ -127,12 +135,24 @@ fn run_mjs(app: Option<&Path>, args: &[&str]) -> Output {
 }
 
 fn run_mjs_ending(app: Option<&Path>, args: &[&str], ending: Option<&str>) -> Output {
+    run_mjs_with(app, args, ending, &[])
+}
+
+fn run_mjs_with(
+    app: Option<&Path>,
+    args: &[&str],
+    ending: Option<&str>,
+    env: &[(&str, &str)],
+) -> Output {
     let mut cmd = Command::new("node");
     cmd.arg(root().join("tools/app-check/run.mjs"))
         .args(args)
         .current_dir(root())
         .env_remove("MOUSSE_NET_ENGINE_CONTROL")
         .env_remove("MOUSSE_APP_DIR")
+        .env_remove("MOUSSE_RELAY_TEST_LINKS")
+        .env_remove("MOUSSE_NET_TEST_EGRESS")
+        .env_remove("FAKE_CONN_UP")
         // Its own target folder: the workspace one holds the helper the
         // helper's tests built with every feature, and a default build there
         // would replace it under them.
@@ -147,6 +167,7 @@ fn run_mjs_ending(app: Option<&Path>, args: &[&str], ending: Option<&str>) -> Ou
         Some(e) => cmd.env("FAKE_ENDING", e),
         None => cmd.env_remove("FAKE_ENDING"),
     };
+    cmd.envs(env.iter().copied());
     cmd.output().expect("node runs")
 }
 
@@ -398,5 +419,104 @@ fn the_kits_controls_fail_with_the_kits_reasons() {
         assert_eq!(v["reason"], reason, "{control}: {out}");
         assert_eq!(v["case"], "ws", "{control}: {out}");
         let _ = std::fs::remove_file(&result);
+    }
+}
+
+/// Enrollment links of a relay on another machine (TEST-NET-1; nothing
+/// dials it) and of a second relay on loopback.
+const REMOTE_RELAY: &str = "mousse-relay://192.0.2.10:7443/#BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc.CQkJCQkJCQkJCQkJCQkJCQ";
+const LOOPBACK_RELAY: &str = "mousse-relay://127.0.0.1:7444/#CAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg.CQkJCQkJCQkJCQkJCQkJCQ";
+
+/// A relay route case: the app gets the links, the remote relay's address
+/// (only that one) is let through the egress guards, and the run passes
+/// when every connection went through that relay.
+#[test]
+fn a_relay_route_case_lets_only_the_remote_relay_through_and_passes_on_relay_connections() {
+    let (app, _head) = fake_app("relay");
+    let links = format!("{REMOTE_RELAY} {LOOPBACK_RELAY}");
+    let o = run_mjs_with(
+        Some(&app.0),
+        &["phase1b.routes-app", "--route", "relay"],
+        None,
+        &[("MOUSSE_RELAY_TEST_LINKS", &links)],
+    );
+    let out = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{out}");
+    assert_eq!(value(&out, "seen_route"), "relay", "{out}");
+    assert_eq!(value(&out, "seen_egress"), "192.0.2.10", "{out}");
+    assert!(
+        out.lines().any(|l| l.trim() == "PASS phase1b.routes-app"),
+        "{out}"
+    );
+}
+
+/// A relay route run in which the app used another route, or another
+/// relay, fails with `route_mismatch`, even though the app said PASS.
+#[test]
+fn a_relay_route_run_that_used_another_route_fails() {
+    let (app, _head) = fake_app("relayleak");
+    let up = |route: &str| format!("{{\"ev\":\"conn.up\",\"route\":{route}}}\n");
+    let relay = up(r#"{"kind":"relay","destination":"relay://192.0.2.10:7443"}"#);
+    for (what, conn_up) in [
+        (
+            "a direct tcp connection beside the relay one",
+            format!("{relay}{}", up(r#"{"kind":"tcp","class":"lan"}"#)),
+        ),
+        ("a tcp hint", up(r#""tcp://192.0.2.10:7000""#)),
+        (
+            "another relay",
+            up(r#"{"kind":"relay","destination":"relay://192.0.2.99:7443"}"#),
+        ),
+    ] {
+        let result = app.0.with_extension("relayleak.json");
+        let o = run_mjs_with(
+            Some(&app.0),
+            &[
+                "phase1b.routes-app",
+                "--route",
+                "relay",
+                "--result",
+                result.to_str().unwrap(),
+            ],
+            None,
+            &[
+                ("MOUSSE_RELAY_TEST_LINKS", REMOTE_RELAY),
+                ("FAKE_CONN_UP", &conn_up),
+            ],
+        );
+        let out = text(&o);
+        assert_eq!(o.status.code(), Some(1), "{what}: {out}");
+        assert!(
+            out.lines().any(|l| l
+                .trim()
+                .starts_with("FAIL phase1b.routes-app reason=route_mismatch")),
+            "{what}: {out}"
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&result).unwrap()).unwrap();
+        assert_eq!(v["outcome"], "FAIL", "{what}: {out}");
+        assert_eq!(v["reason"], "route_mismatch", "{what}: {out}");
+        assert_eq!(v["case"], "relay", "{what}: {out}");
+        let _ = std::fs::remove_file(&result);
+    }
+}
+
+/// Without links, or with a link naming a host the guards cannot allow,
+/// a relay route runs nothing.
+#[test]
+fn a_relay_route_without_usable_links_runs_nothing() {
+    let (app, _head) = fake_app("relaynone");
+    let named = REMOTE_RELAY.replace("192.0.2.10", "relay.example");
+    for links in ["", named.as_str()] {
+        let o = run_mjs_with(
+            Some(&app.0),
+            &["phase1b.routes-app", "--route", "relay"],
+            None,
+            &[("MOUSSE_RELAY_TEST_LINKS", links)],
+        );
+        let out = text(&o);
+        assert_eq!(o.status.code(), Some(2), "{links:?}: {out}");
+        assert!(out.contains("MOUSSE_RELAY_TEST_LINKS"), "{links:?}: {out}");
+        assert!(!out.contains("seen_route="), "the app ran: {out}");
     }
 }

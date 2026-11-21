@@ -25,7 +25,7 @@ export type Control =
   | { type: 'PAIRED'; name: string; role: string };
 
 export type Version = { major: UInt; minor: UInt };
-export const hello = { type: 'HELLO', major: 1, minor: 0 } as const;
+export const hello = { type: 'HELLO', major: 1, minor: 2 } as const;
 export function negotiate(local: Version, peer: Version): UInt {
   const agreed = BigInt(local.minor) < BigInt(peer.minor) ? local.minor : peer.minor;
   requireThat(BigInt(local.major) === BigInt(peer.major) && BigInt(agreed) >= BigInt(local.minor) - 1n,
@@ -126,12 +126,13 @@ export function encodeTicket(ticket: Ticket): Buffer {
 }
 
 export const encodeFragment = (data: Uint8Array): string => Buffer.from(data).toString('base64url');
-export function decodeFragment(fragment: string): Ticket {
-  requireThat(fragment.length > 0 && !/[^A-Za-z0-9_-]/.test(fragment), 'encoding');
-  const data = Buffer.from(fragment, 'base64url');
-  requireThat(encodeFragment(data) === fragment, 'encoding');
-  return decodeTicket(data);
+export function decodeBase64url(text: string): Buffer {
+  requireThat(text.length > 0 && !/[^A-Za-z0-9_-]/.test(text), 'encoding');
+  const data = Buffer.from(text, 'base64url');
+  requireThat(encodeFragment(data) === text, 'encoding');
+  return data;
 }
+export const decodeFragment = (fragment: string): Ticket => decodeTicket(decodeBase64url(fragment));
 
 export const checkJoinerExpiry = (expires: UInt, now: UInt) => {
   requireThat(BigInt(now) < BigInt(expires) + 600n, 'expired');

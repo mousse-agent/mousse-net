@@ -9,6 +9,8 @@
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen_test::wasm_bindgen_test as test;
 
+mod relay;
+
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::path::PathBuf;
@@ -106,6 +108,7 @@ fn checked_in(name: &str) -> Option<String> {
         "join-proof.json",
         "mux.json",
         "pairing-attempts.json",
+        "relay-admission.json",
         "session-cert.json",
         "session-lifecycle.json",
         "ticket.json",
@@ -921,6 +924,7 @@ fn ticket_vectors() -> J {
             { "name": "fragment_unused_bits_set", "fragment": dirty_fragment(&fragment), "result": "encoding" },
         ],
         "route_hints": route_hint_vectors(),
+        "relay_hints": relay_hint_vectors(),
         "joiner_freshness": {
             "description": "The joiner accepts the ticket while now < expires_at + 600.",
             "expires_at": T + 600,
@@ -1039,6 +1043,48 @@ fn route_hint_vectors() -> J {
         .collect();
     json!({
         "description": "Route hints (spec wire.md, \"Route hints\"). Each hint reads as a tcp route (host as ipv4 in dotted decimal, ipv6 as its 16 bytes in hex, or a dns name lowercased, and a port), a wss route (the same host, the port, 443 when the hint has none, and the path), an mdns instance, or is skipped with a reason: reserved, unknown_scheme or malformed.",
+        "cases": cases,
+    })
+}
+
+fn relay_hint_vectors() -> J {
+    use crate::base64url;
+    use crate::relay_endpoint::RelayRoute;
+    let id = base64url::encode(&[0x11; 32]);
+    let handle = base64url::encode(&[0x22; 32]);
+    let short = base64url::encode(&[0x11; 31]);
+    let hints = vec![
+        format!("relay://relay.example:443/{id}/{handle}"),
+        format!("relay://203.0.113.5:7000/{id}/{handle}"),
+        format!("relay://[2001:db8::5]:443/{id}/{handle}"),
+        format!("relay://Relay.Example:443/{id}/{handle}"),
+        format!("relay://relay.example/{id}/{handle}"),
+        format!("relay://relay.example:443/{short}/{handle}"),
+        format!("relay://relay.example:443/{id}"),
+        format!("relay://relay.example:443/{id}/{handle}/x"),
+        format!("relay://relay.example:443/{id}={handle}"),
+        format!("relay://relay.example:0/{id}/{handle}"),
+        format!("relay://relay.example:443/+{}/{handle}", &id[1..]),
+        format!("relay:relay.example:443/{id}/{handle}"),
+        format!("relay://relay.example:443/{id}/{handle}{}", "a".repeat(200)),
+    ];
+    let cases: Vec<J> = hints
+        .iter()
+        .map(|hint| {
+            let result = match RelayRoute::parse_hint(hint) {
+                Some(r) => json!({
+                    "endpoint": r.endpoint.to_string(),
+                    "destination": r.endpoint.destination(),
+                    "relay": hex(&r.relay.0),
+                    "handle": hex(&r.handle),
+                }),
+                None => json!("malformed"),
+            };
+            json!({ "hint": hint, "result": result })
+        })
+        .collect();
+    json!({
+        "description": "Relay route hints (spec wire.md, \"Route hints\", relay; Phase 3). relay://<host>:<port>/<base64url relay id>/<base64url handle>, host and port as in a tcp hint, both ids 32 bytes in base64url without padding, at most 255 bytes. The destination an owner approves is relay://<lower-case host>:<port>. A reader that does not dial relays skips the hint as reserved (route_hints).",
         "cases": cases,
     })
 }
@@ -1557,11 +1603,11 @@ fn hello_vectors() -> J {
         })
     };
     json!({
-        "description": "HELLO version negotiation (spec wire.md, \"Versions\"). `local` is what the receiving side speaks (its newest and oldest minor version), `peer` is the HELLO it received. `result` is the minor version both sides use, or the close code. `this_build` is what mousse-net-core version 1.0 speaks; `hello` is its HELLO. `repeated`: several HELLOs arrive on one connection, as control-message bytes, in order. Only the first counts; each later one is `ignored`, whatever it holds. `agreed` is the connection's minor version at the end (null if the first HELLO closed it).",
+        "description": "HELLO version negotiation (spec wire.md, \"Versions\"). `local` is what the receiving side speaks (its newest and oldest minor version), `peer` is the HELLO it received. `result` is the minor version both sides use, or the close code. `this_build` is what this mousse-net-core build speaks; `hello` is its HELLO. `repeated`: several HELLOs arrive on one connection, as control-message bytes, in order. Only the first counts; each later one is `ignored`, whatever it holds. `agreed` is the connection's minor version at the end (null if the first HELLO closed it).",
         "this_build": { "major": local.major, "minor": local.minor, "oldest_minor": local.oldest_minor },
         "hello": hex(&ControlMessage::hello().encode()),
         "cases": [
-            case("same_version", local, (1, 0)),
+            case("same_version", local, (1, local.minor)),
             case("peer_newer_minor", local, (1, 7)),
             case("peer_major_2", local, (2, 0)),
             case("peer_major_0", local, (0, 0)),
@@ -1572,10 +1618,22 @@ fn hello_vectors() -> J {
             case("major_checked_before_minor", later, (2, 4)),
         ],
         "repeated": [
-            sequence("second_hello_same", local, &[(1, 0), (1, 0)]),
+            sequence(
+                "second_hello_same",
+                local,
+                &[(1, local.minor), (1, local.minor)],
+            ),
             sequence("second_hello_other_minor", later, &[(1, 3), (1, 9)]),
-            sequence("second_hello_other_major", local, &[(1, 0), (2, 0)]),
-            sequence("first_hello_refused", local, &[(2, 0), (1, 0)]),
+            sequence(
+                "second_hello_other_major",
+                local,
+                &[(1, local.minor), (2, 0)],
+            ),
+            sequence(
+                "first_hello_refused",
+                local,
+                &[(2, 0), (1, local.minor)],
+            ),
         ],
     })
 }
@@ -2419,6 +2477,7 @@ fn all_vectors() -> Vec<(&'static str, J)> {
         ("control.json", control_vectors()),
         ("hello.json", hello_vectors()),
         ("pairing-attempts.json", pairing_attempt_vectors()),
+        ("relay-admission.json", relay::relay_admission_vectors()),
     ]
 }
 

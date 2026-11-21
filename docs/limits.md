@@ -5,8 +5,9 @@ count in `mousse-net-core`, `mousse-net-io` and `mousse-helper` is a named
 default in one place per crate: `Limits` in
 `crates/mousse-net-core/src/limits.rs` (the core takes it as a parameter),
 `IoLimits` in `crates/mousse-net-io/src/limits.rs` (passed in through
-`HostConfig::limits` and `Caller::new`), and `HelperLimits` in
-`crates/mousse-helper/src/limits.rs`.
+`HostConfig::limits` and `Caller::new`), `HelperLimits` in
+`crates/mousse-helper/src/limits.rs`, and for the relay `RelayLimits` in
+`crates/mousse-net-core/src/relay/limits.rs`.
 
 The helper reads `MOUSSE_NET_<NAME>` once at startup. A value must be a
 whole number in the unit the name ends with (`_MS`, `_SECS`, `_BYTES`; no
@@ -14,7 +15,8 @@ unit means a count). A value that is not a whole number, is out of range,
 or disagrees with another limit stops startup with a message that names the
 variable and its allowed range. An unknown `MOUSSE_NET_*` name stops startup
 too, except the app's own names, which reach the helper it starts:
-`MOUSSE_NET_ENGINE_*` and `MOUSSE_NET_HELPER`.
+`MOUSSE_NET_ENGINE_*` and `MOUSSE_NET_HELPER`, and the relay's
+(`MOUSSE_NET_RELAY_*`, read only by `mousse-relay`).
 
 Where the peer or a security bound depends on a limit, its range ends at the
 spec's value: it can only be tightened.
@@ -57,6 +59,7 @@ spec's value: it can only be tightened.
 | `MOUSSE_NET_MDNS_ROTATE_MS` | 900000 | 60000 to 900000 | How often the mDNS instance name changes (privacy.md). |
 | `MOUSSE_NET_MDNS_ROTATE_CHECK_MS` | 5000 | 100 to 30000 | How often the advertiser checks whether the name is due to change. |
 | `MOUSSE_NET_STREAMS_PER_CONNECTION` | 32 | 1 to 1024 | Open streams on one connection, both directions counted. A peer's open past it is reset with `REFUSED_STREAM`; an own open fails with `StreamLimit`. With the engine's 256 KiB initial credit per stream, this bounds what one connection can queue unread (wire.md 9.2). |
+| `MOUSSE_NET_OWN_STREAMS_PER_CONNECTION` | 4 | 1 to 4 | Engine streams (labels starting `mousse-`, wire.md 9.5) open on one connection, both directions counted apart from `STREAMS_PER_CONNECTION` and `STREAMS_PER_ENDPOINT`, so the engine never takes the app's places. A peer's open past it is reset with `REFUSED_STREAM`. Tighten only. |
 | `MOUSSE_NET_STREAMS_PER_ENDPOINT` | 128 | 1 to 1024 | Open streams on all of an endpoint's connections together, host and caller sides alike; past it as above. |
 | `MOUSSE_NET_DIAL_PARALLEL` | 4 | 1 to 64 | Caller: candidate addresses for one host dialled at once (Phase 1a §6). |
 | `MOUSSE_NET_DIAL_TIMEOUT_MS` | 2000 | 100 to 60000 | Caller: time one candidate address has to connect and pass step 1 before it is given up (Phase 1a §6). |
@@ -111,8 +114,34 @@ spec's value: it can only be tightened.
 | `MOUSSE_NET_REMOVAL_RETRY_MS` | 1000 | 10 to 60000 | While networking is paused because a removal (`grant.remove`) could not be saved, how often the helper tries the save again (Phase 1a §5.4). |
 | `MOUSSE_NET_KEEP_RETRY_FIRST_MS` | 1000 | 10 to 60000 | App mode: wait before redialling a paired host that could not be reached; each next wait doubles (Phase 1a §6). |
 | `MOUSSE_NET_KEEP_RETRY_MAX_MS` | 60000 | 10 to 3600000 | App mode: longest wait between those redials; not below the first. |
+| `MOUSSE_NET_REMOVAL_MAX_AGE_SECS` | 2592000 | 86400 to 2592000 | "Remove on all my hosts" (Phase 4 Part D): the oldest removal a host accepts and an admin device keeps queued, and how long a host keeps removal ids. Tighten only. |
+| `MOUSSE_NET_REMOVAL_ANSWER_WAIT_MS` | 10000 | 1000 to 120000 | How long one side of `mousse-removal` waits for the other's message (the signed removal, or the host's answer). |
+| `MOUSSE_NET_PLUS_TIMEOUT_MS` | 10000 | 1000 to 60000 | One Plus request. |
+| `MOUSSE_NET_PLUS_ANSWER_MAX_BYTES` | 4194304 | 65536 to 67108864 | Largest answer from Plus the helper reads; a larger one counts as a failed request. |
+| `MOUSSE_NET_PLUS_RETRY_FIRST_MS` | 1000 | 100 to 60000 | First wait before retrying a Plus request; each next wait doubles. |
+| `MOUSSE_NET_PLUS_RETRY_MAX_MS` | 300000 | 1000 to 3600000 | Longest wait before retrying a Plus request; not below the first. |
+| `MOUSSE_NET_PLUS_PREFETCH_PERCENT` | 50 | 10 to 90 | Use of the current relay lease, in percent, at which the next block is asked for; also the status threshold the helper gives a hosted relay. |
+| `MOUSSE_NET_PLUS_NOT_BEFORE_RETRY_MS` | 1000 | 1000 to 10000 | Wait before presenting a block or admission token again that a relay refused for `not before`, or for having no Plus clock yet. |
+| `MOUSSE_NET_PLUS_REFILL_DEADLINE_MS` | 5000 | 1000 to 9000 | After this long without a new block, relayed bulk shows paused; below the relay's default refill wait. |
+| `MOUSSE_NET_PLUS_MAIL_POLL_SECS` | 300 | 30 to 86400 | How often a host fetches its Plus inbox (also after a network change). |
+| `MOUSSE_NET_VIA_RELAY_MOVE_STAGE_SECS` | 86400 | 0 to 604800 | How long a move to another hosted relay stages the new route before cutting over. |
+| `MOUSSE_NET_PLUS_MAIL_PAGES_MAX` | 100 | 1 to 10000 | Most inbox pages one mail round fetches, so a Plus that pages without end cannot hold the round. |
+| `MOUSSE_NET_HANDLE_ROTATE_SECS` | 1209600 | 172800 to 7776000 | Hosted relays: a new registration key (handle) this often. At least twice `MANIFEST_OVERLAP_SECS`, so at most two handles per relay are live; startup refuses otherwise. |
+| `MOUSSE_NET_PLUS_FLEET_REFRESH_SECS` | 3600 | 60 to 86400 | Hosted relays: how often the relay fleet is read from Plus; also at once when this host's relay cannot be reached. |
+| `MOUSSE_NET_PLUS_SLOT_READ_SECS` | 300 | 10 to 86400 | Caller: the least time between two reads of one host's directory slot when no route reaches it (the slot's manifest brings rotated or moved routes). |
 | `MOUSSE_NET_IPC_LINE_MAX_BYTES` | 65536 | 1024 to 65536 | Local control channel: longest line a client may send; a longer one closes the channel (Phase 1b §6.2). |
 | `MOUSSE_NET_IPC_FIRST_LINE_WAIT_MS` | 2000 | 100 to 2000 | Local control channel: time a client has to send its first line before the channel is closed. |
+| `MOUSSE_NET_VIA_RELAY_DIAL_MS` | 10000 | 1000 to 60000 | Through a relay: connect, outer TLS, upgrade, `CALL` or `JOIN`, the splice and step 1, for one try. Above the relay's refusal deadline, so an unlisted caller hears `UNREACHABLE` before it gives up (Phase 3 §B.6). |
+| `MOUSSE_NET_VIA_RELAY_RETRY_FIRST_MS` | 1000 | 100 to 60000 | App mode: wait before registering on one of this computer's relays again after a registration ended or failed; each next wait doubles. |
+| `MOUSSE_NET_VIA_RELAY_RETRY_MAX_MS` | 60000 | 1000 to 600000 | App mode: longest such wait; not below the first. |
+| `MOUSSE_NET_VIA_RELAY_KEEPALIVE_MS` | 20000 | 1000 to 120000 | App mode: a relay registration sends `PING` after this long without sending. |
+| `MOUSSE_NET_VIA_RELAY_IDLE_MS` | 60000 | 3000 to 600000 | App mode: a relay registration that hears nothing for this long is dropped and made again; above the keepalive. |
+| `MOUSSE_NET_VIA_RELAY_CHECK_MS` | 30000 | 100 to 600000 | App mode: how often the helper checks relay invitation and recovery expiry, the end of rotation overlaps and manifest renewal. |
+| `MOUSSE_NET_VIA_RELAY_ACCEPT_LEGS` | 64 | 1 to 64 | App mode: accept legs to this computer's relays being dialled at once. An `INCOMING` past it is not answered and times out at the relay, so a relay cannot make the host dial without bound. Tighten only; the default is the relay's own `RELAY_ACCEPT_LEGS_PER_HANDLE`. |
+| `MOUSSE_NET_VIA_RELAY_ROTATION_RETRY_MS` | 1000 | 100 to 60000 | App mode: during a key rotation, the wait between tries to register the new key, and between `SUCCESSOR`s while the relay refuses it. The rotation is journaled and goes on after a restart; the old key stays current until the new one registers. |
+| `MOUSSE_NET_MANIFEST_OVERLAP_SECS` | 604800 | 86400 to 604800 | How long an old relay route or registration key stays in the manifest, and registered, after a rotation (Phase 3 §B.4 and §B.11). It counts from the rotation's start, before any `SUCCESSOR`, less the 10-minute clock skew. At most the relay's largest `MOUSSE_NET_RELAY_SUCCESSOR_OVERLAP_SECS`; a self-hosted relay sends its own in `REGISTERED`, and the helper uses the smaller of the two, so the old route leaves the manifest before the relay drops the old key. Tighten only. |
+| `MOUSSE_NET_MANIFEST_LIFETIME_SECS` | 2592000 | 604800 to 7776000 | When a manifest becomes stale. A stale manifest's routes are still dialled, after every other route. Above the overlap. |
+| `MOUSSE_NET_VIA_RELAY_REJOIN_SECS` | 86400 | 600 to 86400 | Host: how long a consumed invitation's tag stays in the relay allow-set, so a joiner whose circuit dropped can finish (Phase 3 §B.7). Tighten only: the tag is a capability. |
 | `MOUSSE_NET_SSH_CONNECT_TIMEOUT_SECS` | 10 | 1 to 120 | ssh: `ConnectTimeout` on every call, and the limit on `ssh -G` (Phase 1b §3.1). |
 | `MOUSSE_NET_SSH_ALIVE_INTERVAL_SECS` | 15 | 1 to 300 | ssh: `ServerAliveInterval`. |
 | `MOUSSE_NET_SSH_ALIVE_COUNT` | 3 | 1 to 20 | ssh: `ServerAliveCountMax`. |
@@ -125,6 +154,107 @@ spec's value: it can only be tightened.
 | `MOUSSE_NET_PIPE_CONNECT_WAIT_MS` | 2000 | 100 to 60000 | Remote `mousse-helper pipe`: reach the running helper's IPC and get its `ok`; past it, `not_running` (Phase 1b §3.3). |
 | `MOUSSE_NET_JOIN_DONE_KEEP_SECS` | 86400 | 0 to 2592000 | App mode: how long a "Send link" completion record (`joins/<ticket hash>.done`) the app never acknowledged with `join.ack` is kept after its ticket expired. Until then `join.status` can replay it. |
 | `MOUSSE_NET_INIT_HOLD_MS` | 0 | 0 to 60000 | Checks only: how long `init` waits before it makes the endpoint, so the hard-kill check can stop the app during a first start. Run for the app (`--app`), its stdin closing still ends it at once. |
+
+## Settings
+
+Settings are not limits: text values, read once at startup. An invalid
+value stops startup with a message naming the variable.
+
+| Variable | Default | What it sets |
+|---|---|---|
+| `MOUSSE_NET_PLUS_URL` | unset (no Plus) | The Plus origin, `https://host[:port]` with no path. Plus is not a trust anchor, so the platform verifier checks it and nothing is pinned. Debug builds also take `http://` on a loopback address, for the test stand-in. |
+
+## Relay
+
+`RelayLimits` in `crates/mousse-net-core/src/relay/limits.rs`. `mousse-relay`
+reads `MOUSSE_NET_<NAME>` at startup with the same rules; every name starts
+with `RELAY_`, and the relay accepts no other `MOUSSE_NET_*` name. Where a
+client could push against a limit (connections, legs, circuits, budgets,
+waits a client fills), its range ends at the default: it can only be
+tightened. `RELAY_REFUSE_MS` must be below `RELAY_ACCEPT_WAIT_MS`
+(spec/relay.md 9.1).
+
+| Variable | Default | Allowed | What it limits |
+| --- | --- | --- | --- |
+| `MOUSSE_NET_RELAY_MAX_CONNECTIONS` | 1024 | 1 to 65536 | Open outer connections (capacity; about 52 KB each, plus queued bytes). |
+| `MOUSSE_NET_RELAY_CONNECTIONS_PER_IP` | 256 | 1 to 256 | Open connections per IPv4 address or IPv6 /64, except accept legs once their ACCEPT is accepted (tighten only). |
+| `MOUSSE_NET_RELAY_ACCEPT_LEGS_PER_HANDLE` | 64 | 1 to 64 | Open accept legs per handle (tighten only). |
+| `MOUSSE_NET_RELAY_CIRCUITS_PER_CALLER` | 8 | 2 to 8 | Open circuits per caller fingerprint and handle (tighten only). |
+| `MOUSSE_NET_RELAY_MAX_REGISTRATIONS` | 1024 | 1 to 65536 | Live registrations (capacity). |
+| `MOUSSE_NET_RELAY_HELLO_WAIT_MS` | 5000 | 500 to 5000 | Wait for the first client message after RELAY_HELLO (tighten only). |
+| `MOUSSE_NET_RELAY_UPGRADE_WAIT_MS` | 5000 | 100 to 5000 | Whole TLS and WebSocket upgrade (tighten only). |
+| `MOUSSE_NET_RELAY_HEADER_MAX_BYTES` | 8192 | 1024 to 8192 | Largest upgrade request (tighten only). |
+| `MOUSSE_NET_RELAY_ACCEPT_WAIT_MS` | 10000 | 1000 to 30000 | Wait for the target's accept leg after INCOMING. |
+| `MOUSSE_NET_RELAY_REFUSE_MS` | 500 | 500 to 5000 | Constant refusal deadline from a CALL or JOIN; below the accept wait. |
+| `MOUSSE_NET_RELAY_PREACCEPT_BYTES` | 65536 | 16384 to 65536 | Peer bytes per join circuit and direction before promotion (tighten only). |
+| `MOUSSE_NET_RELAY_PREACCEPT_PER_TARGET` | 4 | 1 to 4 | Join circuits per handle (tighten only). |
+| `MOUSSE_NET_RELAY_KEEPALIVE_MS` | 15000 | 1000 to 15000 | PING on a registration connection after this long without sending (tighten only). |
+| `MOUSSE_NET_RELAY_REGISTRATION_IDLE_MS` | 45000 | 30000 to 45000 | Registration closed after this long without receiving (tighten only). |
+| `MOUSSE_NET_RELAY_CIRCUIT_IDLE_MS` | 60000 | 46000 to 600000 | Spliced circuit closed after this long with no bytes either way; above the peer idle timeout. |
+| `MOUSSE_NET_RELAY_QUEUE_BYTES` | 262144 | 16384 to 262144 | Bytes buffered per circuit and direction before the relay stops reading that leg (tighten only). |
+| `MOUSSE_NET_RELAY_EGRESS_BPS` | 12500000 | 125000 to 12500000000 | Shared egress ceiling in bytes per second (capacity). |
+| `MOUSSE_NET_RELAY_ENROLL_SECS` | 3600 | 60 to 3600 | Enrollment code lifetime; single use (tighten only). |
+| `MOUSSE_NET_RELAY_SUCCESSOR_OVERLAP_SECS` | 604800 | 3600 to 604800 | After a SUCCESSOR, how long the superseded registration key stays authorized (tighten only). |
+| `MOUSSE_NET_RELAY_CHAIN_KEYS_MAX` | 4 | 2 to 4 | Keys one SUCCESSOR chain may hold at once, the current key and those it superseded (tighten only). A SUCCESSOR past it is `REFUSED(chain_full)` and the registration stays; the helper then drops that rotation and refuses the next one until the oldest key leaves. |
+| `MOUSSE_NET_RELAY_STATE_POLL_MS` | 1000 | 100 to 1000 | How often the running relay re-reads its authorized list and enrollment codes, so `revoke` and `enroll` take effect (tighten only). |
+| `MOUSSE_NET_RELAY_SEND_WAIT_MS` | 20000 | 1000 to 20000 | A write to one connection that makes no progress this long closes that connection (tighten only). |
+| `MOUSSE_NET_RELAY_CONTROL_QUEUE_MESSAGES` | 64 | 8 to 64 | Control messages (PONG, REFUSED and the like) queued to one connection; more closes it (tighten only). |
+| `MOUSSE_NET_RELAY_CLOSE_LINGER_MS` | 2000 | 100 to 2000 | Wait for the close frame and the TCP shutdown when the relay closes a connection (tighten only). |
+
+Fixed on purpose in the relay protocol: the 16 384-byte relay message, the
+65 536-byte WebSocket message, 256 caller fingerprints and 8 invitations per
+allow-set, 4 lease ids per `RELEASE`, the path, the subprotocol, the close
+codes, the refusal reasons, the domain strings and the exporter label
+(spec/relay.md 13).
+
+## Relay, hosted mode
+
+A relay in hosted mode also reads these (`docs/phase34-design.md` §H.1),
+with the same rules as the rows above. `HostedLimits` in
+`crates/mousse-net-core/src/relay_hosted/mod.rs` holds them, and
+`crates/mousse-relay-plus/src/settings.rs` reads them.
+
+| Variable | Default | Allowed | What it limits |
+| --- | --- | --- | --- |
+| `MOUSSE_NET_RELAY_REFILL_WAIT_MS` | 10000 | 1000 to 10000 | A paused class waits this long for a `LEASE` before its circuits close with 4001. With the longest peer keepalive (15 s) it stays below the shortest peer idle timeout (30 s), so it can only be shortened. |
+| `MOUSSE_NET_RELAY_REPORT_MS` | 10000 | 1000 to 60000 | Snapshot interval; below Plus's boot silence time (120 s by default). |
+| `MOUSSE_NET_RELAY_REPORT_MIN_MS` | 1000 | 100 to 5000 | Longest delay from a final to its snapshot, and the shortest gap between snapshots; below `REPORT_MS`. |
+| `MOUSSE_NET_RELAY_FINAL_REPORT_WAIT_MS` | 5000 | 0 to 60000 | On a graceful stop, how long to wait for the stopping snapshot to be stored. |
+| `MOUSSE_NET_RELAY_PLUS_TIMEOUT_MS` | 10000 | 1000 to 60000 | One call to Plus. |
+| `MOUSSE_NET_RELAY_CLOCK_RTT_MS` | 2000 | 100 to 10000 | Longest round trip whose Plus answer may set the Plus clock; a longer one only ends leases earlier. |
+| `MOUSSE_NET_RELAY_PLUS_RETRY_FIRST_MS` | 1000 | 100 to 60000 | First wait before sending a boot announcement or report part again after a failed call. Each next wait doubles; a `retry after` from Plus lengthens it. |
+| `MOUSSE_NET_RELAY_PLUS_RETRY_MAX_MS` | 30000 | 1000 to 600000 | Longest such wait; not below the first. |
+| `MOUSSE_NET_RELAY_PLUS_ANSWER_MAX_BYTES` | 65536 | 16384 to 1048576 | Largest Plus answer read. |
+
+Fixed, not variables (Part A of the design): `REQUEST_MAX` 16 384,
+`REPORT_MAX` 65 536, `REPORT_ENTRIES_MAX` 1024, `BLOCK_MAX_LIFETIME`
+172 800 s, `FORWARD_MARGIN` 180 s, the one-second rate burst, the 65 536
+rate-cap floor and smallest block, and at most four lease ids per
+`RELEASE`.
+
+### Settings
+
+Settings are not limits: they have no default and no range.
+
+| Variable | Required | Value |
+| --- | --- | --- |
+| `MOUSSE_NET_RELAY_PLUS_URL` | in hosted mode | The Plus base URL, `https://host[:port][/path]`. TLS 1.3 with the platform's certificate verifier and no pin (Plus is not a trust anchor). `http://` is accepted only to a loopback IP address, for tests on one machine. No user, query or fragment. A missing or bad value stops startup with a message naming the variable. |
+
+### State directory files (hosted)
+
+| File | What |
+| --- | --- |
+| `boot-generation` | The boot generation, a decimal number. At start, under the state directory's lock, the relay adds one and writes it durably (write, fsync, rename, folder sync) before it serves. A file that does not hold a number stops startup; the count never starts over. |
+| `report-key` | The P-256 report key (hex secret, owner-only), made on first start. It signs boot and report bodies. Its public key is what an operator adds to Plus's fleet. |
+
+| `issuer-keys` | The pinned issuer public keys, written by the operator: one per line as 130 hex digits (the 65-byte SEC1 point), blank lines and `#` comments ignored. Two overlap during a rotation. |
+
+`mousse-relay run --hosted` runs a relay in hosted mode; it needs
+`MOUSSE_NET_RELAY_PLUS_URL` and the `issuer-keys` file. The running relay
+reads `issuer-keys` again with the rest of the state directory (every
+`MOUSSE_NET_RELAY_STATE_POLL_MS`) and at once on `SIGHUP`, without ending
+the boot; a file that does not parse leaves the keys in force.
+`mousse-relay reload` checks the file.
 
 ## Debug-build test hooks
 
@@ -162,6 +292,20 @@ The probe reads the engine limits it tests (`MOUSSE_NET_PREAUTH_*`,
 same variables, so a check that tightens one for the host tightens it for
 the probe.
 
+### Relay tests
+
+Settings of the relay's tests, not limits. The relay reads the first two
+only in debug builds; the engine and the app read none of them (the
+helper's check for unknown `MOUSSE_NET_*` names does not see them).
+
+| Variable | What it does |
+| --- | --- |
+| `MOUSSE_RELAY_TAP` | A debug relay writes its decrypted view of both legs of every circuit to this file (`crates/mousse-relay/tests/marker.rs`). |
+| `MOUSSE_RELAY_CONTROL_MARKER_FILE` | Under the `marker-in-relay-memory` control, the relay keeps copies of this file's marker in its heap. |
+| `MOUSSE_RELAY_TEST_LINKS` | Enrollment links of a running `mousse-relay`, separated by whitespace or commas, each used once; links of several relays may be mixed. `crates/mousse-helper/tests/app_relay_remote.rs` (`phase3.relay-routes-cross`, `phase3.relay-rotation-cross`) needs them, at an IP address outside loopback: `routes_cross` seven (six of one relay, one of a second), `rotation_cross` three. Without them its tests fail with `reason=not_configured`. A relay route of `tools/app-check/run.mjs` (`--route relay`) passes them to the app script, and allows each relay outside loopback in `MOUSSE_NET_TEST_EGRESS`. |
+| `MOUSSE_RELAY_TEST_HOST_BUILD` | The build of the relay those links name (`<commit>[-dirty]+<profile>`), written as `host_build` in the result of `app_relay_remote.rs`. Needed with `MOUSSE_RELAY_TEST_RESULT`. |
+| `MOUSSE_RELAY_TEST_RESULT` | A file `app_relay_remote.rs` writes its unsigned result to, for `mousse-check sign`; `{check}` is replaced by the check id. No result is written when the run was not configured. |
+
 ## Fixed on purpose
 
 These are protocol constants, not limits, so they are not settings:
@@ -179,6 +323,10 @@ These are protocol constants, not limits, so they are not settings:
 - The verifier's 24 h certificate maximum (`MAX_LIFETIME_SECS`); a device
   can only issue shorter certificates (`CERT_LIFETIME_SECS`).
 - The joiner record's bound of 3 attempts: the stored format rejects more.
+- Engine-stream messages: at most 262 144 bytes (wire.md 9.5). Plus's fixed
+  maxima (`REQUEST_MAX` 16 384, `DIR_ENTRY_MAX` 4096, `MAIL_ENVELOPE_MAX`
+  8192, `DEPOSIT_TOKENS_MAX` 256, `BLOCK_MAX_LIFETIME` 172 800 s, the
+  65 536-byte block and rate-cap floors).
 - The mDNS name format (`mousse-` and 12 random characters, privacy.md).
 - The `mousse-ssh/1` marker, the selector grammar (26 characters of
   `[a-z2-7]`) and the remote `pipe` exit codes (`not_running` 2,

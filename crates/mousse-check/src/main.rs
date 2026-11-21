@@ -51,6 +51,11 @@ USAGE
   mousse-check device list
   mousse-check report [<phase>] [--allow-dirty] [--full] [--json]
       Print the table from stored runs and results without running anything.
+  mousse-check relay-inspect --state <dir> [--binary <deployed> [--local <built>]] [--log <file>]
+      On a self-hosted relay: compare the deployed binary's hash with a local
+      build, list the state directory against the files a relay may keep,
+      and scan its log for addresses or identifiers. Never prints a secret.
+      Needs no checkout. Ends with PASS relay-inspect or FAIL relay-inspect.
   mousse-check probe --route <hint> (--observe <url> | --no-app) [--invite <ticket>] ...
       Send traffic that must never reach RPC to a host on one route, and
       check each close on the wire and in the app (probe --help).
@@ -86,6 +91,10 @@ struct Args {
 
 const VALUE_FLAGS: &[&str] = &[
     "--root",
+    "--state",
+    "--binary",
+    "--local",
+    "--log",
     "--only",
     "--target",
     "--sign-with",
@@ -176,6 +185,9 @@ fn real_main(raw: Vec<String>) -> Result<ExitCode, String> {
     if matches!(cmd.as_str(), "help" | "--help" | "-h") {
         print!("{HELP}");
         return Ok(ExitCode::SUCCESS);
+    }
+    if cmd == "relay-inspect" {
+        return cmd_relay_inspect(&a);
     }
     let kit = Kit::open(a.get("--root").map(Path::new))?;
     match cmd.as_str() {
@@ -466,6 +478,28 @@ fn cmd_sign(kit: &Kit, a: &Args) -> Result<ExitCode, String> {
 }
 
 /// `config-digest`: the digest a device records before producing a result.
+fn cmd_relay_inspect(a: &Args) -> Result<ExitCode, String> {
+    a.only_known(&["--state", "--binary", "--local", "--log"])?;
+    let state = a
+        .get("--state")
+        .ok_or("relay-inspect needs --state <dir>")?;
+    if a.get("--local").is_some() && a.get("--binary").is_none() {
+        return Err("--local needs --binary".into());
+    }
+    let report = mousse_check::inspect::run(
+        Path::new(state),
+        a.get("--binary").map(Path::new),
+        a.get("--local").map(Path::new),
+        a.get("--log").map(Path::new),
+    );
+    print!("{}", mousse_check::inspect::render(&report));
+    Ok(if report.problems.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    })
+}
+
 fn cmd_config_digest(kit: &Kit, a: &Args) -> Result<ExitCode, String> {
     a.only_known(&["--target", "--control"])?;
     let id = a

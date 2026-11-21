@@ -4,7 +4,7 @@
  * checkout's helper.
  *
  *   node tools/app-check/run.mjs <check id> [--out <dir>] [--role host|caller]
- *     [--topology <name>] [--route tcp|ws|ssh] [--control <name>]
+ *     [--topology <name>] [--route tcp|ws|ssh|relay] [--control <name>]
  *     [--target <cell>] [--result <file>]
  *
  * 1. Builds the debug helper (and, for Phase 1b and later checks,
@@ -52,6 +52,15 @@
  *   else the run fails with `route_mismatch`. On a single machine (no
  *   --role), `tcp` must show both the `tailnet` and the `public` class
  *   (`route.class`), which the app gets through MOUSSE_NET_TEST_CLASS_MAP.
+ * --route relay: the connections go through a running `mousse-relay`,
+ *   named by its enrollment links in MOUSSE_RELAY_TEST_LINKS (whitespace- or
+ *   comma-separated, each used once; docs/limits.md "Relay tests"), which
+ *   the app script gets as they are. Every connection's route must be of
+ *   kind `relay` and, when it names a `destination`, one of those relays
+ *   (`relay://<host>:<port>`). A relay outside loopback (on the Mac in a
+ *   cross-machine cell) is added to MOUSSE_NET_TEST_EGRESS, so the guards
+ *   let the app and the helper reach it and nothing else. Links must name
+ *   IP addresses (the guards resolve no names); without links nothing runs.
  *
  * The verdict line: `FAIL <id> reason=<word>` with the first of
  * plus_contacted, egress_attempted and route_mismatch that applies; else the
@@ -81,6 +90,7 @@
  */
 import { spawn, spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import net from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -89,9 +99,9 @@ import { selfTest as recorderSelfTest, sortRequests, startRecorder, UPDATE_FEED_
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..')
 const USAGE =
-  'usage: node tools/app-check/run.mjs <check id> [--out <dir>] [--role host|caller] [--topology <name>] [--route tcp|ws|ssh] [--control <name>] [--target <cell>] [--result <file>]'
+  'usage: node tools/app-check/run.mjs <check id> [--out <dir>] [--role host|caller] [--topology <name>] [--route tcp|ws|ssh|relay] [--control <name>] [--target <cell>] [--result <file>]'
 const VALUE_FLAGS = ['--out', '--role', '--topology', '--route', '--control', '--target', '--result']
-const ROUTES = ['tcp', 'ws', 'ssh']
+const ROUTES = ['tcp', 'ws', 'ssh', 'relay']
 const GUARD = join(root, 'tools', 'app-check', 'egress-guard.cjs')
 
 function refuse(message) {
@@ -224,7 +234,7 @@ function jsonLines(file) {
     })
 }
 
-/** `tcp`, `ws` or `ssh` for a conn.up route: an object's kind, or a hint's scheme. */
+/** `tcp`, `ws`, `ssh` or `relay` for a conn.up route: an object's kind, or a hint's scheme. */
 export function routeKind(route) {
   if (route && typeof route === 'object') return route.kind
   if (typeof route !== 'string') return undefined
@@ -232,8 +242,41 @@ export function routeKind(route) {
   return scheme === 'wss' ? 'ws' : scheme
 }
 
-/** Why the connections in `<out>/conn-up.jsonl` break the route case, or undefined. */
-export function routeMismatch(out, route, singleMachine) {
+/**
+ * The relays of the enrollment links in `text` (MOUSSE_RELAY_TEST_LINKS):
+ * `{ destinations, remote }`, the `relay://<host>:<port>` of each and the
+ * hosts outside loopback, or `{ error }`.
+ */
+export function relayLinks(text) {
+  const words = (text ?? '').split(/[\s,]+/).filter(Boolean)
+  if (!words.length) return { error: 'a relay route needs MOUSSE_RELAY_TEST_LINKS, enrollment links of a running mousse-relay' }
+  const destinations = new Set()
+  const remote = new Set()
+  for (const w of words) {
+    const m = /^mousse-relay:\/\/(\[[0-9a-fA-F:.]+\]|[^/:[\]]+):(\d{1,5})\/#[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.exec(w)
+    if (!m) return { error: `MOUSSE_RELAY_TEST_LINKS: ${w.slice(0, 40)}... is not a mousse-relay:// enrollment link` }
+    const host = m[1].toLowerCase()
+    const bare = host.replace(/^\[|\]$/g, '')
+    if (!net.isIP(bare)) return { error: `MOUSSE_RELAY_TEST_LINKS: ${host} is a name; the egress guards resolve none, so give the relay's IP address` }
+    destinations.add(`relay://${host}:${Number(m[2])}`)
+    const loopback = bare === '::1' || /^127\./.test(bare) || /^::ffff:127\./.test(bare)
+    if (!loopback) remote.add(bare)
+  }
+  return { destinations: [...destinations], remote: [...remote] }
+}
+
+/** MOUSSE_NET_TEST_EGRESS with `more` addresses added, once each. */
+export function withEgress(egress, more) {
+  const have = (egress ?? '').split(',').map((a) => a.trim()).filter(Boolean)
+  for (const a of more) if (!have.includes(a)) have.push(a)
+  return have.join(',')
+}
+
+/**
+ * Why the connections in `<out>/conn-up.jsonl` break the route case, or
+ * undefined. `relays`: for a relay route, the destinations its links name.
+ */
+export function routeMismatch(out, route, singleMachine, relays = []) {
   const file = join(out, 'conn-up.jsonl')
   if (!existsSync(file)) return 'the app script wrote no conn-up.jsonl'
   const ups = jsonLines(file)
@@ -242,6 +285,10 @@ export function routeMismatch(out, route, singleMachine) {
     const kind = routeKind(up.route)
     if (kind !== route) {
       return `a connection used ${kind ?? 'no named route'} (${JSON.stringify(up.route ?? null)}), not ${route}`
+    }
+    const dest = up.route && typeof up.route === 'object' ? up.route.destination : undefined
+    if (route === 'relay' && dest !== undefined && !relays.includes(String(dest).toLowerCase())) {
+      return `a relay connection went through ${JSON.stringify(dest)}, not a relay of MOUSSE_RELAY_TEST_LINKS (${relays.join(', ')})`
     }
   }
   if (route === 'tcp' && singleMachine) {
@@ -342,6 +389,11 @@ async function main() {
   if (!existsSync(script)) refuse(`${script} does not exist; is MOUSSE_APP_DIR a checkout of the Mousse app?`)
 
   const env = { ...process.env, ...(flags.control ? controlEnv(id, flags.control) : {}) }
+  let relays
+  if (flags.route === 'relay') {
+    relays = relayLinks(env.MOUSSE_RELAY_TEST_LINKS)
+    if (relays.error) refuse(relays.error)
+  }
   const stand = guarded(id)
   const build = helperBuild()
   const tools = buildTools(env, stand, needsSshd(id, flags.route))
@@ -363,7 +415,8 @@ async function main() {
     await recorderSelfTest(recorder).catch((e) => refuse(e.message))
     guardSelfTest(out)
     writeFileSync(egressLog, '')
-    const egress = env.MOUSSE_NET_TEST_EGRESS ?? ''
+    // A relay on another machine is the one address the route needs.
+    const egress = withEgress(env.MOUSSE_NET_TEST_EGRESS, relays?.remote ?? [])
     Object.assign(childEnv, {
       MOUSSE_ID_ORIGIN: recorder.url,
       MOUSSE_PLUS_ORIGIN: recorder.url,
@@ -432,7 +485,7 @@ async function main() {
     }
   }
   if (flags.route) {
-    const why = routeMismatch(out, flags.route, !flags.role)
+    const why = routeMismatch(out, flags.route, !flags.role, relays?.destinations)
     if (why) kit.push(['route_mismatch', why])
   }
 

@@ -18,6 +18,7 @@
 //! - [`discovery`]: mDNS with a rotating random instance name.
 //! - [`watch`]: interface changes and wakes, for the caller to redial.
 //! - [`limits`]: every limit, its default and allowed range.
+//! - [`relay`]: calling, joining and registering through a relay.
 // Only `private` (the Windows security calls) may use unsafe code.
 #![deny(unsafe_code)]
 
@@ -35,6 +36,7 @@ pub mod limits;
 pub mod pipe;
 pub mod preauth;
 pub mod private;
+pub mod relay;
 pub mod rng;
 pub mod routes;
 pub mod store;
@@ -50,7 +52,7 @@ pub use clock::{Clock, ManualClock, SystemClock};
 pub use conn::{CloseReason, ConnStatus, Connection, MuxStream, StreamReader, StreamWriter};
 pub use endpoint::{Endpoint, PortChoice};
 pub use error::NetError;
-pub use host::{ApprovalRequest, Host, HostConfig, HostEvent, Refusal};
+pub use host::{AppliedRemoval, ApprovalRequest, Host, HostConfig, HostEvent, Refusal};
 pub use limits::Limits;
 pub use preauth::{ListenerKind, PreAuthSlot, PreAuthStats};
 pub use tls::TlsPolicy;
@@ -80,6 +82,22 @@ pub type SharedSigner = Arc<dyn IdentitySigner + Send + Sync>;
         mousse_control = "enroll-while-paused",
         mousse_control = "repair-skips-slot",
         mousse_control = "repair-skips-fence",
+        mousse_control = "no-endpoint-lock",
+        mousse_control = "no-pin-relay",
+        mousse_control = "shared-caller-key",
+        mousse_control = "close-all-on-removal",
+        mousse_control = "manifest-unapproved",
+        mousse_control = "blanket-approval",
+        mousse_control = "no-pairing-recovery",
+        mousse_control = "recovery-makes-grant",
+        mousse_control = "no-overlap",
+        mousse_control = "relay-overlap-ignored",
+        mousse_control = "chain-full-ignored",
+        mousse_control = "stale-manifest-dropped",
+        mousse_control = "prompt-on-key-change",
+        mousse_control = "disallow-keeps-paths",
+        mousse_control = "remove-keeps-sessions",
+        mousse_control = "accept-legs-unbounded",
         mousse_control = "ws-allow-origin",
         mousse_control = "plain-ws-off-loopback",
         mousse_control = "release-test-root",
@@ -116,6 +134,22 @@ compile_error!("a mousse_control build has a deliberate defect and is for tests 
     mousse_control = "enroll-while-paused",
     mousse_control = "repair-skips-slot",
     mousse_control = "repair-skips-fence",
+    mousse_control = "no-endpoint-lock",
+    mousse_control = "no-pin-relay",
+    mousse_control = "shared-caller-key",
+    mousse_control = "close-all-on-removal",
+    mousse_control = "manifest-unapproved",
+    mousse_control = "blanket-approval",
+    mousse_control = "no-pairing-recovery",
+    mousse_control = "recovery-makes-grant",
+    mousse_control = "no-overlap",
+    mousse_control = "relay-overlap-ignored",
+    mousse_control = "chain-full-ignored",
+    mousse_control = "stale-manifest-dropped",
+    mousse_control = "prompt-on-key-change",
+    mousse_control = "disallow-keeps-paths",
+    mousse_control = "remove-keeps-sessions",
+    mousse_control = "accept-legs-unbounded",
     mousse_control = "ws-allow-origin",
     mousse_control = "plain-ws-off-loopback",
     mousse_control = "release-test-root",
@@ -168,12 +202,44 @@ pub const CONTROL: Option<&str> = if cfg!(mousse_control = "skip-pin-check") {
     Some("fence-at-accept-only")
 } else if cfg!(mousse_control = "fence-tcp-only") {
     Some("fence-tcp-only")
+} else if cfg!(mousse_control = "no-endpoint-lock") {
+    Some("no-endpoint-lock")
 } else if cfg!(mousse_control = "enroll-while-paused") {
     Some("enroll-while-paused")
 } else if cfg!(mousse_control = "repair-skips-slot") {
     Some("repair-skips-slot")
 } else if cfg!(mousse_control = "repair-skips-fence") {
     Some("repair-skips-fence")
+} else if cfg!(mousse_control = "no-pin-relay") {
+    Some("no-pin-relay")
+} else if cfg!(mousse_control = "shared-caller-key") {
+    Some("shared-caller-key")
+} else if cfg!(mousse_control = "close-all-on-removal") {
+    Some("close-all-on-removal")
+} else if cfg!(mousse_control = "manifest-unapproved") {
+    Some("manifest-unapproved")
+} else if cfg!(mousse_control = "blanket-approval") {
+    Some("blanket-approval")
+} else if cfg!(mousse_control = "no-pairing-recovery") {
+    Some("no-pairing-recovery")
+} else if cfg!(mousse_control = "recovery-makes-grant") {
+    Some("recovery-makes-grant")
+} else if cfg!(mousse_control = "no-overlap") {
+    Some("no-overlap")
+} else if cfg!(mousse_control = "relay-overlap-ignored") {
+    Some("relay-overlap-ignored")
+} else if cfg!(mousse_control = "chain-full-ignored") {
+    Some("chain-full-ignored")
+} else if cfg!(mousse_control = "stale-manifest-dropped") {
+    Some("stale-manifest-dropped")
+} else if cfg!(mousse_control = "prompt-on-key-change") {
+    Some("prompt-on-key-change")
+} else if cfg!(mousse_control = "disallow-keeps-paths") {
+    Some("disallow-keeps-paths")
+} else if cfg!(mousse_control = "remove-keeps-sessions") {
+    Some("remove-keeps-sessions")
+} else if cfg!(mousse_control = "accept-legs-unbounded") {
+    Some("accept-legs-unbounded")
 } else if cfg!(mousse_control = "ws-allow-origin") {
     Some("ws-allow-origin")
 } else if cfg!(mousse_control = "plain-ws-off-loopback") {

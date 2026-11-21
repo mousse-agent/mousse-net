@@ -16,6 +16,15 @@
         mousse_control = "stop-on-mismatch",
         mousse_control = "public-routes",
         mousse_control = "no-rediscovery",
+        mousse_control = "auto-send-unknown",
+        mousse_control = "new-request-id-on-retry",
+        mousse_control = "no-prefetch",
+        mousse_control = "pause-all-classes",
+        mousse_control = "fund-two-relays",
+        mousse_control = "keep-removed-slot",
+        mousse_control = "unpinned-manifest",
+        mousse_control = "trust-from-plus",
+        mousse_control = "no-tag-quota",
         mousse_control = "no-preauth-budget",
         mousse_control = "shared-preauth-pool",
         mousse_control = "ws-slot-after-headers",
@@ -29,6 +38,7 @@
         mousse_control = "repair-skips-slot",
         mousse_control = "repair-skips-fence",
         mousse_control = "limits-raise",
+        mousse_control = "no-endpoint-lock",
         mousse_control = "ws-allow-origin",
         mousse_control = "plain-ws-off-loopback",
         mousse_control = "release-test-root",
@@ -83,6 +93,15 @@ compile_error!("test-in-person lets a typed ticket count as scanned from the hos
     mousse_control = "stop-on-mismatch",
     mousse_control = "public-routes",
     mousse_control = "no-rediscovery",
+    mousse_control = "auto-send-unknown",
+    mousse_control = "new-request-id-on-retry",
+    mousse_control = "no-prefetch",
+    mousse_control = "pause-all-classes",
+    mousse_control = "fund-two-relays",
+    mousse_control = "keep-removed-slot",
+    mousse_control = "unpinned-manifest",
+    mousse_control = "trust-from-plus",
+    mousse_control = "no-tag-quota",
     mousse_control = "no-preauth-budget",
     mousse_control = "shared-preauth-pool",
     mousse_control = "ws-slot-after-headers",
@@ -96,6 +115,7 @@ compile_error!("test-in-person lets a typed ticket count as scanned from the hos
     mousse_control = "repair-skips-slot",
     mousse_control = "repair-skips-fence",
     mousse_control = "limits-raise",
+    mousse_control = "no-endpoint-lock",
     mousse_control = "ws-allow-origin",
     mousse_control = "plain-ws-off-loopback",
     mousse_control = "release-test-root",
@@ -147,10 +167,12 @@ const _: () = {
 
 mod app;
 mod applog;
+mod engine;
 mod ipc;
 mod limits;
 mod peer;
 mod pipe;
+mod plus;
 mod revoke;
 mod ssh;
 
@@ -210,6 +232,8 @@ enum Command {
         /// `init` behind.
         #[arg(long)]
         app: bool,
+        #[command(flatten)]
+        headless: Headless,
     },
     /// Show this endpoint's device id and port.
     Id,
@@ -241,8 +265,10 @@ enum Command {
         /// docs/phase1a-design.md §2). The helper's own lines go to
         /// `helper.log` in the state directory, and it exits when stdin
         /// closes.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "headless")]
         app: bool,
+        #[command(flatten)]
+        headless: Headless,
     },
     /// Make an invitation on the running host and print the ticket and a QR
     /// code. In person (the default), answer "Is the device next to you?";
@@ -253,6 +279,10 @@ enum Command {
         /// a fresh one for each attempt.
         #[arg(long)]
         link: bool,
+        /// Show the ticket as a QR code in the terminal, for the phone's
+        /// in-app scanner (the default in person).
+        #[arg(long, conflicts_with_all = ["link", "no_qr"])]
+        qr: bool,
         /// Print only the ticket line, no QR code.
         #[arg(long)]
         no_qr: bool,
@@ -343,6 +373,56 @@ enum Command {
         #[arg(last = true)]
         command: Vec<String>,
     },
+}
+
+/// A headless endpoint (design §B.13): one endpoint on a server, no app,
+/// driven by this CLI. Its key goes in the OS keystore when one takes it,
+/// otherwise in an owner-only file in the state directory.
+#[derive(clap::Args, Debug, Clone, Copy)]
+struct Headless {
+    /// No app: create the endpoint on first start if the state directory
+    /// has none, with its key in the OS keystore or, where there is none,
+    /// in an owner-only file (0600) in the state directory.
+    #[arg(long)]
+    headless: bool,
+    /// With --headless: keep the key in the owner-only file even if an OS
+    /// keystore is available.
+    #[arg(long, requires = "headless")]
+    key_file: bool,
+}
+
+impl Headless {
+    fn storage(self) -> KeyStorage {
+        if self.key_file {
+            KeyStorage::File
+        } else {
+            KeyStorage::KeystoreOrFile
+        }
+    }
+}
+
+/// Create the endpoint in `dir` for a headless run and say where its key
+/// went.
+fn create_headless(
+    dir: &Path,
+    profile: Option<&str>,
+    headless: Headless,
+) -> Result<Endpoint, String> {
+    let (endpoint, key) =
+        Endpoint::create(dir, profile, headless.storage()).map_err(|e| e.to_string())?;
+    println!(
+        "created endpoint {} in {}",
+        short_id(&endpoint.identity()),
+        dir.display()
+    );
+    match key.storage() {
+        KeyStorage::OsKeystore => println!("identity key: in the OS keystore"),
+        _ => println!(
+            "identity key: in an owner-only file in {} (no OS keystore used)",
+            dir.display()
+        ),
+    }
+    Ok(endpoint)
 }
 
 /// How a ticket reached this device. A ticket given on the command line
@@ -675,13 +755,21 @@ async fn run(cli: Cli) -> Result<i32, String> {
     let dir = std::path::absolute(&dir).unwrap_or(dir);
     let insecure = cli.insecure_file_key;
     match cli.command {
-        Command::Init { profile, app } => {
+        Command::Init {
+            profile,
+            app,
+            headless,
+        } => {
             if app {
                 exit_when_stdin_closes();
             }
             let hold = crate::limits::helper().init_hold_ms();
             if hold > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(hold)).await;
+            }
+            if headless.headless {
+                create_headless(&dir, profile.as_deref(), headless)?;
+                return Ok(0);
             }
             let (endpoint, _) = Endpoint::create(&dir, profile.as_deref(), storage(insecure))
                 .map_err(|e| e.to_string())?;
@@ -720,7 +808,21 @@ async fn run(cli: Cli) -> Result<i32, String> {
             tunnels,
             name,
             app,
+            headless,
         } => {
+            // A headless first start keeps the endpoint it created, and
+            // with it the endpoint's locks, straight into serving: no other
+            // process can open it in between. Another first start that lost
+            // the race finds the endpoint made and refuses like any second
+            // process.
+            let mut created = None;
+            if headless.headless && !Endpoint::exists(&dir) {
+                match create_headless(&dir, None, headless) {
+                    Ok(endpoint) => created = Some(endpoint),
+                    Err(_) if Endpoint::exists(&dir) => {}
+                    Err(e) => return Err(e),
+                }
+            }
             let opts = serve::ServeOptions {
                 name: name.unwrap_or_else(computer_name),
                 listen_ip,
@@ -730,9 +832,9 @@ async fn run(cli: Cli) -> Result<i32, String> {
                 ws_port,
                 tunnels,
             };
-            serve::run(&dir, insecure, opts).await?;
+            serve::run(&dir, insecure, opts, created).await?;
         }
-        Command::Invite { link, no_qr } => invite(&dir, link, no_qr).await?,
+        Command::Invite { link, qr: _, no_qr } => invite(&dir, link, no_qr).await?,
         Command::Join {
             ticket,
             arrival,

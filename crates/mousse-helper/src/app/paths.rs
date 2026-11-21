@@ -323,10 +323,46 @@ pub(super) fn approvals_changed(shared: &Shared, identity: &IdentityPublicKey) {
     shared.caller.forget_routes(Some(identity));
 }
 
-/// Reach `record`'s host: the stored candidates, with what the browse
-/// source finds joining as it arrives. Returns the live connection and how
-/// it was reached.
-async fn reach(shared: &Shared, record: &PeerRecord) -> Result<(Connection, Reached), NetError> {
+/// How a dial reached its host.
+enum Via {
+    Local(Reached),
+    Relay(mousse_net_core::relay_endpoint::RelayRoute),
+}
+
+/// Reach `record`'s host: its own routes and the browse first, then its
+/// relay routes (Phase 3 B.6, B.11). A refusal by the host itself ends it.
+async fn reach(shared: &Shared, record: &PeerRecord) -> Result<(Connection, Via), NetError> {
+    let first = match reach_local(shared, record).await {
+        Ok((conn, used)) => return Ok((conn, Via::Local(used))),
+        Err(e @ NetError::Closed(_)) => return Err(e),
+        Err(e) => e,
+    };
+    let pin = record.pin()?;
+    let mut read_slot = false;
+    loop {
+        if !super::relay::candidates(shared, &pin).is_empty() {
+            match super::relay::reach(shared, &pin).await {
+                Ok((conn, route)) => return Ok((conn, Via::Relay(route))),
+                Err(e @ NetError::Closed(_)) => return Err(e),
+                Err(_) => {}
+            }
+        }
+        // Every route failed: the host's directory slot may hold a newer
+        // manifest (a rotated handle or a moved relay, Phase 4 §B.12).
+        if read_slot || !super::relay::hosted::from_slot(shared, &pin).await {
+            return Err(first);
+        }
+        read_slot = true;
+    }
+}
+
+/// Reach `record`'s host on its own routes: the stored candidates, with
+/// what the browse source finds joining as it arrives. Returns the live
+/// connection and how it was reached.
+async fn reach_local(
+    shared: &Shared,
+    record: &PeerRecord,
+) -> Result<(Connection, Reached), NetError> {
     let pin = record.pin()?;
     let policy = shared.caller.addr_policy().clone();
     let mut search = stored_search(&policy, &shared.info.state_dir, record);
@@ -553,15 +589,28 @@ pub async fn dial(
         .keep
         .note_end(pin, reached.as_ref().err().map(Failure::of));
     let (conn, used) = reached.map_err(DialError::Failed)?;
-    // Only the route is noted, on the record as stored now.
-    let _ = PeerStore::in_dir(&shared.info.state_dir).note_route(&pin, used.route.uri());
-    applog::line(format!(
-        "connected {} (out) at {}",
-        short_id(&pin),
-        used.route
-    ));
     let role = super::pairing::role_text(&record.role);
-    let fields = json!({"dir": "out", "role": role, "route": route_json(&used)});
+    let (route, via) = match used {
+        Via::Local(used) => {
+            // Only the route is noted, on the record as stored now.
+            let _ = PeerStore::in_dir(&shared.info.state_dir).note_route(&pin, used.route.uri());
+            applog::line(format!(
+                "connected {} (out) at {}",
+                short_id(&pin),
+                used.route
+            ));
+            (route_json(&used), None)
+        }
+        Via::Relay(route) => {
+            applog::line(format!(
+                "connected {} (out) through relay {}",
+                short_id(&pin),
+                route.endpoint
+            ));
+            (super::relay::route_json(&route, false), Some(route))
+        }
+    };
+    let fields = json!({"dir": "out", "role": role, "route": route});
     let no = match shared.add_outbound(conn, gen, fields) {
         Ok(no) => no,
         Err(super::Stale::Paused) => return Err(DialError::Paused),
@@ -569,6 +618,9 @@ pub async fn dial(
             return Err(DialError::NoPeer("forgotten while the path opened".into()))
         }
     };
+    if let Some(route) = via {
+        shared.set_via(no, route);
+    }
     Ok(Dialled {
         conn: no,
         already: false,

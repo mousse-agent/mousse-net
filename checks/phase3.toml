@@ -1,0 +1,415 @@
+# Phase 3: self-hosted relay (docs/PLAN.md, "Phase 3"; docs/phase34-design.md
+# Part G.1).
+#
+# Owner check: `mousse-check phase3` shows PASS in every target cell and no
+# INCOMPLETE. Format: checks/README.md.
+#
+# The relay engine's checks (E-R0, E-R1, E-R2, E-R7), the headless daemon's
+# (E-R5) and the release checks (E-R6). The helper's relay client (E-R3, E-R4)
+# has phase3.relay-client, phase3.relay-routes and phase3.relay-rotation; its
+# tests run the real mousse-relay in the test process, on loopback.
+
+phase = "phase3"
+title = "Self-hosted relay"
+plan = "docs/PLAN.md#phase-3"
+
+# ---------------------------------------------------------------------------
+# Relay admission: the core machine and its vectors, then the relay over real
+# connections on loopback.
+
+[[check]]
+id = "phase3.relay-admission"
+title = "Relay admission: every relay vector, the timing rule, wrong relay key and wrong peer identity fail before data, SUCCESSOR needs the current key"
+plan = "docs/phase34-design.md C.2, C.3, G.1; spec/relay.md"
+targets = ["windows-x64", "macos-arm64", "linux-x64"]
+judge = "cargo-test"
+min_tests = 185
+device_steps = "on that machine: mousse-check run phase3.relay-admission --sign-with <key>, then the same with --control"
+
+[[check.local]]
+target = "windows-x64"
+host = "windows-x86_64"
+command = ["cargo", "test", "-p", "mousse-net-core", "-p", "mousse-relay", "--no-fail-fast", "--lib", "--test", "vectors", "--test", "relay_admission"]
+
+[[check.local]]
+target = "macos-arm64"
+host = "macos-aarch64"
+command = ["cargo", "test", "-p", "mousse-net-core", "-p", "mousse-relay", "--no-fail-fast", "--lib", "--test", "vectors", "--test", "relay_admission"]
+
+[[check.local]]
+target = "linux-x64"
+host = "linux-x86_64"
+command = ["cargo", "test", "-p", "mousse-net-core", "-p", "mousse-relay", "--no-fail-fast", "--lib", "--test", "vectors", "--test", "relay_admission"]
+
+[[check.control]]
+name = "skip-allow-set"
+breaks = "the relay admits any caller of a handle that has an allow-set"
+env = { RUSTFLAGS = '--cfg mousse_control="relay-skip-allow-set"' }
+
+[[check.control]]
+name = "refuse-early"
+breaks = "the relay answers a refused call at once instead of at the refusal deadline"
+env = { RUSTFLAGS = '--cfg mousse_control="relay-refuse-early"' }
+
+[[check.control]]
+name = "no-pin-relay"
+breaks = "the native client accepts any relay key"
+env = { RUSTFLAGS = '--cfg mousse_control="no-pin-relay"' }
+
+[[check.control]]
+name = "successor-unchecked"
+breaks = "SUCCESSOR does not check the current key's proof"
+env = { RUSTFLAGS = '--cfg mousse_control="relay-successor-unchecked"' }
+
+[[check.control]]
+name = "chain-full-closes"
+breaks = "a SUCCESSOR whose chain is full closes the registration instead of REFUSED(chain_full)"
+env = { RUSTFLAGS = '--cfg mousse_control="relay-chain-full-closes"' }
+
+[[check]]
+id = "phase3.relay-reboot"
+title = "Relay reboot: identity kept, calls refused until re-registration and an allow-set push, removal survives, one process per state directory"
+plan = "docs/phase34-design.md C.1 rule 10, G.1"
+targets = ["linux-x64", "macos-arm64"]
+judge = "cargo-test"
+min_tests = 1
+device_steps = "on that machine: mousse-check run phase3.relay-reboot --sign-with <key>, then the same with --control"
+
+[[check.local]]
+target = "linux-x64"
+host = "linux-x86_64"
+command = ["cargo", "test", "-p", "mousse-relay", "--no-fail-fast", "--test", "relay_reboot"]
+
+[[check.local]]
+target = "macos-arm64"
+host = "macos-aarch64"
+command = ["cargo", "test", "-p", "mousse-relay", "--no-fail-fast", "--test", "relay_reboot"]
+
+[[check.control]]
+name = "persist-allow-set"
+breaks = "the relay stores the first allow-set of each handle and reapplies it after a reboot"
+env = { RUSTFLAGS = '--cfg mousse_control="relay-persist-allow-set"' }
+
+[[check]]
+id = "phase3.relay-limits"
+title = "Relay limits: per address, per-handle accept legs, per-caller circuits, queue, first-message wait, egress and pre-accept budget; tighten-only variables refuse to loosen"
+plan = "docs/phase34-design.md H.1, G.1; spec/relay.md 13"
+targets = ["linux-x64", "windows-x64"]
+judge = "cargo-test"
+min_tests = 11
+device_steps = "on that machine: mousse-check run phase3.relay-limits --sign-with <key>, then the same with --control"
+
+[[check.local]]
+target = "windows-x64"
+host = "windows-x86_64"
+command = ["cargo", "test", "-p", "mousse-relay", "--no-fail-fast", "--lib", "--test", "relay_limits"]
+
+[[check.local]]
+target = "linux-x64"
+host = "linux-x86_64"
+command = ["cargo", "test", "-p", "mousse-relay", "--no-fail-fast", "--lib", "--test", "relay_limits"]
+
+[[check.control]]
+name = "no-preaccept-budget"
+breaks = "join circuits have no byte budget and no per-target cap"
+env = { RUSTFLAGS = '--cfg mousse_control="relay-no-preaccept-budget"' }
+
+# ---------------------------------------------------------------------------
+# The simulator and the second implementation.
+
+[[check]]
+id = "phase3.sim-relay-admission"
+title = "Simulator: relay admission over many seeds, across reboots and key rotation"
+plan = "docs/phase34-design.md F.1 E-R1 (mousse-sim admission seeds)"
+targets = ["windows-x64"]
+judge = "marker"
+pass_marker = "PASS sim relay-admission"
+fail_marker = "FAIL sim relay-admission"
+
+[[check.local]]
+target = "windows-x64"
+host = "windows-x86_64"
+command = ["cargo", "run", "--release", "-p", "mousse-sim", "--", "run", "relay-admission", "--seeds", "1000"]
+
+[[check.control]]
+name = "relay-early-answer"
+breaks = "the simulated relay's timer runs ahead of its clock, so refused calls are answered before the deadline"
+args = ["--bug", "relay-early-answer"]
+
+[[check.control]]
+name = "relay-stale-allow-set"
+breaks = "the simulated relay reapplies a target's old allow-set when it registers after a reboot"
+args = ["--bug", "relay-stale-allow-set"]
+
+[[check]]
+id = "phase3.relay-second-implementation"
+title = "The independent TypeScript implementation passes every relay vector"
+plan = "docs/phase34-design.md C.3 (\"replayed by an independent implementation from the spec alone\")"
+targets = ["windows-x64"]
+judge = "marker"
+pass_marker = "PASS second-impl"
+fail_marker = "FAIL second-impl"
+
+# Needs `npm ci` once in interop/second-impl-ts.
+[[check.local]]
+target = "windows-x64"
+host = "windows-x86_64"
+cwd = "interop/second-impl-ts"
+command = ["node", "--disable-warning=ExperimentalWarning", "test.mjs"]
+
+[[check.control]]
+name = "relay-allow-set"
+breaks = "the second implementation's relay admits any caller of a handle that has an allow-set"
+env = { MOUSSE_SECOND_BREAK = "relay-allow-set" }
+
+# ---------------------------------------------------------------------------
+# Privacy: the marker.
+
+[[check]]
+id = "phase3.marker"
+title = "A marker sent through the relay inside the peer session is found 0 times in a capture of both legs, the relay's decrypted view and a relay memory sample"
+plan = "docs/phase34-design.md G.1, B.16; spec/privacy.md \"Through a relay\""
+targets = ["linux-x64"]
+judge = "marker"
+pass_marker = "PASS phase3.marker"
+fail_marker = "FAIL phase3.marker"
+device_steps = "in WSL (Linux): mousse-check run phase3.marker --sign-with <key>, then the same with --control"
+
+[[check.local]]
+target = "linux-x64"
+host = "linux-x86_64"
+command = ["cargo", "test", "-p", "mousse-relay", "--test", "marker", "--", "--nocapture"]
+
+[[check.control]]
+name = "marker-in-splice"
+breaks = "packet positive control: the caller also sends the marker in the clear inside the splice and the relay runs without outer TLS, so the capture and the tap must find it"
+env = { RUSTFLAGS = '--cfg mousse_control="marker-in-splice"' }
+expect_reason = "packet"
+
+[[check.control]]
+name = "marker-in-relay-memory"
+breaks = "memory positive control: the relay copies the marker into its heap, so the memory sample must find it"
+env = { RUSTFLAGS = '--cfg mousse_control="marker-in-relay-memory"' }
+expect_reason = "memory"
+
+# ---------------------------------------------------------------------------
+# Headless daemon (E-R5; docs/headless.md)
+
+[[check]]
+id = "phase3.headless"
+title = "serve --headless makes its endpoint with an owner-only key file; a second process for the same endpoint refuses to start while another profile's endpoint starts; the terminal QR code pairs a device; the shipped systemd unit starts the daemon"
+plan = "design §B.13; Part G.1; PLAN Phase 3 exit (a second profile's endpoint starts)"
+targets = ["linux-x64", "macos-arm64"]
+judge = "cargo-test"
+min_tests = 5
+device_steps = "on that machine: mousse-check run phase3.headless --sign-with <key>, then the same with --control no-endpoint-lock"
+
+[[check.local]]
+target = "linux-x64"
+host = "linux-x86_64"
+command = ["cargo", "test", "-p", "mousse-helper", "--features", "test-in-person", "--test", "headless", "--no-fail-fast"]
+
+[[check.local]]
+target = "macos-arm64"
+host = "macos-aarch64"
+command = ["cargo", "test", "-p", "mousse-helper", "--features", "test-in-person", "--test", "headless", "--no-fail-fast"]
+
+[[check.control]]
+name = "no-endpoint-lock"
+breaks = "the endpoint takes no lock, so a second process runs the same endpoint"
+env = { RUSTFLAGS = '--cfg mousse_control="no-endpoint-lock"' }
+
+# ---------------------------------------------------------------------------
+# Releases, install and the template (E-R6; docs/release.md)
+#
+# Both run on any machine with Docker: the PC's Docker Desktop (only on an
+# --internal network), or a Linux host. They need git, cargo (to vendor the
+# crates once per Cargo.lock) and node; the minisign release tool and the
+# Ubuntu cloud image are fetched once by pinned hash.
+
+[[check]]
+id = "phase3.relay-hardening"
+title = "Every relay command starts with core dumps off (hard limit 0) and the process non-dumpable; only a debug build honours the test hook that keeps it dumpable"
+plan = "design §B.15 \"Docker\" (core dumps off), §B.16 (PR_SET_DUMPABLE 0); phase3.install checks the same in the release image and the systemd unit"
+targets = ["linux-x64"]
+judge = "cargo-test"
+min_tests = 2
+device_steps = "in Linux: mousse-check run phase3.relay-hardening --sign-with <key>, then the same with --control"
+
+[[check.local]]
+target = "linux-x64"
+host = "linux-x86_64"
+command = ["cargo", "test", "-p", "mousse-relay", "--test", "hardening", "--no-fail-fast"]
+
+[[check.control]]
+name = "relay-dumpable"
+breaks = "the relay leaves its process dumpable, so same-user processes can read its memory"
+env = { RUSTFLAGS = '--cfg mousse_control="relay-dumpable"' }
+
+[[check]]
+id = "phase3.reproducible"
+title = "Two independent builds of the relay give the same hash and two image builds the same digest; the minisign signature verifies and sign.sh refuses the legacy format; install.sh refuses an unsigned, tampered, re-signed or replayed download"
+plan = "design §B.15 \"Reproducible builds\" and \"Signed\"; Part G.1"
+targets = ["linux-x64"]
+judge = "marker"
+timeout_secs = 3600
+
+[[check.local]]
+target = "linux-x64"
+host = "windows-x86_64"
+command = ["node", "release/tests/check.mjs", "reproducible", "--out", "{out}"]
+
+[[check.local]]
+target = "linux-x64"
+host = "linux-x86_64"
+command = ["node", "release/tests/check.mjs", "reproducible", "--out", "{out}"]
+
+[[check.control]]
+name = "unsigned-accepted"
+breaks = "install.sh's signature check accepts anything, so an attacker's binary with matching checksums and no signatures is accepted"
+args = ["--control", "unsigned-accepted"]
+expect_reason = "unsigned-accepted"
+
+[[check]]
+id = "phase3.install"
+title = "Fresh Ubuntu cloud image to an enrollment link with install.sh (hardened unit, upgrade keeps the identity) and with the cloud-init template; a tampered download installs nothing; the relay image runs read-only, without a shell, as an unprivileged user, and keeps its identity in its state volume"
+plan = "design §B.15 \"Docker\", \"One-command install\" and \"The template\"; Part G.1"
+targets = ["linux-x64"]
+judge = "marker"
+timeout_secs = 3600
+
+[[check.local]]
+target = "linux-x64"
+host = "windows-x86_64"
+command = ["node", "release/tests/check.mjs", "install", "--out", "{out}"]
+
+[[check.local]]
+target = "linux-x64"
+host = "linux-x86_64"
+command = ["node", "release/tests/check.mjs", "install", "--out", "{out}"]
+
+[[check.control]]
+name = "skip-verify"
+breaks = "install.sh skips the release check, so a tampered download is installed"
+args = ["--control", "skip-verify"]
+expect_reason = "tampered-installed"
+
+[[check]]
+id = "phase3.outside-template"
+title = "An independent tester deploys the cloud-init template on their own VPS, gets an enrollment link, and upgrades it with the identity kept"
+plan = "PLAN Phase 3 \"the first template\"; design §B.15 \"The template\""
+targets = ["manual"]
+manual = true
+steps = "someone outside the team pastes dist/cloud-init.yaml of a signed release as user data on a VPS of their choice, opens TCP 443, reads the enrollment link from /root/mousse-relay.txt, enrolls an endpoint, then upgrades with `sudo mousse-relay-install --version <next>` and confirms the endpoint still registers without a new link; attest with the tester, the provider, the image and the two versions"
+
+# ---------------------------------------------------------------------------
+# Manual steps.
+
+[[check]]
+id = "phase3.relay-admission-review"
+title = "Council sign-off of relay admission (Part C) before it freezes for relay protocol version 1"
+plan = "docs/phase34-design.md C.4; checks/reviews/phase0-design-review.md"
+targets = ["relay-admission"]
+manual = true
+steps = "review docs/phase34-design.md C.1 to C.3 and B.3, B.4, B.7 against spec/relay.md and spec/vectors/relay-admission.json; add the C.4 line to checks/reviews/phase0-design-review.md; attest with the reviewers and the review link"
+
+[[check]]
+id = "phase3.inspect"
+title = "On a deployed relay, the kit prints the deployed hash against a local build, the log and the state directory"
+plan = "docs/phase34-design.md G.1, B.16"
+targets = ["self-hosted-relay"]
+manual = true
+steps = "on the relay machine: mousse-check relay-inspect --state <state dir> --binary <deployed mousse-relay> --local <locally built mousse-relay> --log <relay log>; it must end PASS relay-inspect; attest with the output"
+
+# ---------------------------------------------------------------------------
+# The helper's relay client (E-R3, E-R4)
+
+[[check]]
+id = "phase3.relay-routes"
+title = "The app channel's cases over a relay route; bulk on its own outer connection and peer session; removing one caller closes only its circuits, also when the removal is replayed at start; caller keys per pairing; a relay route is dialled only after its destination is approved, per destination; relay-only pairing whose circuit dropped after PAIRED recovers with one grant, and only that grant rides the recovery circuit; disallowing a destination ends the paths through it, bulk included; removing an own relay ends the sessions through it; a caller's pair secret is not in a plain file"
+plan = "docs/phase34-design.md §B.5 to §B.8, §B.11, §B.12 and Part F (E-R3)"
+targets = ["windows-x64", "macos-arm64", "linux-x64"]
+min_tests = 8
+local = [
+  { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_relay", "--no-fail-fast"] },
+  { target = "macos-arm64", host = "macos-aarch64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_relay", "--no-fail-fast"] },
+  { target = "linux-x64", host = "linux-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_relay", "--no-fail-fast"] },
+]
+control = [
+  { name = "shared-caller-key", breaks = "a device uses one caller key for every host", env = { RUSTFLAGS = '--cfg mousse_control="shared-caller-key"' } },
+  { name = "close-all-on-removal", breaks = "a removal empties the allow-set before listing the rest again, closing every caller's circuits", env = { RUSTFLAGS = '--cfg mousse_control="close-all-on-removal"' } },
+  { name = "manifest-unapproved", breaks = "manifest relay routes are dialled without the destination's approval", env = { RUSTFLAGS = '--cfg mousse_control="manifest-unapproved"' } },
+  { name = "blanket-approval", breaks = "one approved relay destination of a host approves every other one", env = { RUSTFLAGS = '--cfg mousse_control="blanket-approval"' } },
+  { name = "no-pairing-recovery", breaks = "a consumed relay invitation's tag leaves the allow-set at once", env = { RUSTFLAGS = '--cfg mousse_control="no-pairing-recovery"' } },
+  { name = "recovery-makes-grant", breaks = "a join circuit admits a granted identity other than the grant its invitation made", env = { RUSTFLAGS = '--cfg mousse_control="recovery-makes-grant"' } },
+  { name = "disallow-keeps-paths", breaks = "disallowing a relay destination leaves the paths through it up", env = { RUSTFLAGS = '--cfg mousse_control="disallow-keeps-paths"' } },
+  { name = "remove-keeps-sessions", breaks = "removing an own relay leaves the sessions through it up", env = { RUSTFLAGS = '--cfg mousse_control="remove-keeps-sessions"' } },
+]
+
+[[check]]
+id = "phase3.relay-client"
+title = "The endpoint side of the relay protocol: the peer TLS runs end to end through the splice; a wrong relay key fails in the outer TLS before any relay message; an unlisted caller and an unknown handle are refused at the constant deadline; an allow-set change closes only the removed caller's circuits; an enrollment code registers once; a relay cannot make the target dial more accept legs than its limit"
+plan = "docs/phase34-design.md §B.2 to §B.9 (E-R3, client side)"
+targets = ["windows-x64", "macos-arm64", "linux-x64"]
+min_tests = 6
+local = [
+  { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-net-io", "--test", "relay", "--no-fail-fast"] },
+  { target = "macos-arm64", host = "macos-aarch64", command = ["cargo", "test", "-p", "mousse-net-io", "--test", "relay", "--no-fail-fast"] },
+  { target = "linux-x64", host = "linux-x86_64", command = ["cargo", "test", "-p", "mousse-net-io", "--test", "relay", "--no-fail-fast"] },
+]
+control = [
+  { name = "no-pin-relay", breaks = "the outer TLS accepts any relay key", env = { RUSTFLAGS = '--cfg mousse_control="no-pin-relay"' } },
+  { name = "accept-legs-unbounded", breaks = "every INCOMING gets an accept leg, however many are being dialled", env = { RUSTFLAGS = '--cfg mousse_control="accept-legs-unbounded"' } },
+]
+
+[[check]]
+id = "phase3.relay-rotation"
+title = "Manual key rotation asks nothing; a caller offline through the rotation comes back through the old route within the overlap and gets the new manifest; removal holds across the rotation; the old key leaves after the overlap; a stale manifest's routes are still dialled; a rotation the relay had not taken before a restart goes on after it, the old key current meanwhile; a full key chain ends the rotation without dropping the registration and refuses the next one at once; a pending rotation can be cancelled; the overlap is never above the relay's"
+plan = "docs/phase34-design.md §B.4 and §B.11 (E-R4)"
+targets = ["linux-x64", "windows-x64"]
+min_tests = 7
+local = [
+  { target = "linux-x64", host = "linux-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_relay_rotation", "--no-fail-fast"] },
+  { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_relay_rotation", "--no-fail-fast"] },
+]
+control = [
+  { name = "no-overlap", breaks = "a rotation drops the old key and its route at once", env = { RUSTFLAGS = '--cfg mousse_control="no-overlap"' } },
+  { name = "stale-manifest-dropped", breaks = "routes of a manifest past its expiry are not dialled", env = { RUSTFLAGS = '--cfg mousse_control="stale-manifest-dropped"' } },
+  { name = "prompt-on-key-change", breaks = "a new relay key or handle at an approved destination needs approval again", env = { RUSTFLAGS = '--cfg mousse_control="prompt-on-key-change"' } },
+  { name = "chain-full-ignored", breaks = "the helper keeps a rotation the relay refused as chain_full and sends SUCCESSOR again", env = { RUSTFLAGS = '--cfg mousse_control="chain-full-ignored"' } },
+  { name = "relay-overlap-ignored", breaks = "the overlap ignores the shorter one the relay advertises", env = { RUSTFLAGS = '--cfg mousse_control="relay-overlap-ignored"' } },
+]
+
+# Cross-machine: the relay on the Mac, both endpoints on the PC dialling
+# out (Part G topology). crates/mousse-helper/tests/app_relay_remote.rs runs
+# the cases of app_relay.rs and app_relay_rotation.rs against the Mac's relay,
+# named by enrollment links in MOUSSE_RELAY_TEST_LINKS (docs/limits.md,
+# "Relay tests"). Without links it fails with reason=not_configured and
+# writes no result. Each run needs fresh links: each is used once.
+
+[[check]]
+id = "phase3.relay-routes-cross"
+title = "As phase3.relay-routes with mousse-relay on the Mac: a PC host registered there, a PC caller reaching it only through the relay"
+plan = "docs/phase34-design.md Part G (phase3.relay-routes, pc-to-mac)"
+targets = ["pc-to-mac-lan"]
+judge = "marker"
+cross_machine = true
+waits = [{ slice = "E-R3 cross", paths = ["crates/mousse-helper/tests/app_relay_remote.rs"] }]
+device_steps = "Mac, from ~/mousse-net-runs-internal/<track> at the build under test, debug profile: cargo build -p mousse-relay; two relays, each mousse-relay --state <dir> init --public <Mac LAN IP>:<port>, then mousse-relay --state <dir> run --listen <Mac LAN IP>:<port>; six links of the first (init prints one, mousse-relay --state <dir> enroll the rest) and one of the second. The Mac only listens; the PC dials. PC: mousse-check config-digest phase3.relay-routes-cross --target pc-to-mac-lan, then cargo test -p mousse-helper --test app_relay_remote -- --ignored --exact routes_cross --nocapture with MOUSSE_RELAY_TEST_LINKS=<the seven links>, MOUSSE_RELAY_TEST_HOST_BUILD=<the Mac build, <commit>+debug> and MOUSSE_RELAY_TEST_RESULT=<file>; it ends PASS phase3.relay-routes-cross or FAIL phase3.relay-routes-cross reason=<word>. Sign the file with mousse-check sign --device-key <key> --config <digest>. Controls: the same with fresh links, the control's RUSTFLAGS on the PC build (its own CARGO_TARGET_DIR) and --control <name> on config-digest; the result names the control and must say FAIL."
+control = [
+  { name = "close-all-on-removal", breaks = "a removal closes every caller's circuits", env = { RUSTFLAGS = '--cfg mousse_control="close-all-on-removal"' } },
+  { name = "manifest-unapproved", breaks = "manifest relay routes are dialled without approval", env = { RUSTFLAGS = '--cfg mousse_control="manifest-unapproved"' } },
+]
+
+[[check]]
+id = "phase3.relay-rotation-cross"
+title = "As phase3.relay-rotation with mousse-relay on the Mac"
+plan = "docs/phase34-design.md Part G (phase3.relay-rotation, pc-to-mac)"
+targets = ["pc-to-mac-lan"]
+judge = "marker"
+cross_machine = true
+waits = [{ slice = "E-R3 cross", paths = ["crates/mousse-helper/tests/app_relay_remote.rs"] }]
+device_steps = "As phase3.relay-routes-cross, with one relay and three links, running --exact rotation_cross; it ends PASS phase3.relay-rotation-cross or FAIL phase3.relay-rotation-cross reason=<word>."
+control = [
+  { name = "no-overlap", breaks = "a rotation drops the old key at once", env = { RUSTFLAGS = '--cfg mousse_control="no-overlap"' } },
+]

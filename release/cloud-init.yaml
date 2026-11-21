@@ -1,0 +1,33 @@
+#cloud-config
+# Mousse relay @MOUSSE_RELEASE_VERSION@, self-hosted, for any VPS that takes cloud-init user data.
+#
+# 1. Create a small VPS with Ubuntu 22.04 or later, or Debian 12 or later, and
+#    paste this whole file as its user data. No domain is needed.
+# 2. Allow TCP port 443 from anywhere in the provider's firewall.
+# 3. About a minute after boot, ssh in and run:
+#        sudo cat /root/mousse-relay.txt
+#    The last lines hold the enrollment link. Paste it in Mousse: Settings,
+#    Reach, Your own relay. A link works once, for an hour; make another with:
+#        sudo -u mousse-relay mousse-relay enroll --state /var/lib/mousse-relay
+#
+# If the server has no public address on its own network interface (it sits
+# behind the provider's NAT), change "auto" below to its public IP.
+#
+# Upgrade later, keeping the relay identity and its authorized list:
+#        sudo mousse-relay-install --version <new version>
+#
+# The installer below checks every download against the release signing key
+# written into it, and refuses anything unsigned. Platforms that end TLS at
+# their own proxy cannot carry the relay's pinned key: use a plain VPS.
+
+write_files:
+  - path: /usr/local/sbin/mousse-relay-install
+    owner: root:root
+    permissions: "0755"
+    content: |
+      @MOUSSE_INSTALL_SH@
+
+runcmd:
+  # The output holds the enrollment link, so it goes only to an owner-only
+  # file, never to the boot log or the provider's console.
+  - [sh, -c, "umask 077; if /usr/local/sbin/mousse-relay-install --public auto >/root/mousse-relay.txt 2>&1; then echo 'mousse-relay installed; the enrollment link is in /root/mousse-relay.txt (ssh in, then: sudo cat /root/mousse-relay.txt)'; else echo 'mousse-relay install failed; see /root/mousse-relay.txt'; exit 1; fi"]

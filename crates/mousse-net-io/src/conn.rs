@@ -539,6 +539,8 @@ pub struct Connection {
     cmd: mpsc::UnboundedSender<Cmd>,
     status: watch::Receiver<ConnStatus>,
     incoming: tokio::sync::Mutex<mpsc::UnboundedReceiver<MuxStream>>,
+    /// The minor version both sides agreed, once the peer's `HELLO` came.
+    minor: watch::Receiver<Option<u64>>,
 }
 
 impl fmt::Debug for Connection {
@@ -567,6 +569,36 @@ impl Connection {
     /// effective deadline of the two certificates.
     pub fn deadline(&self) -> UnixTime {
         self.deadline
+    }
+
+    /// The minor protocol version agreed from the peer's first `HELLO`,
+    /// once it has arrived. Engine streams that need a later minor are
+    /// opened only when this allows them. A peer's stream frames are
+    /// accepted only after its `HELLO`, so it is known on any connection
+    /// the peer has opened a stream on; a host may be live before its
+    /// caller's `HELLO` arrives ([`Connection::hello_minor`] waits).
+    pub fn minor(&self) -> Option<u64> {
+        *self.minor.borrow()
+    }
+
+    /// Wait for the peer's first `HELLO` and return the agreed minor
+    /// version; `None` if the connection ends first. A host can be live
+    /// before its caller's `HELLO` has arrived.
+    pub async fn hello_minor(&self) -> Option<u64> {
+        let mut rx = self.minor.clone();
+        let mut status = self.status.clone();
+        loop {
+            if let Some(minor) = *rx.borrow_and_update() {
+                return Some(minor);
+            }
+            if matches!(*status.borrow_and_update(), ConnStatus::Closed(_)) {
+                return None;
+            }
+            tokio::select! {
+                changed = rx.changed() => if changed.is_err() { return *rx.borrow() },
+                changed = status.changed() => if changed.is_err() { return *rx.borrow() },
+            }
+        }
     }
 
     /// The current status.
@@ -708,6 +740,10 @@ pub(crate) fn channel() -> (mpsc::UnboundedSender<Cmd>, mpsc::UnboundedReceiver<
     mpsc::unbounded_channel()
 }
 
+/// Labels of engine-owned streams (wire.md 9.5). They have their own
+/// places, apart from the app's stream caps.
+pub const ENGINE_LABEL_PREFIX: &str = "mousse-";
+
 /// Start the driver task for one connection.
 pub(crate) fn spawn<P: Pipe>(
     start: Start<P>,
@@ -718,6 +754,7 @@ pub(crate) fn spawn<P: Pipe>(
     let (status_tx, status_rx) = watch::channel(ConnStatus::Pending);
     let (closing_tx, _) = watch::channel(false);
     let (accept_tx, accept_rx) = mpsc::unbounded_channel();
+    let (minor, minor_rx) = watch::channel(None);
     let connection = Connection {
         id: start.conn,
         peer: start.peer,
@@ -726,6 +763,7 @@ pub(crate) fn spawn<P: Pipe>(
         cmd: cmd_tx.clone(),
         status: status_rx,
         incoming: tokio::sync::Mutex::new(accept_rx),
+        minor: minor_rx,
     };
     let driver = Driver {
         mux: Mux::with_limits(start.side, start.clock.mono(), start.limits.core()),
@@ -744,6 +782,7 @@ pub(crate) fn spawn<P: Pipe>(
         blocked: Vec::new(),
         pings: Vec::new(),
         hello: HelloState::new(VersionSupport::LOCAL),
+        minor,
         reason: None,
         before_close: VecDeque::new(),
     };
@@ -775,6 +814,8 @@ struct Driver {
     pings: Vec<oneshot::Sender<()>>,
     /// The peer's `HELLO`s so far.
     hello: HelloState,
+    /// Where the agreed minor version is published for the handle.
+    minor: watch::Sender<Option<u64>>,
     reason: Option<CloseReason>,
     /// Encoded frames a closing step produced, sent before the GOAWAY.
     before_close: VecDeque<Vec<u8>>,
@@ -1072,7 +1113,11 @@ impl Driver {
                     ))
                 } else if !self.role.may_open() {
                     Err(NetError::Refused("the connection is not authorized".into()))
-                } else if let Some(permit) = self.admit.try_admit() {
+                } else if let Some(permit) = if label.starts_with(ENGINE_LABEL_PREFIX) {
+                    self.admit.try_admit_engine()
+                } else {
+                    self.admit.try_admit()
+                } {
                     self.mux
                         .open_stream(class, &label)
                         .map(|id| self.new_stream(id, class, label, permit))
@@ -1295,7 +1340,15 @@ impl Driver {
                     return Verdict::Close(ErrorCode::ProtocolError);
                 };
                 match self.hello.on_hello(*major_version, *minor_version) {
-                    HelloOutcome::Agreed(_) => {}
+                    HelloOutcome::Agreed(minor) => {
+                        self.minor.send_if_modified(|m| {
+                            let first = m.is_none();
+                            if first {
+                                *m = Some(minor);
+                            }
+                            first
+                        });
+                    }
                     HelloOutcome::Ignored => return Verdict::Ignore,
                     HelloOutcome::Close(code) => return Verdict::Close(code),
                 }
@@ -1316,7 +1369,12 @@ impl Driver {
             } => {
                 // Admission: a stream past either cap is refused before
                 // anything is queued for it (Phase 1a §2.2).
-                let Some(permit) = self.admit_peer_stream() else {
+                let permit = if label.starts_with(ENGINE_LABEL_PREFIX) {
+                    self.admit.try_admit_engine()
+                } else {
+                    self.admit_peer_stream()
+                };
+                let Some(permit) = permit else {
                     self.admit.refused();
                     let _ = self.mux.reset(stream, ErrorCode::RefusedStream);
                     return;

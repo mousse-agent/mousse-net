@@ -111,6 +111,83 @@
       "result": "encoding"
     }
   ],
+  "relay_hints": {
+    "cases": [
+      {
+        "hint": "relay://relay.example:443/ERERERERERERERERERERERERERERERERERERERERERE/IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI",
+        "result": {
+          "destination": "relay://relay.example:443",
+          "endpoint": "relay.example:443",
+          "handle": "2222222222222222222222222222222222222222222222222222222222222222",
+          "relay": "1111111111111111111111111111111111111111111111111111111111111111"
+        }
+      },
+      {
+        "hint": "relay://203.0.113.5:7000/ERERERERERERERERERERERERERERERERERERERERERE/IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI",
+        "result": {
+          "destination": "relay://203.0.113.5:7000",
+          "endpoint": "203.0.113.5:7000",
+          "handle": "2222222222222222222222222222222222222222222222222222222222222222",
+          "relay": "1111111111111111111111111111111111111111111111111111111111111111"
+        }
+      },
+      {
+        "hint": "relay://[2001:db8::5]:443/ERERERERERERERERERERERERERERERERERERERERERE/IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI",
+        "result": {
+          "destination": "relay://[2001:db8::5]:443",
+          "endpoint": "[2001:db8::5]:443",
+          "handle": "2222222222222222222222222222222222222222222222222222222222222222",
+          "relay": "1111111111111111111111111111111111111111111111111111111111111111"
+        }
+      },
+      {
+        "hint": "relay://Relay.Example:443/ERERERERERERERERERERERERERERERERERERERERERE/IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI",
+        "result": {
+          "destination": "relay://relay.example:443",
+          "endpoint": "relay.example:443",
+          "handle": "2222222222222222222222222222222222222222222222222222222222222222",
+          "relay": "1111111111111111111111111111111111111111111111111111111111111111"
+        }
+      },
+      {
+        "hint": "relay://relay.example/ERERERERERERERERERERERERERERERERERERERERERE/IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI",
+        "result": "malformed"
+      },
+      {
+        "hint": "relay://relay.example:443/EREREREREREREREREREREREREREREREREREREREREQ/IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI",
+        "result": "malformed"
+      },
+      {
+        "hint": "relay://relay.example:443/ERERERERERERERERERERERERERERERERERERERERERE",
+        "result": "malformed"
+      },
+      {
+        "hint": "relay://relay.example:443/ERERERERERERERERERERERERERERERERERERERERERE/IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI/x",
+        "result": "malformed"
+      },
+      {
+        "hint": "relay://relay.example:443/ERERERERERERERERERERERERERERERERERERERERERE=IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI",
+        "result": "malformed"
+      },
+      {
+        "hint": "relay://relay.example:0/ERERERERERERERERERERERERERERERERERERERERERE/IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI",
+        "result": "malformed"
+      },
+      {
+        "hint": "relay://relay.example:443/+RERERERERERERERERERERERERERERERERERERERERE/IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI",
+        "result": "malformed"
+      },
+      {
+        "hint": "relay:relay.example:443/ERERERERERERERERERERERERERERERERERERERERERE/IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI",
+        "result": "malformed"
+      },
+      {
+        "hint": "relay://relay.example:443/ERERERERERERERERERERERERERERERERERERERERERE/IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "result": "malformed"
+      }
+    ],
+    "description": "Relay route hints (spec wire.md, \"Route hints\", relay; Phase 3). relay://<host>:<port>/<base64url relay id>/<base64url handle>, host and port as in a tcp hint, both ids 32 bytes in base64url without padding, at most 255 bytes. The destination an owner approves is relay://<lower-case host>:<port>. A reader that does not dial relays skips the hint as reserved (route_hints)."
+  },
   "route_hints": {
     "cases": [
       {

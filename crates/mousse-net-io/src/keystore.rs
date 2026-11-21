@@ -5,10 +5,19 @@
 //! Service on Linux. `identity.json` in the state directory records only the
 //! public key and where the secret lives.
 //!
+//! [`KeyStorage::File`] keeps the secret in an owner-only (`0600`) file in the
+//! state directory. It is for headless servers with no OS keystore (design
+//! §B.13): chosen when the endpoint is created, it loads like a keystore key,
+//! and a key file that others can read is refused.
+//!
 //! [`KeyStorage::InsecureFile`] keeps the secret in a plain file next to it.
-//! It exists for tests and headless runs where no keystore is reachable, and
-//! must be asked for explicitly both when the identity is created and every
-//! time it is loaded.
+//! It exists for tests, and must be asked for explicitly both when the
+//! identity is created and every time it is loaded.
+//!
+//! The same store keeps the endpoint's **Plus key** ([`IdentityStore::plus_key`],
+//! Phase 4): a separate P-256 key made when the endpoint first links to
+//! Plus, so Plus never learns the identity key. It lives in `plus-key.json`
+//! and the keystore entry `endpoint-<id>-plus`, kept like the identity.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -21,7 +30,6 @@ use zeroize::Zeroizing;
 
 use crate::error::NetError;
 use crate::rng::os_rng;
-#[cfg(test)]
 use crate::rng::random_bytes;
 use crate::store::{hex, identity_from_hex, unhex, write_atomic};
 
@@ -30,21 +38,34 @@ pub const KEYRING_SERVICE: &str = "mousse-net";
 
 const IDENTITY_FILE: &str = "identity.json";
 const INSECURE_KEY_FILE: &str = "identity.key";
+const PLUS_FILE: &str = "plus-key.json";
+const PLUS_INSECURE_FILE: &str = "plus-key.key";
+const FILE_KEY_FILE: &str = "identity.secret";
+const PLUS_FILE_KEY_FILE: &str = "plus-key.secret";
 
 /// Where the identity secret is kept.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyStorage {
     /// The operating system keystore.
     OsKeystore,
+    /// An owner-only file in the state directory, for headless servers
+    /// with no OS keystore.
+    File,
     /// A plain file in the state directory. Tests only.
     InsecureFile,
+    /// When creating only: the OS keystore if it takes the key, otherwise
+    /// [`KeyStorage::File`] (a headless server with no keystore). The
+    /// identity records which one was used.
+    KeystoreOrFile,
 }
 
 impl KeyStorage {
     fn name(self) -> &'static str {
         match self {
             KeyStorage::OsKeystore => "os-keystore",
+            KeyStorage::File => "file",
             KeyStorage::InsecureFile => "insecure-file",
+            KeyStorage::KeystoreOrFile => "keystore-or-file",
         }
     }
 }
@@ -79,6 +100,12 @@ impl StoredIdentity {
     pub fn storage(&self) -> KeyStorage {
         self.storage
     }
+
+    /// The key, for a key that is not the identity key (the Plus key signs
+    /// its own domain-tagged records).
+    pub fn software_key(&self) -> &SoftwareKey {
+        &self.key
+    }
 }
 
 impl IdentitySigner for StoredIdentity {
@@ -95,6 +122,10 @@ impl IdentitySigner for StoredIdentity {
 #[derive(Clone, Debug)]
 pub struct IdentityStore {
     dir: PathBuf,
+    file: &'static str,
+    insecure_file: &'static str,
+    file_key_file: &'static str,
+    user_suffix: &'static str,
 }
 
 impl IdentityStore {
@@ -102,12 +133,27 @@ impl IdentityStore {
     pub fn new(dir: &Path) -> Self {
         Self {
             dir: dir.to_path_buf(),
+            file: IDENTITY_FILE,
+            insecure_file: INSECURE_KEY_FILE,
+            file_key_file: FILE_KEY_FILE,
+            user_suffix: "",
+        }
+    }
+
+    /// The endpoint's Plus key in `dir` (Phase 4).
+    pub fn plus_key(dir: &Path) -> Self {
+        Self {
+            dir: dir.to_path_buf(),
+            file: PLUS_FILE,
+            insecure_file: PLUS_INSECURE_FILE,
+            file_key_file: PLUS_FILE_KEY_FILE,
+            user_suffix: "-plus",
         }
     }
 
     /// Whether an identity exists here.
     pub fn exists(&self) -> bool {
-        self.dir.join(IDENTITY_FILE).exists()
+        self.dir.join(self.file).exists()
     }
 
     /// Create a new identity for the endpoint `endpoint_id`. Fails if one
@@ -128,18 +174,35 @@ impl IdentityStore {
             .map_err(|e| NetError::Store(format!("{}: {e}", self.dir.display())))?;
         let key = SoftwareKey::generate(&mut os_rng());
         let secret = key.secret_bytes();
-        let keyring_user = match storage {
+        let in_keystore = |user: &str| os_keystore::set(user, secret.as_slice());
+        let in_file = |name: &str| -> Result<(), NetError> {
+            // write_atomic makes the file owner-only before any byte.
+            let text = Zeroizing::new(hex(secret.as_slice()));
+            write_atomic(&self.dir.join(name), text.as_bytes())
+        };
+        let (storage, keyring_user) = match storage {
             KeyStorage::OsKeystore => {
-                let user = keyring_user(endpoint_id);
-                keyring_entry(&user)?
-                    .set_secret(secret.as_slice())
-                    .map_err(|e| NetError::Store(format!("keystore: {e}")))?;
-                Some(user)
+                let user = format!("{}{}", keyring_user(endpoint_id), self.user_suffix);
+                in_keystore(&user)?;
+                (KeyStorage::OsKeystore, Some(user))
+            }
+            KeyStorage::KeystoreOrFile => {
+                let user = format!("{}{}", keyring_user(endpoint_id), self.user_suffix);
+                match in_keystore(&user) {
+                    Ok(()) => (KeyStorage::OsKeystore, Some(user)),
+                    Err(_) => {
+                        in_file(self.file_key_file)?;
+                        (KeyStorage::File, None)
+                    }
+                }
+            }
+            KeyStorage::File => {
+                in_file(self.file_key_file)?;
+                (KeyStorage::File, None)
             }
             KeyStorage::InsecureFile => {
-                let text = Zeroizing::new(hex(secret.as_slice()));
-                write_atomic(&self.dir.join(INSECURE_KEY_FILE), text.as_bytes())?;
-                None
+                in_file(self.insecure_file)?;
+                (KeyStorage::InsecureFile, None)
             }
         };
         let file = IdentityFile {
@@ -149,12 +212,12 @@ impl IdentityStore {
             keyring_user,
         };
         let bytes = serde_json::to_vec_pretty(&file).map_err(|e| NetError::Store(e.to_string()))?;
-        write_atomic(&self.dir.join(IDENTITY_FILE), &bytes)?;
+        write_atomic(&self.dir.join(self.file), &bytes)?;
         Ok(StoredIdentity { key, storage })
     }
 
     fn read_file(&self) -> Result<IdentityFile, NetError> {
-        let path = self.dir.join(IDENTITY_FILE);
+        let path = self.dir.join(self.file);
         let bytes = fs::read(&path)
             .map_err(|e| NetError::Store(format!("no identity in {} ({e})", self.dir.display())))?;
         let file: IdentityFile = serde_json::from_slice(&bytes)
@@ -181,12 +244,17 @@ impl IdentityStore {
                     .keyring_user
                     .as_deref()
                     .ok_or_else(|| NetError::Store("identity file has no keystore entry".into()))?;
-                let secret = Zeroizing::new(
-                    keyring_entry(user)?
-                        .get_secret()
-                        .map_err(|e| NetError::Store(format!("keystore: {e}")))?,
-                );
+                let secret = os_keystore::get(user)?;
                 (secret, KeyStorage::OsKeystore)
+            }
+            "file" => {
+                let path = self.dir.join(self.file_key_file);
+                check_owner_only(&path)?;
+                let text = Zeroizing::new(
+                    fs::read_to_string(&path)
+                        .map_err(|e| NetError::Store(format!("{}: {e}", path.display())))?,
+                );
+                (Zeroizing::new(unhex(text.trim())?), KeyStorage::File)
             }
             "insecure-file" => {
                 if !allow_insecure_file {
@@ -195,7 +263,7 @@ impl IdentityStore {
                             .into(),
                     ));
                 }
-                let path = self.dir.join(INSECURE_KEY_FILE);
+                let path = self.dir.join(self.insecure_file);
                 let text = Zeroizing::new(
                     fs::read_to_string(&path)
                         .map_err(|e| NetError::Store(format!("{}: {e}", path.display())))?,
@@ -227,12 +295,9 @@ impl IdentityStore {
     pub fn delete(&self) -> Result<(), NetError> {
         let file = self.read_file()?;
         if let Some(user) = file.keyring_user.as_deref() {
-            match keyring_entry(user)?.delete_credential() {
-                Ok(()) | Err(keyring::Error::NoEntry) => {}
-                Err(e) => return Err(NetError::Store(format!("keystore: {e}"))),
-            }
+            os_keystore::delete(user)?;
         }
-        for name in [IDENTITY_FILE, INSECURE_KEY_FILE] {
+        for name in [self.file, self.insecure_file, self.file_key_file] {
             let path = self.dir.join(name);
             if path.exists() {
                 fs::remove_file(&path)
@@ -243,14 +308,167 @@ impl IdentityStore {
     }
 }
 
+/// A key file must be readable by its owner only (`0600` or stricter, as
+/// `ssh` asks of a private key). On Windows the state directory's
+/// owner-only DACL, inherited by the file, does this.
+fn check_owner_only(path: &Path) -> Result<(), NetError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::symlink_metadata(path)
+            .map_err(|e| NetError::Store(format!("{}: {e}", path.display())))?;
+        if !meta.file_type().is_file() {
+            return Err(NetError::Store(format!(
+                "{} is not a plain file",
+                path.display()
+            )));
+        }
+        if meta.mode() & 0o077 != 0 {
+            return Err(NetError::Store(format!(
+                "{} can be read by other users (mode {:o}); make it 0600",
+                path.display(),
+                meta.mode() & 0o777
+            )));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 /// The keystore entry name for an endpoint.
 pub fn keyring_user(endpoint_id: &str) -> String {
     format!("endpoint-{endpoint_id}")
 }
 
-fn keyring_entry(user: &str) -> Result<keyring::Entry, NetError> {
-    keyring::Entry::new(KEYRING_SERVICE, user)
-        .map_err(|e| NetError::Store(format!("keystore: {e}")))
+/// The file of the relay seed, beside a file-kept identity (owner-only,
+/// written with `write_atomic`).
+const RELAY_SEED_FILE: &str = "relay-seed.key";
+
+/// The keystore entry name of an endpoint's relay seed.
+pub fn relay_seed_user(endpoint_id: &str) -> String {
+    format!("relay-seed-{endpoint_id}")
+}
+
+/// The endpoint's relay seed: 32 random bytes, kept where its identity is
+/// kept (`storage`), made on first use. Registration keys, caller keys and
+/// a host's pair secrets are derived from it with salts kept in the
+/// helper's state files, and the secrets a caller is given (a host's pair
+/// secret, a ticket's invitation tag) are stored sealed under a key derived
+/// from it, so no other relay secret is ever written to a plain file.
+pub fn relay_seed(
+    dir: &Path,
+    endpoint_id: &str,
+    storage: KeyStorage,
+) -> Result<Zeroizing<[u8; 32]>, NetError> {
+    let parse = |secret: &[u8]| -> Result<Zeroizing<[u8; 32]>, NetError> {
+        let bytes: [u8; 32] = secret
+            .try_into()
+            .map_err(|_| NetError::Store("the relay seed has the wrong length".into()))?;
+        Ok(Zeroizing::new(bytes))
+    };
+    match storage {
+        KeyStorage::OsKeystore | KeyStorage::KeystoreOrFile => {
+            let user = relay_seed_user(endpoint_id);
+            match os_keystore::get_if_any(&user)? {
+                Some(secret) => parse(&secret),
+                None => {
+                    let seed = Zeroizing::new(random_bytes::<32>());
+                    os_keystore::set(&user, seed.as_slice())?;
+                    Ok(seed)
+                }
+            }
+        }
+        KeyStorage::File | KeyStorage::InsecureFile => {
+            let path = dir.join(RELAY_SEED_FILE);
+            if storage == KeyStorage::File && path.exists() {
+                check_owner_only(&path)?;
+            }
+            match fs::read_to_string(&path) {
+                Ok(text) => {
+                    let text = Zeroizing::new(text);
+                    parse(&Zeroizing::new(unhex(text.trim())?))
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    let seed = Zeroizing::new(random_bytes::<32>());
+                    let text = Zeroizing::new(hex(seed.as_slice()));
+                    write_atomic(&path, text.as_bytes())?;
+                    Ok(seed)
+                }
+                Err(e) => Err(NetError::Store(format!("{}: {e}", path.display()))),
+            }
+        }
+    }
+}
+
+/// The OS keystore, when this build has one (feature `os-keystore`, on by
+/// default). The relay builds without it: it keeps no endpoint identity,
+/// and a static Linux build cannot link the Secret Service client.
+#[cfg(feature = "os-keystore")]
+mod os_keystore {
+    use super::{NetError, KEYRING_SERVICE};
+    use zeroize::Zeroizing;
+
+    fn entry(user: &str) -> Result<keyring::Entry, NetError> {
+        keyring::Entry::new(KEYRING_SERVICE, user)
+            .map_err(|e| NetError::Store(format!("keystore: {e}")))
+    }
+
+    pub fn set(user: &str, secret: &[u8]) -> Result<(), NetError> {
+        entry(user)?
+            .set_secret(secret)
+            .map_err(|e| NetError::Store(format!("keystore: {e}")))
+    }
+
+    pub fn get(user: &str) -> Result<Zeroizing<Vec<u8>>, NetError> {
+        Ok(Zeroizing::new(
+            entry(user)?
+                .get_secret()
+                .map_err(|e| NetError::Store(format!("keystore: {e}")))?,
+        ))
+    }
+
+    /// The secret, or `None` when there is no entry.
+    pub fn get_if_any(user: &str) -> Result<Option<Zeroizing<Vec<u8>>>, NetError> {
+        match entry(user)?.get_secret() {
+            Ok(secret) => Ok(Some(Zeroizing::new(secret))),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(NetError::Store(format!("keystore: {e}"))),
+        }
+    }
+
+    pub fn delete(user: &str) -> Result<(), NetError> {
+        match entry(user)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(NetError::Store(format!("keystore: {e}"))),
+        }
+    }
+}
+
+#[cfg(not(feature = "os-keystore"))]
+mod os_keystore {
+    use super::NetError;
+    use zeroize::Zeroizing;
+
+    fn none() -> NetError {
+        NetError::Store("keystore: this build has no OS keystore".into())
+    }
+
+    pub fn set(_user: &str, _secret: &[u8]) -> Result<(), NetError> {
+        Err(none())
+    }
+
+    pub fn get(_user: &str) -> Result<Zeroizing<Vec<u8>>, NetError> {
+        Err(none())
+    }
+
+    pub fn get_if_any(_user: &str) -> Result<Option<Zeroizing<Vec<u8>>>, NetError> {
+        Err(none())
+    }
+
+    pub fn delete(_user: &str) -> Result<(), NetError> {
+        Err(none())
+    }
 }
 
 #[cfg(test)]
@@ -289,6 +507,34 @@ mod tests {
             .unwrap();
         store.delete().unwrap();
         assert!(!store.exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_key_loads_without_the_flag_and_only_while_owner_only() {
+        let dir = temp_dir("idsoft");
+        let store = IdentityStore::new(&dir);
+        let created = store.create(KeyStorage::File, "ep1").unwrap();
+        let loaded = store.load(false).unwrap();
+        assert_eq!(loaded.public_key(), created.public_key());
+        assert_eq!(loaded.storage(), KeyStorage::File);
+        assert!(!dir.join(INSECURE_KEY_FILE).exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let key = dir.join(FILE_KEY_FILE);
+            assert_eq!(
+                fs::metadata(&key).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            fs::set_permissions(&key, fs::Permissions::from_mode(0o640)).unwrap();
+            let err = store.load(false).unwrap_err().to_string();
+            assert!(err.contains("make it 0600"), "{err}");
+            fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(store.load(false).is_ok());
+        }
+        store.delete().unwrap();
+        assert!(!dir.join(FILE_KEY_FILE).exists());
         fs::remove_dir_all(&dir).unwrap();
     }
 

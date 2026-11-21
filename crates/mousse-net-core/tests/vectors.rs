@@ -58,6 +58,7 @@ fn checked_in(name: &str) -> Option<String> {
         "join-proof.json",
         "mux.json",
         "pairing-attempts.json",
+        "relay-admission.json",
         "session-cert.json",
         "session-lifecycle.json",
         "ticket.json",
@@ -848,5 +849,232 @@ fn control_messages() {
             "{}",
             s(&case["name"])
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Relay admission (spec/relay.md section 14)
+// ---------------------------------------------------------------------------
+
+/// Hands out a scenario's listed random values, in order.
+struct Listed(std::collections::VecDeque<Vec<u8>>);
+
+impl rand_core::TryRng for Listed {
+    type Error = std::convert::Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        panic!("the relay draws only bytes")
+    }
+
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        panic!("the relay draws only bytes")
+    }
+
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+        let next = self.0.pop_front().expect("a listed draw");
+        assert_eq!(next.len(), dst.len(), "draw length");
+        dst.copy_from_slice(&next);
+        Ok(())
+    }
+}
+
+impl rand_core::TryCryptoRng for Listed {}
+
+fn relay_output(o: &mousse_net_core::relay::Output) -> J {
+    use mousse_net_core::relay::{Output, RelayMessage};
+    let h = |b: &[u8]| -> String { b.iter().map(|x| format!("{x:02x}")).collect() };
+    match o {
+        Output::Send { conn, message } => serde_json::json!({
+            "send": conn.0,
+            "message": RelayMessage::decode(message).expect("decodes").name(),
+            "hex": h(message),
+        }),
+        Output::Close { conn, code } => serde_json::json!({ "close": conn.0, "code": code }),
+        Output::Splice {
+            circuit,
+            caller,
+            target,
+            class,
+        } => serde_json::json!({
+            "splice": [caller.0, target.0],
+            "circuit": h(circuit),
+            "class": *class as u64,
+        }),
+        Output::Forward { from, to, len } => {
+            serde_json::json!({ "forward": [from.0, to.0], "len": len })
+        }
+        Output::Authorize { fingerprint, chain } => {
+            serde_json::json!({ "authorize": h(fingerprint), "chain": h(chain) })
+        }
+        Output::Supersede {
+            fingerprint,
+            drop_at,
+        } => serde_json::json!({ "supersede": h(fingerprint), "drop_at": drop_at.0 }),
+        Output::Drop { fingerprint } => serde_json::json!({ "drop": h(fingerprint) }),
+        Output::ConsumeCode { hash } => serde_json::json!({ "consume_code": h(hash) }),
+        // Hosted mode only; the vectors cover self mode.
+        Output::Hold { conn, until } => serde_json::json!({ "hold": conn.0, "until": until.0 }),
+        Output::Pause { conn } => serde_json::json!({ "pause": conn.0 }),
+        Output::Resume { conn } => serde_json::json!({ "resume": conn.0 }),
+    }
+}
+
+#[test]
+fn relay_admission() {
+    use mousse_net_core::relay::machine::{AuthorizedKey, EnrollCode, Now, RelayConfig};
+    use mousse_net_core::relay::{
+        check_pin, proof, relay_certificate, Class, ConnId, EnrollmentLink, IpKey, Relay, RelayId,
+        RelayLimits, RelayMessage,
+    };
+
+    let doc = load("relay-admission.json");
+
+    // Derivations.
+    let d = &doc["derivations"];
+    let relay_secret = SoftwareKey::from_secret_bytes(&fixed::<32>(&d["relay_secret"])).unwrap();
+    let relay_key = key(&d["relay_key"]);
+    assert_eq!(relay_secret.public_key(), relay_key);
+    let rid = RelayId::of(&relay_key);
+    assert_eq!(rid.0, fixed::<32>(&d["relay_id"]));
+    let cert = unhex(&d["relay_certificate"]);
+    assert_eq!(relay_certificate(&relay_secret), cert);
+    assert_eq!(check_pin(&cert, &rid), Ok(relay_key));
+    assert!(
+        check_pin(&unhex(&d["other_relay_certificate"]), &rid).is_err(),
+        "another relay's certificate passes the pin"
+    );
+    let reg = key(&d["registration_key"]);
+    let handle = fixed::<32>(&d["handle"]);
+    assert_eq!(proof::handle(&rid, &reg), handle);
+    assert_eq!(
+        reg.fingerprint(),
+        fixed::<32>(&d["registration_fingerprint"])
+    );
+    let new_handle = fixed::<32>(&d["new_handle"]);
+    assert_eq!(proof::handle(&rid, &key(&d["new_key"])), new_handle);
+    let binding = proof::Binding {
+        nonce: fixed(&d["nonce"]),
+        exporter: fixed(&d["exporter"]),
+    };
+    let circuit = fixed::<16>(&d["circuit"]);
+    for p in list(&d["proofs"]) {
+        let record = match s(&p["name"]) {
+            "register" => proof::register_record(&rid, &handle, &binding),
+            "successor_new" | "successor_current" => {
+                proof::successor_record(&rid, &new_handle, &binding)
+            }
+            "call" => proof::call_record(&rid, &handle, &binding, Class::Bulk),
+            "accept" => proof::accept_record(&rid, &handle, &circuit, &binding),
+            other => panic!("proof {other}"),
+        };
+        assert_eq!(record, unhex(&p["record"]), "{}", s(&p["name"]));
+        let sig = RawSignature::from_slice(&unhex(&p["signature"])).unwrap();
+        assert!(proof::verify(&key(&p["key"]), &record, &sig).is_ok());
+    }
+    let inv = &d["invitation"];
+    let tag = proof::invitation_tag(
+        &InvitationId(fixed(&inv["id"])),
+        &TicketSecret::from_bytes(fixed(&inv["secret"])),
+    );
+    assert_eq!(tag, fixed::<32>(&inv["tag"]));
+    assert_eq!(proof::tag_hash(&tag), fixed::<32>(&inv["tag_hash"]));
+    let e = &d["enrollment"];
+    assert_eq!(
+        proof::code_hash(&fixed(&e["code"])),
+        fixed::<32>(&e["code_hash"])
+    );
+    for l in list(&e["links"]) {
+        let link = EnrollmentLink::parse(s(&l["text"])).expect("link");
+        assert_eq!(
+            link.authority(),
+            format!("{}:{}", s(&l["host"]), u(&l["port"]))
+        );
+        assert_eq!(link.relay, rid);
+        assert_eq!(link.code, fixed::<16>(&l["code"]));
+        assert_eq!(link.to_text(), s(&l["text"]));
+    }
+    for bad in list(&e["rejected_links"]) {
+        assert!(EnrollmentLink::parse(s(bad)).is_err(), "{bad}");
+    }
+
+    // Messages.
+    for m in list(&doc["messages"]["valid"]) {
+        let bytes = unhex(&m["hex"]);
+        let msg = RelayMessage::decode(&bytes).expect("valid");
+        assert_eq!(msg.name(), s(&m["name"]));
+        assert_eq!(msg.encode(), bytes);
+    }
+    for m in list(&doc["messages"]["malformed"]) {
+        assert!(
+            RelayMessage::decode(&unhex(&m["hex"])).is_err(),
+            "{}",
+            s(&m["why"])
+        );
+    }
+
+    // Scenarios.
+    for sc in list(&doc["scenarios"]) {
+        let name = s(&sc["name"]);
+        let overrides: Vec<(String, u64)> = sc["limits"]
+            .as_object()
+            .expect("limits")
+            .iter()
+            .map(|(k, v)| (k.clone(), u(v)))
+            .collect();
+        let overrides: Vec<(&str, u64)> = overrides.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+        let config = RelayConfig {
+            relay_key: key(&sc["relay_key"]),
+            boot_id: fixed(&sc["boot_id"]),
+            limits: RelayLimits::DEFAULT
+                .with_overrides(&overrides)
+                .expect("limits"),
+        };
+        let authorized: Vec<AuthorizedKey> = list(&sc["authorized"])
+            .iter()
+            .map(|a| {
+                let fingerprint = fixed(&a["fingerprint"]);
+                AuthorizedKey {
+                    fingerprint,
+                    drop_at: a.get("drop_at").map(|t| UnixTime(u(t))),
+                    chain: a.get("chain").map_or(fingerprint, fixed),
+                }
+            })
+            .collect();
+        let codes: Vec<EnrollCode> = list(&sc["codes"])
+            .iter()
+            .map(|c| EnrollCode {
+                hash: fixed(&c["hash"]),
+                expires_at: UnixTime(u(&c["expires_at"])),
+            })
+            .collect();
+        let mut relay = Relay::new(config, &authorized, &codes);
+        let mut rng = Listed(list(&sc["draws"]).iter().map(unhex).collect());
+        let wall_base = u(&sc["wall_base"]);
+        for (i, ev) in list(&sc["events"]).iter().enumerate() {
+            let at = u(&ev["at"]);
+            let now = Now {
+                mono: Millis(at),
+                wall: UnixTime(wall_base + at / 1000),
+            };
+            let conn = || ConnId(u(&ev["conn"]));
+            let outs = match s(&ev["event"]) {
+                "open" => relay.open(
+                    conn(),
+                    IpKey(fixed(&ev["ip"])),
+                    fixed(&ev["exporter"]),
+                    now,
+                    &mut rng,
+                ),
+                "recv" => relay.receive(conn(), &unhex(&ev["hex"]), now, &mut rng),
+                "data" => relay.data(conn(), u(&ev["len"]) as usize, now, &mut rng),
+                "closed" => relay.closed(conn(), now, &mut rng),
+                "tick" => relay.tick(now, &mut rng),
+                "revoke" => relay.revoke(&fixed(&ev["fingerprint"]), now, &mut rng),
+                other => panic!("event {other}"),
+            };
+            let got: Vec<J> = outs.iter().map(relay_output).collect();
+            assert_eq!(&J::Array(got), &ev["out"], "{name} event {i}");
+        }
+        assert!(rng.0.is_empty(), "{name}: unused draws");
     }
 }

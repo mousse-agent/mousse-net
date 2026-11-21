@@ -38,7 +38,7 @@ The code exchange used by "Send link" pairing (CPace) is specified in
 | Name | Value | Where |
 |---|---|---|
 | Major protocol version | `1` | Session certificate (record and extension), pairing ticket, `HELLO` |
-| Minor protocol version | `0` | `HELLO` |
+| Minor protocol version | `2` | `HELLO` |
 | TLS ALPN | `mousse/1` | TLS ClientHello and ServerHello |
 
 - A peer MUST reject a certificate or ticket whose major version it does not
@@ -76,6 +76,12 @@ When the peer's `HELLO` arrives, each side decides on its own:
 4. Otherwise the connection uses `agreed`.
 
 When both sides accept, they reach the same `agreed`.
+
+**What each minor adds.** Minor `1` adds two engine streams (9.5),
+`mousse-keys` and `mousse-manifest`, for relays; minor `2` adds
+`mousse-grants` and `mousse-removal`. Each is opened only on a connection
+whose `agreed` minor is at least the one that added it; a minor `0` peer
+never sees them.
 
 **Only the first `HELLO` counts.** The peer's first `HELLO` on a connection
 fixes `agreed` or closes the connection. A later `HELLO` on the same
@@ -152,13 +158,20 @@ display and indexing value; it does not appear on the wire.
 
 **What the identity key signs (frozen).** The identity key signs only
 canonical CBOR maps (section 3) whose key `1` is a text domain string, and
-each domain string names exactly one record type. Major version 1 has one
-domain: `mousse-session-v1`, the session record (5.1). A new signed record
+each domain string names exactly one record type. Major version 1 has
+these domains: `mousse-session-v1`, the session record (5.1),
+`mousse-manifest-v1`, a host's relay manifest (9.5), and
+`mousse-removal-v1`, a removal from an owner-role device (9.5). A new signed record
 needs a new domain string that no other record uses; the identity key MUST
 never sign raw bytes, a hash supplied from outside, or a record without its
 domain at key 1. This keeps any two signed things from ever being confused,
 whatever is added later. In `mousse-net-core`, `IdentitySigner` accepts only
 an `IdentityRecord`, which only the core builds.
+
+Relay proofs ([relay.md](relay.md) section 5) follow the same rule (canonical
+CBOR, a domain string of their own at key 1) but are signed by an
+endpoint's relay keys (a registration key per relay, a caller key per
+pairing), never by the identity key.
 
 **Hardware keys stay usable while unlocked.** A session certificate is
 renewed in the background (section 6). A key store that asks for user
@@ -396,7 +409,9 @@ in TLS 1.3).
 
 If the peer session runs inside another TLS connection (for example a
 WebSocket to a relay), the exporters MUST come from the inner peer session,
-never the outer one.
+never the outer one. The outer connection to a relay has its own exporter,
+`EXPORTER-mousse-relay-v1`, used only by relay proofs
+([relay.md](relay.md) sections 2 and 5).
 
 A TLS 1.3 exporter is derived before the client's certificate is sent, so it
 does not by itself name the client. Every construction that uses one also
@@ -470,6 +485,11 @@ enrolled_by, granted_at, expires_at?}`:
   `PAIRED` was lost (10.6 rule 7).
 - `expires_at`: optional. At that second the grant is already expired.
 
+Local fields a host keeps with a grant, never sent: the **caller key
+fingerprint** and the **pair secret** a caller enrolled on `mousse-keys`
+(9.5). A new pairing of the same device replaces both, and removing the
+grant deletes them.
+
 Rules:
 
 - At most one grant per identity on an endpoint. A new grant for the same
@@ -484,7 +504,9 @@ Rules:
   effect on other endpoints of the same device.
 - Grant ids are local and never reused, also across restarts: an endpoint
   stores the next grant id with its grants, because the grant that last
-  used an id may already be gone.
+  used an id may already be gone. A grant that replaces another (a new
+  pairing of the same device) takes a new id, so a grant id names exactly
+  one pairing.
 
 **Removal from another device (later phases).** Phase 0 removes grants only
 locally. When removal messages are added, an endpoint accepts one only from
@@ -688,6 +710,79 @@ An unknown error code in `RESET` or `GOAWAY` is not a frame error; treat it as
 - **GOAWAY** ends the connection: the sender sends nothing after it and closes
   the pipe; the receiver stops sending and closes too.
 
+### 9.5 Engine streams
+
+Streams whose label starts with `mousse-` belong to the engine: an
+implementation handles them itself and never passes them to an
+application, and an application cannot open them. Each is opened only when
+the connection's agreed minor version (section 2) allows it; any other
+`mousse-` stream is answered with `RESET REFUSED_STREAM`.
+
+Each message on an engine stream is a 4-byte big-endian length followed by
+that many bytes of one canonical CBOR map (section 3). A message is at most
+**262 144** bytes; a longer declared length is a protocol error on that
+stream (`RESET PROTOCOL_ERROR`).
+
+| Label | Minor | Opened by | Carries |
+|---|---|---|---|
+| `mousse-keys` | 1 | caller, on every new connection to a host, as its first stream | caller → host: `{1: caller relay public key (65, SEC1)}`; host → caller: `{1: pair secret (32)}`; then both finish. The host answers only on a connection bound to a live grant |
+| `mousse-manifest` | 1 | host, once the caller has opened a stream, and again on every change | one signed manifest envelope (below); then the host finishes |
+| `mousse-grants` | 2 | host, to a caller whose live grant has role `owner` | `{1: [{1: identity key (65), 2: grant id (uint), 3: role (text), 4: name (text)}]}`: every grant on the host, at the stream's start and again on every change |
+| `mousse-removal` | 2 | caller | caller → host: one signed removal envelope; host → caller: `{1: removal id (16), 2: result (0 applied, 1 stale, 2 refused)}`; then both finish |
+
+**The caller key** is one P-256 key per caller and host; a relay admits a
+call by its fingerprint (`relay.md`). The pair secret is one 32-byte
+random value per grant; the host keeps it for that grant.
+
+**The manifest record** (domain `mousse-manifest-v1`), signed by the
+host's identity key; the envelope is `{1: record bytes, 2: raw signature
+(64)}` over the record bytes:
+
+| Key | Value |
+|---|---|
+| 1 | text `"mousse-manifest-v1"` |
+| 2 | bytes: host identity key (65) |
+| 3 | uint: sequence (grows) |
+| 4 | uint: issued at |
+| 5 | uint: expires at |
+| 6 | array of at most 4 routes `{1: relay identity key (65), 2: 1 to 4 endpoint texts host:port, 3: handle (32), 4: region text (0 to 32 bytes)}` |
+
+A caller keeps a manifest only if the identity key at key 2 is the pinned
+host and the signature verifies under it, and only if its sequence is above
+the one it keeps. Endpoint texts follow the `tcp` hint host and port rules
+(10.2.1), lower case. Past `expires at` the manifest is stale: its routes
+are still tried, after every other route.
+
+**The removal record** (domain `mousse-removal-v1`), signed by the admin
+device's identity key: `{1: "mousse-removal-v1", 2: signer identity key
+(65), 3: recipient host identity key (65), 4: removed identity key (65), 5:
+grant id on the recipient (uint), 6: removal id (16, random), 7: issued at
+(Unix seconds)}`. The envelope is `{1: record bytes, 2: raw signature (64)}`
+over the record bytes. A removal is signed once; every resend carries the
+same bytes.
+
+**What a host accepts**, under the lock under which it admits connections
+and enrolls devices, in order; a failure answers `refused` or `stale` and
+changes nothing else:
+
+1. The signature verifies under key 2, and that signer holds a live grant
+   with role `owner` on this endpoint.
+2. Key 3 is this endpoint's identity.
+3. The removal id is new. A known id whose record bytes hash (SHA-256) to
+   the stored hash returns the stored result and does nothing else; a known
+   id with other bytes is `refused`. `issued at` is at most the removal
+   maximum age plus the clock skew in the past, and at most the clock skew
+   in the future.
+4. Key 4 holds a grant whose id equals key 5; otherwise `stale` (a newer
+   pairing of that device stays).
+5. That grant's authorizing owner equals the signer's grant's authorizing
+   owner; otherwise `refused`.
+
+The host stores the removal id, the record hash and the result durably for
+every result from check 3 on, before it acts; for `applied` it then removes
+the grant, whose connections close with `GRANT_REVOKED`. It keeps removal
+ids for the maximum age plus the skew.
+
 ## 10. Pairing
 
 Pairing turns an unknown endpoint (the **joiner**) into one with a grant on
@@ -789,7 +884,8 @@ A skipped hint is not an error: the joiner tries the next one.
 | `tcp` | `tcp://<host>:<port>` | A direct TLS connection. |
 | `wss` | `wss://<host>[:<port>]<path>` | The same TLS connection, carried in WebSocket binary messages inside an outer TLS connection to a tunnel the host's owner runs. |
 | `mdns` | `mdns:<instance>` | Browse for this service instance on the local network. |
-| `ssh`, `ws`, `relay` | reserved | Kept for transports that never appear on the wire (`ssh`, plain `ws`) or later ones. Skipped as `reserved`. |
+| `relay` | `relay://<host>:<port>/<relay id>/<handle>` | Through a relay ([relay.md](relay.md)). Readers that do not dial relays skip it as `reserved`. |
+| `ssh`, `ws` | reserved | Kept for transports that never appear on the wire (`ssh`, plain `ws`). Skipped as `reserved`. |
 | anything else, or no `:` | | Skipped as `unknown_scheme`. |
 
 A `tcp`, `wss` or `mdns` hint that breaks its grammar is skipped as
@@ -827,6 +923,14 @@ address (upper or lower case hex, leading zeros in a group, `::`, an
 embedded IPv4 part) is the same host, and the text form is not kept.
 Vectors give it as the 16 address bytes in hex. An IPv4 host is given in
 dotted decimal, and a DNS name lowercased.
+
+A `relay` hint names a relay and the host's handle there: `<host>:<port>`
+by the `tcp` rules, then the relay id and the handle, each 32 bytes in
+base64url without padding, the whole hint at most 255 bytes. The relay id
+pins the relay's own TLS key; the host is still checked against the
+ticket's pin inside. A joiner dials it only if the owner approved its
+destination, `relay://<lower-case host>:<port>`. Vectors: `ticket.json`
+`relay_hints`.
 
 Whichever route reaches it, the host is checked against the ticket's pin. A
 pin mismatch on a LAN candidate means another endpoint holds that address

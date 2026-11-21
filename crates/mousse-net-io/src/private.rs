@@ -25,6 +25,23 @@ pub fn make_private_dir(dir: &Path) -> io::Result<()> {
     restrict_contents(dir)
 }
 
+/// Make `dir` (and its parents) if it does not exist yet, owner-only from
+/// the start, and leave an existing one alone. For use before taking a lock
+/// inside it: a process that is then refused never changes the permissions
+/// of files another process is writing (on Windows that can make the other
+/// process's write fail). Once it holds the lock, the caller makes the
+/// folder and its contents owner-only with [`make_private_dir`].
+pub fn ensure_dir_for_lock(dir: &Path) -> io::Result<()> {
+    if let Some(parent) = dir.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    match fs::create_dir(dir) {
+        Ok(()) => restrict(dir, true),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// [`make_private_dir`], made durable: its parent is synced (Unix), so a
 /// file saved in it and reported saved does not vanish with the folder on
 /// a power loss. The parent is synced every time, also when the folder

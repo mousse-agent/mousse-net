@@ -245,12 +245,18 @@ async fn accept_holding<P: Pipe>(
 }
 
 /// Run until stopped (Ctrl-C or the `stop` control request).
+/// `opened` is an endpoint this process just created and still holds the
+/// locks of (a headless first start); otherwise the endpoint is opened here.
 pub async fn run(
     state_dir: &Path,
     insecure_file_key: bool,
     opts: ServeOptions,
+    opened: Option<mousse_net_io::Endpoint>,
 ) -> Result<(), String> {
-    let mut endpoint = crate::open_endpoint(state_dir, false)?;
+    let mut endpoint = match opened {
+        Some(endpoint) => endpoint,
+        None => crate::open_endpoint(state_dir, false)?,
+    };
     if opts.app {
         // stdout carries only app-channel frames from here on.
         crate::applog::to_file(state_dir)?;
@@ -259,6 +265,7 @@ pub async fn run(
         .load_identity(insecure_file_key)
         .map_err(|e| e.to_string())?;
     let real_identity = endpoint.identity();
+    let key_storage = key.storage();
     let (clock, manual_clock) = crate::app::clock();
     let mut config = HostConfig::for_endpoint(&endpoint, opts.name.clone(), clock.clone())
         .map_err(|e| e.to_string())?;
@@ -279,6 +286,26 @@ pub async fn run(
     // anything is accepted (Phase 1a §5.4). If that fails, networking
     // starts paused.
     let removal = crate::revoke::Removal::start(host.clone(), &endpoint.grants_dir());
+    let (engine, engine_events) = crate::engine::Engine::new(
+        host.clone(),
+        removal.clone(),
+        signer.clone(),
+        clock.clone(),
+        endpoint.dir().to_path_buf(),
+    );
+    // Plus (Phase 4): nothing is fetched before ready; the client starts
+    // its background work once attached.
+    // Plus judges every signed request and token on its own clock, so the
+    // client keeps wall time even where a test moves the helper's clock.
+    let plus = crate::plus::Plus::open(
+        crate::limits::settings().plus_url.as_deref(),
+        endpoint.dir(),
+        Arc::new(mousse_net_io::SystemClock::new()),
+        key_storage,
+        endpoint.plus_key_store(),
+        endpoint.endpoint_id(),
+        engine.events(),
+    )?;
     // `routes.json` decides where to listen; without it, `--listen-ip`.
     let stored = RoutesStore::in_dir(state_dir)
         .load()
@@ -459,6 +486,9 @@ pub async fn run(
                 ))
             }),
             manual_clock,
+            signer: signer.clone(),
+            endpoint_id: endpoint.endpoint_id().to_owned(),
+            key_storage,
             ssh,
         };
         Some(crate::app::App::start(
@@ -466,10 +496,23 @@ pub async fn run(
             Arc::new(caller),
             removal.clone(),
             info,
+            engine.clone(),
+            engine_events,
         ))
     } else {
+        // No app: engine events are only logged.
+        let mut engine_events = engine_events;
+        tokio::spawn(async move {
+            while let Some(event) = engine_events.recv().await {
+                print_line(format!("engine: {event}"));
+            }
+        });
         None
     };
+    // After the app, so the relay client's pairings are there (Phase 4).
+    if let Some(plus) = plus {
+        engine.set_plus(plus);
+    }
     let app_end = async {
         match &app {
             Some(app) => app.ended().await,

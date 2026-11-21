@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use mousse_net_core::pairing::{Arrival, InvitationKind, Route, Ticket, CODE_FAILED_MESSAGE};
 use mousse_net_core::session_cert::CertError;
 use mousse_net_core::ErrorCode;
-use mousse_net_io::pipe::{route_uri, AddrClass, AddrPolicy, LocalRoute, RouteKind};
+use mousse_net_io::pipe::{route_uri, AddrClass, AddrPolicy, BoxPipe, LocalRoute, RouteKind};
 use mousse_net_io::store::{
     hex, is_stale, short_id, Approval, ApprovalStore, CompletionRecord, CompletionStore,
     PeerRecord, PeerStore, PeersLock, APPROVAL_SOURCE_TICKET, COMPLETION_PAIRED,
@@ -160,6 +160,60 @@ pub(crate) fn usable_routes(hints: &[String]) -> Vec<LocalRoute> {
         .collect()
 }
 
+/// Where a join dials: a route of this computer's own, or a relay with the
+/// ticket's invitation tag (Phase 3 B.7).
+pub(crate) enum JoinRoute {
+    Local(LocalRoute),
+    Relay {
+        route: mousse_net_core::relay_endpoint::RelayRoute,
+        tag: [u8; 32],
+    },
+}
+
+impl JoinRoute {
+    fn hint(&self) -> String {
+        match self {
+            JoinRoute::Local(route) => route.uri(),
+            JoinRoute::Relay { route, .. } => route.to_hint(),
+        }
+    }
+
+    fn order(&self) -> u8 {
+        match self {
+            JoinRoute::Local(route) => match route.kind() {
+                RouteKind::Tcp => 0,
+                RouteKind::Ws => 1,
+                RouteKind::Ssh => 2,
+            },
+            JoinRoute::Relay { .. } => 3,
+        }
+    }
+
+    /// A pipe to the host on this route, and how it was reached.
+    async fn open(&self, caller: &Caller) -> Result<(BoxPipe, JoinedVia), NetError> {
+        match self {
+            JoinRoute::Local(route) => {
+                let (pipe, class) = caller.open_route(route).await?;
+                let reached = Reached {
+                    route: route.clone(),
+                    class,
+                };
+                Ok((pipe, JoinedVia::Local(reached)))
+            }
+            JoinRoute::Relay { route, tag } => {
+                let pipe = crate::app::dial_join_route(caller.addr_policy(), route, *tag).await?;
+                Ok((Box::new(pipe), JoinedVia::Relay(route.clone())))
+            }
+        }
+    }
+}
+
+/// How a join reached its host.
+pub(crate) enum JoinedVia {
+    Local(Reached),
+    Relay(mousse_net_core::relay_endpoint::RelayRoute),
+}
+
 /// Asks for the send-link code on the terminal.
 pub struct TypedCode;
 
@@ -239,6 +293,7 @@ pub fn reason_of(e: &NetError) -> String {
         NetError::Tls(_) => "tls".into(),
         NetError::Timeout(_) => "timeout".into(),
         NetError::Io(_) => "unreachable".into(),
+        NetError::Relay(e) => e.word().into(),
         NetError::Forbidden(_) => "forbidden_address".into(),
         // An ssh try names its own reason (Phase 1b §3.5).
         NetError::Ssh { reason, .. } => reason.name().into(),
@@ -330,6 +385,7 @@ pub async fn join(
     } else {
         println!("joining; the host owner is asked to confirm");
     }
+    let candidates: Vec<JoinRoute> = candidates.into_iter().map(JoinRoute::Local).collect();
     let (conn, record, already_paired, _) = join_routes(
         &side.caller,
         &side.peers(),
@@ -386,13 +442,13 @@ pub(crate) async fn join_routes<C: CodeEntry>(
     ticket: &Ticket,
     arrival: Arrival,
     name: &str,
-    candidates: &[LocalRoute],
+    candidates: &[JoinRoute],
     consented: bool,
     link: Option<&[String]>,
     codes: &mut C,
     mut progress: impl FnMut(&str),
     wanted: impl Fn() -> bool,
-) -> Result<(Connection, PeerRecord, bool, Reached), Failure> {
+) -> Result<(Connection, PeerRecord, bool, JoinedVia), Failure> {
     let held = peers.load().is_ok_and(|ps| {
         ps.iter()
             .any(|p| p.pin().ok() == Some(ticket.host_identity))
@@ -418,30 +474,22 @@ pub(crate) async fn join_routes<C: CodeEntry>(
     let mut step1 = Step1Failures::default();
     // Pipe-generic (Phase 1b §1.4): `tcp` candidates first, then `ws`/`wss`,
     // then `ssh`, each pipe from `Caller::open_route` (resolved once, the
-    // classified address dialled).
-    let mut ordered: Vec<&LocalRoute> = candidates.iter().collect();
-    ordered.sort_by_key(|r| match r.kind() {
-        RouteKind::Tcp => 0,
-        RouteKind::Ws => 1,
-        RouteKind::Ssh => 2,
-    });
+    // classified address dialled); then the relays (Phase 3 B.7).
+    let mut ordered: Vec<&JoinRoute> = candidates.iter().collect();
+    ordered.sort_by_key(|r| r.order());
     for route in ordered {
-        let hint = route.uri();
+        let hint = route.hint();
         progress(&hint);
-        let (pipe, class) = match caller.open_route(route).await {
+        let (pipe, reached) = match route.open(caller).await {
             Ok(p) => p,
             Err(e) => {
                 last = Failure::new(format!("{hint}: {e}"), &reason_of(&e));
                 continue;
             }
         };
-        let reached = Reached {
-            route: route.clone(),
-            class,
-        };
-        // If the connection drops before PAIRED, the join reconnects here
-        // to learn whether the host enrolled this device.
-        let redial = || async { caller.open_route(route).await.map(|(pipe, _)| pipe) };
+        // If the connection drops before PAIRED, the join reconnects the
+        // same way to learn whether the host enrolled this device.
+        let redial = || async { route.open(caller).await.map(|(pipe, _)| pipe) };
         let joined = if resume {
             caller
                 .join_pinned_with_redial(pipe, ticket, arrival, name, codes, redial)
@@ -462,7 +510,9 @@ pub(crate) async fn join_routes<C: CodeEntry>(
                             return Err(f);
                         }
                     };
-                caller.remember_local_routes(ticket.host_identity, vec![route.clone()]);
+                if let JoinRoute::Local(route) = route {
+                    caller.remember_local_routes(ticket.host_identity, vec![route.clone()]);
+                }
                 return Ok((conn, record, already, reached));
             }
             Ok((conn, outcome)) => {
@@ -512,7 +562,9 @@ pub(crate) async fn join_routes<C: CodeEntry>(
                 caller
                     .pin_stored(ticket)
                     .map_err(|e| Failure::new(e.to_string(), "store"))?;
-                caller.remember_local_routes(ticket.host_identity, vec![route.clone()]);
+                if let JoinRoute::Local(route) = route {
+                    caller.remember_local_routes(ticket.host_identity, vec![route.clone()]);
+                }
                 return Ok((conn, record, already, reached));
             }
             // Another endpoint at this address: try the next one.

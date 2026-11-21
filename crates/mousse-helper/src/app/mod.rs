@@ -32,14 +32,24 @@
 
 mod budget;
 mod changes;
+mod engine_ops;
 mod frame;
 mod out;
 mod pairing;
 mod paths;
+mod relay;
+mod relay_store;
 mod routes;
 
 pub use changes::{clock, interface_ips, interface_source};
 pub use paths::{browse_source, StoreCandidates};
+pub(crate) use relay::dial_join_route;
+
+/// Whether a stored role (a peer record's) is `owner`.
+pub fn role_is_owner(stored: &str) -> bool {
+    engine_ops::is_owner(stored)
+}
+
 pub(crate) use paths::{stored_search, ticket_candidates};
 
 use std::collections::BTreeMap;
@@ -64,6 +74,7 @@ use self::budget::Budget;
 use self::frame::Frame;
 use self::out::{Meta, Out};
 use crate::applog;
+use crate::engine::{Engine, ENGINE_PREFIX};
 use crate::limits::HelperLimits;
 use crate::revoke::Removal;
 
@@ -98,6 +109,12 @@ pub struct AppInfo {
     pub state_dir: PathBuf,
     /// Where to look for paired hosts that moved (Phase 1a §6).
     pub browse: Option<Arc<mousse_net_io::discovery::CachedBrowse>>,
+    /// The identity key, to sign this host's manifest.
+    pub signer: mousse_net_io::SharedSigner,
+    /// The endpoint id and where its identity is kept: the relay seed is
+    /// kept the same way.
+    pub endpoint_id: String,
+    pub key_storage: mousse_net_io::keystore::KeyStorage,
     /// Debug builds with `MOUSSE_HELPER_MANUAL_CLOCK=1`: the clock
     /// `test.clock` moves.
     #[cfg_attr(not(debug_assertions), allow(dead_code))]
@@ -148,10 +165,12 @@ struct Shared {
     admission: Arc<StreamAdmission>,
     pairing: Mutex<pairing::State>,
     keep: paths::Keep,
+    relay: relay::State,
     /// SSH routes: `ssh.*` and the connection window (Phase 1b §3).
     ssh: Arc<crate::ssh::Ssh>,
     info: AppInfo,
     limits: HelperLimits,
+    engine: Arc<Engine>,
 }
 
 /// One chunk from the app for the engine.
@@ -178,6 +197,10 @@ struct ConnEntry {
     /// while another path to the host was up (a dial). The only handles
     /// `path.reopened` accepts.
     reopen: bool,
+    /// Inbound: the caller has opened a stream, so the host may open one.
+    caller_opened: bool,
+    /// Outbound through a relay: the route, for its bulk companion.
+    via: Option<mousse_net_core::relay_endpoint::RelayRoute>,
 }
 
 struct StreamEntry {
@@ -266,7 +289,14 @@ fn error(id: &Value, error: &str, reason: impl Into<String>) -> Value {
 
 impl App {
     /// Start the channel on stdin and stdout.
-    pub fn start(host: Host, caller: Arc<Caller>, removal: Arc<Removal>, info: AppInfo) -> Self {
+    pub fn start(
+        host: Host,
+        caller: Arc<Caller>,
+        removal: Arc<Removal>,
+        info: AppInfo,
+        engine: Arc<Engine>,
+        mut engine_events: mpsc::UnboundedReceiver<Value>,
+    ) -> Self {
         let limits = *crate::limits::helper();
         let (ended, _) = watch::channel(None);
         let shared = Arc::new(Shared {
@@ -296,9 +326,11 @@ impl App {
             removal,
             pairing: Mutex::new(pairing::State::new(info.name.clone())),
             keep: paths::Keep::default(),
+            relay: relay::State::new(&info),
             ssh: info.ssh.clone(),
             info,
             limits,
+            engine,
         });
         tokio::spawn(read_stdin(shared.clone()));
         tokio::spawn(write_stdout(shared.clone()));
@@ -306,6 +338,18 @@ impl App {
         tokio::spawn(pairing::prune_completions(shared.clone()));
         tokio::spawn(paths::keep_connected(shared.clone()));
         tokio::spawn(changes::forward_renewals(shared.clone()));
+        // Phase 4's mailbox reads pair secrets and the manifest from here.
+        shared
+            .engine
+            .set_pairs(Arc::new(relay::Pairs(Arc::downgrade(&shared))));
+        tokio::spawn(relay::run(shared.clone()));
+        tokio::spawn(relay::hosted::run(shared.clone()));
+        let events_to = shared.clone();
+        tokio::spawn(async move {
+            while let Some(event) = engine_events.recv().await {
+                events_to.event(event);
+            }
+        });
         Self { shared }
     }
 
@@ -329,13 +373,6 @@ impl App {
         from: Option<std::net::SocketAddr>,
         local: Option<std::net::SocketAddr>,
     ) -> Option<u64> {
-        let peer = short_id(conn.peer());
-        // Must-fail control: announce the connection before step 2 settles.
-        let wait_for_live = !cfg!(mousse_control = "inbound-before-live");
-        if wait_for_live && !conn.settled(true).await.is_live() {
-            applog::line(format!("refused {peer}: not live"));
-            return None;
-        }
         let class = match (kind, from) {
             (RouteKind::Tcp, Some(from)) => RouteClass::of_tcp(
                 self.shared
@@ -346,11 +383,22 @@ impl App {
             (RouteKind::Ssh, _) => RouteClass::Ssh,
             _ => RouteClass::Tunnel,
         };
+        let route = json!({"kind": kind.name(), "class": class.name()});
+        self.inbound_on(conn, route).await
+    }
+
+    /// An inbound connection on `route` (as `conn.up` shows it): announced
+    /// once it is live. Returns its number.
+    pub async fn inbound_on(&self, conn: Connection, route: Value) -> Option<u64> {
+        let peer = short_id(conn.peer());
+        // Must-fail control: announce the connection before step 2 settles.
+        let wait_for_live = !cfg!(mousse_control = "inbound-before-live");
+        if wait_for_live && !conn.settled(true).await.is_live() {
+            applog::line(format!("refused {peer}: not live"));
+            return None;
+        }
         let grant = self.shared.host.grant_of(conn.id());
-        let mut fields = json!({
-            "dir": "in",
-            "route": {"kind": kind.name(), "class": class.name()},
-        });
+        let mut fields = json!({"dir": "in", "route": route});
         if let Some(g) = &grant {
             fields["grant"] = json!(g.id.0);
             fields["role"] = json!(g.role.as_str());
@@ -458,6 +506,13 @@ impl Shared {
         self.publish(conn, false, Some(gen), fields)
     }
 
+    /// Note that outbound connection `no` runs through a relay route.
+    fn set_via(&self, no: u64, route: mousse_net_core::relay_endpoint::RelayRoute) {
+        if let Some(entry) = lock(&self.core).conns.get_mut(&no) {
+            entry.via = Some(route);
+        }
+    }
+
     fn publish(
         self: &Arc<Self>,
         conn: Connection,
@@ -503,6 +558,8 @@ impl Shared {
                     identity,
                     inbound,
                     reopen,
+                    caller_opened: false,
+                    via: None,
                 },
             );
             fields["ev"] = json!("conn.up");
@@ -511,14 +568,18 @@ impl Shared {
             fields["deadline"] = json!(conn.deadline().secs());
             core.out.conn_event(no, &fields);
             self.queued(&core);
-            tokio::spawn(conn_task(self.clone(), no, conn, inbound));
+            tokio::spawn(conn_task(self.clone(), no, conn.clone(), inbound));
+            if !inbound {
+                let shared = self.clone();
+                tokio::spawn(async move { relay::ensure_keys(&shared, &conn).await });
+            }
             no
         };
         Ok(no)
     }
 
     /// The connection ended: its streams end with it (`conn.down` says so).
-    fn conn_down(&self, no: u64, reason: &CloseReason) {
+    fn conn_down(self: &Arc<Self>, no: u64, reason: &CloseReason) {
         let mut core = lock(&self.core);
         let Some(entry) = core.conns.remove(&no) else {
             return;
@@ -542,8 +603,13 @@ impl Shared {
         core.out.conn_event(no, &event);
         self.queued(&core);
         drop(core);
+        relay::conn_gone(self, no);
         if !entry.inbound {
             self.keep.kick(paths::Kick::Look);
+            if entry.via.is_some() {
+                let shared = self.clone();
+                tokio::spawn(async move { relay::drop_companion(&shared, no).await });
+            }
         }
         applog::line(format!("closed {}: {reason}", short_id(&entry.identity)));
     }
@@ -752,11 +818,34 @@ impl Shared {
                     Some("bulk") => Some(PriorityClass::Bulk),
                     _ => None,
                 };
-                let entry = conn.and_then(|c| core.conns.get(&c).map(|e| (c, e.conn.clone())));
+                let entry = conn.and_then(|c| {
+                    core.conns
+                        .get(&c)
+                        .map(|e| (c, e.conn.clone(), e.identity, e.via.clone()))
+                });
+                // Engine stream labels belong to the helper.
+                let label = label.filter(|l| !l.starts_with(ENGINE_PREFIX));
                 match (entry, label, class) {
-                    (Some((no, conn)), Some(label), Some(class)) => {
+                    (Some((no, conn, pin, via)), Some(label), Some(class)) => {
                         drop(core);
-                        tokio::spawn(open_stream(self.clone(), id, no, conn, label, class));
+                        let shared = self.clone();
+                        tokio::spawn(async move {
+                            // Bulk through a relay has its own outer
+                            // connection and peer session (Phase 3 B.6).
+                            let conn = match via {
+                                Some(route) if class == PriorityClass::Bulk => {
+                                    match relay::bulk_companion(&shared, no, pin, route).await {
+                                        Ok(bulk) => bulk,
+                                        Err(e) => {
+                                            shared.event(error(&id, "no_conn", e.to_string()));
+                                            return;
+                                        }
+                                    }
+                                }
+                                _ => conn,
+                            };
+                            open_stream(shared, id, no, conn, label, class).await;
+                        });
                     }
                     (None, _, _) => {
                         self.reply(&mut core, error(&id, "no_conn", "no such connection"))
@@ -802,6 +891,14 @@ impl Shared {
             op if pairing::OPS.contains(&op) => {
                 drop(core);
                 pairing::on_request(self, id, op, &map);
+            }
+            op if relay::OPS.contains(&op) => {
+                drop(core);
+                relay::on_request(self, id, op, &map);
+            }
+            op if engine_ops::OPS.contains(&op) => {
+                drop(core);
+                engine_ops::on_request(self, id, op, &map);
             }
             other => {
                 let reason = format!("unknown op {other:?}");
@@ -1114,9 +1211,43 @@ async fn write_stdout(shared: Arc<Shared>) {
 /// Watch one connection: hand its peer's streams to the app (or refuse
 /// them), and report its end.
 async fn conn_task(shared: Arc<Shared>, no: u64, conn: Arc<Connection>, inbound: bool) {
+    // Inbound: the host opens engine streams only once the caller has
+    // opened one.
+    let (opened, opened_rx) = watch::channel(false);
+    if inbound {
+        shared.engine.on_inbound(conn.clone(), opened_rx);
+    } else {
+        shared.engine.on_outbound(conn.clone());
+    }
     let accept = async {
         while let Some(stream) = conn.accept_stream().await {
-            if !inbound {
+            opened.send_replace(true);
+            if inbound {
+                // The engine lets a host open streams only once its caller
+                // has opened one.
+                let first = {
+                    let mut core = lock(&shared.core);
+                    core.conns
+                        .get_mut(&no)
+                        .is_some_and(|e| !std::mem::replace(&mut e.caller_opened, true))
+                };
+                if first {
+                    relay::send_manifest(&shared, no, conn.clone());
+                }
+            }
+            if stream.label().starts_with(ENGINE_PREFIX) {
+                // The relay's engine streams (minor 1), then Phase 4's.
+                let keys = conn.minor().unwrap_or(0) >= relay::KEYS_MINOR;
+                match stream.label() {
+                    relay::MANIFEST_LABEL if keys && !inbound => {
+                        tokio::spawn(relay::read_manifest(shared.clone(), *conn.peer(), stream));
+                    }
+                    relay::KEYS_LABEL if keys && inbound => {
+                        tokio::spawn(relay::serve_keys(shared.clone(), conn.clone(), stream));
+                    }
+                    _ => shared.engine.on_stream(conn.clone(), inbound, stream),
+                }
+            } else if !inbound {
                 // Not in 1.0: the host opens no streams to its caller.
                 stream.writer.reset(ErrorCode::RefusedStream);
             } else if LABELS.contains(&stream.label()) {
