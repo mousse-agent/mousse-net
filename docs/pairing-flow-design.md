@@ -293,8 +293,9 @@ true}`
   caller key and recovery entries.
 - It leaves the outbound peer record, its approvals, its relay secrets and
   its completion record alone.
-- Before it replies, the streams the peer opened on this computer's own
-  connections to it are reset, and data queued for the app on them is
+- Before it replies, the streams the peer opened are reset, on this
+  computer's own connections to it and on the peer's connections here
+  (which close only afterwards), and data queued for the app on them is
   dropped. No data from them reaches the app after the reply.
   `grant.remove` does the same.
 - An id that is no longer this computer's grant answers `{removed:
