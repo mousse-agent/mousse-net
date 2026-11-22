@@ -275,6 +275,32 @@ impl std::fmt::Display for RoleEditError {
     }
 }
 
+/// Why [`Host::add_grant_connected`] did not answer with a saved grant.
+#[derive(Debug)]
+pub enum ConnectedGrantError {
+    /// Networking is paused: a removal failed to save.
+    Paused,
+    /// The connection is closing, or (inbound) no grant of this computer
+    /// serves it any more.
+    Closing,
+    /// The grant table refused the grant (the identity is denied).
+    Refused(String),
+    /// The grant is in effect but the table could not be saved; the host
+    /// keeps retrying, and the call may be repeated.
+    NotSaved(NetError),
+}
+
+impl std::fmt::Display for ConnectedGrantError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Paused => f.write_str("networking is paused"),
+            Self::Closing => f.write_str("the connection is closing"),
+            Self::Refused(why) => f.write_str(why),
+            Self::NotSaved(e) => write!(f, "the grant is in effect but saving it failed ({e})"),
+        }
+    }
+}
+
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -456,6 +482,24 @@ where
     /// Whether `grant` waits for its role edit to settle.
     fn is_suspended(&self, grant: GrantId) -> bool {
         self.suspended.contains(&grant)
+    }
+
+    /// The grant `conn` is live under at `now`, if it is served
+    /// ([`Host::grant_of`]).
+    fn grant_of(&self, conn: ConnectionId, now: UnixTime) -> Option<&Grant> {
+        let Some(GateState::Live { grant }) = self.gates.get(&conn).map(|g| g.state()) else {
+            return None;
+        };
+        // Must-fail control (tests only): the gate alone decides.
+        if cfg!(mousse_control = "grant-served-while-not-serving") {
+            return (!self.is_suspended(*grant))
+                .then(|| self.grants.get(*grant))
+                .flatten();
+        }
+        let held = self.grants.get(*grant)?;
+        self.grants
+            .live_grant(&held.identity, now)
+            .filter(|g| g.id == *grant && self.serving() && !self.is_suspended(g.id))
     }
 
     /// Whether the admission fence stops connections of `kind`.
@@ -1070,22 +1114,80 @@ where
     /// settle) and this one is not waiting for a role edit to settle.
     pub fn grant_of(&self, conn: ConnectionId) -> Option<Grant> {
         let now = self.shared.clock.now();
-        let inner = lock(&self.shared);
-        let Some(GateState::Live { grant }) = inner.gates.get(&conn).map(|g| g.state()) else {
-            return None;
-        };
-        // Must-fail control (tests only): the gate alone decides.
-        if cfg!(mousse_control = "grant-served-while-not-serving") {
-            return (!inner.is_suspended(*grant))
-                .then(|| inner.grants.get(*grant).cloned())
-                .flatten();
+        lock(&self.shared).grant_of(conn, now).cloned()
+    }
+
+    /// Grant `identity`, the authenticated peer of `conn`, access to this
+    /// computer with `role`, for `grant.add_connected`. Returns the grant
+    /// and whether it existed; an existing grant is returned as it is,
+    /// never widened or narrowed.
+    ///
+    /// Under the host's lock: refused while networking is paused; the
+    /// grant is committed under a [`crate::LivePermit`] of `conn`, so never
+    /// on a connection that started to close; an inbound connection is
+    /// answered with the grant it is live under, if this computer still
+    /// serves it. The table is saved before success is returned, also when
+    /// the grant existed and an earlier save failed.
+    pub fn add_grant_connected(
+        &self,
+        conn: &Connection,
+        inbound: bool,
+        identity: IdentityPublicKey,
+        name: String,
+        role: Role,
+    ) -> Result<(Grant, bool), ConnectedGrantError> {
+        let now = self.shared.clock.now();
+        let mut inner = lock(&self.shared);
+        // Must-fail controls (tests only): the commit ignores the pause,
+        // the connection's liveness, or an earlier failed save.
+        if inner.paused && !cfg!(mousse_control = "connected-grant-while-paused") {
+            return Err(ConnectedGrantError::Paused);
         }
-        let held = inner.grants.get(*grant)?;
-        inner
+        let any_conn = cfg!(mousse_control = "grant-from-stale-connection");
+        let permit = conn.live_permit();
+        if permit.is_none() && !any_conn {
+            return Err(ConnectedGrantError::Closing);
+        }
+        let existing = if inbound {
+            // Live only under a grant of this computer: that grant is the
+            // answer, and no grant means the connection is ending.
+            match inner.grant_of(conn.id(), now) {
+                Some(grant) if grant.identity == identity => Some(grant.clone()),
+                _ if !any_conn => return Err(ConnectedGrantError::Closing),
+                _ => None,
+            }
+        } else {
+            inner.grants.live_grant(&identity, now).cloned()
+        };
+        if let Some(grant) = existing {
+            drop(permit);
+            if inner.unsaved && !cfg!(mousse_control = "connected-grant-answers-unsaved") {
+                inner.persist().map_err(ConnectedGrantError::NotSaved)?;
+            }
+            return Ok((grant, true));
+        }
+        let new = NewGrant {
+            identity,
+            name,
+            role,
+            authorizing_owner: self.shared.owner,
+            expires_at: None,
+            enrolled_by: None,
+        };
+        let (id, events) = inner
             .grants
-            .live_grant(&held.identity, now)
-            .filter(|g| g.id == *grant && inner.serving() && !inner.is_suspended(g.id))
+            .add(new, now)
+            .map_err(|e| ConnectedGrantError::Refused(e.to_string()))?;
+        inner.apply_grant_events(events);
+        // The grant is in effect: the connection may close from here on.
+        drop(permit);
+        let grant = inner
+            .grants
+            .get(id)
             .cloned()
+            .ok_or_else(|| ConnectedGrantError::Refused("the new grant is missing".into()))?;
+        inner.persist().map_err(ConnectedGrantError::NotSaved)?;
+        Ok((grant, false))
     }
 
     /// The live grant `identity` holds on this endpoint, if any and if it
@@ -2647,6 +2749,80 @@ mod tests {
             Err(RoleEditError::Paused)
         ));
         assert_eq!(role_of(&host, &other.identity()), Some(("owner".into(), 1)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A grant for a connection's peer is refused while networking is
+    /// paused, checked under the lock a failed removal sets the fence
+    /// under; the connection stays live and nothing is granted.
+    #[tokio::test]
+    async fn a_connected_grant_is_refused_while_paused() {
+        let (host, _events) = host_in(None);
+        let (_caller, _id, hosted, _dialled) = connected(&host).await;
+        let other = new_caller();
+        host.set_fence(true);
+        assert!(matches!(
+            host.add_grant_connected(&hosted, false, other.identity(), "x".into(), role("viewer")),
+            Err(ConnectedGrantError::Paused)
+        ));
+        assert!(host.live_grant(&other.identity()).is_none());
+    }
+
+    /// The peer's `GOAWAY` makes its connection closing at once, before the
+    /// driver is done and while the gate still reads live: no grant is
+    /// committed on it, nor is the grant it is live under answered.
+    #[tokio::test]
+    async fn no_grant_is_made_or_answered_on_a_connection_the_peer_is_closing() {
+        let (host, _events) = host_in(None);
+        let (caller, _id, hosted, dialled) = connected(&host).await;
+        dialled.close(ErrorCode::NoError);
+        within("closing", async {
+            while !hosted.is_closing() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let other = new_caller();
+        assert!(matches!(
+            host.add_grant_connected(&hosted, false, other.identity(), "x".into(), role("viewer")),
+            Err(ConnectedGrantError::Closing)
+        ));
+        assert!(host.live_grant(&other.identity()).is_none());
+        assert!(matches!(
+            host.add_grant_connected(&hosted, true, caller.identity(), "x".into(), role("viewer")),
+            Err(ConnectedGrantError::Closing)
+        ));
+    }
+
+    /// The grant an inbound connection is live under is answered only once
+    /// the table is saved: after an earlier save failed, a failing save
+    /// answers `NotSaved`, and the next one saves what was pending.
+    #[tokio::test]
+    async fn an_existing_grant_is_answered_only_once_the_table_is_saved() {
+        use crate::private::faults::{plan_replaces, Fault};
+        let dir = fresh_dir("connected-unsaved");
+        let (host, _events) = host_in(Some(dir.clone()));
+        host.shared.ticker_paused.store(true, Ordering::SeqCst);
+        let (caller, id, hosted, _dialled) = connected(&host).await;
+        let store = GrantStore::in_dir(&dir);
+        let other = new_caller();
+        plan_replaces(store.path(), &[Fault::BeforeRename]);
+        assert!(host
+            .add_grant_as(other.identity(), "other".into(), None, None)
+            .is_err());
+        plan_replaces(store.path(), &[Fault::BeforeRename]);
+        assert!(matches!(
+            host.add_grant_connected(&hosted, true, caller.identity(), "x".into(), role("viewer")),
+            Err(ConnectedGrantError::NotSaved(_))
+        ));
+        let (grant, already) = host
+            .add_grant_connected(&hosted, true, caller.identity(), "x".into(), role("viewer"))
+            .unwrap();
+        assert_eq!((grant.id, already), (id, true));
+        let stored = store.load().unwrap();
+        assert!(stored
+            .live_grant(&other.identity(), host.shared.clock.now())
+            .is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

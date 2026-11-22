@@ -13,7 +13,7 @@ id = "pairing-roles.grant-roles"
 title = "The role chosen with an approval, a link invitation or grant.add is the grant's, and a failed answer's role reaches no one; an edit is stored before it takes effect, refused at a stale revision or while a removal is not saved, and cuts the old role's paths with CANCELLED before it is answered (nothing queued under the old role leaves after the reply, no waiting announcement or call is delivered); streams of a restricted grant reach only an app that opted in, and standalone serve opens a terminal only for an owner; a demoted owner loses its grant list and its removals; nothing is served while the host is not serving or after a grant expired; a restricted or edited store is one an older helper refuses"
 plan = "docs/pairing-flow-design.md §7, §8 and §11"
 targets = ["windows-x64", "macos-arm64", "linux-x64"]
-min_tests = 459
+min_tests = 463
 local = [
   { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-net-core", "-p", "mousse-net-io", "-p", "mousse-helper", "--features", "mousse-helper/test-in-person", "--lib", "--bins", "--test", "app_grant_roles", "--test", "headless", "--test", "pairing_e2e", "--no-fail-fast"] },
   { target = "macos-arm64", host = "macos-aarch64", command = ["cargo", "test", "-p", "mousse-net-core", "-p", "mousse-net-io", "-p", "mousse-helper", "--features", "mousse-helper/test-in-person", "--lib", "--bins", "--test", "app_grant_roles", "--test", "headless", "--test", "pairing_e2e", "--no-fail-fast"] },
@@ -39,17 +39,20 @@ control = [
 
 [[check]]
 id = "pairing-roles.grant-connected"
-title = "grant.add_connected grants the authenticated peer of a live connection of the channel: never a connection that closed meanwhile, never an identity the request names, never a denied identity, and an existing grant comes back with its own role"
+title = "grant.add_connected grants the authenticated peer of a live connection of the channel: never on a connection that started to close (forgotten, edited or removed, closed by the peer), never while paused, never an identity the request names, never a denied identity or a name the grant name rule refuses; an existing grant comes back with its own role, and only once the table is saved"
 plan = "docs/pairing-flow-design.md §7 and §11"
 targets = ["windows-x64", "macos-arm64", "linux-x64"]
-min_tests = 7
+min_tests = 115
 local = [
-  { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_grant_connected", "--no-fail-fast"] },
-  { target = "macos-arm64", host = "macos-aarch64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_grant_connected", "--no-fail-fast"] },
-  { target = "linux-x64", host = "linux-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_grant_connected", "--no-fail-fast"] },
+  { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-net-io", "-p", "mousse-helper", "--lib", "--test", "app_grant_connected", "--no-fail-fast"] },
+  { target = "macos-arm64", host = "macos-aarch64", command = ["cargo", "test", "-p", "mousse-net-io", "-p", "mousse-helper", "--lib", "--test", "app_grant_connected", "--no-fail-fast"] },
+  { target = "linux-x64", host = "linux-x86_64", command = ["cargo", "test", "-p", "mousse-net-io", "-p", "mousse-helper", "--lib", "--test", "app_grant_connected", "--no-fail-fast"] },
 ]
 control = [
-  { name = "grant-from-stale-connection", breaks = "a connection that is closing still grants its peer", env = { RUSTFLAGS = '--cfg mousse_control="grant-from-stale-connection"' } },
+  { name = "grant-from-stale-connection", breaks = "a connection that is closing, or one the channel forgot, still grants its peer", env = { RUSTFLAGS = '--cfg mousse_control="grant-from-stale-connection"' } },
   { name = "connected-grant-upgrades-existing", breaks = "an existing grant is widened to the role the request names", env = { RUSTFLAGS = '--cfg mousse_control="connected-grant-upgrades-existing"' } },
   { name = "connected-grant-trusts-request-identity", breaks = "the identity is read from the request instead of the connection", env = { RUSTFLAGS = '--cfg mousse_control="connected-grant-trusts-request-identity"' } },
+  { name = "live-permit-ignored", breaks = "a close does not wait for a live permit, so a grant can commit on a connection that started to close", env = { RUSTFLAGS = '--cfg mousse_control="live-permit-ignored"' } },
+  { name = "connected-grant-while-paused", breaks = "the host commits a grant for a connection's peer while a failed removal holds networking paused", env = { RUSTFLAGS = '--cfg mousse_control="connected-grant-while-paused"' } },
+  { name = "connected-grant-answers-unsaved", breaks = "an existing grant is answered while an earlier save is still pending", env = { RUSTFLAGS = '--cfg mousse_control="connected-grant-answers-unsaved"' } },
 ]

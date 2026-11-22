@@ -8,8 +8,18 @@
 
 mod common;
 
+use std::path::Path;
+
 use common::*;
+use mousse_net_core::grants::MAX_NAME_LEN;
 use serde_json::{json, Value};
+
+/// Debug builds: a closed connection's entry stays on the channel this
+/// long before `conn.down`, so a request reaches the liveness check with
+/// the closing entry still there, not the check for a missing one.
+fn down_held() -> [(&'static str, &'static Path); 1] {
+    [("MOUSSE_HELPER_TEST_DOWN_HOLD_MS", Path::new("5000"))]
+}
 
 /// B joined A in person, with an invitation of `role`.
 struct Paired {
@@ -24,11 +34,17 @@ struct Paired {
 }
 
 fn paired(tag: &str, role: &str) -> Paired {
+    paired_with(tag, role, &[], &[])
+}
+
+/// [`paired`], with the debug-build hooks `a_raw` and `b_raw` set on A's
+/// and B's helpers.
+fn paired_with(tag: &str, role: &str, a_raw: &[(&str, &Path)], b_raw: &[(&str, &Path)]) -> Paired {
     let a_end = Endpoint::init(&format!("{tag}a"));
     let b_end = Endpoint::init(&format!("{tag}b"));
-    let mut a = a_end.app("hostA", &[]);
+    let mut a = a_end.app_raw("hostA", &[], 0, a_raw);
     a.hello();
-    let mut b = b_end.app("peerB", &[]);
+    let mut b = b_end.app_raw("peerB", &[], 0, b_raw);
     b.hello();
     let created = a.call("invite.create", json!({"role": role}));
     let invitation = created["invitation"].as_str().unwrap().to_owned();
@@ -121,11 +137,24 @@ fn a_repeated_request_returns_the_one_grant() {
     assert_eq!(grants_of(&mut p.b, &a_identity).len(), 1);
 }
 
+/// `reply` is `no_conn` for a connection still on the channel but
+/// closing, not for one already gone.
+fn assert_closing(reply: &Value) {
+    assert_eq!(reply["error"], json!("no_conn"), "{reply}");
+    assert!(
+        reply["reason"]
+            .as_str()
+            .is_some_and(|m| m.contains("is closing")),
+        "{reply}"
+    );
+}
+
 /// A connection that is closing when the request is handled grants
-/// nothing: here `peer.forget` closes B's path to A just before.
+/// nothing: here `peer.forget` closes B's path to A just before. B keeps
+/// the closing entry, so the request is refused by the liveness check.
 #[test]
 fn a_connection_closed_meanwhile_grants_nothing() {
-    let mut p = paired("gccl", "owner");
+    let mut p = paired_with("gccl", "owner", &[], &down_held());
     let a_identity = p.a.identity.clone();
     let forget = p.b.start("peer.forget", json!({"identity": a_identity}));
     let add = p.b.start(
@@ -133,12 +162,196 @@ fn a_connection_closed_meanwhile_grants_nothing() {
         json!({"conn": p.b_conn, "name": "hostA", "role": "owner"}),
     );
     assert_eq!(p.b.reply(forget)["forgotten"], json!(true));
-    let reply = p.b.reply(add);
-    assert_eq!(reply["error"], json!("no_conn"), "{reply}");
+    assert_closing(&p.b.reply(add));
     assert!(grants_of(&mut p.b, &a_identity).is_empty());
     // Nor does a connection number this channel never had.
     let reply = add_connected(&mut p.b, 9999, "owner");
     assert_eq!(reply["error"], json!("no_conn"), "{reply}");
+}
+
+/// A's inbound connection from B, closed by an edit of B's grant and then
+/// by its removal, is refused while its entry is still there: no grant is
+/// answered or made, and the edited grant keeps its role.
+#[test]
+fn an_inbound_connection_closed_by_an_edit_or_a_removal_grants_nothing() {
+    let mut p = paired_with("gcin", "owner", &down_held(), &[]);
+    let b_identity = p.b.identity.clone();
+    let grant = grants_of(&mut p.a, &b_identity)[0]["grant"].clone();
+    p.a.call(
+        "grant.set_role",
+        json!({"grant": grant, "expected_revision": 1, "role": "viewer"}),
+    );
+    assert_closing(&add_connected(&mut p.a, p.a_conn, "owner"));
+    let grants = grants_of(&mut p.a, &b_identity);
+    assert_eq!(grants.len(), 1, "{grants:?}");
+    assert_eq!(
+        (&grants[0]["role"], &grants[0]["revision"]),
+        (&json!("viewer"), &json!(2)),
+        "{grants:?}"
+    );
+    // B comes back on a new path, and A removes B's grant.
+    let old = p.a_conn;
+    let again = p.a.wait("B's new path to A", WAIT, |st| {
+        st.messages
+            .iter()
+            .find(|m| {
+                m["ev"] == "conn.up"
+                    && m["dir"] == "in"
+                    && m["identity"] == b_identity.as_str()
+                    && m["conn"].as_u64() != Some(old)
+            })
+            .map(|m| m["conn"].as_u64().unwrap())
+    });
+    p.a.call("grant.remove", json!({"grant": grant}));
+    assert_closing(&add_connected(&mut p.a, again, "owner"));
+    assert!(grants_of(&mut p.a, &b_identity).is_empty());
+}
+
+/// B's outbound connection to A, closed by A (the peer's `GOAWAY`), not
+/// by anything on B: B still reads it as closing and grants nothing.
+#[test]
+fn an_outbound_connection_the_peer_closed_grants_nothing() {
+    let mut p = paired_with("gcga", "owner", &[], &down_held());
+    let a_identity = p.a.identity.clone();
+    let b_identity = p.b.identity.clone();
+    let grant = grants_of(&mut p.a, &b_identity)[0]["grant"].clone();
+    // A's edit closes its side of the path with GOAWAY.
+    p.a.call(
+        "grant.set_role",
+        json!({"grant": grant, "expected_revision": 1, "role": "viewer"}),
+    );
+    let a_conn = p.a_conn;
+    p.a.event("conn.down", |m| m["conn"].as_u64() == Some(a_conn));
+    // A's side is done; the GOAWAY reached B before A's pipe closed.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert_closing(&add_connected(&mut p.b, p.b_conn, "owner"));
+    assert!(grants_of(&mut p.b, &a_identity).is_empty());
+}
+
+/// While a removal that failed to save holds networking paused, no grant
+/// is made.
+#[test]
+fn a_request_while_paused_is_refused() {
+    let mut p = paired("gcps", "owner");
+    let a_identity = p.a.identity.clone();
+    let c_end = Endpoint::init("gcpsc");
+    let mut c = c_end.app("peerC", &[]);
+    c.hello();
+    let added = p.b.call(
+        "grant.add",
+        json!({"identity": c.identity, "name": "C", "role": "viewer"}),
+    );
+    block_table(&p.b_end);
+    let removed = p.b.call("grant.remove", json!({"grant": added["grant"]}));
+    assert_eq!(removed["paused"], true, "{removed}");
+    let reply = add_connected(&mut p.b, p.b_conn, "owner");
+    assert_eq!(reply["error"], json!("paused"), "{reply}");
+    assert!(grants_of(&mut p.b, &a_identity).is_empty());
+}
+
+/// The grant table cannot be written: a directory is in its way.
+fn block_table(end: &Endpoint) {
+    let table = end.dir.join("grants.json");
+    let _ = std::fs::remove_file(&table);
+    std::fs::create_dir_all(table.join("in-the-way")).unwrap();
+}
+
+fn unblock_table(end: &Endpoint) {
+    std::fs::remove_dir_all(end.dir.join("grants.json")).unwrap();
+}
+
+/// A grant is answered only once the table is saved: a failed save is
+/// `store_failed`, also for a grant that exists in memory only, on an
+/// outbound connection (the grant this request made) and on an inbound
+/// one (the grant it is live under, with another grant's save pending).
+/// Once the table can be written, the repeated request saves it.
+#[test]
+fn a_grant_is_answered_only_once_saved() {
+    let mut p = paired("gcsf", "owner");
+    let a_identity = p.a.identity.clone();
+    let b_identity = p.b.identity.clone();
+    block_table(&p.b_end);
+    for _ in 0..2 {
+        let reply = add_connected(&mut p.b, p.b_conn, "viewer");
+        assert_eq!(reply["error"], json!("store_failed"), "{reply}");
+    }
+    unblock_table(&p.b_end);
+    let reply = add_connected(&mut p.b, p.b_conn, "viewer");
+    assert_eq!(
+        (&reply["role"], &reply["already"]),
+        (&json!("viewer"), &json!(true)),
+        "{reply}"
+    );
+    // A: another grant's save failed, so B's grant on A's inbound
+    // connection is not answered until the table is saved.
+    let c_end = Endpoint::init("gcsfc");
+    let mut c = c_end.app("peerC", &[]);
+    c.hello();
+    let c_identity = c.identity.clone();
+    block_table(&p.a_end);
+    let added = p.a.request(
+        "grant.add",
+        json!({"identity": c_identity, "name": "C", "role": "viewer"}),
+    );
+    assert_eq!(added["error"], json!("store_failed"), "{added}");
+    let reply = add_connected(&mut p.a, p.a_conn, "owner");
+    assert_eq!(reply["error"], json!("store_failed"), "{reply}");
+    unblock_table(&p.a_end);
+    let reply = add_connected(&mut p.a, p.a_conn, "owner");
+    assert_eq!(reply["already"], json!(true), "{reply}");
+    // Both tables are on disk.
+    p.a.kill();
+    p.b.kill();
+    let mut a = p.a_end.app("hostA", &[]);
+    a.hello();
+    assert_eq!(grants_of(&mut a, &c_identity).len(), 1);
+    assert_eq!(grants_of(&mut a, &b_identity).len(), 1);
+    let mut b = p.b_end.app("peerB", &[]);
+    b.hello();
+    assert_eq!(grants_of(&mut b, &a_identity).len(), 1);
+}
+
+/// A name the grant name rule refuses is `bad_request`, also when the
+/// grant exists already.
+#[test]
+fn a_name_outside_the_rule_is_refused() {
+    let mut p = paired("gcnm", "owner");
+    let long = "n".repeat(MAX_NAME_LEN + 1);
+    for name in ["", long.as_str()] {
+        let reply = p.b.request(
+            "grant.add_connected",
+            json!({"conn": p.b_conn, "name": name, "role": "owner"}),
+        );
+        assert_eq!(reply["error"], json!("bad_request"), "{reply}");
+    }
+    let made = add_connected(&mut p.b, p.b_conn, "viewer");
+    assert_eq!(made["already"], json!(false), "{made}");
+    let reply = p.b.request(
+        "grant.add_connected",
+        json!({"conn": p.b_conn, "name": long, "role": "viewer"}),
+    );
+    assert_eq!(reply["error"], json!("bad_request"), "{reply}");
+    let longest = "n".repeat(MAX_NAME_LEN);
+    let reply = p.b.request(
+        "grant.add_connected",
+        json!({"conn": p.b_conn, "name": longest, "role": "viewer"}),
+    );
+    assert_eq!(reply["already"], json!(true), "{reply}");
+}
+
+/// A 1.2 app learns from `hello` that this helper takes
+/// `grant.add_connected`.
+#[test]
+fn a_1_2_hello_lists_the_feature() {
+    let end = Endpoint::init("gchl");
+    let mut app = end.app("hostA", &[]);
+    let hello = app.call("hello", json!({"proto": [1, 2]}));
+    assert!(
+        hello["features"]
+            .as_array()
+            .is_some_and(|f| f.contains(&json!("grant-add-connected"))),
+        "{hello}"
+    );
 }
 
 /// A grant that exists is returned with its own role, not widened to the

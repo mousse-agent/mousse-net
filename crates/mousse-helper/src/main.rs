@@ -77,7 +77,10 @@
         mousse_control = "demoted-owner-keeps-grants",
         mousse_control = "role-edit-keeps-queued-announcement",
         mousse_control = "role-edit-delivers-on-closing-path",
-        mousse_control = "suspended-reads-as-revoked"
+        mousse_control = "suspended-reads-as-revoked",
+        mousse_control = "grant-from-stale-connection",
+        mousse_control = "connected-grant-upgrades-existing",
+        mousse_control = "connected-grant-trusts-request-identity"
     )
 ))]
 compile_error!("a mousse_control build has a deliberate defect and is for tests only; build it without --release");
@@ -162,6 +165,9 @@ compile_error!("test-in-person lets a typed ticket count as scanned from the hos
     mousse_control = "role-edit-keeps-queued-announcement",
     mousse_control = "role-edit-delivers-on-closing-path",
     mousse_control = "suspended-reads-as-revoked",
+    mousse_control = "grant-from-stale-connection",
+    mousse_control = "connected-grant-upgrades-existing",
+    mousse_control = "connected-grant-trusts-request-identity",
     feature = "test-in-person"
 ))]
 const _: () = {
