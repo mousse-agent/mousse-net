@@ -1,0 +1,30 @@
+# Pairing flow, pull requests 4 and 5: the role of a grant, chosen when it
+# is made and edited in place (docs/pairing-flow-design.md §7, §8 and §11).
+#
+# Owner check: `mousse-check pairing-roles` shows PASS in every target
+# cell, with no INCOMPLETE. Format: checks/README.md.
+
+phase = "pairing-roles"
+title = "Choosing, editing and enforcing the role of a grant"
+plan = "docs/pairing-flow-design.md#11-checks"
+
+[[check]]
+id = "pairing-roles.grant-roles"
+title = "The role chosen with an approval or grant.add is the grant's; an edit is stored before it takes effect, refused at a stale revision and cuts the old role's paths with CANCELLED; streams of a restricted grant reach only an app that opted in, and standalone serve opens a terminal only for an owner; a demoted owner loses its grant list and its removals; a restricted store is one an older helper refuses"
+plan = "docs/pairing-flow-design.md §7, §8 and §11"
+targets = ["windows-x64", "macos-arm64", "linux-x64"]
+min_tests = 363
+local = [
+  { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-net-core", "-p", "mousse-net-io", "-p", "mousse-helper", "--features", "mousse-helper/test-in-person", "--lib", "--test", "app_grant_roles", "--test", "headless", "--no-fail-fast"] },
+  { target = "macos-arm64", host = "macos-aarch64", command = ["cargo", "test", "-p", "mousse-net-core", "-p", "mousse-net-io", "-p", "mousse-helper", "--features", "mousse-helper/test-in-person", "--lib", "--test", "app_grant_roles", "--test", "headless", "--no-fail-fast"] },
+  { target = "linux-x64", host = "linux-x86_64", command = ["cargo", "test", "-p", "mousse-net-core", "-p", "mousse-net-io", "-p", "mousse-helper", "--features", "mousse-helper/test-in-person", "--lib", "--test", "app_grant_roles", "--test", "headless", "--no-fail-fast"] },
+]
+control = [
+  { name = "approval-uses-invitation-role", breaks = "the role chosen with the approval is ignored and the grant takes the invitation's", env = { RUSTFLAGS = '--cfg mousse_control="approval-uses-invitation-role"' } },
+  { name = "role-edit-ignores-revision", breaks = "an edit made against a stale revision is applied", env = { RUSTFLAGS = '--cfg mousse_control="role-edit-ignores-revision"' } },
+  { name = "role-edit-keeps-reverse-path", breaks = "a call the peer opened on this computer's outbound path stays open under the old role after an edit", env = { RUSTFLAGS = '--cfg mousse_control="role-edit-keeps-reverse-path"' } },
+  { name = "restricted-grant-served-to-legacy-app", breaks = "an app that did not list grant-roles in hello gets the streams of a non-owner grant", env = { RUSTFLAGS = '--cfg mousse_control="restricted-grant-served-to-legacy-app"' } },
+  { name = "restricted-grant-opens-standalone-terminal", breaks = "standalone serve opens a terminal whatever the grant's role", env = { RUSTFLAGS = '--cfg mousse_control="restricted-grant-opens-standalone-terminal"' } },
+  { name = "demoted-owner-keeps-grants", breaks = "a peer demoted from owner keeps its mousse-grants stream and its signer standing", env = { RUSTFLAGS = '--cfg mousse_control="demoted-owner-keeps-grants"' } },
+  { name = "restricted-store-readable-by-old-helper", breaks = "the store version is not raised for a non-owner grant, so an older helper reads it as owner", env = { RUSTFLAGS = '--cfg mousse_control="restricted-store-readable-by-old-helper"' } },
+]

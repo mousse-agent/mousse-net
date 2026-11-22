@@ -417,6 +417,34 @@ before queued work commits.
   its `mousse.hello` reply. `AUTHORIZED` stays as it is. The serving side
   enforces from its own grant only.
 
+### 8.5 As built (pull request 4)
+
+Where pull request 4 differs from the text above, or settles what it left
+open:
+
+- **Unknown save outcome.** The grant is suspended: its connections close,
+  new ones are refused, its streams are not handed to the app and its
+  signer cannot remove. It is served again when a later save of the table
+  succeeds, or when the helper's periodic re-read finds the stored role and
+  revision equal to the ones in memory. The edit's reply is
+  `store_failed`, and the helper cuts the grant's paths as for an edit.
+  A further edit of a suspended grant first saves the table again and is
+  refused with `store_failed` if that fails.
+- **Refusals.** An edit the grant table refuses for another reason (the
+  revision would overflow, the identity is denied) is `bad_request`.
+- **Store version.** A table holding a non-`owner` grant is written with
+  version 3; a table of `owner` grants only stays version 2 and an older
+  helper still loads it. Revision 1 is not written, so a table that was
+  never edited is stored as before. An older helper ignores a higher
+  revision in a version 2 file and drops it when it saves, so after a
+  downgrade and an upgrade those grants are at revision 1 again; the roles
+  are unchanged, as they are all `owner`.
+- **Renewals.** A stream is checked against the grant's current role and
+  revision when it is handed to the app, so a stream on a path that was
+  renewing during the edit is served under the new role.
+- **Standalone `serve`.** The terminal is opened for `owner` only
+  (`serve.rs` `TERMINAL_ROLES`).
+
 ## 9. Relay-only completion recovery
 
 A "Send link" join over a relay saves its completion record first and the
@@ -485,6 +513,11 @@ Each check is a `mousse-check` entry in `checks/pairing-flow.toml` with a
 must-fail control (`cfg!(mousse_control = "...")`, listed in the workspace
 `check-cfg`). Each control fails its own assertion while the normal build
 passes.
+
+`mousse-check` finds a check's file by the part of its id before the dot,
+which is the file's `phase`. The role checks are therefore in
+`checks/pairing-roles.toml` as `pairing-roles.grant-roles` and
+`pairing-roles.grant-connected`, with the controls listed below.
 
 | Check | Control | The bug it plants |
 |---|---|---|
