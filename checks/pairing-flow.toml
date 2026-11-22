@@ -42,3 +42,23 @@ control = [
   { name = "check-auto-approves-public", breaks = "a public hint is reported automatic", env = { RUSTFLAGS = '--cfg mousse_control="check-auto-approves-public"' } },
   { name = "link-accepts-kind1", breaks = "a pasted in-person ticket is taken as scanned", env = { RUSTFLAGS = '--cfg mousse_control="link-accepts-kind1"' } },
 ]
+
+[[check]]
+id = "pairing-flow.join-probe"
+title = "join.probe is reachable only when the inner TLS matches the ticket's host; it dials only what join would dial, never a relay, under one deadline; it pairs, stores and announces nothing; probes are capped, and cancel, pause and channel close end them once and free the slot"
+plan = "docs/pairing-flow-design.md §5 and §12"
+targets = ["windows-x64", "macos-arm64", "linux-x64"]
+min_tests = 10
+local = [
+  { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_join_probe", "--no-fail-fast"] },
+  { target = "macos-arm64", host = "macos-aarch64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_join_probe", "--no-fail-fast"] },
+  { target = "linux-x64", host = "linux-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_join_probe", "--no-fail-fast"] },
+]
+control = [
+  { name = "probe-accepts-outer-tls", breaks = "success without the inner identity", env = { RUSTFLAGS = '--cfg mousse_control="probe-accepts-outer-tls"' } },
+  { name = "probe-sends-join-proof", breaks = "the probe advances the invitation", env = { RUSTFLAGS = '--cfg mousse_control="probe-sends-join-proof"' } },
+  { name = "probe-dials-unapproved", breaks = "an unapproved destination is dialled", env = { RUSTFLAGS = '--cfg mousse_control="probe-dials-unapproved"' } },
+  { name = "probe-opens-relay-circuit", breaks = "a relay hint is probed", env = { RUSTFLAGS = '--cfg mousse_control="probe-opens-relay-circuit"' } },
+  { name = "probe-restarts-deadline", breaks = "each candidate gets a new deadline", env = { RUSTFLAGS = '--cfg mousse_control="probe-restarts-deadline"' } },
+  { name = "probe-cancel-keeps-slot", breaks = "a cancelled probe keeps its slot", env = { RUSTFLAGS = '--cfg mousse_control="probe-cancel-keeps-slot"' } },
+]
