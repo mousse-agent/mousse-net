@@ -4,9 +4,30 @@
 //! - **Host:** `invite.create {kind: in_person|link}`, `invite.cancel`,
 //!   `approval.answer`; events `approval`, `invite.code` (a link's code,
 //!   each time a new one shows), `enrolled`, `invite.ended`.
+//! - **Choosing the way** (protocol 1.2, features `invite-way` and
+//!   `route-readiness`; `docs/pairing-flow-design.md` §2 and §3):
+//!   `invite.create {kind?, way, route?}` puts only the chosen way's hints
+//!   in the ticket, or the one exact `route` of this computer's inventory
+//!   (see [`availability`]), and its reply lists the `ways` carried.
+//!   Without `way` or `route` it is the 1.1 path, unchanged, reply
+//!   included. With either, unknown fields, `way: null`, an unknown way
+//!   or a selector of the wrong type are `bad_request`, and a selection
+//!   with nothing to offer now is `way_unavailable` with its `reason`
+//!   (`restart_required` first when the way's saved setting waits for a
+//!   restart; `route_not_offered` when the way offers routes but not the
+//!   exact `route`); it leaves no invitation, code or relay allow-set
+//!   entry. A relay ticket takes a free allow-set slot under one lock with
+//!   its creation, never one held by an open invitation or a recovery
+//!   entry. `routes.available {}` reports each way's state, reason and
+//!   routes.
 //! - **Joiner:** `join {ticket, arrival: scan|link, approved, pinned}`,
 //!   `join.code`, `join.cancel`, `join.status`, `join.ack`; events
-//!   `join.progress`, `join.code_needed`, `join.attempt_failed`. An
+//!   `join.progress`, `join.code_needed`, `join.attempt_failed`.
+//!   `join.check {ticket, arrival}` reports what a join would refuse and
+//!   what it would do with each hint, with no network traffic (see
+//!   [`check`]); it shares its decisions with `join` ([`admit`],
+//!   [`mousse_net_io::Caller::check_join`] and
+//!   [`super::paths::hint_decision`]). An
 //!   in-person ticket needs `arrival: scan`. A `pinned` in-person join is
 //!   one the app recorded before it started: the ticket's host counts as
 //!   pinned, and repeated past the ticket's expiry it learns whether a
@@ -47,10 +68,15 @@ use crate::applog;
 use crate::peer::{JoinRoute, JoinedVia};
 use crate::revoke::Removed;
 
+mod availability;
+mod check;
+
 /// The requests this module answers.
-pub const OPS: [&str; 18] = [
+pub const OPS: [&str; 20] = [
     "config.set",
     "invite.create",
+    "routes.available",
+    "join.check",
     "invite.cancel",
     "approval.answer",
     "join",
@@ -185,6 +211,11 @@ pub fn on_request(shared: &Arc<Shared>, id: Value, op: &str, map: &Map<String, V
             None => error(&id, "bad_request", "config.set needs name"),
         },
         "invite.create" => invite(shared, &id, map),
+        "routes.available" => availability::available(shared, &id, map),
+        "join.check" => match check::check(shared, &id, map) {
+            Some(reply) => reply,
+            None => return,
+        },
         "invite.cancel" => match parse_invitation(str_field(map, "invitation")) {
             Some(invitation) => {
                 shared.host.cancel(&invitation);
@@ -252,46 +283,158 @@ pub(super) fn paused(shared: &Shared, id: &Value) -> Value {
 }
 
 fn invite(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
+    // A selector asks for the 1.2 path; without one, 1.1 unchanged.
+    if map.contains_key("way") || map.contains_key("route") {
+        return invite_way(shared, id, map);
+    }
     let kind = match str_field(map, "kind") {
         None | Some("in_person") => InvitationKind::InPerson,
         Some("link") => InvitationKind::SendLink,
         Some(_) => return error(id, "bad_request", "kind is in_person or link"),
     };
-    // What the listener serves now (Phase 1b §1.5).
-    let mut routes = shared
-        .info
-        .listen
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .routes
-        .clone();
-    // This computer's registered relays, as `relay` hints (Phase 3 B.11).
-    for hint in super::relay::ticket_hints(shared) {
-        if routes.len() < mousse_net_core::pairing::MAX_ROUTES {
-            routes.push(hint);
-        }
-    }
+    // What the listener serves now (Phase 1b §1.5), then this computer's
+    // registered relays as `relay` hints (Phase 3 B.11).
+    let routes = availability::legacy_routes(shared);
     match shared.host.invite(kind, routes.clone()) {
         Ok(created) => {
             super::relay::on_invite(shared, &created.ticket);
-            let invitation = created.ticket.invitation;
-            state(shared).invitations.push(invitation);
-            let mut reply = json!({
-                "re": id,
-                "invitation": invitation_hex(&invitation),
-                "uri": created.fragment,
-                "routes": routes,
-                "expires_at": created.ticket.expires_at.secs(),
-            });
-            // A link's first code. It is shown only to the owner, never
-            // logged, and is not part of the link.
-            if let Some((code, left)) = shared.host.invitation_code(&invitation) {
-                reply["code"] = json!(code.as_str());
-                reply["attempts_left"] = json!(left);
-            }
-            reply
+            invite_reply(shared, id, &created, &routes, None)
         }
         Err(e) => error(id, "refused", e.to_string()),
+    }
+}
+
+/// The reply to an `invite.create` that made `created` with `routes`. Only
+/// a selected ticket's reply lists its `ways`: the 1.1 reply stays as it
+/// was.
+fn invite_reply(
+    shared: &Shared,
+    id: &Value,
+    created: &mousse_net_core::pairing::CreatedInvitation,
+    routes: &[String],
+    ways: Option<&[&str]>,
+) -> Value {
+    let invitation = created.ticket.invitation;
+    state(shared).invitations.push(invitation);
+    let mut reply = json!({
+        "re": id,
+        "invitation": invitation_hex(&invitation),
+        "uri": created.fragment,
+        "routes": routes,
+        "expires_at": created.ticket.expires_at.secs(),
+    });
+    if let Some(ways) = ways {
+        reply["ways"] = json!(ways);
+    }
+    // A link's first code. It is shown only to the owner, never logged, and
+    // is not part of the link.
+    if let Some((code, left)) = shared.host.invitation_code(&invitation) {
+        reply["code"] = json!(code.as_str());
+        reply["attempts_left"] = json!(left);
+    }
+    reply
+}
+
+/// `way_unavailable`, and why (a reason of `routes.available`).
+fn way_unavailable(id: &Value, way: &str, reason: &str) -> Value {
+    let mut reply = error(
+        id,
+        "way_unavailable",
+        format!("this computer has nothing to offer for {way} now ({reason})"),
+    );
+    reply["reason"] = json!(reason);
+    reply
+}
+
+/// `invite.create {kind?, way, route?}`: a ticket that carries only the
+/// chosen way's hints, or the one exact `route`. Every check comes before
+/// the invitation exists, so a refusal leaves nothing behind.
+fn invite_way(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
+    if let Some(field) = map
+        .keys()
+        .find(|k| !matches!(k.as_str(), "id" | "op" | "kind" | "way" | "route"))
+    {
+        return error(
+            id,
+            "bad_request",
+            format!("invite.create has no field {field:?}"),
+        );
+    }
+    let kind = match map.get("kind") {
+        None => InvitationKind::InPerson,
+        Some(Value::String(k)) if k == "in_person" => InvitationKind::InPerson,
+        Some(Value::String(k)) if k == "link" => InvitationKind::SendLink,
+        Some(_) => return error(id, "bad_request", "kind is in_person or link"),
+    };
+    let way = match map.get("way").and_then(Value::as_str) {
+        Some(way) if availability::WAYS.contains(&way) => way,
+        _ => {
+            return error(
+                id,
+                "bad_request",
+                "way is lan, tailnet, public, tunnel or relay",
+            )
+        }
+    };
+    let route = match map.get("route") {
+        None => None,
+        Some(Value::String(route)) => Some(route.as_str()),
+        Some(_) => return error(id, "bad_request", "route is a hint text"),
+    };
+    if shared.removal.is_paused() {
+        return way_unavailable(id, way, "paused");
+    }
+    let saved = match availability::saved_config(shared) {
+        Ok(saved) => saved,
+        Err(e) => return error(id, "store_failed", e),
+    };
+    let inventory = availability::inventory(shared);
+    if way == "relay" {
+        if let Some(e) = inventory.relay_store_failed() {
+            return error(id, "store_failed", e.to_owned());
+        }
+    }
+    // What the listener offers now is about to be replaced.
+    if availability::restart_required(shared, &inventory, saved.as_ref(), way) {
+        return way_unavailable(id, way, "restart_required");
+    }
+    let routes = availability::select(&inventory, way, route);
+    if routes.is_empty() {
+        let reason = if route.is_some() && !availability::select(&inventory, way, None).is_empty() {
+            // The way offers routes, just not this one. For relay, capacity
+            // and the grants store come before `route_not_offered`.
+            if way == "relay" {
+                match super::relay::slot_free(shared) {
+                    Ok(true) => "route_not_offered",
+                    Ok(false) => "relay_capacity",
+                    Err(e) => return error(id, "store_failed", e),
+                }
+            } else {
+                "route_not_offered"
+            }
+        } else {
+            availability::unavailable_reason(shared, &inventory, saved.as_ref(), way)
+        };
+        return way_unavailable(id, way, reason);
+    }
+    let ways = availability::ways_of(&inventory, way, &routes);
+    let carries_relay = routes
+        .iter()
+        .any(|r| mousse_net_core::relay_endpoint::RelayRoute::parse_hint(r).is_some());
+    let made = if carries_relay {
+        // The allow-set slot is checked and taken with the creation.
+        super::relay::invite_with_slot(shared, || shared.host.invite(kind, routes.clone()))
+    } else {
+        shared
+            .host
+            .invite(kind, routes.clone())
+            .map_err(super::relay::SlotRefused::Create)
+    };
+    match made {
+        Ok(created) => invite_reply(shared, id, &created, &routes, Some(&ways)),
+        Err(super::relay::SlotRefused::Full) => way_unavailable(id, way, "relay_capacity"),
+        Err(super::relay::SlotRefused::Store(e)) => error(id, "store_failed", e),
+        Err(super::relay::SlotRefused::Create(e)) => error(id, "refused", e.to_string()),
     }
 }
 
@@ -323,7 +466,7 @@ fn start_join(shared: &Arc<Shared>, id: &Value, map: &Map<String, Value>) -> Opt
         Err(e) => return Some(error(id, "bad_ticket", e)),
     };
     // 1.0 apps send no arrival: their tickets came from the in-app scanner.
-    let mut arrival = match str_field(map, "arrival") {
+    let arrival = match str_field(map, "arrival") {
         None | Some("scan") => Arrival::InAppScan,
         Some("link") => Arrival::Link,
         Some(_) => return Some(error(id, "bad_request", "arrival is scan or link")),
@@ -338,24 +481,10 @@ fn start_join(shared: &Arc<Shared>, id: &Value, map: &Map<String, Value>) -> Opt
         }
         Some(_) => return Some(error(id, "bad_request", "approved is a list of routes")),
     };
-    // An in-person ticket skips the code, so it pairs only from a scan of
-    // the host's screen: one that came as a link may have been swapped.
-    if ticket.kind == InvitationKind::InPerson && arrival == Arrival::Link {
-        // Must-fail control: the link is taken as a scan.
-        if cfg!(mousse_control = "link-accepts-kind1") {
-            arrival = Arrival::InAppScan;
-        } else {
-            return Some(error(
-                id,
-                "pairing_failed",
-                "an in-person ticket pairs only when scanned from the host's screen \
-                 (PAIRING_FAILED)",
-            ));
-        }
-    }
-    if shared.removal.is_paused() {
-        return Some(paused(shared, id));
-    }
+    let arrival = match admit(shared, id, &ticket, arrival) {
+        Ok(arrival) => arrival,
+        Err(reply) => return Some(reply),
+    };
     let pinned = map.get("pinned").and_then(Value::as_bool).unwrap_or(false);
     let key = invitation_hex(&ticket.invitation);
     let mut st = state(shared);
@@ -391,6 +520,63 @@ fn start_join(shared: &Arc<Shared>, id: &Value, map: &Map<String, Value>) -> Opt
         },
     );
     None
+}
+
+/// The refusals `join`, `join.check` and `join.probe` share before the
+/// ticket's flow record is read: the arrival an in-person ticket needs,
+/// and the pause. The arrival to join with, or the error reply.
+fn admit(shared: &Shared, id: &Value, ticket: &Ticket, arrival: Arrival) -> Result<Arrival, Value> {
+    let mut arrival = arrival;
+    // An in-person ticket skips the code, so it pairs only from a scan of
+    // the host's screen: one that came as a link may have been swapped.
+    if ticket.kind == InvitationKind::InPerson && arrival == Arrival::Link {
+        // Must-fail control: the link is taken as a scan.
+        if cfg!(mousse_control = "link-accepts-kind1") {
+            arrival = Arrival::InAppScan;
+        } else {
+            return Err(error(
+                id,
+                "pairing_failed",
+                "an in-person ticket pairs only when scanned from the host's screen \
+                 (PAIRING_FAILED)",
+            ));
+        }
+    }
+    if shared.removal.is_paused() {
+        return Err(paused(shared, id));
+    }
+    Ok(arrival)
+}
+
+/// What a join of `ticket` dials, in order: the ticket's private-range
+/// hints and the ones the owner approved (§1.3), then its relay routes the
+/// owner approved (Phase 3 B.7).
+struct JoinPlan {
+    /// `approved`, in canonical form.
+    approved_routes: Vec<String>,
+    /// The relay routes, with the invitation's tag.
+    relays: Vec<(mousse_net_core::relay_endpoint::RelayRoute, [u8; 32])>,
+    candidates: Vec<JoinRoute>,
+}
+
+fn join_plan(shared: &Shared, ticket: &Ticket, approved: &[String]) -> JoinPlan {
+    let policy = shared.caller.addr_policy().clone();
+    let approved_routes = super::paths::canonical_list(Some(&json!(approved)));
+    let relays = super::relay::join_candidates(ticket, approved);
+    let candidates: Vec<JoinRoute> =
+        super::paths::ticket_candidates(&policy, &ticket.routes, &approved_routes)
+            .into_iter()
+            .map(JoinRoute::Local)
+            .chain(relays.iter().map(|(route, tag)| JoinRoute::Relay {
+                route: route.clone(),
+                tag: *tag,
+            }))
+            .collect();
+    JoinPlan {
+        approved_routes,
+        relays,
+        candidates,
+    }
 }
 
 /// What a `join` asked for.
@@ -448,20 +634,11 @@ async fn join(
         approved,
         typed,
     } = ask;
-    // Private-range hints, and the ones the owner approved (§1.3).
-    let policy = shared.caller.addr_policy().clone();
-    let approved_routes = super::paths::canonical_list(Some(&json!(approved)));
-    // Then the ticket's relay routes the owner approved (Phase 3 B.7).
-    let relays = super::relay::join_candidates(&ticket, &approved);
-    let candidates: Vec<JoinRoute> =
-        super::paths::ticket_candidates(&policy, &ticket.routes, &approved_routes)
-            .into_iter()
-            .map(JoinRoute::Local)
-            .chain(relays.iter().map(|(route, tag)| JoinRoute::Relay {
-                route: route.clone(),
-                tag: *tag,
-            }))
-            .collect();
+    let JoinPlan {
+        approved_routes,
+        relays,
+        candidates,
+    } = join_plan(&shared, &ticket, &approved);
     // A removal of the host while the join runs (`peer.forget`) wins: the
     // join stores nothing, or what it stored goes with the removal.
     let pin = ticket.host_identity;

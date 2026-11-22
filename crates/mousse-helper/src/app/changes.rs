@@ -193,19 +193,26 @@ pub fn interface_source() -> Arc<dyn InterfaceSource> {
 /// `MOUSSE_HELPER_INTERFACES_FILE` (the address is each line's second
 /// word).
 pub fn interface_ips() -> Vec<std::net::IpAddr> {
+    listed_interface_ips().unwrap_or_default()
+}
+
+/// [`interface_ips`], or why the interfaces could not be listed (in debug
+/// builds: the file could not be read), for answers that must tell "no
+/// such address" from "unknown" (`routes.available`, `join.check`).
+pub fn listed_interface_ips() -> Result<Vec<std::net::IpAddr>, String> {
     #[cfg(debug_assertions)]
     if let Some(path) = std::env::var_os("MOUSSE_HELPER_INTERFACES_FILE") {
-        return std::fs::read_to_string(path)
-            .unwrap_or_default()
+        return Ok(std::fs::read_to_string(path)
+            .map_err(|e| format!("the interfaces file: {e}"))?
             .lines()
             .filter_map(|l| l.split_whitespace().nth(1)?.parse().ok())
-            .collect();
+            .collect());
     }
-    if_addrs::get_if_addrs()
-        .unwrap_or_default()
+    Ok(if_addrs::get_if_addrs()
+        .map_err(|e| format!("listing the interfaces: {e}"))?
         .into_iter()
         .map(|i| i.ip())
-        .collect()
+        .collect())
 }
 
 /// The helper's clock, and in debug builds with
