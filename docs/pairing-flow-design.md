@@ -106,7 +106,7 @@ does not use that list. A candidate's way comes from where it came from:
 |---|---|
 | `lan` | private IPv4 literals the listener serves |
 | `tailnet` | `100.64.0.0/10` literals the listener serves |
-| `public` | entries of the `public` list, whatever their address class |
+| `public` | entries of the `public` list, whatever their address class, while the forwarded-to address (or every address) is bound |
 | `tunnel` | configured and CLI tunnel origins, and #10's managed tunnel, while the WebSocket listener runs |
 | `relay` | hints of this computer's registered relays |
 
@@ -119,7 +119,9 @@ canonical text.
   order.
 - `way: null`, an unknown way, a selector of the wrong type, or `route`
   without `way`: `bad_request`.
-- A well-formed selection with nothing to offer now: `way_unavailable`.
+- A well-formed selection with nothing to offer now: `way_unavailable`,
+  with `reason` as `routes.available` gives it (`paused` while networking
+  is paused).
 - The selection is made before the invitation, its code or a relay
   allow-set entry exists. A failed request leaves none of them behind.
 - `relay`: the relay allow-set slot is checked and reserved under one lock
@@ -198,6 +200,9 @@ hint, in ticket order:
   candidate filter.
 - It reads stored flow records without taking a join hold or replaying a
   completion.
+- It checks as a join without `pinned` does: an in-person ticket past its
+  expiry is `expired`, although a `pinned` join of it may still go ahead
+  to learn a lost outcome.
 - Errors: `bad_request`, `bad_ticket`, `pairing_failed`, `expired`,
   `attempts_exhausted`, `paused`, `store_failed`.
 
@@ -484,7 +489,9 @@ once #10 is merged.
 Each check is a `mousse-check` entry in `checks/pairing-flow.toml` with a
 must-fail control (`cfg!(mousse_control = "...")`, listed in the workspace
 `check-cfg`). Each control fails its own assertion while the normal build
-passes.
+passes. `mousse-check` takes a check id's prefix as the manifest's file
+stem, so the ids there are `pairing-flow.<name>`: the table's
+`pairing.invite-way` is `pairing-flow.invite-way`, and so on.
 
 | Check | Control | The bug it plants |
 |---|---|---|
