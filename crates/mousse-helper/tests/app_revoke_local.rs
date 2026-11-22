@@ -8,19 +8,33 @@
 //! grant for B. `grant.remove` is run on the same pairing to pin what it
 //! takes that `grant.revoke_local` keeps.
 //!
+//! Relay cleanup is checked on its own pairing: B joins A through A's relay
+//! only, its caller key held back, so A keeps a recovery entry for it.
+//!
 //! The check `pairing-revoke.revoke-local` runs this file.
 
 mod common;
+#[path = "common/relay.rs"]
+mod relay_fixture;
 
 use std::path::Path;
 
 use common::*;
 use mousse_net_core::pairing::Ticket;
+use mousse_net_core::relay_endpoint::RelayRoute;
 use mousse_net_io::store::hex;
+use relay_fixture::TestRelay as Relay;
 use serde_json::{json, Value};
 
 /// Retry a failed save quickly.
 const FAST_RETRY: [(&str, &str); 1] = [("REMOVAL_RETRY_MS", "50")];
+
+/// Fast relay re-registration and redials.
+const RELAY_FAST: [(&str, &str); 3] = [
+    ("VIA_RELAY_RETRY_FIRST_MS", "100"),
+    ("KEEP_RETRY_FIRST_MS", "100"),
+    ("KEEP_RETRY_MAX_MS", "500"),
+];
 
 /// A and B, paired both ways. The apps drop before their folders go.
 struct Both {
@@ -65,21 +79,39 @@ fn start_raw(
     app
 }
 
-/// Pair A and B both ways, with `env` on A.
-fn both_ways(tag: &str, env: &[(&str, &str)]) -> Both {
-    both_ways_holding(tag, env, None)
+/// A debug-build test hook on A.
+#[derive(Clone, Copy)]
+enum Hook<'a> {
+    None,
+    /// Hold at this point while [`hold_file`] exists.
+    Hold(&'a str),
+    /// Stop at this point, as a crash would.
+    Crash(&'a str),
 }
 
-/// [`both_ways`], A held at the test hook `hold` (if given) by the file
-/// [`hold_file`].
-fn both_ways_holding(tag: &str, env: &[(&str, &str)], hold: Option<&str>) -> Both {
+/// The variable and value that set `hook` on the helper of `end`.
+fn hook_var(end: &Endpoint, hook: Hook<'_>) -> Option<(&'static str, String)> {
+    match hook {
+        Hook::None => None,
+        Hook::Hold(point) => Some((
+            "MOUSSE_HELPER_TEST_HOLD",
+            format!("{point}={}", hold_file(end).display()),
+        )),
+        Hook::Crash(point) => Some(("MOUSSE_HELPER_TEST_CRASH", point.to_owned())),
+    }
+}
+
+/// Pair A and B both ways, with `env` on A.
+fn both_ways(tag: &str, env: &[(&str, &str)]) -> Both {
+    both_ways_hooked(tag, env, Hook::None)
+}
+
+/// [`both_ways`], with `hook` on A.
+fn both_ways_hooked(tag: &str, env: &[(&str, &str)], hook: Hook<'_>) -> Both {
     let a_end = Endpoint::init(&format!("{tag}a"));
     let b_end = Endpoint::init(&format!("{tag}b"));
-    let hold = hold.map(|point| format!("{point}={}", hold_file(&a_end).display()));
-    let raw: Vec<(&str, &Path)> = hold
-        .iter()
-        .map(|h| ("MOUSSE_HELPER_TEST_HOLD", Path::new(h)))
-        .collect();
+    let var = hook_var(&a_end, hook);
+    let raw: Vec<(&str, &Path)> = var.iter().map(|(k, v)| (*k, Path::new(v))).collect();
     let mut a = start_raw(&a_end, "hostA", env, 0, &raw);
     let mut b = start(&b_end, "peerB", &[], 0);
     let a_port = a.call("hello", json!({"proto": [1, 2]}))["port"]
@@ -156,6 +188,83 @@ fn caller_key_listed(dir: &Path, grant: u64) -> bool {
     file["keys"]
         .as_array()
         .is_some_and(|keys| keys.iter().any(|k| k["grant"] == grant))
+}
+
+/// Whether the relay file of A's grants keeps a recovery entry for `grant`.
+fn recovery_listed(dir: &Path, grant: u64) -> bool {
+    let Ok(bytes) = std::fs::read(dir.join("relay-grants.json")) else {
+        return false;
+    };
+    let file: Value = serde_json::from_slice(&bytes).unwrap();
+    file["recovery"]
+        .as_array()
+        .is_some_and(|entries| entries.iter().any(|r| r["grant"] == grant))
+}
+
+/// Host A on a relay, and B joined it through the relay only with its
+/// caller key held back (`MOUSSE_HELPER_TEST_NO_KEYS`): A keeps a
+/// recovery entry for B's grant. The apps drop before their folders and
+/// the relay.
+struct RelayOnly {
+    a: App,
+    _b: App,
+    a_end: Endpoint,
+    _b_end: Endpoint,
+    _relay: Relay,
+    grant: u64,
+}
+
+/// `uri`'s ticket with only its relay route.
+fn relay_only(uri: &str) -> String {
+    let fragment = uri.rsplit('#').next().unwrap();
+    let mut ticket = Ticket::from_fragment(fragment).unwrap();
+    ticket
+        .routes
+        .retain(|r| RelayRoute::parse_hint(r).is_some());
+    assert_eq!(ticket.routes.len(), 1, "{:?}", ticket.routes);
+    ticket.to_fragment()
+}
+
+/// [`RelayOnly`], with `hook` on A.
+fn relay_only_without_keys(tag: &str, hook: Hook<'_>) -> RelayOnly {
+    let relay = Relay::start();
+    let a_end = Endpoint::init(&format!("{tag}a"));
+    let b_end = Endpoint::init(&format!("{tag}b"));
+    let var = hook_var(&a_end, hook);
+    let raw: Vec<(&str, &Path)> = var.iter().map(|(k, v)| (*k, Path::new(v))).collect();
+    let mut a = start_raw(&a_end, "hostA", &RELAY_FAST, 0, &raw);
+    let reply = a.call("relay.enroll", json!({"link": relay.link()}));
+    assert_eq!(reply["relay"]["state"], "registered", "{reply}");
+    let no_keys = [("MOUSSE_HELPER_TEST_NO_KEYS", Path::new("1"))];
+    let mut b = start_raw(&b_end, "peerB", &RELAY_FAST, 0, &no_keys);
+    let invite = a.call("invite.create", json!({}));
+    let invitation = invite["invitation"].as_str().unwrap().to_owned();
+    let ticket = relay_only(invite["uri"].as_str().unwrap());
+    let id = b.start(
+        "join",
+        json!({"ticket": ticket, "pinned": true, "approved": [relay.destination()]}),
+    );
+    let approval = a.event("approval", |m| m["invitation"] == invitation.as_str());
+    a.call(
+        "approval.answer",
+        json!({"request": approval["request"], "yes": true}),
+    );
+    let join = b.reply(id);
+    assert!(join.get("error").is_none(), "{join}");
+    let enrolled = a.event("enrolled", |m| m["invitation"] == invitation.as_str());
+    let grant = enrolled["grant"].as_u64().unwrap();
+    until("A's recovery entry for B", || {
+        recovery_listed(&a_end.dir, grant)
+    });
+    assert!(!caller_key_listed(&a_end.dir, grant));
+    RelayOnly {
+        a,
+        _b: b,
+        a_end,
+        _b_end: b_end,
+        _relay: relay,
+        grant,
+    }
 }
 
 fn grant_of(app: &mut App, identity: &str) -> Option<Value> {
@@ -391,7 +500,7 @@ fn on_a_shared_connection_the_peers_calls_stop_and_this_computers_go_on() {
 /// answers a call of A's on the same connection after it. None of B's
 /// bytes on its call reach A's app after the reply.
 fn no_data_from_the_peers_call_after_the_reply(tag: &str, op: &str) {
-    let mut both = both_ways_holding(tag, &[], Some("served-reset"));
+    let mut both = both_ways_hooked(tag, &[], Hook::Hold("served-reset"));
     let a_to_b = both.a_to_b;
     let b_from_a = a_calls_b_on(&mut both, a_to_b, b"first");
     let open = both.b.open(b_from_a, "mousse.rpc", "interactive");
@@ -503,6 +612,95 @@ fn a_crash_before_the_save_keeps_the_peer_out() {
     assert_eq!(b_dials_a(&mut both)["why"], "not_authorized");
     assert_eq!(outbound_state(&mut both), kept);
     a_calls_b(&mut both, b"after the crash");
+}
+
+/// A stops right after it journaled the revocation, before the relay
+/// cleanup ran. After a restart, B's caller key is gone from A's relay
+/// file as well.
+#[test]
+fn a_crash_after_the_journal_leaves_no_caller_key() {
+    let mut both = both_ways_hooked("rl-jkey", &[], Hook::Crash("removal-journaled"));
+    let grant = both.grant;
+    both.a.start("grant.revoke_local", json!({"grant": grant}));
+    assert_eq!(both.a.exit_within(WAIT), Some(86), "{}", both.a.err());
+    assert!(caller_key_listed(&both.a_end.dir, grant));
+    both.a = start(&both.a_end, "hostA", &[], both.a_port);
+    until("A to drop the revoked grant's caller key", || {
+        !caller_key_listed(&both.a_end.dir, grant)
+    });
+}
+
+/// The same crash, for a grant whose caller key never came: after a
+/// restart its recovery entry is gone.
+#[test]
+fn a_crash_after_the_journal_leaves_no_recovery_entry() {
+    let mut ro = relay_only_without_keys("rl-jrec", Hook::Crash("removal-journaled"));
+    let grant = ro.grant;
+    ro.a.start("grant.revoke_local", json!({"grant": grant}));
+    assert_eq!(ro.a.exit_within(WAIT), Some(86), "{}", ro.a.err());
+    assert!(recovery_listed(&ro.a_end.dir, grant));
+    ro.a = start(&ro.a_end, "hostA", &RELAY_FAST, 0);
+    until("A to drop the revoked grant's recovery entry", || {
+        !recovery_listed(&ro.a_end.dir, grant)
+    });
+}
+
+/// The recovery entry of a revoked grant whose caller key never came goes
+/// with the grant.
+#[test]
+fn a_revoked_grants_recovery_entry_goes_though_its_caller_key_never_came() {
+    let mut ro = relay_only_without_keys("rl-rec", Hook::None);
+    let grant = ro.grant;
+    let reply = ro.a.call("grant.revoke_local", json!({"grant": grant}));
+    assert_eq!(reply["removed"], true, "{reply}");
+    until("A to drop the revoked grant's recovery entry", || {
+        !recovery_listed(&ro.a_end.dir, grant)
+    });
+}
+
+/// B pairs with A again, and its new grant replaces the old one. Revoking
+/// the old grant's id answers `removed: false` and leaves the new grant.
+#[test]
+fn revoking_a_replaced_grant_leaves_the_new_one() {
+    let mut both = both_ways("rl-old", &[]);
+    let old = both.grant;
+    let again = pair_apps(&mut both.a, &mut both.b);
+    let new = again.enrolled["grant"].as_u64().unwrap();
+    assert_ne!(new, old);
+    let b_identity = both.b.identity.clone();
+    let reply = both.a.call("grant.revoke_local", json!({"grant": old}));
+    assert_eq!(reply["removed"], false, "{reply}");
+    let grant = grant_of(&mut both.a, &b_identity).map(|g| g["grant"].clone());
+    assert_eq!(grant, Some(json!(new)), "the new grant went");
+    let dial = b_dials_a(&mut both);
+    assert!(dial.get("error").is_none(), "B cannot reach A: {dial}");
+}
+
+/// A reads B's caller-key request, and the grant it came on ends before
+/// A stores the key (held at `keys-grant-read`): no key is kept for it.
+#[test]
+fn a_caller_key_for_a_grant_that_ended_while_it_was_read_is_not_kept() {
+    let a_end = Endpoint::init("rl-keysa");
+    let b_end = Endpoint::init("rl-keysb");
+    let (k, v) = hook_var(&a_end, Hook::Hold("keys-grant-read")).unwrap();
+    let mut a = start_raw(&a_end, "hostA", &[], 0, &[(k, Path::new(&v))]);
+    let mut b = start(&b_end, "peerB", &[], 0);
+    let grant = pair_apps(&mut a, &mut b).enrolled["grant"]
+        .as_u64()
+        .unwrap();
+    until("A to read B's caller key request", || {
+        hold_file(&a_end).exists()
+    });
+    let reply = a.call("grant.revoke_local", json!({"grant": grant}));
+    assert_eq!(reply["removed"], true, "{reply}");
+    std::fs::remove_file(hold_file(&a_end)).unwrap();
+    until("A to answer B's caller key request", || {
+        a_end.log().contains("caller key from") || caller_key_listed(&a_end.dir, grant)
+    });
+    assert!(
+        !caller_key_listed(&a_end.dir, grant),
+        "a caller key was kept for a grant that had ended"
+    );
 }
 
 #[test]

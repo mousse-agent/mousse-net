@@ -10,10 +10,10 @@ plan = "docs/pairing-flow-design.md#61-ending-one-direction-grant_revoke_local"
 
 [[check]]
 id = "pairing-revoke.revoke-local"
-title = "A local revocation stops the peer's calls into this computer, also on a shared minor-3 connection, after a restart and through a failed save, while this computer keeps its own way to the peer"
+title = "A local revocation stops the peer's calls into this computer, also on a shared minor-3 connection, after a restart and through a failed save, while this computer keeps its own way to the peer; no data from the peer's calls reaches the app after the reply; no relay key or recovery entry of the grant outlives a crash or a race"
 plan = "docs/pairing-flow-design.md §6.1 and §11"
 targets = ["windows-x64", "macos-arm64", "linux-x64"]
-min_tests = 7
+min_tests = 14
 local = [
   { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_revoke_local", "--no-fail-fast"] },
   { target = "macos-arm64", host = "macos-aarch64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_revoke_local", "--no-fail-fast"] },

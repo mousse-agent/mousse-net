@@ -1332,7 +1332,8 @@ fn reset_unserved(shared: &Shared) {
     for (handle, writer) in unserved(shared, &core) {
         writer.reset(ErrorCode::GrantRevoked);
         drop_stream(&mut core, handle);
-        let event = json!({"ev": "stream.reset", "handle": handle, "code": ErrorCode::GrantRevoked.name()});
+        let event =
+            json!({"ev": "stream.reset", "handle": handle, "code": ErrorCode::GrantRevoked.name()});
         core.out.json(&event);
     }
     core.regrant(&shared.limits);

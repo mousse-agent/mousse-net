@@ -279,6 +279,7 @@ impl Removal {
         if !cfg!(mousse_control = "no-revoke-journal") {
             self.journal.add(grant.0).map_err(JournalFailed)?;
         }
+        crate::peer::crash_point("removal-journaled");
         let removed = self.host.remove_grant(grant);
         // In memory the grant is gone either way: relays hear it now.
         self.removed.send_modify(|n| *n += 1);
