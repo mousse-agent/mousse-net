@@ -78,9 +78,14 @@ use crate::engine::{Engine, ENGINE_PREFIX};
 use crate::limits::HelperLimits;
 use crate::revoke::Removal;
 
-/// The protocol this helper speaks: 1.1 (Phase 1b §7), which serves a 1.0
-/// app too.
-const PROTO: (u64, u64) = (1, 1);
+/// The protocol this helper speaks: 1.2 (`docs/pairing-flow-design.md` §1),
+/// which serves 1.1 and 1.0 apps too.
+const PROTO: (u64, u64) = (1, 2);
+
+/// What this helper implements beyond 1.1, listed in the `hello` reply of a
+/// 1.2 channel. An older helper ignores a field it does not know, so an app
+/// reads this list before it sends one.
+pub const FEATURES: &[&str] = &[];
 
 /// The stream labels an inbound connection passes on to the app (§3.2).
 pub const LABELS: [&str; 6] = [
@@ -962,9 +967,10 @@ impl Shared {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        json!({
+        let agreed = minor.min(PROTO.1);
+        let mut reply = json!({
             "re": id,
-            "proto": [PROTO.0, minor.min(PROTO.1)],
+            "proto": [PROTO.0, agreed],
             "build": crate::BUILD,
             "identity": hex(self.info.identity.as_bytes()),
             "device": short_id(&self.info.identity),
@@ -974,7 +980,12 @@ impl Shared {
             "routes_config": listen.config,
             "unbound": listen.unbound,
             "paused": self.removal.paused_reason(),
-        })
+        });
+        // Only a 1.2 app reads the list; 1.1 and 1.0 replies stay as they were.
+        if agreed >= 2 {
+            reply["features"] = json!(FEATURES);
+        }
+        reply
     }
 
     fn has(&self, handle: u32) -> bool {

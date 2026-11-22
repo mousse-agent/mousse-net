@@ -968,17 +968,19 @@ fn an_unacknowledged_completion_record_goes_after_its_time() {
 }
 
 #[test]
-fn the_helper_speaks_1_1_and_still_serves_1_0() {
+fn the_helper_speaks_1_2_and_still_serves_1_1_and_1_0() {
     let end = Endpoint::init("lk-proto");
     let mut app = end.app("hostA", &[]);
-    assert_eq!(
-        app.call("hello", json!({"proto": [1, 0]}))["proto"],
-        json!([1, 0])
-    );
-    assert_eq!(
-        app.call("hello", json!({"proto": [1, 1]}))["proto"],
-        json!([1, 1])
-    );
+    // An older app gets its own minor and no feature list.
+    for minor in [0, 1] {
+        let hello = app.call("hello", json!({"proto": [1, minor]}));
+        assert_eq!(hello["proto"], json!([1, minor]));
+        assert!(hello.get("features").is_none(), "{hello}");
+    }
+    // A 1.2 app gets the list of what this helper implements beyond 1.1.
+    let hello = app.call("hello", json!({"proto": [1, 2]}));
+    assert_eq!(hello["proto"], json!([1, 2]));
+    assert!(hello["features"].is_array(), "{hello}");
 }
 
 #[test]
