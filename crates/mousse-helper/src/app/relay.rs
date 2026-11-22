@@ -1415,7 +1415,7 @@ pub async fn ensure_keys(shared: &Arc<Shared>, conn: &Connection) {
         return failed("malformed answer".into());
     };
     let secret = Zeroizing::new(secret);
-    let new = !had.is_some_and(|h| *h == *secret);
+    let new = had.is_none_or(|h| *h != *secret);
     let sealed = if new {
         match seal_secret(shared, &pin, SEALED_PAIR_SECRET, &secret) {
             Ok(sealed) => Some(sealed),
@@ -1426,6 +1426,8 @@ pub async fn ensure_keys(shared: &Arc<Shared>, conn: &Connection) {
     };
     // The secret is for `pairing`: a tag from it or before it is done
     // with, one from a newer pairing stays until that one's keys come.
+    // A slow exchange of an older pairing never overwrites the secret a
+    // newer pairing already stored.
     let stored = (|| -> Result<bool, String> {
         peer_entry(shared, &pin)?;
         let key = hex(pin.as_bytes());
@@ -1433,26 +1435,30 @@ pub async fn ensure_keys(shared: &Arc<Shared>, conn: &Connection) {
         let mut file = shared.relay.files.peers()?;
         let p = entry_mut(&mut file, &key);
         let before = p.clone();
-        if let Some(sealed) = sealed {
-            p.pair_secret = Some(sealed);
-        }
+        let current = pairing >= p.keys_pairing;
+        let wrote = match sealed {
+            Some(sealed) if current => {
+                p.pair_secret = Some(sealed);
+                true
+            }
+            _ => false,
+        };
         p.keys_pairing = p.keys_pairing.max(pairing);
         if p.tag_pairing <= p.keys_pairing {
             p.join_tag = None;
         }
-        if *p == before {
-            return Ok(false);
+        if *p != before {
+            shared.relay.files.save_peers(file)?;
         }
-        shared.relay.files.save_peers(file)?;
-        Ok(true)
+        Ok(wrote)
     })();
     match stored {
         Err(e) => failed(e),
-        Ok(_) if new => {
+        Ok(true) => {
             applog::line(format!("caller key enrolled with {}", short_id(&pin)));
             shared.event(json!({"ev": "peer.keys", "identity": hex(pin.as_bytes())}));
         }
-        Ok(_) => {}
+        Ok(false) => {}
     }
 }
 
@@ -1785,7 +1791,11 @@ pub async fn dial_route(
     for addr in addrs {
         let called = dial_call(&addr, route.relay, route.handle, &key, class, dial_within()).await;
         let pipe = match (called, &join_tag) {
-            (Err(RelayError::Unreachable), Some(tag)) if class == Class::Interactive => {
+            // A refusal the relay delays past our dial limit ends in a
+            // timeout, so that falls back to the tag too.
+            (Err(RelayError::Unreachable | RelayError::Timeout), Some(tag))
+                if class == Class::Interactive =>
+            {
                 dial_join(&addr, route.relay, route.handle, **tag, dial_within()).await
             }
             (called, _) => called,
@@ -1926,8 +1936,8 @@ pub fn seal_join_tag(shared: &Shared, ticket: &Ticket) -> Result<String, String>
 /// one that found this device paired already. The ticket's relay hints
 /// the owner approved, and their approvals, are kept with the host, even
 /// when the join went another way. A new pairing (`paired`) takes the
-/// next number on the host's relay entry, so no older link record's tag
-/// replaces its own. When it went through a relay (`via`), the sealed tag
+/// next number on the host's relay entry, above its link records not
+/// replayed yet, so no older link record's tag replaces its own. When it went through a relay (`via`), the sealed tag
 /// is kept until the host answers `mousse-keys` for it, also when the pair
 /// secret stored is from an earlier pairing.
 pub fn after_join(
@@ -1943,6 +1953,15 @@ pub fn after_join(
     let kept = (|| -> Result<(), String> {
         let peers = PeerStore::in_dir(&shared.info.state_dir);
         let held = peers.lock().map_err(|e| e.to_string())?;
+        // A link record not replayed yet may hold a number above the
+        // entry's, also one taken in this same second.
+        let recorded = if paired {
+            recorded_pairing(shared, &held, &key)
+                .map_err(|e| e.to_string())?
+                .unwrap_or(0)
+        } else {
+            0
+        };
         {
             let _io = guard(&shared.relay.io);
             let mut file = shared.relay.files.peers()?;
@@ -1954,6 +1973,7 @@ pub fn after_join(
                 }
             }
             if paired {
+                p.pairing = p.pairing.max(recorded);
                 p.pairing = p.next_pairing(now());
             }
             if let (Some(_), Some(sealed)) = (via, sealed) {
@@ -1989,8 +2009,10 @@ pub fn after_join(
 /// ticket's relay routes the owner approved (pairing-flow design §9): the
 /// hints, their destinations and the ticket's tag, `sealed` for this
 /// endpoint ([`seal_join_tag`]). The pairing's number and the tag's
-/// expiry are filled in once it paired ([`prepare_completion`]). `None`
-/// when no relay route was approved.
+/// expiry are filled in once it paired ([`prepare_completion`]). A join
+/// with no relay route approved gets one too, with no routes and no tag,
+/// so every link pairing takes a number: a newer pairing of any kind ends
+/// the tag of an older one whose record is not replayed yet.
 pub fn completion_relay(
     ticket: &Ticket,
     approved: &[String],
@@ -2002,8 +2024,10 @@ pub fn completion_relay(
         return None;
     }
     let candidates = join_candidates(ticket, approved);
-    let (_, tag) = candidates.first()?;
     let mut relay = CompletionRelay::default();
+    let Some((_, tag)) = candidates.first() else {
+        return Some(relay);
+    };
     for (route, _) in &candidates {
         let hint = route.to_hint();
         if !relay.routes.contains(&hint) {
@@ -2025,19 +2049,19 @@ pub fn completion_relay(
 
 /// The newest pairing number in the host `identity`'s (hex) completion
 /// records: one a failed write has not replayed yet is above the number
-/// on its relay entry. Under the peers lock `_held`.
+/// on its relay entry. `None` when no record of the host has a relay part.
+/// Under the peers lock `_held`.
 fn recorded_pairing(
     shared: &Shared,
     _held: &PeersLock<'_>,
     identity: &str,
-) -> Result<u64, NetError> {
+) -> Result<Option<u64>, NetError> {
     Ok(CompletionStore::in_dir(&shared.info.state_dir)
         .list()?
         .iter()
         .filter(|(_, r)| r.host_identity == identity)
         .filter_map(|(_, r)| r.relay.as_ref().map(|relay| relay.pairing))
-        .max()
-        .unwrap_or(0))
+        .max())
 }
 
 /// A link join paired at `at` (Unix seconds, the PAIRED time), under the
@@ -2071,7 +2095,9 @@ pub fn prepare_completion(
             .and_then(|file| file.peers.into_iter().find(|p| p.identity == key))
             .unwrap_or_default()
     };
-    let newest = entry.pairing.max(recorded_pairing(shared, held, &key)?);
+    let newest = entry
+        .pairing
+        .max(recorded_pairing(shared, held, &key)?.unwrap_or(0));
     let limits = limits();
     relay.pairing = PeerRelay {
         pairing: newest,
@@ -2090,17 +2116,18 @@ pub fn prepare_completion(
 /// The host `identity` (hex) lost its grant here, which drops its
 /// completion records (Phase 1b §1.3): the pairings numbered so far end,
 /// also one only a record holds, so a record of one restores no relay
-/// writes, also one a failed delete left behind. Under the peers lock
-/// `held`.
+/// writes, also one a failed delete left behind. The end is at least 1, so
+/// a record from before pairing numbers (number 0) ends too. Under the
+/// peers lock `held`.
 pub fn end_pairings(shared: &Shared, held: &PeersLock<'_>, identity: &str) -> Result<(), NetError> {
     let recorded = recorded_pairing(shared, held, identity)?;
     let _io = guard(&shared.relay.io);
     let mut file = shared.relay.files.peers().map_err(NetError::Store)?;
-    if recorded == 0 && !file.peers.iter().any(|p| p.identity == identity) {
+    if recorded.is_none() && !file.peers.iter().any(|p| p.identity == identity) {
         return Ok(());
     }
     let p = entry_mut(&mut file, identity);
-    let ended = p.pairing.max(recorded);
+    let ended = p.pairing.max(recorded.unwrap_or(0)).max(1);
     if p.ended == ended {
         return Ok(());
     }
