@@ -254,6 +254,11 @@ struct Core {
     /// reads it before it starts and publishes its path only if it has not
     /// changed, so no path to a forgotten peer comes up after the forget.
     peer_gen: HashMap<IdentityPublicKey, u64>,
+    /// Per peer, how often a join to it was made void: by `peer.forget`,
+    /// or by a removal of its grant here, which keeps the peer and its
+    /// paths. A join reads it before it starts and stores the peer only if
+    /// it has not changed, checked under the peers lock.
+    join_gen: HashMap<IdentityPublicKey, u64>,
 }
 
 /// Why a connection that finished opening was closed instead of published.
@@ -326,6 +331,7 @@ impl App {
                 peak_buffered: 0,
                 ending: None,
                 peer_gen: HashMap::new(),
+                join_gen: HashMap::new(),
             }),
             wake_writer: Notify::new(),
             ended,
@@ -502,6 +508,11 @@ impl Shared {
     /// The generation of `pin` (see `Core::peer_gen`).
     fn peer_gen(&self, pin: &IdentityPublicKey) -> u64 {
         lock(&self.core).peer_gen.get(pin).copied().unwrap_or(0)
+    }
+
+    /// The join generation of `pin` (see `Core::join_gen`).
+    fn join_gen(&self, pin: &IdentityPublicKey) -> u64 {
+        lock(&self.core).join_gen.get(pin).copied().unwrap_or(0)
     }
 
     /// Publish an outbound path to a peer whose generation was `gen` when

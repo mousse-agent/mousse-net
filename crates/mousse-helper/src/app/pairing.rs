@@ -487,8 +487,11 @@ async fn join(
     // removal of its grant here) wins: the join stores nothing, or what it
     // stored goes with the removal.
     let pin = ticket.host_identity;
+    // The path it opens is closed by a `peer.forget` only; a removal of the
+    // grant here keeps the peer's paths but voids the join.
     let gen = shared.peer_gen(&pin);
-    let wanted = || shared.peer_gen(&pin) == gen;
+    let joins = shared.join_gen(&pin);
+    let wanted = || shared.join_gen(&pin) == joins;
     let result = if candidates.is_empty() && usable.len() < relays.len() {
         Err(crate::peer::Failure {
             text: "the ticket's relay routes need its tag stored sealed, and sealing it failed"
@@ -791,16 +794,17 @@ fn store_ticket_approvals(shared: &Shared, ticket: &Ticket, approved: &[String])
 }
 
 /// The host `identity` lost its grant here: no completion record may bring
-/// it back (Phase 1b §5.4). Under the peers lock: the generation a join
-/// checks before it stores the host advances, so a join that has not
+/// it back (Phase 1b §5.4). Under the peers lock: the join generation a
+/// join checks before it stores the host advances, so a join that has not
 /// stored its record yet stores nothing; the host's pairings end on its
 /// relay entry, so a record a failed delete leaves restores no relay
-/// writes; and its records are deleted.
+/// writes; and its records are deleted. The peer stays paired, so its
+/// paths, their dials and renewals (`Core::peer_gen`) are left alone.
 fn forget_completions(shared: &Shared, identity: &str) -> Result<(), NetError> {
     let peers = peers(shared);
     let held = peers.lock()?;
     if let Ok(pin) = identity_from_hex(identity) {
-        *super::lock(&shared.core).peer_gen.entry(pin).or_default() += 1;
+        *super::lock(&shared.core).join_gen.entry(pin).or_default() += 1;
     }
     let ended = super::relay::end_pairings(shared, &held, identity);
     let removed = crate::peer::drop_completions(&shared.info.state_dir, &held, identity);
@@ -955,10 +959,11 @@ fn forget_peer(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
         })?;
         // Under the peers lock, which a join checks the generation under
         // before it stores the host: it stores before this or not at all.
-        *super::lock(&shared.core)
-            .peer_gen
-            .entry(identity)
-            .or_default() += 1;
+        {
+            let mut core = super::lock(&shared.core);
+            *core.peer_gen.entry(identity).or_default() += 1;
+            *core.join_gen.entry(identity).or_default() += 1;
+        }
         crate::peer::drop_completions(&shared.info.state_dir, &held, &key)
     });
     match updated {
