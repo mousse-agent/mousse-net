@@ -153,6 +153,10 @@ mousse_net_core::define_limits! {
         pipe_connect_wait_ms = "PIPE_CONNECT_WAIT_MS": 2_000, [100, 60_000];
         /// App mode: how long a "Send link" completion record the app never acknowledged (`join.ack`) is kept after its ticket expired (Phase 1b §5.4).
         join_done_keep_secs = "JOIN_DONE_KEEP_SECS": 86_400, [0, 2_592_000];
+        /// App mode: one `join.probe`, every route it tries included, under one deadline (`docs/pairing-flow-design.md` §5; tighten only).
+        join_probe_ms = "JOIN_PROBE_MS": 10_000, [500, 10_000];
+        /// App mode: `join.probe`s running at once on one channel; another is `busy` (tighten only).
+        join_probes_max = "JOIN_PROBES_MAX": 2, [1, 2];
         /// Checks only: how long `init` waits before it makes the endpoint, so a check can stop the app during the first start. Run for the app (`--app`), its stdin closing still ends it at once.
         init_hold_ms = "INIT_HOLD_MS": 0, [0, 60_000];
         /// Through a relay: connect, outer TLS, upgrade, `CALL` or `JOIN`, the splice and step 1, for one try; above the relay's refusal deadline (Phase 3 §B.6).

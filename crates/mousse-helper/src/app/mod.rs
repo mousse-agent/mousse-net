@@ -86,7 +86,13 @@ const PROTO: (u64, u64) = (1, 2);
 /// What this helper implements beyond 1.1, listed in the `hello` reply of a
 /// 1.2 channel. An older helper ignores a field it does not know, so an app
 /// reads this list before it sends one.
-pub const FEATURES: &[&str] = &[GRANT_ROLES, GRANT_ADD_CONNECTED];
+pub const FEATURES: &[&str] = &[
+    "invite-way",
+    "route-readiness",
+    "join-probe",
+    GRANT_ROLES,
+    GRANT_ADD_CONNECTED,
+];
 
 /// The feature an app lists in its hello `features` to take streams of
 /// grants whose role is not `owner`.
