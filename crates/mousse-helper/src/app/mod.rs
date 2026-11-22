@@ -85,7 +85,7 @@ const PROTO: (u64, u64) = (1, 2);
 /// What this helper implements beyond 1.1, listed in the `hello` reply of a
 /// 1.2 channel. An older helper ignores a field it does not know, so an app
 /// reads this list before it sends one.
-pub const FEATURES: &[&str] = &[];
+pub const FEATURES: &[&str] = &["invite-way"];
 
 /// The stream labels an inbound connection passes on to the app (§3.2).
 pub const LABELS: [&str; 6] = [

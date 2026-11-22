@@ -79,6 +79,10 @@ pub struct ListenState {
     pub port: u16,
     /// The addresses bound now.
     pub bound: Vec<IpAddr>,
+    /// `--listen-ip` when no `routes.json` chose the addresses: the
+    /// listener then serves what [`route_hints`] lists for it, whatever
+    /// `config.lan` says.
+    pub listen_ip: Option<IpAddr>,
     /// Tunnels given on the command line (`--tunnel`), advertised besides
     /// the config's.
     pub extra: Vec<String>,
@@ -380,6 +384,7 @@ pub async fn run(
         config: config.clone(),
         port,
         bound: bound.clone(),
+        listen_ip: stored.is_none().then_some(opts.listen_ip),
         extra,
     }));
     // The loopback ws listener, for the owner's tunnel client (§4.1).
