@@ -5,8 +5,15 @@
 //!
 //! Helpers run `serve --app` on loopback. Crashes use the debug-build hook
 //! `MOUSSE_HELPER_TEST_CRASH`, which stops the helper at a named point.
+//!
+//! A removal of the host wins over the relay part of a completion record
+//! too (pairing-flow design §9): nothing of it is restored afterwards.
 
 mod common;
+#[path = "common/relay.rs"]
+mod relay_fixture;
+#[path = "common/relay_link.rs"]
+mod relay_link;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -857,6 +864,65 @@ fn a_host_removed_before_the_join_stores_it_stays_removed() {
 #[test]
 fn a_host_removed_while_the_join_stores_it_keeps_no_path() {
     removed_during_the_join("lk-rm-late", "link-done-saved");
+}
+
+/// Nothing of B is kept for the relay: no relay entry, no approval.
+fn no_relay_path_to(a: &App, host: &relay_link::RelayHost) {
+    let b_id = host.b.identity.as_str();
+    let entry = relay_link::relay_peer(&a.dir, b_id);
+    assert_eq!(
+        entry,
+        Value::Null,
+        "a removed host's relay entry came back: {entry}"
+    );
+    let kept = relay_link::approvals(&a.dir);
+    assert!(
+        kept.iter().all(|x| x["identity"] != b_id),
+        "a removed host's approval came back: {kept:?}"
+    );
+}
+
+#[test]
+fn a_relay_link_replay_after_the_host_was_removed_restores_nothing() {
+    let mut host = relay_link::RelayHost::start("lk-rforget");
+    let ae = Endpoint::init("lk-rforget-a");
+    let link = host.join_crashing(&ae, "link-done-saved");
+    let mut a = host.joiner(&ae, &[], &[]);
+    let identity = host.b.identity.clone();
+    a.call("peer.forget", json!({"identity": identity}));
+    let s = relay_link::status(&mut a, &link);
+    assert_eq!(s["done"], Value::Null, "a removed host came back: {s}");
+    assert_eq!(peer_of(&mut a, &identity), Value::Null);
+    no_relay_path_to(&a, &host);
+}
+
+/// The host is removed once a relay-only link join stored it and before
+/// the join reports it: the removal takes the relay route, its approval
+/// and the tag too, and the join does not bring them back.
+#[test]
+fn a_host_removed_as_a_relay_link_join_ends_keeps_no_relay_path() {
+    let mut host = relay_link::RelayHost::start("lk-rjoined");
+    let ae = Endpoint::init("lk-rjoined-a");
+    let held = ae.dir.join("held");
+    let hold = format!("link-joined={}", held.display());
+    let mut a = host.joiner(&ae, &[], &[("MOUSSE_HELPER_TEST_HOLD", Path::new(&hold))]);
+    let link = host.link();
+    let id = host.join(&mut a, &link);
+    let until = std::time::Instant::now() + WAIT;
+    while !held.exists() {
+        assert!(std::time::Instant::now() < until, "the join never held");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let identity = host.b.identity.clone();
+    let gone = a.call("peer.forget", json!({"identity": identity}));
+    assert_eq!(gone["forgotten"], true, "{gone}");
+    std::fs::remove_file(&held).unwrap();
+    let reply = a.reply(id);
+    assert_eq!(reply["error"], "forgotten", "{reply}");
+    assert_eq!(peer_of(&mut a, &identity), Value::Null);
+    no_relay_path_to(&a, &host);
+    let s = relay_link::status(&mut a, &link);
+    assert_eq!(s["done"], Value::Null, "{s}");
 }
 
 #[test]
