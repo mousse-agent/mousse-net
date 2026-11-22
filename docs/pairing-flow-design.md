@@ -329,6 +329,24 @@ already}`
 - The grant is saved before the reply.
 - Errors: `bad_request`, `no_conn`, `paused`, `refused`, `store_failed`.
 
+**As built (pull request 5).**
+
+- Every field is required, and a request with any other field (an
+  `identity`, a `receipt`) is `bad_request`.
+- The lookup and the commit hold the app channel's core lock, which
+  `conn.down`, `peer.forget` and the removal pause take too. A connection
+  counts as live when its status is live and, for an outbound one,
+  `peer.forget` has not removed its peer since it was published: each
+  connection entry keeps the forget count it was published under (a field
+  added in `app/mod.rs`). Revocation and denial are decided inside the
+  commit, under the host's lock.
+- On an inbound connection the peer can only be live under a grant of this
+  computer; that grant is the reply (`already: true`). If the connection is
+  no longer live under a grant, the reply is `no_conn`.
+- A save that fails after the grant was added in memory is `store_failed`,
+  as for `grant.add`: the grant stays in effect, and repeating the request
+  saves it.
+
 After Allow the new direction uses the existing connection on minor 3. A
 computer that was granted access and has no route of its own to dial reads
 "available when the other computer connects".

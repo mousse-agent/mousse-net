@@ -28,3 +28,20 @@ control = [
   { name = "demoted-owner-keeps-grants", breaks = "a peer demoted from owner keeps its mousse-grants stream and its signer standing", env = { RUSTFLAGS = '--cfg mousse_control="demoted-owner-keeps-grants"' } },
   { name = "restricted-store-readable-by-old-helper", breaks = "the store version is not raised for a non-owner grant, so an older helper reads it as owner", env = { RUSTFLAGS = '--cfg mousse_control="restricted-store-readable-by-old-helper"' } },
 ]
+
+[[check]]
+id = "pairing-roles.grant-connected"
+title = "grant.add_connected grants the authenticated peer of a live connection of the channel: never a connection that closed meanwhile, never an identity the request names, never a denied identity, and an existing grant comes back with its own role"
+plan = "docs/pairing-flow-design.md §7 and §11"
+targets = ["windows-x64", "macos-arm64", "linux-x64"]
+min_tests = 7
+local = [
+  { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_grant_connected", "--no-fail-fast"] },
+  { target = "macos-arm64", host = "macos-aarch64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_grant_connected", "--no-fail-fast"] },
+  { target = "linux-x64", host = "linux-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_grant_connected", "--no-fail-fast"] },
+]
+control = [
+  { name = "grant-from-stale-connection", breaks = "a connection that is closing still grants its peer", env = { RUSTFLAGS = '--cfg mousse_control="grant-from-stale-connection"' } },
+  { name = "connected-grant-upgrades-existing", breaks = "an existing grant is widened to the role the request names", env = { RUSTFLAGS = '--cfg mousse_control="connected-grant-upgrades-existing"' } },
+  { name = "connected-grant-trusts-request-identity", breaks = "the identity is read from the request instead of the connection", env = { RUSTFLAGS = '--cfg mousse_control="connected-grant-trusts-request-identity"' } },
+]

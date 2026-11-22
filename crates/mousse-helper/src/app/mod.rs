@@ -85,11 +85,15 @@ const PROTO: (u64, u64) = (1, 2);
 /// What this helper implements beyond 1.1, listed in the `hello` reply of a
 /// 1.2 channel. An older helper ignores a field it does not know, so an app
 /// reads this list before it sends one.
-pub const FEATURES: &[&str] = &[GRANT_ROLES];
+pub const FEATURES: &[&str] = &[GRANT_ROLES, GRANT_ADD_CONNECTED];
 
 /// The feature an app lists in its hello `features` to take streams of
 /// grants whose role is not `owner`.
 const GRANT_ROLES: &str = "grant-roles";
+
+/// `grant.add_connected`: grant the peer of a live connection by the
+/// identity that connection authenticated (`pairing/connected.rs`).
+const GRANT_ADD_CONNECTED: &str = "grant-add-connected";
 
 /// The stream labels an inbound connection passes on to the app (§3.2).
 pub const LABELS: [&str; 6] = [
@@ -210,6 +214,9 @@ struct ConnEntry {
     caller_opened: bool,
     /// Outbound through a relay: the route, for its bulk companion.
     via: Option<mousse_net_core::relay_endpoint::RelayRoute>,
+    /// How often `peer.forget` had removed the peer when this was published
+    /// ([`Core::peer_gen`]): once it differs, the path is closing.
+    gen: u64,
 }
 
 struct StreamEntry {
@@ -570,6 +577,7 @@ impl Shared {
             let conn = Arc::new(conn);
             let no = core.next_conn;
             core.next_conn += 1;
+            let gen = core.peer_gen.get(&identity).copied().unwrap_or(0);
             core.conns.insert(
                 no,
                 ConnEntry {
@@ -579,6 +587,7 @@ impl Shared {
                     reopen,
                     caller_opened: false,
                     via: None,
+                    gen,
                 },
             );
             fields["ev"] = json!("conn.up");

@@ -26,6 +26,9 @@
 //!   `grant.remove` (journaled, see [`crate::revoke`]); events
 //!   `grant.closed`, `grant.role_changed`, `store.failed`, `net.paused`
 //!   and `net.resumed`.
+//! - **Asked for access:** `grant.add_connected {conn, name, role}` grants
+//!   the peer of one of this channel's live connections, by the identity
+//!   that connection authenticated (see [`connected`]).
 //! - **Peers:** `peers.list`, `peer.add` (idempotent), `peer.forget`,
 //!   `peer.addresses.set`, `approvals.list`, and `dial`, whose `conn.up`
 //!   carries the role the peer gave this device and the route it came up on
@@ -53,10 +56,11 @@ use crate::applog;
 use crate::peer::{JoinRoute, JoinedVia};
 use crate::revoke::Removed;
 
+mod connected;
 mod roles;
 
 /// The requests this module answers.
-pub const OPS: [&str; 19] = [
+pub const OPS: [&str; 20] = [
     "config.set",
     "invite.create",
     "invite.cancel",
@@ -74,6 +78,7 @@ pub const OPS: [&str; 19] = [
     "peer.add",
     "peer.forget",
     "peer.addresses.set",
+    "grant.add_connected",
     "dial",
     "approvals.list",
 ];
@@ -236,6 +241,7 @@ pub fn on_request(shared: &Arc<Shared>, id: Value, op: &str, map: &Map<String, V
         "peer.add" => add_peer(shared, &id, map),
         "peer.forget" => forget_peer(shared, &id, map),
         "peer.addresses.set" => super::paths::set_addresses(shared, &id, map),
+        "grant.add_connected" => connected::add_connected(shared, &id, map),
         "dial" => match str_field(map, "identity") {
             Some(_) if shared.removal.is_paused() => paused(shared, &id),
             Some(identity) => {
