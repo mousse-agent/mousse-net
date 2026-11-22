@@ -244,7 +244,7 @@ fn dial_within() -> Duration {
 /// route only public or tailnet (§B.11), so a host's ticket or manifest
 /// cannot point its callers at their LAN. Debug builds also take loopback,
 /// for tests on one computer.
-fn relay_class_ok(class: AddrClass, own: bool, loopback: bool) -> bool {
+pub(super) fn relay_class_ok(class: AddrClass, own: bool, loopback: bool) -> bool {
     match class {
         AddrClass::Forbidden => false,
         AddrClass::Public | AddrClass::Tailnet => true,
@@ -882,9 +882,14 @@ fn recovery_allows(shared: &Shared, conn: &Connection) -> bool {
 /// Caller keys of live grants, oldest grant first, capped at 256; then the
 /// fingerprints past the cap (for the "limit 256" note).
 fn listed_callers(shared: &Shared) -> (Vec<(u64, [u8; 32])>, Vec<u64>) {
+    let keys = shared.relay.files.grants().unwrap_or_default().keys;
+    listed_callers_in(shared, &keys)
+}
+
+/// [`listed_callers`] with the caller keys given.
+fn listed_callers_in(shared: &Shared, keys: &[GrantKey]) -> (Vec<(u64, [u8; 32])>, Vec<u64>) {
     let mut grants = shared.host.grants();
     grants.sort_by_key(|g| g.id.0);
-    let keys = shared.relay.files.grants().unwrap_or_default().keys;
     let mut listed = Vec::new();
     let mut over = Vec::new();
     for g in grants {
@@ -931,25 +936,38 @@ fn compute_allow(shared: &Shared) -> AllowSet {
             expires_at: i.expires_at,
         })
         .collect();
-    if !cfg!(mousse_control = "no-pairing-recovery") {
-        let grants: HashSet<u64> = shared.host.grants().iter().map(|g| g.id.0).collect();
-        let keyed: HashSet<u64> = listed.iter().map(|(g, _)| *g).collect();
-        for r in shared.relay.files.grants().unwrap_or_default().recovery {
-            if r.expires_at > t && grants.contains(&r.grant) && !keyed.contains(&r.grant) {
-                if let Some(tag_hash) = fixed::<32>(&r.tag_hash) {
-                    invitations.push(InvitationEntry {
-                        tag_hash,
-                        expires_at: r.expires_at,
-                    });
-                }
-            }
-        }
-    }
+    let recovery = shared.relay.files.grants().unwrap_or_default().recovery;
+    invitations.extend(recovery_entries(shared, &recovery, &listed, t));
     invitations.truncate(ALLOW_INVITATIONS_MAX);
     AllowSet {
         callers: listed.into_iter().map(|(_, fp)| fp).collect(),
         invitations,
     }
+}
+
+/// The recovery entries the allow-set lists at `t`: unexpired, of a live
+/// grant that has no caller key listed yet (§B.7).
+fn recovery_entries(
+    shared: &Shared,
+    recovery: &[Recovery],
+    listed: &[(u64, [u8; 32])],
+    t: u64,
+) -> Vec<InvitationEntry> {
+    if cfg!(mousse_control = "no-pairing-recovery") {
+        return Vec::new();
+    }
+    let grants: HashSet<u64> = shared.host.grants().iter().map(|g| g.id.0).collect();
+    let keyed: HashSet<u64> = listed.iter().map(|(g, _)| *g).collect();
+    recovery
+        .iter()
+        .filter(|r| r.expires_at > t && grants.contains(&r.grant) && !keyed.contains(&r.grant))
+        .filter_map(|r| {
+            Some(InvitationEntry {
+                tag_hash: fixed::<32>(&r.tag_hash)?,
+                expires_at: r.expires_at,
+            })
+        })
+        .collect()
 }
 
 /// Push the allow-set to every own relay if it changed.
@@ -997,13 +1015,28 @@ fn prune_keys(shared: &Shared) {
 // ---------------------------------------------------------------------------
 // Invitations
 
-/// The `relay://` hints of this computer's registered relays, for tickets.
+/// The `relay://` hints of this computer's registered relays, for tickets;
+/// none when `relays.json` cannot be read (the 1.1 invitation path).
 pub fn ticket_hints(shared: &Shared) -> Vec<String> {
-    let Ok(file) = shared.relay.files.relays() else {
-        return Vec::new();
-    };
+    own_relay_hints(shared).map(|o| o.hints).unwrap_or_default()
+}
+
+/// This computer's own relays as a way to offer (`docs/pairing-flow-design.md`
+/// §2 and §3).
+pub struct OwnRelayHints {
+    /// Relays set (`relay.enroll`), registered or not.
+    pub configured: usize,
+    /// The hints of the registered ones, in `relays.json` order.
+    pub hints: Vec<String>,
+}
+
+/// [`ticket_hints`], with how many relays are set, or why `relays.json`
+/// could not be read.
+pub fn own_relay_hints(shared: &Shared) -> Result<OwnRelayHints, String> {
+    let file = shared.relay.files.relays()?;
     let st = guard(&shared.relay.status);
-    file.relays
+    let hints = file
+        .relays
         .iter()
         .filter(|r| st.get(&r.relay).is_some_and(|s| s.state == "registered"))
         .filter_map(|r| {
@@ -1019,24 +1052,89 @@ pub fn ticket_hints(shared: &Shared) -> Vec<String> {
                 .to_hint(),
             )
         })
-        .collect()
+        .collect();
+    Ok(OwnRelayHints {
+        configured: file.relays.len(),
+        hints,
+    })
 }
 
-/// A new invitation whose ticket carries a relay hint: list its tag.
-pub fn on_invite(shared: &Shared, ticket: &Ticket) {
+/// Why a relay invitation was not made ([`invite_with_slot`]).
+pub enum SlotRefused {
+    /// Every allow-set invitation slot is held by an open invitation or a
+    /// recovery entry.
+    Full,
+    /// The relay state could not be read.
+    Store(String),
+    /// Making the invitation failed.
+    Create(NetError),
+}
+
+/// Allow-set invitation slots in use: open invitations that carry a relay
+/// hint, and recovery entries (§B.7), as [`compute_allow`] lists them
+/// before its cap.
+fn slots_in_use(shared: &Shared, open: &[OpenInvite]) -> Result<usize, String> {
+    let file = shared.relay.files.grants()?;
+    let (listed, _) = listed_callers_in(shared, &file.keys);
+    let t = now();
+    let invitations = open.iter().filter(|i| i.expires_at > t).count();
+    Ok(invitations + recovery_entries(shared, &file.recovery, &listed, t).len())
+}
+
+/// Whether an allow-set slot is free for a new relay invitation now.
+pub fn slot_free(shared: &Shared) -> Result<bool, String> {
+    let open = guard(&shared.relay.invites);
+    Ok(slots_in_use(shared, &open)? < ALLOW_INVITATIONS_MAX)
+}
+
+/// Make a relay invitation with `create` in a free allow-set slot. The
+/// check, the invitation and its listing happen under one lock, so two
+/// requests for the last slot cannot both get it, and a new invitation
+/// never displaces an open one or a recovery entry. Nothing is listed when
+/// `create` fails.
+pub fn invite_with_slot(
+    shared: &Shared,
+    create: impl FnOnce() -> Result<mousse_net_core::pairing::CreatedInvitation, NetError>,
+) -> Result<mousse_net_core::pairing::CreatedInvitation, SlotRefused> {
+    let mut open = guard(&shared.relay.invites);
+    let used = slots_in_use(shared, &open).map_err(SlotRefused::Store)?;
+    // Must-fail control: the new invitation takes a slot in use.
+    if used >= ALLOW_INVITATIONS_MAX && !cfg!(mousse_control = "relay-reservation-overbooks") {
+        return Err(SlotRefused::Full);
+    }
+    let created = create().map_err(SlotRefused::Create)?;
+    if let Some(entry) = open_invite(&created.ticket) {
+        open.push(entry);
+    }
+    drop(open);
+    refresh_allow(shared);
+    Ok(created)
+}
+
+/// The allow-set entry of a new invitation, if its ticket carries a relay
+/// hint.
+fn open_invite(ticket: &Ticket) -> Option<OpenInvite> {
     if !ticket
         .routes
         .iter()
         .any(|r| RelayRoute::parse_hint(r).is_some())
     {
-        return;
+        return None;
     }
     let tag = invitation_tag(&ticket.invitation, &ticket.secret);
-    guard(&shared.relay.invites).push(OpenInvite {
+    Some(OpenInvite {
         invitation: ticket.invitation,
         tag_hash: tag_hash(&tag),
         expires_at: ticket.expires_at.secs(),
-    });
+    })
+}
+
+/// A new invitation whose ticket carries a relay hint: list its tag.
+pub fn on_invite(shared: &Shared, ticket: &Ticket) {
+    let Some(entry) = open_invite(ticket) else {
+        return;
+    };
+    guard(&shared.relay.invites).push(entry);
     refresh_allow(shared);
 }
 

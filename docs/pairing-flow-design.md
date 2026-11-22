@@ -94,8 +94,9 @@ Additions only. A 1.2 helper serves a 1.1 app unchanged.
   inventory; it never adds an address.
 
 The reply keeps `{invitation, uri, routes, expires_at, code?,
-attempts_left?}` and adds `ways`: the distinct ways of the routes carried,
-in order. With `way` it is exactly `[way]`.
+attempts_left?}`. With `way` it adds `ways`, which is exactly `[way]`.
+Without `way` the reply is the 1.1 reply, field for field, with no `ways`:
+an app on the 1.1 path gets the same bytes as before.
 
 **Inventory.** The helper lists every candidate before any cap, then
 selects, then caps at `MAX_ROUTES`. Today's `advertised()` caps while it
@@ -106,12 +107,17 @@ does not use that list. A candidate's way comes from where it came from:
 |---|---|
 | `lan` | private IPv4 literals the listener serves |
 | `tailnet` | `100.64.0.0/10` literals the listener serves |
-| `public` | entries of the `public` list, whatever their address class |
+| `public` | entries of the `public` list, whatever their address class, while the forwarded-to address (or every address) is bound |
 | `tunnel` | configured and CLI tunnel origins, and #10's managed tunnel, while the WebSocket listener runs |
 | `relay` | hints of this computer's registered relays |
 
 Order within a way is today's order. Candidates are deduplicated by
-canonical text.
+canonical text within each way: a LAN address also listed as a port
+forward is an offer of both ways. A candidate longer than `MAX_ROUTE_LEN`
+can never be in a ticket and is left out before readiness and before the
+cap. With no `routes.json`, a listener on `0.0.0.0` offers every address
+it serves, uncapped; the selected path does not inherit the 1.1 list's
+cut to eight, so LAN addresses cannot push a tailnet address out.
 
 **Rules.**
 
@@ -119,7 +125,13 @@ canonical text.
   order.
 - `way: null`, an unknown way, a selector of the wrong type, or `route`
   without `way`: `bad_request`.
-- A well-formed selection with nothing to offer now: `way_unavailable`.
+- A well-formed selection with nothing to offer now: `way_unavailable`,
+  with `reason` as `routes.available` gives it (`paused` while networking
+  is paused, then `restart_required` when the way waits for a restart,
+  even while the running listener still serves its old routes).
+- An exact `route` the way does not offer, while the way is ready:
+  `way_unavailable` with `reason: route_not_offered`. When the way has
+  nothing to offer, its own reason is given instead.
 - The selection is made before the invitation, its code or a relay
   allow-set entry exists. A failed request leaves none of them behind.
 - `relay`: the relay allow-set slot is checked and reserved under one lock
@@ -150,6 +162,7 @@ that way alone would put in a ticket now.
 | `unavailable` | `interface_unknown` | the interfaces could not be listed |
 | `unavailable` | `not_bound` | selected, but its socket is not bound |
 | `unavailable` | `restart_required` | the saved setting for this way differs from the one running |
+| `unavailable` | `route_too_long` | the way's only candidates are too long for a ticket |
 | `unavailable` | `not_configured` | no port forward, tunnel or relay is set |
 | `unavailable` | `origin_unavailable` | a tunnel is set but the WebSocket listener is not running |
 | `unavailable` | `relay_not_registered` | a relay is set but not registered now |
@@ -158,7 +171,18 @@ that way alone would put in a ticket now.
 
 - `ready` means this helper can issue a ticket with that way. It says
   nothing about the other device's path to it.
+- `paused` comes first, then `restart_required`, then the others.
+  `restart_required` counts a change of the way's own setting that waits
+  for a restart: `lan` or `tailnet` switched, the `public` list or its
+  `forward_to`, the `tunnels` list, and a changed `port` for `lan`,
+  `tailnet` and `public` while they are on. Lists compare as canonical
+  text. A change `routes.config` applies at once (a new port forward list
+  that keeps one) is not pending.
 - A pending restart for one way does not hide another way that works.
+- `origin_unavailable` cannot arise in this helper alone: a tunnel set at
+  start starts the WebSocket listener, and setting the first one takes a
+  restart. It is kept for #10's managed tunnel, whose origin can be down
+  while the setting is on.
 - `no_interface` supports "No Tailscale address on this computer". It does
   not prove Tailscale is stopped: the range is shared with carrier NAT, and
   routed setups exist.
@@ -185,7 +209,11 @@ hint, in ticket order:
   Otherwise `null`.
 - `reason`: for `skip`, one of `reserved`, `unknown_scheme`, `malformed`,
   `forbidden_address`, `unsupported_transport` (a valid `mdns:` hint, which
-  this helper does not dial from a ticket). Otherwise `null`.
+  this helper does not dial from a ticket). Otherwise `null`. A relay hint
+  whose endpoint is a literal address the relay dialler refuses for
+  another device's relay (anything but public or tailnet; loopback is
+  allowed in debug builds) is `forbidden_address`. A relay named by DNS is
+  not looked up.
 - `local`: `interface_present`, `no_matching_interface` or `unknown`.
   Advice only. It never proves that routing works or fails.
 
@@ -198,6 +226,9 @@ hint, in ticket order:
   candidate filter.
 - It reads stored flow records without taking a join hold or replaying a
   completion.
+- It checks as a join without `pinned` does: an in-person ticket past its
+  expiry is `expired`, although a `pinned` join of it may still go ahead
+  to learn a lost outcome.
 - Errors: `bad_request`, `bad_ticket`, `pairing_failed`, `expired`,
   `attempts_exhausted`, `paused`, `store_failed`.
 
@@ -215,19 +246,25 @@ hint, in ticket order:
   or `tls`.
 
 `join.probe.cancel {probe}` → `{cancelled}`. `probe` is the request id of
-the `join.probe` on the same channel. A cancel that wins ends the probe
-with the error `cancelled`, once; `cancelled: true` means the dial and its
-slot are released.
+the `join.probe` on the same channel, so a `join.probe` id must be a string
+or a number (otherwise `bad_request`), and an id held by a probe still
+running is `busy`. A cancel that wins stops the probe at once and ends it
+with the error `cancelled`, once; both that error and `cancelled: true`
+come after the probe's task has exited, so its dial and its slot are
+already released.
 
 **Rules.**
 
 - It dials what `join` would dial: private literals, plus hints that are
   in both the ticket and `approved`. `approved` holds at most `MAX_ROUTES`
   entries. Nothing given here is stored as an approval.
-- It reuses `Caller::probe_route`: the pinned inner TLS handshake, then the
-  pipe is dropped. No `HELLO`, `JOIN_PROOF`, code exchange or stream. No
-  pin, peer, approval, completion or key is stored, and no connection is
-  announced to the app.
+- It opens each route as the join does: routes in the join's order (`tcp`
+  before `wss`, whatever the ticket's order), and for a route whose name
+  resolves to several addresses, the first address whose pipe opens is
+  the one tried; the others are not. On that pipe it runs the pinned inner
+  TLS handshake (`Caller::probe_pipe`), then drops the pipe. No `HELLO`,
+  `JOIN_PROOF`, code exchange or stream. No pin, peer, approval,
+  completion or key is stored, and no connection is announced to the app.
 - **Relay hints are not probed.** A relay join opens a circuit and uses the
   host's pre-accept quota, which the join that follows needs. With a relay
   hint left and no direct route passed, the answer is `reachable: null,
@@ -235,16 +272,26 @@ slot are released.
 - One search, one route at a time, one monotonic deadline over lookup,
   every address, outer TLS and WebSocket, and inner TLS. No candidate
   starts after the deadline or a cancel.
-- One probe per ticket hash. A second, or one over the cap, is `busy`.
-- It ends on cancel, on networking pause and when the channel closes.
+- One probe per ticket hash. A second, or one over the cap, is `busy`. A
+  probe holds its slot until its task exits, however it ends.
+- It ends on cancel, on networking pause and when the channel closes. A
+  pause or a close wins over a result that is ready at the same moment,
+  and both are checked again before each route.
 - No progress event and no cache of results.
-- Errors: those of `join.check`, plus `busy` and `cancelled`.
+- With both a relay hint and an unapproved hint left, the reason is
+  `relay_unprobed`.
+- A cancel naming no running probe (unknown, already answered or already
+  cancelled) is `{cancelled: false}`.
+- Errors: those of `join.check`, plus `busy` and `cancelled`. Like
+  `join.check` it checks as a join without `pinned` does.
 
 **Cost to the host.** A probe from a device with no grant holds one
 pre-auth slot of its listener kind until it closes. It spends no pairing
 attempt and does not rotate a code. A host that already granted the probing
 device recognizes it at step 1; the promise is that no invitation or grant
-changes, not that the host sees nothing.
+changes, not that the host sees nothing. Such a probe may make the host
+announce `conn.up` for that device before any wire `HELLO`; the host
+helper's wait for `HELLO` in `App::inbound_on` (added in #10) closes that.
 
 **What a positive answer means.** The endpoint named in the link answered.
 It does not show that the invitation is still open, and it does not
@@ -504,7 +551,9 @@ once #10 is merged.
 Each check is a `mousse-check` entry in `checks/pairing-flow.toml` with a
 must-fail control (`cfg!(mousse_control = "...")`, listed in the workspace
 `check-cfg`). Each control fails its own assertion while the normal build
-passes.
+passes. `mousse-check` takes a check id's prefix as the manifest's file
+stem, so the ids there are `pairing-flow.<name>`: the table's
+`pairing.invite-way` is `pairing-flow.invite-way`, and so on.
 
 | Check | Control | The bug it plants |
 |---|---|---|
