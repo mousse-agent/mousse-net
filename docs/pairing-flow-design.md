@@ -566,8 +566,16 @@ which is the file's `phase`. The role checks are therefore in
 | | `role-edit-keeps-reverse-path` | a path under the old role stays open |
 | | `restricted-grant-served-to-legacy-app` | an app without `grant-roles` gets the traffic |
 | | `restricted-grant-opens-standalone-terminal` | `serve` ignores the role |
-| | `demoted-owner-keeps-grants` | `mousse-grants` stays open after demotion |
+| | `demoted-owner-keeps-grants` | any granted caller gets `mousse-grants` |
+| | `demoted-signer-removes` | a demoted signer still removes |
 | | `restricted-store-readable-by-old-helper` | the store version is not raised |
+| | `role-edit-unfenced` | queued data leaves after the reply |
+| | `role-edit-while-paused` | an edit commits while paused |
+| | `role-edit-keeps-queued-announcement` | a waiting `stream.incoming` is written |
+| | `role-edit-delivers-on-closing-path` | a call on a cut path is delivered |
+| | `grant-served-while-not-serving` | a grant is served unsaved or expired |
+| | `suspended-reads-as-revoked` | a suspended grant's streams read revoked |
+| | `answer-role-sticks-to-invitation` | a failed answer's role is kept |
 | `pairing.grant-connected` | `grant-from-stale-connection` | a closed connection's identity is granted |
 | | `connected-grant-upgrades-existing` | an existing grant is widened |
 | | `connected-grant-trusts-request-identity` | the identity is read from the request |
