@@ -85,6 +85,62 @@ pub fn canonical_list(value: Option<&Value>) -> Vec<String> {
     out
 }
 
+/// What a join does with one ticket hint (§1.3; `docs/pairing-flow-design.md`
+/// §4). Every decision about a ticket's hints is this one: the routes a
+/// join dials ([`ticket_candidates`], [`super::relay::join_candidates`]),
+/// what `join.check` reports and what `join.probe` dials.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HintDecision {
+    /// Dialled without approval: 1a's automatic rule.
+    Automatic(LocalRoute),
+    /// Dialled only once the owner approved its canonical text.
+    Approval(LocalRoute),
+    /// A relay route, dialled only once its destination
+    /// (`relay://host:port`) is approved.
+    Relay(mousse_net_core::relay_endpoint::RelayRoute),
+    /// Never dialled from a ticket, and why: `reserved`, `unknown_scheme`,
+    /// `malformed`, `forbidden_address` or `unsupported_transport` (a
+    /// valid `mdns:` hint, which needs a browse).
+    Skip(&'static str),
+}
+
+/// The decision for one ticket hint.
+pub fn hint_decision(policy: &AddrPolicy, hint: &str) -> HintDecision {
+    use mousse_net_core::pairing::RouteSkip;
+    use mousse_net_core::relay_endpoint::RelayRoute;
+    let route = match Route::parse(hint) {
+        Ok(route) => match LocalRoute::from_route(route) {
+            Some(route) => route,
+            None => return HintDecision::Skip("unsupported_transport"),
+        },
+        Err(RouteSkip::Reserved) => {
+            // Reserved on the wire's grammar, read by the helper's own.
+            if let Some(relay) = RelayRoute::parse_hint(hint) {
+                return HintDecision::Relay(relay);
+            }
+            match LocalRoute::parse(hint) {
+                // The control build reads a plain ws hint as an owner's route.
+                Ok(route)
+                    if cfg!(mousse_control = "plain-ws-from-ticket")
+                        && route.kind() == RouteKind::Ws =>
+                {
+                    route
+                }
+                _ if hint.starts_with("relay:") => return HintDecision::Skip("malformed"),
+                _ => return HintDecision::Skip(RouteSkip::Reserved.name()),
+            }
+        }
+        Err(skip) => return HintDecision::Skip(skip.name()),
+    };
+    if peer_route_ok(policy, &route) {
+        HintDecision::Automatic(route)
+    } else if policy.names_forbidden(&route) {
+        HintDecision::Skip("forbidden_address")
+    } else {
+        HintDecision::Approval(route)
+    }
+}
+
 /// The hints of a ticket this helper may dial (§1.3): those under the
 /// automatic rule, and `tcp` or `wss` hints the owner approved at Connect
 /// that name no forbidden address. Plain `ws` and `ssh` hints are reserved
@@ -96,22 +152,19 @@ pub fn ticket_candidates(
 ) -> Vec<LocalRoute> {
     let mut out: Vec<LocalRoute> = Vec::new();
     for hint in hints {
-        let route = match Route::parse(hint).ok().and_then(LocalRoute::from_route) {
-            Some(route) => route,
-            // The control build reads a plain ws hint as an owner's route.
-            None if cfg!(mousse_control = "plain-ws-from-ticket") => {
-                match LocalRoute::parse(hint) {
-                    Ok(route) if route.kind() == RouteKind::Ws => route,
-                    _ => continue,
-                }
+        let route = match hint_decision(policy, hint) {
+            HintDecision::Automatic(route) => route,
+            HintDecision::Approval(route)
+                if approved.contains(&route.uri())
+                    // The control build dials any TCP hint without approval.
+                    || (cfg!(mousse_control = "unapproved-public")
+                        && route.kind() == RouteKind::Tcp) =>
+            {
+                route
             }
-            None => continue,
+            _ => continue,
         };
-        let approved = approved.contains(&route.uri())
-            // The control build dials any TCP hint without approval.
-            || (cfg!(mousse_control = "unapproved-public") && route.kind() == RouteKind::Tcp);
-        let ok = peer_route_ok(policy, &route) || (approved && !policy.names_forbidden(&route));
-        if ok && !out.contains(&route) {
+        if !out.contains(&route) {
             out.push(route);
         }
     }

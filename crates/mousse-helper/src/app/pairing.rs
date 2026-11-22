@@ -452,7 +452,7 @@ async fn join(
     let policy = shared.caller.addr_policy().clone();
     let approved_routes = super::paths::canonical_list(Some(&json!(approved)));
     // Then the ticket's relay routes the owner approved (Phase 3 B.7).
-    let relays = super::relay::join_candidates(&ticket, &approved);
+    let relays = super::relay::join_candidates(&policy, &ticket, &approved);
     let candidates: Vec<JoinRoute> =
         super::paths::ticket_candidates(&policy, &ticket.routes, &approved_routes)
             .into_iter()
