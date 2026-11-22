@@ -3,20 +3,23 @@
 //!
 //! - **Host:** `invite.create {kind: in_person|link}`, `invite.cancel`,
 //!   `approval.answer`; events `approval`, `invite.code` (a link's code,
-//!   each time a new one shows), `enrolled`, `invite.ended`. The reply
-//!   lists the `ways` of the routes the ticket carries.
+//!   each time a new one shows), `enrolled`, `invite.ended`.
 //! - **Choosing the way** (protocol 1.2, features `invite-way` and
 //!   `route-readiness`; `docs/pairing-flow-design.md` §2 and §3):
 //!   `invite.create {kind?, way, route?}` puts only the chosen way's hints
 //!   in the ticket, or the one exact `route` of this computer's inventory
-//!   (see [`availability`]). Without `way` or `route` it is the 1.1 path,
-//!   unchanged. With either, unknown fields, `way: null`, an unknown way
+//!   (see [`availability`]), and its reply lists the `ways` carried.
+//!   Without `way` or `route` it is the 1.1 path, unchanged, reply
+//!   included. With either, unknown fields, `way: null`, an unknown way
 //!   or a selector of the wrong type are `bad_request`, and a selection
-//!   with nothing to offer now is `way_unavailable` with its `reason`; it
-//!   leaves no invitation, code or relay allow-set entry. A relay ticket
-//!   takes a free allow-set slot under one lock with its creation, never
-//!   one held by an open invitation or a recovery entry. `routes.available
-//!   {}` reports each way's state, reason and routes.
+//!   with nothing to offer now is `way_unavailable` with its `reason`
+//!   (`restart_required` first when the way's saved setting waits for a
+//!   restart; `route_not_offered` when the way offers routes but not the
+//!   exact `route`); it leaves no invitation, code or relay allow-set
+//!   entry. A relay ticket takes a free allow-set slot under one lock with
+//!   its creation, never one held by an open invitation or a recovery
+//!   entry. `routes.available {}` reports each way's state, reason and
+//!   routes.
 //! - **Joiner:** `join {ticket, arrival: scan|link, approved, pinned}`,
 //!   `join.code`, `join.cancel`, `join.status`, `join.ack`; events
 //!   `join.progress`, `join.code_needed`, `join.attempt_failed`.
@@ -312,20 +315,21 @@ fn invite(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
     match shared.host.invite(kind, routes.clone()) {
         Ok(created) => {
             super::relay::on_invite(shared, &created.ticket);
-            let ways = availability::ways_of(&availability::inventory(shared), &routes);
-            invite_reply(shared, id, &created, &routes, &ways)
+            invite_reply(shared, id, &created, &routes, None)
         }
         Err(e) => error(id, "refused", e.to_string()),
     }
 }
 
-/// The reply to an `invite.create` that made `created` with `routes`.
+/// The reply to an `invite.create` that made `created` with `routes`. Only
+/// a selected ticket's reply lists its `ways`: the 1.1 reply stays as it
+/// was.
 fn invite_reply(
     shared: &Shared,
     id: &Value,
     created: &mousse_net_core::pairing::CreatedInvitation,
     routes: &[String],
-    ways: &[&str],
+    ways: Option<&[&str]>,
 ) -> Value {
     let invitation = created.ticket.invitation;
     state(shared).invitations.push(invitation);
@@ -335,8 +339,10 @@ fn invite_reply(
         "uri": created.fragment,
         "routes": routes,
         "expires_at": created.ticket.expires_at.secs(),
-        "ways": ways,
     });
+    if let Some(ways) = ways {
+        reply["ways"] = json!(ways);
+    }
     // A link's first code. It is shown only to the owner, never logged, and
     // is not part of the link.
     if let Some((code, left)) = shared.host.invitation_code(&invitation) {
@@ -395,18 +401,31 @@ fn invite_way(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
     if shared.removal.is_paused() {
         return way_unavailable(id, way, "paused");
     }
+    let saved = match availability::saved_config(shared) {
+        Ok(saved) => saved,
+        Err(e) => return error(id, "store_failed", e),
+    };
     let inventory = availability::inventory(shared);
     if way == "relay" {
         if let Some(e) = inventory.relay_store_failed() {
             return error(id, "store_failed", e.to_owned());
         }
     }
+    // What the listener offers now is about to be replaced.
+    if availability::restart_required(&inventory, saved.as_ref(), way) {
+        return way_unavailable(id, way, "restart_required");
+    }
     let routes = availability::select(&inventory, way, route);
     if routes.is_empty() {
-        let reason = availability::unavailable_reason(shared, &inventory, way);
+        let reason = if route.is_some() && !availability::select(&inventory, way, None).is_empty() {
+            // The way offers routes, just not this one.
+            "route_not_offered"
+        } else {
+            availability::unavailable_reason(shared, &inventory, saved.as_ref(), way)
+        };
         return way_unavailable(id, way, reason);
     }
-    let ways = availability::ways_of(&inventory, &routes);
+    let ways = availability::ways_of(&inventory, way, &routes);
     let carries_relay = routes
         .iter()
         .any(|r| mousse_net_core::relay_endpoint::RelayRoute::parse_hint(r).is_some());
@@ -420,7 +439,7 @@ fn invite_way(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
             .map_err(super::relay::SlotRefused::Create)
     };
     match made {
-        Ok(created) => invite_reply(shared, id, &created, &routes, &ways),
+        Ok(created) => invite_reply(shared, id, &created, &routes, Some(&ways)),
         Err(super::relay::SlotRefused::Full) => way_unavailable(id, way, "relay_capacity"),
         Err(super::relay::SlotRefused::Store(e)) => error(id, "store_failed", e),
         Err(super::relay::SlotRefused::Create(e)) => error(id, "refused", e.to_string()),
@@ -551,7 +570,7 @@ struct JoinPlan {
 fn join_plan(shared: &Shared, ticket: &Ticket, approved: &[String]) -> JoinPlan {
     let policy = shared.caller.addr_policy().clone();
     let approved_routes = super::paths::canonical_list(Some(&json!(approved)));
-    let relays = super::relay::join_candidates(&policy, ticket, approved);
+    let relays = super::relay::join_candidates(ticket, approved);
     let candidates: Vec<JoinRoute> =
         super::paths::ticket_candidates(&policy, &ticket.routes, &approved_routes)
             .into_iter()

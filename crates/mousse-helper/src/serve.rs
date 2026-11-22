@@ -197,28 +197,41 @@ struct State {
 /// Route hints for a listener on `ip`:`port`. An unspecified address
 /// expands to this machine's LAN addresses.
 pub fn route_hints(ip: IpAddr, port: u16) -> Vec<String> {
+    let addrs: Vec<IpAddr> = if ip.is_unspecified() {
+        if_addrs::get_if_addrs()
+            .map(|ifaces| ifaces.iter().map(|i| i.ip()).collect())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let mut out = served_hints(ip, port, &addrs);
+    out.truncate(8);
+    out
+}
+
+/// Every route hint a listener on `ip`:`port` serves, uncapped and sorted:
+/// `ip` itself, or for an unspecified address each usable one of `addrs`
+/// (no loopback or link-local; IPv6 only for an IPv6 listener).
+/// [`route_hints`] is this list cut to eight.
+pub fn served_hints(ip: IpAddr, port: u16, addrs: &[IpAddr]) -> Vec<String> {
     if !ip.is_unspecified() {
         return vec![route_uri(&route_from_addr(SocketAddr::new(ip, port)))];
     }
     let mut out = Vec::new();
-    if let Ok(ifaces) = if_addrs::get_if_addrs() {
-        for iface in ifaces {
-            let addr = iface.ip();
-            if addr.is_loopback() {
-                continue;
-            }
-            let usable = match addr {
-                IpAddr::V4(v4) => !v4.is_link_local(),
-                IpAddr::V6(v6) => ip.is_ipv6() && !v6.is_unicast_link_local(),
-            };
-            if usable {
-                out.push(route_uri(&route_from_addr(SocketAddr::new(addr, port))));
-            }
+    for &addr in addrs {
+        if addr.is_loopback() {
+            continue;
+        }
+        let usable = match addr {
+            IpAddr::V4(v4) => !v4.is_link_local(),
+            IpAddr::V6(v6) => ip.is_ipv6() && !v6.is_unicast_link_local(),
+        };
+        if usable {
+            out.push(route_uri(&route_from_addr(SocketAddr::new(addr, port))));
         }
     }
     out.sort();
     out.dedup();
-    out.truncate(8);
     out
 }
 

@@ -244,7 +244,7 @@ fn dial_within() -> Duration {
 /// route only public or tailnet (§B.11), so a host's ticket or manifest
 /// cannot point its callers at their LAN. Debug builds also take loopback,
 /// for tests on one computer.
-fn relay_class_ok(class: AddrClass, own: bool, loopback: bool) -> bool {
+pub(super) fn relay_class_ok(class: AddrClass, own: bool, loopback: bool) -> bool {
     match class {
         AddrClass::Forbidden => false,
         AddrClass::Public | AddrClass::Tailnet => true,
@@ -1922,19 +1922,12 @@ pub async fn drop_companion(shared: &Shared, no: u64) {
 // Joining through a relay
 
 /// The ticket's relay routes the owner approved at Connect.
-pub fn join_candidates(
-    policy: &AddrPolicy,
-    ticket: &Ticket,
-    approved: &[String],
-) -> Vec<(RelayRoute, [u8; 32])> {
+pub fn join_candidates(ticket: &Ticket, approved: &[String]) -> Vec<(RelayRoute, [u8; 32])> {
     let tag = invitation_tag(&ticket.invitation, &ticket.secret);
     ticket
         .routes
         .iter()
-        .filter_map(|h| match super::paths::hint_decision(policy, h) {
-            super::paths::HintDecision::Relay(route) => Some(route),
-            _ => None,
-        })
+        .filter_map(|h| RelayRoute::parse_hint(h))
         .filter(|r| approved.contains(&r.endpoint.destination()))
         .map(|r| (r, tag))
         .collect()
@@ -1982,7 +1975,7 @@ pub fn after_join(shared: &Shared, ticket: &Ticket, route: &RelayRoute, tag: [u8
 /// A ticket's relay hints the owner approved at Connect, kept with the
 /// host even when the join went another way.
 pub fn approve_ticket_routes(shared: &Shared, ticket: &Ticket, approved: &[String]) {
-    for (route, _) in join_candidates(shared.caller.addr_policy(), ticket, approved) {
+    for (route, _) in join_candidates(ticket, approved) {
         let hint = route.to_hint();
         let _ = update_peer(shared, &ticket.host_identity, |p| {
             if !p.ticket_routes.contains(&hint) {

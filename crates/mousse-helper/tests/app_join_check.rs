@@ -437,6 +437,182 @@ fn refusals_come_before_any_traffic() {
     assert_eq!(egress_log(&b.egress), "");
 }
 
+/// A relay hint whose literal address the relay dialler refuses (the
+/// wildcard address, or a LAN address, which only an own relay may use) is
+/// `skip` / `forbidden_address`, as `join` never dials it; a debug
+/// loopback relay and a named relay stay `approval_required`, and the name
+/// is not looked up.
+#[test]
+fn a_relay_literal_the_dialler_refuses_is_forbidden() {
+    let a_end = Endpoint::init("jc-rl-a");
+    let mut a = a_end.app("hostA", &[]);
+    a.hello();
+    let link = a.call("invite.create", json!({"kind": "link"}));
+    let (relay, relay_n) = counting_listener();
+    let mut b = joiner("jc-rl-b", "");
+    let hint = |endpoint: &str| {
+        RelayRoute {
+            endpoint: RelayEndpoint::parse(endpoint).unwrap(),
+            relay: RelayId([1; 32]),
+            handle: [2; 32],
+        }
+        .to_hint()
+    };
+    let routes = vec![
+        hint(&format!("0.0.0.0:{}", relay.port())),
+        hint("192.168.77.7:7443"),
+        hint("[::]:7443"),
+        relay_hint(relay.port()),
+        hint("relay.example:7443"),
+    ];
+    let reply = b.app.call(
+        "join.check",
+        json!({"ticket": with_routes(&link, &routes), "arrival": "link"}),
+    );
+    let got: Vec<(Value, Value, Value)> = reply["hints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| {
+            (
+                h["eligibility"].clone(),
+                h["destination"].clone(),
+                h["reason"].clone(),
+            )
+        })
+        .collect();
+    let forbidden = (json!("skip"), Value::Null, json!("forbidden_address"));
+    assert_eq!(
+        got,
+        vec![
+            forbidden.clone(),
+            forbidden.clone(),
+            forbidden,
+            (
+                json!("approval_required"),
+                json!(format!("relay://127.0.0.1:{}", relay.port())),
+                Value::Null
+            ),
+            (
+                json!("approval_required"),
+                json!("relay://relay.example:7443"),
+                Value::Null
+            ),
+        ],
+        "{reply}"
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(relay_n.load(Ordering::SeqCst), 0);
+    assert_eq!(egress_log(&b.egress), "", "a lookup or dial left loopback");
+}
+
+/// A link whose three code attempts are spent is `attempts_exhausted` on
+/// `join.check`, from the stored flow record, as on `join`.
+#[test]
+fn a_spent_link_is_attempts_exhausted_on_the_check() {
+    let a_end = Endpoint::init("jc-ex-a");
+    let mut a = a_end.app("hostA", &[]);
+    a.hello();
+    let b_end = Endpoint::init("jc-ex-b");
+    let mut b = b_end.app("peerB", &[]);
+    b.hello();
+    b.call("hello", json!({"proto": [1, 2]}));
+    let link = a.call("invite.create", json!({"kind": "link"}));
+    let inv = link["invitation"].as_str().unwrap().to_owned();
+    let uri = link["uri"].as_str().unwrap().to_owned();
+    let wrong = |code: &str| -> String {
+        code.bytes()
+            .map(|d| char::from(b'0' + (d - b'0' + 1) % 10))
+            .collect()
+    };
+    let code_with = |a: &App, left: u64| -> String {
+        a.wait(&format!("the code with {left} tries left"), WAIT, |st| {
+            st.messages
+                .iter()
+                .find(|m| {
+                    m["ev"] == "invite.code" && m["invitation"] == inv && m["attempts_left"] == left
+                })
+                .map(|m| m["code"].as_str().unwrap().to_owned())
+        })
+    };
+    let id = b.start("join", json!({"ticket": uri, "arrival": "link"}));
+    let nth = |b: &App, ev: &str, n: usize| {
+        b.wait(&format!("{ev} #{n}"), WAIT, |st| {
+            st.messages
+                .iter()
+                .filter(|m| m["ev"] == ev && m["invitation"] == inv)
+                .nth(n)
+                .cloned()
+        })
+    };
+    nth(&b, "join.code_needed", 0);
+    let first = wrong(link["code"].as_str().unwrap());
+    b.call("join.code", json!({"invitation": inv, "code": first}));
+    for (n, left) in [(0usize, 2u64), (1, 1)] {
+        assert_eq!(nth(&b, "join.attempt_failed", n)["attempts_left"], left);
+        let code = wrong(&code_with(&a, left));
+        b.call("join.code", json!({"invitation": inv, "code": code}));
+    }
+    assert_eq!(b.reply(id)["error"], "attempts_exhausted");
+    let check = b.request("join.check", json!({"ticket": uri, "arrival": "link"}));
+    assert_eq!(check["error"], "attempts_exhausted", "{check}");
+    let join = b.request("join", json!({"ticket": uri, "arrival": "link"}));
+    assert_eq!(join["error"], "attempts_exhausted", "{join}");
+}
+
+/// With a flow record whose outcome is pending, `join.check` past the
+/// ticket's expiry answers as the join does: both go ahead (a grant
+/// outlives its invitation), where a ticket with no record is `expired`.
+#[test]
+fn a_pending_outcome_past_expiry_checks_as_the_join_does() {
+    let a_end = Endpoint::init("jc-pend-a");
+    let mut a = a_end.app("hostA", &[]);
+    a.hello();
+    let b_end = Endpoint::init("jc-pend-b");
+    let mut b = b_end.app_raw(
+        "peerB",
+        &[("CONNECT_TIMEOUT_MS", "300")],
+        0,
+        &[("MOUSSE_HELPER_MANUAL_CLOCK", Path::new("1"))],
+    );
+    b.hello();
+    b.call("hello", json!({"proto": [1, 2]}));
+    let invite = a.call("invite.create", json!({}));
+    let ticket = invite["uri"].as_str().unwrap().to_owned();
+    let parsed = Ticket::from_fragment(&ticket).unwrap();
+    let hash: String = parsed.hash().iter().map(|b| format!("{b:02x}")).collect();
+    let now = b.call("test.clock", json!({}))["now"].as_i64().unwrap();
+    let past = parsed.expires_at.secs() as i64 - now + 3_600;
+    b.call("test.clock", json!({"advance_secs": past}));
+
+    let check = |b: &mut App| b.request("join.check", json!({"ticket": ticket, "arrival": "scan"}));
+    let first = check(&mut b);
+    assert_eq!(first["error"], "expired", "no record yet: {first}");
+    let join = b.request("join", json!({"ticket": ticket, "arrival": "scan"}));
+    assert_eq!(join["error"], "expired", "{join}");
+
+    // A pinned join past expiry stores the pending record once it is
+    // connected; the host never enrolled this device, so the outcome stays
+    // unknown and the record stays.
+    let pinned = b.request(
+        "join",
+        json!({"ticket": ticket, "arrival": "scan", "pinned": true}),
+    );
+    assert!(pinned["error"].is_string(), "{pinned}");
+    assert_ne!(pinned["error"], "expired", "{pinned}");
+    let status = b.call("join.status", json!({"ticket_hash": hash}));
+    assert_eq!(status["pending"], true, "{status}");
+
+    // Now the check goes ahead, and so does a join without `pinned`.
+    let after = check(&mut b);
+    assert!(after.get("error").is_none(), "{after}");
+    assert_eq!(after["kind"], "in_person");
+    assert_eq!(after["invitation"], invite["invitation"]);
+    let join = b.request("join", json!({"ticket": ticket, "arrival": "scan"}));
+    assert!(join["error"].is_string(), "{join}");
+    assert_ne!(join["error"], "expired", "{join}");
+}
+
 /// While networking is paused `join.check` says so, as `join` does.
 #[test]
 fn a_pause_refuses_the_check_as_it_refuses_the_join() {
