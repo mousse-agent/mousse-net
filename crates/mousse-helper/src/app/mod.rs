@@ -229,9 +229,10 @@ struct StreamEntry {
     /// budget).
     tx_window: u64,
     tx_done: bool,
-    /// A stream the host opened on this computer's own connection to it
-    /// (minor 3): the grant of this computer's it is served under. It is
-    /// reset when that grant stops being live.
+    /// The grant of this computer's the stream is served under: for a
+    /// stream the host opened on this computer's own connection to it
+    /// (minor 3), and for one a caller opened on its connection here. It
+    /// is reset when that grant stops being live.
     served: Option<u64>,
 }
 
@@ -1283,7 +1284,7 @@ fn serve_host_stream(shared: &Arc<Shared>, no: u64, conn: &Connection, stream: M
     shared.queued(&core);
 }
 
-/// Reset every host-opened stream whose grant here is no longer live (a
+/// Reset every peer stream whose grant here is no longer live (a
 /// removal, an expiry, a pause), on every change to the grant table and
 /// when networking pauses. A removal the app asked for has reset them
 /// already, before its reply ([`reset_unserved`]).
@@ -1303,8 +1304,10 @@ async fn watch_served(shared: Arc<Shared>) {
     }
 }
 
-/// The host-opened streams whose grant here is no longer live, or all of
-/// them while networking is paused.
+/// The peer's streams whose grant here is no longer live, or all of them
+/// while networking is paused: those the host opened on this computer's
+/// connection to it, and those a caller opened on its connection here,
+/// whose connection the host closes after the removal.
 fn unserved(shared: &Shared, core: &Core) -> Vec<(u32, StreamWriter)> {
     let paused = shared.removal.is_paused();
     core.streams
@@ -1388,7 +1391,14 @@ async fn conn_task(shared: Arc<Shared>, no: u64, conn: Arc<Connection>, inbound:
                 let label = stream.label().to_owned();
                 let class = stream.class();
                 let mut core = lock(&shared.core);
+                // The caller's grant, read under the core lock a removal
+                // resets under: the removal either sees the stream or the
+                // grant is gone here.
+                let grant = shared.host.grant_of(conn.id());
                 if let Some(handle) = shared.add_stream(&mut core, no, stream, false) {
+                    if let Some(entry) = core.streams.get_mut(&handle) {
+                        entry.served = grant.map(|g| g.id.0);
+                    }
                     let event = json!({
                         "ev": "stream.incoming",
                         "conn": no,
@@ -1411,6 +1421,11 @@ async fn conn_task(shared: Arc<Shared>, no: u64, conn: Arc<Connection>, inbound:
         () = accept => CloseReason::PipeClosed,
         reason = conn.closed() => reason,
     };
+    // Test hook: hold a caller's connection between its close and its end
+    // here, as a slow close would.
+    if inbound {
+        crate::peer::crash_point("inbound-down");
+    }
     shared.conn_down(no, &reason);
 }
 

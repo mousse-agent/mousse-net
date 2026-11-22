@@ -549,6 +549,52 @@ fn after_a_grant_removal_replies_no_data_from_the_peers_call_arrives() {
     no_data_from_the_peers_call_after_the_reply("rl-rm-after", "grant.remove");
 }
 
+/// B has a stream open on its own connection to A, which A's app accepted
+/// and has not credited, so B's bytes wait at A. A runs `op` on its grant
+/// for B, and the end of that connection here is held (`inbound-down`),
+/// as a slow close would be. A's app credits the stream after the reply:
+/// none of B's bytes reach it.
+fn no_data_from_the_peers_inbound_stream_after_the_reply(tag: &str, op: &str) {
+    let mut both = both_ways_hooked(tag, &[], Hook::Hold("inbound-down"));
+    let b_identity = both.b.identity.clone();
+    let a_from_b = both.a.event("conn.up", |m| {
+        m["dir"] == "in" && m["identity"] == b_identity.as_str()
+    })["conn"]
+        .as_u64()
+        .unwrap();
+    let open = both.b.open(both.b_to_a, "mousse.rpc", "bulk");
+    both.b.send(open, &[b'x'; 4096], true);
+    let incoming = both.a.event("stream.incoming", |m| m["conn"] == a_from_b);
+    let handle = incoming["handle"].as_u64().unwrap() as u32;
+    both.a.accept(handle);
+    until("B's bytes waiting at A", || {
+        both.a.stats()["queued_bytes"].as_u64().unwrap_or(0) > 0
+    });
+    let reply = both.a.call(op, json!({"grant": both.grant}));
+    assert_eq!(reply["removed"], true, "{reply}");
+    let hold = hold_file(&both.a_end);
+    until("the end of B's connection held at A", || hold.exists());
+    both.a.credit(handle, 1 << 20);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let _ = std::fs::remove_file(&hold);
+    both.a.event("conn.down", |m| m["conn"] == a_from_b);
+    assert_eq!(
+        both.a.received(handle),
+        (0, false),
+        "B's bytes on its own connection reached A's app after {op} replied"
+    );
+}
+
+#[test]
+fn after_a_local_revocation_replies_no_data_from_the_peers_own_connection_arrives() {
+    no_data_from_the_peers_inbound_stream_after_the_reply("rl-in-after", "grant.revoke_local");
+}
+
+#[test]
+fn after_a_grant_removal_replies_no_data_from_the_peers_own_connection_arrives() {
+    no_data_from_the_peers_inbound_stream_after_the_reply("rl-rm-in-after", "grant.remove");
+}
+
 /// The save fails: networking pauses until a retry saves it. B stays out
 /// after the resume, and A's way to B is as it was.
 #[test]
