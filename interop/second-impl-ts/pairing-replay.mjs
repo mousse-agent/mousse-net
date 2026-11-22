@@ -216,7 +216,11 @@ export function replayEndToEnd(flow, input) {
       case 'submit_code':
         return project(joiner.submit(step.code), party);
       case 'approve':
-        return project(host.approve(conn, hostNow), party);
+        assert.ok(step.role === undefined || typeof step.role === 'string');
+        return project(host.approve(conn, hostNow, step.role), party);
+      case 'set_role':
+        assert.equal(party, 'host');
+        return project(host.setRole(hex(joinerEndpoint.identity), step.role), party);
       case 'goaway': {
         const frame = frames.get(`${conn}/${party}`)?.shift();
         assert.ok(frame);

@@ -511,6 +511,15 @@ Rules:
   used an id may already be gone. A grant that replaces another (a new
   pairing of the same device) takes a new id, so a grant id names exactly
   one pairing.
+- **Editing the role in place.** The owner may change a grant's role
+  without replacing it: the id, identity, name, receipt, authorizing owner,
+  times and the local caller key and pair secret stay. Each grant keeps a
+  local **revision**, 1 when the grant is made, one higher after each edit;
+  an edit names the revision it was made against and is refused if that is
+  not the current one. The revision is local and never sent. An edit is
+  stored before it takes effect, and then closes every connection bound to
+  the grant with `CANCELLED`: the grant is not gone, so `GRANT_REVOKED`
+  does not apply. The peer connects again and is served under the new role.
 
 **Removal from another device (later phases).** Phase 0 removes grants only
 locally. When removal messages are added, an endpoint accepts one only from
@@ -1013,8 +1022,11 @@ profile label `Work` (`a (Work)` in person, `a` for a send link).
 1. Join proof accepted; the host sends `AUTHORIZED {join_only}`.
 2. The host asks its owner: "Is the device next to you?", showing the
    joiner's name from `JOIN_PROOF`.
-3. On approval the host enrolls (10.8). On decline it closes with
-   `PAIRING_DECLINED`; on cancel, `CANCELLED`.
+3. On approval the host enrolls (10.8). The owner may choose the role of
+   this grant with the approval; without a choice it is the role fixed in
+   the invitation. The choice applies to this enrollment only and does not
+   change the invitation. On decline it closes with `PAIRING_DECLINED`; on
+   cancel, `CANCELLED`.
 4. The joiner accepts `PAIRED` and becomes live (8.2).
 
 ### 10.5 Binding transcript
@@ -1266,12 +1278,13 @@ routes:
 
 1. Mark the invitation consumed.
 2. Add the grant (identity, the name from `JOIN_PROOF`, the role and
-   authorizing owner fixed in the invitation). If the identity already holds
+   authorizing owner fixed in the invitation, or, in person, the role the
+   owner chose with the approval, 10.4). If the identity already holds
    a grant on this endpoint (for example two invitations joined at the same
    time), the new grant replaces it (section 7).
 3. Bind this connection to the new grant; it becomes live.
-4. Send `PAIRED {host name, role}`. The host name is the host endpoint's
-   display name, `<computer> (<profile>)` in the app.
+4. Send `PAIRED {host name, role}` with the grant's role. The host name is
+   the host endpoint's display name, `<computer> (<profile>)` in the app.
 5. Close every other join-only connection of the invitation with
    `INVITATION_INVALID`.
 
@@ -1282,7 +1295,8 @@ Cancelling or declining an invitation grants nothing. A joiner that already
 holds a live grant gets `AUTHORIZED {live}` at step 2; if the invitation is
 still open, its valid proof starts a normal pairing that replaces the grant
 (section 8, step 3). Otherwise the host's answer is `PAIRED` again if this
-invitation made the grant, which is how a joiner whose `PAIRED` was lost
+invitation made the grant, carrying the grant's role now (an edit since,
+section 7, shows), which is how a joiner whose `PAIRED` was lost
 learns that it was enrolled (10.6 rule 7), and `AUTHORIZED {live}` if it did
 not; then pairing ends with "already paired". A "Send link" joiner believes
 either answer only for a host it pinned before the flow, or for its own
