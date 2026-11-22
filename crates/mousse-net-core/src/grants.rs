@@ -134,6 +134,11 @@ pub struct Grant {
     pub name: String,
     /// The role on this endpoint.
     pub role: Role,
+    /// Local, never sent: 1 for a new grant (and for one stored before
+    /// revisions were kept), one higher after each role edit
+    /// ([`GrantTable::set_role`]). An edit names the revision it read, so a
+    /// stale edit is refused.
+    pub revision: u64,
     /// Where the grant came from.
     pub source: GrantSource,
     /// The profile that authorized it.
@@ -190,15 +195,31 @@ pub struct Denial {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GrantEvent {
     /// Close these live channels now, with `code` in `GOAWAY`. They were
-    /// bound to `grant`, which no longer authorizes anything.
+    /// bound to `grant`, which no longer authorizes them.
     CloseChannels {
-        /// The grant that ended.
+        /// The grant that ended or changed.
         grant: GrantId,
         /// The channels it had authorized.
         channels: Vec<ConnectionId>,
-        /// Always [`ErrorCode::GrantRevoked`].
+        /// [`ErrorCode::GrantRevoked`] when the grant is gone;
+        /// [`ErrorCode::Cancelled`] when its role was edited in place and
+        /// the channels must authorize again under the new role.
         code: ErrorCode,
     },
+}
+
+/// What [`GrantTable::set_role`] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoleEdit {
+    /// The grant's role now.
+    pub role: Role,
+    /// The grant's revision now.
+    pub revision: u64,
+    /// Whether the role changed. `false`: the grant already had that role
+    /// at the expected revision, and nothing happened.
+    pub changed: bool,
+    /// The channels to close (with `CANCELLED`) because the role changed.
+    pub events: Vec<GrantEvent>,
 }
 
 /// Why a grant-table operation was refused.
@@ -214,8 +235,12 @@ pub enum GrantError {
     InvalidRole,
     /// The name is empty or longer than [`MAX_NAME_LEN`] bytes.
     InvalidName,
-    /// Restored data has duplicate ids or identities.
+    /// Restored data has duplicate ids or identities, or a revision of 0.
     Inconsistent,
+    /// A role edit named a revision that is not the grant's current one.
+    RevisionConflict,
+    /// The grant's revision cannot grow any more.
+    RevisionOverflow,
 }
 
 impl fmt::Display for GrantError {
@@ -227,6 +252,8 @@ impl fmt::Display for GrantError {
             GrantError::InvalidRole => "invalid role name",
             GrantError::InvalidName => "invalid device name",
             GrantError::Inconsistent => "inconsistent stored grants",
+            GrantError::RevisionConflict => "the grant changed since that revision",
+            GrantError::RevisionOverflow => "the grant's revision cannot grow any more",
         })
     }
 }
@@ -280,7 +307,7 @@ impl GrantTable {
             table.denials.insert(d.identity, d.denied_at);
         }
         for g in grants {
-            if g.id.0 >= next_grant_id {
+            if g.id.0 >= next_grant_id || g.revision == 0 {
                 return Err(GrantError::Inconsistent);
             }
             if table.denials.contains_key(&g.identity) {
@@ -317,6 +344,7 @@ impl GrantTable {
             identity: new.identity,
             name: new.name,
             role: new.role,
+            revision: 1,
             source: GrantSource::Local,
             authorizing_owner: new.authorizing_owner,
             adopted_into: None,
@@ -327,6 +355,77 @@ impl GrantTable {
         self.by_identity.insert(grant.identity, id);
         self.grants.insert(id, grant);
         Ok((id, events))
+    }
+
+    /// Edit a live grant's role in place, if its revision is still
+    /// `expected_revision`. Everything else about the grant stays: its id,
+    /// identity, name, receipt, authorizing owner and times (and what the
+    /// I/O layer keeps with it). A change raises the revision by one,
+    /// unbinds the grant's channels and asks for them to close with
+    /// `CANCELLED`: they were authorized under the old role.
+    ///
+    /// The same role at the expected revision changes nothing
+    /// (`changed: false`). Another revision is
+    /// [`GrantError::RevisionConflict`], whatever the role.
+    pub fn set_role(
+        &mut self,
+        id: GrantId,
+        expected_revision: u64,
+        role: Role,
+        now: UnixTime,
+    ) -> Result<RoleEdit, GrantError> {
+        let grant = self
+            .grants
+            .get_mut(&id)
+            .filter(|g| g.is_live(now))
+            .ok_or(GrantError::UnknownGrant)?;
+        if self.denials.contains_key(&grant.identity) {
+            return Err(GrantError::Denied);
+        }
+        // Must-fail control (tests only): a stale edit is applied.
+        if grant.revision != expected_revision
+            && !cfg!(mousse_control = "role-edit-ignores-revision")
+        {
+            return Err(GrantError::RevisionConflict);
+        }
+        if grant.role == role {
+            return Ok(RoleEdit {
+                role,
+                revision: grant.revision,
+                changed: false,
+                events: Vec::new(),
+            });
+        }
+        let revision = grant
+            .revision
+            .checked_add(1)
+            .ok_or(GrantError::RevisionOverflow)?;
+        grant.role = role.clone();
+        grant.revision = revision;
+        let channels: Vec<ConnectionId> = self
+            .bindings
+            .iter()
+            .filter(|(_, g)| **g == id)
+            .map(|(c, _)| *c)
+            .collect();
+        for c in &channels {
+            self.bindings.remove(c);
+        }
+        let events = if channels.is_empty() {
+            Vec::new()
+        } else {
+            vec![GrantEvent::CloseChannels {
+                grant: id,
+                channels,
+                code: ErrorCode::Cancelled,
+            }]
+        };
+        Ok(RoleEdit {
+            role,
+            revision,
+            changed: true,
+            events,
+        })
     }
 
     /// Remove a grant and close every channel bound to it.
@@ -592,6 +691,118 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(events.len(), 1);
         assert!(t.get(a).is_none());
+    }
+
+    fn role(name: &str) -> Role {
+        Role::new(name).unwrap()
+    }
+
+    #[test]
+    fn a_role_edit_keeps_the_grant_and_closes_its_channels_with_cancelled() {
+        let mut t = GrantTable::new();
+        let mut new = new_grant(1, None);
+        new.enrolled_by = Some(InvitationId([7; 16]));
+        let (a, _) = t.add(new, NOW).unwrap();
+        let (b, _) = t.add(new_grant(2, None), NOW).unwrap();
+        t.bind(ConnectionId(10), a, NOW).unwrap();
+        t.bind(ConnectionId(11), b, NOW).unwrap();
+        let before = t.get(a).cloned().unwrap();
+        assert_eq!(before.revision, 1);
+
+        let edit = t.set_role(a, 1, role("viewer"), UnixTime(1_500)).unwrap();
+        assert!(edit.changed);
+        assert_eq!(edit.revision, 2);
+        assert_eq!(
+            edit.events,
+            vec![GrantEvent::CloseChannels {
+                grant: a,
+                channels: vec![ConnectionId(10)],
+                code: ErrorCode::Cancelled
+            }]
+        );
+        let after = t.get(a).cloned().unwrap();
+        assert_eq!(
+            after,
+            Grant {
+                role: role("viewer"),
+                revision: 2,
+                ..before
+            },
+            "only the role and the revision change"
+        );
+        assert_eq!(t.binding(ConnectionId(10)), None);
+        assert_eq!(t.binding(ConnectionId(11)), Some(b));
+        assert_eq!(t.live_grant(&id(1), NOW).map(|g| g.id), Some(a));
+    }
+
+    #[test]
+    fn a_stale_role_edit_is_refused_and_changes_nothing() {
+        let mut t = GrantTable::new();
+        let (a, _) = t.add(new_grant(1, None), NOW).unwrap();
+        t.set_role(a, 1, role("viewer"), NOW).unwrap();
+        assert_eq!(
+            t.set_role(a, 1, role("owner"), NOW),
+            Err(GrantError::RevisionConflict)
+        );
+        // Even naming the role it has, at an old revision.
+        assert_eq!(
+            t.set_role(a, 1, role("viewer"), NOW),
+            Err(GrantError::RevisionConflict)
+        );
+        assert_eq!(
+            t.get(a).map(|g| (g.role.clone(), g.revision)),
+            Some((role("viewer"), 2))
+        );
+    }
+
+    #[test]
+    fn the_same_role_at_the_current_revision_is_not_a_change() {
+        let mut t = GrantTable::new();
+        let (a, _) = t.add(new_grant(1, None), NOW).unwrap();
+        t.bind(ConnectionId(10), a, NOW).unwrap();
+        let edit = t.set_role(a, 1, Role::owner(), NOW).unwrap();
+        assert!(!edit.changed);
+        assert_eq!(edit.revision, 1);
+        assert!(edit.events.is_empty());
+        assert_eq!(t.binding(ConnectionId(10)), Some(a));
+    }
+
+    #[test]
+    fn a_role_edit_needs_a_live_grant_and_a_revision_that_can_grow() {
+        let mut t = GrantTable::new();
+        let (a, _) = t.add(new_grant(1, Some(UnixTime(2_000))), NOW).unwrap();
+        assert_eq!(
+            t.set_role(a, 1, role("viewer"), UnixTime(2_000)),
+            Err(GrantError::UnknownGrant)
+        );
+        assert_eq!(
+            t.set_role(GrantId(99), 1, role("viewer"), NOW),
+            Err(GrantError::UnknownGrant)
+        );
+        let mut top = t.get(a).cloned().unwrap();
+        top.revision = u64::MAX;
+        let mut t = GrantTable::restore(vec![top], Vec::new(), t.next_grant_id()).unwrap();
+        assert_eq!(
+            t.set_role(a, u64::MAX, role("viewer"), NOW),
+            Err(GrantError::RevisionOverflow)
+        );
+        assert_eq!(t.get(a).map(|g| g.role.clone()), Some(Role::owner()));
+    }
+
+    #[test]
+    fn restore_keeps_revisions_and_refuses_revision_zero() {
+        let mut t = GrantTable::new();
+        let (a, _) = t.add(new_grant(1, None), NOW).unwrap();
+        t.set_role(a, 1, role("viewer"), NOW).unwrap();
+        let grants: Vec<Grant> = t.grants().cloned().collect();
+        let restored = GrantTable::restore(grants.clone(), Vec::new(), t.next_grant_id()).unwrap();
+        assert_eq!(restored.get(a).map(|g| g.revision), Some(2));
+        let mut zero = grants;
+        zero[0].revision = 0;
+        assert_eq!(
+            GrantTable::restore(zero, Vec::new(), t.next_grant_id()).err(),
+            Some(GrantError::Inconsistent)
+        );
     }
 
     #[test]
