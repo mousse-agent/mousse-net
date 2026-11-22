@@ -306,7 +306,13 @@ impl EnrollmentSaveError {
 }
 
 fn file_of(table: &GrantTable) -> GrantFile {
-    let restricted = table.grants().any(|g| g.role.as_str() != Role::OWNER);
+    // A grant not `owner`, or one whose role was ever edited: an older
+    // helper would serve the first as owner, and would drop the revision
+    // of the second on its next save (back to 1, so a stale edit made
+    // against an older revision could apply again after an upgrade).
+    let restricted = table
+        .grants()
+        .any(|g| g.role.as_str() != Role::OWNER || g.revision > 1);
     // Must-fail control (tests only): the version is not raised, so an
     // older helper loads a restricted grant and serves it as owner.
     let version = if restricted && !cfg!(mousse_control = "restricted-store-readable-by-old-helper")
@@ -1322,6 +1328,45 @@ mod tests {
         let loaded = store.load().unwrap();
         let g = loaded.get(id).unwrap();
         assert_eq!((g.role.as_str(), g.revision), ("viewer", 2));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A grant edited back to owner keeps a revision above 1, which an
+    /// older helper would drop on its next save: owner rev 1, viewer rev 2,
+    /// owner rev 3. The file stays one an older helper refuses, in
+    /// `grants.json` and in an enrollment journal's table, and the
+    /// revision comes back.
+    #[test]
+    fn an_owner_grant_edited_back_keeps_the_file_unreadable_by_an_older_helper() {
+        use crate::private::faults::{plan_replaces, Fault};
+        let dir = temp_dir("edited-back");
+        let store = GrantStore::in_dir(&dir);
+        let mut table = GrantTable::new();
+        let id = grant_with(&mut table, Role::OWNER);
+        table
+            .set_role(id, 1, Role::new("viewer").unwrap(), UnixTime(2))
+            .unwrap();
+        table.set_role(id, 2, Role::owner(), UnixTime(3)).unwrap();
+        assert!(table.grants().all(|g| g.role.as_str() == Role::OWNER));
+        store.save(&table).unwrap();
+        assert!(!version_2_loader_accepts(&dir));
+        let loaded = store.load().unwrap();
+        let g = loaded.get(id).unwrap();
+        assert_eq!((g.role.as_str(), g.revision), (Role::OWNER, 3));
+
+        // The same table kept in force by an enrollment journal.
+        let mut next = table.clone();
+        let new = grant_with(&mut next, Role::OWNER);
+        let identity = next.get(new).unwrap().identity;
+        plan_replaces(store.path(), &[Fault::BeforeRename]);
+        let pending = PendingEnrollment {
+            grant: new,
+            identity,
+            invitation: InvitationId([3; 16]),
+        };
+        assert!(store.save_enrollment(&table, &next, &[pending]).is_err());
+        assert!(store.load_pending().unwrap().is_some());
+        assert!(!version_2_loader_accepts(&dir));
         fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -114,9 +114,13 @@ fn reply(shared: &Shared, id: &Value, mut grant: Grant, asked: Role, already: bo
     // role the request named.
     if cfg!(mousse_control = "connected-grant-upgrades-existing") && already && grant.role != asked
     {
-        if let Ok((edited, _)) = shared.host.set_role(grant.id, grant.revision, asked) {
-            grant = edited;
+        let editing = shared.host.edit_role(grant.id, grant.revision, asked);
+        if let Ok((edited, _)) = editing.outcome() {
+            grant = edited.clone();
         }
+        tokio::spawn(async move {
+            let _ = editing.finish().await;
+        });
     }
     json!({
         "re": id,

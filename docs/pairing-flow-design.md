@@ -450,13 +450,37 @@ open:
   refused with `store_failed` if that fails.
 - **Refusals.** An edit the grant table refuses for another reason (the
   revision would overflow, the identity is denied) is `bad_request`.
-- **Store version.** A table holding a non-`owner` grant is written with
-  version 3; a table of `owner` grants only stays version 2 and an older
-  helper still loads it. Revision 1 is not written, so a table that was
-  never edited is stored as before. An older helper ignores a higher
-  revision in a version 2 file and drops it when it saves, so after a
-  downgrade and an upgrade those grants are at revision 1 again; the roles
-  are unchanged, as they are all `owner`.
+- **Store version.** A table is written with version 3 when any grant's
+  role is not `owner` or any grant's revision is above 1 (it was edited,
+  even back to `owner`); the same holds for the table an enrollment journal
+  keeps. A table of `owner` grants that were never edited stays version 2
+  and an older helper still loads it; revision 1 is not written. So an
+  older helper never rewrites an edited grant back to revision 1, after
+  which a stale edit against an old revision could apply again.
+- **Answering an edit.** The host commits the edit and closes the grant's
+  connections under its lock; the app channel then cuts its own paths (see
+  below). The reply is sent only once every connection closed has dropped
+  what was queued on it and finished the frame it was writing (a fence,
+  bounded by `close_linger`): nothing queued under the old role, a
+  `mousse-grants` list included, leaves after the reply.
+  `grant.role_changed` is sent at the same point.
+- **Paused.** An edit is refused with `paused` while a removal that failed
+  to save holds networking paused. The host sets its fence under the lock
+  the signed removal saved under, so no edit commits between the failed
+  save and the pause.
+- **Cut paths.** A connection the edit closes reads as closing at once, and
+  no stream is handed to the app on a closing connection, one the peer
+  opened before the edit included. A `stream.incoming` still waiting to be
+  written for a stream the edit cut is dropped with that stream's data, and
+  no `stream.reset` is sent for a stream the app never heard of.
+- **Not serving.** While an enrollment save's outcome is unknown, no grant
+  reads as live, on this computer's own outbound connections too; nor does
+  an expired grant, before the expiry is swept.
+- **Suspended grants.** A stream under a grant whose edit waits to settle
+  is reset with `CANCELLED`, not `GRANT_REVOKED`: the grant still exists.
+- **Grant list.** A host opens and keeps `mousse-grants` only for a caller
+  whose grant is `owner`, checked when the stream opens and again before
+  each list. Signer standing is checked separately, on every removal.
 - **Renewals.** A stream is checked against the grant's current role and
   revision when it is handed to the app, so a stream on a path that was
   renewing during the edit is served under the new role.

@@ -34,6 +34,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -267,6 +268,11 @@ pub(crate) enum Cmd {
     Code(PairingCode),
     /// Answered when the peer's next `PONG` arrives.
     Ping(oneshot::Sender<()>),
+    /// Answered once nothing queued before this command can still leave:
+    /// the connection is closing (closing drops the mux's queue) and the
+    /// writer has finished the frame it held, or the driver ended. Sent
+    /// after a [`Cmd::Close`].
+    Fence(oneshot::Sender<()>),
 }
 
 /// How a stream's receive side ended.
@@ -565,6 +571,9 @@ pub struct Connection {
     incoming: tokio::sync::Mutex<mpsc::UnboundedReceiver<MuxStream>>,
     /// The minor version both sides agreed, once the peer's `HELLO` came.
     minor: watch::Receiver<Option<u64>>,
+    /// Set by [`Connection::close`] at once and by the driver when the
+    /// connection starts to close for any reason.
+    shutting: Arc<AtomicBool>,
 }
 
 impl fmt::Debug for Connection {
@@ -732,9 +741,32 @@ impl Connection {
         matches!(tokio::time::timeout(within, rx).await, Ok(Ok(())))
     }
 
-    /// Close with `code`.
+    /// Close with `code`. [`Connection::is_closing`] is true from now on.
     pub fn close(&self, code: ErrorCode) {
+        self.shutting.store(true, Ordering::SeqCst);
         let _ = self.cmd.send(Cmd::Close(code));
+    }
+
+    /// Whether the connection is closing or closed: [`Connection::close`]
+    /// was called, or the driver started to shut down (the peer's
+    /// `GOAWAY`, the certificate's deadline, a failed pipe, any close).
+    /// Unlike [`Connection::status`], which reads
+    /// [`ConnStatus::Closed`] only once the driver is done, this is true
+    /// for the whole of the shutdown.
+    pub fn is_closing(&self) -> bool {
+        self.shutting.load(Ordering::SeqCst)
+            || matches!(*self.status.borrow(), ConnStatus::Closed(_))
+    }
+
+    /// Wait until nothing queued on this connection before the call can
+    /// still be sent. Call it after [`Connection::close`]: it returns once
+    /// the close dropped the queue and the frame being written, if any,
+    /// went out (or the connection ended).
+    pub async fn fence(&self) {
+        let (tx, rx) = oneshot::channel();
+        if self.cmd.send(Cmd::Fence(tx)).is_ok() {
+            let _ = rx.await;
+        }
     }
 }
 
@@ -779,6 +811,7 @@ pub(crate) fn spawn<P: Pipe>(
     let (closing_tx, _) = watch::channel(false);
     let (accept_tx, accept_rx) = mpsc::unbounded_channel();
     let (minor, minor_rx) = watch::channel(None);
+    let shutting = Arc::new(AtomicBool::new(false));
     let connection = Connection {
         id: start.conn,
         peer: start.peer,
@@ -788,6 +821,7 @@ pub(crate) fn spawn<P: Pipe>(
         status: status_rx,
         incoming: tokio::sync::Mutex::new(accept_rx),
         minor: minor_rx,
+        shutting: shutting.clone(),
     };
     let driver = Driver {
         mux: Mux::with_limits(start.side, start.clock.mono(), start.limits.core()),
@@ -800,6 +834,7 @@ pub(crate) fn spawn<P: Pipe>(
         cmd_tx,
         status: status_tx,
         closing: closing_tx,
+        shutting,
         accept: accept_tx,
         streams: HashMap::new(),
         finished: Vec::new(),
@@ -809,6 +844,7 @@ pub(crate) fn spawn<P: Pipe>(
         minor,
         reason: None,
         before_close: VecDeque::new(),
+        fences: Vec::new(),
     };
     tokio::spawn(driver.run(start.tls, cmd_rx));
     connection
@@ -823,6 +859,8 @@ struct Driver {
     cmd_tx: mpsc::UnboundedSender<Cmd>,
     status: watch::Sender<ConnStatus>,
     closing: watch::Sender<bool>,
+    /// The handle's view of closing ([`Connection::is_closing`]).
+    shutting: Arc<AtomicBool>,
     accept: mpsc::UnboundedSender<MuxStream>,
     streams: HashMap<u32, StreamTx>,
     /// Streams the peer finished whose receive side waits for the mux to
@@ -843,6 +881,9 @@ struct Driver {
     reason: Option<CloseReason>,
     /// Encoded frames a closing step produced, sent before the GOAWAY.
     before_close: VecDeque<Vec<u8>>,
+    /// Who waits for [`Cmd::Fence`]. Dropped (which answers too) when the
+    /// driver ends.
+    fences: Vec<oneshot::Sender<()>>,
 }
 
 fn classify(frame: &Frame) -> Result<(Traffic, Option<ControlMessage>), ErrorCode> {
@@ -907,6 +948,14 @@ impl Driver {
             }
             if self.mux.is_closing() && give_up.is_none() {
                 give_up = Some(Instant::now() + self.limits.close_linger);
+            }
+            // The writer asks again only after its last frame went out, and
+            // a closing mux has dropped its queue: nothing from before can
+            // leave any more.
+            if slot.is_some() && self.mux.is_closing() {
+                for fence in self.fences.drain(..) {
+                    let _ = fence.send(());
+                }
             }
             if slot.is_some() {
                 if let Some(frame) = self.next_frame() {
@@ -1067,6 +1116,7 @@ impl Driver {
     }
 
     fn mark_closing(&self) {
+        self.shutting.store(true, Ordering::SeqCst);
         self.closing
             .send_if_modified(|closing| !std::mem::replace(closing, true));
     }
@@ -1194,6 +1244,15 @@ impl Driver {
                 if !self.mux.is_closing() {
                     self.mux.ping();
                     self.pings.push(reply);
+                }
+            }
+            Cmd::Fence(reply) => {
+                // Must-fail control (tests only): the fence is answered at
+                // once, while queued data can still go out.
+                if cfg!(mousse_control = "role-edit-unfenced") {
+                    let _ = reply.send(());
+                } else {
+                    self.fences.push(reply);
                 }
             }
         }
@@ -2059,6 +2118,76 @@ mod tests {
                 .any(|f| matches!(f, Frame::Credit { stream, .. } if *stream == id)),
             "credit after the FIN: {after:?}"
         );
+    }
+
+    /// A fence asked for after a close is answered only once nothing
+    /// queued before the close can leave: while the writer holds a frame
+    /// on a full pipe it waits, and after it only that frame goes out;
+    /// what was still queued behind it never does. The handle reads closing
+    /// from the moment the close is asked for.
+    #[tokio::test]
+    async fn a_fence_after_a_close_waits_for_the_frame_in_flight_and_nothing_queued_leaves() {
+        let (conn, mut peer, valve, _clock) = connected(3_600).await;
+        let stream = conn
+            .open_stream(PriorityClass::Interactive, "terminal")
+            .await
+            .unwrap();
+        stream.writer.write(b"open").await.unwrap();
+        assert!(
+            within(
+                "the open",
+                peer.read_until(|f| matches!(f, Frame::Data { .. }))
+            )
+            .await
+        );
+        assert!(!conn.is_closing());
+
+        // The writer waits on the pipe with "held"; "queued" waits in the
+        // mux behind it.
+        valve.close();
+        stream.writer.write(b"held").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        stream.writer.write(b"queued").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        conn.close(ErrorCode::Cancelled);
+        assert!(conn.is_closing());
+        let fence = conn.fence();
+        tokio::pin!(fence);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut fence)
+                .await
+                .is_err(),
+            "the fence was answered while a frame was still held"
+        );
+        valve.open();
+        within("the fence", fence).await;
+
+        let from = peer.frames.len();
+        assert!(
+            within(
+                "the GOAWAY",
+                peer.read_until(|f| matches!(f, Frame::GoAway { .. }))
+            )
+            .await
+        );
+        assert_eq!(data_of(&peer.frames[from..]), [b"held".as_slice()]);
+    }
+
+    /// The peer's `GOAWAY` makes the handle read closing: nobody here
+    /// called [`Connection::close`].
+    #[tokio::test]
+    async fn the_peers_goaway_reads_as_closing_at_once() {
+        let (conn, mut peer, _valve, _clock) = connected(3_600).await;
+        assert!(!conn.is_closing());
+        peer.mux.close(ErrorCode::NoError);
+        peer.flush().await;
+        within("closing", async {
+            while !conn.is_closing() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
     }
 
     /// The peer finishes its half, then resets the stream while this side's
