@@ -62,7 +62,11 @@ pub fn greet(app: &mut App) -> Value {
 
 impl RelayHost {
     pub fn start(tag: &str) -> Self {
-        let relay = Relay::start();
+        Self::start_with(tag, &[])
+    }
+
+    pub fn start_with(tag: &str, overrides: &[(&'static str, u64)]) -> Self {
+        let relay = Relay::start_with(overrides);
         let end = Endpoint::init(&format!("{tag}-b"));
         let mut b = end.app("hostB", &FAST);
         let port = greet(&mut b)["port"].as_u64().unwrap();
