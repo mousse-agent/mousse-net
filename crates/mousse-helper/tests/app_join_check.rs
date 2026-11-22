@@ -590,6 +590,12 @@ fn a_pending_outcome_past_expiry_checks_as_the_join_does() {
     assert_eq!(first["error"], "expired", "no record yet: {first}");
     let join = b.request("join", json!({"ticket": ticket, "arrival": "scan"}));
     assert_eq!(join["error"], "expired", "{join}");
+    let probe = |b: &mut App| b.request("join.probe", json!({"ticket": ticket, "arrival": "scan"}));
+    let first = probe(&mut b);
+    assert_eq!(
+        first["error"], "expired",
+        "the probe, no record yet: {first}"
+    );
 
     // A pinned join past expiry stores the pending record once it is
     // connected; the host never enrolled this device, so the outcome stays
@@ -608,6 +614,9 @@ fn a_pending_outcome_past_expiry_checks_as_the_join_does() {
     assert!(after.get("error").is_none(), "{after}");
     assert_eq!(after["kind"], "in_person");
     assert_eq!(after["invitation"], invite["invitation"]);
+    let probed = probe(&mut b);
+    assert!(probed.get("error").is_none(), "the probe: {probed}");
+    assert_eq!(probed["reachable"], true, "{probed}");
     let join = b.request("join", json!({"ticket": ticket, "arrival": "scan"}));
     assert!(join["error"].is_string(), "{join}");
     assert_ne!(join["error"], "expired", "{join}");

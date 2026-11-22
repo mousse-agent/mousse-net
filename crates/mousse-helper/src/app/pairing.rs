@@ -27,7 +27,10 @@
 //!   what it would do with each hint, with no network traffic (see
 //!   [`check`]); it shares its decisions with `join` ([`admit`],
 //!   [`mousse_net_io::Caller::check_join`] and
-//!   [`super::paths::hint_decision`]). An
+//!   [`super::paths::hint_decision`]). `join.probe {ticket, arrival,
+//!   approved?}` and `join.probe.cancel {probe}` (feature `join-probe`)
+//!   report whether the ticket's host answers on a route a join would
+//!   dial, pairing nothing (see [`probe`]). An
 //!   in-person ticket needs `arrival: scan`. A `pinned` in-person join is
 //!   one the app recorded before it started: the ticket's host counts as
 //!   pinned, and repeated past the ticket's expiry it learns whether a
@@ -70,13 +73,16 @@ use crate::revoke::Removed;
 
 mod availability;
 mod check;
+mod probe;
 
 /// The requests this module answers.
-pub const OPS: [&str; 20] = [
+pub const OPS: [&str; 22] = [
     "config.set",
     "invite.create",
     "routes.available",
     "join.check",
+    "join.probe",
+    "join.probe.cancel",
     "invite.cancel",
     "approval.answer",
     "join",
@@ -105,6 +111,8 @@ pub struct State {
     approvals: HashMap<String, ApprovalRequest>,
     /// Joins running, by invitation (hex).
     joins: HashMap<String, Join>,
+    /// Probes running (see [`probe`]).
+    probes: Vec<probe::Probe>,
 }
 
 /// A join running.
@@ -123,6 +131,7 @@ impl State {
             invitations: Vec::new(),
             approvals: HashMap::new(),
             joins: HashMap::new(),
+            probes: Vec::new(),
         }
     }
 }
@@ -213,6 +222,14 @@ pub fn on_request(shared: &Arc<Shared>, id: Value, op: &str, map: &Map<String, V
         "invite.create" => invite(shared, &id, map),
         "routes.available" => availability::available(shared, &id, map),
         "join.check" => match check::check(shared, &id, map) {
+            Some(reply) => reply,
+            None => return,
+        },
+        "join.probe" => match probe::start(shared, &id, map) {
+            Some(reply) => reply,
+            None => return,
+        },
+        "join.probe.cancel" => match probe::cancel(shared, &id, map) {
             Some(reply) => reply,
             None => return,
         },

@@ -170,6 +170,15 @@ pub(crate) enum JoinRoute {
     },
 }
 
+/// `candidates` in the order a join tries them: `tcp`, then `ws`/`wss`,
+/// then `ssh`, then the relays, each kind in the order given (a stable
+/// sort). `join.probe` tries its routes in this order too.
+pub fn in_join_order(candidates: &[JoinRoute]) -> Vec<&JoinRoute> {
+    let mut ordered: Vec<&JoinRoute> = candidates.iter().collect();
+    ordered.sort_by_key(|r| r.order());
+    ordered
+}
+
 impl JoinRoute {
     fn hint(&self) -> String {
         match self {
@@ -475,9 +484,7 @@ pub(crate) async fn join_routes<C: CodeEntry>(
     // Pipe-generic (Phase 1b §1.4): `tcp` candidates first, then `ws`/`wss`,
     // then `ssh`, each pipe from `Caller::open_route` (resolved once, the
     // classified address dialled); then the relays (Phase 3 B.7).
-    let mut ordered: Vec<&JoinRoute> = candidates.iter().collect();
-    ordered.sort_by_key(|r| r.order());
-    for route in ordered {
+    for route in in_join_order(candidates) {
         let hint = route.hint();
         progress(&hint);
         let (pipe, reached) = match route.open(caller).await {
