@@ -26,6 +26,41 @@ use crate::store::write_atomic;
 /// Most route hints a ticket carries (wire 10.2).
 const MAX_ADVERTISED: usize = mousse_net_core::pairing::MAX_ROUTES;
 
+/// Where a route this computer offers comes from: the way a joiner reaches
+/// it (`docs/pairing-flow-design.md` §2). Relays are the helper's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Way {
+    /// A served private IPv4 address of an interface.
+    Lan,
+    /// A served `100.64.0.0/10` address of an interface.
+    Tailnet,
+    /// An entry of the `public` list (a port forward).
+    Public,
+    /// An entry of the `tunnels` list.
+    Tunnel,
+}
+
+impl Way {
+    /// The name in the app protocol.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Lan => "lan",
+            Self::Tailnet => "tailnet",
+            Self::Public => "public",
+            Self::Tunnel => "tunnel",
+        }
+    }
+}
+
+/// One route this computer offers, and where it came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Candidate {
+    /// The way it came from.
+    pub way: Way,
+    /// The route in its canonical form.
+    pub route: String,
+}
+
 /// `<state>/routes.json`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoutesConfig {
@@ -136,27 +171,56 @@ impl RoutesConfig {
     }
 
     /// The routes to advertise when the listener serves `bound` on `port`,
-    /// with this computer's `interfaces`: at most 8.
+    /// with this computer's `interfaces`: at most 8. The first distinct
+    /// [`RoutesConfig::candidates`], in their order.
     pub fn advertised(&self, interfaces: &[IpAddr], bound: &[IpAddr], port: u16) -> Vec<String> {
-        let all = bound.iter().any(IpAddr::is_unspecified);
-        let served = |ip: &IpAddr| all || bound.contains(ip);
         let mut out: Vec<String> = Vec::new();
-        let mut push = |route: String| {
-            if !out.contains(&route) && out.len() < MAX_ADVERTISED {
-                out.push(route);
-            }
-        };
-        for ip in interfaces.iter().filter(|ip| ip.is_ipv4()) {
-            let class = classify(*ip);
-            let lan = self.lan && class == AddrClass::Lan && !is_link_local(ip);
-            let tailnet = self.tailnet && class == AddrClass::Tailnet;
-            if (lan || tailnet) && served(ip) {
-                push(LocalRoute::tcp(std::net::SocketAddr::new(*ip, port)).uri());
+        for candidate in self.candidates(interfaces, bound, port) {
+            if !out.contains(&candidate.route) && out.len() < MAX_ADVERTISED {
+                out.push(candidate.route);
             }
         }
-        for text in self.public.iter().chain(&self.tunnels) {
+        out
+    }
+
+    /// Every route this config offers when the listener serves `bound` on
+    /// `port`, with this computer's `interfaces`, before any cap and with
+    /// repeats kept (`docs/pairing-flow-design.md` §2): the served LAN and
+    /// tailnet addresses in interface order, then `public`, then
+    /// `tunnels`. Each route is in its canonical form and carries the way
+    /// it came from, never one read back from its text: a `public` entry
+    /// naming a private address is still `public`.
+    pub fn candidates(&self, interfaces: &[IpAddr], bound: &[IpAddr], port: u16) -> Vec<Candidate> {
+        let all = bound.iter().any(IpAddr::is_unspecified);
+        let served = |ip: &IpAddr| all || bound.contains(ip);
+        let mut out: Vec<Candidate> = Vec::new();
+        for ip in interfaces.iter().filter(|ip| ip.is_ipv4()) {
+            let class = classify(*ip);
+            let way = if self.lan && class == AddrClass::Lan && !is_link_local(ip) {
+                Way::Lan
+            } else if self.tailnet && class == AddrClass::Tailnet {
+                Way::Tailnet
+            } else {
+                continue;
+            };
+            if served(ip) {
+                out.push(Candidate {
+                    way,
+                    route: LocalRoute::tcp(std::net::SocketAddr::new(*ip, port)).uri(),
+                });
+            }
+        }
+        let listed = self
+            .public
+            .iter()
+            .map(|t| (Way::Public, t))
+            .chain(self.tunnels.iter().map(|t| (Way::Tunnel, t)));
+        for (way, text) in listed {
             if let Ok(route) = LocalRoute::parse(text) {
-                push(route.uri());
+                out.push(Candidate {
+                    way,
+                    route: route.uri(),
+                });
             }
         }
         out
@@ -214,4 +278,129 @@ impl RoutesStore {
 /// route); `routes.test` dials only those and `wss` tunnels.
 pub fn testable(route: &LocalRoute) -> bool {
     matches!(route.kind(), RouteKind::Tcp | RouteKind::Ws)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ip(text: &str) -> IpAddr {
+        text.parse().unwrap()
+    }
+
+    fn any() -> Vec<IpAddr> {
+        vec![ip("0.0.0.0")]
+    }
+
+    /// Ten LAN addresses fill a ticket: the tunnel after them is cut from
+    /// what is advertised, yet stays a candidate, of its own way.
+    #[test]
+    fn a_later_way_survives_the_cap_among_the_candidates() {
+        let interfaces: Vec<IpAddr> = (1..=10).map(|n| ip(&format!("192.168.1.{n}"))).collect();
+        let config = RoutesConfig {
+            lan: true,
+            tunnels: vec!["wss://t.example/mousse-net/1".into()],
+            ..RoutesConfig::default()
+        };
+        let advertised = config.advertised(&interfaces, &any(), 7000);
+        assert_eq!(advertised.len(), MAX_ADVERTISED);
+        assert!(advertised.iter().all(|r| r.starts_with("tcp://192.168.1.")));
+        let candidates = config.candidates(&interfaces, &any(), 7000);
+        assert_eq!(candidates.len(), 11);
+        assert_eq!(
+            candidates.last(),
+            Some(&Candidate {
+                way: Way::Tunnel,
+                route: "wss://t.example:443/mousse-net/1".into(),
+            })
+        );
+    }
+
+    /// The way comes from the list an entry is in: a port forward naming a
+    /// private address is `public`, and with LAN off no interface address
+    /// is offered for it.
+    #[test]
+    fn a_public_entry_keeps_its_way_whatever_its_address() {
+        let config = RoutesConfig {
+            tailnet: true,
+            public: vec!["tcp://192.168.1.9:7000".into()],
+            forward_to: Some("192.168.1.9".parse().unwrap()),
+            ..RoutesConfig::default()
+        };
+        let interfaces = [ip("192.168.1.9"), ip("100.100.1.2")];
+        let bound = [ip("192.168.1.9"), ip("100.100.1.2")];
+        let candidates = config.candidates(&interfaces, &bound, 7000);
+        assert_eq!(
+            candidates,
+            vec![
+                Candidate {
+                    way: Way::Tailnet,
+                    route: "tcp://100.100.1.2:7000".into(),
+                },
+                Candidate {
+                    way: Way::Public,
+                    route: "tcp://192.168.1.9:7000".into(),
+                },
+            ]
+        );
+    }
+
+    /// Only served addresses are offered: a tailnet address whose socket is
+    /// not bound is no candidate, and neither are link-local addresses.
+    #[test]
+    fn unserved_and_link_local_addresses_are_not_candidates() {
+        let config = RoutesConfig {
+            lan: false,
+            tailnet: true,
+            ..RoutesConfig::default()
+        };
+        let interfaces = [ip("100.100.1.2"), ip("100.100.1.3")];
+        let candidates = config.candidates(&interfaces, &[ip("100.100.1.3")], 7000);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|c| c.route.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tcp://100.100.1.3:7000"]
+        );
+        let lan = RoutesConfig {
+            lan: true,
+            ..RoutesConfig::default()
+        };
+        assert!(lan
+            .candidates(&[ip("169.254.3.4")], &any(), 7000)
+            .is_empty());
+    }
+
+    /// A route listed twice stays twice among the candidates, each with its
+    /// way, and is advertised once, where it first appears.
+    #[test]
+    fn repeats_are_kept_as_candidates_and_advertised_once() {
+        let config = RoutesConfig {
+            lan: true,
+            public: vec![
+                "tcp://192.168.1.9:7000".into(),
+                "tcp://far.example:7000".into(),
+            ],
+            ..RoutesConfig::default()
+        };
+        let interfaces = [ip("192.168.1.9")];
+        let candidates = config.candidates(&interfaces, &any(), 7000);
+        let ways: Vec<(Way, &str)> = candidates
+            .iter()
+            .map(|c| (c.way, c.route.as_str()))
+            .collect();
+        assert_eq!(
+            ways,
+            vec![
+                (Way::Lan, "tcp://192.168.1.9:7000"),
+                (Way::Public, "tcp://192.168.1.9:7000"),
+                (Way::Public, "tcp://far.example:7000"),
+            ]
+        );
+        assert_eq!(
+            config.advertised(&interfaces, &any(), 7000),
+            vec!["tcp://192.168.1.9:7000", "tcp://far.example:7000"]
+        );
+    }
 }
