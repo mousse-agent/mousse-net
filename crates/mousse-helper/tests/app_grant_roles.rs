@@ -58,6 +58,11 @@ fn pair_as(a: &mut App, b: &mut App, invite: Option<&str>, answer: Option<&str>)
         Some(role) => json!({"role": role}),
         None => json!({}),
     };
+    pair_with(a, b, fields, answer)
+}
+
+/// [`pair_as`], with A's `invite.create` taking `fields`.
+fn pair_with(a: &mut App, b: &mut App, fields: Value, answer: Option<&str>) -> Paired {
     let created = a.call("invite.create", fields);
     let invitation = created["invitation"].as_str().unwrap().to_owned();
     let join_id = b.start("join", json!({"ticket": created["uri"], "pinned": true}));
@@ -154,6 +159,57 @@ fn a_link_invitation_keeps_its_role_on_enrollment() {
     assert_eq!(enrolled["role"], "viewer", "{enrolled}");
     let g = grant_of(&mut a, &b.identity);
     assert_eq!((&g["role"], &g["revision"]), (&json!("viewer"), &json!(1)));
+}
+
+/// With a chosen way, `role` is checked as without one and the selected
+/// invitation carries it exactly as an unselected one: in person to the
+/// enrollment and the grant, and as a link through the code.
+#[test]
+fn a_selected_invitation_carries_its_role_like_an_unselected_one() {
+    let (_ae, mut a, _be, mut b) = started("grrw");
+    for fields in [
+        json!({"role": "Not A Role"}),
+        json!({"role": 7}),
+        json!({"way": "lan", "role": "Not A Role"}),
+        json!({"way": "lan", "role": 7}),
+    ] {
+        let reply = a.request("invite.create", fields.clone());
+        assert_eq!(reply["error"], "bad_request", "{fields}: {reply}");
+    }
+    let p = pair_with(
+        &mut a,
+        &mut b,
+        json!({"way": "lan", "role": "viewer"}),
+        None,
+    );
+    assert_eq!(p.join["role"], "viewer", "{}", p.join);
+    assert_eq!(p.enrolled["role"], "viewer", "{}", p.enrolled);
+    let g = grant_of(&mut a, &b.identity);
+    assert_eq!((&g["role"], &g["revision"]), (&json!("viewer"), &json!(1)));
+    // A link ticket of the chosen way.
+    let c_end = Endpoint::init("grrwc");
+    let mut c = c_end.app("peerC", &[]);
+    c.hello();
+    let invite = a.call(
+        "invite.create",
+        json!({"kind": "link", "way": "lan", "role": "member"}),
+    );
+    assert_eq!(invite["ways"], json!(["lan"]), "{invite}");
+    let inv = invite["invitation"].as_str().unwrap().to_owned();
+    let route = invite["routes"][0].as_str().unwrap().to_owned();
+    let id = c.start(
+        "join",
+        json!({"ticket": invite["uri"], "arrival": "link", "approved": [route]}),
+    );
+    c.event("join.code_needed", |m| m["invitation"] == inv.as_str());
+    c.call(
+        "join.code",
+        json!({"invitation": inv, "code": invite["code"]}),
+    );
+    assert_eq!(c.reply(id)["role"], "member");
+    let enrolled = a.event("enrolled", |m| m["invitation"] == inv.as_str());
+    assert_eq!(enrolled["role"], "member", "{enrolled}");
+    assert_eq!(grant_of(&mut a, &c.identity)["role"], "member");
 }
 
 #[test]

@@ -154,6 +154,8 @@ spec's value: it can only be tightened.
 | `MOUSSE_NET_SSH_REPLY_MAX_BYTES` | 1048576 | 1024 to 1048576 | ssh: one `ssh.run` reply after the marker; a longer one fails with `remote_failed` (Phase 1b §3.4). |
 | `MOUSSE_NET_PIPE_CONNECT_WAIT_MS` | 2000 | 100 to 60000 | Remote `mousse-helper pipe`: reach the running helper's IPC and get its `ok`; past it, `not_running` (Phase 1b §3.3). |
 | `MOUSSE_NET_JOIN_DONE_KEEP_SECS` | 86400 | 0 to 2592000 | App mode: how long a "Send link" completion record (`joins/<ticket hash>.done`) the app never acknowledged with `join.ack` is kept after its ticket expired. Until then `join.status` can replay it. |
+| `MOUSSE_NET_JOIN_PROBE_MS` | 10000 | 500 to 10000 | App mode: one `join.probe`, under one deadline over every route it tries (lookup, outer TLS and WebSocket, inner TLS); no route starts after it, and the answer is `timeout` (`docs/pairing-flow-design.md` §5). |
+| `MOUSSE_NET_JOIN_PROBES_MAX` | 2 | 1 to 2 | App mode: `join.probe`s running at once (one app channel per helper); another, or a second for the same ticket, is `busy`. |
 | `MOUSSE_NET_INIT_HOLD_MS` | 0 | 0 to 60000 | Checks only: how long `init` waits before it makes the endpoint, so the hard-kill check can stop the app during a first start. Run for the app (`--app`), its stdin closing still ends it at once. |
 
 ## Settings

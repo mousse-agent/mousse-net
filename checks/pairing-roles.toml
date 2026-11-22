@@ -35,4 +35,5 @@ control = [
   { name = "grant-served-while-not-serving", breaks = "a connection's or identity's grant reads as live while the host serves nothing and after the grant expired", env = { RUSTFLAGS = '--cfg mousse_control="grant-served-while-not-serving"' } },
   { name = "suspended-reads-as-revoked", breaks = "a stream under a grant whose edit waits to settle is reset GRANT_REVOKED as if the grant were gone", env = { RUSTFLAGS = '--cfg mousse_control="suspended-reads-as-revoked"' } },
   { name = "answer-role-sticks-to-invitation", breaks = "the role given with a failed answer is kept on the invitation and reaches the next joiner", env = { RUSTFLAGS = '--cfg mousse_control="answer-role-sticks-to-invitation"' } },
+  { name = "way-invite-drops-role", breaks = "an invitation made with a chosen way takes owner whatever role was asked", env = { RUSTFLAGS = '--cfg mousse_control="way-invite-drops-role"' } },
 ]
