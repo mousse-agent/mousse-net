@@ -1,0 +1,44 @@
+# Pairing flow: one chosen way per ticket, readiness, inspecting a link
+# (docs/pairing-flow-design.md §11 and §12). Format: checks/README.md.
+#
+# Each check runs one test file of the helper. Every control plants one bug
+# and must fail its own assertion while the normal build passes.
+
+phase = "pairing-flow"
+title = "One chosen way per ticket; readiness; link inspection"
+plan = "docs/pairing-flow-design.md"
+
+[[check]]
+id = "pairing-flow.invite-way"
+title = "A selected ticket carries only the chosen way's hints, chosen before the route cap; an exact route is one inventory entry and never adds an address; readiness reasons per way; relay allow-set slots are never overbooked; malformed selections are bad_request and 1.1 requests are unchanged"
+plan = "docs/pairing-flow-design.md §1 to §3 and §12"
+targets = ["windows-x64", "macos-arm64", "linux-x64"]
+min_tests = 9
+local = [
+  { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_invite_way", "--no-fail-fast"] },
+  { target = "macos-arm64", host = "macos-aarch64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_invite_way", "--no-fail-fast"] },
+  { target = "linux-x64", host = "linux-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_invite_way", "--no-fail-fast"] },
+]
+control = [
+  { name = "select-after-route-cap", breaks = "the way is selected from the capped list", env = { RUSTFLAGS = '--cfg mousse_control="select-after-route-cap"' } },
+  { name = "selector-adds-address", breaks = "a route outside the inventory is put in the ticket", env = { RUSTFLAGS = '--cfg mousse_control="selector-adds-address"' } },
+  { name = "relay-reservation-overbooks", breaks = "a new invitation takes a slot in use", env = { RUSTFLAGS = '--cfg mousse_control="relay-reservation-overbooks"' } },
+  { name = "invite-all-ways", breaks = "a selected ticket carries another way's hint", env = { RUSTFLAGS = '--cfg mousse_control="invite-all-ways"' } },
+]
+
+[[check]]
+id = "pairing-flow.join-check"
+title = "join.check keeps the ticket's hint order and gives each hint's exact approval destination, with no lookup, connection, relay contact, event or store change; it refuses what join refuses before any traffic"
+plan = "docs/pairing-flow-design.md §4 and §12"
+targets = ["windows-x64", "macos-arm64", "linux-x64"]
+min_tests = 4
+local = [
+  { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_join_check", "--no-fail-fast"] },
+  { target = "macos-arm64", host = "macos-aarch64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_join_check", "--no-fail-fast"] },
+  { target = "linux-x64", host = "linux-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_join_check", "--no-fail-fast"] },
+]
+control = [
+  { name = "check-dials-destination", breaks = "inspection makes network traffic", env = { RUSTFLAGS = '--cfg mousse_control="check-dials-destination"' } },
+  { name = "check-auto-approves-public", breaks = "a public hint is reported automatic", env = { RUSTFLAGS = '--cfg mousse_control="check-auto-approves-public"' } },
+  { name = "link-accepts-kind1", breaks = "a pasted in-person ticket is taken as scanned", env = { RUSTFLAGS = '--cfg mousse_control="link-accepts-kind1"' } },
+]
