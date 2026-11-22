@@ -70,7 +70,9 @@
         mousse_control = "done-pin-only",
         mousse_control = "replay-after-removal",
         mousse_control = "join-ignores-removal",
-        mousse_control = "removal-leaves-pending"
+        mousse_control = "removal-leaves-pending",
+        mousse_control = "local-revoke-forgets-peer",
+        mousse_control = "local-revoke-keeps-inbound-access"
     )
 ))]
 compile_error!("a mousse_control build has a deliberate defect and is for tests only; build it without --release");
@@ -148,6 +150,8 @@ compile_error!("test-in-person lets a typed ticket count as scanned from the hos
     mousse_control = "replay-after-removal",
     mousse_control = "join-ignores-removal",
     mousse_control = "removal-leaves-pending",
+    mousse_control = "local-revoke-forgets-peer",
+    mousse_control = "local-revoke-keeps-inbound-access",
     feature = "test-in-person"
 ))]
 const _: () = {
