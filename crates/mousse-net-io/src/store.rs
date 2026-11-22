@@ -839,6 +839,11 @@ pub struct CompletionRelay {
     /// After this (Unix seconds) the tag is not restored.
     #[serde(default)]
     pub tag_expires_at: u64,
+    /// The pairing's number with its host, kept on the host's relay entry
+    /// too: a record of an older pairing, or of one that ended, never
+    /// replaces what a newer one stored.
+    #[serde(default)]
+    pub pairing: u64,
 }
 
 /// The completion records in the `joins` folder, beside the flow records.
@@ -935,7 +940,35 @@ impl CompletionStore {
                 removed.push(hash);
             }
         }
+        // The deletions survive a power loss before the removal answers.
+        if !removed.is_empty() {
+            crate::private::sync_dir(&self.dir).map_err(|e| store_err(&self.dir, e))?;
+        }
         Ok(removed)
+    }
+
+    /// The owner disallowed `destination` for the host `identity` (hex):
+    /// take it out of that host's records, so no replay approves it again.
+    pub fn drop_destination(
+        &self,
+        _held: &PeersLock<'_>,
+        identity: &str,
+        destination: &str,
+    ) -> Result<(), NetError> {
+        for (_, mut record) in self.list()? {
+            if record.host_identity != identity {
+                continue;
+            }
+            let before = record.clone();
+            record.approvals.retain(|a| a.destination != destination);
+            if let Some(relay) = &mut record.relay {
+                relay.destinations.retain(|d| d != destination);
+            }
+            if record != before {
+                self.save(&record)?;
+            }
+        }
+        Ok(())
     }
 
     /// Delete the records whose ticket expired more than `keep_secs`
@@ -949,17 +982,6 @@ impl CompletionStore {
         }
         Ok(pruned)
     }
-}
-
-/// Whether `record` is the newest completion record for its host among
-/// `records` (by `at`, then ticket hash): only that one may restore a
-/// relay tag, so an older record never replaces a newer pairing's tag.
-pub fn is_newest_for_host(record: &CompletionRecord, records: &[CompletionRecord]) -> bool {
-    let key = |r: &CompletionRecord| (r.at, r.ticket_hash.clone());
-    records
-        .iter()
-        .filter(|r| r.host_identity == record.host_identity)
-        .all(|r| key(r) <= key(record))
 }
 
 /// A completion record kept past its time: more than `keep_secs` after
@@ -1626,6 +1648,7 @@ mod tests {
             destinations: vec!["relay://relay.example:443".into()],
             join_tag: Some("5ea1ed".into()),
             tag_expires_at: 1_700_000_600,
+            pairing: 1_700_000_000,
         }
     }
 
@@ -1700,15 +1723,45 @@ mod tests {
     }
 
     #[test]
-    fn only_the_newest_record_for_a_host_may_restore_its_tag() {
-        let older = completion(1, "ab", 100, Some(relay_part()));
-        let newer = completion(2, "ab", 200, Some(relay_part()));
-        let other_host = completion(3, "cd", 300, Some(relay_part()));
-        let all = [older.clone(), newer.clone(), other_host.clone()];
-        assert!(!is_newest_for_host(&older, &all));
-        assert!(is_newest_for_host(&newer, &all));
-        assert!(is_newest_for_host(&other_host, &all));
-        // Alone, a record is the newest.
-        assert!(is_newest_for_host(&older, std::slice::from_ref(&older)));
+    fn deleting_a_hosts_records_is_an_error_until_the_folder_is_synced() {
+        let dir = temp_dir("done-sync");
+        let store = CompletionStore::in_dir(&dir);
+        store
+            .save(&completion(1, "ab", 100, Some(relay_part())))
+            .unwrap();
+        let peers = PeerStore::in_dir(&dir);
+        let held = peers.lock().unwrap();
+        crate::private::faults::fail_syncs(&dir.join("joins"), 1);
+        assert!(store.remove_naming(&held, "ab").is_err());
+        drop(held);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_disallowed_destination_leaves_only_that_hosts_records() {
+        let dir = temp_dir("done-disallow");
+        let store = CompletionStore::in_dir(&dir);
+        let destination = "relay://relay.example:443";
+        let approval = |host: &str| Approval {
+            identity: host.into(),
+            destination: destination.into(),
+            source: "ticket".into(),
+            at: 100,
+        };
+        let mut mine = completion(1, "ab", 100, Some(relay_part()));
+        mine.approvals = vec![approval("ab")];
+        let mut other = completion(2, "cd", 100, Some(relay_part()));
+        other.approvals = vec![approval("cd")];
+        store.save(&mine).unwrap();
+        store.save(&other).unwrap();
+        let peers = PeerStore::in_dir(&dir);
+        let held = peers.lock().unwrap();
+        store.drop_destination(&held, "ab", destination).unwrap();
+        drop(held);
+        let mine = store.load(&[1; 32]).unwrap().unwrap();
+        assert!(mine.approvals.is_empty());
+        assert!(mine.relay.unwrap().destinations.is_empty());
+        assert_eq!(store.load(&[2; 32]).unwrap(), Some(other));
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

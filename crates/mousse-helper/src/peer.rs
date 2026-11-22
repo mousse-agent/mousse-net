@@ -165,6 +165,14 @@ pub(crate) fn usable_routes(hints: &[String]) -> Vec<LocalRoute> {
 pub(crate) type ReplayRelay<'a> =
     dyn Fn(&PeersLock<'_>, &CompletionRecord) -> Result<(), NetError> + Send + Sync + 'a;
 
+/// Readies a link join's relay writes under the peers lock, at the PAIRED
+/// time (Unix seconds): fills in the relay part's pairing number and tag
+/// expiry, if there is a relay part. It writes nothing.
+pub(crate) type PrepareRelay<'a> = dyn Fn(&PeersLock<'_>, u64, Option<&mut CompletionRelay>) -> Result<(), NetError>
+    + Send
+    + Sync
+    + 'a;
+
 /// An app's "Send link" join ([`join_routes`]).
 pub(crate) struct LinkJoin<'a> {
     /// The destinations the owner approved at Connect.
@@ -172,6 +180,8 @@ pub(crate) struct LinkJoin<'a> {
     /// The relay part of the completion record, with the sealed tag; the
     /// tag is kept only if the join goes through a relay.
     pub relay: Option<CompletionRelay>,
+    /// Numbers the relay part once the pairing is made.
+    pub prepare: &'a PrepareRelay<'a>,
     /// Makes the relay writes of a completion record.
     pub replay: &'a ReplayRelay<'a>,
 }
@@ -643,7 +653,8 @@ pub(crate) fn crash_point(point: &str) {
 /// completion record also holds the writes for the ticket's approved relay
 /// routes, with the sealed tag when the join went through a relay
 /// (`via_relay`), so they are replayed with the rest (pairing-flow design
-/// §9).
+/// §9). The relay part takes the pairing's number under the same peers
+/// lock.
 #[allow(clippy::too_many_arguments)]
 fn finish_link(
     caller: &Caller,
@@ -695,7 +706,7 @@ fn finish_link(
         offered: Vec::new(),
         paired_at: now,
     };
-    let done = CompletionRecord {
+    let mut done = CompletionRecord {
         ticket_hash: hex(&hash),
         host_identity: identity,
         outcome: COMPLETION_PAIRED.into(),
@@ -720,6 +731,8 @@ fn finish_link(
         drop(held);
         return Err(removed_meanwhile(caller, &hash));
     }
+    // The pairing's number, and the tag's expiry from the PAIRED time.
+    (link.prepare)(&held, now, done.relay.as_mut()).map_err(store)?;
     // Must-fail control: the pin is saved with no completion record first.
     if cfg!(mousse_control = "no-completion-record") {
         crash_point("link-done-saved");

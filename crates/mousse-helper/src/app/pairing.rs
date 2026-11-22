@@ -42,7 +42,7 @@ use mousse_net_core::pairing::{Arrival, InvitationId, InvitationKind, PairingCod
 use mousse_net_core::ErrorCode;
 use mousse_net_io::store::{
     hex, identity_from_hex, short_id, unhex, Approval, ApprovalStore, CompletionRecord,
-    CompletionStore, PeerRecord, PeerStore, PeersLock, APPROVAL_SOURCE_TICKET,
+    CompletionRelay, CompletionStore, PeerRecord, PeerStore, PeersLock, APPROVAL_SOURCE_TICKET,
 };
 use mousse_net_io::{ApprovalRequest, CodeEntry, HostEvent, NetError, NoCode};
 use serde_json::{json, Map, Value};
@@ -458,23 +458,44 @@ async fn join(
     // Private-range hints, and the ones the owner approved (§1.3).
     let policy = shared.caller.addr_policy().clone();
     let approved_routes = super::paths::canonical_list(Some(&json!(approved)));
-    // Then the ticket's relay routes the owner approved (Phase 3 B.7).
+    // Then the ticket's relay routes the owner approved (Phase 3 B.7),
+    // tried only once the ticket's tag is sealed, so the way back through
+    // the relay can be stored (pairing-flow design §9).
     let relays = super::relay::join_candidates(&ticket, &approved);
+    let sealed = if relays.is_empty() {
+        None
+    } else {
+        match super::relay::seal_join_tag(&shared, &ticket) {
+            Ok(sealed) => Some(sealed),
+            Err(e) => {
+                applog::line(format!("sealing a ticket's relay tag failed: {e}"));
+                None
+            }
+        }
+    };
+    let usable = if sealed.is_some() { &relays[..] } else { &[] };
     let candidates: Vec<JoinRoute> =
         super::paths::ticket_candidates(&policy, &ticket.routes, &approved_routes)
             .into_iter()
             .map(JoinRoute::Local)
-            .chain(relays.iter().map(|(route, tag)| JoinRoute::Relay {
+            .chain(usable.iter().map(|(route, tag)| JoinRoute::Relay {
                 route: route.clone(),
                 tag: *tag,
             }))
             .collect();
-    // A removal of the host while the join runs (`peer.forget`) wins: the
-    // join stores nothing, or what it stored goes with the removal.
+    // A removal of the host while the join runs (`peer.forget`, or a
+    // removal of its grant here) wins: the join stores nothing, or what it
+    // stored goes with the removal.
     let pin = ticket.host_identity;
     let gen = shared.peer_gen(&pin);
     let wanted = || shared.peer_gen(&pin) == gen;
-    let result = if candidates.is_empty() {
+    let result = if candidates.is_empty() && usable.len() < relays.len() {
+        Err(crate::peer::Failure {
+            text: "the ticket's relay routes need its tag stored sealed, and sealing it failed"
+                .into(),
+            reason: "store".into(),
+        })
+    } else if candidates.is_empty() {
         Err(crate::peer::Failure {
             text: "the ticket has no private-range address and none it lists was approved".into(),
             reason: "no_route".into(),
@@ -494,9 +515,13 @@ async fn join(
         let replay = |held: &PeersLock<'_>, done: &CompletionRecord| {
             super::relay::replay_completion(&shared, held, done)
         };
+        let prepare = |held: &PeersLock<'_>, at: u64, relay: Option<&mut CompletionRelay>| {
+            super::relay::prepare_completion(&shared, held, &ticket, at, relay)
+        };
         let link = (ticket.kind == InvitationKind::SendLink).then(|| crate::peer::LinkJoin {
             approved: approved.as_slice(),
-            relay: super::relay::completion_relay(&shared, &ticket, &approved),
+            relay: super::relay::completion_relay(&ticket, &approved, sealed.as_deref()),
+            prepare: &prepare,
             replay: &replay,
         });
         match typed {
@@ -571,20 +596,20 @@ async fn join(
             let after = !linked
                 || cfg!(mousse_control = "relay-replay-after-forget")
                 || cfg!(mousse_control = "completion-omits-relay-admission");
-            if after {
-                super::relay::approve_ticket_routes(&shared, &ticket, &approved);
-            }
             let (route, via) = match reached {
                 JoinedVia::Local(reached) => (super::paths::route_json(&reached), None),
-                JoinedVia::Relay(route) => {
-                    if let Some((_, tag)) = relays.iter().find(|(r, _)| *r == route) {
-                        if after {
-                            super::relay::after_join(&shared, &ticket, &route, *tag);
-                        }
-                    }
-                    (super::relay::route_json(&route, false), Some(route))
-                }
+                JoinedVia::Relay(route) => (super::relay::route_json(&route, false), Some(route)),
             };
+            if after {
+                super::relay::after_join(
+                    &shared,
+                    &ticket,
+                    &approved,
+                    via.as_ref(),
+                    sealed.as_deref(),
+                    !already,
+                );
+            }
             let fields = json!({"dir": "out", "role": role, "route": route});
             match shared.add_outbound(conn, gen, fields) {
                 Ok(no) => {
@@ -765,15 +790,23 @@ fn store_ticket_approvals(shared: &Shared, ticket: &Ticket, approved: &[String])
     }
 }
 
-/// The host `identity` was removed: no completion record may bring it
-/// back (Phase 1b §5.4).
+/// The host `identity` lost its grant here: no completion record may bring
+/// it back (Phase 1b §5.4). Under the peers lock: the generation a join
+/// checks before it stores the host advances, so a join that has not
+/// stored its record yet stores nothing; the host's pairings end on its
+/// relay entry, so a record a failed delete leaves restores no relay
+/// writes; and its records are deleted.
 fn forget_completions(shared: &Shared, identity: &str) -> Result<(), NetError> {
     let peers = peers(shared);
     let held = peers.lock()?;
-    let removed = crate::peer::drop_completions(&shared.info.state_dir, &held, identity)?;
+    if let Ok(pin) = identity_from_hex(identity) {
+        *super::lock(&shared.core).peer_gen.entry(pin).or_default() += 1;
+    }
+    let ended = super::relay::end_pairings(shared, &held, identity);
+    let removed = crate::peer::drop_completions(&shared.info.state_dir, &held, identity);
     drop(held);
-    settle(shared, &removed);
-    Ok(())
+    settle(shared, &removed?);
+    ended
 }
 
 /// Clear the pending marks of `tickets`, whose completion records a
