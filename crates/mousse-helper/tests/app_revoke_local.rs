@@ -49,16 +49,38 @@ fn hello(app: &mut App) -> Value {
 }
 
 fn start(end: &Endpoint, name: &str, env: &[(&str, &str)], port: u16) -> App {
-    let mut app = end.app_with(name, env, port, None);
+    start_raw(end, name, env, port, &[])
+}
+
+/// [`start`], with the debug-build test hooks in `raw`.
+fn start_raw(
+    end: &Endpoint,
+    name: &str,
+    env: &[(&str, &str)],
+    port: u16,
+    raw: &[(&str, &Path)],
+) -> App {
+    let mut app = end.app_raw(name, env, port, raw);
     hello(&mut app);
     app
 }
 
 /// Pair A and B both ways, with `env` on A.
 fn both_ways(tag: &str, env: &[(&str, &str)]) -> Both {
+    both_ways_holding(tag, env, None)
+}
+
+/// [`both_ways`], A held at the test hook `hold` (if given) by the file
+/// [`hold_file`].
+fn both_ways_holding(tag: &str, env: &[(&str, &str)], hold: Option<&str>) -> Both {
     let a_end = Endpoint::init(&format!("{tag}a"));
     let b_end = Endpoint::init(&format!("{tag}b"));
-    let mut a = start(&a_end, "hostA", env, 0);
+    let hold = hold.map(|point| format!("{point}={}", hold_file(&a_end).display()));
+    let raw: Vec<(&str, &Path)> = hold
+        .iter()
+        .map(|h| ("MOUSSE_HELPER_TEST_HOLD", Path::new(h)))
+        .collect();
+    let mut a = start_raw(&a_end, "hostA", env, 0, &raw);
     let mut b = start(&b_end, "peerB", &[], 0);
     let a_port = a.call("hello", json!({"proto": [1, 2]}))["port"]
         .as_u64()
@@ -109,6 +131,11 @@ fn both_ways(tag: &str, env: &[(&str, &str)]) -> Both {
             && caller_key_listed(&both.a_end.dir, grant)
     });
     both
+}
+
+/// The file that holds A at its test hook while it exists.
+fn hold_file(a_end: &Endpoint) -> std::path::PathBuf {
+    a_end.dir.join("hold")
 }
 
 /// Wait until `ok` holds.
@@ -356,6 +383,61 @@ fn on_a_shared_connection_the_peers_calls_stop_and_this_computers_go_on() {
             .count(),
         1
     );
+}
+
+/// B has a call open on A's connection, which A's app accepted. A runs
+/// `op` on its grant for B while the reset that follows a change to the
+/// grant table is held (`served-reset`). B then sends on that call, and
+/// answers a call of A's on the same connection after it. None of B's
+/// bytes on its call reach A's app after the reply.
+fn no_data_from_the_peers_call_after_the_reply(tag: &str, op: &str) {
+    let mut both = both_ways_holding(tag, &[], Some("served-reset"));
+    let a_to_b = both.a_to_b;
+    let b_from_a = a_calls_b_on(&mut both, a_to_b, b"first");
+    let open = both.b.open(b_from_a, "mousse.rpc", "interactive");
+    both.b.send(open, b"before", false);
+    let incoming = both.a.event("stream.incoming", |m| m["conn"] == a_to_b);
+    let served = incoming["handle"].as_u64().unwrap() as u32;
+    both.a.accept(served);
+    both.a.credit(served, 1 << 20);
+    until("B's first bytes at A", || both.a.received(served).0 == 6);
+
+    // A's own call on the connection, which B answers last.
+    let seen = both.b.events("stream.incoming").len();
+    let mine = both.a.open(a_to_b, "mousse.rpc", "interactive");
+    both.a.credit(mine, 1 << 20);
+    both.a.send(mine, b"ping", false);
+    let at_b = both.b.wait("A's call on B", WAIT, |st| {
+        st.messages
+            .iter()
+            .filter(|m| m["ev"] == "stream.incoming")
+            .nth(seen)
+            .cloned()
+    });
+    let answer = at_b["handle"].as_u64().unwrap() as u32;
+    both.b.accept(answer);
+
+    let reply = both.a.call(op, json!({"grant": both.grant}));
+    assert_eq!(reply["removed"], true, "{reply}");
+    both.b.send(open, b"after the reply", false);
+    both.b.send(answer, b"last", true);
+    assert_eq!(both.a.until_fin(mine, WAIT), b"last");
+    let _ = std::fs::remove_file(hold_file(&both.a_end));
+    assert_eq!(
+        both.a.received(served),
+        (6, false),
+        "B's bytes reached A's app after {op} replied"
+    );
+}
+
+#[test]
+fn after_a_local_revocation_replies_no_data_from_the_peers_call_arrives() {
+    no_data_from_the_peers_call_after_the_reply("rl-after", "grant.revoke_local");
+}
+
+#[test]
+fn after_a_grant_removal_replies_no_data_from_the_peers_call_arrives() {
+    no_data_from_the_peers_call_after_the_reply("rl-rm-after", "grant.remove");
 }
 
 /// The save fails: networking pauses until a retry saves it. B stays out

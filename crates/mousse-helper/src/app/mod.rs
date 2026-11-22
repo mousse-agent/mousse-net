@@ -1285,7 +1285,8 @@ fn serve_host_stream(shared: &Arc<Shared>, no: u64, conn: &Connection, stream: M
 
 /// Reset every host-opened stream whose grant here is no longer live (a
 /// removal, an expiry, a pause), on every change to the grant table and
-/// when networking pauses.
+/// when networking pauses. A removal the app asked for has reset them
+/// already, before its reply ([`reset_unserved`]).
 async fn watch_served(shared: Arc<Shared>) {
     let mut grants = shared.host.grants_changed();
     let mut pause = shared.removal.watch();
@@ -1294,31 +1295,48 @@ async fn watch_served(shared: Arc<Shared>) {
             changed = grants.changed() => if changed.is_err() { return },
             changed = pause.changed() => if changed.is_err() { return },
         }
-        let mut core = lock(&shared.core);
-        let paused = shared.removal.is_paused();
-        let gone: Vec<(u32, StreamWriter)> = core
-            .streams
-            .iter()
-            .filter_map(|(h, s)| {
-                let grant = s.served?;
-                let identity = core.conns.get(&s.conn)?.identity;
-                let live = !paused
-                    && shared
-                        .host
-                        .live_grant(&identity)
-                        .is_some_and(|g| g.id.0 == grant);
-                (!live).then(|| (*h, s.writer.clone()))
-            })
-            .collect();
-        for (handle, writer) in gone {
-            writer.reset(ErrorCode::GrantRevoked);
-            drop_stream(&mut core, handle);
-            let event = json!({"ev": "stream.reset", "handle": handle, "code": ErrorCode::GrantRevoked.name()});
-            core.out.json(&event);
+        // Test hook: hold here while there is a stream to reset.
+        if cfg!(debug_assertions) && !unserved(&shared, &lock(&shared.core)).is_empty() {
+            crate::peer::crash_point("served-reset");
         }
-        core.regrant(&shared.limits);
-        shared.queued(&core);
+        reset_unserved(&shared);
     }
+}
+
+/// The host-opened streams whose grant here is no longer live, or all of
+/// them while networking is paused.
+fn unserved(shared: &Shared, core: &Core) -> Vec<(u32, StreamWriter)> {
+    let paused = shared.removal.is_paused();
+    core.streams
+        .iter()
+        .filter_map(|(h, s)| {
+            let grant = s.served?;
+            let identity = core.conns.get(&s.conn)?.identity;
+            let live = !paused
+                && shared
+                    .host
+                    .live_grant(&identity)
+                    .is_some_and(|g| g.id.0 == grant);
+            (!live).then(|| (*h, s.writer.clone()))
+        })
+        .collect()
+}
+
+/// Reset the [`unserved`] streams under the core lock: the peer gets
+/// `GRANT_REVOKED`, the app a `stream.reset`, and data queued for the app
+/// on them is dropped, as is any that arrives later. `grant.remove` and
+/// `grant.revoke_local` call it before they reply, so no data from the
+/// peer's streams reaches the app after a reply saying it was removed.
+fn reset_unserved(shared: &Shared) {
+    let mut core = lock(&shared.core);
+    for (handle, writer) in unserved(shared, &core) {
+        writer.reset(ErrorCode::GrantRevoked);
+        drop_stream(&mut core, handle);
+        let event = json!({"ev": "stream.reset", "handle": handle, "code": ErrorCode::GrantRevoked.name()});
+        core.out.json(&event);
+    }
+    core.regrant(&shared.limits);
+    shared.queued(&core);
 }
 
 /// Watch one connection: hand its peer's streams to the app (or refuse

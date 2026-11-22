@@ -795,6 +795,9 @@ fn remove_grant(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value 
         .find(|g| g.id == GrantId(grant))
         .map(|g| hex(g.identity.as_bytes()));
     let removed = shared.removal.remove(GrantId(grant));
+    if matches!(removed, Ok(Removed::Saved | Removed::Paused)) {
+        super::reset_unserved(shared);
+    }
     if let (Ok(Removed::Saved | Removed::Paused), Some(identity)) = (&removed, &identity) {
         // Its approvals go too (§1.3), with any completion record.
         if let Err(e) = forget_completions(shared, identity) {

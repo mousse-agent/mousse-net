@@ -64,6 +64,9 @@ pub(super) fn revoke_local(shared: &Shared, id: &Value, map: &Map<String, Value>
         })
         .flatten();
     let removed = shared.removal.remove(grant);
+    if matches!(removed, Ok(Removed::Saved | Removed::Paused)) {
+        super::super::reset_unserved(shared);
+    }
     if let (Ok(Removed::Saved | Removed::Paused), Some(identity)) = (&removed, forget) {
         let mut fields = Map::new();
         fields.insert(
