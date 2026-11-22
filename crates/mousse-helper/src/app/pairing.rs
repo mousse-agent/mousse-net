@@ -19,7 +19,12 @@
 //!   {}` reports each way's state, reason and routes.
 //! - **Joiner:** `join {ticket, arrival: scan|link, approved, pinned}`,
 //!   `join.code`, `join.cancel`, `join.status`, `join.ack`; events
-//!   `join.progress`, `join.code_needed`, `join.attempt_failed`. An
+//!   `join.progress`, `join.code_needed`, `join.attempt_failed`.
+//!   `join.check {ticket, arrival}` reports what a join would refuse and
+//!   what it would do with each hint, with no network traffic (see
+//!   [`check`]); it shares its decisions with `join` ([`admit`],
+//!   [`mousse_net_io::Caller::check_join`] and
+//!   [`super::paths::hint_decision`]). An
 //!   in-person ticket needs `arrival: scan`. A `pinned` in-person join is
 //!   one the app recorded before it started: the ticket's host counts as
 //!   pinned, and repeated past the ticket's expiry it learns whether a
@@ -61,12 +66,14 @@ use crate::peer::{JoinRoute, JoinedVia};
 use crate::revoke::Removed;
 
 mod availability;
+mod check;
 
 /// The requests this module answers.
-pub const OPS: [&str; 19] = [
+pub const OPS: [&str; 20] = [
     "config.set",
     "invite.create",
     "routes.available",
+    "join.check",
     "invite.cancel",
     "approval.answer",
     "join",
@@ -202,6 +209,10 @@ pub fn on_request(shared: &Arc<Shared>, id: Value, op: &str, map: &Map<String, V
         },
         "invite.create" => invite(shared, &id, map),
         "routes.available" => availability::available(shared, &id, map),
+        "join.check" => match check::check(shared, &id, map) {
+            Some(reply) => reply,
+            None => return,
+        },
         "invite.cancel" => match parse_invitation(str_field(map, "invitation")) {
             Some(invitation) => {
                 shared.host.cancel(&invitation);
