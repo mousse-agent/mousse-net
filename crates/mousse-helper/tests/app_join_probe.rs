@@ -548,15 +548,16 @@ fn a_cancel_drops_the_dial_and_frees_the_slot_before_its_reply() {
     soon("the probe's connection to close", PROMPTLY, || {
         closed.load(Ordering::SeqCst) == 1
     });
+    // The new probe either dials or is answered (`busy`) at once.
+    wait_until("the new probe to dial or be answered", || {
+        taken.load(Ordering::SeqCst) == 2 || answers(&b, again) > 0
+    });
     assert_eq!(
         answers(&b, again),
         0,
         "the cancelled probe kept its slot: {:?}",
         b.st().messages.last()
     );
-    wait_until("the new probe to dial", || {
-        taken.load(Ordering::SeqCst) == 2
-    });
     b.call("join.probe.cancel", json!({"probe": again}));
 }
 
