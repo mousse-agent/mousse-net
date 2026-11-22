@@ -1,9 +1,12 @@
 //! Pairing both ways, grants and peers on the app channel (Phase 1a §2.3,
 //! §5.1 and §5.4; "Send link", Phase 1b §5 and §7).
 //!
-//! - **Host:** `invite.create {kind: in_person|link}`, `invite.cancel`,
-//!   `approval.answer`; events `approval`, `invite.code` (a link's code,
-//!   each time a new one shows), `enrolled`, `invite.ended`.
+//! - **Host:** `invite.create {kind: in_person|link, role?}`,
+//!   `invite.cancel`, `approval.answer {request, yes, role?}`; events
+//!   `approval`, `invite.code` (a link's code, each time a new one shows),
+//!   `enrolled` (with the grant's role), `invite.ended`. An invitation's
+//!   role is `owner` unless `role` names another; an in-person answer may
+//!   choose the role of its one grant (see [`roles`]).
 //! - **Joiner:** `join {ticket, arrival: scan|link, approved, pinned}`,
 //!   `join.code`, `join.cancel`, `join.status`, `join.ack`; events
 //!   `join.progress`, `join.code_needed`, `join.attempt_failed`. An
@@ -17,9 +20,12 @@
 //!   owner approved at Connect (Phase 1b §1.3): only those and private
 //!   literals are dialled, and a join that pairs stores them as `ticket`
 //!   approvals (a link join through its completion record).
-//! - **Grants:** `grants.list`, `grant.add` (idempotent), `grant.remove`
-//!   (journaled, see [`crate::revoke`]); events `grant.closed`,
-//!   `store.failed`, `net.paused` and `net.resumed`.
+//! - **Grants:** `grants.list` (each with its role revision), `grant.add
+//!   {role?}` (idempotent; an existing grant keeps its role),
+//!   `grant.set_role` (an in-place role edit, see [`roles`]),
+//!   `grant.remove` (journaled, see [`crate::revoke`]); events
+//!   `grant.closed`, `grant.role_changed`, `store.failed`, `net.paused`
+//!   and `net.resumed`.
 //! - **Peers:** `peers.list`, `peer.add` (idempotent), `peer.forget`,
 //!   `peer.addresses.set`, `approvals.list`, and `dial`, whose `conn.up`
 //!   carries the role the peer gave this device and the route it came up on
@@ -30,7 +36,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, MutexGuard};
 
-use mousse_net_core::grants::{Grant, GrantId};
+use mousse_net_core::grants::{Grant, GrantId, Role};
 use mousse_net_core::pairing::{Arrival, InvitationId, InvitationKind, PairingCode, Ticket};
 use mousse_net_core::ErrorCode;
 use mousse_net_io::store::{
@@ -47,8 +53,10 @@ use crate::applog;
 use crate::peer::{JoinRoute, JoinedVia};
 use crate::revoke::Removed;
 
+mod roles;
+
 /// The requests this module answers.
-pub const OPS: [&str; 18] = [
+pub const OPS: [&str; 19] = [
     "config.set",
     "invite.create",
     "invite.cancel",
@@ -59,6 +67,7 @@ pub const OPS: [&str; 18] = [
     "join.status",
     "join.ack",
     "grants.list",
+    "grant.set_role",
     "grant.add",
     "grant.remove",
     "peers.list",
@@ -145,6 +154,7 @@ fn grant_json(shared: &Shared, g: &Grant) -> Value {
         "identity": hex(g.identity.as_bytes()),
         "name": g.name,
         "role": g.role.as_str(),
+        "revision": g.revision,
         "granted_at": g.granted_at.secs(),
         "expires_at": g.expires_at.map(|t| t.secs()),
         "receipt": g.enrolled_by.as_ref().map(invitation_hex),
@@ -213,6 +223,7 @@ pub fn on_request(shared: &Arc<Shared>, id: Value, op: &str, map: &Map<String, V
                 .collect();
             json!({"re": id, "grants": grants})
         }
+        "grant.set_role" => roles::set_role(shared, &id, map),
         "grant.add" => add_grant(shared, &id, map),
         "grant.remove" => remove_grant(shared, &id, map),
         "approvals.list" => super::paths::list_approvals(shared, &id, map),
@@ -257,6 +268,11 @@ fn invite(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
         Some("link") => InvitationKind::SendLink,
         Some(_) => return error(id, "bad_request", "kind is in_person or link"),
     };
+    // Absent: owner, as before roles could be chosen.
+    let role = match roles::optional_role(map) {
+        Ok(role) => role.unwrap_or_else(Role::owner),
+        Err(e) => return error(id, "bad_request", e),
+    };
     // What the listener serves now (Phase 1b §1.5).
     let mut routes = shared
         .info
@@ -271,7 +287,7 @@ fn invite(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
             routes.push(hint);
         }
     }
-    match shared.host.invite(kind, routes.clone()) {
+    match shared.host.invite_as(kind, routes.clone(), role) {
         Ok(created) => {
             super::relay::on_invite(shared, &created.ticket);
             let invitation = created.ticket.invitation;
@@ -300,6 +316,13 @@ fn answer(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
         return error(id, "bad_request", "approval.answer needs request");
     };
     let yes = map.get("yes").and_then(Value::as_bool).unwrap_or(false);
+    // Checked before the request is taken, so a bad answer leaves it
+    // waiting. A role only makes sense with yes.
+    let role = match roles::optional_role(map) {
+        Ok(Some(_)) if !yes => return error(id, "bad_request", "a role goes with yes only"),
+        Ok(role) => role,
+        Err(e) => return error(id, "bad_request", e),
+    };
     let Some(req) = state(shared).approvals.remove(request) else {
         return error(id, "no_request", "no such approval request is waiting");
     };
@@ -307,7 +330,7 @@ fn answer(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
         shared.host.decline(&req.invitation);
         return json!({"re": id});
     }
-    match shared.host.approve(&req) {
+    match shared.host.approve_as(&req, role) {
         Ok(()) => json!({"re": id}),
         Err(e) => error(id, "stale", e.to_string()),
     }
@@ -764,8 +787,22 @@ fn add_grant(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
             None => return error(id, "bad_request", "receipt is an invitation id (hex)"),
         },
     };
-    match shared.host.add_grant(identity, name.to_owned(), receipt) {
-        Ok((grant, already)) => json!({"re": id, "grant": grant.id.0, "already": already}),
+    let role = match roles::optional_role(map) {
+        Ok(role) => role,
+        Err(e) => return error(id, "bad_request", e),
+    };
+    // Absent: owner for a new grant, as before roles could be chosen. An
+    // existing grant comes back with its own role.
+    match shared
+        .host
+        .add_grant_as(identity, name.to_owned(), receipt, role)
+    {
+        Ok((grant, already)) => json!({
+            "re": id,
+            "grant": grant.id.0,
+            "role": grant.role.as_str(),
+            "already": already,
+        }),
         Err(e @ NetError::Store(_)) => error(
             id,
             "store_failed",
@@ -951,6 +988,7 @@ pub fn host_event(shared: &Shared, event: HostEvent) {
             invitation,
             grant,
             identity,
+            role,
         } => {
             applog::line(format!(
                 "enrolled grant {} {}",
@@ -966,8 +1004,19 @@ pub fn host_event(shared: &Shared, event: HostEvent) {
                 "invitation": invitation_hex(&invitation),
                 "grant": grant.0,
                 "identity": hex(identity.as_bytes()),
+                "role": role.as_str(),
             })
         }
+        HostEvent::RoleChanged {
+            grant,
+            role,
+            revision,
+        } => json!({
+            "ev": "grant.role_changed",
+            "grant": grant.0,
+            "role": role.as_str(),
+            "revision": revision,
+        }),
         HostEvent::InvitationEnded { invitation, reason } => {
             super::relay::on_invitation_ended(shared, &invitation);
             let mut st = state(shared);

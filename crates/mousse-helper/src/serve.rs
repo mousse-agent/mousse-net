@@ -20,7 +20,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use mousse_net_core::grants::GrantId;
+use mousse_net_core::grants::{GrantId, Role};
 use mousse_net_core::identity::{IdentityPublicKey, SoftwareKey};
 use mousse_net_core::pairing::{CpaceExchangeFactory, InvitationId, InvitationKind};
 use mousse_net_core::ErrorCode;
@@ -683,7 +683,7 @@ async fn ws_connection(
         Some(app) => {
             app.inbound(conn, RouteKind::Ws, None, None).await;
         }
-        None => serve_streams(conn, addr).await,
+        None => serve_streams(&host, conn, addr).await,
     }
 }
 
@@ -725,17 +725,37 @@ async fn handle_connection(
     };
     // The socket that accepted it closing ends it too.
     tokio::select! {
-        () = serve_streams(conn, addr) => {}
+        () = serve_streams(&host, conn, addr) => {}
         _ = closing.wait_for(|closed| *closed) => {}
     }
 }
 
-/// Standalone `serve`: terminals and `helper-info` for a live connection.
-async fn serve_streams(conn: mousse_net_io::Connection, addr: SocketAddr) {
+/// The roles standalone `serve` opens a terminal for. A terminal is a shell
+/// as this user, so only the owner's own devices get one.
+pub const TERMINAL_ROLES: &[&str] = &[Role::OWNER];
+
+/// Whether standalone `serve` opens a terminal for `conn` now: it is live
+/// under a served grant whose role [`TERMINAL_ROLES`] names. Read when the
+/// stream arrives, so an edit made since the connection came up counts.
+fn may_open_terminal(host: &Host, conn: &mousse_net_io::Connection) -> bool {
+    // Must-fail control (tests only): the role is not looked at.
+    host.grant_of(conn.id()).is_some_and(|g| {
+        cfg!(mousse_control = "restricted-grant-opens-standalone-terminal")
+            || TERMINAL_ROLES.contains(&g.role.as_str())
+    })
+}
+
+/// Standalone `serve`: terminals (for [`TERMINAL_ROLES`]) and
+/// `helper-info` for a live connection.
+async fn serve_streams(host: &Host, conn: mousse_net_io::Connection, addr: SocketAddr) {
     let peer = short_id(conn.peer());
     print_line(format!("connected {peer} from {addr}"));
     while let Some(stream) = conn.accept_stream().await {
         if stream.label() == term::LABEL {
+            if !may_open_terminal(host, &conn) {
+                stream.writer.reset(ErrorCode::RefusedStream);
+                continue;
+            }
             tokio::spawn(term::serve(stream));
         } else if stream.label() == INFO_LABEL {
             tokio::spawn(send_info(stream));
@@ -821,11 +841,13 @@ fn on_event(state: &State, event: HostEvent) {
             invitation,
             grant,
             identity,
+            role,
         } => {
             print_line(format!(
-                "enrolled grant {} {}",
+                "enrolled grant {} {} as {}",
                 grant.0,
-                short_id(&identity)
+                short_id(&identity),
+                role.as_str()
             ));
             if let Some(tx) = waiter(&invitation) {
                 let _ = tx.send(
@@ -845,6 +867,15 @@ fn on_event(state: &State, event: HostEvent) {
                 grant.0
             ));
         }
+        HostEvent::RoleChanged {
+            grant,
+            role,
+            revision,
+        } => print_line(format!(
+            "grant {} is {} now (revision {revision})",
+            grant.0,
+            role.as_str()
+        )),
         HostEvent::StoreFailed(e) => print_line(format!("saving grants failed: {e}")),
     }
 }

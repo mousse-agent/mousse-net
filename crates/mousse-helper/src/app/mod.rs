@@ -85,7 +85,11 @@ const PROTO: (u64, u64) = (1, 2);
 /// What this helper implements beyond 1.1, listed in the `hello` reply of a
 /// 1.2 channel. An older helper ignores a field it does not know, so an app
 /// reads this list before it sends one.
-pub const FEATURES: &[&str] = &[];
+pub const FEATURES: &[&str] = &[GRANT_ROLES];
+
+/// The feature an app lists in its hello `features` to take streams of
+/// grants whose role is not `owner`.
+const GRANT_ROLES: &str = "grant-roles";
 
 /// The stream labels an inbound connection passes on to the app (§3.2).
 pub const LABELS: [&str; 6] = [
@@ -229,14 +233,18 @@ struct StreamEntry {
     /// budget).
     tx_window: u64,
     tx_done: bool,
-    /// A stream the host opened on this computer's own connection to it
-    /// (minor 3): the grant of this computer's it is served under. It is
-    /// reset when that grant stops being live.
-    served: Option<u64>,
+    /// A stream the peer opened, on its connection to this computer or (a
+    /// host-opened stream, minor 3) on this computer's own connection to
+    /// it: the id and revision of the grant of this computer's it is served
+    /// under. It is reset with `GRANT_REVOKED` when that grant stops being
+    /// live, and with `CANCELLED` when its role is edited.
+    served: Option<(u64, u64)>,
 }
 
 struct Core {
     hello: bool,
+    /// The app opted in to `grant-roles` at its first hello.
+    roles: bool,
     out: Out,
     budget: Budget,
     conns: HashMap<u64, ConnEntry>,
@@ -311,6 +319,7 @@ impl App {
         let shared = Arc::new(Shared {
             core: Mutex::new(Core {
                 hello: false,
+                roles: false,
                 out: Out::default(),
                 budget: Budget::new(
                     limits.app_credit_budget_bytes(),
@@ -748,6 +757,8 @@ impl Shared {
                 let reply = self.hello(&id, &map);
                 if reply.get("error").is_none() && !core.hello {
                     core.hello = true;
+                    // Fixed for the channel at its first hello.
+                    core.roles = opts_into_roles(&reply, &map);
                     // Keep paired hosts connected from now on.
                     self.keep.kick(paths::Kick::Reset(None));
                 }
@@ -1114,6 +1125,34 @@ impl Shared {
     }
 }
 
+/// Whether the app of a channel takes streams of grants whose role is not
+/// `owner`: its hello `features` listed `grant-roles` on a channel agreed at
+/// 1.2 or later. Anything else (an older minor, no list, a list without it,
+/// a malformed one) is no.
+fn opts_into_roles(reply: &Value, request: &Map<String, Value>) -> bool {
+    let agreed = reply
+        .get("proto")
+        .and_then(|p| p.get(1))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    agreed >= 2
+        && request
+            .get("features")
+            .and_then(Value::as_array)
+            .is_some_and(|f| f.iter().any(|v| v.as_str() == Some(GRANT_ROLES)))
+}
+
+/// Whether a stream served under `grant` may reach this channel's app: an
+/// `owner` grant always does, another role only when the app opted in to
+/// `grant-roles`.
+fn may_serve(core: &Core, grant: &mousse_net_core::grants::Grant) -> bool {
+    // Must-fail control (tests only): an app that never opted in gets the
+    // traffic of any role.
+    grant.role.as_str() == mousse_net_core::grants::Role::OWNER
+        || core.roles
+        || cfg!(mousse_control = "restricted-grant-served-to-legacy-app")
+}
+
 /// End a stream here: queued frames go, held credit returns, its pumps
 /// stop.
 fn drop_stream(core: &mut Core, handle: u32) {
@@ -1251,13 +1290,37 @@ fn both_ways(conn: &Connection) -> bool {
 /// under, so a removal either sees the stream or is seen here.
 fn serve_host_stream(shared: &Arc<Shared>, no: u64, conn: &Connection, stream: MuxStream) {
     let both = both_ways(conn) && LABELS.contains(&stream.label());
-    let mut core = lock(&shared.core);
+    let core = lock(&shared.core);
     let grant = if both && !shared.removal.is_paused() {
         shared.host.live_grant(conn.peer())
     } else {
         None
     };
-    let Some(grant) = grant else {
+    deliver(shared, core, no, grant, stream);
+}
+
+/// A stream the caller opened on its connection to this computer: passed
+/// to the app as `stream.incoming` with the grant the connection is live
+/// under, read under the core lock a role edit cuts streams under. A
+/// connection no longer live under a served grant (closed by a removal or
+/// a role edit, or its grant waiting for an edit to settle) refuses it.
+fn serve_peer_stream(shared: &Arc<Shared>, no: u64, conn: &Connection, stream: MuxStream) {
+    let core = lock(&shared.core);
+    let grant = shared.host.grant_of(conn.id());
+    deliver(shared, core, no, grant, stream);
+}
+
+/// Hand `stream` to the app under `grant`, with the grant's id, role and
+/// revision, or refuse it: without a grant, and for a grant whose role is
+/// not `owner` when the app did not opt in to `grant-roles`.
+fn deliver(
+    shared: &Arc<Shared>,
+    mut core: MutexGuard<'_, Core>,
+    no: u64,
+    grant: Option<mousse_net_core::grants::Grant>,
+    stream: MuxStream,
+) {
+    let Some(grant) = grant.filter(|g| may_serve(&core, g)) else {
         drop(core);
         stream.writer.reset(ErrorCode::RefusedStream);
         return;
@@ -1268,7 +1331,7 @@ fn serve_host_stream(shared: &Arc<Shared>, no: u64, conn: &Connection, stream: M
         return;
     };
     if let Some(entry) = core.streams.get_mut(&handle) {
-        entry.served = Some(grant.id.0);
+        entry.served = Some((grant.id.0, grant.revision));
     }
     let event = json!({
         "ev": "stream.incoming",
@@ -1278,8 +1341,45 @@ fn serve_host_stream(shared: &Arc<Shared>, no: u64, conn: &Connection, stream: M
         "class": class_name(class),
         "grant": grant.id.0,
         "role": grant.role.as_str(),
+        "revision": grant.revision,
     });
     core.out.json(&event);
+    shared.queued(&core);
+}
+
+/// Cut what this channel serves `identity` under its grant `grant` after
+/// that grant's role was edited to `revision`, under the core lock streams
+/// are delivered under: every stream served under an older revision is
+/// reset with `CANCELLED` and dropped with what was queued for it, and
+/// every outbound connection to `identity` (each may carry streams the
+/// peer opens under the grant) closes with `CANCELLED`. The host closed
+/// the inbound connections bound to the grant already.
+fn cut_role(shared: &Shared, grant: u64, revision: u64, identity: &IdentityPublicKey) {
+    let mut core = lock(&shared.core);
+    // Must-fail control (tests only): streams and paths under the old role
+    // stay.
+    if cfg!(mousse_control = "role-edit-keeps-reverse-path") {
+        return;
+    }
+    let stale: Vec<(u32, StreamWriter)> = core
+        .streams
+        .iter()
+        .filter(|(_, s)| s.served.is_some_and(|(g, r)| g == grant && r != revision))
+        .map(|(h, s)| (*h, s.writer.clone()))
+        .collect();
+    for (handle, writer) in stale {
+        writer.reset(ErrorCode::Cancelled);
+        drop_stream(&mut core, handle);
+        let event =
+            json!({"ev": "stream.reset", "handle": handle, "code": ErrorCode::Cancelled.name()});
+        core.out.json(&event);
+    }
+    for entry in core.conns.values() {
+        if !entry.inbound && entry.identity == *identity {
+            entry.conn.close(ErrorCode::Cancelled);
+        }
+    }
+    core.regrant(&shared.limits);
     shared.queued(&core);
 }
 
@@ -1296,24 +1396,40 @@ async fn watch_served(shared: Arc<Shared>) {
         }
         let mut core = lock(&shared.core);
         let paused = shared.removal.is_paused();
-        let gone: Vec<(u32, StreamWriter)> = core
+        let gone: Vec<(u32, StreamWriter, ErrorCode)> = core
             .streams
             .iter()
             .filter_map(|(h, s)| {
-                let grant = s.served?;
+                let (grant, revision) = s.served?;
                 let identity = core.conns.get(&s.conn)?.identity;
-                let live = !paused
-                    && shared
+                let now = if paused {
+                    None
+                } else {
+                    shared
                         .host
                         .live_grant(&identity)
-                        .is_some_and(|g| g.id.0 == grant);
-                (!live).then(|| (*h, s.writer.clone()))
+                        .filter(|g| g.id.0 == grant)
+                };
+                // The grant is gone (or not served): revoked. Its role was
+                // edited: cancelled. Must-fail control (tests only): only
+                // the grant id is compared.
+                let code = match now {
+                    None => ErrorCode::GrantRevoked,
+                    Some(g)
+                        if g.revision != revision
+                            && !cfg!(mousse_control = "role-edit-keeps-reverse-path") =>
+                    {
+                        ErrorCode::Cancelled
+                    }
+                    Some(_) => return None,
+                };
+                Some((*h, s.writer.clone(), code))
             })
             .collect();
-        for (handle, writer) in gone {
-            writer.reset(ErrorCode::GrantRevoked);
+        for (handle, writer, code) in gone {
+            writer.reset(code);
             drop_stream(&mut core, handle);
-            let event = json!({"ev": "stream.reset", "handle": handle, "code": ErrorCode::GrantRevoked.name()});
+            let event = json!({"ev": "stream.reset", "handle": handle, "code": code.name()});
             core.out.json(&event);
         }
         core.regrant(&shared.limits);
@@ -1366,20 +1482,7 @@ async fn conn_task(shared: Arc<Shared>, no: u64, conn: Arc<Connection>, inbound:
                 // for it (wire.md 8, step 5). Before, it opens none.
                 serve_host_stream(&shared, no, &conn, stream);
             } else if LABELS.contains(&stream.label()) {
-                let label = stream.label().to_owned();
-                let class = stream.class();
-                let mut core = lock(&shared.core);
-                if let Some(handle) = shared.add_stream(&mut core, no, stream, false) {
-                    let event = json!({
-                        "ev": "stream.incoming",
-                        "conn": no,
-                        "handle": handle,
-                        "label": label,
-                        "class": class_name(class),
-                    });
-                    core.out.json(&event);
-                    shared.queued(&core);
-                }
+                serve_peer_stream(&shared, no, &conn, stream);
             } else if stream.label() == crate::serve::INFO_LABEL {
                 tokio::spawn(crate::serve::send_info(stream));
             } else {

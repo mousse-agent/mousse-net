@@ -103,7 +103,13 @@ pub async fn publish_grants(
     let (_reader, writer) = stream.split();
     loop {
         changes.borrow_and_update();
-        let owner = conn.upgrade().is_some_and(|c| engine.is_owner_conn(&c));
+        // A demotion closes the connection with `CANCELLED` under the host
+        // lock (which drops what was queued on it), so a list written
+        // after this check passed cannot reach a demoted caller; a change
+        // seen here ends the stream. Must-fail control (tests only):
+        // ownership is checked at the start only.
+        let owner = cfg!(mousse_control = "demoted-owner-keeps-grants")
+            || conn.upgrade().is_some_and(|c| engine.is_owner_conn(&c));
         if !owner {
             writer.reset(ErrorCode::Cancelled);
             return;
