@@ -70,7 +70,14 @@
         mousse_control = "done-pin-only",
         mousse_control = "replay-after-removal",
         mousse_control = "join-ignores-removal",
-        mousse_control = "removal-leaves-pending"
+        mousse_control = "removal-leaves-pending",
+        mousse_control = "role-edit-keeps-reverse-path",
+        mousse_control = "restricted-grant-served-to-legacy-app",
+        mousse_control = "restricted-grant-opens-standalone-terminal",
+        mousse_control = "demoted-owner-keeps-grants",
+        mousse_control = "role-edit-keeps-queued-announcement",
+        mousse_control = "role-edit-delivers-on-closing-path",
+        mousse_control = "suspended-reads-as-revoked"
     )
 ))]
 compile_error!("a mousse_control build has a deliberate defect and is for tests only; build it without --release");
@@ -148,6 +155,13 @@ compile_error!("test-in-person lets a typed ticket count as scanned from the hos
     mousse_control = "replay-after-removal",
     mousse_control = "join-ignores-removal",
     mousse_control = "removal-leaves-pending",
+    mousse_control = "role-edit-keeps-reverse-path",
+    mousse_control = "restricted-grant-served-to-legacy-app",
+    mousse_control = "restricted-grant-opens-standalone-terminal",
+    mousse_control = "demoted-owner-keeps-grants",
+    mousse_control = "role-edit-keeps-queued-announcement",
+    mousse_control = "role-edit-delivers-on-closing-path",
+    mousse_control = "suspended-reads-as-revoked",
     feature = "test-in-person"
 ))]
 const _: () = {

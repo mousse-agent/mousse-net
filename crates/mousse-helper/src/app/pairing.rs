@@ -223,7 +223,10 @@ pub fn on_request(shared: &Arc<Shared>, id: Value, op: &str, map: &Map<String, V
                 .collect();
             json!({"re": id, "grants": grants})
         }
-        "grant.set_role" => roles::set_role(shared, &id, map),
+        "grant.set_role" => match roles::set_role(shared, &id, map) {
+            Some(reply) => reply,
+            None => return,
+        },
         "grant.add" => add_grant(shared, &id, map),
         "grant.remove" => remove_grant(shared, &id, map),
         "approvals.list" => super::paths::list_approvals(shared, &id, map),

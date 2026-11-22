@@ -498,6 +498,14 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
         grants: &mut GrantTable,
         now: UnixTime,
     ) -> Result<Vec<HostAction>, HostPairingError> {
+        // Must-fail control (tests only): the chosen role is kept on the
+        // invitation, before the answer is known to be for a joiner, so a
+        // failed answer's role reaches the next joiner.
+        if cfg!(mousse_control = "answer-role-sticks-to-invitation") {
+            if let (Some(inv), Some(role)) = (self.invitations.get_mut(invitation), role.clone()) {
+                inv.params.role = role;
+            }
+        }
         let inv = self
             .invitations
             .get(invitation)

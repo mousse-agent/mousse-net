@@ -7,7 +7,10 @@
 //! A is the host; B (and C) joined it.
 
 mod common;
+#[path = "common/relay.rs"]
+mod relay_fixture;
 
+use std::path::Path;
 use std::time::Duration;
 
 use common::*;
@@ -128,6 +131,31 @@ fn the_role_chosen_with_the_answer_is_the_grants_role() {
     assert_eq!((&g["role"], &g["revision"]), (&json!("member"), &json!(1)));
 }
 
+/// A "Send link" invitation made with a role other than `owner` enrolls
+/// with that role: the grant, `enrolled` and the joiner's reply carry it.
+#[test]
+fn a_link_invitation_keeps_its_role_on_enrollment() {
+    let (_ae, mut a, _be, mut b) = started("grrl2");
+    let invite = a.call("invite.create", json!({"kind": "link", "role": "viewer"}));
+    let inv = invite["invitation"].as_str().unwrap().to_owned();
+    let route = invite["routes"][0].as_str().unwrap().to_owned();
+    let id = b.start(
+        "join",
+        json!({"ticket": invite["uri"], "arrival": "link", "approved": [route]}),
+    );
+    b.event("join.code_needed", |m| m["invitation"] == inv.as_str());
+    b.call(
+        "join.code",
+        json!({"invitation": inv, "code": invite["code"]}),
+    );
+    let join = b.reply(id);
+    assert_eq!(join["role"], "viewer", "{join}");
+    let enrolled = a.event("enrolled", |m| m["invitation"] == inv.as_str());
+    assert_eq!(enrolled["role"], "viewer", "{enrolled}");
+    let g = grant_of(&mut a, &b.identity);
+    assert_eq!((&g["role"], &g["revision"]), (&json!("viewer"), &json!(1)));
+}
+
 #[test]
 fn without_a_chosen_role_the_grant_takes_the_invitations() {
     let (_ae, mut a, _be, mut b) = started("grrb");
@@ -226,6 +254,95 @@ fn a_role_edit_cancels_where_a_removal_revokes() {
     assert_eq!(down["reason"], "grant_revoked", "{down}");
 }
 
+/// B's caller key on A, and the pair secret A answered it with, belong to
+/// B's grant, which an edit keeps in place: after the edit and B's new
+/// path, A holds the same key with the same salt (so the same pair
+/// secret), and B the same sealed secret, without a new `peer.keys`.
+#[test]
+fn an_edit_keeps_the_caller_key_and_the_pair_secret() {
+    let relay = relay_fixture::TestRelay::start();
+    let (ae, mut a, be, mut b) = started("grrs");
+    let enrolled = a.call("relay.enroll", json!({"link": relay.link()}));
+    assert_eq!(enrolled["relay"]["state"], "registered", "{enrolled}");
+    pair_as(&mut a, &mut b, None, None);
+    b.event("peer.keys", |m| m["identity"] == a.identity.as_str());
+    let a_identity = a.identity.clone();
+    let keys = || -> Vec<Value> {
+        let file: Value =
+            serde_json::from_slice(&std::fs::read(ae.dir.join("relay-grants.json")).unwrap())
+                .unwrap();
+        file["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|k| json!([k["grant"], k["identity"], k["caller"], k["salt"]]))
+            .collect()
+    };
+    let secret = || -> Value {
+        let file: Value =
+            serde_json::from_slice(&std::fs::read(be.dir.join("relay-peers.json")).unwrap())
+                .unwrap();
+        file["peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["identity"] == a_identity.as_str())
+            .map(|p| p["pair_secret"].clone())
+            .unwrap_or(Value::Null)
+    };
+    let (keys_before, secret_before) = (keys(), secret());
+    assert_eq!(keys_before.len(), 1, "{keys_before:?}");
+    assert!(secret_before.is_string(), "{secret_before}");
+
+    let grant = grant_of(&mut a, &b.identity)["grant"].clone();
+    a.call(
+        "grant.set_role",
+        json!({"grant": grant, "expected_revision": 1, "role": "member"}),
+    );
+    // B's new path confirms its key again.
+    outbound(&b, &a.identity, 1);
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(keys(), keys_before);
+    assert_eq!(secret(), secret_before);
+    assert_eq!(b.events("peer.keys").len(), 1);
+    let g = grant_of(&mut a, &b.identity);
+    assert_eq!(
+        (&g["grant"], &g["relay"]),
+        (&grant, &json!("listed")),
+        "{g}"
+    );
+}
+
+/// While a removal that failed to save holds networking paused, a role
+/// edit is refused as `paused` and changes nothing.
+#[test]
+fn a_role_edit_while_a_removal_is_not_saved_is_paused() {
+    let (ae, mut a, _be, mut b) = started("grrp");
+    pair_as(&mut a, &mut b, None, None);
+    let (_ce, mut c) = {
+        let end = Endpoint::init("grrpc");
+        let mut app = end.app("peerC", &[]);
+        app.hello();
+        (end, app)
+    };
+    pair_as(&mut a, &mut c, None, None);
+    let grant_b = grant_of(&mut a, &b.identity)["grant"].clone();
+    let grant_c = grant_of(&mut a, &c.identity)["grant"].clone();
+    // The grant table cannot be written: a directory is in its way.
+    let table = ae.dir.join("grants.json");
+    std::fs::remove_file(&table).unwrap();
+    std::fs::create_dir_all(table.join("in-the-way")).unwrap();
+    let removed = a.call("grant.remove", json!({"grant": grant_c}));
+    assert_eq!(removed["paused"], true, "{removed}");
+    let reply = a.request(
+        "grant.set_role",
+        json!({"grant": grant_b, "expected_revision": 1, "role": "member"}),
+    );
+    assert_eq!(reply["error"], "paused", "{reply}");
+    let g = grant_of(&mut a, &b.identity);
+    assert_eq!((&g["role"], &g["revision"]), (&json!("owner"), &json!(1)));
+}
+
 #[test]
 fn a_stale_revision_is_refused_and_the_same_role_is_no_change() {
     let (_ae, mut a, _be, mut b) = started("grrf");
@@ -311,6 +428,32 @@ fn a_1_2_app_that_did_not_opt_in_never_gets_streams_of_a_restricted_grant() {
     refused_to(&mut a, &mut b);
 }
 
+/// The other direction: B's app did not opt in to `grant-roles`, and B
+/// grants A the role `member`. A call A opens on B's connection to it is
+/// refused, and B's app never gets it.
+#[test]
+fn a_call_from_the_host_under_a_restricted_grant_is_refused_to_an_app_that_did_not_opt_in() {
+    let (_ae, mut a, _be, mut b) = started("grrm");
+    let p = pair_as(&mut a, &mut b, None, None);
+    let added = b.call(
+        "grant.add",
+        json!({"identity": a.identity, "name": "hostA", "role": "member"}),
+    );
+    assert_eq!(added["role"], "member", "{added}");
+    let h = b.open(p.b_conn, "mousse.rpc", "interactive");
+    b.send(h, b"first", true);
+    incoming(&a, p.a_conn, 0);
+    let call = a.open(p.a_conn, "mousse.rpc", "interactive");
+    a.send(call, b"for an owner only", false);
+    let reset = a.event("stream.reset", |m| m["handle"] == call);
+    assert_eq!(reset["code"], "refused_stream", "{reset}");
+    assert!(
+        b.events("stream.incoming").is_empty(),
+        "{:?}",
+        b.events("stream.incoming")
+    );
+}
+
 /// Streams in both directions carry the grant they are served under: on
 /// A, B's grant there; on B, its grant for A.
 #[test]
@@ -337,6 +480,107 @@ fn every_stream_carries_its_grant_role_and_revision() {
         (&at_b["grant"], &at_b["role"], &at_b["revision"]),
         (&added["grant"], &json!("owner"), &json!(1)),
         "{at_b}"
+    );
+}
+
+/// A's app has stopped reading: B's bulk fills what A's helper writes to
+/// it, and a second stream B opens is announced behind it. A narrows B's
+/// grant meanwhile. Once A reads again, the cut stream's announcement
+/// never arrives: the app hears of no stream under the old revision after
+/// the edit, and of no reset for a stream it never saw.
+#[test]
+fn an_announcement_waiting_under_the_old_role_never_reaches_the_app() {
+    let (_ae, mut a, _be, mut b) = started("grrq");
+    let p = pair_as(&mut a, &mut b, None, None);
+    let grant = grant_of(&mut a, &b.identity)["grant"].clone();
+    let bulk = b.open(p.b_conn, "mousse.blob", "bulk");
+    let first = a.incoming(p.a_conn, 0);
+    a.accept(first);
+    a.credit(first, 16 << 20);
+    a.pause();
+    let size = 6 << 20;
+    b.send(bulk, &pattern(size, 7), false);
+    b.wait("the bulk to go", WAIT, |st| {
+        (st.tx[&bulk].sent == size as u64).then_some(())
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    let late = b.open(p.b_conn, "mousse.rpc", "interactive");
+    b.send(late, b"late", false);
+    std::thread::sleep(Duration::from_millis(500));
+    let edit = a.start(
+        "grant.set_role",
+        json!({"grant": grant, "expected_revision": 1, "role": "member"}),
+    );
+    std::thread::sleep(Duration::from_millis(1000));
+    a.resume();
+    let reply = a.reply(edit);
+    assert_eq!(reply["changed"], json!(true), "{reply}");
+    a.event("conn.down", |m| m["conn"] == p.a_conn);
+    let announced: Vec<Value> = a
+        .events("stream.incoming")
+        .into_iter()
+        .filter(|m| m["conn"] == p.a_conn)
+        .collect();
+    assert_eq!(
+        announced.len(),
+        1,
+        "a stream cut by the edit was announced: {announced:?}"
+    );
+    let resets: Vec<Value> = a
+        .events("stream.reset")
+        .into_iter()
+        .filter(|m| m["handle"] != json!(first))
+        .collect();
+    assert!(resets.is_empty(), "{resets:?}");
+}
+
+/// A opens a call on B's connection to it just before B narrows its grant
+/// for A; B's helper has accepted the call and not served it yet (a test
+/// hold keeps it there, and keeps the closed connection's entry). The
+/// edit cut that path: the call is never delivered on it, under either
+/// revision.
+#[test]
+fn a_call_waiting_on_a_cut_path_is_never_delivered() {
+    let a_end = Endpoint::init("grrka");
+    let b_end = Endpoint::init("grrkb");
+    let mut a = a_end.app("hostA", &[]);
+    hello_roles(&mut a);
+    let mut b = b_end.app_raw(
+        "peerB",
+        &[],
+        0,
+        &[
+            ("MOUSSE_HELPER_TEST_STREAM_HOLD_MS", Path::new("1500")),
+            ("MOUSSE_HELPER_TEST_DOWN_HOLD_MS", Path::new("5000")),
+        ],
+    );
+    hello_roles(&mut b);
+    let p = pair_as(&mut a, &mut b, None, None);
+    let added = b.call(
+        "grant.add",
+        json!({"identity": a.identity, "name": "hostA"}),
+    );
+    let h = b.open(p.b_conn, "mousse.rpc", "interactive");
+    b.send(h, b"first", true);
+    incoming(&a, p.a_conn, 0);
+    let call = a.open(p.a_conn, "mousse.rpc", "interactive");
+    a.send(call, b"late call", false);
+    std::thread::sleep(Duration::from_millis(300));
+    let edited = b.call(
+        "grant.set_role",
+        json!({"grant": added["grant"], "expected_revision": 1, "role": "member"}),
+    );
+    assert_eq!(edited["changed"], json!(true), "{edited}");
+    // Past the hold, while B still keeps the closed connection's entry.
+    std::thread::sleep(Duration::from_millis(2500));
+    let delivered: Vec<Value> = b
+        .events("stream.incoming")
+        .into_iter()
+        .filter(|m| m["conn"] == p.b_conn)
+        .collect();
+    assert!(
+        delivered.is_empty(),
+        "a call was delivered on a path the edit cut: {delivered:?}"
     );
 }
 
@@ -432,6 +676,21 @@ fn a_demoted_owner_gets_no_grant_list() {
         "grant.set_role",
         json!({"grant": grant, "expected_revision": 1, "role": "member"}),
     );
+    // The edit cut B's path; B comes back on a new one, live under the
+    // member grant, and opens a stream on it as before.
+    let old = p.b_conn;
+    let again = b.wait("B's new path to A", WAIT, |st| {
+        st.messages
+            .iter()
+            .find(|m| {
+                m["ev"] == "conn.up"
+                    && m["dir"] == "out"
+                    && m["identity"] == host.as_str()
+                    && m["conn"].as_u64() != Some(old)
+            })
+            .map(|m| m["conn"].as_u64().unwrap())
+    });
+    b.open(again, "mousse.hello", "interactive");
     let d_end = Endpoint::init("grrld");
     let mut d = d_end.app("peerD", &[]);
     d.hello();

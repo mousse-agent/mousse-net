@@ -10,14 +10,14 @@ plan = "docs/pairing-flow-design.md#11-checks"
 
 [[check]]
 id = "pairing-roles.grant-roles"
-title = "The role chosen with an approval or grant.add is the grant's; an edit is stored before it takes effect, refused at a stale revision and cuts the old role's paths with CANCELLED; streams of a restricted grant reach only an app that opted in, and standalone serve opens a terminal only for an owner; a demoted owner loses its grant list and its removals; a restricted store is one an older helper refuses"
+title = "The role chosen with an approval, a link invitation or grant.add is the grant's, and a failed answer's role reaches no one; an edit is stored before it takes effect, refused at a stale revision or while a removal is not saved, and cuts the old role's paths with CANCELLED before it is answered (nothing queued under the old role leaves after the reply, no waiting announcement or call is delivered); streams of a restricted grant reach only an app that opted in, and standalone serve opens a terminal only for an owner; a demoted owner loses its grant list and its removals; nothing is served while the host is not serving or after a grant expired; a restricted or edited store is one an older helper refuses"
 plan = "docs/pairing-flow-design.md §7, §8 and §11"
 targets = ["windows-x64", "macos-arm64", "linux-x64"]
-min_tests = 363
+min_tests = 377
 local = [
-  { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-net-core", "-p", "mousse-net-io", "-p", "mousse-helper", "--features", "mousse-helper/test-in-person", "--lib", "--test", "app_grant_roles", "--test", "headless", "--no-fail-fast"] },
-  { target = "macos-arm64", host = "macos-aarch64", command = ["cargo", "test", "-p", "mousse-net-core", "-p", "mousse-net-io", "-p", "mousse-helper", "--features", "mousse-helper/test-in-person", "--lib", "--test", "app_grant_roles", "--test", "headless", "--no-fail-fast"] },
-  { target = "linux-x64", host = "linux-x86_64", command = ["cargo", "test", "-p", "mousse-net-core", "-p", "mousse-net-io", "-p", "mousse-helper", "--features", "mousse-helper/test-in-person", "--lib", "--test", "app_grant_roles", "--test", "headless", "--no-fail-fast"] },
+  { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-net-core", "-p", "mousse-net-io", "-p", "mousse-helper", "--features", "mousse-helper/test-in-person", "--lib", "--test", "app_grant_roles", "--test", "headless", "--test", "pairing_e2e", "--no-fail-fast"] },
+  { target = "macos-arm64", host = "macos-aarch64", command = ["cargo", "test", "-p", "mousse-net-core", "-p", "mousse-net-io", "-p", "mousse-helper", "--features", "mousse-helper/test-in-person", "--lib", "--test", "app_grant_roles", "--test", "headless", "--test", "pairing_e2e", "--no-fail-fast"] },
+  { target = "linux-x64", host = "linux-x86_64", command = ["cargo", "test", "-p", "mousse-net-core", "-p", "mousse-net-io", "-p", "mousse-helper", "--features", "mousse-helper/test-in-person", "--lib", "--test", "app_grant_roles", "--test", "headless", "--test", "pairing_e2e", "--no-fail-fast"] },
 ]
 control = [
   { name = "approval-uses-invitation-role", breaks = "the role chosen with the approval is ignored and the grant takes the invitation's", env = { RUSTFLAGS = '--cfg mousse_control="approval-uses-invitation-role"' } },
@@ -25,6 +25,14 @@ control = [
   { name = "role-edit-keeps-reverse-path", breaks = "a call the peer opened on this computer's outbound path stays open under the old role after an edit", env = { RUSTFLAGS = '--cfg mousse_control="role-edit-keeps-reverse-path"' } },
   { name = "restricted-grant-served-to-legacy-app", breaks = "an app that did not list grant-roles in hello gets the streams of a non-owner grant", env = { RUSTFLAGS = '--cfg mousse_control="restricted-grant-served-to-legacy-app"' } },
   { name = "restricted-grant-opens-standalone-terminal", breaks = "standalone serve opens a terminal whatever the grant's role", env = { RUSTFLAGS = '--cfg mousse_control="restricted-grant-opens-standalone-terminal"' } },
-  { name = "demoted-owner-keeps-grants", breaks = "a peer demoted from owner keeps its mousse-grants stream and its signer standing", env = { RUSTFLAGS = '--cfg mousse_control="demoted-owner-keeps-grants"' } },
-  { name = "restricted-store-readable-by-old-helper", breaks = "the store version is not raised for a non-owner grant, so an older helper reads it as owner", env = { RUSTFLAGS = '--cfg mousse_control="restricted-store-readable-by-old-helper"' } },
+  { name = "demoted-owner-keeps-grants", breaks = "the grant list goes to any granted caller, so a peer demoted from owner gets it again on its next path", env = { RUSTFLAGS = '--cfg mousse_control="demoted-owner-keeps-grants"' } },
+  { name = "demoted-signer-removes", breaks = "a signer whose grant's role was edited still signs removals as an owner", env = { RUSTFLAGS = '--cfg mousse_control="demoted-signer-removes"' } },
+  { name = "restricted-store-readable-by-old-helper", breaks = "the store version is not raised for a non-owner or edited grant, so an older helper reads it as owner or drops its revision", env = { RUSTFLAGS = '--cfg mousse_control="restricted-store-readable-by-old-helper"' } },
+  { name = "role-edit-unfenced", breaks = "the fence after a close is answered at once, so data queued under the old role can leave after the edit is answered", env = { RUSTFLAGS = '--cfg mousse_control="role-edit-unfenced"' } },
+  { name = "role-edit-while-paused", breaks = "a role edit commits while a removal that failed to save holds networking paused", env = { RUSTFLAGS = '--cfg mousse_control="role-edit-while-paused"' } },
+  { name = "role-edit-keeps-queued-announcement", breaks = "a stream.incoming waiting to be written stays queued after the edit cut its stream", env = { RUSTFLAGS = '--cfg mousse_control="role-edit-keeps-queued-announcement"' } },
+  { name = "role-edit-delivers-on-closing-path", breaks = "a call accepted on a path the edit cut is delivered on it", env = { RUSTFLAGS = '--cfg mousse_control="role-edit-delivers-on-closing-path"' } },
+  { name = "grant-served-while-not-serving", breaks = "a connection's or identity's grant reads as live while the host serves nothing and after the grant expired", env = { RUSTFLAGS = '--cfg mousse_control="grant-served-while-not-serving"' } },
+  { name = "suspended-reads-as-revoked", breaks = "a stream under a grant whose edit waits to settle is reset GRANT_REVOKED as if the grant were gone", env = { RUSTFLAGS = '--cfg mousse_control="suspended-reads-as-revoked"' } },
+  { name = "answer-role-sticks-to-invitation", breaks = "the role given with a failed answer is kept on the invitation and reaches the next joiner", env = { RUSTFLAGS = '--cfg mousse_control="answer-role-sticks-to-invitation"' } },
 ]
