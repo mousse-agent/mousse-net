@@ -657,7 +657,7 @@ fn malformed_selections_are_refused_and_1_1_requests_are_unchanged() {
         json!({"way": "lan", "route": null}),
         json!({"way": "lan", "kind": "bus"}),
         json!({"way": "lan", "kind": null}),
-        json!({"way": "lan", "role": "owner"}),
+        json!({"way": "lan", "role": "Not A Role"}),
     ] {
         let reply = a.request("invite.create", bad.clone());
         assert_eq!(reply["error"], "bad_request", "{bad}: {reply}");
