@@ -37,10 +37,8 @@ pub(super) fn add_connected(shared: &Shared, id: &Value, map: &Map<String, Value
     // Must-fail control (tests only): the identity is taken from the
     // request when it names one.
     let trusts_request = cfg!(mousse_control = "connected-grant-trusts-request-identity");
-    if let Some(unknown) = map
-        .keys()
-        .find(|k| !FIELDS.contains(&k.as_str()) && !(trusts_request && k.as_str() == "identity"))
-    {
+    let known = |k: &str| FIELDS.contains(&k) || (trusts_request && k == "identity");
+    if let Some(unknown) = map.keys().find(|k| !known(k.as_str())) {
         return error(id, "bad_request", format!("unknown field {unknown:?}"));
     }
     let Some(no) = map.get("conn").and_then(Value::as_u64) else {
