@@ -395,14 +395,23 @@ fn invite_way(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
         }
     }
     // What the listener offers now is about to be replaced.
-    if availability::restart_required(&inventory, saved.as_ref(), way) {
+    if availability::restart_required(shared, &inventory, saved.as_ref(), way) {
         return way_unavailable(id, way, "restart_required");
     }
     let routes = availability::select(&inventory, way, route);
     if routes.is_empty() {
         let reason = if route.is_some() && !availability::select(&inventory, way, None).is_empty() {
-            // The way offers routes, just not this one.
-            "route_not_offered"
+            // The way offers routes, just not this one. For relay, capacity
+            // and the grants store come before `route_not_offered`.
+            if way == "relay" {
+                match super::relay::slot_free(shared) {
+                    Ok(true) => "route_not_offered",
+                    Ok(false) => "relay_capacity",
+                    Err(e) => return error(id, "store_failed", e),
+                }
+            } else {
+                "route_not_offered"
+            }
         } else {
             availability::unavailable_reason(shared, &inventory, saved.as_ref(), way)
         };
