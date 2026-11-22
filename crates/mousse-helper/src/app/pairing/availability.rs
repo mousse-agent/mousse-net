@@ -288,12 +288,15 @@ fn has_interface(inventory: &Inventory, class: AddrClass) -> Option<bool> {
 
 /// Whether the listener running now serves addresses of `class`.
 fn running_on(shared: &Shared, inventory: &Inventory, class: AddrClass) -> bool {
-    let listen = &inventory.listen;
+    running_on_with(shared.caller.addr_policy(), &inventory.listen, class)
+}
+
+fn running_on_with(policy: &AddrPolicy, listen: &ListenState, class: AddrClass) -> bool {
     match listen.listen_ip {
         Some(ip) if ip.is_unspecified() => true,
         Some(ip) => {
             let route = LocalRoute::tcp(SocketAddr::new(ip, listen.port));
-            let way = served_way(shared.caller.addr_policy(), &route);
+            let way = served_way(policy, &route);
             matches!(
                 (class, way),
                 (AddrClass::Lan, Some(Way::Lan)) | (AddrClass::Tailnet, Some(Way::Tailnet))
@@ -307,19 +310,34 @@ fn running_on(shared: &Shared, inventory: &Inventory, class: AddrClass) -> bool 
     }
 }
 
-/// Whether the saved setting for `way` differs from the one running, so
+/// Whether the saved setting for `way` differs from what is running, so
 /// what this way offers changes at the next start. `routes.config` applies
 /// a change that needs no restart to the running config at once
 /// ([`RoutesConfig::restart_needed`]), so any difference left is one that
-/// waits for a restart. The port counts for every way the listener serves.
-fn restart_pending(running: &RoutesConfig, saved: Option<&RoutesConfig>, way: &str) -> bool {
+/// waits for a restart. For `lan` and `tailnet`, the running side is what
+/// the listener actually serves (including when started without
+/// `routes.json`), not only the synthesized config. The port counts for
+/// every way the listener serves.
+fn restart_pending(
+    policy: &AddrPolicy,
+    listen: &ListenState,
+    saved: Option<&RoutesConfig>,
+    way: &str,
+) -> bool {
     let Some(saved) = saved else {
         return false;
     };
+    let running = &listen.config;
     let port = saved.port != running.port;
     match way {
-        "lan" => saved.lan != running.lan || (port && running.lan),
-        "tailnet" => saved.tailnet != running.tailnet || (port && running.tailnet),
+        "lan" => {
+            let served = running_on_with(policy, listen, AddrClass::Lan);
+            saved.lan != served || (port && served)
+        }
+        "tailnet" => {
+            let served = running_on_with(policy, listen, AddrClass::Tailnet);
+            saved.tailnet != served || (port && served)
+        }
         "public" => {
             canonical(&saved.public) != canonical(&running.public)
                 || (!saved.public.is_empty() && saved.forward_to != running.forward_to)
@@ -330,18 +348,29 @@ fn restart_pending(running: &RoutesConfig, saved: Option<&RoutesConfig>, way: &s
     }
 }
 
-/// A route list as canonical text: `routes.config` stores it canonical,
-/// while the running copy keeps the text `routes.json` had at start.
+/// A route list as canonical text, deduplicated in first-occurrence order:
+/// `routes.config` stores it that way via `RoutesConfig::checked`, while
+/// the running copy keeps what `routes.json` had at start.
 fn canonical(list: &[String]) -> Vec<String> {
-    list.iter()
-        .map(|text| LocalRoute::parse(text).map_or_else(|_| text.clone(), |r| r.uri()))
-        .collect()
+    let mut out = Vec::new();
+    for text in list {
+        let uri = LocalRoute::parse(text).map_or_else(|_| text.clone(), |r| r.uri());
+        if !out.contains(&uri) {
+            out.push(uri);
+        }
+    }
+    out
 }
 
-/// Whether `way` waits for a restart: its saved setting differs from the
-/// one running ([`restart_pending`]).
-pub fn restart_required(inventory: &Inventory, saved: Option<&RoutesConfig>, way: &str) -> bool {
-    restart_pending(&inventory.listen.config, saved, way)
+/// Whether `way` waits for a restart: its saved setting differs from what
+/// is running ([`restart_pending`]).
+pub fn restart_required(
+    shared: &Shared,
+    inventory: &Inventory,
+    saved: Option<&RoutesConfig>,
+    way: &str,
+) -> bool {
+    restart_pending(shared.caller.addr_policy(), &inventory.listen, saved, way)
 }
 
 /// Why `way` has nothing to offer: `(state, reason)` as `routes.available`
@@ -354,7 +383,7 @@ fn why_not(
 ) -> (&'static str, &'static str) {
     const NA: &str = "unavailable";
     let running = &inventory.listen.config;
-    if restart_pending(running, saved, way) {
+    if restart_required(shared, inventory, saved, way) {
         return (NA, "restart_required");
     }
     if inventory.too_long.contains(&way) {
@@ -406,7 +435,7 @@ pub fn readiness(
         }
     }
     // What the listener offers now is about to be replaced.
-    if restart_required(inventory, saved, way) {
+    if restart_required(shared, inventory, saved, way) {
         return Ok(("unavailable", Some("restart_required"), Vec::new()));
     }
     let routes = select(inventory, way, None);
@@ -565,5 +594,78 @@ mod tests {
         assert_eq!(select(&inventory, "public", None), fits);
         assert!(select(&inventory, "public", Some(&long)).is_empty());
         assert!(select(&inventory, "tunnel", None).is_empty());
+    }
+
+    /// Without `routes.json`, a `0.0.0.0` listener serves both LAN and
+    /// tailnet even though the synthesized config says `tailnet: false`: a
+    /// save that turns tailnet off or changes the port marks it pending.
+    #[test]
+    fn restart_pending_uses_served_ways_when_started_without_routes_json() {
+        let policy = AddrPolicy::release();
+        let listen = ListenState {
+            config: RoutesConfig {
+                lan: true,
+                tailnet: false,
+                ..RoutesConfig::default()
+            },
+            port: 7000,
+            listen_ip: Some(IpAddr::from([0, 0, 0, 0])),
+            ..ListenState::default()
+        };
+        let saved_tailnet_off = RoutesConfig {
+            lan: true,
+            tailnet: false,
+            ..RoutesConfig::default()
+        };
+        assert!(!restart_pending(
+            &policy,
+            &listen,
+            Some(&saved_tailnet_off),
+            "lan"
+        ));
+        assert!(restart_pending(
+            &policy,
+            &listen,
+            Some(&saved_tailnet_off),
+            "tailnet"
+        ));
+
+        let saved_port_change = RoutesConfig {
+            lan: true,
+            tailnet: true,
+            port: Some(7443),
+            ..RoutesConfig::default()
+        };
+        assert!(restart_pending(
+            &policy,
+            &listen,
+            Some(&saved_port_change),
+            "lan"
+        ));
+        assert!(restart_pending(
+            &policy,
+            &listen,
+            Some(&saved_port_change),
+            "tailnet"
+        ));
+    }
+
+    /// `canonical` removes duplicates after canonicalization, keeping
+    /// first-occurrence order as `RoutesConfig::checked` does.
+    #[test]
+    fn canonical_deduplicates_in_first_occurrence_order() {
+        let list = vec![
+            "wss://t.example/mousse-net/1".to_owned(),
+            "wss://other.example:443/mousse-net/1".to_owned(),
+            "wss://t.example:443/mousse-net/1".to_owned(),
+            "wss://T.EXAMPLE/mousse-net/1".to_owned(),
+        ];
+        assert_eq!(
+            canonical(&list),
+            [
+                "wss://t.example:443/mousse-net/1",
+                "wss://other.example:443/mousse-net/1",
+            ]
+        );
     }
 }

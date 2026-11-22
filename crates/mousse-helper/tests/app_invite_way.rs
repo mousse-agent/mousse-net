@@ -407,7 +407,8 @@ fn snapshot(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
 fn a_failed_selection_leaves_no_invitation_code_or_slot() {
     let relay = relay_fixture::TestRelay::start();
     let end = Endpoint::init("iw-left");
-    let mut a = end.app("hostA", &[]);
+    let file = interfaces_file(&end, "lo0 127.0.0.1\nutun4 100.100.9.9\n");
+    let mut a = app_with_interfaces(&end, &[], 0, &file);
     hello12(&mut a);
     let enrolled = a.call("relay.enroll", json!({"link": relay.link()}));
     assert_eq!(enrolled["relay"]["state"], "registered", "{enrolled}");
@@ -587,8 +588,9 @@ fn readiness_says_why_a_way_is_not_ready() {
     assert_eq!(refused["error"], "way_unavailable", "{refused}");
     assert_eq!(refused["reason"], "disabled");
 
-    // Tailnet saved on, not running yet: a restart is pending for it alone.
-    let saved = a.call("routes.config", json!({"tailnet": true}));
+    // Tailnet saved on while keeping LAN on: a restart is pending for
+    // tailnet alone, and LAN stays ready and selectable.
+    let saved = a.call("routes.config", json!({"lan": true, "tailnet": true}));
     assert_eq!(saved["restart_needed"], true, "{saved}");
     let available = a.call("routes.available", json!({}));
     assert_eq!(way_of(&available, "tailnet")["reason"], "restart_required");
@@ -742,4 +744,163 @@ fn a_pause_hides_every_way() {
     let refused = p.a.request("invite.create", json!({"way": "lan"}));
     assert_eq!(refused["error"], "way_unavailable", "{refused}");
     assert_eq!(refused["reason"], "paused");
+}
+
+/// Without `routes.json`, a way the running listener actually serves
+/// reports `restart_required` once a saved config turns it off or changes
+/// its port.
+#[test]
+fn a_listener_without_routes_json_reports_restart_when_its_way_changes() {
+    let end = Endpoint::init("iw-norj-lan");
+    let file = interfaces_file(&end, "lo0 127.0.0.1\nutun4 100.100.9.9\n");
+    let mut a = app_with_interfaces(&end, &[], 0, &file);
+    hello12(&mut a);
+    assert_eq!(
+        way_of(&a.call("routes.available", json!({})), "lan")["state"],
+        "ready"
+    );
+    // Saving `tailnet: true` writes `lan: false`, turning off the running LAN way.
+    let saved = a.call("routes.config", json!({"tailnet": true}));
+    assert_eq!(saved["restart_needed"], true, "{saved}");
+    let available = a.call("routes.available", json!({}));
+    assert_eq!(
+        way_of(&available, "lan")["reason"],
+        "restart_required",
+        "{available}"
+    );
+    assert_eq!(
+        way_of(&available, "tailnet")["reason"],
+        "restart_required",
+        "{available}"
+    );
+    let refused = a.request("invite.create", json!({"way": "lan"}));
+    assert_eq!(refused["error"], "way_unavailable", "{refused}");
+    assert_eq!(refused["reason"], "restart_required", "{refused}");
+    // Keeping `lan: true` while setting a fixed port still needs a restart for LAN.
+    a.call(
+        "routes.config",
+        json!({"lan": true, "tailnet": false, "port": 7443}),
+    );
+    let available = a.call("routes.available", json!({}));
+    assert_eq!(
+        way_of(&available, "lan")["reason"],
+        "restart_required",
+        "{available}"
+    );
+
+    // Same for a listener serving tailnet without `routes.json`.
+    let tail_end = Endpoint::init("iw-norj-tail");
+    let port = free_port();
+    let tail_file = interfaces_file(&tail_end, "lo0 127.0.0.1\nutun4 100.100.9.9\n");
+    let map = format!("{port}=tailnet");
+    let mut b = app_with_interfaces(&tail_end, &[("TEST_CLASS_MAP", &map)], port, &tail_file);
+    hello12(&mut b);
+    assert_eq!(
+        way_of(&b.call("routes.available", json!({})), "tailnet")["state"],
+        "ready"
+    );
+    b.call("routes.config", json!({"lan": true}));
+    let available = b.call("routes.available", json!({}));
+    assert_eq!(
+        way_of(&available, "tailnet")["reason"],
+        "restart_required",
+        "{available}"
+    );
+    let refused = b.request("invite.create", json!({"way": "tailnet"}));
+    assert_eq!(refused["error"], "way_unavailable", "{refused}");
+    assert_eq!(refused["reason"], "restart_required", "{refused}");
+    // Keeping `tailnet: true` while changing the port still marks tailnet pending.
+    b.call(
+        "routes.config",
+        json!({"lan": false, "tailnet": true, "port": 7443}),
+    );
+    let available = b.call("routes.available", json!({}));
+    assert_eq!(
+        way_of(&available, "tailnet")["reason"],
+        "restart_required",
+        "{available}"
+    );
+}
+
+/// Selecting an unoffered exact `route` on `relay` reports `relay_capacity`
+/// when all allow-set slots are full and `store_failed` when the grants
+/// file cannot be read, rather than `route_not_offered`.
+#[test]
+fn a_relay_exact_route_checks_capacity_and_store_before_route_not_offered() {
+    let relay = relay_fixture::TestRelay::start();
+    let end = Endpoint::init("iw-rel-ex");
+    let file = interfaces_file(&end, "lo0 127.0.0.1\n");
+    let mut a = app_with_interfaces(&end, &[], 0, &file);
+    hello12(&mut a);
+    let enrolled = a.call("relay.enroll", json!({"link": relay.link()}));
+    assert_eq!(enrolled["relay"]["state"], "registered", "{enrolled}");
+
+    let wrong = json!({"way": "relay", "route": "tcp://127.0.0.1:9"});
+    let free = a.request("invite.create", wrong.clone());
+    assert_eq!(free["error"], "way_unavailable", "{free}");
+    assert_eq!(free["reason"], "route_not_offered", "{free}");
+
+    for _ in 0..8 {
+        a.call("invite.create", json!({"way": "relay"}));
+    }
+    let full = a.request("invite.create", wrong.clone());
+    assert_eq!(full["error"], "way_unavailable", "{full}");
+    assert_eq!(full["reason"], "relay_capacity", "{full}");
+
+    let grants = end.dir.join("relay-grants.json");
+    let _ = std::fs::remove_file(&grants);
+    std::fs::create_dir_all(grants.join("in-the-way")).unwrap();
+    let broken = a.request("invite.create", wrong);
+    assert_eq!(broken["error"], "store_failed", "{broken}");
+}
+
+/// Duplicate `public` or `tunnels` entries in `routes.json` at start
+/// (which `routes.config` deduplicates on save) do not mark those
+/// untouched ways `restart_required` after an unrelated save.
+#[test]
+fn duplicate_routes_at_start_do_not_trigger_restart_required_after_unrelated_save() {
+    let end = Endpoint::init("iw-dedup");
+    std::fs::write(
+        end.dir.join("routes.json"),
+        serde_json::to_vec(&json!({
+            "lan": true,
+            "public": ["tcp://p1.example:7443", "tcp://P1.EXAMPLE:7443"],
+            "forward_to": "127.0.0.1",
+            "tunnels": [
+                "wss://t.example/mousse-net/1",
+                "wss://t.example:443/mousse-net/1"
+            ],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let file = interfaces_file(&end, "lo0 127.0.0.1\n");
+    let mut a = app_with_interfaces(&end, &[], 0, &file);
+    hello12(&mut a);
+
+    let saved = a.call("routes.config", json!({"lan": false}));
+    assert_eq!(saved["restart_needed"], true, "{saved}");
+    let available = a.call("routes.available", json!({}));
+    assert_eq!(
+        way_of(&available, "lan")["reason"],
+        "restart_required",
+        "{available}"
+    );
+    assert_eq!(
+        way_of(&available, "public")["state"],
+        "ready",
+        "{available}"
+    );
+    assert_eq!(
+        way_of(&available, "public")["routes"],
+        json!(["tcp://p1.example:7443"])
+    );
+    assert_eq!(
+        way_of(&available, "tunnel")["state"],
+        "ready",
+        "{available}"
+    );
+    assert_eq!(way_of(&available, "tunnel")["routes"], json!([TUNNEL]));
+    a.call("invite.create", json!({"way": "public"}));
+    a.call("invite.create", json!({"way": "tunnel"}));
 }
