@@ -407,7 +407,8 @@ fn snapshot(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
 fn a_failed_selection_leaves_no_invitation_code_or_slot() {
     let relay = relay_fixture::TestRelay::start();
     let end = Endpoint::init("iw-left");
-    let mut a = end.app("hostA", &[]);
+    let file = interfaces_file(&end, "lo0 127.0.0.1\nutun4 100.100.9.9\n");
+    let mut a = app_with_interfaces(&end, &[], 0, &file);
     hello12(&mut a);
     let enrolled = a.call("relay.enroll", json!({"link": relay.link()}));
     assert_eq!(enrolled["relay"]["state"], "registered", "{enrolled}");
