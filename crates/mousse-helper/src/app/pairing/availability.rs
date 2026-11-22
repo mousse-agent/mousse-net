@@ -5,11 +5,12 @@
 //! from: `lan` and `tailnet` from the addresses the listener serves now,
 //! `public` and `tunnel` from their lists, `relay` from this computer's
 //! registered relays. Without `routes.json` the listener serves what
-//! `--listen-ip` gives, and those addresses take the way of their class.
-//! Candidates are deduplicated by canonical text, first way first. A
-//! selected ticket is built from the inventory: select by way (and exact
-//! route), then cap at `MAX_ROUTES`. The 1.1 invitation path does not use
-//! it.
+//! `--listen-ip` gives (every address, uncapped), and those addresses take
+//! the way of their class. Candidates are deduplicated by canonical text
+//! within each way, so a route served two ways is an offer of each, and a
+//! candidate longer than `MAX_ROUTE_LEN` is left out. A selected ticket is
+//! built from the inventory: select by way (and exact route), then cap at
+//! `MAX_ROUTES`. The 1.1 invitation path does not use it.
 //!
 //! **Readiness.** `routes.available {}` → `{ways: [{way, state, reason,
 //! routes}]}`, all five ways in order. `routes` is what a selection of that
@@ -18,8 +19,8 @@
 
 use std::net::{IpAddr, SocketAddr};
 
-use mousse_net_core::pairing::MAX_ROUTES;
-use mousse_net_io::pipe::{classify, AddrClass, LocalRoute};
+use mousse_net_core::pairing::{MAX_ROUTES, MAX_ROUTE_LEN};
+use mousse_net_io::pipe::{classify, AddrClass, AddrPolicy, LocalRoute};
 use mousse_net_io::routes::{RoutesConfig, RoutesStore, Way};
 use serde_json::{json, Map, Value};
 
@@ -38,8 +39,11 @@ pub struct Offer {
 
 /// What this computer can offer now.
 pub struct Inventory {
-    /// Every candidate, deduplicated by canonical text, in way order.
+    /// Every candidate that fits a ticket, deduplicated by canonical text
+    /// within its way, in way order.
     pub offers: Vec<Offer>,
+    /// The ways that had a candidate longer than `MAX_ROUTE_LEN`, left out.
+    too_long: Vec<&'static str>,
     /// The listener state the offers were read from.
     listen: ListenState,
     /// This computer's interface addresses, or why they could not be
@@ -74,23 +78,39 @@ fn tunnel_origins(shared: &Shared, listen: &ListenState) -> Vec<String> {
 }
 
 /// The way of an address the listener serves without `routes.json`:
-/// IPv4 literals of class `lan` or `tailnet` under this build's policy.
-fn served_way(shared: &Shared, route: &LocalRoute) -> Option<Way> {
+/// IPv4 literals of class `lan` or `tailnet` under `policy`.
+fn served_way(policy: &AddrPolicy, route: &LocalRoute) -> Option<Way> {
     let (Some(ip), Some(port)) = (route.ip(), route.port()) else {
         return None;
     };
     if !ip.is_ipv4() || !matches!(route, LocalRoute::Tcp { .. }) {
         return None;
     }
-    match shared
-        .caller
-        .addr_policy()
-        .class_of(SocketAddr::new(ip, port))
-    {
+    match policy.class_of(SocketAddr::new(ip, port)) {
         AddrClass::Lan => Some(Way::Lan),
         AddrClass::Tailnet => Some(Way::Tailnet),
         _ => None,
     }
+}
+
+/// The `lan` and `tailnet` candidates of a listener on `ip`:`port` without
+/// `routes.json`: every address it serves (for `0.0.0.0`, each usable one
+/// of `addrs`), uncapped, with the way of its class. The 1.1 advertisement
+/// ([`crate::serve::route_hints`]) is the same list cut to eight before it
+/// is classed; selection must not inherit that cut.
+fn listener_candidates(
+    policy: &AddrPolicy,
+    ip: IpAddr,
+    port: u16,
+    addrs: &[IpAddr],
+) -> Vec<(Way, String)> {
+    crate::serve::served_hints(ip, port, addrs)
+        .iter()
+        .filter_map(|hint| {
+            let route = LocalRoute::parse(hint).ok()?;
+            Some((served_way(policy, &route)?, route.uri()))
+        })
+        .collect()
 }
 
 /// Whether a port forward is served: by the 0.0.0.0 socket, or by the
@@ -136,13 +156,13 @@ pub fn inventory(shared: &Shared) -> Inventory {
         // No `routes.json`: what `--listen-ip` serves, whatever the
         // synthesized config says.
         Some(ip) => {
-            for hint in crate::serve::route_hints(ip, listen.port) {
-                if let Ok(route) = LocalRoute::parse(&hint) {
-                    if let Some(way) = served_way(shared, &route) {
-                        all.push((way, route.uri()));
-                    }
-                }
-            }
+            let addrs = interfaces.as_deref().unwrap_or_default();
+            all.extend(listener_candidates(
+                shared.caller.addr_policy(),
+                ip,
+                listen.port,
+                addrs,
+            ));
         }
         None => {
             let ips = interfaces.as_deref().unwrap_or_default();
@@ -160,31 +180,27 @@ pub fn inventory(shared: &Shared) -> Inventory {
             }
         }
     }
-    let mut offers: Vec<Offer> = Vec::new();
-    let mut push = |way: &'static str, route: String| {
-        if !offers.iter().any(|o| o.route == route) {
-            offers.push(Offer { way, route });
-        }
-    };
+    let mut listed: Vec<(&'static str, String)> = Vec::new();
     for way in [Way::Lan, Way::Tailnet, Way::Public] {
         for (w, route) in &all {
             if *w == way {
-                push(way.name(), route.clone());
+                listed.push((way.name(), route.clone()));
             }
         }
     }
     for route in tunnel_origins(shared, &listen) {
-        push(Way::Tunnel.name(), route);
+        listed.push((Way::Tunnel.name(), route));
     }
     let relays = match super::super::relay::own_relay_hints(shared) {
         Ok(own) => {
             for hint in own.hints {
-                push("relay", hint);
+                listed.push(("relay", hint));
             }
             Ok(own.configured)
         }
         Err(e) => Err(e),
     };
+    let (mut offers, too_long) = offers_of(listed);
     // Must-fail control: the way is selected from the capped 1.1 list.
     if cfg!(mousse_control = "select-after-route-cap") {
         let legacy = legacy_routes(shared);
@@ -192,10 +208,31 @@ pub fn inventory(shared: &Shared) -> Inventory {
     }
     Inventory {
         offers,
+        too_long,
         listen,
         interfaces,
         relays,
     }
+}
+
+/// The offers of `listed` candidates (in way order), and the ways that had
+/// one too long for a ticket. Deduplicated within each way: a route served
+/// two ways (a LAN address also listed as a port forward) is an offer of
+/// each. A candidate longer than `MAX_ROUTE_LEN` can never be offered, so
+/// it is left out before readiness and before the cap.
+fn offers_of(listed: Vec<(&'static str, String)>) -> (Vec<Offer>, Vec<&'static str>) {
+    let mut offers: Vec<Offer> = Vec::new();
+    let mut too_long: Vec<&'static str> = Vec::new();
+    for (way, route) in listed {
+        if route.len() > MAX_ROUTE_LEN {
+            if !too_long.contains(&way) {
+                too_long.push(way);
+            }
+        } else if !offers.iter().any(|o| o.way == way && o.route == route) {
+            offers.push(Offer { way, route });
+        }
+    }
+    (offers, too_long)
 }
 
 /// The routes a ticket of `way` carries, `route` alone if given: at most
@@ -220,12 +257,17 @@ pub fn select(inventory: &Inventory, way: &str, route: Option<&str>) -> Vec<Stri
     picked
 }
 
-/// The ways of `routes`, distinct, in order. A route the inventory does
-/// not hold has no way.
-pub fn ways_of(inventory: &Inventory, routes: &[String]) -> Vec<&'static str> {
+/// The ways of a selection of `way` that gave `routes`, distinct, in order:
+/// a route offered as `way` counts as `way`, any other as the first way
+/// that offers it. A route the inventory does not hold has no way.
+pub fn ways_of(inventory: &Inventory, way: &str, routes: &[String]) -> Vec<&'static str> {
     let mut out: Vec<&'static str> = Vec::new();
     for route in routes {
-        if let Some(offer) = inventory.offers.iter().find(|o| &o.route == route) {
+        let of_route = || inventory.offers.iter().filter(move |o| &o.route == route);
+        if let Some(offer) = of_route()
+            .find(|o| o.way == way)
+            .or_else(|| of_route().next())
+        {
             if !out.contains(&offer.way) {
                 out.push(offer.way);
             }
@@ -251,7 +293,7 @@ fn running_on(shared: &Shared, inventory: &Inventory, class: AddrClass) -> bool 
         Some(ip) if ip.is_unspecified() => true,
         Some(ip) => {
             let route = LocalRoute::tcp(SocketAddr::new(ip, listen.port));
-            let way = served_way(shared, &route);
+            let way = served_way(shared.caller.addr_policy(), &route);
             matches!(
                 (class, way),
                 (AddrClass::Lan, Some(Way::Lan)) | (AddrClass::Tailnet, Some(Way::Tailnet))
@@ -266,22 +308,40 @@ fn running_on(shared: &Shared, inventory: &Inventory, class: AddrClass) -> bool 
 }
 
 /// Whether the saved setting for `way` differs from the one running, so
-/// it takes effect at the next start ([`RoutesConfig::restart_needed`],
-/// per way).
+/// what this way offers changes at the next start. `routes.config` applies
+/// a change that needs no restart to the running config at once
+/// ([`RoutesConfig::restart_needed`]), so any difference left is one that
+/// waits for a restart. The port counts for every way the listener serves.
 fn restart_pending(running: &RoutesConfig, saved: Option<&RoutesConfig>, way: &str) -> bool {
     let Some(saved) = saved else {
         return false;
     };
+    let port = saved.port != running.port;
     match way {
-        "lan" => saved.lan != running.lan,
-        "tailnet" => saved.tailnet != running.tailnet,
+        "lan" => saved.lan != running.lan || (port && running.lan),
+        "tailnet" => saved.tailnet != running.tailnet || (port && running.tailnet),
         "public" => {
-            saved.public.is_empty() != running.public.is_empty()
+            canonical(&saved.public) != canonical(&running.public)
                 || (!saved.public.is_empty() && saved.forward_to != running.forward_to)
+                || (port && !running.public.is_empty())
         }
-        "tunnel" => saved.tunnels.is_empty() != running.tunnels.is_empty(),
+        "tunnel" => canonical(&saved.tunnels) != canonical(&running.tunnels),
         _ => false,
     }
+}
+
+/// A route list as canonical text: `routes.config` stores it canonical,
+/// while the running copy keeps the text `routes.json` had at start.
+fn canonical(list: &[String]) -> Vec<String> {
+    list.iter()
+        .map(|text| LocalRoute::parse(text).map_or_else(|_| text.clone(), |r| r.uri()))
+        .collect()
+}
+
+/// Whether `way` waits for a restart: its saved setting differs from the
+/// one running ([`restart_pending`]).
+pub fn restart_required(inventory: &Inventory, saved: Option<&RoutesConfig>, way: &str) -> bool {
+    restart_pending(&inventory.listen.config, saved, way)
 }
 
 /// Why `way` has nothing to offer: `(state, reason)` as `routes.available`
@@ -296,6 +356,9 @@ fn why_not(
     let running = &inventory.listen.config;
     if restart_pending(running, saved, way) {
         return (NA, "restart_required");
+    }
+    if inventory.too_long.contains(&way) {
+        return (NA, "route_too_long");
     }
     match way {
         "lan" | "tailnet" => {
@@ -342,6 +405,10 @@ pub fn readiness(
             return Err(e.to_owned());
         }
     }
+    // What the listener offers now is about to be replaced.
+    if restart_required(inventory, saved, way) {
+        return Ok(("unavailable", Some("restart_required"), Vec::new()));
+    }
     let routes = select(inventory, way, None);
     if routes.is_empty() {
         let (state, reason) = why_not(shared, inventory, saved, way);
@@ -354,14 +421,22 @@ pub fn readiness(
 }
 
 /// Why a selection of `way` has nothing to offer, for its
-/// `way_unavailable` error. The stored routes config is read as well as it
-/// can be.
-pub fn unavailable_reason(shared: &Shared, inventory: &Inventory, way: &str) -> &'static str {
-    let saved = RoutesStore::in_dir(&shared.info.state_dir)
+/// `way_unavailable` error. `saved` is `routes.json` as stored.
+pub fn unavailable_reason(
+    shared: &Shared,
+    inventory: &Inventory,
+    saved: Option<&RoutesConfig>,
+    way: &str,
+) -> &'static str {
+    why_not(shared, inventory, saved, way).1
+}
+
+/// `routes.json` as stored: `None` when there is none, `Err` when it cannot
+/// be read.
+pub fn saved_config(shared: &Shared) -> Result<Option<RoutesConfig>, String> {
+    RoutesStore::in_dir(&shared.info.state_dir)
         .load()
-        .ok()
-        .flatten();
-    why_not(shared, inventory, saved.as_ref(), way).1
+        .map_err(|e| e.to_string())
 }
 
 /// `routes.available {}`.
@@ -373,9 +448,9 @@ pub fn available(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value
             format!("routes.available has no field {field:?}"),
         );
     }
-    let saved = match RoutesStore::in_dir(&shared.info.state_dir).load() {
+    let saved = match saved_config(shared) {
         Ok(saved) => saved,
-        Err(e) => return error(id, "store_failed", e.to_string()),
+        Err(e) => return error(id, "store_failed", e),
     };
     let inventory = inventory(shared);
     let mut ways = Vec::new();
@@ -391,4 +466,104 @@ pub fn available(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value
         }
     }
     json!({"re": id, "ways": ways})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `0.0.0.0` listener with eight LAN addresses that sort before a
+    /// tailnet one still offers the tailnet address: selection sees every
+    /// address, while the 1.1 list is cut to eight before it is classed.
+    #[test]
+    fn a_wildcard_listener_offers_every_address_uncapped() {
+        let policy = AddrPolicy::release();
+        let mut addrs: Vec<IpAddr> = (1..=8).map(|n| IpAddr::from([10, 0, 0, n])).collect();
+        addrs.push(IpAddr::from([100, 100, 9, 9]));
+        addrs.push(IpAddr::from([127, 0, 0, 1]));
+        let any = IpAddr::from([0, 0, 0, 0]);
+        let tailnet = "tcp://100.100.9.9:7443".to_owned();
+
+        let all = listener_candidates(&policy, any, 7443, &addrs);
+        let of = |way: Way| -> Vec<String> {
+            all.iter()
+                .filter(|(w, _)| *w == way)
+                .map(|(_, r)| r.clone())
+                .collect()
+        };
+        assert_eq!(of(Way::Tailnet), std::slice::from_ref(&tailnet));
+        assert_eq!(of(Way::Lan).len(), 8, "{all:?}");
+        assert!(!all.iter().any(|(_, r)| r.contains("127.0.0.1")));
+
+        let mut legacy = crate::serve::served_hints(any, 7443, &addrs);
+        legacy.truncate(8);
+        assert!(!legacy.contains(&tailnet), "{legacy:?}");
+    }
+
+    /// A listener on one address offers that address alone.
+    #[test]
+    fn a_listener_on_one_address_offers_it_alone() {
+        let policy = AddrPolicy::release();
+        let ip = IpAddr::from([100, 100, 9, 9]);
+        let addrs = [IpAddr::from([10, 0, 0, 1]), ip];
+        assert_eq!(
+            listener_candidates(&policy, ip, 7443, &addrs),
+            [(Way::Tailnet, "tcp://100.100.9.9:7443".to_owned())]
+        );
+    }
+
+    fn pairs(offers: &[Offer]) -> Vec<(&'static str, &str)> {
+        offers.iter().map(|o| (o.way, o.route.as_str())).collect()
+    }
+
+    /// A LAN address also listed as a port forward is an offer of each
+    /// way; a route listed twice within one way is one offer.
+    #[test]
+    fn duplicates_are_dropped_within_a_way_not_across_ways() {
+        let lan = "tcp://192.168.1.5:7443";
+        let (offers, too_long) = offers_of(vec![
+            ("lan", lan.to_owned()),
+            ("lan", lan.to_owned()),
+            ("public", lan.to_owned()),
+            ("public", "tcp://p1.example:7443".to_owned()),
+            ("public", lan.to_owned()),
+        ]);
+        assert_eq!(
+            pairs(&offers),
+            [
+                ("lan", lan),
+                ("public", lan),
+                ("public", "tcp://p1.example:7443"),
+            ]
+        );
+        assert!(too_long.is_empty());
+    }
+
+    /// A candidate longer than `MAX_ROUTE_LEN` is left out before the cap,
+    /// so it never takes the place of one that fits; its way is recorded.
+    #[test]
+    fn a_route_too_long_is_left_out_before_the_cap() {
+        let long = format!("tcp://{}.example:7443", "a".repeat(MAX_ROUTE_LEN));
+        let fits: Vec<String> = (1..=MAX_ROUTES)
+            .map(|n| format!("tcp://p{n}.example:7443"))
+            .collect();
+        let mut listed = vec![("public", long.clone())];
+        listed.extend(fits.iter().map(|r| ("public", r.clone())));
+        listed.push((
+            "tunnel",
+            format!("wss://{}.example/mousse-net/1", "b".repeat(MAX_ROUTE_LEN)),
+        ));
+        let (offers, too_long) = offers_of(listed);
+        assert_eq!(too_long, ["public", "tunnel"]);
+        let inventory = Inventory {
+            offers,
+            too_long,
+            listen: ListenState::default(),
+            interfaces: Ok(Vec::new()),
+            relays: Ok(0),
+        };
+        assert_eq!(select(&inventory, "public", None), fits);
+        assert!(select(&inventory, "public", Some(&long)).is_empty());
+        assert!(select(&inventory, "tunnel", None).is_empty());
+    }
 }
