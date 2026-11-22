@@ -470,10 +470,9 @@ pub struct Dialled {
 
 /// One dial at a time per host, so the keeper and `dial` never open two
 /// paths at once.
-#[derive(Default)]
 pub struct Keep {
     locks: Mutex<HashMap<IdentityPublicKey, Arc<tokio::sync::Mutex<()>>>>,
-    kicks: Mutex<Option<mpsc::UnboundedSender<Kick>>>,
+    kicks: mpsc::UnboundedSender<Kick>,
     /// Per host: how many dials have ended, and how the last one failed.
     ends: Mutex<HashMap<IdentityPublicKey, (u64, Option<Failure>)>>,
     /// Hosts reached through a relay whose direct routes are being tried
@@ -484,6 +483,8 @@ pub struct Keep {
 /// Something the keeper should look at.
 #[derive(Clone, Copy, Debug)]
 pub enum Kick {
+    /// The app completed hello, so the keeper can start dialing.
+    Start,
     /// Connections changed: dial hosts with none that are due.
     Look,
     /// Try now and start the waits over: one host, or all of them.
@@ -491,6 +492,19 @@ pub enum Kick {
 }
 
 impl Keep {
+    pub fn new() -> (Self, mpsc::UnboundedReceiver<Kick>) {
+        let (kicks, receiver) = mpsc::unbounded_channel();
+        (
+            Self {
+                locks: Mutex::default(),
+                kicks,
+                ends: Mutex::default(),
+                upgrading: Mutex::default(),
+            },
+            receiver,
+        )
+    }
+
     fn lock_for(&self, pin: IdentityPublicKey) -> Arc<tokio::sync::Mutex<()>> {
         self.locks
             .lock()
@@ -515,16 +529,9 @@ impl Keep {
         *entry = (entry.0 + 1, failure);
     }
 
-    /// Tell the keeper (once it runs).
+    /// Queue work for the keeper, including the first hello before it runs.
     pub fn kick(&self, kick: Kick) {
-        if let Some(tx) = self
-            .kicks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-        {
-            let _ = tx.send(kick);
-        }
+        let _ = self.kicks.send(kick);
     }
 }
 
@@ -921,18 +928,20 @@ fn refused(e: &NetError) -> bool {
 
 /// Keep one outbound path to every paired host (§6). Runs from the first
 /// `hello` until the channel ends.
-pub async fn keep_connected(shared: Arc<Shared>) {
-    let (tx, mut kicks) = mpsc::unbounded_channel();
-    *shared.keep.kicks.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+pub async fn keep_connected(shared: Arc<Shared>, mut kicks: mpsc::UnboundedReceiver<Kick>) {
     let limits = shared.limits;
     let first = crate::limits::ms(limits.keep_retry_first_ms());
     let longest = crate::limits::ms(limits.keep_retry_max_ms());
     let (done_tx, mut done) =
         mpsc::unbounded_channel::<(IdentityPublicKey, Result<(), NetError>)>();
     let mut hosts: HashMap<IdentityPublicKey, Retry> = HashMap::new();
-    // Wait for the first kick: the app said hello.
-    if kicks.recv().await.is_none() {
-        return;
+    // Other background work can signal before the app completes hello.
+    loop {
+        match kicks.recv().await {
+            Some(Kick::Start) => break,
+            Some(_) => {}
+            None => return,
+        }
     }
     loop {
         let now = Instant::now();
@@ -982,7 +991,7 @@ pub async fn keep_connected(shared: Arc<Shared>) {
         tokio::select! {
             kick = kicks.recv() => match kick {
                 None => return,
-                Some(Kick::Look) => {}
+                Some(Kick::Look | Kick::Start) => {}
                 Some(Kick::Reset(which)) => {
                     for (pin, r) in hosts.iter_mut() {
                         if which.is_none_or(|w| w == *pin) {

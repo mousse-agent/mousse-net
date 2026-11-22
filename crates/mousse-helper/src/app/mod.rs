@@ -303,6 +303,7 @@ impl App {
     ) -> Self {
         let limits = *crate::limits::helper();
         let (ended, _) = watch::channel(None);
+        let (keep, kicks) = paths::Keep::new();
         let shared = Arc::new(Shared {
             core: Mutex::new(Core {
                 hello: false,
@@ -329,7 +330,7 @@ impl App {
             host,
             removal,
             pairing: Mutex::new(pairing::State::new(info.name.clone())),
-            keep: paths::Keep::default(),
+            keep,
             relay: relay::State::new(&info),
             ssh: info.ssh.clone(),
             info,
@@ -340,7 +341,7 @@ impl App {
         tokio::spawn(write_stdout(shared.clone()));
         tokio::spawn(pairing::watch_pause(shared.clone()));
         tokio::spawn(pairing::prune_completions(shared.clone()));
-        tokio::spawn(paths::keep_connected(shared.clone()));
+        tokio::spawn(paths::keep_connected(shared.clone(), kicks));
         tokio::spawn(changes::forward_renewals(shared.clone()));
         tokio::spawn(watch_served(shared.clone()));
         // Phase 4's mailbox reads pair secrets and the manifest from here.
@@ -744,7 +745,7 @@ impl Shared {
                 if reply.get("error").is_none() && !core.hello {
                     core.hello = true;
                     // Keep paired hosts connected from now on.
-                    self.keep.kick(paths::Kick::Reset(None));
+                    self.keep.kick(paths::Kick::Start);
                 }
                 self.reply(&mut core, reply);
             }
