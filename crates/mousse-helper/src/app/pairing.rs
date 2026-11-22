@@ -16,7 +16,14 @@
 //!   `approved` lists the ticket's hints beyond the automatic rule that the
 //!   owner approved at Connect (Phase 1b §1.3): only those and private
 //!   literals are dialled, and a join that pairs stores them as `ticket`
-//!   approvals (a link join through its completion record).
+//!   approvals (a link join through its completion record). A link join's
+//!   record also holds its writes for the ticket's approved relay routes:
+//!   the hints, their approvals and, when it went through a relay, the
+//!   ticket's tag sealed for this endpoint, so a relay-only pairing that
+//!   stopped part way is still reachable (pairing-flow design §9). They
+//!   are replayed under the peers lock before the join or `join.status`
+//!   reports it done; the tag only before the host's keys arrive, before
+//!   it expires and from the host's newest record.
 //! - **Grants:** `grants.list`, `grant.add` (idempotent), `grant.remove`
 //!   (journaled, see [`crate::revoke`]); events `grant.closed`,
 //!   `store.failed`, `net.paused` and `net.resumed`.
@@ -34,8 +41,8 @@ use mousse_net_core::grants::{Grant, GrantId};
 use mousse_net_core::pairing::{Arrival, InvitationId, InvitationKind, PairingCode, Ticket};
 use mousse_net_core::ErrorCode;
 use mousse_net_io::store::{
-    hex, identity_from_hex, short_id, unhex, Approval, ApprovalStore, CompletionStore, PeerRecord,
-    PeerStore, APPROVAL_SOURCE_TICKET,
+    hex, identity_from_hex, short_id, unhex, Approval, ApprovalStore, CompletionRecord,
+    CompletionStore, PeerRecord, PeerStore, PeersLock, APPROVAL_SOURCE_TICKET,
 };
 use mousse_net_io::{ApprovalRequest, CodeEntry, HostEvent, NetError, NoCode};
 use serde_json::{json, Map, Value};
@@ -481,7 +488,17 @@ async fn join(
                 "route": route,
             }));
         };
-        let link = (ticket.kind == InvitationKind::SendLink).then_some(approved.as_slice());
+        // A link join keeps its relay writes in its completion record and
+        // makes them under the peers lock with the rest (pairing-flow
+        // design §9).
+        let replay = |held: &PeersLock<'_>, done: &CompletionRecord| {
+            super::relay::replay_completion(&shared, held, done)
+        };
+        let link = (ticket.kind == InvitationKind::SendLink).then(|| crate::peer::LinkJoin {
+            approved: approved.as_slice(),
+            relay: super::relay::completion_relay(&shared, &ticket, &approved),
+            replay: &replay,
+        });
         match typed {
             Some(typed) => {
                 let mut codes = ChannelCode {
@@ -542,12 +559,28 @@ async fn join(
                 store_ticket_approvals(&shared, &ticket, &approved_routes);
             }
             shared.caller.forget_routes(Some(&ticket.host_identity));
-            super::relay::approve_ticket_routes(&shared, &ticket, &approved);
+            let linked = ticket.kind == InvitationKind::SendLink && !already;
+            if linked {
+                crate::peer::crash_point("link-joined");
+            }
+            // A link join that paired made its relay writes with its
+            // completion record, under the peers lock; others make them
+            // now. Must-fail controls: they are made now as well, after the
+            // lock was let go (so after a removal meanwhile too), or only
+            // now.
+            let after = !linked
+                || cfg!(mousse_control = "relay-replay-after-forget")
+                || cfg!(mousse_control = "completion-omits-relay-admission");
+            if after {
+                super::relay::approve_ticket_routes(&shared, &ticket, &approved);
+            }
             let (route, via) = match reached {
                 JoinedVia::Local(reached) => (super::paths::route_json(&reached), None),
                 JoinedVia::Relay(route) => {
                     if let Some((_, tag)) = relays.iter().find(|(r, _)| *r == route) {
-                        super::relay::after_join(&shared, &ticket, &route, *tag);
+                        if after {
+                            super::relay::after_join(&shared, &ticket, &route, *tag);
+                        }
                     }
                     (super::relay::route_json(&route, false), Some(route))
                 }
@@ -647,10 +680,14 @@ fn join_status(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
     ));
     // Must-fail control: recovery saves the pin alone.
     let full = !cfg!(mousse_control = "done-pin-only");
-    let done = match crate::peer::replay_completion(&shared.info.state_dir, &hash, full, stale) {
-        Ok(done) => done,
-        Err(e) => return error(id, "store_failed", e.to_string()),
+    let replay = |held: &PeersLock<'_>, done: &CompletionRecord| {
+        super::relay::replay_completion(shared, held, done)
     };
+    let done =
+        match crate::peer::replay_completion(&shared.info.state_dir, &hash, full, stale, &replay) {
+            Ok(done) => done,
+            Err(e) => return error(id, "store_failed", e.to_string()),
+        };
     if let Some(done) = &done {
         if let Err(e) = shared.caller.settle_stored(&hash) {
             return error(id, "store_failed", e.to_string());

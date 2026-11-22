@@ -432,6 +432,36 @@ secret or link is written. Until it lands, a relay-only pairing has this
 window, and the app says "Pairing was saved, but relay setup didn't
 finish" when it knows.
 
+As built:
+
+- The record (`joins/<ticket hash>.done`) gets an optional `relay` field:
+  the ticket's approved `relay://` hints, their destinations, and, when
+  the join went through a relay, the ticket's tag sealed for this
+  endpoint (the same sealing as `relay-peers.json`) with the time after
+  which it is not restored. That time is the earlier of
+  `VIA_RELAY_REJOIN_SECS` after the join and `JOIN_DONE_KEEP_SECS` after
+  the ticket's expiry. A record without relay routes is written exactly
+  as before. A helper from before ignores the field, and this one reads
+  records without it.
+- The join makes these writes under the peers lock, right after the
+  host's row and approvals and before it replies; `join.status` replays
+  them the same way before it answers `done`. Each write is idempotent.
+  A failed write stops the replay and keeps the record: `join.status`
+  answers `store_failed`, and the join answers with the reason it gives
+  every failed store, `store`. A removal of the host (`peer.forget`,
+  `grant.remove`) deletes the record under the same lock, so nothing is
+  restored after one, and a link join that paired and finishes after a
+  removal writes nothing more. In-person joins and "already paired" link
+  joins still make their relay writes after the join, as before.
+- The tag is restored only while the host's entry in `relay-peers.json`
+  has no pair secret, before its time, and from the newest completion
+  record for that host, so an older unacknowledged record never replaces
+  a newer pairing's tag. The route and its approval are restored all the
+  same.
+- Its check is `pairing-relay-completion.relay-completion` in
+  `checks/pairing-relay-completion.toml`: the kit wants each check id to
+  start with its manifest's name.
+
 ## 10. Work breakdown
 
 | # | Pull request | Changes authorization | Depends on |

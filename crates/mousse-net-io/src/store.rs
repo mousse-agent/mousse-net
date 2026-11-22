@@ -815,6 +815,30 @@ pub struct CompletionRecord {
     pub expires_at: u64,
     /// When the join finished (Unix seconds).
     pub at: u64,
+    /// What the join keeps for the ticket's relay routes the owner
+    /// approved (pairing-flow design §9). Absent when there were none,
+    /// and in records from before it; a helper from before it ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<CompletionRelay>,
+}
+
+/// The relay part of a [`CompletionRecord`]: the writes a "Send link" join
+/// makes for the ticket's approved relay routes, so a relay-only pairing
+/// that stopped part way can still be reached again.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompletionRelay {
+    /// The ticket's approved `relay://` hints, kept with the host.
+    pub routes: Vec<String>,
+    /// Their destinations (`relay://<endpoint>`), approved for the host.
+    pub destinations: Vec<String>,
+    /// The ticket's invitation tag, sealed for this endpoint (hex), when
+    /// the join went through a relay: the way back through it until the
+    /// host answers `mousse-keys`. Never stored in the clear.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join_tag: Option<String>,
+    /// After this (Unix seconds) the tag is not restored.
+    #[serde(default)]
+    pub tag_expires_at: u64,
 }
 
 /// The completion records in the `joins` folder, beside the flow records.
@@ -925,6 +949,17 @@ impl CompletionStore {
         }
         Ok(pruned)
     }
+}
+
+/// Whether `record` is the newest completion record for its host among
+/// `records` (by `at`, then ticket hash): only that one may restore a
+/// relay tag, so an older record never replaces a newer pairing's tag.
+pub fn is_newest_for_host(record: &CompletionRecord, records: &[CompletionRecord]) -> bool {
+    let key = |r: &CompletionRecord| (r.at, r.ticket_hash.clone());
+    records
+        .iter()
+        .filter(|r| r.host_identity == record.host_identity)
+        .all(|r| key(r) <= key(record))
 }
 
 /// A completion record kept past its time: more than `keep_secs` after
@@ -1556,5 +1591,124 @@ mod tests {
             vec!["tcp://10.0.0.3:7443", "tcp://10.0.0.2:7443"]
         );
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn completion(
+        hash: u8,
+        host: &str,
+        at: u64,
+        relay: Option<CompletionRelay>,
+    ) -> CompletionRecord {
+        CompletionRecord {
+            ticket_hash: hex(&[hash; 32]),
+            host_identity: host.into(),
+            outcome: COMPLETION_PAIRED.into(),
+            peer: PeerRecord {
+                name: "hostB".into(),
+                identity: host.into(),
+                role: "owner".into(),
+                routes: vec!["tcp://10.0.0.2:7443".into()],
+                last_route: Some("tcp://10.0.0.2:7443".into()),
+                addresses: Vec::new(),
+                offered: Vec::new(),
+                paired_at: at,
+            },
+            approvals: Vec::new(),
+            expires_at: at + 900,
+            at,
+            relay,
+        }
+    }
+
+    fn relay_part() -> CompletionRelay {
+        CompletionRelay {
+            routes: vec!["relay://relay.example:443/AAAA/BBBB".into()],
+            destinations: vec!["relay://relay.example:443".into()],
+            join_tag: Some("5ea1ed".into()),
+            tag_expires_at: 1_700_000_600,
+        }
+    }
+
+    /// A completion record as a helper from before the relay part writes
+    /// and reads it.
+    #[derive(Serialize, Deserialize)]
+    struct CompletionBefore {
+        ticket_hash: String,
+        host_identity: String,
+        outcome: String,
+        peer: PeerRecord,
+        approvals: Vec<Approval>,
+        expires_at: u64,
+        at: u64,
+    }
+
+    #[test]
+    fn a_completion_record_keeps_its_relay_part_through_a_save() {
+        let dir = temp_dir("done-relay");
+        let store = CompletionStore::in_dir(&dir);
+        let record = completion(5, "ab", 1_700_000_000, Some(relay_part()));
+        store.save(&record).unwrap();
+        assert_eq!(store.load(&[5; 32]).unwrap(), Some(record));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_completion_record_from_before_the_relay_part_still_loads() {
+        let dir = temp_dir("done-old");
+        let store = CompletionStore::in_dir(&dir);
+        let record = completion(6, "ab", 1_700_000_000, None);
+        let old = CompletionBefore {
+            ticket_hash: record.ticket_hash.clone(),
+            host_identity: record.host_identity.clone(),
+            outcome: record.outcome.clone(),
+            peer: record.peer.clone(),
+            approvals: Vec::new(),
+            expires_at: record.expires_at,
+            at: record.at,
+        };
+        fs::create_dir_all(dir.join("joins")).unwrap();
+        fs::write(store.path(&[6; 32]), serde_json::to_vec(&old).unwrap()).unwrap();
+        assert_eq!(store.load(&[6; 32]).unwrap(), Some(record));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_helper_from_before_reads_a_record_with_the_relay_part() {
+        let dir = temp_dir("done-new");
+        let store = CompletionStore::in_dir(&dir);
+        let record = completion(7, "ab", 1_700_000_000, Some(relay_part()));
+        store.save(&record).unwrap();
+        let bytes = fs::read(store.path(&[7; 32])).unwrap();
+        let old: CompletionBefore = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(old.peer, record.peer);
+        assert_eq!((old.at, old.expires_at), (record.at, record.expires_at));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_record_with_no_relay_part_is_written_as_before() {
+        let dir = temp_dir("done-same");
+        let store = CompletionStore::in_dir(&dir);
+        store
+            .save(&completion(8, "ab", 1_700_000_000, None))
+            .unwrap();
+        let bytes = fs::read(store.path(&[8; 32])).unwrap();
+        let fields: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&bytes).unwrap();
+        assert!(!fields.contains_key("relay"), "{fields:?}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn only_the_newest_record_for_a_host_may_restore_its_tag() {
+        let older = completion(1, "ab", 100, Some(relay_part()));
+        let newer = completion(2, "ab", 200, Some(relay_part()));
+        let other_host = completion(3, "cd", 300, Some(relay_part()));
+        let all = [older.clone(), newer.clone(), other_host.clone()];
+        assert!(!is_newest_for_host(&older, &all));
+        assert!(is_newest_for_host(&newer, &all));
+        assert!(is_newest_for_host(&other_host, &all));
+        // Alone, a record is the newest.
+        assert!(is_newest_for_host(&older, std::slice::from_ref(&older)));
     }
 }

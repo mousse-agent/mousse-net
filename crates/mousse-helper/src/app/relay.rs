@@ -77,7 +77,8 @@ use mousse_net_io::rng::random_bytes;
 
 use crate::engine::stream as engine_stream;
 use mousse_net_io::store::{
-    hex, identity_from_hex, short_id, unhex, Approval, ApprovalStore, PeerStore,
+    hex, identity_from_hex, is_newest_for_host, short_id, unhex, Approval, ApprovalStore,
+    CompletionRecord, CompletionRelay, CompletionStore, PeerStore, PeersLock,
 };
 use mousse_net_io::{ConnStatus, Connection, MuxStream, NetError};
 use serde_json::{json, Map, Value};
@@ -1891,6 +1892,142 @@ pub fn approve_ticket_routes(shared: &Shared, ticket: &Ticket, approved: &[Strin
             "ticket",
         );
     }
+}
+
+/// What a "Send link" join keeps in its completion record for the
+/// ticket's relay routes the owner approved (pairing-flow design §9): the
+/// hints, their destinations and the ticket's tag sealed for this
+/// endpoint. The tag is restored no later than the host keeps its
+/// recovery entry or the record is kept, whichever ends first. `None`
+/// when no relay route was approved.
+pub fn completion_relay(
+    shared: &Shared,
+    ticket: &Ticket,
+    approved: &[String],
+) -> Option<CompletionRelay> {
+    // Must-fail control: the record holds no relay writes, which are made
+    // after it as before, so a crash between the two loses them.
+    if cfg!(mousse_control = "completion-omits-relay-admission") {
+        return None;
+    }
+    let candidates = join_candidates(ticket, approved);
+    let (_, tag) = candidates.first()?;
+    let mut relay = CompletionRelay::default();
+    for (route, _) in &candidates {
+        let hint = route.to_hint();
+        if !relay.routes.contains(&hint) {
+            relay.routes.push(hint);
+        }
+        let destination = route.endpoint.destination();
+        if !relay.destinations.contains(&destination) {
+            relay.destinations.push(destination);
+        }
+    }
+    // Must-fail control: the tag is written in the clear.
+    relay.join_tag = if cfg!(mousse_control = "completion-stores-clear-tag") {
+        Some(hex(tag))
+    } else {
+        seal_secret(shared, &ticket.host_identity, SEALED_JOIN_TAG, tag).ok()
+    };
+    let limits = limits();
+    relay.tag_expires_at = now().saturating_add(limits.via_relay_rejoin_secs()).min(
+        ticket
+            .expires_at
+            .secs()
+            .saturating_add(limits.join_done_keep_secs()),
+    );
+    Some(relay)
+}
+
+/// Make the relay writes of the completion record `record` again, under
+/// the peers lock `held` (a removal of the host deletes the record under
+/// it, so nothing is restored after one): the hints go into the host's
+/// entry in `relay-peers.json`, then their destinations become `ticket`
+/// approvals. The sealed tag goes back only while the host has not
+/// answered `mousse-keys`, before it expires, and from the newest record
+/// for the host. Each write is idempotent; an error is returned, so the
+/// pairing is not reported complete.
+pub fn replay_completion(
+    shared: &Shared,
+    held: &PeersLock<'_>,
+    record: &CompletionRecord,
+) -> Result<(), NetError> {
+    let Some(relay) = &record.relay else {
+        return Ok(());
+    };
+    let pin = identity_from_hex(&record.host_identity)?;
+    let dir = &shared.info.state_dir;
+    let records: Vec<CompletionRecord> = CompletionStore::in_dir(dir)
+        .list()?
+        .into_iter()
+        .map(|(_, r)| r)
+        .collect();
+    // Must-fail control: a tag past its time, or from an older record, or
+    // after the host's keys arrived, comes back.
+    let retired_too = cfg!(mousse_control = "completion-replays-retired-tag");
+    let live =
+        retired_too || (now() <= relay.tag_expires_at && is_newest_for_host(record, &records));
+    let tag = match relay.join_tag.as_deref().filter(|_| live) {
+        // The control build wrote it in the clear.
+        Some(clear) if cfg!(mousse_control = "completion-stores-clear-tag") => {
+            fixed::<32>(clear).and_then(|tag| seal_secret(shared, &pin, SEALED_JOIN_TAG, &tag).ok())
+        }
+        tag => tag.map(str::to_owned),
+    };
+    let routes: Vec<&String> = relay
+        .routes
+        .iter()
+        .filter(|h| RelayRoute::parse_hint(h).is_some())
+        .collect();
+    {
+        let _io = guard(&shared.relay.io);
+        let mut file = shared.relay.files.peers().map_err(NetError::Store)?;
+        if !file
+            .peers
+            .iter()
+            .any(|p| p.identity == record.host_identity)
+        {
+            file.peers.push(PeerRelay {
+                identity: record.host_identity.clone(),
+                salt: hex(&random_bytes::<16>()),
+                ..PeerRelay::default()
+            });
+        }
+        if let Some(p) = file
+            .peers
+            .iter_mut()
+            .find(|p| p.identity == record.host_identity)
+        {
+            for hint in &routes {
+                if !p.ticket_routes.contains(hint) {
+                    p.ticket_routes.push((*hint).clone());
+                }
+            }
+            if let Some(tag) = tag {
+                if p.pair_secret.is_none() || retired_too {
+                    p.join_tag = Some(tag);
+                }
+            }
+        }
+        shared
+            .relay
+            .files
+            .save_peers(file)
+            .map_err(NetError::Store)?;
+    }
+    crate::peer::crash_point("link-relay-routes-saved");
+    let approvals: Vec<Approval> = relay
+        .destinations
+        .iter()
+        .filter(|d| RelayEndpoint::from_destination(d).is_some())
+        .map(|destination| Approval {
+            identity: record.host_identity.clone(),
+            destination: destination.clone(),
+            source: "ticket".into(),
+            at: record.at,
+        })
+        .collect();
+    ApprovalStore::in_dir(dir).add(held, &approvals)
 }
 
 // ---------------------------------------------------------------------------
