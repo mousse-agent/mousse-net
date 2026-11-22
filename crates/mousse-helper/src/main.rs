@@ -76,7 +76,13 @@
         mousse_control = "relay-reservation-overbooks",
         mousse_control = "invite-all-ways",
         mousse_control = "check-dials-destination",
-        mousse_control = "check-auto-approves-public"
+        mousse_control = "check-auto-approves-public",
+        mousse_control = "probe-accepts-outer-tls",
+        mousse_control = "probe-sends-join-proof",
+        mousse_control = "probe-dials-unapproved",
+        mousse_control = "probe-opens-relay-circuit",
+        mousse_control = "probe-restarts-deadline",
+        mousse_control = "probe-cancel-keeps-slot"
     )
 ))]
 compile_error!("a mousse_control build has a deliberate defect and is for tests only; build it without --release");
@@ -160,6 +166,12 @@ compile_error!("test-in-person lets a typed ticket count as scanned from the hos
     mousse_control = "invite-all-ways",
     mousse_control = "check-dials-destination",
     mousse_control = "check-auto-approves-public",
+    mousse_control = "probe-accepts-outer-tls",
+    mousse_control = "probe-sends-join-proof",
+    mousse_control = "probe-dials-unapproved",
+    mousse_control = "probe-opens-relay-circuit",
+    mousse_control = "probe-restarts-deadline",
+    mousse_control = "probe-cancel-keeps-slot",
     feature = "test-in-person"
 ))]
 const _: () = {

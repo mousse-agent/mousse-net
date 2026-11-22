@@ -12,6 +12,8 @@
 mod common;
 #[path = "common/relay.rs"]
 mod relay_fixture;
+#[path = "common/tunnel.rs"]
+mod tunnel;
 
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -449,7 +451,8 @@ fn probes_are_capped_and_cancel_frees_the_slot() {
     }
 }
 
-/// A networking pause ends a running probe once, with `paused`.
+/// A networking pause ends a running probe once, with `paused`: its dial
+/// is dropped at once and no later route is dialled.
 #[test]
 fn a_pause_ends_a_probe_once() {
     let mut p = pair_up("jp-pause", &[], &[("REMOVAL_RETRY_MS", "60000")]);
@@ -459,9 +462,13 @@ fn a_pause_ends_a_probe_once() {
     let mut c = c_end.app("peerC", &[]);
     c.hello();
     pair_apps(&mut p.b, &mut c);
-    let (addr, taken) = stalled();
+    let (addr, taken, closed) = stalled_watching_close();
+    let (later, later_n) = stalled();
     let invite = p.a.call("invite.create", json!({"kind": "link"}));
-    let ticket = with_routes(&invite, &[format!("tcp://{addr}")]);
+    let ticket = with_routes(
+        &invite,
+        &[format!("tcp://{addr}"), format!("tcp://{later}")],
+    );
     let probe =
         p.b.start("join.probe", json!({"ticket": ticket, "arrival": "link"}));
     wait_until("the probe to dial", || taken.load(Ordering::SeqCst) == 1);
@@ -473,12 +480,33 @@ fn a_pause_ends_a_probe_once() {
     assert_eq!(removed["paused"], true);
     let reply = p.b.reply(probe);
     assert_eq!(reply["error"], "paused", "{reply}");
+    soon("the probe's connection to close", PROMPTLY, || {
+        closed.load(Ordering::SeqCst) == 1
+    });
     p.b.event("net.paused", |_| true);
-    std::thread::sleep(Duration::from_millis(300));
+    std::thread::sleep(Duration::from_millis(1_000));
     assert_eq!(answers(&p.b, probe), 1, "the probe was answered twice");
+    assert_eq!(
+        later_n.load(Ordering::SeqCst),
+        0,
+        "a route was dialled after the pause"
+    );
 }
 
-/// When the channel closes, the probe's dial is dropped.
+/// Wait at most `within` for `f`.
+fn soon(what: &str, within: Duration, f: impl Fn() -> bool) {
+    let deadline = Instant::now() + within;
+    while !f() {
+        assert!(Instant::now() < deadline, "{what} took over {within:?}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Well before the probe's own deadline (10 s by default).
+const PROMPTLY: Duration = Duration::from_millis(1_500);
+
+/// When the channel closes, the probe's dial is dropped at once, well
+/// before the probe's deadline.
 #[test]
 fn closing_the_channel_ends_a_probe() {
     let (_ae, mut a) = start("jp-close-a", "hostA", &[]);
@@ -489,9 +517,269 @@ fn closing_the_channel_ends_a_probe() {
     b.start("join.probe", json!({"ticket": ticket, "arrival": "link"}));
     wait_until("the probe to dial", || taken.load(Ordering::SeqCst) == 1);
     b.close_stdin();
-    wait_until("the probe's connection to close", || {
+    soon("the probe's connection to close", PROMPTLY, || {
         closed.load(Ordering::SeqCst) == 1
     });
+}
+
+/// A cancel drops the probe's dial at once, well before the probe's
+/// deadline, and its reply comes after the slot is free: with one slot, a
+/// probe started right after the reply runs.
+#[test]
+fn a_cancel_drops_the_dial_and_frees_the_slot_before_its_reply() {
+    let (_ae, mut a) = start("jp-cxl-a", "hostA", &[]);
+    let (_be, mut b) = start("jp-cxl-b", "peerB", &[("JOIN_PROBES_MAX", "1")]);
+    let (addr, taken, closed) = stalled_watching_close();
+    let invite = a.call("invite.create", json!({"kind": "link"}));
+    let ticket = with_routes(&invite, &[format!("tcp://{addr}")]);
+    let probe = b.start("join.probe", json!({"ticket": ticket, "arrival": "link"}));
+    wait_until("the probe to dial", || taken.load(Ordering::SeqCst) == 1);
+    let started = Instant::now();
+    let cancel = b.call("join.probe.cancel", json!({"probe": probe}));
+    assert_eq!(cancel["cancelled"], true, "{cancel}");
+    assert!(
+        started.elapsed() < PROMPTLY,
+        "the cancel took {:?}",
+        started.elapsed()
+    );
+    // At once, with no wait: the one slot is free, and so is the ticket.
+    let again = b.start("join.probe", json!({"ticket": ticket, "arrival": "link"}));
+    assert_eq!(b.reply(probe)["error"], "cancelled");
+    soon("the probe's connection to close", PROMPTLY, || {
+        closed.load(Ordering::SeqCst) == 1
+    });
+    assert_eq!(
+        answers(&b, again),
+        0,
+        "the cancelled probe kept its slot: {:?}",
+        b.st().messages.last()
+    );
+    wait_until("the new probe to dial", || {
+        taken.load(Ordering::SeqCst) == 2
+    });
+    b.call("join.probe.cancel", json!({"probe": again}));
+}
+
+/// A second probe of a ticket being probed is `busy` while a slot is free;
+/// another ticket takes that slot.
+#[test]
+fn a_second_probe_of_one_ticket_is_busy_with_a_slot_free() {
+    let (_ae, mut a) = start("jp-dup-a", "hostA", &[]);
+    let (_be, mut b) = start("jp-dup-b", "peerB", &[]);
+    let (addr, taken) = stalled();
+    let (other, other_n) = stalled();
+    let invite = a.call("invite.create", json!({"kind": "link"}));
+    let ticket = with_routes(&invite, &[format!("tcp://{addr}")]);
+    let first = b.start("join.probe", json!({"ticket": ticket, "arrival": "link"}));
+    wait_until("the probe to dial", || taken.load(Ordering::SeqCst) == 1);
+    let again = b.request("join.probe", json!({"ticket": ticket, "arrival": "link"}));
+    assert_eq!(again["error"], "busy", "{again}");
+    let invite = a.call("invite.create", json!({"kind": "link"}));
+    let second = b.start(
+        "join.probe",
+        json!({"ticket": with_routes(&invite, &[format!("tcp://{other}")]), "arrival": "link"}),
+    );
+    wait_until("the other probe to dial", || {
+        other_n.load(Ordering::SeqCst) == 1
+    });
+    assert_eq!(taken.load(Ordering::SeqCst), 1, "the busy probe dialled");
+    for id in [first, second] {
+        assert_eq!(
+            b.call("join.probe.cancel", json!({"probe": id}))["cancelled"],
+            true
+        );
+    }
+}
+
+/// The id of a `join.probe` is its cancel handle: one that is neither a
+/// string nor a number is `bad_request`, and the id of a probe still
+/// running is `busy`. Once a probe answered, its id can be used again,
+/// and the new probe is the one a cancel reaches.
+#[test]
+fn probe_ids_are_strings_or_numbers_and_one_per_running_probe() {
+    let (_ae, mut a) = start("jp-id-a", "hostA", &[]);
+    let (_be, mut b) = start("jp-id-b", "peerB", &[("JOIN_PROBE_MS", "500")]);
+    let (addr, taken) = stalled();
+    let tickets: Vec<String> = (0..2)
+        .map(|_| {
+            let invite = a.call("invite.create", json!({"kind": "link"}));
+            with_routes(&invite, &[format!("tcp://{addr}")])
+        })
+        .collect();
+    let answer_to = |b: &App, id: &Value, n: usize| -> Value {
+        b.wait(&format!("answer {n} to {id}"), WAIT, |st| {
+            st.messages
+                .iter()
+                .filter(|m| m.get("re") == Some(id))
+                .nth(n)
+                .cloned()
+        })
+    };
+    for id in [Value::Null, json!({"x": 1}), json!([1]), json!(true)] {
+        b.send_json(&json!({
+            "id": id, "op": "join.probe", "ticket": tickets[0], "arrival": "link",
+        }));
+        assert_eq!(answer_to(&b, &id, 0)["error"], "bad_request", "{id}");
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(taken.load(Ordering::SeqCst), 0, "a refused probe dialled");
+
+    let id = json!("probe-one");
+    let send = |b: &App, ticket: &str| {
+        b.send_json(&json!({"id": id, "op": "join.probe", "ticket": ticket, "arrival": "link"}));
+    };
+    send(&b, &tickets[0]);
+    wait_until("the probe to dial", || taken.load(Ordering::SeqCst) == 1);
+    send(&b, &tickets[1]);
+    assert_eq!(answer_to(&b, &id, 0)["error"], "busy");
+    // The first one runs on to its deadline.
+    assert_eq!(answer_to(&b, &id, 1)["reason"], "timeout");
+    // The id is free again: the new probe runs and a cancel reaches it.
+    send(&b, &tickets[1]);
+    wait_until("the new probe to dial", || {
+        taken.load(Ordering::SeqCst) == 2
+    });
+    let cancel = b.call("join.probe.cancel", json!({"probe": id}));
+    assert_eq!(cancel["cancelled"], true, "{cancel}");
+    assert_eq!(answer_to(&b, &id, 2)["error"], "cancelled");
+}
+
+/// Cancelling a probe that already answered, or an id no probe has, says
+/// `cancelled: false` and answers nothing more.
+#[test]
+fn cancelling_an_answered_or_unknown_probe_cancels_nothing() {
+    let (_ae, mut a) = start("jp-late-a", "hostA", &[]);
+    let (_be, mut b) = start("jp-late-b", "peerB", &[]);
+    let invite = a.call("invite.create", json!({"kind": "link"}));
+    let probe = b.start(
+        "join.probe",
+        json!({"ticket": invite["uri"], "arrival": "link"}),
+    );
+    assert_eq!(b.reply(probe)["reachable"], true);
+    let late = b.call("join.probe.cancel", json!({"probe": probe}));
+    assert_eq!(late["cancelled"], false, "{late}");
+    for unknown in [json!(987_654), json!("never-sent")] {
+        let reply = b.call("join.probe.cancel", json!({"probe": unknown}));
+        assert_eq!(reply["cancelled"], false, "{unknown}: {reply}");
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        answers(&b, probe),
+        1,
+        "the answered probe was answered again"
+    );
+}
+
+/// An expired ticket, this helper's own ticket and a pasted in-person
+/// ticket are refused before any traffic, as a join refuses them.
+#[test]
+fn refused_tickets_are_refused_before_any_traffic() {
+    let (_ae, mut a) = start("jp-ref-a", "hostA", &[]);
+    let (_be, mut b) = start("jp-ref-b", "peerB", &[]);
+    let (addr, taken) = stalled();
+    let routes = [format!("tcp://{addr}")];
+
+    let link = a.call("invite.create", json!({"kind": "link"}));
+    let mut expired = Ticket::from_fragment(link["uri"].as_str().unwrap()).unwrap();
+    expired.routes = routes.to_vec();
+    expired.expires_at = mousse_net_core::UnixTime(1_000);
+    let own = b.call("invite.create", json!({"kind": "link"}));
+    let in_person = a.call("invite.create", json!({}));
+    for (what, ticket, want) in [
+        ("expired", expired.to_fragment(), "expired"),
+        ("own", with_routes(&own, &routes), "pairing_failed"),
+        ("pasted", with_routes(&in_person, &routes), "pairing_failed"),
+    ] {
+        let reply = b.request("join.probe", json!({"ticket": ticket, "arrival": "link"}));
+        assert_eq!(reply["error"], want, "{what}: {reply}");
+        let join = b.request("join", json!({"ticket": ticket, "arrival": "link"}));
+        assert_eq!(join["error"], want, "{what}: the join says {join}");
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        taken.load(Ordering::SeqCst),
+        0,
+        "a refused ticket was dialled"
+    );
+}
+
+/// A `wss` route whose outer TLS is trusted (a tunnel stand-in) but whose
+/// inner identity is not the ticket's host is not reachable; the same
+/// stand-in in front of the host is.
+#[test]
+fn a_trusted_tunnel_to_the_wrong_host_is_not_reachable() {
+    let pki = tunnel::Pki::new("probe");
+    let tunnels = tunnel::Tunnels::new();
+    let a_end = Endpoint::init("jp-wss-a");
+    let mut a = a_end.app_args("hostA", &[], &["--ws-port", "0"]);
+    let a_ws = a.hello()["ws_port"].as_u64().unwrap() as u16;
+    let c_end = Endpoint::init("jp-wss-c");
+    let mut c = c_end.app_args("other", &[], &["--ws-port", "0"]);
+    let c_ws = c.hello()["ws_port"].as_u64().unwrap() as u16;
+    let b_end = Endpoint::init("jp-wss-b");
+    let root = pki.root_file(&b_end.dir);
+    let mut b = b_end.app("peerB", &[("TEST_EXTRA_ROOT", root.to_str().unwrap())]);
+    b.hello();
+    b.call("hello", json!({"proto": [1, 2]}));
+    let invite = a.call("invite.create", json!({"kind": "link"}));
+    let probe = |b: &mut App, port: u16| {
+        let route = tunnel::route(port);
+        let ticket = with_routes(&invite, std::slice::from_ref(&route));
+        b.call(
+            "join.probe",
+            json!({"ticket": ticket, "arrival": "link", "approved": [route]}),
+        )
+    };
+    let wrong = probe(&mut b, tunnels.stand_in(&pki, c_ws));
+    assert_eq!(wrong["reachable"], false, "{wrong}");
+    let reason = wrong["reason"].as_str().unwrap_or_default();
+    assert!(
+        ["pin_mismatch", "peer_certificate", "tls"].contains(&reason),
+        "{wrong}"
+    );
+    let right_port = tunnels.stand_in(&pki, a_ws);
+    let right = probe(&mut b, right_port);
+    assert_eq!(right["reachable"], true, "{right}");
+    assert_eq!(right["route"], tunnel::route(right_port));
+}
+
+/// Routes are tried in the join's order, `tcp` before `wss`, whatever the
+/// ticket's order: with both answering, the `tcp` route is the one named.
+#[test]
+fn routes_are_tried_in_the_join_order() {
+    let pki = tunnel::Pki::new("order");
+    let tunnels = tunnel::Tunnels::new();
+    let a_end = Endpoint::init("jp-ord-a");
+    let mut a = a_end.app_args("hostA", &[], &["--ws-port", "0"]);
+    let a_ws = a.hello()["ws_port"].as_u64().unwrap() as u16;
+    let lan = route_of(&mut a);
+    let b_end = Endpoint::init("jp-ord-b");
+    let root = pki.root_file(&b_end.dir);
+    let mut b = b_end.app("peerB", &[("TEST_EXTRA_ROOT", root.to_str().unwrap())]);
+    b.hello();
+    b.call("hello", json!({"proto": [1, 2]}));
+    let wss = tunnel::route(tunnels.stand_in(&pki, a_ws));
+    let invite = a.call("invite.create", json!({"kind": "link"}));
+    // The wss route alone answers: the stand-in works.
+    let alone = b.call(
+        "join.probe",
+        json!({
+            "ticket": with_routes(&invite, std::slice::from_ref(&wss)),
+            "arrival": "link",
+            "approved": [wss],
+        }),
+    );
+    assert_eq!(alone["route"], wss.as_str(), "{alone}");
+    let reply = b.call(
+        "join.probe",
+        json!({
+            "ticket": with_routes(&invite, &[wss.clone(), lan.clone()]),
+            "arrival": "link",
+            "approved": [wss],
+        }),
+    );
+    assert_eq!(reply["reachable"], true, "{reply}");
+    assert_eq!(reply["route"], lan.as_str(), "{reply}");
 }
 
 /// Malformed probes and cancels are refused before anything is dialled,

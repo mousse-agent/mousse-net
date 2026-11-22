@@ -246,19 +246,25 @@ hint, in ticket order:
   or `tls`.
 
 `join.probe.cancel {probe}` → `{cancelled}`. `probe` is the request id of
-the `join.probe` on the same channel. A cancel that wins ends the probe
-with the error `cancelled`, once; `cancelled: true` means the dial and its
-slot are released.
+the `join.probe` on the same channel, so a `join.probe` id must be a string
+or a number (otherwise `bad_request`), and an id held by a probe still
+running is `busy`. A cancel that wins stops the probe at once and ends it
+with the error `cancelled`, once; both that error and `cancelled: true`
+come after the probe's task has exited, so its dial and its slot are
+already released.
 
 **Rules.**
 
 - It dials what `join` would dial: private literals, plus hints that are
   in both the ticket and `approved`. `approved` holds at most `MAX_ROUTES`
   entries. Nothing given here is stored as an approval.
-- It reuses `Caller::probe_route`: the pinned inner TLS handshake, then the
-  pipe is dropped. No `HELLO`, `JOIN_PROOF`, code exchange or stream. No
-  pin, peer, approval, completion or key is stored, and no connection is
-  announced to the app.
+- It opens each route as the join does: routes in the join's order (`tcp`
+  before `wss`, whatever the ticket's order), and for a route whose name
+  resolves to several addresses, the first address whose pipe opens is
+  the one tried; the others are not. On that pipe it runs the pinned inner
+  TLS handshake (`Caller::probe_pipe`), then drops the pipe. No `HELLO`,
+  `JOIN_PROOF`, code exchange or stream. No pin, peer, approval,
+  completion or key is stored, and no connection is announced to the app.
 - **Relay hints are not probed.** A relay join opens a circuit and uses the
   host's pre-accept quota, which the join that follows needs. With a relay
   hint left and no direct route passed, the answer is `reachable: null,
@@ -266,8 +272,11 @@ slot are released.
 - One search, one route at a time, one monotonic deadline over lookup,
   every address, outer TLS and WebSocket, and inner TLS. No candidate
   starts after the deadline or a cancel.
-- One probe per ticket hash. A second, or one over the cap, is `busy`.
-- It ends on cancel, on networking pause and when the channel closes.
+- One probe per ticket hash. A second, or one over the cap, is `busy`. A
+  probe holds its slot until its task exits, however it ends.
+- It ends on cancel, on networking pause and when the channel closes. A
+  pause or a close wins over a result that is ready at the same moment,
+  and both are checked again before each route.
 - No progress event and no cache of results.
 - With both a relay hint and an unapproved hint left, the reason is
   `relay_unprobed`.
@@ -280,7 +289,9 @@ slot are released.
 pre-auth slot of its listener kind until it closes. It spends no pairing
 attempt and does not rotate a code. A host that already granted the probing
 device recognizes it at step 1; the promise is that no invitation or grant
-changes, not that the host sees nothing.
+changes, not that the host sees nothing. Such a probe may make the host
+announce `conn.up` for that device before any wire `HELLO`; the host
+helper's wait for `HELLO` in `App::inbound_on` (added in #10) closes that.
 
 **What a positive answer means.** The endpoint named in the link answered.
 It does not show that the invitation is still open, and it does not
