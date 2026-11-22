@@ -243,7 +243,12 @@ slot are released.
 - One probe per ticket hash. A second, or one over the cap, is `busy`.
 - It ends on cancel, on networking pause and when the channel closes.
 - No progress event and no cache of results.
-- Errors: those of `join.check`, plus `busy` and `cancelled`.
+- With both a relay hint and an unapproved hint left, the reason is
+  `relay_unprobed`.
+- A cancel naming no running probe (unknown, already answered or already
+  cancelled) is `{cancelled: false}`.
+- Errors: those of `join.check`, plus `busy` and `cancelled`. Like
+  `join.check` it checks as a join without `pinned` does.
 
 **Cost to the host.** A probe from a device with no grant holds one
 pre-auth slot of its listener kind until it closes. It spends no pairing
