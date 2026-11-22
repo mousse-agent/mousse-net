@@ -19,7 +19,12 @@
 //!   approvals (a link join through its completion record).
 //! - **Grants:** `grants.list`, `grant.add` (idempotent), `grant.remove`
 //!   (journaled, see [`crate::revoke`]); events `grant.closed`,
-//!   `store.failed`, `net.paused` and `net.resumed`.
+//!   `store.failed`, `net.paused` and `net.resumed`. `grant.remove` also
+//!   drops this computer's approvals, completion records and remembered
+//!   routes for that identity. `grant.revoke_local` (protocol 1.2, feature
+//!   `grant-revoke-local`, see [`revoke_local`]) removes the grant through
+//!   the same journal and keeps all of those: it ends only the peer's use
+//!   of this computer, and this computer can still call the peer.
 //! - **Peers:** `peers.list`, `peer.add` (idempotent), `peer.forget`,
 //!   `peer.addresses.set`, `approvals.list`, and `dial`, whose `conn.up`
 //!   carries the role the peer gave this device and the route it came up on
@@ -47,8 +52,10 @@ use crate::applog;
 use crate::peer::{JoinRoute, JoinedVia};
 use crate::revoke::Removed;
 
+mod revoke_local;
+
 /// The requests this module answers.
-pub const OPS: [&str; 18] = [
+pub const OPS: [&str; 19] = [
     "config.set",
     "invite.create",
     "invite.cancel",
@@ -61,6 +68,7 @@ pub const OPS: [&str; 18] = [
     "grants.list",
     "grant.add",
     "grant.remove",
+    "grant.revoke_local",
     "peers.list",
     "peer.add",
     "peer.forget",
@@ -215,6 +223,7 @@ pub fn on_request(shared: &Arc<Shared>, id: Value, op: &str, map: &Map<String, V
         }
         "grant.add" => add_grant(shared, &id, map),
         "grant.remove" => remove_grant(shared, &id, map),
+        "grant.revoke_local" => revoke_local::revoke_local(shared, &id, map),
         "approvals.list" => super::paths::list_approvals(shared, &id, map),
         "peers.list" => match peers(shared).load() {
             Ok(list) => {

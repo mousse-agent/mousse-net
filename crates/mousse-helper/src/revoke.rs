@@ -1,6 +1,6 @@
 //! Removal of a grant, journaled and fail-closed (Phase 1a §5.4).
 //!
-//! `grant.remove` takes three steps:
+//! `grant.remove` and `grant.revoke_local` take three steps:
 //!
 //! 1. write `revoke {grant}` to `revoke.journal` in the state folder,
 //!    durably;
