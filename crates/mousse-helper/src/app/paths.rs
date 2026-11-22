@@ -116,6 +116,9 @@ pub fn hint_decision(policy: &AddrPolicy, hint: &str) -> HintDecision {
         Err(RouteSkip::Reserved) => {
             // Reserved on the wire's grammar, read by the helper's own.
             if let Some(relay) = RelayRoute::parse_hint(hint) {
+                if !relay_literal_ok(policy, &relay) {
+                    return HintDecision::Skip("forbidden_address");
+                }
                 return HintDecision::Relay(relay);
             }
             match LocalRoute::parse(hint) {
@@ -139,6 +142,30 @@ pub fn hint_decision(policy: &AddrPolicy, hint: &str) -> HintDecision {
     } else {
         HintDecision::Approval(route)
     }
+}
+
+/// Whether the relay dialler would dial a ticket relay route's endpoint, as
+/// far as that is known without a lookup: a literal address goes through
+/// the rule the dialler applies to a peer's relay (public or tailnet; in
+/// debug builds loopback too). A name stays unresolved and passes.
+fn relay_literal_ok(
+    policy: &AddrPolicy,
+    route: &mousse_net_core::relay_endpoint::RelayRoute,
+) -> bool {
+    use mousse_net_core::relay_endpoint::EndpointHost;
+    if matches!(route.endpoint.host, EndpointHost::Dns(_)) {
+        return true;
+    }
+    let Ok(ip) = route.endpoint.host_text().parse::<std::net::IpAddr>() else {
+        // The dialler finds no address to dial either.
+        return false;
+    };
+    let addr = std::net::SocketAddr::new(ip, route.endpoint.port);
+    super::relay::relay_class_ok(
+        policy.class_of(addr),
+        false,
+        addr.ip().to_canonical().is_loopback(),
+    )
 }
 
 /// The hints of a ticket this helper may dial (§1.3): those under the
