@@ -399,7 +399,11 @@ impl App {
         let peer = short_id(conn.peer());
         // Must-fail control: announce the connection before step 2 settles.
         let wait_for_live = !cfg!(mousse_control = "inbound-before-live");
-        if wait_for_live && !conn.settled(true).await.is_live() {
+        // A saved grant can make the host live before the caller's HELLO.
+        // Wait for the agreed version so conn.up reports whether it can call back.
+        if wait_for_live
+            && (!conn.settled(true).await.is_live() || conn.hello_minor().await.is_none())
+        {
             applog::line(format!("refused {peer}: not live"));
             return None;
         }

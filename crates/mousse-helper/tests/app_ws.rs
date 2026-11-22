@@ -13,14 +13,19 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use common::*;
+use mousse_net_core::control::{ControlMessage, VersionSupport};
 use mousse_net_core::identity::{IdentityPublicKey, SoftwareKey};
+use mousse_net_core::mux::Frame;
 use mousse_net_core::pairing::RouteHost;
+use mousse_net_io::certs::CertManager;
 use mousse_net_io::pipe::ws::{self, WsTarget};
 use mousse_net_io::rng::os_rng;
 use mousse_net_io::store::{hex, unhex};
-use mousse_net_io::{Caller, ConnStatus, Limits, ManualClock, NetError};
+use mousse_net_io::tls::{self, TlsPolicy};
+use mousse_net_io::{Caller, ConnStatus, Limits, ManualClock, NetError, SystemClock};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde_json::json;
+use tokio::io::AsyncWriteExt;
 
 /// A helper with its ws listener on: the state, the app, the ws port.
 fn ws_app(tag: &str, env: &[(&str, &str)]) -> (Endpoint, App, u16) {
@@ -440,6 +445,54 @@ fn wss_through_a_tls_terminating_stand_in_goes_live() {
         caller.dial(pipe, host).await.unwrap()
     });
     assert_eq!(conn.status(), ConnStatus::Live);
+}
+
+#[test]
+fn a_tunnel_reconnect_reports_two_way_support_even_with_a_delayed_hello() {
+    let (_end, mut a, port) = ws_app("ws-delayed-hello", &[]);
+    let clock = Arc::new(SystemClock::new());
+    let cert = CertManager::new(
+        Arc::new(SoftwareKey::generate(&mut os_rng())),
+        clock.clone(),
+    )
+    .current()
+    .unwrap();
+    let me = hex(cert.identity().as_bytes());
+    a.call("grant.add", json!({"identity": me, "name": "laptop"}));
+    let host = identity_of(&a);
+    let rt = runtime();
+    let _conn = rt.block_on(async {
+        let tunnel = stand_in(trusted_pki(), port).await;
+        let addr = ([127, 0, 0, 1], tunnel).into();
+        let pipe = ws::dial(&tunnel_target(tunnel), addr, Limits::DEFAULT.io())
+            .await
+            .unwrap();
+        let (mut conn, _) = tls::connect(pipe, &cert, host, clock, TlsPolicy::default())
+            .await
+            .unwrap();
+        // On reconnect the saved grant makes the host live as soon as TLS
+        // finishes. Delay the caller's HELLO as a slower path would.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let hello = ControlMessage::Hello {
+            major_version: VersionSupport::LOCAL.major,
+            minor_version: VersionSupport::LOCAL.minor,
+        };
+        conn.write_all(
+            &Frame::Control {
+                payload: hello.encode(),
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+        conn.flush().await.unwrap();
+        conn
+    });
+    let up = a.event("conn.up", |m| {
+        m["dir"] == "in" && m["identity"] == me.as_str()
+    });
+    assert_eq!(up["route"]["class"], "tunnel", "{up}");
+    assert_eq!(up["both"], true, "{up}");
 }
 
 /// A tunnel certificate no root vouches for is refused at the outer TLS.
