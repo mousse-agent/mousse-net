@@ -869,12 +869,18 @@ fn a_stalled_older_keys_exchange_does_not_overwrite_a_newer_pair_secret() {
     let b_id = host.b.identity.clone();
     let l1 = host.link();
     joined_via_relay(&mut a, &host, &l1);
+    // B's manifest is saved to the same file; wait for it, so that write
+    // does not undo the edit below.
+    a.event("peer.manifest", |m| m["identity"] == b_id.as_str());
     // `ensure_keys` for pairing 1 has received B's answer and is held
     // before taking the relay lock.
     held(&file);
 
-    // Simulate a newer pairing's pair secret and keys_pairing stored
-    // meanwhile in relay-peers.json.
+    // Simulate a newer pairing's pair secret stored meanwhile in
+    // relay-peers.json. Only the secret's pairing moves on, not the entry's:
+    // every new outbound connection starts its own exchange, and one
+    // started after this edit is then for an older pairing too, so it must
+    // not write either.
     let path = a_end.dir.join("relay-peers.json");
     let mut peers_file: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     let newer_secret = "aa".repeat(48);
@@ -885,7 +891,6 @@ fn a_stalled_older_keys_exchange_does_not_overwrite_a_newer_pair_secret() {
         .find(|p| p["identity"] == b_id.as_str())
         .unwrap();
     let p1 = entry["pairing"].as_u64().unwrap();
-    entry["pairing"] = json!(p1 + 1);
     entry["keys_pairing"] = json!(p1 + 1);
     entry["pair_secret"] = json!(newer_secret);
     std::fs::write(&path, serde_json::to_vec_pretty(&peers_file).unwrap()).unwrap();
