@@ -224,7 +224,9 @@ fn a_grant_removal_while_a_relay_link_join_has_paired_stores_nothing() {
 }
 
 /// The record of a host whose grant was removed could not be deleted: a
-/// replay of it restores none of its relay writes.
+/// replay of it restores none of its relay writes. Unix: the delete is
+/// made to fail with the folder's permissions.
+#[cfg(unix)]
 #[test]
 fn a_record_a_grant_removal_failed_to_delete_restores_no_relay_writes() {
     let mut host = RelayHost::start("rc-rm-stuck");

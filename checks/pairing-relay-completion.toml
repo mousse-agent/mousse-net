@@ -15,7 +15,7 @@ id = "pairing-relay-completion.relay-completion"
 title = "A relay-only link join stopped after its completion record, at each later write, comes back over the relay after a restart; the record keeps the tag sealed; a replay restores no retired, expired, older or removed pairing's tag or route and no disallowed approval; a crash once the host answered mousse-keys, or an earlier pair secret, strands nothing; a failed write keeps the record; records from before still replay"
 plan = "docs/pairing-flow-design.md §9 and §11"
 targets = ["windows-x64", "macos-arm64", "linux-x64"]
-min_tests = 142
+min_tests = 141
 local = [
   { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-net-io", "-p", "mousse-helper", "--no-fail-fast", "--lib", "--test", "app_relay_first", "--test", "app_link", "--test", "app_relay_completion"] },
   { target = "macos-arm64", host = "macos-aarch64", command = ["cargo", "test", "-p", "mousse-net-io", "-p", "mousse-helper", "--no-fail-fast", "--lib", "--test", "app_relay_first", "--test", "app_link", "--test", "app_relay_completion"] },
