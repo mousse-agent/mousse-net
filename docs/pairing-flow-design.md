@@ -6,7 +6,7 @@ Tracking issue: mousse-agent/mousse#1510.
 
 This document says what the engine adds so the app can offer the pairing
 flow below. §10 splits the work into pull requests and says which of them
-change authorization and are held for review by the second teammate.
+change authorization or store an admission credential.
 
 ## The flow
 
@@ -494,10 +494,89 @@ relay-only ticket there is no direct route to fall back on.
 The fix stores the approved relay route and destination and the sealed
 tag with the completion record, replays them before the pairing is
 reported complete, and never brings back a tag after the caller key was
-enrolled, the peer was removed or the tag expired. No plain tag, ticket
+enrolled for that pairing, the peer was removed, a newer pairing stored
+its own, or the tag expired. No plain tag, ticket
 secret or link is written. Until it lands, a relay-only pairing has this
 window, and the app says "Pairing was saved, but relay setup didn't
 finish" when it knows.
+
+As built:
+
+- The record (`joins/<ticket hash>.done`) gets an optional `relay` field:
+  the ticket's approved `relay://` hints, their destinations, and, when
+  the join went through a relay, the ticket's tag sealed for this
+  endpoint (the same sealing as `relay-peers.json`), with the time after
+  which it is not restored and the pairing's number (below). That time is
+  the earlier of `VIA_RELAY_REJOIN_SECS` after PAIRED and
+  `JOIN_DONE_KEEP_SECS` after the ticket's expiry. A link join with no
+  relay route approved keeps the field too, with no routes and no tag,
+  only for its pairing's number. A helper from before ignores the field,
+  and this one reads records without it.
+- A join tries a ticket's relay routes only once the ticket's tag is
+  sealed, so its way back through the relay can be stored. If sealing
+  fails (the relay seed is unavailable), the relay routes are dropped and
+  the join tries the rest; with nothing left it answers `store`.
+- The join makes these writes under the peers lock, right after the
+  host's row and approvals and before it replies; `join.status` replays
+  them the same way before it answers `done`. Each write is idempotent.
+  A failed write stops the replay and keeps the record: `join.status`
+  answers `store_failed`, and the join answers with the reason it gives
+  every failed store, `store`. A later `join.status` that can write
+  answers `done`. In-person joins and "already paired" link joins still
+  make their relay writes after the join, as before. A join that went
+  directly keeps the approved relay route and its approval, and no tag.
+- Each pairing with a host takes a number that only grows (above the
+  host's last one, and no lower than the PAIRED time in seconds). It is
+  kept on the host's entry in `relay-peers.json` under the peers lock, so
+  it outlasts `join.ack`. Every link pairing takes one, also one with no
+  relay route, and an in-person pairing takes one above the host's
+  records not yet replayed, also in the same second. The tag is restored
+  only from the host's newest pairing, before its time, and while the
+  host has not answered `mousse-keys` for that pairing, so an older
+  record, acknowledged or not, never replaces a newer pairing's tag. The
+  route and its approval are restored all the same.
+- The entry also keeps the pairing the stored pair secret was sent in.
+  A pair secret from an earlier pairing does not keep a newer pairing's
+  tag out; a secret that arrives for a pairing retires that pairing's tag
+  and older ones. A secret that arrives late for an older pairing never
+  replaces the one a newer pairing stored.
+- Through a relay the helper dials `CALL` with its caller key first and
+  falls back to `JOIN` with the tag only when the relay does not admit
+  the call (it refuses it, or holds the refusal past the helper's relay
+  dial limit) and the tag is newer than the stored pair secret. A crash after
+  the host listed the caller key, and dropped its recovery entry, but
+  before this device stored the pair secret therefore still reaches the
+  host.
+- A removal of the host (`peer.forget`, or `grant.remove` of its grant
+  here) deletes its records under the peers lock, so nothing is restored
+  after one. The link join checks the host's join generation under that
+  lock before it stores anything; both removals advance it there, so a
+  join that paired and finishes after a removal answers `forgotten` and
+  writes nothing. It is not the generation that closes paths to a
+  forgotten peer: `grant.remove` keeps the peer, so its dials, path
+  renewals and relay-to-direct upgrades go on. `grant.remove` also marks
+  the host's pairings so far as ended on its relay entry (at least
+  number 1, so a record from before pairing numbers ends too), so a
+  record whose delete failed restores no relay writes. Deletions are
+  followed by a sync of the `joins` folder.
+- `peer.relay.disallow` drops the approval and takes the destination out
+  of that host's records under the peers lock, so no replay approves it
+  again until the owner allows it.
+- Known limit, older helpers: there is no guard against running a helper
+  from before this change on newer state. It ignores the record's `relay`
+  field, so after a downgrade an unacknowledged relay link join's row and
+  approvals come back but its relay route and tag do not, and that
+  pairing is not reached through the relay until it pairs again. When it
+  saves `relay-peers.json` it drops the pairing numbers and ended marks;
+  back on this helper, a stored tag then counts as older than a stored
+  pair secret (it is not used), and a record whose delete failed before
+  the downgrade can restore its relay writes.
+- Known limit: a link join already past PAIRED when the owner disallows
+  its relay can still approve it as it finishes; disallowing again after
+  the join replies holds.
+- Its check is `pairing-relay-completion.relay-completion` in
+  `checks/pairing-relay-completion.toml`: the kit wants each check id to
+  start with its manifest's name.
 
 ## 10. Work breakdown
 
@@ -511,8 +590,8 @@ finish" when it knows.
 | 6 | Relay-only completion recovery (§9) | stores an admission credential | none |
 
 1 and 2 are a complete step by themselves: a ticket discloses one way, a
-link can be inspected without traffic, and its host can be checked. 3 to 6
-are held for review by the second teammate before they merge.
+link can be inspected without traffic, and its host can be checked. 3 to 5
+change authorization and 6 stores an admission credential.
 
 **Files.**
 

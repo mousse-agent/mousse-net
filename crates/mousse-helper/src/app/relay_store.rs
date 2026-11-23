@@ -177,6 +177,40 @@ pub struct PeerRelay {
     /// `mousse-keys`: the way back through the relay meanwhile (§B.7).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub join_tag: Option<String>,
+    /// The newest pairing with the host this device made: a number that
+    /// only grows (pairing-flow design §9). 0: none recorded.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub pairing: u64,
+    /// The pairing `join_tag` is from.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub tag_pairing: u64,
+    /// The pairing `pair_secret` was sent in: the newest when it came.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub keys_pairing: u64,
+    /// Pairings up to this one ended with a removal of the host's grant
+    /// here: their completion records restore no relay writes.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub ended: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+impl PeerRelay {
+    /// The number of a new pairing made at `at` (Unix seconds): above the
+    /// newest one, and no lower than `at`, so it still grows after the
+    /// entry was dropped and made again.
+    pub fn next_pairing(&self, at: u64) -> u64 {
+        self.pairing.saturating_add(1).max(at)
+    }
+
+    /// Whether the stored tag belongs to a pairing newer than the stored
+    /// pair secret, so it is still the way back through a relay.
+    pub fn tag_is_current(&self) -> bool {
+        self.join_tag.is_some()
+            && (self.pair_secret.is_none() || self.tag_pairing > self.keys_pairing)
+    }
 }
 
 #[derive(Default, Serialize, Deserialize)]
