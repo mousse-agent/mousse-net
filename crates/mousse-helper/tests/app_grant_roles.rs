@@ -442,19 +442,26 @@ fn a_restricted_grant_ends_by(tag: &str, op: &str, opted: bool) {
     let reply = a.reply(id);
     assert_eq!(reply["removed"], true, "{op}: {reply}");
     if let Some(served) = served {
-        let (reset, code, replied) = a.wait("the reset and the reply", WAIT, |st| {
-            let reset = st
-                .messages
-                .iter()
-                .position(|m| m["ev"] == "stream.reset" && m["handle"] == served)?;
+        // The call ends with its own reset, or with its connection when
+        // that ends first; either before the reply.
+        let (ended, how, replied) = a.wait("the call's end and the reply", WAIT, |st| {
+            let ended = st.messages.iter().position(|m| {
+                (m["ev"] == "stream.reset" && m["handle"] == served)
+                    || (m["ev"] == "conn.down" && m["conn"] == p.a_conn)
+            })?;
             let replied = st
                 .messages
                 .iter()
                 .position(|m| m.get("re") == Some(&json!(id)))?;
-            Some((reset, st.messages[reset]["code"].clone(), replied))
+            Some((ended, st.messages[ended].clone(), replied))
         });
-        assert!(reset < replied, "{op} replied before the call was reset");
-        assert_eq!(code, "grant_revoked", "{op}");
+        assert!(ended < replied, "{op} replied before the call ended");
+        let code = if how["ev"] == "stream.reset" {
+            &how["code"]
+        } else {
+            &how["reason"]
+        };
+        assert_eq!(code, "grant_revoked", "{op}: {how}");
     } else {
         assert!(
             a.events("stream.incoming").is_empty(),
