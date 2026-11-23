@@ -86,7 +86,13 @@ const PROTO: (u64, u64) = (1, 2);
 /// What this helper implements beyond 1.1, listed in the `hello` reply of a
 /// 1.2 channel. An older helper ignores a field it does not know, so an app
 /// reads this list before it sends one.
-pub const FEATURES: &[&str] = &["invite-way", "route-readiness", "join-probe", GRANT_ROLES];
+pub const FEATURES: &[&str] = &[
+    "invite-way",
+    "route-readiness",
+    "join-probe",
+    "grant-revoke-local",
+    GRANT_ROLES,
+];
 
 /// The feature an app lists in its hello `features` to take streams of
 /// grants whose role is not `owner`.
@@ -263,6 +269,11 @@ struct Core {
     /// reads it before it starts and publishes its path only if it has not
     /// changed, so no path to a forgotten peer comes up after the forget.
     peer_gen: HashMap<IdentityPublicKey, u64>,
+    /// Per peer, how often a join to it was made void: by `peer.forget`,
+    /// or by a removal of its grant here, which keeps the peer and its
+    /// paths. A join reads it before it starts and stores the peer only if
+    /// it has not changed, checked under the peers lock.
+    join_gen: HashMap<IdentityPublicKey, u64>,
 }
 
 /// Why a connection that finished opening was closed instead of published.
@@ -336,6 +347,7 @@ impl App {
                 peak_buffered: 0,
                 ending: None,
                 peer_gen: HashMap::new(),
+                join_gen: HashMap::new(),
             }),
             wake_writer: Notify::new(),
             ended,
@@ -512,6 +524,11 @@ impl Shared {
     /// The generation of `pin` (see `Core::peer_gen`).
     fn peer_gen(&self, pin: &IdentityPublicKey) -> u64 {
         lock(&self.core).peer_gen.get(pin).copied().unwrap_or(0)
+    }
+
+    /// The join generation of `pin` (see `Core::join_gen`).
+    fn join_gen(&self, pin: &IdentityPublicKey) -> u64 {
+        lock(&self.core).join_gen.get(pin).copied().unwrap_or(0)
     }
 
     /// Publish an outbound path to a peer whose generation was `gen` when
@@ -1412,9 +1429,10 @@ fn cut_role(
     closed
 }
 
-/// Reset every host-opened stream whose grant here is no longer live (a
-/// removal, an expiry, a pause), on every change to the grant table and
-/// when networking pauses.
+/// Reset every peer stream whose grant here is no longer live (a
+/// removal, an expiry, a pause) or whose role was edited, on every change
+/// to the grant table and when networking pauses. A removal the app asked
+/// for has reset them already, before its reply ([`reset_unserved`]).
 async fn watch_served(shared: Arc<Shared>) {
     let mut grants = shared.host.grants_changed();
     let mut pause = shared.removal.watch();
@@ -1423,37 +1441,57 @@ async fn watch_served(shared: Arc<Shared>) {
             changed = grants.changed() => if changed.is_err() { return },
             changed = pause.changed() => if changed.is_err() { return },
         }
-        let mut core = lock(&shared.core);
-        let paused = shared.removal.is_paused();
-        let gone: Vec<(u32, StreamWriter, ErrorCode)> = core
-            .streams
-            .iter()
-            .filter_map(|(h, s)| {
-                let (grant, revision) = s.served?;
-                let identity = core.conns.get(&s.conn)?.identity;
-                let now = if paused {
-                    None
-                } else {
-                    shared
-                        .host
-                        .live_grant(&identity)
-                        .filter(|g| g.id.0 == grant)
-                };
-                let suspended = !paused && shared.host.is_suspended(GrantId(grant));
-                let code = served_code(now.map(|g| g.revision), revision, suspended)?;
-                Some((*h, s.writer.clone(), code))
-            })
-            .collect();
-        for (handle, writer, code) in gone {
-            writer.reset(code);
-            if drop_stream(&mut core, handle) {
-                let event = json!({"ev": "stream.reset", "handle": handle, "code": code.name()});
-                core.out.json(&event);
-            }
+        // Test hook: hold here while there is a stream to reset.
+        if cfg!(debug_assertions) && !unserved(&shared, &lock(&shared.core)).is_empty() {
+            crate::peer::crash_point("served-reset");
         }
-        core.regrant(&shared.limits);
-        shared.queued(&core);
+        reset_unserved(&shared);
     }
+}
+
+/// The peer's streams that end now, with the code each is reset with
+/// ([`served_code`]): those the host opened on this computer's connection
+/// to it, and those a caller opened on its connection here. While
+/// networking is paused, all of them.
+fn unserved(shared: &Shared, core: &Core) -> Vec<(u32, StreamWriter, ErrorCode)> {
+    let paused = shared.removal.is_paused();
+    core.streams
+        .iter()
+        .filter_map(|(h, s)| {
+            let (grant, revision) = s.served?;
+            let identity = core.conns.get(&s.conn)?.identity;
+            let now = if paused {
+                None
+            } else {
+                shared
+                    .host
+                    .live_grant(&identity)
+                    .filter(|g| g.id.0 == grant)
+            };
+            let suspended = !paused && shared.host.is_suspended(GrantId(grant));
+            let code = served_code(now.map(|g| g.revision), revision, suspended)?;
+            Some((*h, s.writer.clone(), code))
+        })
+        .collect()
+}
+
+/// Reset the [`unserved`] streams under the core lock streams are
+/// delivered under: the peer gets the code, the app a `stream.reset`, and
+/// data queued for the app on them is dropped, as is any that arrives
+/// later. `grant.remove` and `grant.revoke_local` call it before they
+/// reply, so no data from the peer's streams reaches the app after a reply
+/// saying it was removed.
+fn reset_unserved(shared: &Shared) {
+    let mut core = lock(&shared.core);
+    for (handle, writer, code) in unserved(shared, &core) {
+        writer.reset(code);
+        if drop_stream(&mut core, handle) {
+            let event = json!({"ev": "stream.reset", "handle": handle, "code": code.name()});
+            core.out.json(&event);
+        }
+    }
+    core.regrant(&shared.limits);
+    shared.queued(&core);
 }
 
 /// How a stream served under a grant at `revision` ends, now that the
@@ -1544,6 +1582,11 @@ async fn conn_task(shared: Arc<Shared>, no: u64, conn: Arc<Connection>, inbound:
         () = accept => CloseReason::PipeClosed,
         reason = closed => reason,
     };
+    // Test hook: hold a caller's connection between its close and its end
+    // here, as a slow close would.
+    if inbound {
+        crate::peer::crash_point("inbound-down");
+    }
     shared.conn_down(no, &reason);
 }
 

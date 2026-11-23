@@ -297,6 +297,8 @@ struct RxState {
     end: Option<StreamEnd>,
     /// The reader is gone: nothing more is kept.
     gone: bool,
+    /// This side reset the stream with this code ([`StreamWriter::reset`]).
+    reset: Option<ErrorCode>,
 }
 
 struct RxQueue {
@@ -346,6 +348,16 @@ impl RxQueue {
         }
         drop(st);
         self.ready.notify_one();
+    }
+
+    /// This side resets the stream with `code`; the first code counts.
+    fn mark_reset(&self, code: ErrorCode) {
+        self.lock().reset.get_or_insert(code);
+    }
+
+    /// The code this side reset the stream with, if it did.
+    fn local_reset(&self) -> Option<ErrorCode> {
+        self.lock().reset
     }
 
     /// The reader let go: drop what waits.
@@ -482,6 +494,7 @@ fn clone_err(e: &NetError) -> NetError {
 #[derive(Clone)]
 pub struct StreamWriter {
     id: StreamId,
+    rx: Arc<RxQueue>,
     cmd: mpsc::UnboundedSender<Cmd>,
     closing: watch::Receiver<bool>,
 }
@@ -511,8 +524,11 @@ impl StreamWriter {
         let _ = self.cmd.send(Cmd::Finish(self.id));
     }
 
-    /// Abort the stream in both directions.
+    /// Abort the stream in both directions. The peer gets `code`, also when
+    /// DATA it already sent arrives before the reset is sent and finds the
+    /// reader gone.
     pub fn reset(&self, code: ErrorCode) {
+        self.rx.mark_reset(code);
         let _ = self.cmd.send(Cmd::Reset(self.id, code));
     }
 
@@ -1348,7 +1364,7 @@ impl Driver {
         MuxStream {
             reader: StreamReader {
                 id,
-                rx,
+                rx: rx.clone(),
                 cmd: self.cmd_tx.clone(),
                 ended: None,
                 closing: self.closing.subscribe(),
@@ -1357,6 +1373,7 @@ impl Driver {
             },
             writer: StreamWriter {
                 id,
+                rx,
                 cmd: self.cmd_tx.clone(),
                 closing: self.closing.subscribe(),
             },
@@ -1474,8 +1491,13 @@ impl Driver {
                     .streams
                     .get(&stream.0)
                     .is_some_and(|tx| tx.rx.push(bytes, chunk));
-                if !delivered && self.streams.remove(&stream.0).is_some() {
-                    let _ = self.mux.reset(stream, ErrorCode::Cancelled);
+                if !delivered {
+                    if let Some(tx) = self.streams.remove(&stream.0) {
+                        // A reset this side asked for may still wait in the
+                        // command queue: send its code, not ours.
+                        let code = tx.rx.local_reset().unwrap_or(ErrorCode::Cancelled);
+                        let _ = self.mux.reset(stream, code);
+                    }
                 }
             }
             MuxEvent::Finished { stream } => {
@@ -2221,6 +2243,57 @@ mod tests {
             within("the reset", stream.reader.reset_by_peer()).await,
             ErrorCode::Cancelled
         );
+    }
+
+    /// This side resets a stream with a code and lets its reader go while
+    /// DATA from the peer is in flight. Whichever the driver takes first,
+    /// the reset or the DATA, the peer gets that code, never `CANCELLED`.
+    /// The driver picks between them at random, so the race is run on many
+    /// streams.
+    #[tokio::test]
+    async fn data_in_flight_at_a_local_reset_gets_the_resets_code() {
+        let (conn, mut peer, _valve, _clock) = connected(3_600).await;
+        for _ in 0..32 {
+            let stream = conn
+                .open_stream(PriorityClass::Interactive, "terminal")
+                .await
+                .unwrap();
+            let id = stream.id();
+            stream.writer.write(b"open").await.unwrap();
+            assert!(
+                within(
+                    "the open",
+                    peer.read_until(|f| matches!(f, Frame::Data { stream, .. } if *stream == id))
+                )
+                .await
+            );
+            // The peer's DATA waits in the pipe while, before the driver
+            // runs again (one thread), this side resets and drops the stream.
+            peer.mux.send(id, b"late").unwrap();
+            peer.flush().await;
+            stream.writer.reset(ErrorCode::GrantRevoked);
+            drop(stream);
+            assert!(
+                within(
+                    "the reset",
+                    peer.read_until(|f| matches!(f, Frame::Reset { stream, .. } if *stream == id))
+                )
+                .await
+            );
+            let codes: Vec<ErrorCode> = peer
+                .frames
+                .iter()
+                .filter_map(|f| match f {
+                    Frame::Reset { stream, code } if *stream == id => Some(*code),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                codes,
+                [ErrorCode::GrantRevoked],
+                "late DATA changed the reset's code"
+            );
+        }
     }
 
     /// A peer splitting its data into one-byte DATA frames while nobody
