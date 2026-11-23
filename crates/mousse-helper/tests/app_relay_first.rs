@@ -6,10 +6,18 @@
 //!
 //! Host A is reached directly only through a loopback proxy this file
 //! runs, which can add delay or cut every connection.
+//!
+//! A "Send link" pairing that can only go through a relay is reached
+//! through it again after a crash at each point after its completion
+//! record was saved (pairing-flow design §9, `pairing-relay-completion`):
+//! the record holds the relay route, its approval and the sealed tag, and
+//! a replay brings back no tag that was retired or expired.
 
 mod common;
 #[path = "common/relay.rs"]
 mod relay_fixture;
+#[path = "common/relay_link.rs"]
+mod relay_link;
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -279,4 +287,165 @@ fn the_relay_carries_the_host_again_when_the_direct_path_drops() {
         &mut fx.a,
         b"relayed again",
     );
+}
+
+// ---------------------------------------------------------------------------
+// Relay-only link completion recovery
+
+/// The path of A's completion record for `link`.
+fn record_path(a_end: &Endpoint, link: &relay_link::Link) -> std::path::PathBuf {
+    a_end
+        .dir
+        .join("joins")
+        .join(format!("{}.done", link.hash()))
+}
+
+/// A relay-only link join stopped at `point`, after its completion record
+/// was saved: after a restart, `join.status` reports it done, A reaches B
+/// again through the relay, and B lists A's caller key.
+fn a_relay_link_join_stopped_at_comes_back_over_the_relay(tag: &str, point: &str) {
+    let mut host = relay_link::RelayHost::start(tag);
+    let a_end = Endpoint::init(&format!("{tag}-a"));
+    let link = host.join_crashing(&a_end, point);
+    let mut a = host.joiner(&a_end, &[], &[]);
+    let b_id = host.b.identity.clone();
+    let s = relay_link::status(&mut a, &link);
+    assert_eq!(s["done"]["identity"], b_id.as_str(), "{s}");
+    let up = relay_link::dial_up(&mut a, &b_id);
+    assert_eq!(
+        up["route"]["kind"], "relay",
+        "A came back another way: {up}"
+    );
+    let a_id = a.identity.clone();
+    wait_until("B lists A's caller key", || {
+        host.relay_status(&a_id) == "listed"
+    });
+}
+
+#[test]
+fn a_crash_right_after_the_relay_link_record_still_comes_back_over_the_relay() {
+    a_relay_link_join_stopped_at_comes_back_over_the_relay("rlc-saved", "link-done-saved");
+}
+
+#[test]
+fn a_crash_after_the_relay_link_row_still_comes_back_over_the_relay() {
+    a_relay_link_join_stopped_at_comes_back_over_the_relay("rlc-row", "link-row-saved");
+}
+
+#[test]
+fn a_crash_after_the_relay_link_route_still_comes_back_over_the_relay() {
+    a_relay_link_join_stopped_at_comes_back_over_the_relay("rlc-route", "link-relay-routes-saved");
+}
+
+/// The record keeps the tag sealed for this endpoint: neither the tag nor
+/// the ticket's secret or link is in it in the clear, nor in A's log.
+#[test]
+fn a_relay_link_record_holds_the_tag_only_sealed() {
+    let mut host = relay_link::RelayHost::start("rlc-sealed");
+    let a_end = Endpoint::init("rlc-sealed-a");
+    let link = host.join_crashing(&a_end, "link-done-saved");
+    let text = std::fs::read_to_string(record_path(&a_end, &link)).unwrap();
+    let record: Value = serde_json::from_str(&text).unwrap();
+    assert!(
+        record["relay"]["join_tag"].is_string(),
+        "no tag kept: {record}"
+    );
+    let tag = mousse_net_io::store::hex(&link.tag());
+    let secret = mousse_net_io::store::hex(link.ticket.secret.expose());
+    let fragment = link.uri.rsplit('#').next().unwrap().to_owned();
+    for (what, clear) in [
+        ("tag", &tag),
+        ("ticket secret", &secret),
+        ("link", &fragment),
+    ] {
+        assert!(
+            !text.to_lowercase().contains(&clear.to_lowercase()),
+            "the record holds the {what} in the clear: {text}"
+        );
+    }
+    let mut a = host.joiner(&a_end, &[], &[]);
+    relay_link::status(&mut a, &link);
+    assert!(!a_end.log().contains(&tag), "the tag is in A's log");
+}
+
+/// A record the app never acknowledged, replayed once the host answered
+/// `mousse-keys`, does not bring the retired tag back.
+#[test]
+fn a_replay_after_the_hosts_keys_arrived_brings_back_no_tag() {
+    let mut host = relay_link::RelayHost::start("rlc-keys");
+    let a_end = Endpoint::init("rlc-keys-a");
+    let mut a = host.joiner(&a_end, &[], &[]);
+    let link = host.link();
+    let id = host.join(&mut a, &link);
+    let reply = a.reply(id);
+    assert!(reply.get("error").is_none(), "{reply}");
+    let up = a.event("conn.up", |m| m["conn"] == reply["conn"]);
+    assert_eq!(up["route"]["kind"], "relay", "{up}");
+    let b_id = host.b.identity.clone();
+    a.event("peer.keys", |m| m["identity"] == b_id.as_str());
+    let entry = relay_link::relay_peer(&a.dir, &b_id);
+    assert!(entry["pair_secret"].is_string(), "{entry}");
+    assert!(entry["join_tag"].is_null(), "{entry}");
+    let s = relay_link::status(&mut a, &link);
+    assert_eq!(s["done"]["identity"], b_id.as_str(), "{s}");
+    let entry = relay_link::relay_peer(&a.dir, &b_id);
+    assert!(
+        entry["join_tag"].is_null(),
+        "a replay brought back a retired tag: {entry}"
+    );
+}
+
+/// Past the time the host keeps its recovery entry, a replay still stores
+/// the route and its approval, but not the tag.
+#[test]
+fn a_replay_after_the_tag_expired_keeps_the_route_and_not_the_tag() {
+    let rejoin = [("VIA_RELAY_REJOIN_SECS", "600")];
+    let mut host = relay_link::RelayHost::start("rlc-expired");
+    let a_end = Endpoint::init("rlc-expired-a");
+    let link = host.join_crashing_with(&a_end, "link-done-saved", &rejoin);
+    let clock = [("MOUSSE_HELPER_MANUAL_CLOCK", std::path::Path::new("1"))];
+    let mut a = host.joiner(&a_end, &rejoin, &clock);
+    a.call("test.clock", json!({"advance_secs": 601}));
+    let b_id = host.b.identity.clone();
+    let s = relay_link::status(&mut a, &link);
+    assert_eq!(s["done"]["identity"], b_id.as_str(), "{s}");
+    let entry = relay_link::relay_peer(&a.dir, &b_id);
+    let hint = link
+        .ticket
+        .routes
+        .iter()
+        .find(|r| r.starts_with("relay://"))
+        .unwrap()
+        .clone();
+    assert_eq!(entry["ticket_routes"], json!([hint]), "{entry}");
+    assert!(
+        relay_link::approvals(&a.dir)
+            .iter()
+            .any(|x| x["identity"] == b_id.as_str() && x["destination"] == host.destination()),
+        "the relay was not approved again"
+    );
+    assert!(
+        entry["join_tag"].is_null(),
+        "an expired tag came back: {entry}"
+    );
+}
+
+/// A record written by a helper from before the relay part still replays:
+/// the host is stored and reported done, and no tag is made up.
+#[test]
+fn a_relay_link_record_from_before_still_replays() {
+    let mut host = relay_link::RelayHost::start("rlc-old");
+    let a_end = Endpoint::init("rlc-old-a");
+    let link = host.join_crashing(&a_end, "link-done-saved");
+    let path = record_path(&a_end, &link);
+    let mut record: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(record["relay"].is_object(), "{record}");
+    record.as_object_mut().unwrap().remove("relay");
+    std::fs::write(&path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+    let mut a = host.joiner(&a_end, &[], &[]);
+    let b_id = host.b.identity.clone();
+    let s = relay_link::status(&mut a, &link);
+    assert_eq!(s["done"]["identity"], b_id.as_str(), "{s}");
+    assert_eq!(peer_of(&mut a, &b_id)["name"], "hostB");
+    assert!(relay_link::relay_peer(&a.dir, &b_id)["join_tag"].is_null());
 }
