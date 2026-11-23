@@ -455,12 +455,10 @@ fn scan(rows: &[Vec<bool>]) -> String {
     found.pop().unwrap()
 }
 
-#[test]
-fn the_terminal_qr_code_pairs_a_device() {
-    let host = temp_dir("hl-qr-host");
-    let phone = temp_dir("hl-qr-phone");
-    let server = serve_headless(&host, "server", &["--key-file"]);
-    let (code, out, err) = run(&phone, &["init", "--headless", "--key-file"]);
+/// Pair `phone` (a new headless endpoint) with the headless host in `host`
+/// through the terminal QR code; the host's `serve` is running.
+fn pair_by_qr(host: &Path, phone: &Path) {
+    let (code, out, err) = run(phone, &["init", "--headless", "--key-file"]);
     assert_eq!(code, Some(0), "init: {out} {err}");
 
     let mut invite_cmd = helper(&["--state", &host.display().to_string(), "invite", "--qr"]);
@@ -487,8 +485,12 @@ fn the_terminal_qr_code_pairs_a_device() {
     let (code, out, err) = join.finish();
     assert_eq!(code, Some(0), "join: {out} {err}");
     invite.wait_for("paired: grant ");
+}
 
-    // The pairing works: a command runs on the headless host.
+/// `phone` runs `echo hello-headless` in a terminal on the host named
+/// `server`: the exit code and output.
+fn term_echo(phone: &Path) -> (Option<i32>, String, String) {
+    let phone_state = phone.display().to_string();
     let echo: Vec<&str> = if cfg!(windows) {
         vec!["cmd", "/c", "echo", "hello-headless"]
     } else {
@@ -496,9 +498,66 @@ fn the_terminal_qr_code_pairs_a_device() {
     };
     let mut args = vec!["--state", &phone_state, "term", "server", "--"];
     args.extend(echo);
-    let (code, out, err) = Proc::spawn(helper(&args)).finish();
+    Proc::spawn(helper(&args)).finish()
+}
+
+#[test]
+fn the_terminal_qr_code_pairs_a_device() {
+    let host = temp_dir("hl-qr-host");
+    let phone = temp_dir("hl-qr-phone");
+    let server = serve_headless(&host, "server", &["--key-file"]);
+    pair_by_qr(&host, &phone);
+
+    // The pairing works: a command runs on the headless host.
+    let (code, out, err) = term_echo(&phone);
     assert_eq!(code, Some(0), "term: {out} {err}");
     assert!(out.contains("hello-headless"), "{out}");
+
+    stop(&host, server);
+    cleanup(&[&host, &phone]);
+}
+
+/// Every `grants.json` under `dir`.
+fn grant_files(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(grant_files(&path));
+        } else if path.file_name().is_some_and(|n| n == "grants.json") {
+            found.push(path);
+        }
+    }
+    found
+}
+
+/// Standalone `serve` opens a terminal only for an owner grant: once the
+/// paired device's grant is stored with another role, its terminal is
+/// refused.
+#[test]
+fn a_restricted_grant_gets_no_standalone_terminal() {
+    let host = temp_dir("hl-role-host");
+    let phone = temp_dir("hl-role-phone");
+    let server = serve_headless(&host, "server", &["--key-file"]);
+    pair_by_qr(&host, &phone);
+    stop(&host, server);
+
+    // The grant as a helper with roles stores a narrowed one.
+    let files = grant_files(&host);
+    assert_eq!(files.len(), 1, "{files:?}");
+    let mut table: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap();
+    table["version"] = serde_json::json!(3);
+    for grant in table["grants"].as_array_mut().unwrap() {
+        grant["role"] = serde_json::json!("member");
+        grant["revision"] = serde_json::json!(2);
+    }
+    std::fs::write(&files[0], serde_json::to_vec(&table).unwrap()).unwrap();
+
+    let server = serve_headless(&host, "server", &["--key-file"]);
+    let (code, out, err) = term_echo(&phone);
+    assert_ne!(code, Some(0), "term: {out} {err}");
+    assert!(!out.contains("hello-headless"), "{out}");
 
     stop(&host, server);
     cleanup(&[&host, &phone]);

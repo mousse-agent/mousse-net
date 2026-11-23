@@ -52,7 +52,10 @@ pub use clock::{Clock, ManualClock, SystemClock};
 pub use conn::{CloseReason, ConnStatus, Connection, MuxStream, StreamReader, StreamWriter};
 pub use endpoint::{Endpoint, PortChoice};
 pub use error::NetError;
-pub use host::{AppliedRemoval, ApprovalRequest, Host, HostConfig, HostEvent, Refusal};
+pub use host::{
+    AppliedRemoval, ApprovalRequest, Host, HostConfig, HostEvent, Refusal, RoleEditError,
+    RoleEditing,
+};
 pub use limits::Limits;
 pub use preauth::{ListenerKind, PreAuthSlot, PreAuthStats};
 pub use tls::TlsPolicy;
@@ -111,7 +114,11 @@ pub type SharedSigner = Arc<dyn IdentitySigner + Send + Sync>;
         mousse_control = "unbounded-candidates",
         mousse_control = "ssh-races-lan",
         mousse_control = "bind-all-lan-off",
-        mousse_control = "pin-stored-memory-only"
+        mousse_control = "pin-stored-memory-only",
+        mousse_control = "restricted-store-readable-by-old-helper",
+        mousse_control = "role-edit-unfenced",
+        mousse_control = "role-edit-while-paused",
+        mousse_control = "grant-served-while-not-serving"
     )
 ))]
 compile_error!("a mousse_control build has a deliberate defect and is for tests only; build it without --release");
@@ -163,7 +170,11 @@ compile_error!("a mousse_control build has a deliberate defect and is for tests 
     mousse_control = "unbounded-candidates",
     mousse_control = "ssh-races-lan",
     mousse_control = "bind-all-lan-off",
-    mousse_control = "pin-stored-memory-only"
+    mousse_control = "pin-stored-memory-only",
+    mousse_control = "restricted-store-readable-by-old-helper",
+    mousse_control = "role-edit-unfenced",
+    mousse_control = "role-edit-while-paused",
+    mousse_control = "grant-served-while-not-serving"
 ))]
 const _: () = {
     let profile = env!("MOUSSE_BUILD_PROFILE").as_bytes();

@@ -22,7 +22,7 @@ use mousse_net_core::authz::{
 use mousse_net_core::control::{
     negotiate_version, AuthorizedState, ControlMessage, VersionSupport,
 };
-use mousse_net_core::grants::{GrantTable, NewGrant, OwnerRef, Role};
+use mousse_net_core::grants::{GrantEvent, GrantTable, NewGrant, OwnerRef, Role};
 use mousse_net_core::identity::{IdentityPublicKey, SoftwareKey};
 use mousse_net_core::mux::Frame;
 use mousse_net_core::pairing::{
@@ -403,13 +403,42 @@ impl World {
             ("host", "approve") => {
                 let conn = u(&step["conn"]);
                 let invitation = self.invitation.expect("created");
-                match self
-                    .host
-                    .approve(&invitation, ConnectionId(conn), &mut self.grants, now)
-                {
+                let role = step.get("role").map(|r| Role::new(s(r)).expect("role"));
+                match self.host.approve_as(
+                    &invitation,
+                    ConnectionId(conn),
+                    role,
+                    &mut self.grants,
+                    now,
+                ) {
                     Ok(actions) => self.host_actions(actions),
                     Err(e) => vec![json!({ "error": host_error_name(e) })],
                 }
+            }
+            ("host", "set_role") => {
+                // The owner edits the joiner's grant in place, at its
+                // current revision.
+                let grant = self
+                    .grants
+                    .live_grant(&joiner_key(), now)
+                    .map(|g| (g.id, g.revision))
+                    .expect("granted");
+                let role = Role::new(s(&step["role"])).expect("role");
+                let edit = self
+                    .grants
+                    .set_role(grant.0, grant.1, role, now)
+                    .expect("set_role");
+                let mut out = vec![json!({ "role_set": {
+                    "role": edit.role.as_str(),
+                    "changed": edit.changed,
+                } })];
+                for e in edit.events {
+                    let GrantEvent::CloseChannels { channels, code, .. } = e;
+                    for c in channels {
+                        out.extend(self.host_close(c.0, code));
+                    }
+                }
+                out
             }
             (name, "start") => {
                 let ticket = Ticket::decode(&unhex(&step["ticket"])).expect("ticket");
@@ -1358,6 +1387,32 @@ fn joiner_cap_survives_reopening() -> J {
     )
 }
 
+/// The role chosen with the approval is the grant's, for this enrollment
+/// only; the receipt replay carries the grant's role as it is now.
+fn approved_role_then_edited() -> J {
+    let mut r =
+        Recorder::new(json!({ "host": ticket_draws("approved_role"), "joiners": { "a": [] } }));
+    let mut c = create(1);
+    c["role"] = json!("client");
+    r.event(c);
+    let t = r.ticket();
+    r.event(scan(&t));
+    r.event(connect("a", 1, exporter_pair("approved_role/conn1")));
+    // Deliver by hand from here, so that PAIRED can be lost.
+    r.pump = false;
+    let out = r.event(json!({ "party": "host", "event": "approve", "conn": 1, "role": "member" }));
+    sent_control(&out, "host", "PAIRED");
+    r.event(json!({ "party": "a", "event": "drop" }));
+    r.event(json!({ "party": "host", "event": "set_role", "role": "viewer" }));
+    r.pump = true;
+    r.event(connect("a", 2, exporter_pair("approved_role/conn2")));
+    r.finish(
+        "approved_role_then_edited",
+        "Events new in this flow (the conventions predate them): host/approve with `role` approves with that role chosen for this enrollment's grant (without it, the invitation's role); host/set_role edits the role of the joiner's grant in place to `role` at its current revision (wire.md 7) and outputs role_set with the grant's role and whether it changed, then a close with the edit's code for each channel the grant had authorized. The invitation offers the role client. The owner approves the device in person and chooses member with the approval: the grant is made with member and PAIRED says member; the invitation keeps client. The connection breaks before PAIRED arrives, and the owner then edits the grant's role in place to viewer (role_set; no channel is bound, so none closes). The joiner reconnects with the same ticket: step 2 finds the live grant (AUTHORIZED live), and the grant's enrollment receipt names this invitation, so the answer to the proof is PAIRED with the grant's role as it is now, viewer, not the invitation's or the approval's. The grant stays viewer.",
+        1,
+    )
+}
+
 fn document() -> J {
     json!({
         "description": "End-to-end pairing (spec wire.md, sections 8, 10 and 11, and cpace.md). Each flow lists scripted random draws per party, then events in order with every output. Replaying the events with the same draws must give the same outputs byte for byte.",
@@ -1387,6 +1442,7 @@ fn document() -> J {
             swapped_in_person_link(),
             own_ticket(),
             joiner_cap_survives_reopening(),
+            approved_role_then_edited(),
         ],
     })
 }

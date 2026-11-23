@@ -85,13 +85,14 @@ Additions only. A 1.2 helper serves a 1.1 app unchanged.
 
 ## 2. Choosing the way: `invite.create`
 
-`invite.create {kind?, way?, route?}`
+`invite.create {kind?, way?, route?, role?}`
 
 - `kind`: `in_person` or `link`, default `in_person`, as today.
 - `way`: one of `lan`, `tailnet`, `public`, `tunnel`, `relay`.
 - `route`: optional, valid only with `way`. An exact canonical hint taken
   from `routes.available`. It selects one entry of this computer's
   inventory; it never adds an address.
+- `role`: the invitation's role (§8.1), the same with `way` as without.
 
 The reply keeps `{invitation, uri, routes, expires_at, code?,
 attempts_left?}`. With `way` it adds `ways`, which is exactly `[way]`.
@@ -408,8 +409,9 @@ given meaning by the app. The engine keeps two meanings of `owner`: the
 
 ### 8.1 Choosing the role
 
-- `invite.create {role?}`: the role fixed in the invitation. Absent:
-  `owner`, as today.
+- `invite.create {role?}`: the role fixed in the invitation, with or
+  without `way`, checked the same way on both paths. Absent: `owner`, as
+  today.
 - `approval.answer {request, yes, role?}`: for an in-person approval, the
   role of the grant. Absent: the invitation's role. A role with `yes:
   false` is `bad_request`. The role is checked before the pending request
@@ -483,6 +485,58 @@ before queued work commits.
 - How the caller learns its role after an edit: the serving app says it in
   its `mousse.hello` reply. `AUTHORIZED` stays as it is. The serving side
   enforces from its own grant only.
+
+### 8.5 As built (pull request 4)
+
+Where pull request 4 differs from the text above, or settles what it left
+open:
+
+- **Unknown save outcome.** The grant is suspended: its connections close,
+  new ones are refused, its streams are not handed to the app and its
+  signer cannot remove. It is served again when a later save of the table
+  succeeds, or when the helper's periodic re-read finds the stored role and
+  revision equal to the ones in memory. The edit's reply is
+  `store_failed`, and the helper cuts the grant's paths as for an edit.
+  A further edit of a suspended grant first saves the table again and is
+  refused with `store_failed` if that fails.
+- **Refusals.** An edit the grant table refuses for another reason (the
+  revision would overflow, the identity is denied) is `bad_request`.
+- **Store version.** A table is written with version 3 when any grant's
+  role is not `owner` or any grant's revision is above 1 (it was edited,
+  even back to `owner`); the same holds for the table an enrollment journal
+  keeps. A table of `owner` grants that were never edited stays version 2
+  and an older helper still loads it; revision 1 is not written. So an
+  older helper never rewrites an edited grant back to revision 1, after
+  which a stale edit against an old revision could apply again.
+- **Answering an edit.** The host commits the edit and closes the grant's
+  connections under its lock; the app channel then cuts its own paths (see
+  below). The reply is sent only once every connection closed has dropped
+  what was queued on it and finished the frame it was writing (a fence,
+  bounded by `close_linger`): nothing queued under the old role, a
+  `mousse-grants` list included, leaves after the reply.
+  `grant.role_changed` is sent at the same point.
+- **Paused.** An edit is refused with `paused` while a removal that failed
+  to save holds networking paused. The host sets its fence under the lock
+  the signed removal saved under, so no edit commits between the failed
+  save and the pause.
+- **Cut paths.** A connection the edit closes reads as closing at once, and
+  no stream is handed to the app on a closing connection, one the peer
+  opened before the edit included. A `stream.incoming` still waiting to be
+  written for a stream the edit cut is dropped with that stream's data, and
+  no `stream.reset` is sent for a stream the app never heard of.
+- **Not serving.** While an enrollment save's outcome is unknown, no grant
+  reads as live, on this computer's own outbound connections too; nor does
+  an expired grant, before the expiry is swept.
+- **Suspended grants.** A stream under a grant whose edit waits to settle
+  is reset with `CANCELLED`, not `GRANT_REVOKED`: the grant still exists.
+- **Grant list.** A host opens and keeps `mousse-grants` only for a caller
+  whose grant is `owner`, checked when the stream opens and again before
+  each list. Signer standing is checked separately, on every removal.
+- **Renewals.** A stream is checked against the grant's current role and
+  revision when it is handed to the app, so a stream on a path that was
+  renewing during the edit is served under the new role.
+- **Standalone `serve`.** The terminal is opened for `owner` only
+  (`serve.rs` `TERMINAL_ROLES`).
 
 ## 9. Relay-only completion recovery
 
@@ -634,6 +688,11 @@ passes. `mousse-check` takes a check id's prefix as the manifest's file
 stem, so the ids there are `pairing-flow.<name>`: the table's
 `pairing.invite-way` is `pairing-flow.invite-way`, and so on.
 
+`mousse-check` finds a check's file by the part of its id before the dot,
+which is the file's `phase`. The role checks are therefore in
+`checks/pairing-roles.toml` as `pairing-roles.grant-roles` and
+`pairing-roles.grant-connected`, with the controls listed below.
+
 | Check | Control | The bug it plants |
 |---|---|---|
 | `pairing.invite-way` | `select-after-route-cap` | the way is selected from the capped list |
@@ -657,8 +716,17 @@ stem, so the ids there are `pairing-flow.<name>`: the table's
 | | `role-edit-keeps-reverse-path` | a path under the old role stays open |
 | | `restricted-grant-served-to-legacy-app` | an app without `grant-roles` gets the traffic |
 | | `restricted-grant-opens-standalone-terminal` | `serve` ignores the role |
-| | `demoted-owner-keeps-grants` | `mousse-grants` stays open after demotion |
+| | `demoted-owner-keeps-grants` | any granted caller gets `mousse-grants` |
+| | `demoted-signer-removes` | a demoted signer still removes |
 | | `restricted-store-readable-by-old-helper` | the store version is not raised |
+| | `role-edit-unfenced` | queued data leaves after the reply |
+| | `role-edit-while-paused` | an edit commits while paused |
+| | `role-edit-keeps-queued-announcement` | a waiting `stream.incoming` is written |
+| | `role-edit-delivers-on-closing-path` | a call on a cut path is delivered |
+| | `grant-served-while-not-serving` | a grant is served unsaved or expired |
+| | `suspended-reads-as-revoked` | a suspended grant's streams read revoked |
+| | `answer-role-sticks-to-invitation` | a failed answer's role is kept |
+| | `way-invite-drops-role` | a chosen way drops the role |
 | `pairing.grant-connected` | `grant-from-stale-connection` | a closed connection's identity is granted |
 | | `connected-grant-upgrades-existing` | an existing grant is widened |
 | | `connected-grant-trusts-request-identity` | the identity is read from the request |

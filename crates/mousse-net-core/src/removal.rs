@@ -510,8 +510,11 @@ pub fn decide(
     let r = removal.removal();
     // Check 1.
     let signer_grant = grants.live_grant(&r.signer, now).filter(|g| {
-        // Must-fail control (tests only): any live grant may sign.
-        cfg!(mousse_control = "accept-any-signer") || g.role.as_str() == Role::OWNER
+        // Must-fail controls (tests only): any live grant may sign; a grant
+        // whose role was edited (a demoted owner) still may.
+        cfg!(mousse_control = "accept-any-signer")
+            || (cfg!(mousse_control = "demoted-signer-removes") && g.revision > 1)
+            || g.role.as_str() == Role::OWNER
     });
     let Some(signer_grant) = signer_grant else {
         return Decision::Refuse;

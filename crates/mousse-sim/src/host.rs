@@ -554,14 +554,11 @@ impl HostDev {
                     conn,
                     grant,
                     identity,
+                    role,
                 } => {
                     if let Some(hc) = self.conns.get_mut(&conn) {
                         hc.gate.promote(grant);
                     }
-                    let role = self
-                        .grants
-                        .get(grant)
-                        .map_or_else(Role::owner, |g| g.role.clone());
                     sim.say(
                         self.id,
                         format_args!(

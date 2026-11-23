@@ -66,7 +66,11 @@
         mousse_control = "skip-code-confirm",
         mousse_control = "host-attempts-reset-on-reconnect",
         mousse_control = "invitation-survives-exhaustion",
-        mousse_control = "same-code-after-failure"
+        mousse_control = "same-code-after-failure",
+        mousse_control = "approval-uses-invitation-role",
+        mousse_control = "role-edit-ignores-revision",
+        mousse_control = "demoted-signer-removes",
+        mousse_control = "answer-role-sticks-to-invitation"
     ),
     not(debug_assertions)
 ))]
@@ -103,7 +107,11 @@ compile_error!("mousse_control plants a bug for tests; it is not allowed in rele
     mousse_control = "skip-code-confirm",
     mousse_control = "host-attempts-reset-on-reconnect",
     mousse_control = "invitation-survives-exhaustion",
-    mousse_control = "same-code-after-failure"
+    mousse_control = "same-code-after-failure",
+    mousse_control = "approval-uses-invitation-role",
+    mousse_control = "role-edit-ignores-revision",
+    mousse_control = "demoted-signer-removes",
+    mousse_control = "answer-role-sticks-to-invitation"
 ))]
 const _: () = {
     let profile = env!("MOUSSE_BUILD_PROFILE").as_bytes();

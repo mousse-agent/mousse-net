@@ -341,6 +341,67 @@ fn in_person_pairing_needs_a_proof_and_one_tap() {
     );
 }
 
+/// Two joiners wait on one in-person invitation of role `client`. The
+/// owner's answer for the first, with role `member`, fails: once for a
+/// connection that is not a joiner, once after the joiner left (stale).
+/// Neither answer's role reaches the invitation or the other joiner: the
+/// second, approved without a role, gets the invitation's.
+#[test]
+fn a_role_with_a_failed_answer_reaches_neither_the_invitation_nor_the_other_joiner() {
+    let mut w = world();
+    let client = Role::new(Role::CLIENT).unwrap();
+    let member = Role::new("member").unwrap();
+    let ticket = w.invite_as(
+        InvitationKind::InPerson,
+        client.clone(),
+        OwnerRef::from_bytes([0x53; 16]),
+    );
+    let mut first = w.joiner(&ticket, 2);
+    w.connect(&mut first, 10, 2);
+    let mut second = w.joiner(&ticket, 3);
+    w.connect(&mut second, 11, 3);
+
+    assert_eq!(
+        w.host.approve_as(
+            &ticket.invitation,
+            ConnectionId(99),
+            Some(member.clone()),
+            &mut w.grants,
+            NOW
+        ),
+        Err(HostPairingError::UnknownJoiner)
+    );
+    let _ = w.host.on_connection_closed(ConnectionId(10));
+    assert_eq!(
+        w.host.approve_as(
+            &ticket.invitation,
+            ConnectionId(10),
+            Some(member),
+            &mut w.grants,
+            NOW
+        ),
+        Err(HostPairingError::UnknownJoiner)
+    );
+    assert_eq!(w.grants.grants().count(), 0);
+
+    let actions = w
+        .host
+        .approve_as(
+            &ticket.invitation,
+            ConnectionId(11),
+            None,
+            &mut w.grants,
+            NOW,
+        )
+        .unwrap();
+    assert!(actions.iter().any(|a| matches!(
+        a,
+        HostAction::Enrolled { role, .. } if *role == client
+    )));
+    assert_eq!(w.grants.live_grant(&key(3), NOW).unwrap().role, client);
+    assert!(w.grants.live_grant(&key(2), NOW).is_none());
+}
+
 /// Current behaviour, kept on purpose: pairing an identity that already
 /// holds a grant on this endpoint replaces the grant, so the newer role and
 /// authorizing owner win and the old grant's channels close. An endpoint has
@@ -615,7 +676,7 @@ fn a_lost_paired_on_the_last_attempt_is_learned_on_reconnect() {
         .iter()
         .any(|a| matches!(a, HostAction::Enrolled { .. })));
     // PAIRED never arrives.
-    w.host.on_connection_closed(ConnectionId(10));
+    let _ = w.host.on_connection_closed(ConnectionId(10));
     assert_eq!(j.closed(None), vec![]);
     assert_eq!(j.attempts_left(), 0);
     assert!(j.outcome_pending());
@@ -688,7 +749,7 @@ fn a_lost_confirmation_on_the_last_attempt_ends_after_reconnect() {
     w.connect(&mut j, 10, 2);
     let right = w.host.code(&ticket.invitation).unwrap().clone();
     w.attempt_until_confirmation(&mut j, 10, &right, &mut rng);
-    w.host.on_connection_closed(ConnectionId(10));
+    let _ = w.host.on_connection_closed(ConnectionId(10));
     j.closed(None);
     assert!(j.outcome_pending());
     assert_eq!(w.host.attempts_left(&ticket.invitation), Some(2));
@@ -1241,7 +1302,7 @@ fn an_abandoned_attempt_keeps_its_debit() {
         &mut w.rng,
     );
     // The link drops mid-attempt.
-    w.host.on_connection_closed(ConnectionId(10));
+    let _ = w.host.on_connection_closed(ConnectionId(10));
     j.closed(None);
     assert_eq!(w.host.attempts_left(&ticket.invitation), Some(2));
     assert_eq!(j.attempts_left(), 2);

@@ -4207,6 +4207,316 @@
           "ticket": "a701010202035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450955d9bbe3c5330f2ade33721d4bcabbd0550a89864f1782d7951ecb6969c2be0c357061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
         }
       ]
+    },
+    {
+      "description": "Events new in this flow (the conventions predate them): host/approve with `role` approves with that role chosen for this enrollment's grant (without it, the invitation's role); host/set_role edits the role of the joiner's grant in place to `role` at its current revision (wire.md 7) and outputs role_set with the grant's role and whether it changed, then a close with the edit's code for each channel the grant had authorized. The invitation offers the role client. The owner approves the device in person and chooses member with the approval: the grant is made with member and PAIRED says member; the invitation keeps client. The connection breaks before PAIRED arrives, and the owner then edits the grant's role in place to viewer (role_set; no channel is bound, so none closes). The joiner reconnects with the same ticket: step 2 finds the live grant (AUTHORIZED live), and the grant's enrollment receipt names this invitation, so the answer to the proof is PAIRED with the grant's role as it is now, viewer, not the invitation's or the approval's. The grant stays viewer.",
+      "draws": {
+        "host": [
+          {
+            "bytes": "6bc5221f5e6f78aea633e5ebdc2c9364",
+            "use": "invitation_id"
+          },
+          {
+            "bytes": "146db1be1cadb5602f32edfc3130e796",
+            "use": "ticket_secret"
+          }
+        ],
+        "joiners": {
+          "a": []
+        }
+      },
+      "end": {
+        "grants": [
+          {
+            "authorizing_owner": "51515151515151515151515151515151",
+            "bound_connections": [
+              2
+            ],
+            "expires_at": null,
+            "granted_at": 1790000000,
+            "identity": "04d65a93977caa3d1b081852ff57a79e465f1660577304baead505dd3a48589cf350185e895372df6221ea3a137557e473fddb6755f05bd507c3c533fce9c91285",
+            "name": "Phone (Work)",
+            "role": "viewer"
+          }
+        ],
+        "host": {
+          "attempts_left": 3,
+          "shown_code": null,
+          "status": "consumed"
+        },
+        "joiners": {
+          "a": {
+            "attempts_left": 3,
+            "live": true,
+            "outcome_pending": false,
+            "state": "paired",
+            "stored": null
+          }
+        }
+      },
+      "kind": 1,
+      "name": "approved_role_then_edited",
+      "steps": [
+        {
+          "event": "create",
+          "kind": 1,
+          "out": [
+            {
+              "ticket": {
+                "binary": "a701010201035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e579404506bc5221f5e6f78aea633e5ebdc2c93640550146db1be1cadb5602f32edfc3130e796061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433",
+                "fragment": "pwEBAgEDWEEEAhfmF_C2RDkoJ4-WmZ5pojpPLBUr321s32bluAKC1O0ZSn3ry5dxLS3aPKhaqHZaVvRfx1hZllLyiXxlMG5XlARQa8UiH15veK6mM-Xr3CyTZAVQFG2xvhyttWAvMu38MTDnlgYaarE92AeBd3RjcDovLzE5Mi4xNjguMS4yMDo3NDQz",
+                "hash": "66e60e902d3a998471b15b9b3155bde3db4d4b4360761afa34ba97c1fbf6fab5",
+                "shown_code": null
+              }
+            }
+          ],
+          "party": "host",
+          "role": "client"
+        },
+        {
+          "arrival": "in_app_scan",
+          "event": "start",
+          "out": [],
+          "party": "a",
+          "ticket": "a701010201035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e579404506bc5221f5e6f78aea633e5ebdc2c93640550146db1be1cadb5602f32edfc3130e796061a6ab13dd80781777463703a2f2f3139322e3136382e312e32303a37343433"
+        },
+        {
+          "conn": 1,
+          "event": "connect",
+          "exporters": {
+            "join": "6309d3da7a9946076ebaeb8d08a47262fcc65ab4867d11d411f7c750b1522941",
+            "pair": "a69fdd86e55a8f981f321f447c1828ebcddda0e0e2117d1859e19141c7ed75bd"
+          },
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000101010203",
+                "frame": "000000000700000007a3000101010203",
+                "from": "a",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000101010203",
+                "frame": "000000000700000007a3000101010203",
+                "from": "host",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a4000301506bc5221f5e6f78aea633e5ebdc2c93640258203033b3fb03c6815d4e1334e724a4b342f0d80d21e711d988153e739e2f8ad614036c50686f6e652028576f726b29",
+                "frame": "000000000700000046a4000301506bc5221f5e6f78aea633e5ebdc2c93640258203033b3fb03c6815d4e1334e724a4b342f0d80d21e711d988153e739e2f8ad614036c50686f6e652028576f726b29",
+                "from": "a",
+                "type": "JOIN_PROOF"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "control": "a3000101010203",
+          "event": "receive",
+          "out": [
+            {
+              "version": 3
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a3000101010203",
+          "event": "receive",
+          "out": [
+            {
+              "version": 3
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "control": "a4000301506bc5221f5e6f78aea633e5ebdc2c93640258203033b3fb03c6815d4e1334e724a4b342f0d80d21e711d988153e739e2f8ad614036c50686f6e652028576f726b29",
+          "event": "receive",
+          "out": [
+            {
+              "admitted_join_only": 1
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a200020102",
+                "frame": "000000000700000005a200020102",
+                "from": "host",
+                "type": "AUTHORIZED"
+              }
+            },
+            {
+              "ask_approval": {
+                "conn": 1,
+                "name": "Phone (Work)"
+              }
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a200020102",
+          "event": "receive",
+          "out": [],
+          "party": "a"
+        },
+        {
+          "conn": 1,
+          "event": "approve",
+          "out": [
+            {
+              "enrolled": {
+                "conn": 1
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000601644465736b02666d656d626572",
+                "frame": "000000000700000011a3000601644465736b02666d656d626572",
+                "from": "host",
+                "type": "PAIRED"
+              }
+            }
+          ],
+          "party": "host",
+          "role": "member"
+        },
+        {
+          "event": "drop",
+          "out": [],
+          "party": "a"
+        },
+        {
+          "event": "set_role",
+          "out": [
+            {
+              "role_set": {
+                "changed": true,
+                "role": "viewer"
+              }
+            }
+          ],
+          "party": "host",
+          "role": "viewer"
+        },
+        {
+          "conn": 2,
+          "event": "connect",
+          "exporters": {
+            "join": "59defdada6114b7828b3be97c2cc3eb249480c4cd6b1c72ee095c1915d87bf87",
+            "pair": "066aacfbe150237f5557835f07f57cba302f32c4085b2f212fc8bde85c29a32c"
+          },
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a3000101010203",
+                "frame": "000000000700000007a3000101010203",
+                "from": "a",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a3000101010203",
+                "frame": "000000000700000007a3000101010203",
+                "from": "host",
+                "type": "HELLO"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a200020101",
+                "frame": "000000000700000005a200020101",
+                "from": "host",
+                "type": "AUTHORIZED"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a4000301506bc5221f5e6f78aea633e5ebdc2c9364025820c9200dcae56ea38920fa6e5c505ea4a1325494773699ba0d982baf2016d7e9c0036c50686f6e652028576f726b29",
+                "frame": "000000000700000046a4000301506bc5221f5e6f78aea633e5ebdc2c9364025820c9200dcae56ea38920fa6e5c505ea4a1325494773699ba0d982baf2016d7e9c0036c50686f6e652028576f726b29",
+                "from": "a",
+                "type": "JOIN_PROOF"
+              }
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "conn": 2,
+          "control": "a3000101010203",
+          "event": "receive",
+          "out": [
+            {
+              "version": 3
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a3000101010203",
+          "event": "receive",
+          "out": [
+            {
+              "version": 3
+            }
+          ],
+          "party": "a"
+        },
+        {
+          "control": "a200020101",
+          "event": "receive",
+          "out": [],
+          "party": "a"
+        },
+        {
+          "conn": 2,
+          "control": "a4000301506bc5221f5e6f78aea633e5ebdc2c9364025820c9200dcae56ea38920fa6e5c505ea4a1325494773699ba0d982baf2016d7e9c0036c50686f6e652028576f726b29",
+          "event": "receive",
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a3000601644465736b0266766965776572",
+                "frame": "000000000700000011a3000601644465736b0266766965776572",
+                "from": "host",
+                "type": "PAIRED"
+              }
+            }
+          ],
+          "party": "host"
+        },
+        {
+          "control": "a3000601644465736b0266766965776572",
+          "event": "receive",
+          "out": [
+            {
+              "paired": {
+                "host_identity": "040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794",
+                "host_name": "Desk",
+                "role": "viewer"
+              }
+            }
+          ],
+          "party": "a"
+        }
+      ]
     }
   ]
 }

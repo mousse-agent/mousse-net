@@ -34,7 +34,7 @@ npm test
 ```
 
 The tests print case counts by vector file and end with `PASS second-impl` or
-`FAIL second-impl`. They replay fifteen pairing flows and
+`FAIL second-impl`. They replay sixteen pairing flows and
 twelve attempt sequences with the supplied random draws, and compare
 the resulting messages byte for byte. The relay tests rebuild every relay
 derivation and the relay certificate, decode and re-encode every relay message,
