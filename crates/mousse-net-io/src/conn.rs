@@ -35,7 +35,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use mousse_net_core::authz::{Traffic, Verdict};
@@ -575,6 +575,45 @@ impl MuxStream {
     }
 }
 
+/// Whether a connection has started to close, shared by its handle and its
+/// driver. Marking it waits for any [`LivePermit`] to be dropped, so what
+/// was done under a permit was done while the connection was live.
+#[derive(Debug, Default)]
+struct Liveness {
+    closing: AtomicBool,
+    gate: Mutex<()>,
+}
+
+impl Liveness {
+    /// Mark closing, once every permit held now is dropped.
+    fn mark(&self) {
+        if self.is_set() {
+            return;
+        }
+        // Must-fail control (tests only): closing does not wait for the
+        // permits held.
+        if cfg!(mousse_control = "live-permit-ignored") {
+            self.closing.store(true, Ordering::SeqCst);
+            return;
+        }
+        let _gate = self.gate.lock().unwrap_or_else(PoisonError::into_inner);
+        self.closing.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether it is marked; never waits.
+    fn is_set(&self) -> bool {
+        self.closing.load(Ordering::SeqCst)
+    }
+}
+
+/// Proof that a connection was live when the permit was taken and stays
+/// live while it is held: [`Connection::close`] and the driver's shutdown
+/// wait for it before the connection reads as closing. Hold one only for
+/// a short in-memory step, never across an `.await` or I/O.
+pub struct LivePermit<'a> {
+    _gate: MutexGuard<'a, ()>,
+}
+
 /// A handle to a running connection. Dropping it closes the connection with
 /// `NO_ERROR`.
 pub struct Connection {
@@ -589,7 +628,7 @@ pub struct Connection {
     minor: watch::Receiver<Option<u64>>,
     /// Set by [`Connection::close`] at once and by the driver when the
     /// connection starts to close for any reason.
-    shutting: Arc<AtomicBool>,
+    shutting: Arc<Liveness>,
 }
 
 impl fmt::Debug for Connection {
@@ -758,8 +797,9 @@ impl Connection {
     }
 
     /// Close with `code`. [`Connection::is_closing`] is true from now on.
+    /// Waits for a [`LivePermit`] held elsewhere to be dropped.
     pub fn close(&self, code: ErrorCode) {
-        self.shutting.store(true, Ordering::SeqCst);
+        self.shutting.mark();
         let _ = self.cmd.send(Cmd::Close(code));
     }
 
@@ -770,8 +810,20 @@ impl Connection {
     /// [`ConnStatus::Closed`] only once the driver is done, this is true
     /// for the whole of the shutdown.
     pub fn is_closing(&self) -> bool {
-        self.shutting.load(Ordering::SeqCst)
-            || matches!(*self.status.borrow(), ConnStatus::Closed(_))
+        self.shutting.is_set() || matches!(*self.status.borrow(), ConnStatus::Closed(_))
+    }
+
+    /// A permit that holds off [`Connection::is_closing`] while it is
+    /// held, or `None` if the connection is closing already. Work that
+    /// must not land on a closing connection (a grant made for its peer)
+    /// commits under it.
+    pub fn live_permit(&self) -> Option<LivePermit<'_>> {
+        let gate = self
+            .shutting
+            .gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        (!self.is_closing()).then_some(LivePermit { _gate: gate })
     }
 
     /// Wait until nothing queued on this connection before the call can
@@ -827,7 +879,7 @@ pub(crate) fn spawn<P: Pipe>(
     let (closing_tx, _) = watch::channel(false);
     let (accept_tx, accept_rx) = mpsc::unbounded_channel();
     let (minor, minor_rx) = watch::channel(None);
-    let shutting = Arc::new(AtomicBool::new(false));
+    let shutting = Arc::new(Liveness::default());
     let connection = Connection {
         id: start.conn,
         peer: start.peer,
@@ -876,7 +928,7 @@ struct Driver {
     status: watch::Sender<ConnStatus>,
     closing: watch::Sender<bool>,
     /// The handle's view of closing ([`Connection::is_closing`]).
-    shutting: Arc<AtomicBool>,
+    shutting: Arc<Liveness>,
     accept: mpsc::UnboundedSender<MuxStream>,
     streams: HashMap<u32, StreamTx>,
     /// Streams the peer finished whose receive side waits for the mux to
@@ -1132,7 +1184,7 @@ impl Driver {
     }
 
     fn mark_closing(&self) {
-        self.shutting.store(true, Ordering::SeqCst);
+        self.shutting.mark();
         self.closing
             .send_if_modified(|closing| !std::mem::replace(closing, true));
     }
@@ -2210,6 +2262,33 @@ mod tests {
             }
         })
         .await;
+    }
+
+    /// A close waits for a live permit held elsewhere: until the permit
+    /// is dropped the connection reads as live, and afterwards no permit
+    /// is given.
+    #[tokio::test]
+    async fn a_close_waits_for_the_live_permit_held() {
+        let (conn, _peer, _valve, _clock) = connected(3_600).await;
+        let conn = Arc::new(conn);
+        let permit = conn.live_permit().expect("live");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let closer = {
+            let conn = conn.clone();
+            std::thread::spawn(move || {
+                conn.close(ErrorCode::Cancelled);
+                let _ = done_tx.send(());
+            })
+        };
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the close went through while a permit was held"
+        );
+        assert!(!conn.is_closing());
+        drop(permit);
+        closer.join().unwrap();
+        assert!(conn.is_closing());
+        assert!(conn.live_permit().is_none());
     }
 
     /// The peer finishes its half, then resets the stream while this side's

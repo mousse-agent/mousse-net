@@ -390,12 +390,44 @@ already}`
 - `conn` is a connection number of this channel. The identity is the
   authenticated peer of that connection; the request carries none.
 - The connection must be published and live when the grant is committed.
-  The lookup and the commit are serialized with close, `peer.forget`,
-  revocation and the removal pause.
+  The commit is serialized with the connection's close (by either side),
+  `peer.forget`, revocation and the removal pause.
 - An existing live grant is returned as it is, with its own role, even when
   the request names a wider one.
 - The grant is saved before the reply.
 - Errors: `bad_request`, `no_conn`, `paused`, `refused`, `store_failed`.
+
+**As built (pull request 5).**
+
+- Every field is required, and a request with any other field (an
+  `identity`, a `receipt`) is `bad_request`. `name` follows the grant name
+  rule (1 to 128 bytes); a name outside it is `bad_request`, also when the
+  grant exists already.
+- The channel's entry for `conn` is looked up under the app channel's core
+  lock, which `conn.down`, `peer.forget` and the removal pause take too.
+  The entry must be there and not closing, and for an outbound connection
+  `peer.forget` must not have removed its peer since it was published: each
+  connection entry keeps the forget count it was published under (a field
+  added in `app/mod.rs`). The core lock is released before the commit, so
+  no disk write runs under it.
+- The commit runs under the host's lock, which a failed removal sets the
+  pause under: while paused the reply is `paused`. It holds a live permit
+  of the connection while the grant is added in memory. A connection reads
+  as closing from the moment its shutdown starts, whoever starts it (a
+  local close, the peer's `GOAWAY`, the certificate's deadline, a failed
+  pipe), not only once its driver is done, and marking it closing waits for
+  a permit held. So a grant is never committed on a connection that started
+  to close; the reply is then `no_conn`. Revocation and denial are decided
+  in the same commit.
+- On an inbound connection the peer can only be live under a grant of this
+  computer that is served; that grant is the reply (`already: true`). If the
+  connection is no longer live under a served grant (it was edited or
+  removed), the reply is `no_conn`.
+- Success is answered only with the table saved. A save that fails after
+  the grant was added in memory is `store_failed`, as for `grant.add`: the
+  grant stays in effect, and repeating the request saves it. An existing
+  grant, on either direction, is answered only after a save that failed
+  earlier (of any grant) succeeds; until then the reply is `store_failed`.
 
 After Allow the new direction uses the existing connection on minor 3. A
 computer that was granted access and has no route of its own to dial reads
@@ -727,9 +759,12 @@ which is the file's `phase`. The role checks are therefore in
 | | `suspended-reads-as-revoked` | a suspended grant's streams read revoked |
 | | `answer-role-sticks-to-invitation` | a failed answer's role is kept |
 | | `way-invite-drops-role` | a chosen way drops the role |
-| `pairing.grant-connected` | `grant-from-stale-connection` | a closed connection's identity is granted |
+| `pairing.grant-connected` | `grant-from-stale-connection` | a closing connection's identity is granted |
 | | `connected-grant-upgrades-existing` | an existing grant is widened |
 | | `connected-grant-trusts-request-identity` | the identity is read from the request |
+| | `live-permit-ignored` | a close does not wait for the commit |
+| | `connected-grant-while-paused` | the host commits while paused |
+| | `connected-grant-answers-unsaved` | an existing grant is answered unsaved |
 | `pairing.relay-completion` | `completion-omits-relay-admission` | the crash window stays |
 | | `completion-replays-retired-tag` | a retired tag comes back |
 | | `completion-stores-clear-tag` | the tag is stored unsealed |
