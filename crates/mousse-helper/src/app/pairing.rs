@@ -50,7 +50,12 @@
 //!   it expires and from the host's newest record.
 //! - **Grants:** `grants.list`, `grant.add` (idempotent), `grant.remove`
 //!   (journaled, see [`crate::revoke`]); events `grant.closed`,
-//!   `store.failed`, `net.paused` and `net.resumed`.
+//!   `store.failed`, `net.paused` and `net.resumed`. `grant.remove` also
+//!   drops this computer's approvals, completion records and remembered
+//!   routes for that identity. `grant.revoke_local` (protocol 1.2, feature
+//!   `grant-revoke-local`, see [`revoke_local`]) removes the grant through
+//!   the same journal and keeps all of those: it ends only the peer's use
+//!   of this computer, and this computer can still call the peer.
 //! - **Peers:** `peers.list`, `peer.add` (idempotent), `peer.forget`,
 //!   `peer.addresses.set`, `approvals.list`, and `dial`, whose `conn.up`
 //!   carries the role the peer gave this device and the route it came up on
@@ -81,9 +86,10 @@ use crate::revoke::Removed;
 mod availability;
 mod check;
 mod probe;
+mod revoke_local;
 
 /// The requests this module answers.
-pub const OPS: [&str; 22] = [
+pub const OPS: [&str; 23] = [
     "config.set",
     "invite.create",
     "routes.available",
@@ -100,6 +106,7 @@ pub const OPS: [&str; 22] = [
     "grants.list",
     "grant.add",
     "grant.remove",
+    "grant.revoke_local",
     "peers.list",
     "peer.add",
     "peer.forget",
@@ -270,6 +277,7 @@ pub fn on_request(shared: &Arc<Shared>, id: Value, op: &str, map: &Map<String, V
         }
         "grant.add" => add_grant(shared, &id, map),
         "grant.remove" => remove_grant(shared, &id, map),
+        "grant.revoke_local" => revoke_local::revoke_local(shared, &id, map),
         "approvals.list" => super::paths::list_approvals(shared, &id, map),
         "peers.list" => match peers(shared).load() {
             Ok(list) => {
@@ -1058,6 +1066,9 @@ fn remove_grant(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value 
         .find(|g| g.id == GrantId(grant))
         .map(|g| hex(g.identity.as_bytes()));
     let removed = shared.removal.remove(GrantId(grant));
+    if matches!(removed, Ok(Removed::Saved | Removed::Paused)) {
+        super::reset_unserved(shared);
+    }
     if let (Ok(Removed::Saved | Removed::Paused), Some(identity)) = (&removed, &identity) {
         // Its approvals go too (§1.3), with any completion record.
         if let Err(e) = forget_completions(shared, identity) {
