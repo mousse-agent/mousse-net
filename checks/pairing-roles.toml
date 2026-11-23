@@ -13,7 +13,7 @@ id = "pairing-roles.grant-roles"
 title = "The role chosen with an approval, a link invitation or grant.add is the grant's, and a failed answer's role reaches no one; an edit is stored before it takes effect, refused at a stale revision or while a removal is not saved, and cuts the old role's paths with CANCELLED before it is answered (nothing queued under the old role leaves after the reply, no waiting announcement or call is delivered); streams of a restricted grant reach only an app that opted in, and standalone serve opens a terminal only for an owner; a demoted owner loses its grant list and its removals; nothing is served while the host is not serving or after a grant expired; a restricted or edited store is one an older helper refuses"
 plan = "docs/pairing-flow-design.md §7, §8 and §11"
 targets = ["windows-x64", "macos-arm64", "linux-x64"]
-min_tests = 470
+min_tests = 481
 local = [
   { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-net-core", "-p", "mousse-net-io", "-p", "mousse-helper", "--features", "mousse-helper/test-in-person", "--lib", "--bins", "--test", "app_grant_roles", "--test", "headless", "--test", "pairing_e2e", "--no-fail-fast"] },
   { target = "macos-arm64", host = "macos-aarch64", command = ["cargo", "test", "-p", "mousse-net-core", "-p", "mousse-net-io", "-p", "mousse-helper", "--features", "mousse-helper/test-in-person", "--lib", "--bins", "--test", "app_grant_roles", "--test", "headless", "--test", "pairing_e2e", "--no-fail-fast"] },
