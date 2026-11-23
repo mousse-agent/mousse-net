@@ -1,6 +1,6 @@
 //! Removal of a grant, journaled and fail-closed (Phase 1a §5.4).
 //!
-//! `grant.remove` takes three steps:
+//! `grant.remove` and `grant.revoke_local` take three steps:
 //!
 //! 1. write `revoke {grant}` to `revoke.journal` in the state folder,
 //!    durably;
@@ -279,6 +279,7 @@ impl Removal {
         if !cfg!(mousse_control = "no-revoke-journal") {
             self.journal.add(grant.0).map_err(JournalFailed)?;
         }
+        crate::peer::crash_point("removal-journaled");
         let removed = self.host.remove_grant(grant);
         // In memory the grant is gone either way: relays hear it now.
         self.removed.send_modify(|n| *n += 1);

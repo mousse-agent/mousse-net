@@ -430,6 +430,7 @@ fn set_status(shared: &Shared, relay: &str, status: Status) {
 /// Start every own relay's registrations, then keep the allow-set and the
 /// manifest current. Runs for the life of the channel.
 pub async fn run(shared: Arc<Shared>) {
+    prune_keys(&shared);
     if shared.relay.seed().is_err() {
         return;
     }
@@ -982,8 +983,12 @@ pub fn refresh_allow(shared: &Shared) {
     });
 }
 
-/// Drop caller keys and recovery entries of grants that are gone.
+/// Drop caller keys and recovery entries of grants that are gone: after
+/// each removal, and at start, for a removal that a crash stopped before
+/// this ran. The grants are read under the lock a new key is saved under,
+/// so a key that arrives meanwhile stays.
 fn prune_keys(shared: &Shared) {
+    let _io = guard(&shared.relay.io);
     let live: HashSet<(u64, String)> = shared
         .host
         .grants()
@@ -991,7 +996,6 @@ fn prune_keys(shared: &Shared) {
         .map(|g| (g.id.0, hex(g.identity.as_bytes())))
         .collect();
     let ids: HashSet<u64> = live.iter().map(|(g, _)| *g).collect();
-    let _io = guard(&shared.relay.io);
     let Ok(mut file) = shared.relay.files.grants() else {
         return;
     };
@@ -1002,7 +1006,9 @@ fn prune_keys(shared: &Shared) {
     file.recovery
         .retain(|r| ids.contains(&r.grant) && r.expires_at > t);
     if before != (file.keys.len(), file.recovery.len()) {
-        let _ = shared.relay.files.save_grants(file);
+        if let Err(e) = shared.relay.files.save_grants(file) {
+            applog::line(format!("dropping relay keys of removed grants failed: {e}"));
+        }
     }
 }
 
@@ -1310,6 +1316,7 @@ pub async fn serve_keys(shared: Arc<Shared>, conn: Arc<Connection>, stream: MuxS
         refuse(ErrorCode::RefusedStream, "no live grant on the connection");
         return;
     };
+    crate::peer::crash_point("keys-grant-read");
     let Ok(seed) = shared.relay.seed() else {
         refuse(ErrorCode::RefusedStream, "no relay seed");
         return;
@@ -1318,6 +1325,12 @@ pub async fn serve_keys(shared: Arc<Shared>, conn: Arc<Connection>, stream: MuxS
     let fp = caller_key.fingerprint();
     let salt = {
         let _io = guard(&shared.relay.io);
+        // The grant may have ended (or been replaced) since it was read; a
+        // key for it would erase the replacement's.
+        if shared.host.grant_of(conn.id()).map(|g| g.id) != Some(grant.id) {
+            refuse(ErrorCode::RefusedStream, "the grant ended meanwhile");
+            return;
+        }
         let mut file = match shared.relay.files.grants() {
             Ok(file) => file,
             Err(e) => {

@@ -340,8 +340,28 @@ true}`
   caller key and recovery entries.
 - It leaves the outbound peer record, its approvals, its relay secrets and
   its completion record alone.
+- Before it replies, the streams the peer opened are reset, on this
+  computer's own connections to it and on the peer's connections here
+  (which close only afterwards), and data queued for the app on them is
+  dropped. No data from them reaches the app after the reply.
+  `grant.remove` does the same.
+- An id that is no longer this computer's grant answers `{removed:
+  false}`, also when a newer pairing of the same peer replaced it; the
+  newer grant stays.
 - Errors: `bad_request`, `journal_failed`. Events: the existing
   `grant.closed`, `net.paused` and `net.resumed`.
+
+As built, relay cleanup for any removal:
+
+- A start drops the caller keys and recovery entries of grants that are
+  gone, so a crash between the journal and the cleanup leaves none on
+  disk. A cleanup whose save fails is logged and runs again at the next
+  removal or start. A leftover entry never admits anyone: the allow-set
+  lists only keys and recovery entries of live grants.
+- A caller key is stored only if the connection it came on still holds
+  the same grant under the relay file's lock. A key from a grant that
+  ended or was replaced meanwhile is refused, so it cannot erase the
+  replacement's key.
 
 ## 7. Asking for the other direction
 
