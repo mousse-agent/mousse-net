@@ -6,7 +6,7 @@ Tracking issue: mousse-agent/mousse#1510.
 
 This document says what the engine adds so the app can offer the pairing
 flow below. §10 splits the work into pull requests and says which of them
-change authorization and are held for review by the second teammate.
+change authorization or store an admission credential.
 
 ## The flow
 
@@ -590,8 +590,8 @@ As built:
 | 6 | Relay-only completion recovery (§9) | stores an admission credential | none |
 
 1 and 2 are a complete step by themselves: a ticket discloses one way, a
-link can be inspected without traffic, and its host can be checked. 3 to 6
-are held for review by the second teammate before they merge.
+link can be inspected without traffic, and its host can be checked. 3 to 5
+change authorization and 6 stores an admission credential.
 
 **Files.**
 
