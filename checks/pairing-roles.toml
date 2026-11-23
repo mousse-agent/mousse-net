@@ -43,7 +43,7 @@ id = "pairing-roles.grant-connected"
 title = "grant.add_connected grants the authenticated peer of a live connection of the channel: never on a connection that started to close (forgotten, edited or removed, closed by the peer), never while paused, never an identity the request names, never a denied identity or a name the grant name rule refuses; an existing grant comes back with its own role, and only once the table is saved"
 plan = "docs/pairing-flow-design.md §7 and §11"
 targets = ["windows-x64", "macos-arm64", "linux-x64"]
-min_tests = 119
+min_tests = 127
 local = [
   { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-net-io", "-p", "mousse-helper", "--lib", "--test", "app_grant_connected", "--no-fail-fast"] },
   { target = "macos-arm64", host = "macos-aarch64", command = ["cargo", "test", "-p", "mousse-net-io", "-p", "mousse-helper", "--lib", "--test", "app_grant_connected", "--no-fail-fast"] },
