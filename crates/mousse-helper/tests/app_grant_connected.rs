@@ -207,6 +207,25 @@ fn an_inbound_connection_closed_by_an_edit_or_a_removal_grants_nothing() {
     assert!(grants_of(&mut p.a, &b_identity).is_empty());
 }
 
+/// A revokes B's `member` grant locally (`grant.revoke_local`), which
+/// closes A's inbound connection from B like a removal. While its entry
+/// is still there, a request on it is refused: the grant just revoked is
+/// not made again, under any role.
+#[test]
+fn an_inbound_connection_closed_by_a_local_revocation_grants_nothing() {
+    let mut p = paired_with("gcrl", "member", &down_held(), &[]);
+    let b_identity = p.b.identity.clone();
+    let grant = grants_of(&mut p.a, &b_identity)[0]["grant"].clone();
+    let revoked = p.a.call("grant.revoke_local", json!({"grant": grant}));
+    assert_eq!(revoked["removed"], json!(true), "{revoked}");
+    for role in ["member", "owner"] {
+        assert_closing(&add_connected(&mut p.a, p.a_conn, role));
+    }
+    assert!(grants_of(&mut p.a, &b_identity).is_empty());
+    let again = p.a.call("grant.revoke_local", json!({"grant": grant}));
+    assert_eq!(again["removed"], json!(false), "{again}");
+}
+
 /// B's outbound connection to A, closed by A (the peer's `GOAWAY`), not
 /// by anything on B: B still reads it as closing and grants nothing.
 #[test]
