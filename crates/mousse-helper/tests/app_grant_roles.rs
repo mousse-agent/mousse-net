@@ -399,6 +399,137 @@ fn a_role_edit_while_a_removal_is_not_saved_is_paused() {
     assert_eq!((&g["role"], &g["revision"]), (&json!("owner"), &json!(1)));
 }
 
+/// B joined A as `member` and opened a call on its connection to A. A
+/// runs `op` (`grant.remove` or `grant.revoke_local`) on B's grant. With
+/// an app that took `grant-roles` (`opted`), the call it got is reset
+/// `GRANT_REVOKED` (a removal, not an edit's `CANCELLED`) before the
+/// reply; with one that did not, the call never reached it. Either way
+/// the grant is gone, and a role edit after it finds no grant, brings
+/// nothing back and announces no change.
+fn a_restricted_grant_ends_by(tag: &str, op: &str, opted: bool) {
+    let a_end = Endpoint::init(&format!("{tag}a"));
+    let b_end = Endpoint::init(&format!("{tag}b"));
+    let mut a = a_end.app("hostA", &[]);
+    if opted {
+        hello_roles(&mut a);
+    } else {
+        let reply = a.call("hello", json!({"proto": [1, 2], "name": "hostA"}));
+        a.identity = reply["identity"].as_str().unwrap().to_owned();
+    }
+    let mut b = b_end.app("peerB", &[]);
+    b.hello();
+    let p = pair_as(&mut a, &mut b, Some("member"), None);
+    let g = grant_of(&mut a, &b.identity);
+    assert_eq!(
+        (&g["role"], &g["revision"]),
+        (&json!("member"), &json!(1)),
+        "{g}"
+    );
+    let grant = g["grant"].clone();
+    let h = b.open(p.b_conn, "mousse.rpc", "interactive");
+    b.send(h, b"a call", false);
+    let served = if opted {
+        let at_a = incoming(&a, p.a_conn, 0);
+        assert_eq!(at_a["role"], "member", "{at_a}");
+        Some(at_a["handle"].clone())
+    } else {
+        let reset = b.event("stream.reset", |m| m["handle"] == h);
+        assert_eq!(reset["code"], "refused_stream", "{reset}");
+        None
+    };
+
+    let id = a.start(op, json!({"grant": grant}));
+    let reply = a.reply(id);
+    assert_eq!(reply["removed"], true, "{op}: {reply}");
+    if let Some(served) = served {
+        let (reset, code, replied) = a.wait("the reset and the reply", WAIT, |st| {
+            let reset = st
+                .messages
+                .iter()
+                .position(|m| m["ev"] == "stream.reset" && m["handle"] == served)?;
+            let replied = st
+                .messages
+                .iter()
+                .position(|m| m.get("re") == Some(&json!(id)))?;
+            Some((reset, st.messages[reset]["code"].clone(), replied))
+        });
+        assert!(reset < replied, "{op} replied before the call was reset");
+        assert_eq!(code, "grant_revoked", "{op}");
+    } else {
+        assert!(
+            a.events("stream.incoming").is_empty(),
+            "{:?}",
+            a.events("stream.incoming")
+        );
+    }
+    let down = a.event("conn.down", |m| m["conn"] == p.a_conn);
+    assert_eq!(down["reason"], "grant_revoked", "{down}");
+
+    let edit = a.request(
+        "grant.set_role",
+        json!({"grant": grant, "expected_revision": 1, "role": "owner"}),
+    );
+    assert_eq!(edit["error"], "no_grant", "{edit}");
+    assert_eq!(grant_of(&mut a, &b.identity), Value::Null);
+    assert!(a.events("grant.role_changed").is_empty());
+}
+
+#[test]
+fn a_local_revocation_of_a_restricted_grant_resets_its_calls_first_and_no_edit_revives_it() {
+    a_restricted_grant_ends_by("grrlv", "grant.revoke_local", true);
+}
+
+#[test]
+fn a_removal_of_a_restricted_grant_resets_its_calls_first_and_no_edit_revives_it() {
+    a_restricted_grant_ends_by("grrrm", "grant.remove", true);
+}
+
+#[test]
+fn a_restricted_grant_revoked_under_an_app_that_did_not_opt_in_stays_gone() {
+    a_restricted_grant_ends_by("grrln", "grant.revoke_local", false);
+}
+
+/// A grants B `member` and edits it to `viewer` (revision 2). Then A joins
+/// B by a link of B's: A's completion record of that pairing is written
+/// and replayed, by the join and again by `join.status`. It holds A's way
+/// to B only, so B's grant on A keeps its role and revision.
+#[test]
+fn a_link_completion_replay_leaves_the_peers_grant_here_as_it_was() {
+    let (_ae, mut a, _be, mut b) = started("grrcr");
+    pair_as(&mut a, &mut b, Some("member"), None);
+    let grant = grant_of(&mut a, &b.identity)["grant"].clone();
+    a.call(
+        "grant.set_role",
+        json!({"grant": grant, "expected_revision": 1, "role": "viewer"}),
+    );
+    let mine = |a: &mut App, b: &App| {
+        let g = grant_of(a, &b.identity);
+        json!([g["grant"], g["role"], g["revision"]])
+    };
+    let before = mine(&mut a, &b);
+    assert_eq!(before, json!([grant, "viewer", 2]));
+
+    let invite = b.call("invite.create", json!({"kind": "link"}));
+    let inv = invite["invitation"].as_str().unwrap().to_owned();
+    let route = invite["routes"][0].as_str().unwrap().to_owned();
+    let id = a.start(
+        "join",
+        json!({"ticket": invite["uri"], "arrival": "link", "approved": [route]}),
+    );
+    a.event("join.code_needed", |m| m["invitation"] == inv.as_str());
+    a.call(
+        "join.code",
+        json!({"invitation": inv, "code": invite["code"]}),
+    );
+    let join = a.reply(id);
+    assert!(join.get("error").is_none(), "join: {join}");
+    assert_eq!(mine(&mut a, &b), before);
+    let status = a.call("join.status", json!({"ticket_hash": join["ticket_hash"]}));
+    assert_eq!(status["done"]["identity"], b.identity.as_str(), "{status}");
+    assert_eq!(mine(&mut a, &b), before);
+    assert_eq!(a.events("grant.role_changed").len(), 1);
+}
+
 #[test]
 fn a_stale_revision_is_refused_and_the_same_role_is_no_change() {
     let (_ae, mut a, _be, mut b) = started("grrf");
