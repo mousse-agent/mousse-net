@@ -401,12 +401,35 @@ pub fn relay_seed(
     }
 }
 
+/// A secret as it is written to the OS keystore: lowercase hex text.
+///
+/// The keystore client hands every secret to the Linux Secret Service
+/// labelled `text/plain`, and KWallet 6.31 and later refuse a `text/plain`
+/// secret that is not valid UTF-8, which 32 random bytes almost never are.
+/// Hex is valid text everywhere, so the same form is used on every system.
+#[cfg_attr(not(feature = "os-keystore"), allow(dead_code))]
+fn keystore_text(secret: &[u8]) -> Zeroizing<String> {
+    Zeroizing::new(hex(secret))
+}
+
+/// A secret read back from the OS keystore: hex text as [`keystore_text`]
+/// writes it, or the raw bytes an earlier build wrote. The secrets kept
+/// there are 32 bytes, so a raw one is never 64 hex digits.
+#[cfg_attr(not(feature = "os-keystore"), allow(dead_code))]
+fn keystore_secret(stored: &[u8]) -> Zeroizing<Vec<u8>> {
+    let as_text = std::str::from_utf8(stored)
+        .ok()
+        .filter(|text| text.len() == 64)
+        .and_then(|text| unhex(text).ok());
+    Zeroizing::new(as_text.unwrap_or_else(|| stored.to_vec()))
+}
+
 /// The OS keystore, when this build has one (feature `os-keystore`, on by
 /// default). The relay builds without it: it keeps no endpoint identity,
 /// and a static Linux build cannot link the Secret Service client.
 #[cfg(feature = "os-keystore")]
 mod os_keystore {
-    use super::{NetError, KEYRING_SERVICE};
+    use super::{keystore_secret, keystore_text, NetError, KEYRING_SERVICE};
     use zeroize::Zeroizing;
 
     fn entry(user: &str) -> Result<keyring::Entry, NetError> {
@@ -416,22 +439,23 @@ mod os_keystore {
 
     pub fn set(user: &str, secret: &[u8]) -> Result<(), NetError> {
         entry(user)?
-            .set_secret(secret)
+            .set_secret(keystore_text(secret).as_bytes())
             .map_err(|e| NetError::Store(format!("keystore: {e}")))
     }
 
     pub fn get(user: &str) -> Result<Zeroizing<Vec<u8>>, NetError> {
-        Ok(Zeroizing::new(
+        let stored = Zeroizing::new(
             entry(user)?
                 .get_secret()
                 .map_err(|e| NetError::Store(format!("keystore: {e}")))?,
-        ))
+        );
+        Ok(keystore_secret(&stored))
     }
 
     /// The secret, or `None` when there is no entry.
     pub fn get_if_any(user: &str) -> Result<Option<Zeroizing<Vec<u8>>>, NetError> {
         match entry(user)?.get_secret() {
-            Ok(secret) => Ok(Some(Zeroizing::new(secret))),
+            Ok(stored) => Ok(Some(keystore_secret(&Zeroizing::new(stored)))),
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(e) => Err(NetError::Store(format!("keystore: {e}"))),
         }
@@ -551,6 +575,31 @@ mod tests {
         .unwrap();
         assert!(store.load(true).is_err());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// KWallet 6.31 and later refuse a `text/plain` secret that is not
+    /// valid UTF-8, and the keystore client labels every secret so.
+    #[test]
+    fn keystore_secrets_are_written_as_text_and_read_back() {
+        let mut not_text = 0;
+        for _ in 0..64 {
+            let secret = random_bytes::<32>();
+            not_text += usize::from(std::str::from_utf8(&secret).is_err());
+            let stored = keystore_text(&secret);
+            assert!(stored.bytes().all(|b| b.is_ascii_hexdigit()));
+            assert_eq!(keystore_secret(stored.as_bytes()).as_slice(), secret);
+        }
+        // Control: raw secrets are not text, so writing them as they are fails.
+        assert!(not_text > 0);
+    }
+
+    #[test]
+    fn a_raw_secret_from_an_earlier_build_still_reads() {
+        let mut secret = random_bytes::<32>();
+        assert_eq!(keystore_secret(&secret).as_slice(), secret);
+        // Even one that happens to be ASCII hex: it is 32 bytes, not 64.
+        secret.copy_from_slice(b"0123456789abcdef0123456789abcdef");
+        assert_eq!(keystore_secret(&secret).as_slice(), secret);
     }
 
     #[test]
