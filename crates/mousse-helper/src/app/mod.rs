@@ -435,12 +435,7 @@ impl App {
         let peer = short_id(conn.peer());
         // Must-fail control: announce the connection before step 2 settles.
         let wait_for_live = !cfg!(mousse_control = "inbound-before-live");
-        // A saved grant can make the host live before the caller's HELLO.
-        // Wait for the agreed version so conn.up reports whether it can call back.
-        if wait_for_live
-            && (!conn.settled(true).await.is_live() || conn.hello_minor().await.is_none())
-        {
-            applog::line(format!("refused {peer}: not live"));
+        if wait_for_live && !self.caller_hello(&conn, &peer).await {
             return None;
         }
         let grant = self.shared.host.grant_of(conn.id());
@@ -452,6 +447,31 @@ impl App {
         let no = self.shared.add_conn(conn, true, fields).ok()?;
         applog::line(format!("connected {peer} (in)"));
         Some(no)
+    }
+
+    /// Whether inbound `conn` is live and its caller's `HELLO` has arrived.
+    /// A saved grant can make the host live before that `HELLO`, and
+    /// `conn.up` reports whether the connection can carry calls back, which
+    /// the agreed minor decides. A caller may send keepalives before its
+    /// `HELLO`, so the wait is bounded; past it the connection is closed.
+    async fn caller_hello(&self, conn: &Connection, peer: &str) -> bool {
+        if !conn.settled(true).await.is_live() {
+            applog::line(format!("refused {peer}: not live"));
+            return false;
+        }
+        let wait = crate::limits::ms(self.shared.limits.inbound_hello_wait_ms());
+        match tokio::time::timeout(wait, conn.hello_minor()).await {
+            Ok(Some(_)) => true,
+            Ok(None) => {
+                applog::line(format!("refused {peer}: closed before HELLO"));
+                false
+            }
+            Err(_) => {
+                applog::line(format!("refused {peer}: no HELLO"));
+                conn.close(ErrorCode::ProtocolError);
+                false
+            }
+        }
     }
 
     /// Close inbound connection `no` when the socket that accepted it

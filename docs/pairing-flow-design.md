@@ -320,6 +320,8 @@ device recognizes it at step 1; the promise is that no invitation or grant
 changes, not that the host sees nothing. Such a probe may make the host
 announce `conn.up` for that device before any wire `HELLO`; the host
 helper's wait for `HELLO` in `App::inbound_on` (added in #10) closes that.
+The wait is bounded by `MOUSSE_NET_INBOUND_HELLO_WAIT_MS`; a caller with no
+`HELLO` by then is closed and never announced.
 
 **What a positive answer means.** The endpoint named in the link answered.
 It does not show that the invitation is still open, and it does not
