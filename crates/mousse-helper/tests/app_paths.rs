@@ -419,6 +419,36 @@ fn a_path_to_each_paired_host_is_kept_from_the_stored_candidates() {
     assert_eq!(peer_of(&mut b, &a.identity)["addresses"], json!([a_route]));
 }
 
+/// The app's `hello` is already waiting on stdin when the helper starts,
+/// so the channel can handle it before the keeper task first runs. The
+/// start signal is queued for the keeper, never dropped: every start dials
+/// the paired host (mousse-net#20).
+#[test]
+fn a_hello_waiting_at_start_always_starts_the_keeper() {
+    const STARTS: usize = 10;
+    let a_end = Endpoint::init("ksa");
+    let b_end = Endpoint::init("ksb");
+    let mut a = a_end.app("hostA", &[]);
+    a.hello();
+    let mut b = b_end.app("peerB", &[]);
+    b.hello();
+    let a_route = route_of(&mut a);
+    trust(&mut a, &mut b, &[]);
+    b.call(
+        "peer.addresses.set",
+        json!({"identity": a.identity, "routes": [a_route]}),
+    );
+    wait_outbound(&b, &a.identity, 0);
+    for _ in 0..STARTS {
+        b.kill();
+        // `hello` is written as soon as the process exists, before its
+        // runtime has started any task.
+        b = b_end.app("peerB", &[]);
+        b.hello();
+        wait_outbound(&b, &a.identity, 0);
+    }
+}
+
 /// A host that went away is tried again after waits that double up to the
 /// longest, and the path comes back on its own when the host does.
 #[test]
