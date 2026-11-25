@@ -1266,6 +1266,49 @@ fn routes_config_says_when_a_restart_is_needed() {
     assert_eq!(stored["tunnels"], json!([]));
 }
 
+#[test]
+fn a_managed_tunnel_reaches_new_tickets_without_changing_saved_routes() {
+    let end = Endpoint::init("managed-tunnel");
+    let settings = end.dir.join("routes.json");
+    let manual = "wss://manual.example:443/mousse-net/1";
+    let managed = "wss://managed.example:443/mousse-net/1";
+    let stored =
+        r#"{"lan": false, "tailnet": false, "tunnels": ["wss://manual.example/mousse-net/1"]}"#;
+    std::fs::write(&settings, stored).unwrap();
+
+    let mut app = end.app("host", &[]);
+    let hello = app.hello();
+    assert_eq!(hello["managed_tunnel"], true);
+    assert_eq!(hello["routes"], json!([manual]));
+    assert_eq!(
+        app.call("routes.managed_tunnel", json!({"route": managed}))["routes"],
+        json!([manual, managed])
+    );
+    assert_eq!(
+        app.call("invite.create", json!({"kind": "link"}))["routes"],
+        json!([manual, managed])
+    );
+    for bad in [
+        json!({}),
+        json!({"route": 42}),
+        json!({"route": "tcp://example.net:443"}),
+    ] {
+        assert_eq!(
+            app.request("routes.managed_tunnel", bad)["error"],
+            "bad_route"
+        );
+    }
+    assert_eq!(app.hello()["routes"], json!([manual, managed]));
+    assert_eq!(
+        app.call("routes.managed_tunnel", json!({"route": null}))["routes"],
+        json!([manual])
+    );
+    assert_eq!(std::fs::read_to_string(&settings).unwrap(), stored);
+    app.call("routes.managed_tunnel", json!({"route": managed}));
+    drop(app);
+    assert_eq!(end.app("host", &[]).hello()["routes"], json!([manual]));
+}
+
 /// With nothing selected the helper listens on loopback only and
 /// advertises nothing.
 #[test]

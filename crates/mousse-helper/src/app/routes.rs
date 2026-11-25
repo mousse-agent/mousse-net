@@ -7,6 +7,11 @@
 //!   takes a restart of this helper ([`RoutesConfig::restart_needed`]);
 //!   other changes reach the next ticket. `routes` is what the new config
 //!   advertises with the interfaces now.
+//! - `routes.managed_tunnel {route}` → `{routes}` adds a running app
+//!   tunnel to new invitations. `null` withdraws it. This route is kept in
+//!   memory and does not affect the saved owner routes. It is a candidate
+//!   of the `tunnel` way for `routes.available` and `invite.create {way}`
+//!   (feature `managed-tunnel`; `docs/pairing-flow-design.md` §1 to §3).
 //! - `routes.test {route}` → `{ok, ms}` or `{ok: false, reason, why}`:
 //!   dials this helper's own `tcp`, `ws` or `wss` route pinned to its own
 //!   identity, and closes once step 1 passed, before step 2. A failure
@@ -16,6 +21,7 @@
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
+use mousse_net_core::pairing::MAX_ROUTE_LEN;
 use mousse_net_io::pipe::LocalRoute;
 use mousse_net_io::routes::{testable, RoutesConfig, RoutesStore};
 use serde_json::{json, Map, Value};
@@ -124,6 +130,39 @@ pub fn config(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
         "restart_needed": restart_needed,
         "config": next,
     })
+}
+
+/// An app-owned route that was verified by the app through `routes.test`.
+pub fn managed_tunnel(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
+    // A 1.2 operation: a field it does not know is refused, not ignored.
+    if let Some(unknown) = map
+        .keys()
+        .find(|k| !["op", "id", "route"].contains(&k.as_str()))
+    {
+        return error(id, "bad_request", format!("unknown field {unknown:?}"));
+    }
+    let route = match map.get("route") {
+        Some(Value::Null) => None,
+        Some(Value::String(text)) => {
+            let Ok(route @ LocalRoute::Wss { .. }) = LocalRoute::parse(text) else {
+                return error(id, "bad_route", "the managed tunnel needs a wss route");
+            };
+            let uri = route.uri();
+            if uri.len() > MAX_ROUTE_LEN || shared.caller.addr_policy().names_forbidden(&route) {
+                return error(id, "bad_route", "the managed tunnel route is not diallable");
+            }
+            if shared.info.ws_port.is_none() {
+                return error(id, "bad_route", "the local tunnel origin is unavailable");
+            }
+            Some(uri)
+        }
+        _ => return error(id, "bad_route", "the managed tunnel needs a route or null"),
+    };
+    let interfaces = crate::app::interface_ips();
+    let mut listen = shared.info.listen.lock().unwrap_or_else(|e| e.into_inner());
+    listen.managed_tunnel = route;
+    listen.readvertise(&interfaces);
+    json!({"re": id, "routes": listen.routes})
 }
 
 /// `routes.test {route}`: answered when the try ends.

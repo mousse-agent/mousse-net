@@ -93,6 +93,7 @@ pub const FEATURES: &[&str] = &[
     "grant-revoke-local",
     GRANT_ROLES,
     GRANT_ADD_CONNECTED,
+    "managed-tunnel",
 ];
 
 /// The feature an app lists in its hello `features` to take streams of
@@ -336,6 +337,7 @@ impl App {
     ) -> Self {
         let limits = *crate::limits::helper();
         let (ended, _) = watch::channel(None);
+        let (keep, kicks) = paths::Keep::new();
         let shared = Arc::new(Shared {
             core: Mutex::new(Core {
                 hello: false,
@@ -364,7 +366,7 @@ impl App {
             host,
             removal,
             pairing: Mutex::new(pairing::State::new(info.name.clone())),
-            keep: paths::Keep::default(),
+            keep,
             relay: relay::State::new(&info),
             ssh: info.ssh.clone(),
             info,
@@ -375,7 +377,7 @@ impl App {
         tokio::spawn(write_stdout(shared.clone()));
         tokio::spawn(pairing::watch_pause(shared.clone()));
         tokio::spawn(pairing::prune_completions(shared.clone()));
-        tokio::spawn(paths::keep_connected(shared.clone()));
+        tokio::spawn(paths::keep_connected(shared.clone(), kicks));
         tokio::spawn(changes::forward_renewals(shared.clone()));
         tokio::spawn(watch_served(shared.clone()));
         // Phase 4's mailbox reads pair secrets and the manifest from here.
@@ -433,8 +435,7 @@ impl App {
         let peer = short_id(conn.peer());
         // Must-fail control: announce the connection before step 2 settles.
         let wait_for_live = !cfg!(mousse_control = "inbound-before-live");
-        if wait_for_live && !conn.settled(true).await.is_live() {
-            applog::line(format!("refused {peer}: not live"));
+        if wait_for_live && !self.caller_hello(&conn, &peer).await {
             return None;
         }
         let grant = self.shared.host.grant_of(conn.id());
@@ -446,6 +447,31 @@ impl App {
         let no = self.shared.add_conn(conn, true, fields).ok()?;
         applog::line(format!("connected {peer} (in)"));
         Some(no)
+    }
+
+    /// Whether inbound `conn` is live and its caller's `HELLO` has arrived.
+    /// A saved grant can make the host live before that `HELLO`, and
+    /// `conn.up` reports whether the connection can carry calls back, which
+    /// the agreed minor decides. A caller may send keepalives before its
+    /// `HELLO`, so the wait is bounded; past it the connection is closed.
+    async fn caller_hello(&self, conn: &Connection, peer: &str) -> bool {
+        if !conn.settled(true).await.is_live() {
+            applog::line(format!("refused {peer}: not live"));
+            return false;
+        }
+        let wait = crate::limits::ms(self.shared.limits.inbound_hello_wait_ms());
+        match tokio::time::timeout(wait, conn.hello_minor()).await {
+            Ok(Some(_)) => true,
+            Ok(None) => {
+                applog::line(format!("refused {peer}: closed before HELLO"));
+                false
+            }
+            Err(_) => {
+                applog::line(format!("refused {peer}: no HELLO"));
+                conn.close(ErrorCode::ProtocolError);
+                false
+            }
+        }
     }
 
     /// Close inbound connection `no` when the socket that accepted it
@@ -788,7 +814,7 @@ impl Shared {
                     // Fixed for the channel at its first hello.
                     core.roles = opts_into_roles(&reply, &map);
                     // Keep paired hosts connected from now on.
-                    self.keep.kick(paths::Kick::Reset(None));
+                    self.keep.kick(paths::Kick::Start);
                 }
                 self.reply(&mut core, reply);
             }
@@ -932,6 +958,11 @@ impl Shared {
                 let reply = routes::config(self, &id, &map);
                 self.event(reply);
             }
+            "routes.managed_tunnel" => {
+                drop(core);
+                let reply = routes::managed_tunnel(self, &id, &map);
+                self.event(reply);
+            }
             "routes.test" => {
                 drop(core);
                 let route = map.get("route").and_then(Value::as_str).map(str::to_owned);
@@ -1015,6 +1046,7 @@ impl Shared {
             "device": short_id(&self.info.identity),
             "port": self.info.port,
             "ws_port": self.info.ws_port,
+            "managed_tunnel": self.info.ws_port.is_some(),
             "routes": listen.routes,
             "routes_config": listen.config,
             "unbound": listen.unbound,

@@ -13,14 +13,20 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use common::*;
+use mousse_net_core::control::{ControlMessage, VersionSupport};
 use mousse_net_core::identity::{IdentityPublicKey, SoftwareKey};
+use mousse_net_core::mux::Frame;
 use mousse_net_core::pairing::RouteHost;
+use mousse_net_core::session_cert::SessionCertificate;
+use mousse_net_io::certs::CertManager;
 use mousse_net_io::pipe::ws::{self, WsTarget};
 use mousse_net_io::rng::os_rng;
 use mousse_net_io::store::{hex, unhex};
-use mousse_net_io::{Caller, ConnStatus, Limits, ManualClock, NetError};
+use mousse_net_io::tls::{self, TlsPolicy};
+use mousse_net_io::{Caller, ConnStatus, Limits, ManualClock, NetError, SystemClock};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde_json::json;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// A helper with its ws listener on: the state, the app, the ws port.
 fn ws_app(tag: &str, env: &[(&str, &str)]) -> (Endpoint, App, u16) {
@@ -136,6 +142,24 @@ fn upgraded(port: u16) -> TcpStream {
     let got = answer(&mut s);
     assert!(got.starts_with("HTTP/1.1 101"), "{got}");
     s
+}
+
+#[test]
+fn the_app_origin_is_available_before_a_tunnel_is_configured() {
+    let end = Endpoint::init("ws-origin");
+    let mut app = end.app("hostA", &[]);
+    let hello = app.hello();
+    let port = u16::try_from(hello["ws_port"].as_u64().expect("no local origin")).unwrap();
+    assert!(hello["routes_config"]["tunnels"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    drop(upgraded(port));
+    drop(app);
+
+    let mut restarted = end.app("hostA", &[]);
+    assert_eq!(restarted.hello()["ws_port"], port);
+    drop(upgraded(port));
 }
 
 #[test]
@@ -422,6 +446,94 @@ fn wss_through_a_tls_terminating_stand_in_goes_live() {
         caller.dial(pipe, host).await.unwrap()
     });
     assert_eq!(conn.status(), ConnStatus::Live);
+}
+
+#[test]
+fn a_tunnel_reconnect_reports_two_way_support_even_with_a_delayed_hello() {
+    let (_end, mut a, port) = ws_app("ws-delayed-hello", &[]);
+    let (cert, me) = granted_caller(&mut a);
+    let host = identity_of(&a);
+    let rt = runtime();
+    let _conn = rt.block_on(async {
+        let mut conn = tunnel_tls(port, &cert, host).await;
+        // On reconnect the saved grant makes the host live as soon as TLS
+        // finishes. Delay the caller's HELLO as a slower path would.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let hello = ControlMessage::Hello {
+            major_version: VersionSupport::LOCAL.major,
+            minor_version: VersionSupport::LOCAL.minor,
+        };
+        conn.write_all(
+            &Frame::Control {
+                payload: hello.encode(),
+            }
+            .encode(),
+        )
+        .await
+        .unwrap();
+        conn.flush().await.unwrap();
+        conn
+    });
+    let up = a.event("conn.up", |m| {
+        m["dir"] == "in" && m["identity"] == me.as_str()
+    });
+    assert_eq!(up["route"]["class"], "tunnel", "{up}");
+    assert_eq!(up["both"], true, "{up}");
+}
+
+/// A granted caller that is live but never sends HELLO is closed after
+/// `INBOUND_HELLO_WAIT_MS`, before the first keepalive, and never
+/// announced.
+#[test]
+fn a_caller_that_never_sends_hello_is_closed_unannounced() {
+    let (_end, mut a, port) = ws_app("ws-no-hello", &[("INBOUND_HELLO_WAIT_MS", "300")]);
+    let (cert, me) = granted_caller(&mut a);
+    let host = identity_of(&a);
+    let rt = runtime();
+    let closed = rt.block_on(async {
+        let mut conn = tunnel_tls(port, &cert, host).await;
+        let mut buf = [0u8; 4096];
+        let until_closed = async { while matches!(conn.read(&mut buf).await, Ok(n) if n > 0) {} };
+        tokio::time::timeout(Duration::from_secs(10), until_closed)
+            .await
+            .is_ok()
+    });
+    assert!(closed, "the host kept a connection that sent no HELLO");
+    let ups = a.events("conn.up");
+    assert!(ups.iter().all(|m| m["identity"] != me.as_str()), "{ups:?}");
+}
+
+/// A session certificate for a new device, granted by `a`, and its
+/// identity in hex.
+fn granted_caller(a: &mut App) -> (SessionCertificate, String) {
+    let cert = CertManager::new(
+        Arc::new(SoftwareKey::generate(&mut os_rng())),
+        Arc::new(SystemClock::new()),
+    )
+    .current()
+    .unwrap();
+    let me = hex(cert.identity().as_bytes());
+    a.call("grant.add", json!({"identity": me, "name": "laptop"}));
+    (cert, me)
+}
+
+/// Reach the helper on ws `port` through a TLS-terminating tunnel stand-in
+/// as `cert`, up to the end of the inner TLS. Nothing of the mux is sent.
+async fn tunnel_tls(
+    port: u16,
+    cert: &SessionCertificate,
+    host: IdentityPublicKey,
+) -> impl AsyncRead + AsyncWrite + Unpin {
+    let tunnel = stand_in(trusted_pki(), port).await;
+    let addr = ([127, 0, 0, 1], tunnel).into();
+    let pipe = ws::dial(&tunnel_target(tunnel), addr, Limits::DEFAULT.io())
+        .await
+        .unwrap();
+    let clock = Arc::new(SystemClock::new());
+    let (conn, _) = tls::connect(pipe, cert, host, clock, TlsPolicy::default())
+        .await
+        .unwrap();
+    conn
 }
 
 /// A tunnel certificate no root vouches for is refused at the outer TLS.

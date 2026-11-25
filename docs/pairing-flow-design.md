@@ -75,6 +75,7 @@ Additions only. A 1.2 helper serves a 1.1 app unchanged.
   | `grant-revoke-local` | `grant.revoke_local` |
   | `grant-roles` | `role` on `invite.create`, `approval.answer` and `grant.add`; `grant.set_role`; grant fields on `stream.incoming` |
   | `grant-add-connected` | `grant.add_connected` |
+  | `managed-tunnel` | `routes.managed_tunnel`; `managed_tunnel` in `hello`; the managed tunnel as a `tunnel` candidate (§3.1) |
 
 - **Unknown fields.** Every new operation rejects a field it does not know
   with `bad_request`. `invite.create` rejects unknown fields only when
@@ -181,15 +182,41 @@ that way alone would put in a ticket now.
   that keeps one) is not pending.
 - A pending restart for one way does not hide another way that works.
 - `origin_unavailable` cannot arise in this helper alone: a tunnel set at
-  start starts the WebSocket listener, and setting the first one takes a
-  restart. It is kept for #10's managed tunnel, whose origin can be down
-  while the setting is on.
+  start starts the WebSocket listener, setting the first one takes a
+  restart, and `routes.managed_tunnel` refuses a route while the listener
+  is not running (§3.1). It is kept for an origin that stops while a
+  tunnel is set.
 - `no_interface` supports "No Tailscale address on this computer". It does
   not prove Tailscale is stopped: the range is shared with carrier NAT, and
   routed setups exist.
 - The app asks again when the dialog opens and on the network, config and
   relay events it already receives. There is no readiness event.
 - Errors: `bad_request`, `store_failed`.
+
+### 3.1 The managed tunnel: `routes.managed_tunnel`
+
+`routes.managed_tunnel {route}` → `{routes}`
+
+- `route`: the `wss` route of a tunnel the app runs to this helper's local
+  WebSocket origin, or `null` to withdraw it. The app confirms it with
+  `routes.test` first.
+- The route lives in memory for the helper's lifetime. It is never written
+  to `routes.json`, and a restart forgets it.
+- While it is set it is a `tunnel` candidate (§2), after the configured
+  and command-line tunnels: `routes.available` reports `tunnel` ready with
+  it, and `invite.create {way: "tunnel"}` carries it, also as an exact
+  `route`. Withdrawing it takes it out of both at once, with no restart.
+  A pending restart of the `tunnels` list still makes the way
+  `restart_required`, managed tunnel or not.
+- The 1.1 invitation path carries it too, in the last of the
+  `MAX_ROUTES` slots; `routes` in the reply is that list.
+- In app mode the helper runs the local origin without a configured
+  tunnel. `hello` says `managed_tunnel: true` when it runs (its port is
+  `ws_port`). When it cannot bind, the helper still starts,
+  `managed_tunnel` is `false` and a route is refused.
+- Errors: `bad_request` for a field it does not know; `bad_route` for a
+  missing or non-`wss` route, one longer than `MAX_ROUTE_LEN` or naming a
+  forbidden address, and while the local origin is not running.
 
 ## 4. Inspecting a link: `join.check`
 
@@ -293,6 +320,8 @@ device recognizes it at step 1; the promise is that no invitation or grant
 changes, not that the host sees nothing. Such a probe may make the host
 announce `conn.up` for that device before any wire `HELLO`; the host
 helper's wait for `HELLO` in `App::inbound_on` (added in #10) closes that.
+The wait is bounded by `MOUSSE_NET_INBOUND_HELLO_WAIT_MS`; a caller with no
+`HELLO` by then is closed and never announced.
 
 **What a positive answer means.** The endpoint named in the link answered.
 It does not show that the invitation is still open, and it does not
@@ -708,8 +737,8 @@ change authorization and 6 stores an admission credential.
 **#10 (managed tunnel).** It owns `routes.managed_tunnel`, the
 `managed_tunnel` listener slot, the keeper's start sequence and the wait
 for the caller's `HELLO`. Pull request 1 reads tunnel candidates through
-one function; the managed slot is added to that function, with a test,
-once #10 is merged.
+one function; #10 adds the managed slot to that function, with a test, and
+lists `managed-tunnel` in `features` (§3.1).
 
 ## 11. Checks
 
