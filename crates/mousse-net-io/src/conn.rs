@@ -34,7 +34,8 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use mousse_net_core::authz::{Traffic, Verdict};
@@ -267,6 +268,11 @@ pub(crate) enum Cmd {
     Code(PairingCode),
     /// Answered when the peer's next `PONG` arrives.
     Ping(oneshot::Sender<()>),
+    /// Answered once nothing queued before this command can still leave:
+    /// the connection is closing (closing drops the mux's queue) and the
+    /// writer has finished the frame it held, or the driver ended. Sent
+    /// after a [`Cmd::Close`].
+    Fence(oneshot::Sender<()>),
 }
 
 /// How a stream's receive side ended.
@@ -291,6 +297,8 @@ struct RxState {
     end: Option<StreamEnd>,
     /// The reader is gone: nothing more is kept.
     gone: bool,
+    /// This side reset the stream with this code ([`StreamWriter::reset`]).
+    reset: Option<ErrorCode>,
 }
 
 struct RxQueue {
@@ -340,6 +348,16 @@ impl RxQueue {
         }
         drop(st);
         self.ready.notify_one();
+    }
+
+    /// This side resets the stream with `code`; the first code counts.
+    fn mark_reset(&self, code: ErrorCode) {
+        self.lock().reset.get_or_insert(code);
+    }
+
+    /// The code this side reset the stream with, if it did.
+    fn local_reset(&self) -> Option<ErrorCode> {
+        self.lock().reset
     }
 
     /// The reader let go: drop what waits.
@@ -476,6 +494,7 @@ fn clone_err(e: &NetError) -> NetError {
 #[derive(Clone)]
 pub struct StreamWriter {
     id: StreamId,
+    rx: Arc<RxQueue>,
     cmd: mpsc::UnboundedSender<Cmd>,
     closing: watch::Receiver<bool>,
 }
@@ -505,8 +524,11 @@ impl StreamWriter {
         let _ = self.cmd.send(Cmd::Finish(self.id));
     }
 
-    /// Abort the stream in both directions.
+    /// Abort the stream in both directions. The peer gets `code`, also when
+    /// DATA it already sent arrives before the reset is sent and finds the
+    /// reader gone.
     pub fn reset(&self, code: ErrorCode) {
+        self.rx.mark_reset(code);
         let _ = self.cmd.send(Cmd::Reset(self.id, code));
     }
 
@@ -553,6 +575,45 @@ impl MuxStream {
     }
 }
 
+/// Whether a connection has started to close, shared by its handle and its
+/// driver. Marking it waits for any [`LivePermit`] to be dropped, so what
+/// was done under a permit was done while the connection was live.
+#[derive(Debug, Default)]
+struct Liveness {
+    closing: AtomicBool,
+    gate: Mutex<()>,
+}
+
+impl Liveness {
+    /// Mark closing, once every permit held now is dropped.
+    fn mark(&self) {
+        if self.is_set() {
+            return;
+        }
+        // Must-fail control (tests only): closing does not wait for the
+        // permits held.
+        if cfg!(mousse_control = "live-permit-ignored") {
+            self.closing.store(true, Ordering::SeqCst);
+            return;
+        }
+        let _gate = self.gate.lock().unwrap_or_else(PoisonError::into_inner);
+        self.closing.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether it is marked; never waits.
+    fn is_set(&self) -> bool {
+        self.closing.load(Ordering::SeqCst)
+    }
+}
+
+/// Proof that a connection was live when the permit was taken and stays
+/// live while it is held: [`Connection::close`] and the driver's shutdown
+/// wait for it before the connection reads as closing. Hold one only for
+/// a short in-memory step, never across an `.await` or I/O.
+pub struct LivePermit<'a> {
+    _gate: MutexGuard<'a, ()>,
+}
+
 /// A handle to a running connection. Dropping it closes the connection with
 /// `NO_ERROR`.
 pub struct Connection {
@@ -565,6 +626,9 @@ pub struct Connection {
     incoming: tokio::sync::Mutex<mpsc::UnboundedReceiver<MuxStream>>,
     /// The minor version both sides agreed, once the peer's `HELLO` came.
     minor: watch::Receiver<Option<u64>>,
+    /// Set by [`Connection::close`] at once and by the driver when the
+    /// connection starts to close for any reason.
+    shutting: Arc<Liveness>,
 }
 
 impl fmt::Debug for Connection {
@@ -732,9 +796,45 @@ impl Connection {
         matches!(tokio::time::timeout(within, rx).await, Ok(Ok(())))
     }
 
-    /// Close with `code`.
+    /// Close with `code`. [`Connection::is_closing`] is true from now on.
+    /// Waits for a [`LivePermit`] held elsewhere to be dropped.
     pub fn close(&self, code: ErrorCode) {
+        self.shutting.mark();
         let _ = self.cmd.send(Cmd::Close(code));
+    }
+
+    /// Whether the connection is closing or closed: [`Connection::close`]
+    /// was called, or the driver started to shut down (the peer's
+    /// `GOAWAY`, the certificate's deadline, a failed pipe, any close).
+    /// Unlike [`Connection::status`], which reads
+    /// [`ConnStatus::Closed`] only once the driver is done, this is true
+    /// for the whole of the shutdown.
+    pub fn is_closing(&self) -> bool {
+        self.shutting.is_set() || matches!(*self.status.borrow(), ConnStatus::Closed(_))
+    }
+
+    /// A permit that holds off [`Connection::is_closing`] while it is
+    /// held, or `None` if the connection is closing already. Work that
+    /// must not land on a closing connection (a grant made for its peer)
+    /// commits under it.
+    pub fn live_permit(&self) -> Option<LivePermit<'_>> {
+        let gate = self
+            .shutting
+            .gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        (!self.is_closing()).then_some(LivePermit { _gate: gate })
+    }
+
+    /// Wait until nothing queued on this connection before the call can
+    /// still be sent. Call it after [`Connection::close`]: it returns once
+    /// the close dropped the queue and the frame being written, if any,
+    /// went out (or the connection ended).
+    pub async fn fence(&self) {
+        let (tx, rx) = oneshot::channel();
+        if self.cmd.send(Cmd::Fence(tx)).is_ok() {
+            let _ = rx.await;
+        }
     }
 }
 
@@ -779,6 +879,7 @@ pub(crate) fn spawn<P: Pipe>(
     let (closing_tx, _) = watch::channel(false);
     let (accept_tx, accept_rx) = mpsc::unbounded_channel();
     let (minor, minor_rx) = watch::channel(None);
+    let shutting = Arc::new(Liveness::default());
     let connection = Connection {
         id: start.conn,
         peer: start.peer,
@@ -788,6 +889,7 @@ pub(crate) fn spawn<P: Pipe>(
         status: status_rx,
         incoming: tokio::sync::Mutex::new(accept_rx),
         minor: minor_rx,
+        shutting: shutting.clone(),
     };
     let driver = Driver {
         mux: Mux::with_limits(start.side, start.clock.mono(), start.limits.core()),
@@ -800,6 +902,7 @@ pub(crate) fn spawn<P: Pipe>(
         cmd_tx,
         status: status_tx,
         closing: closing_tx,
+        shutting,
         accept: accept_tx,
         streams: HashMap::new(),
         finished: Vec::new(),
@@ -809,6 +912,7 @@ pub(crate) fn spawn<P: Pipe>(
         minor,
         reason: None,
         before_close: VecDeque::new(),
+        fences: Vec::new(),
     };
     tokio::spawn(driver.run(start.tls, cmd_rx));
     connection
@@ -823,6 +927,8 @@ struct Driver {
     cmd_tx: mpsc::UnboundedSender<Cmd>,
     status: watch::Sender<ConnStatus>,
     closing: watch::Sender<bool>,
+    /// The handle's view of closing ([`Connection::is_closing`]).
+    shutting: Arc<Liveness>,
     accept: mpsc::UnboundedSender<MuxStream>,
     streams: HashMap<u32, StreamTx>,
     /// Streams the peer finished whose receive side waits for the mux to
@@ -843,6 +949,9 @@ struct Driver {
     reason: Option<CloseReason>,
     /// Encoded frames a closing step produced, sent before the GOAWAY.
     before_close: VecDeque<Vec<u8>>,
+    /// Who waits for [`Cmd::Fence`]. Dropped (which answers too) when the
+    /// driver ends.
+    fences: Vec<oneshot::Sender<()>>,
 }
 
 fn classify(frame: &Frame) -> Result<(Traffic, Option<ControlMessage>), ErrorCode> {
@@ -907,6 +1016,14 @@ impl Driver {
             }
             if self.mux.is_closing() && give_up.is_none() {
                 give_up = Some(Instant::now() + self.limits.close_linger);
+            }
+            // The writer asks again only after its last frame went out, and
+            // a closing mux has dropped its queue: nothing from before can
+            // leave any more.
+            if slot.is_some() && self.mux.is_closing() {
+                for fence in self.fences.drain(..) {
+                    let _ = fence.send(());
+                }
             }
             if slot.is_some() {
                 if let Some(frame) = self.next_frame() {
@@ -1067,6 +1184,7 @@ impl Driver {
     }
 
     fn mark_closing(&self) {
+        self.shutting.mark();
         self.closing
             .send_if_modified(|closing| !std::mem::replace(closing, true));
     }
@@ -1196,6 +1314,15 @@ impl Driver {
                     self.pings.push(reply);
                 }
             }
+            Cmd::Fence(reply) => {
+                // Must-fail control (tests only): the fence is answered at
+                // once, while queued data can still go out.
+                if cfg!(mousse_control = "role-edit-unfenced") {
+                    let _ = reply.send(());
+                } else {
+                    self.fences.push(reply);
+                }
+            }
         }
     }
 
@@ -1289,7 +1416,7 @@ impl Driver {
         MuxStream {
             reader: StreamReader {
                 id,
-                rx,
+                rx: rx.clone(),
                 cmd: self.cmd_tx.clone(),
                 ended: None,
                 closing: self.closing.subscribe(),
@@ -1298,6 +1425,7 @@ impl Driver {
             },
             writer: StreamWriter {
                 id,
+                rx,
                 cmd: self.cmd_tx.clone(),
                 closing: self.closing.subscribe(),
             },
@@ -1415,8 +1543,13 @@ impl Driver {
                     .streams
                     .get(&stream.0)
                     .is_some_and(|tx| tx.rx.push(bytes, chunk));
-                if !delivered && self.streams.remove(&stream.0).is_some() {
-                    let _ = self.mux.reset(stream, ErrorCode::Cancelled);
+                if !delivered {
+                    if let Some(tx) = self.streams.remove(&stream.0) {
+                        // A reset this side asked for may still wait in the
+                        // command queue: send its code, not ours.
+                        let code = tx.rx.local_reset().unwrap_or(ErrorCode::Cancelled);
+                        let _ = self.mux.reset(stream, code);
+                    }
                 }
             }
             MuxEvent::Finished { stream } => {
@@ -2061,6 +2194,103 @@ mod tests {
         );
     }
 
+    /// A fence asked for after a close is answered only once nothing
+    /// queued before the close can leave: while the writer holds a frame
+    /// on a full pipe it waits, and after it only that frame goes out;
+    /// what was still queued behind it never does. The handle reads closing
+    /// from the moment the close is asked for.
+    #[tokio::test]
+    async fn a_fence_after_a_close_waits_for_the_frame_in_flight_and_nothing_queued_leaves() {
+        let (conn, mut peer, valve, _clock) = connected(3_600).await;
+        let stream = conn
+            .open_stream(PriorityClass::Interactive, "terminal")
+            .await
+            .unwrap();
+        stream.writer.write(b"open").await.unwrap();
+        assert!(
+            within(
+                "the open",
+                peer.read_until(|f| matches!(f, Frame::Data { .. }))
+            )
+            .await
+        );
+        assert!(!conn.is_closing());
+
+        // The writer waits on the pipe with "held"; "queued" waits in the
+        // mux behind it.
+        valve.close();
+        stream.writer.write(b"held").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        stream.writer.write(b"queued").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        conn.close(ErrorCode::Cancelled);
+        assert!(conn.is_closing());
+        let fence = conn.fence();
+        tokio::pin!(fence);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut fence)
+                .await
+                .is_err(),
+            "the fence was answered while a frame was still held"
+        );
+        valve.open();
+        within("the fence", fence).await;
+
+        let from = peer.frames.len();
+        assert!(
+            within(
+                "the GOAWAY",
+                peer.read_until(|f| matches!(f, Frame::GoAway { .. }))
+            )
+            .await
+        );
+        assert_eq!(data_of(&peer.frames[from..]), [b"held".as_slice()]);
+    }
+
+    /// The peer's `GOAWAY` makes the handle read closing: nobody here
+    /// called [`Connection::close`].
+    #[tokio::test]
+    async fn the_peers_goaway_reads_as_closing_at_once() {
+        let (conn, mut peer, _valve, _clock) = connected(3_600).await;
+        assert!(!conn.is_closing());
+        peer.mux.close(ErrorCode::NoError);
+        peer.flush().await;
+        within("closing", async {
+            while !conn.is_closing() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+    }
+
+    /// A close waits for a live permit held elsewhere: until the permit
+    /// is dropped the connection reads as live, and afterwards no permit
+    /// is given.
+    #[tokio::test]
+    async fn a_close_waits_for_the_live_permit_held() {
+        let (conn, _peer, _valve, _clock) = connected(3_600).await;
+        let conn = Arc::new(conn);
+        let permit = conn.live_permit().expect("live");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let closer = {
+            let conn = conn.clone();
+            std::thread::spawn(move || {
+                conn.close(ErrorCode::Cancelled);
+                let _ = done_tx.send(());
+            })
+        };
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the close went through while a permit was held"
+        );
+        assert!(!conn.is_closing());
+        drop(permit);
+        closer.join().unwrap();
+        assert!(conn.is_closing());
+        assert!(conn.live_permit().is_none());
+    }
+
     /// The peer finishes its half, then resets the stream while this side's
     /// half is open and idle: the reader still learns of the reset, so
     /// whoever holds the stream can let it and its credit go.
@@ -2092,6 +2322,57 @@ mod tests {
             within("the reset", stream.reader.reset_by_peer()).await,
             ErrorCode::Cancelled
         );
+    }
+
+    /// This side resets a stream with a code and lets its reader go while
+    /// DATA from the peer is in flight. Whichever the driver takes first,
+    /// the reset or the DATA, the peer gets that code, never `CANCELLED`.
+    /// The driver picks between them at random, so the race is run on many
+    /// streams.
+    #[tokio::test]
+    async fn data_in_flight_at_a_local_reset_gets_the_resets_code() {
+        let (conn, mut peer, _valve, _clock) = connected(3_600).await;
+        for _ in 0..32 {
+            let stream = conn
+                .open_stream(PriorityClass::Interactive, "terminal")
+                .await
+                .unwrap();
+            let id = stream.id();
+            stream.writer.write(b"open").await.unwrap();
+            assert!(
+                within(
+                    "the open",
+                    peer.read_until(|f| matches!(f, Frame::Data { stream, .. } if *stream == id))
+                )
+                .await
+            );
+            // The peer's DATA waits in the pipe while, before the driver
+            // runs again (one thread), this side resets and drops the stream.
+            peer.mux.send(id, b"late").unwrap();
+            peer.flush().await;
+            stream.writer.reset(ErrorCode::GrantRevoked);
+            drop(stream);
+            assert!(
+                within(
+                    "the reset",
+                    peer.read_until(|f| matches!(f, Frame::Reset { stream, .. } if *stream == id))
+                )
+                .await
+            );
+            let codes: Vec<ErrorCode> = peer
+                .frames
+                .iter()
+                .filter_map(|f| match f {
+                    Frame::Reset { stream, code } if *stream == id => Some(*code),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                codes,
+                [ErrorCode::GrantRevoked],
+                "late DATA changed the reset's code"
+            );
+        }
     }
 
     /// A peer splitting its data into one-byte DATA frames while nobody

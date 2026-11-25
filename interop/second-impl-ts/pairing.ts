@@ -23,6 +23,7 @@ export type Effect =
   | { ask_approval: { conn: number; name: string } }
   | { admitted_join_only: number }
   | { enrolled: { conn: number } }
+  | { role_set: { changed: boolean; role: string } }
   | { invitation_ended: ErrorName }
   | { paired: { host_identity: string; host_name: string; role: string } }
   | { already_paired: true }
@@ -207,15 +208,31 @@ export class PairingHost {
     return output;
   }
 
-  approve(conn: number, now: number): Effect[] {
+  // `role`: the owner chose the role of this enrollment's grant with the approval; the invitation keeps its own.
+  approve(conn: number, now: number, role?: string): Effect[] {
     const connection = this.connections.get(conn);
     if (this.status !== 'open' || !connection || connection.gate.state !== 'join_only' || this.ticket.kind !== 1) {
       return [{ error: 'not_open' }];
     }
-    return this.enroll(conn, connection, now);
+    return this.enroll(conn, connection, now, role ?? this.policy.role);
   }
 
-  private enroll(conn: number, connection: HostConnection, now: number): Effect[] {
+  // Edit a grant's role in place (wire.md 7): its channels close with CANCELLED and authorize again.
+  setRole(identity: string, role: string): Effect[] {
+    const grant = this.grants.get(identity);
+    requireThat(grant !== undefined, 'no_grant');
+    const changed = grant.role !== role;
+    const output: Effect[] = [{ role_set: { changed, role } }];
+    if (!changed) return output;
+    this.grants.set(identity, { ...grant, role, bound_connections: [] });
+    for (const id of grant.bound_connections) {
+      const connection = this.connections.get(id);
+      if (connection) output.push(close(id, connection.gate, 'cancelled'));
+    }
+    return output;
+  }
+
+  private enroll(conn: number, connection: HostConnection, now: number, role = this.policy.role): Effect[] {
     if (this.status !== 'open' || now >= Number(this.ticket.expiresAt)) {
       return [close(conn, connection.gate, 'invitation_invalid')];
     }
@@ -226,7 +243,7 @@ export class PairingHost {
     try {
       this.grants.set(identity, { authorizing_owner: this.policy.authorizingOwner, bound_connections: [conn],
         enrolled_by: hex(this.ticket.invitation), expires_at: this.policy.grantExpiresAt, granted_at: now,
-        identity, name: connection.name, role: this.policy.role });
+        identity, name: connection.name, role });
     } catch {
       return [close(conn, connection.gate, 'internal_error'), ...this.checkExhausted()];
     }
@@ -234,7 +251,7 @@ export class PairingHost {
     this.shownCode = null;
     connection.gate.promote();
     const output: Effect[] = [{ enrolled: { conn } },
-      send(conn, { type: 'PAIRED', name: this.endpoint.name, role: this.policy.role })];
+      send(conn, { type: 'PAIRED', name: this.endpoint.name, role })];
     for (const [id, other] of this.connections) {
       this.stopAttempts(other);
       if (id === conn) continue;

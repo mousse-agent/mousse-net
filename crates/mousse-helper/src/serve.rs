@@ -20,7 +20,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use mousse_net_core::grants::GrantId;
+use mousse_net_core::grants::{GrantId, Role};
 use mousse_net_core::identity::{IdentityPublicKey, SoftwareKey};
 use mousse_net_core::pairing::{CpaceExchangeFactory, InvitationId, InvitationKind};
 use mousse_net_core::ErrorCode;
@@ -79,6 +79,10 @@ pub struct ListenState {
     pub port: u16,
     /// The addresses bound now.
     pub bound: Vec<IpAddr>,
+    /// `--listen-ip` when no `routes.json` chose the addresses: the
+    /// listener then serves what [`route_hints`] lists for it, whatever
+    /// `config.lan` says.
+    pub listen_ip: Option<IpAddr>,
     /// Tunnels given on the command line (`--tunnel`), advertised besides
     /// the config's.
     pub extra: Vec<String>,
@@ -201,28 +205,41 @@ struct State {
 /// Route hints for a listener on `ip`:`port`. An unspecified address
 /// expands to this machine's LAN addresses.
 pub fn route_hints(ip: IpAddr, port: u16) -> Vec<String> {
+    let addrs: Vec<IpAddr> = if ip.is_unspecified() {
+        if_addrs::get_if_addrs()
+            .map(|ifaces| ifaces.iter().map(|i| i.ip()).collect())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let mut out = served_hints(ip, port, &addrs);
+    out.truncate(8);
+    out
+}
+
+/// Every route hint a listener on `ip`:`port` serves, uncapped and sorted:
+/// `ip` itself, or for an unspecified address each usable one of `addrs`
+/// (no loopback or link-local; IPv6 only for an IPv6 listener).
+/// [`route_hints`] is this list cut to eight.
+pub fn served_hints(ip: IpAddr, port: u16, addrs: &[IpAddr]) -> Vec<String> {
     if !ip.is_unspecified() {
         return vec![route_uri(&route_from_addr(SocketAddr::new(ip, port)))];
     }
     let mut out = Vec::new();
-    if let Ok(ifaces) = if_addrs::get_if_addrs() {
-        for iface in ifaces {
-            let addr = iface.ip();
-            if addr.is_loopback() {
-                continue;
-            }
-            let usable = match addr {
-                IpAddr::V4(v4) => !v4.is_link_local(),
-                IpAddr::V6(v6) => ip.is_ipv6() && !v6.is_unicast_link_local(),
-            };
-            if usable {
-                out.push(route_uri(&route_from_addr(SocketAddr::new(addr, port))));
-            }
+    for &addr in addrs {
+        if addr.is_loopback() {
+            continue;
+        }
+        let usable = match addr {
+            IpAddr::V4(v4) => !v4.is_link_local(),
+            IpAddr::V6(v6) => ip.is_ipv6() && !v6.is_unicast_link_local(),
+        };
+        if usable {
+            out.push(route_uri(&route_from_addr(SocketAddr::new(addr, port))));
         }
     }
     out.sort();
     out.dedup();
-    out.truncate(8);
     out
 }
 
@@ -388,6 +405,7 @@ pub async fn run(
         config: config.clone(),
         port,
         bound: bound.clone(),
+        listen_ip: stored.is_none().then_some(opts.listen_ip),
         extra,
         managed_tunnel: None,
     }));
@@ -694,7 +712,7 @@ async fn ws_connection(
         Some(app) => {
             app.inbound(conn, RouteKind::Ws, None, None).await;
         }
-        None => serve_streams(conn, addr).await,
+        None => serve_streams(&host, conn, addr).await,
     }
 }
 
@@ -736,17 +754,37 @@ async fn handle_connection(
     };
     // The socket that accepted it closing ends it too.
     tokio::select! {
-        () = serve_streams(conn, addr) => {}
+        () = serve_streams(&host, conn, addr) => {}
         _ = closing.wait_for(|closed| *closed) => {}
     }
 }
 
-/// Standalone `serve`: terminals and `helper-info` for a live connection.
-async fn serve_streams(conn: mousse_net_io::Connection, addr: SocketAddr) {
+/// The roles standalone `serve` opens a terminal for. A terminal is a shell
+/// as this user, so only the owner's own devices get one.
+pub const TERMINAL_ROLES: &[&str] = &[Role::OWNER];
+
+/// Whether standalone `serve` opens a terminal for `conn` now: it is live
+/// under a served grant whose role [`TERMINAL_ROLES`] names. Read when the
+/// stream arrives, so an edit made since the connection came up counts.
+fn may_open_terminal(host: &Host, conn: &mousse_net_io::Connection) -> bool {
+    // Must-fail control (tests only): the role is not looked at.
+    host.grant_of(conn.id()).is_some_and(|g| {
+        cfg!(mousse_control = "restricted-grant-opens-standalone-terminal")
+            || TERMINAL_ROLES.contains(&g.role.as_str())
+    })
+}
+
+/// Standalone `serve`: terminals (for [`TERMINAL_ROLES`]) and
+/// `helper-info` for a live connection.
+async fn serve_streams(host: &Host, conn: mousse_net_io::Connection, addr: SocketAddr) {
     let peer = short_id(conn.peer());
     print_line(format!("connected {peer} from {addr}"));
     while let Some(stream) = conn.accept_stream().await {
         if stream.label() == term::LABEL {
+            if !may_open_terminal(host, &conn) {
+                stream.writer.reset(ErrorCode::RefusedStream);
+                continue;
+            }
             tokio::spawn(term::serve(stream));
         } else if stream.label() == INFO_LABEL {
             tokio::spawn(send_info(stream));
@@ -832,11 +870,13 @@ fn on_event(state: &State, event: HostEvent) {
             invitation,
             grant,
             identity,
+            role,
         } => {
             print_line(format!(
-                "enrolled grant {} {}",
+                "enrolled grant {} {} as {}",
                 grant.0,
-                short_id(&identity)
+                short_id(&identity),
+                role.as_str()
             ));
             if let Some(tx) = waiter(&invitation) {
                 let _ = tx.send(
@@ -856,6 +896,15 @@ fn on_event(state: &State, event: HostEvent) {
                 grant.0
             ));
         }
+        HostEvent::RoleChanged {
+            grant,
+            role,
+            revision,
+        } => print_line(format!(
+            "grant {} is {} now (revision {revision})",
+            grant.0,
+            role.as_str()
+        )),
         HostEvent::StoreFailed(e) => print_line(format!("saving grants failed: {e}")),
     }
 }

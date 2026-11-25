@@ -1,0 +1,29 @@
+# Pairing flow, pull request 6: a relay-only "Send link" pairing that
+# stopped after its completion record was saved is still reached through
+# the relay, and what its record restores never outlasts a newer pairing,
+# a removal or a disallow (docs/pairing-flow-design.md §9 and §11).
+#
+# Owner check: `mousse-check pairing-relay-completion` shows PASS in every
+# target cell, with no INCOMPLETE. Format: checks/README.md.
+
+phase = "pairing-relay-completion"
+title = "Relay-only link pairing recovers after a crash"
+plan = "docs/pairing-flow-design.md#9-relay-only-completion-recovery"
+
+[[check]]
+id = "pairing-relay-completion.relay-completion"
+title = "A relay-only link join stopped after its completion record, at each later write, comes back over the relay after a restart; the record keeps the tag sealed; a replay restores no retired, expired, older or removed pairing's tag or route and no disallowed approval; a crash once the host answered mousse-keys, or an earlier pair secret, strands nothing; an older keys exchange never overwrites a newer pair secret; a refusal past the dial limit still falls back to the tag; a failed write keeps the record; records from before still replay, and end with a grant removal; a grant removal leaves the peer's dials and upgrades alone; every link pairing, and an in-person one after it, takes a newer number"
+plan = "docs/pairing-flow-design.md §9 and §11"
+targets = ["windows-x64", "macos-arm64", "linux-x64"]
+min_tests = 147
+local = [
+  { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-net-io", "-p", "mousse-helper", "--no-fail-fast", "--lib", "--test", "app_relay_first", "--test", "app_link", "--test", "app_relay_completion"] },
+  { target = "macos-arm64", host = "macos-aarch64", command = ["cargo", "test", "-p", "mousse-net-io", "-p", "mousse-helper", "--no-fail-fast", "--lib", "--test", "app_relay_first", "--test", "app_link", "--test", "app_relay_completion"] },
+  { target = "linux-x64", host = "linux-x86_64", command = ["cargo", "test", "-p", "mousse-net-io", "-p", "mousse-helper", "--no-fail-fast", "--lib", "--test", "app_relay_first", "--test", "app_link", "--test", "app_relay_completion"] },
+]
+control = [
+  { name = "completion-omits-relay-admission", breaks = "the completion record holds no relay writes, which are made after it, so a crash between the two leaves a pairing that cannot be reached", env = { RUSTFLAGS = '--cfg mousse_control="completion-omits-relay-admission"' } },
+  { name = "completion-replays-retired-tag", breaks = "a replay brings back a tag after the host's keys arrived, after it expired, or from an older pairing", env = { RUSTFLAGS = '--cfg mousse_control="completion-replays-retired-tag"' } },
+  { name = "completion-stores-clear-tag", breaks = "the completion record holds the ticket's tag in the clear", env = { RUSTFLAGS = '--cfg mousse_control="completion-stores-clear-tag"' } },
+  { name = "relay-replay-after-forget", breaks = "the join makes its relay writes after it let go of the peers lock, so a removal meanwhile is undone", env = { RUSTFLAGS = '--cfg mousse_control="relay-replay-after-forget"' } },
+]

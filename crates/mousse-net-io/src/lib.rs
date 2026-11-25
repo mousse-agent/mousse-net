@@ -49,10 +49,15 @@ pub use caller::{
     RouteClass, Search, Step1Failures,
 };
 pub use clock::{Clock, ManualClock, SystemClock};
-pub use conn::{CloseReason, ConnStatus, Connection, MuxStream, StreamReader, StreamWriter};
+pub use conn::{
+    CloseReason, ConnStatus, Connection, LivePermit, MuxStream, StreamReader, StreamWriter,
+};
 pub use endpoint::{Endpoint, PortChoice};
 pub use error::NetError;
-pub use host::{AppliedRemoval, ApprovalRequest, Host, HostConfig, HostEvent, Refusal};
+pub use host::{
+    AppliedRemoval, ApprovalRequest, ConnectedGrantError, Host, HostConfig, HostEvent, Refusal,
+    RoleEditError, RoleEditing,
+};
 pub use limits::Limits;
 pub use preauth::{ListenerKind, PreAuthSlot, PreAuthStats};
 pub use tls::TlsPolicy;
@@ -111,7 +116,15 @@ pub type SharedSigner = Arc<dyn IdentitySigner + Send + Sync>;
         mousse_control = "unbounded-candidates",
         mousse_control = "ssh-races-lan",
         mousse_control = "bind-all-lan-off",
-        mousse_control = "pin-stored-memory-only"
+        mousse_control = "pin-stored-memory-only",
+        mousse_control = "restricted-store-readable-by-old-helper",
+        mousse_control = "role-edit-unfenced",
+        mousse_control = "role-edit-while-paused",
+        mousse_control = "grant-served-while-not-serving",
+        mousse_control = "grant-from-stale-connection",
+        mousse_control = "live-permit-ignored",
+        mousse_control = "connected-grant-while-paused",
+        mousse_control = "connected-grant-answers-unsaved"
     )
 ))]
 compile_error!("a mousse_control build has a deliberate defect and is for tests only; build it without --release");
@@ -163,7 +176,15 @@ compile_error!("a mousse_control build has a deliberate defect and is for tests 
     mousse_control = "unbounded-candidates",
     mousse_control = "ssh-races-lan",
     mousse_control = "bind-all-lan-off",
-    mousse_control = "pin-stored-memory-only"
+    mousse_control = "pin-stored-memory-only",
+    mousse_control = "restricted-store-readable-by-old-helper",
+    mousse_control = "role-edit-unfenced",
+    mousse_control = "role-edit-while-paused",
+    mousse_control = "grant-served-while-not-serving",
+    mousse_control = "grant-from-stale-connection",
+    mousse_control = "live-permit-ignored",
+    mousse_control = "connected-grant-while-paused",
+    mousse_control = "connected-grant-answers-unsaved"
 ))]
 const _: () = {
     let profile = env!("MOUSSE_BUILD_PROFILE").as_bytes();

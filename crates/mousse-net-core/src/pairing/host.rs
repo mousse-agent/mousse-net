@@ -117,6 +117,8 @@ pub enum HostAction {
         grant: GrantId,
         /// The device.
         identity: IdentityPublicKey,
+        /// The new grant's role, as `PAIRED` carries it.
+        role: Role,
     },
     /// The invitation ended without enrollment.
     InvitationEnded {
@@ -472,7 +474,8 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
         actions
     }
 
-    /// In person: the owner tapped "yes" for the device on `conn`.
+    /// In person: the owner tapped "yes" for the device on `conn`. The new
+    /// grant gets the invitation's role.
     pub fn approve(
         &mut self,
         invitation: &InvitationId,
@@ -480,6 +483,29 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
         grants: &mut GrantTable,
         now: UnixTime,
     ) -> Result<Vec<HostAction>, HostPairingError> {
+        self.approve_as(invitation, conn, None, grants, now)
+    }
+
+    /// [`HostPairing::approve`], with the role the owner chose with the
+    /// answer (`None`: the invitation's role). The role goes to this
+    /// enrollment only; the invitation keeps its own, so an answer for one
+    /// joiner never reaches another.
+    pub fn approve_as(
+        &mut self,
+        invitation: &InvitationId,
+        conn: ConnectionId,
+        role: Option<Role>,
+        grants: &mut GrantTable,
+        now: UnixTime,
+    ) -> Result<Vec<HostAction>, HostPairingError> {
+        // Must-fail control (tests only): the chosen role is kept on the
+        // invitation, before the answer is known to be for a joiner, so a
+        // failed answer's role reaches the next joiner.
+        if cfg!(mousse_control = "answer-role-sticks-to-invitation") {
+            if let (Some(inv), Some(role)) = (self.invitations.get_mut(invitation), role.clone()) {
+                inv.params.role = role;
+            }
+        }
         let inv = self
             .invitations
             .get(invitation)
@@ -493,7 +519,7 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
         if !inv.joiners.contains_key(&conn) {
             return Err(HostPairingError::UnknownJoiner);
         }
-        Ok(self.enroll(invitation, conn, grants, now))
+        Ok(self.enroll(invitation, conn, role, grants, now))
     }
 
     /// A `CODE_EXCHANGE` arrived on a join-only connection.
@@ -614,7 +640,7 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
                 if step.peer_confirmed {
                     record.state = AttemptState::Succeeded;
                     record.exchange = None;
-                    actions.extend(self.enroll(&invitation, conn, grants, now));
+                    actions.extend(self.enroll(&invitation, conn, None, grants, now));
                 }
                 actions
             }
@@ -671,15 +697,24 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
     }
 
     /// Atomic consumption: grant, bind, mark consumed, dismiss other joiners.
+    /// `chosen` is the role the owner picked with an in-person answer; the
+    /// grant and `PAIRED` carry it, or the invitation's role without one.
     fn enroll(
         &mut self,
         invitation: &InvitationId,
         conn: ConnectionId,
+        chosen: Option<Role>,
         grants: &mut GrantTable,
         now: UnixTime,
     ) -> Vec<HostAction> {
         let Some(inv) = self.invitations.get_mut(invitation) else {
             return Vec::new();
+        };
+        // Resolved once, for this enrollment only. Must-fail control (tests
+        // only): the role chosen with the answer is ignored.
+        let role = match chosen {
+            Some(role) if !cfg!(mousse_control = "approval-uses-invitation-role") => role,
+            _ => inv.params.role.clone(),
         };
         if !inv.is_open(now) {
             return vec![HostAction::Close {
@@ -697,7 +732,7 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
         let new_grant = NewGrant {
             identity: joiner.identity,
             name: joiner.name,
-            role: inv.params.role.clone(),
+            role: role.clone(),
             authorizing_owner: inv.params.authorizing_owner,
             expires_at: inv.params.grant_expires_at,
             enrolled_by: Some(*invitation),
@@ -729,7 +764,6 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
         inv.status = InvitationStatus::Consumed { grant };
         inv.attempts.clear();
         let others: Vec<ConnectionId> = std::mem::take(&mut inv.joiners).into_keys().collect();
-        let role = inv.params.role.clone();
         self.by_conn.remove(&conn);
         let mut actions: Vec<HostAction> = events.into_iter().map(HostAction::Grant).collect();
         actions.push(HostAction::Enrolled {
@@ -737,6 +771,7 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
             conn,
             grant,
             identity: joiner.identity,
+            role: role.clone(),
         });
         actions.push(HostAction::Send {
             conn,

@@ -1101,6 +1101,26 @@ where
         Ok(started.elapsed())
     }
 
+    /// Pass step 1 pinned to `pin` on `pipe`, a pipe of a `kind` route
+    /// already open ([`Caller::open_route`]), then close before step 2. A
+    /// join runs step 1 on the one pipe it opened, so this tells what a
+    /// join would find there (`join.probe`).
+    pub async fn probe_pipe(
+        &self,
+        pipe: BoxPipe,
+        kind: RouteKind,
+        pin: IdentityPublicKey,
+    ) -> Result<(), NetError> {
+        let own = self.certs.current()?;
+        let within = self.opener.within(kind);
+        let handshake = tls::connect(pipe, &own, pin, self.clock.clone(), self.policy);
+        let (stream, _) = tokio::time::timeout(within, handshake)
+            .await
+            .unwrap_or(Err(NetError::Timeout("step 1")))?;
+        drop(stream);
+        Ok(())
+    }
+
     /// [`Caller::search`] without making the path current: the live
     /// connection, how it was reached, and every candidate the search
     /// took, in order.

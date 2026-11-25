@@ -10,8 +10,8 @@ use mousse_net_core::session_cert::CertError;
 use mousse_net_core::ErrorCode;
 use mousse_net_io::pipe::{route_uri, AddrClass, AddrPolicy, BoxPipe, LocalRoute, RouteKind};
 use mousse_net_io::store::{
-    hex, is_stale, short_id, Approval, ApprovalStore, CompletionRecord, CompletionStore,
-    PeerRecord, PeerStore, PeersLock, APPROVAL_SOURCE_TICKET, COMPLETION_PAIRED,
+    hex, is_stale, short_id, Approval, ApprovalStore, CompletionRecord, CompletionRelay,
+    CompletionStore, PeerRecord, PeerStore, PeersLock, APPROVAL_SOURCE_TICKET, COMPLETION_PAIRED,
 };
 use mousse_net_io::{
     Caller, CloseReason, CodeEntry, Connection, Endpoint, JoinOutcome, NetError, Reached,
@@ -160,6 +160,32 @@ pub(crate) fn usable_routes(hints: &[String]) -> Vec<LocalRoute> {
         .collect()
 }
 
+/// The relay writes of a link completion record (pairing-flow design §9),
+/// made under the peers lock `held`, after the host's row and approvals.
+pub(crate) type ReplayRelay<'a> =
+    dyn Fn(&PeersLock<'_>, &CompletionRecord) -> Result<(), NetError> + Send + Sync + 'a;
+
+/// Readies a link join's relay writes under the peers lock, at the PAIRED
+/// time (Unix seconds): fills in the relay part's pairing number and tag
+/// expiry, if there is a relay part. It writes nothing.
+pub(crate) type PrepareRelay<'a> = dyn Fn(&PeersLock<'_>, u64, Option<&mut CompletionRelay>) -> Result<(), NetError>
+    + Send
+    + Sync
+    + 'a;
+
+/// An app's "Send link" join ([`join_routes`]).
+pub(crate) struct LinkJoin<'a> {
+    /// The destinations the owner approved at Connect.
+    pub approved: &'a [String],
+    /// The relay part of the completion record, with the sealed tag; the
+    /// tag is kept only if the join goes through a relay.
+    pub relay: Option<CompletionRelay>,
+    /// Numbers the relay part once the pairing is made.
+    pub prepare: &'a PrepareRelay<'a>,
+    /// Makes the relay writes of a completion record.
+    pub replay: &'a ReplayRelay<'a>,
+}
+
 /// Where a join dials: a route of this computer's own, or a relay with the
 /// ticket's invitation tag (Phase 3 B.7).
 pub(crate) enum JoinRoute {
@@ -168,6 +194,15 @@ pub(crate) enum JoinRoute {
         route: mousse_net_core::relay_endpoint::RelayRoute,
         tag: [u8; 32],
     },
+}
+
+/// `candidates` in the order a join tries them: `tcp`, then `ws`/`wss`,
+/// then `ssh`, then the relays, each kind in the order given (a stable
+/// sort). `join.probe` tries its routes in this order too.
+pub fn in_join_order(candidates: &[JoinRoute]) -> Vec<&JoinRoute> {
+    let mut ordered: Vec<&JoinRoute> = candidates.iter().collect();
+    ordered.sort_by_key(|r| r.order());
+    ordered
 }
 
 impl JoinRoute {
@@ -444,7 +479,7 @@ pub(crate) async fn join_routes<C: CodeEntry>(
     name: &str,
     candidates: &[JoinRoute],
     consented: bool,
-    link: Option<&[String]>,
+    link: Option<LinkJoin<'_>>,
     codes: &mut C,
     mut progress: impl FnMut(&str),
     wanted: impl Fn() -> bool,
@@ -475,9 +510,7 @@ pub(crate) async fn join_routes<C: CodeEntry>(
     // Pipe-generic (Phase 1b §1.4): `tcp` candidates first, then `ws`/`wss`,
     // then `ssh`, each pipe from `Caller::open_route` (resolved once, the
     // classified address dialled); then the relays (Phase 3 B.7).
-    let mut ordered: Vec<&JoinRoute> = candidates.iter().collect();
-    ordered.sort_by_key(|r| r.order());
-    for route in ordered {
+    for route in in_join_order(candidates) {
         let hint = route.hint();
         progress(&hint);
         let (pipe, reached) = match route.open(caller).await {
@@ -499,22 +532,26 @@ pub(crate) async fn join_routes<C: CodeEntry>(
                 .join_with_redial(pipe, ticket, arrival, name, codes, pinned, redial)
                 .await
         };
-        match joined {
-            Ok((conn, outcome)) if link.is_some() => {
-                let approved = link.unwrap_or_default();
-                let (record, already) =
-                    match finish_link(caller, peers, ticket, &hint, approved, outcome, &wanted) {
-                        Ok(done) => done,
-                        Err(f) => {
-                            conn.close(ErrorCode::Cancelled);
-                            return Err(f);
-                        }
-                    };
+        let joined = match (joined, &link) {
+            (Ok((conn, outcome)), Some(link)) => {
+                let via_relay = matches!(route, JoinRoute::Relay { .. });
+                let (record, already) = match finish_link(
+                    caller, peers, ticket, &hint, link, via_relay, outcome, &wanted,
+                ) {
+                    Ok(done) => done,
+                    Err(f) => {
+                        conn.close(ErrorCode::Cancelled);
+                        return Err(f);
+                    }
+                };
                 if let JoinRoute::Local(route) = route {
                     caller.remember_local_routes(ticket.host_identity, vec![route.clone()]);
                 }
                 return Ok((conn, record, already, reached));
             }
+            (joined, _) => joined,
+        };
+        match joined {
             Ok((conn, outcome)) => {
                 let already = matches!(outcome, JoinOutcome::AlreadyPaired);
                 // Built from the stored record as it is under the lock, so
@@ -619,16 +656,24 @@ pub(crate) fn crash_point(point: &str) {
     let _ = point;
 }
 
-/// The end of an app's "Send link" join (Phase 1b §5.4 and §3.6).
+/// The end of an app's "Send link" join (Phase 1b §5.4 and §3.6). The
+/// completion record also holds the writes for the ticket's approved relay
+/// routes, with the sealed tag when the join went through a relay
+/// (`via_relay`), so they are replayed with the rest (pairing-flow design
+/// §9). The relay part takes the pairing's number under the same peers
+/// lock.
+#[allow(clippy::too_many_arguments)]
 fn finish_link(
     caller: &Caller,
     peers: &PeerStore,
     ticket: &Ticket,
     hint: &str,
-    approved: &[String],
+    link: &LinkJoin<'_>,
+    via_relay: bool,
     outcome: JoinOutcome,
     wanted: &impl Fn() -> bool,
 ) -> Result<(PeerRecord, bool), Failure> {
+    let approved = link.approved;
     let store = |e: NetError| Failure::new(e.to_string(), "store");
     let hash = ticket.hash();
     let identity = hex(ticket.host_identity.as_bytes());
@@ -668,7 +713,7 @@ fn finish_link(
         offered: Vec::new(),
         paired_at: now,
     };
-    let done = CompletionRecord {
+    let mut done = CompletionRecord {
         ticket_hash: hex(&hash),
         host_identity: identity,
         outcome: COMPLETION_PAIRED.into(),
@@ -676,6 +721,12 @@ fn finish_link(
         approvals: ticket_approvals(ticket, approved, now),
         expires_at: ticket.expires_at.secs(),
         at: now,
+        relay: link.relay.clone().map(|mut relay| {
+            if !via_relay {
+                relay.join_tag = None;
+            }
+            relay
+        }),
     };
     // The record, the row and the approvals are written under one peers
     // lock, checked against a removal of the host under it: a removal
@@ -687,6 +738,8 @@ fn finish_link(
         drop(held);
         return Err(removed_meanwhile(caller, &hash));
     }
+    // The pairing's number, and the tag's expiry from the PAIRED time.
+    (link.prepare)(&held, now, done.relay.as_mut()).map_err(store)?;
     // Must-fail control: the pin is saved with no completion record first.
     if cfg!(mousse_control = "no-completion-record") {
         crash_point("link-done-saved");
@@ -700,7 +753,7 @@ fn finish_link(
             .save(&done)
             .map_err(store)?;
         crash_point("link-done-saved");
-        if replay_held(peers.dir(), &held, &hash, true, None)
+        if replay_held(peers.dir(), &held, &hash, true, None, link.replay)
             .map_err(store)?
             .is_none()
         {
@@ -768,8 +821,10 @@ fn merge_peer(list: &mut Vec<PeerRecord>, mut record: PeerRecord) {
 
 /// Make the writes of the completion record for `ticket_hash` again, under
 /// the peers lock: the host's row in `peers.json` (merged as the join
-/// merges it), then its approvals. Each is idempotent. Returns the record,
-/// or `None` if there is none: never made, acknowledged, dropped by a
+/// merges it), then its approvals, then its relay writes (`relay`). Each
+/// is idempotent, and an error stops the replay, so the record is only
+/// reported done once all of them are stored. Returns the record, or
+/// `None` if there is none: never made, acknowledged, dropped by a
 /// removal of its host, or past `stale` (`(now, keep_secs)`), in which
 /// case it is deleted here. `full`: false only for the `done-pin-only`
 /// must-fail control, which saves the pin without routes or approvals.
@@ -778,10 +833,11 @@ pub(crate) fn replay_completion(
     ticket_hash: &[u8; 32],
     full: bool,
     stale: Option<(u64, u64)>,
+    relay: &ReplayRelay<'_>,
 ) -> Result<Option<CompletionRecord>, NetError> {
     let peers = PeerStore::in_dir(dir);
     let held = peers.lock()?;
-    replay_held(dir, &held, ticket_hash, full, stale)
+    replay_held(dir, &held, ticket_hash, full, stale, relay)
 }
 
 /// [`replay_completion`], under the peers lock `held`.
@@ -791,6 +847,7 @@ fn replay_held(
     ticket_hash: &[u8; 32],
     full: bool,
     stale: Option<(u64, u64)>,
+    relay: &ReplayRelay<'_>,
 ) -> Result<Option<CompletionRecord>, NetError> {
     let records = CompletionStore::in_dir(dir);
     let Some(record) = records.load(ticket_hash)? else {
@@ -810,6 +867,8 @@ fn replay_held(
     held.update(|list| merge_peer(list, peer))?;
     if full {
         ApprovalStore::in_dir(dir).add(held, &record.approvals)?;
+        crash_point("link-row-saved");
+        relay(held, &record)?;
     }
     Ok(Some(record))
 }

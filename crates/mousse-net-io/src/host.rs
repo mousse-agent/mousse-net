@@ -34,7 +34,7 @@
 //! are checked before the traffic they bound: a join proof that arrives
 //! after the join-proof wait is refused even before the ticker runs.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -43,7 +43,8 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use mousse_net_core::authz::{ConnectionGate, GateState, Traffic, Verdict};
 use mousse_net_core::control::{AuthorizedState, ControlMessage};
 use mousse_net_core::grants::{
-    validate_name, Denial, Grant, GrantEvent, GrantId, GrantTable, NewGrant, OwnerRef, Role,
+    validate_name, Denial, Grant, GrantError, GrantEvent, GrantId, GrantTable, NewGrant, OwnerRef,
+    Role,
 };
 use mousse_net_core::identity::IdentityPublicKey;
 use mousse_net_core::mux::MuxRole;
@@ -54,7 +55,7 @@ use mousse_net_core::pairing::{
 };
 use mousse_net_core::removal::{self, Decision, Journaled, RemovalId, SignedRemoval};
 use mousse_net_core::{ConnectionId, ErrorCode, Millis, UnixTime};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::admission::StreamAdmission;
 use crate::certs::CertManager;
@@ -159,6 +160,19 @@ pub enum HostEvent {
         grant: GrantId,
         /// The device.
         identity: IdentityPublicKey,
+        /// The new grant's role.
+        role: Role,
+    },
+    /// A grant's role was changed in place and saved ([`Host::set_role`]),
+    /// or a role edit whose save had an unknown outcome was settled: the
+    /// grant is served again, with this role and revision.
+    RoleChanged {
+        /// The grant.
+        grant: GrantId,
+        /// Its role now.
+        role: Role,
+        /// Its revision now.
+        revision: u64,
     },
     /// An invitation ended without pairing.
     InvitationEnded {
@@ -167,7 +181,8 @@ pub enum HostEvent {
         /// Why.
         reason: ErrorCode,
     },
-    /// Grant channels were closed (removed, expired or denied grant).
+    /// Grant channels were closed (removed, expired or denied grant, or a
+    /// role edit).
     ChannelsClosed {
         /// The grant.
         grant: GrantId,
@@ -185,6 +200,105 @@ pub enum Refusal {
     Fenced,
     /// The pool or the source's share is full.
     Full(PreAuthFull),
+}
+
+/// Why [`Host::set_role`] changed nothing, or did not settle.
+#[derive(Debug)]
+pub enum RoleEditError {
+    /// No live grant has that id.
+    NoGrant,
+    /// The grant's revision is not the one the edit was made against.
+    RevisionConflict,
+    /// The edit cannot be made (a denied identity, or a revision that
+    /// cannot grow).
+    Refused(String),
+    /// The host serves no grant until a save works.
+    NotServing,
+    /// Networking is paused: a removal failed to save.
+    Paused,
+    /// The save failed with the table as it was, on disk and in memory:
+    /// nothing changed.
+    NotSaved(NetError),
+    /// The save failed after the new table may have reached the disk: the
+    /// edit is in memory, and the grant is served under neither role until
+    /// the stored table is read back or saved again
+    /// ([`HostEvent::RoleChanged`] says when).
+    Unsettled(NetError),
+}
+
+/// A role edit made by [`Host::edit_role`] whose closed connections may
+/// still send what was queued before the edit.
+#[must_use = "finish() waits until nothing queued under the old role can leave"]
+pub struct RoleEditing {
+    #[allow(clippy::type_complexity)]
+    result: Result<(Grant, bool, Option<HostEvent>), RoleEditError>,
+    fences: Vec<oneshot::Receiver<()>>,
+    events: mpsc::UnboundedSender<HostEvent>,
+}
+
+impl RoleEditing {
+    /// The grant as it is now and whether it changed, or the error, as
+    /// [`RoleEditing::finish`] will return it.
+    pub fn outcome(&self) -> Result<(&Grant, bool), &RoleEditError> {
+        match &self.result {
+            Ok((grant, changed, _)) => Ok((grant, *changed)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Wait until every connection the edit closed has dropped its queue
+    /// and finished the frame it was writing, then send
+    /// [`HostEvent::RoleChanged`] and return the result.
+    pub async fn finish(self) -> Result<(Grant, bool), RoleEditError> {
+        for fence in self.fences {
+            let _ = fence.await;
+        }
+        let (current, changed, event) = self.result?;
+        if let Some(event) = event {
+            let _ = self.events.send(event);
+        }
+        Ok((current, changed))
+    }
+}
+
+impl std::fmt::Display for RoleEditError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoGrant => f.write_str("no such grant"),
+            Self::RevisionConflict => f.write_str("the grant changed since that revision"),
+            Self::Refused(why) => f.write_str(why),
+            Self::NotServing => f.write_str("grants are not served until a save works"),
+            Self::Paused => f.write_str("networking is paused"),
+            Self::NotSaved(e) => write!(f, "the change was not saved: {e}"),
+            Self::Unsettled(e) => write!(f, "the change may not have been saved: {e}"),
+        }
+    }
+}
+
+/// Why [`Host::add_grant_connected`] did not answer with a saved grant.
+#[derive(Debug)]
+pub enum ConnectedGrantError {
+    /// Networking is paused: a removal failed to save.
+    Paused,
+    /// The connection is closing, or (inbound) no grant of this computer
+    /// serves it any more.
+    Closing,
+    /// The grant table refused the grant (the identity is denied).
+    Refused(String),
+    /// The grant is in effect but the table could not be saved; the host
+    /// keeps retrying, and the call may be repeated.
+    NotSaved(NetError),
+}
+
+impl std::fmt::Display for ConnectedGrantError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Paused => f.write_str("networking is paused"),
+            Self::Closing => f.write_str("the connection is closing"),
+            Self::Refused(why) => f.write_str(why),
+            Self::NotSaved(e) => write!(f, "the grant is in effect but saving it failed ({e})"),
+        }
+    }
 }
 
 impl std::fmt::Display for Refusal {
@@ -211,6 +325,10 @@ struct Inner<F: CodeExchangeFactory> {
     /// The admission fence ([`Host::set_fence`]): nothing new is admitted,
     /// enrolled or re-paired until it is cleared.
     paused: bool,
+    /// Grants whose role edit was saved with an unknown outcome: neither
+    /// role is served (no connection is live under them) until the stored
+    /// table is read back or saved again.
+    suspended: HashSet<GrantId>,
     /// Pre-auth places held by connections that are not live yet.
     slots: HashMap<ConnectionId, PreAuthSlot>,
     /// The listener kind of every registered connection.
@@ -276,6 +394,16 @@ where
         self.send(conn, Cmd::Close(code));
     }
 
+    /// Ask each of `conns`, closed already, to answer once nothing queued
+    /// before the close can still leave ([`Cmd::Fence`]).
+    fn fence_conns(&self, conns: &[ConnectionId], fences: &mut Vec<oneshot::Receiver<()>>) {
+        for conn in conns {
+            let (tx, rx) = oneshot::channel();
+            self.send(*conn, Cmd::Fence(tx));
+            fences.push(rx);
+        }
+    }
+
     /// Save the grant table. On failure the change stays in effect in
     /// memory, the host reports [`HostEvent::StoreFailed`] and retries.
     fn persist(&mut self) -> Result<(), NetError> {
@@ -287,6 +415,8 @@ where
             Ok(()) => {
                 self.unsaved = false;
                 self.reconcile = false;
+                // The table in memory is the one on disk now.
+                self.settle_roles();
                 Ok(())
             }
             Err(e) => {
@@ -301,6 +431,75 @@ where
     /// to be saved away.
     fn serving(&self) -> bool {
         !self.reconcile
+    }
+
+    /// Serve the suspended grants again: the table in memory is known to
+    /// be the stored one. Each gets [`HostEvent::RoleChanged`] with the
+    /// role it is served under from now on.
+    fn settle_roles(&mut self) {
+        if self.suspended.is_empty() {
+            return;
+        }
+        for id in std::mem::take(&mut self.suspended) {
+            if let Some(g) = self.grants.get(id) {
+                let _ = self.events.send(HostEvent::RoleChanged {
+                    grant: id,
+                    role: g.role.clone(),
+                    revision: g.revision,
+                });
+            }
+        }
+        self.grants_gen.send_modify(|g| *g += 1);
+    }
+
+    /// For suspended grants: read the stored table back. Where it holds
+    /// what is in memory, the edit is on disk (a load makes it durable
+    /// first), and the grants are served again. Run by the ticker.
+    fn reread_suspended(&mut self) {
+        if self.suspended.is_empty() {
+            return;
+        }
+        let Some(store) = &self.store else {
+            self.settle_roles();
+            return;
+        };
+        let Ok(stored) = store.load() else {
+            return;
+        };
+        let same = self
+            .suspended
+            .iter()
+            .all(|id| match (stored.get(*id), self.grants.get(*id)) {
+                (Some(s), Some(m)) => s.role == m.role && s.revision == m.revision,
+                (None, None) => true,
+                _ => false,
+            });
+        if same {
+            self.settle_roles();
+        }
+    }
+
+    /// Whether `grant` waits for its role edit to settle.
+    fn is_suspended(&self, grant: GrantId) -> bool {
+        self.suspended.contains(&grant)
+    }
+
+    /// The grant `conn` is live under at `now`, if it is served
+    /// ([`Host::grant_of`]).
+    fn grant_of(&self, conn: ConnectionId, now: UnixTime) -> Option<&Grant> {
+        let Some(GateState::Live { grant }) = self.gates.get(&conn).map(|g| g.state()) else {
+            return None;
+        };
+        // Must-fail control (tests only): the gate alone decides.
+        if cfg!(mousse_control = "grant-served-while-not-serving") {
+            return (!self.is_suspended(*grant))
+                .then(|| self.grants.get(*grant))
+                .flatten();
+        }
+        let held = self.grants.get(*grant)?;
+        self.grants
+            .live_grant(&held.identity, now)
+            .filter(|g| g.id == *grant && self.serving() && !self.is_suspended(g.id))
     }
 
     /// Whether the admission fence stops connections of `kind`.
@@ -334,6 +533,10 @@ where
         else {
             return false;
         };
+        if self.is_suspended(grant) {
+            self.close_conn(conn, ErrorCode::InternalError);
+            return false;
+        }
         let live = self
             .grants
             .get(grant)
@@ -394,6 +597,7 @@ where
                     conn,
                     grant,
                     identity,
+                    ..
                 } => Some((
                     *conn,
                     PendingEnrollment {
@@ -434,11 +638,13 @@ where
                         conn,
                         grant,
                         identity,
+                        role,
                     } => {
                         let _ = self.events.send(HostEvent::Enrolled {
                             invitation,
                             grant,
                             identity,
+                            role,
                         });
                         Some(HostAction::Close {
                             conn,
@@ -568,6 +774,7 @@ where
                     conn,
                     grant,
                     identity,
+                    role,
                 } => {
                     // Already saved by `commit_enrollment`.
                     if let Some(gate) = self.gates.get_mut(&conn) {
@@ -580,6 +787,7 @@ where
                         invitation,
                         grant,
                         identity,
+                        role,
                     });
                 }
                 HostAction::InvitationEnded { invitation, reason } => {
@@ -642,6 +850,7 @@ where
                 unsaved: false,
                 reconcile: false,
                 paused: false,
+                suspended: HashSet::new(),
                 slots: HashMap::new(),
                 kinds: HashMap::new(),
                 events,
@@ -742,7 +951,11 @@ where
             // listener let it in. Control (tests only): the listener's
             // check at accept is the only one.
             let fenced = inner.fenced(kind) && !cfg!(mousse_control = "fence-at-accept-only");
-            if !inner.serving() || fenced {
+            // A grant whose role edit has not settled serves under neither
+            // role.
+            let suspended =
+                matches!(gate.state(), GateState::Live { grant } if inner.is_suspended(*grant));
+            if !inner.serving() || fenced || suspended {
                 gate.close(ErrorCode::InternalError);
             }
             // A live connection's place is free at once; any other holds
@@ -789,14 +1002,26 @@ where
     /// Create an invitation of `kind` with these route hints. In person,
     /// the owner confirms the device is next to them; a send link asks the
     /// joiner for the code the host shows ([`HostEvent::ShowCode`]).
+    /// The device is granted the owner role.
     pub fn invite(
         &self,
         kind: InvitationKind,
         routes: Vec<String>,
     ) -> Result<CreatedInvitation, NetError> {
+        self.invite_as(kind, routes, Role::owner())
+    }
+
+    /// [`Host::invite`], granting `role`. An in-person answer may choose
+    /// another role for its device ([`Host::approve_as`]).
+    pub fn invite_as(
+        &self,
+        kind: InvitationKind,
+        routes: Vec<String>,
+        role: Role,
+    ) -> Result<CreatedInvitation, NetError> {
         let params = InvitationParams {
             kind,
-            role: Role::owner(),
+            role,
             authorizing_owner: self.shared.owner,
             routes,
             grant_expires_at: None,
@@ -820,8 +1045,18 @@ where
         lock(&self.shared).pairing.status(invitation)
     }
 
-    /// The owner said yes.
+    /// The owner said yes. The device gets the invitation's role.
     pub fn approve(&self, request: &ApprovalRequest) -> Result<(), NetError> {
+        self.approve_as(request, None)
+    }
+
+    /// The owner said yes and chose `role` for the device (`None`: the
+    /// invitation's role). The role goes to this enrollment only.
+    pub fn approve_as(
+        &self,
+        request: &ApprovalRequest,
+        role: Option<Role>,
+    ) -> Result<(), NetError> {
         let mut inner = lock(&self.shared);
         let inner = &mut *inner;
         // Under the same lock as the enrollment: a removal, denial or close
@@ -841,9 +1076,10 @@ where
         let before = inner.grants.clone();
         let actions = inner
             .pairing
-            .approve(
+            .approve_as(
                 &request.invitation,
                 request.conn,
+                role,
                 &mut inner.grants,
                 self.shared.clock.now(),
             )
@@ -873,19 +1109,106 @@ where
         self.shared.streams.clone()
     }
 
-    /// The grant `conn` is live under, if it is live.
+    /// The grant `conn` is live under, if it is live, not expired and
+    /// served: the host serves grants (no enrollment waits for a save to
+    /// settle) and this one is not waiting for a role edit to settle.
     pub fn grant_of(&self, conn: ConnectionId) -> Option<Grant> {
-        let inner = lock(&self.shared);
-        match inner.gates.get(&conn).map(|g| g.state()) {
-            Some(GateState::Live { grant }) => inner.grants.get(*grant).cloned(),
-            _ => None,
-        }
+        let now = self.shared.clock.now();
+        lock(&self.shared).grant_of(conn, now).cloned()
     }
 
-    /// The live grant `identity` holds on this endpoint, if any.
+    /// Grant `identity`, the authenticated peer of `conn`, access to this
+    /// computer with `role`, for `grant.add_connected`. Returns the grant
+    /// and whether it existed; an existing grant is returned as it is,
+    /// never widened or narrowed.
+    ///
+    /// Under the host's lock: refused while networking is paused; the
+    /// grant is committed under a [`crate::LivePermit`] of `conn`, so never
+    /// on a connection that started to close; an inbound connection is
+    /// answered with the grant it is live under, if this computer still
+    /// serves it. The table is saved before success is returned, also when
+    /// the grant existed and an earlier save failed.
+    pub fn add_grant_connected(
+        &self,
+        conn: &Connection,
+        inbound: bool,
+        identity: IdentityPublicKey,
+        name: String,
+        role: Role,
+    ) -> Result<(Grant, bool), ConnectedGrantError> {
+        let now = self.shared.clock.now();
+        let mut inner = lock(&self.shared);
+        // Must-fail controls (tests only): the commit ignores the pause,
+        // the connection's liveness, or an earlier failed save.
+        if inner.paused && !cfg!(mousse_control = "connected-grant-while-paused") {
+            return Err(ConnectedGrantError::Paused);
+        }
+        let any_conn = cfg!(mousse_control = "grant-from-stale-connection");
+        let permit = conn.live_permit();
+        if permit.is_none() && !any_conn {
+            return Err(ConnectedGrantError::Closing);
+        }
+        let existing = if inbound {
+            // Live only under a grant of this computer: that grant is the
+            // answer, and no grant means the connection is ending.
+            match inner.grant_of(conn.id(), now) {
+                Some(grant) if grant.identity == identity => Some(grant.clone()),
+                _ if !any_conn => return Err(ConnectedGrantError::Closing),
+                _ => None,
+            }
+        } else {
+            inner.grants.live_grant(&identity, now).cloned()
+        };
+        if let Some(grant) = existing {
+            drop(permit);
+            if inner.unsaved && !cfg!(mousse_control = "connected-grant-answers-unsaved") {
+                inner.persist().map_err(ConnectedGrantError::NotSaved)?;
+            }
+            return Ok((grant, true));
+        }
+        let new = NewGrant {
+            identity,
+            name,
+            role,
+            authorizing_owner: self.shared.owner,
+            expires_at: None,
+            enrolled_by: None,
+        };
+        let (id, events) = inner
+            .grants
+            .add(new, now)
+            .map_err(|e| ConnectedGrantError::Refused(e.to_string()))?;
+        inner.apply_grant_events(events);
+        // The grant is in effect: the connection may close from here on.
+        drop(permit);
+        let grant = inner
+            .grants
+            .get(id)
+            .cloned()
+            .ok_or_else(|| ConnectedGrantError::Refused("the new grant is missing".into()))?;
+        inner.persist().map_err(ConnectedGrantError::NotSaved)?;
+        Ok((grant, false))
+    }
+
+    /// The live grant `identity` holds on this endpoint, if any and if it
+    /// is served: the host serves grants (no enrollment waits for a save
+    /// to settle) and this one is not waiting for a role edit to settle.
     pub fn live_grant(&self, identity: &IdentityPublicKey) -> Option<Grant> {
         let now = self.shared.clock.now();
-        lock(&self.shared).grants.live_grant(identity, now).cloned()
+        let inner = lock(&self.shared);
+        let serving = inner.serving() || cfg!(mousse_control = "grant-served-while-not-serving");
+        inner
+            .grants
+            .live_grant(identity, now)
+            .filter(|g| serving && !inner.is_suspended(g.id))
+            .cloned()
+    }
+
+    /// Whether `grant` waits for its last role edit to settle (a save
+    /// whose outcome is unknown): it exists, and is served under neither
+    /// role until the stored table is read back or saved again.
+    pub fn is_suspended(&self, grant: GrantId) -> bool {
+        lock(&self.shared).is_suspended(grant)
     }
 
     /// All grants.
@@ -924,6 +1247,20 @@ where
         if !inner.serving() {
             return Err("networking is paused".into());
         }
+        // A signer whose grant waits for its role edit to settle holds no
+        // served owner grant: refused like one without a grant, before the
+        // journal is looked at.
+        let signer = signed.removal().signer;
+        if inner
+            .grants
+            .live_grant(&signer, now)
+            .is_some_and(|g| inner.is_suspended(g.id))
+        {
+            return Ok(AppliedRemoval {
+                decision: Decision::Refuse,
+                saved: Ok(()),
+            });
+        }
         let decision = removal::decide(
             signed,
             &self.identity(),
@@ -944,6 +1281,11 @@ where
             let events = inner.grants.remove(grant);
             inner.apply_grant_events(events);
             saved = inner.persist();
+            if saved.is_err() {
+                // The caller pauses networking; the fence goes up under
+                // this lock already, so no role edit commits between.
+                inner.set_fence(true);
+            }
         }
         Ok(AppliedRemoval { decision, saved })
     }
@@ -1020,6 +1362,19 @@ where
         name: String,
         receipt: Option<InvitationId>,
     ) -> Result<(Grant, bool), NetError> {
+        self.add_grant_as(identity, name, receipt, None)
+    }
+
+    /// [`Host::add_grant`] with the role of a new grant (`None`: owner, as
+    /// [`Host::add_grant`]). An existing live grant is returned as it is,
+    /// with its own role: it is never widened or narrowed here.
+    pub fn add_grant_as(
+        &self,
+        identity: IdentityPublicKey,
+        name: String,
+        receipt: Option<InvitationId>,
+        role: Option<Role>,
+    ) -> Result<(Grant, bool), NetError> {
         let now = self.shared.clock.now();
         let mut inner = lock(&self.shared);
         if let Some(grant) = inner.grants.live_grant(&identity, now).cloned() {
@@ -1031,7 +1386,7 @@ where
         let new = NewGrant {
             identity,
             name,
-            role: Role::owner(),
+            role: role.unwrap_or_else(Role::owner),
             authorizing_owner: self.shared.owner,
             expires_at: None,
             enrolled_by: receipt,
@@ -1048,6 +1403,150 @@ where
             .ok_or_else(|| NetError::Refused("the new grant is missing".into()))?;
         inner.persist()?;
         Ok((grant, false))
+    }
+
+    /// Change the role of grant `grant` in place, if its revision is still
+    /// `expected_revision`. Returns the grant as it is now and whether it
+    /// changed; the same role at the current revision changes nothing.
+    ///
+    /// The check, the save and admission run under one lock. The edit is
+    /// saved before it takes effect: only after the save works are the
+    /// grant's connections closed with `CANCELLED`
+    /// ([`HostEvent::ChannelsClosed`]) and [`HostEvent::RoleChanged`]
+    /// sent. A save that failed with the old table in place changes
+    /// nothing. A save whose outcome is unknown keeps the edit in memory,
+    /// closes the grant's connections and serves the grant under neither
+    /// role until the stored table is read back or saved again; the caller
+    /// is told [`RoleEditError::Unsettled`], never that the edit is done.
+    /// A grant waiting so is saved again first on the next edit.
+    ///
+    /// Before it returns, every connection the edit closed has dropped
+    /// what was queued on it: nothing queued under the old role (a
+    /// `mousse-grants` list, say) is sent after the caller hears the
+    /// result. While the admission fence is set (a removal failed to
+    /// save) nothing is edited: [`RoleEditError::Paused`].
+    pub async fn set_role(
+        &self,
+        grant: GrantId,
+        expected_revision: u64,
+        role: Role,
+    ) -> Result<(Grant, bool), RoleEditError> {
+        self.edit_role(grant, expected_revision, role)
+            .finish()
+            .await
+    }
+
+    /// [`Host::set_role`] in two steps, for a caller that cuts paths of its
+    /// own between them: this one commits (or not) and closes the
+    /// connections, [`RoleEditing::finish`] waits for their fences and
+    /// gives the result. [`RoleEditing::outcome`] reads it before.
+    pub fn edit_role(&self, grant: GrantId, expected_revision: u64, role: Role) -> RoleEditing {
+        let mut fences = Vec::new();
+        let result = self.set_role_locked(grant, expected_revision, role, &mut fences);
+        RoleEditing {
+            result,
+            fences,
+            events: lock(&self.shared).events.clone(),
+        }
+    }
+
+    /// [`Host::set_role`] under the lock. `fences` gets one receiver per
+    /// connection closed; [`HostEvent::RoleChanged`] comes back to send
+    /// once they are answered.
+    #[allow(clippy::type_complexity)]
+    fn set_role_locked(
+        &self,
+        grant: GrantId,
+        expected_revision: u64,
+        role: Role,
+        fences: &mut Vec<oneshot::Receiver<()>>,
+    ) -> Result<(Grant, bool, Option<HostEvent>), RoleEditError> {
+        let now = self.shared.clock.now();
+        let mut guard = lock(&self.shared);
+        let inner = &mut *guard;
+        if !inner.serving() {
+            return Err(RoleEditError::NotServing);
+        }
+        // Must-fail control (tests only): an edit commits while a removal
+        // that failed to save holds networking paused.
+        if inner.paused && !cfg!(mousse_control = "role-edit-while-paused") {
+            return Err(RoleEditError::Paused);
+        }
+        if inner.is_suspended(grant) {
+            // Nothing is acknowledged about this grant until its last edit
+            // is known to be on disk.
+            inner.persist().map_err(RoleEditError::Unsettled)?;
+        }
+        let mut table = inner.grants.clone();
+        let edit = table
+            .set_role(grant, expected_revision, role, now)
+            .map_err(|e| match e {
+                GrantError::UnknownGrant => RoleEditError::NoGrant,
+                GrantError::RevisionConflict => RoleEditError::RevisionConflict,
+                other => RoleEditError::Refused(other.to_string()),
+            })?;
+        let current = |table: &GrantTable| table.get(grant).cloned().ok_or(RoleEditError::NoGrant);
+        if !edit.changed {
+            return Ok((current(&inner.grants)?, false, None));
+        }
+        let events = edit.events;
+        let saved = match &inner.store {
+            Some(store) => store.save_checked(&table),
+            None => Ok(()),
+        };
+        let closed: Vec<ConnectionId> = events
+            .iter()
+            .flat_map(|GrantEvent::CloseChannels { channels, .. }| channels.iter().copied())
+            .collect();
+        match saved {
+            Ok(()) => {
+                inner.grants = table;
+                inner.unsaved = false;
+                inner.apply_grant_events(events);
+                inner.fence_conns(&closed, fences);
+                inner.grants_gen.send_modify(|g| *g += 1);
+                // The whole table is on disk: earlier unsettled edits too.
+                inner.settle_roles();
+                let event = HostEvent::RoleChanged {
+                    grant,
+                    role: edit.role,
+                    revision: edit.revision,
+                };
+                Ok((current(&inner.grants)?, true, Some(event)))
+            }
+            Err(failure) if !failure.in_place => {
+                let _ = inner
+                    .events
+                    .send(HostEvent::StoreFailed(failure.error.to_string()));
+                Err(RoleEditError::NotSaved(failure.error))
+            }
+            Err(failure) => {
+                // The new table may be on disk, or not: a restart could
+                // come back with either role, so neither is served.
+                let _ = inner
+                    .events
+                    .send(HostEvent::StoreFailed(failure.error.to_string()));
+                inner.grants = table;
+                inner.unsaved = true;
+                inner.suspended.insert(grant);
+                inner.apply_grant_events(events);
+                let bound: Vec<ConnectionId> = inner
+                    .gates
+                    .iter()
+                    .filter(
+                        |(_, g)| matches!(g.state(), GateState::Live { grant: b } if *b == grant),
+                    )
+                    .map(|(c, _)| *c)
+                    .collect();
+                for conn in &bound {
+                    inner.close_conn(*conn, ErrorCode::InternalError);
+                }
+                inner.fence_conns(&closed, fences);
+                inner.fence_conns(&bound, fences);
+                inner.grants_gen.send_modify(|g| *g += 1);
+                Err(RoleEditError::Unsettled(failure.error))
+            }
+        }
     }
 
     /// Save the grant table now. A failure is reported as
@@ -1140,6 +1639,7 @@ async fn ticker<F: CodeExchangeFactory>(shared: Weak<Shared<F>>) {
         let mono = shared.clock.mono();
         let mut inner = lock(&shared);
         inner.expire_grants(now);
+        inner.reread_suspended();
         let actions = inner.pairing.tick(now);
         inner.apply(actions);
         let overdue: Vec<(ConnectionId, ErrorCode)> = inner
@@ -1467,6 +1967,19 @@ mod tests {
         }
     }
 
+    /// Once the grant expired, the connection it is live under reads no
+    /// grant, though nothing swept the gate yet (the ticker is stopped): a
+    /// stream accepted just before the expiry is not served after it.
+    #[tokio::test]
+    async fn an_expired_grant_is_not_the_grant_of_its_connection() {
+        let live = live().await;
+        let grant = live.host.grant_of(live.hosted.id());
+        assert!(grant.is_some());
+        live.expire_without_the_ticker();
+        assert_eq!(live.host.grant_of(live.hosted.id()), None);
+        assert!(live.host.live_grant(&grant.unwrap().identity).is_none());
+    }
+
     #[tokio::test]
     async fn a_stream_after_the_grant_expired_is_refused_without_the_ticker() {
         let live = live().await;
@@ -1742,6 +2255,10 @@ mod tests {
         );
         assert!(granted(&host, &identity));
         assert!(!lock(&host.shared).serving());
+        // Nothing is served meanwhile: no grant reads as live, for a
+        // stream on a connection of this computer's own either.
+        assert!(host.live_grant(&other.identity()).is_none());
+        assert!(host.live_grant(&identity).is_none());
         let (a, b) = tokio::io::duplex(1 << 16);
         let (hosted, _dialled) = tokio::join!(host.accept(a), other.dial(b, host.identity()));
         assert_eq!(
@@ -1757,6 +2274,7 @@ mod tests {
         })
         .await;
         assert!(lock(&host.shared).serving());
+        assert!(host.live_grant(&other.identity()).is_some());
         let (a, b) = tokio::io::duplex(1 << 16);
         let (hosted, dialled) = tokio::join!(host.accept(a), other.dial(b, host.identity()));
         let (hosted, dialled) = (hosted.unwrap(), dialled.unwrap());
@@ -1865,5 +2383,446 @@ mod tests {
         assert!(result.is_err());
         assert!(host.shared.after_pairing_check.lock().unwrap().is_none());
         assert!(!granted(&host, &caller.identity()));
+    }
+
+    fn role(name: &str) -> Role {
+        Role::new(name).unwrap()
+    }
+
+    /// The role and revision `identity`'s grant has in `host`.
+    fn role_of(host: &Host, identity: &IdentityPublicKey) -> Option<(String, u64)> {
+        host.grants()
+            .into_iter()
+            .find(|g| g.identity == *identity)
+            .map(|g| (g.role.as_str().to_owned(), g.revision))
+    }
+
+    /// A caller granted in `host` (saved) and connected live to it.
+    async fn connected(host: &Host) -> (Caller, GrantId, Connection, Connection) {
+        let caller = new_caller();
+        let id = grant(host, caller.identity());
+        lock(&host.shared).persist().unwrap();
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let (hosted, dialled) = tokio::join!(host.accept(a), caller.dial(b, host.identity()));
+        (caller, id, hosted.unwrap(), dialled.unwrap())
+    }
+
+    /// The next event that is not about approvals, codes or closed
+    /// channels.
+    async fn next_role_event(events: &mut mpsc::UnboundedReceiver<HostEvent>) -> HostEvent {
+        loop {
+            match within("host event", events.recv()).await {
+                Some(e @ (HostEvent::RoleChanged { .. } | HostEvent::Enrolled { .. })) => return e,
+                Some(_) => continue,
+                None => panic!("host events ended"),
+            }
+        }
+    }
+
+    /// In person, the owner's answer chooses the role: the grant, the
+    /// `PAIRED` the device gets and the enrollment event all carry it, not
+    /// the invitation's.
+    #[tokio::test]
+    async fn an_in_person_answer_chooses_the_role_of_its_grant() {
+        let (host, mut events) = host_in(None);
+        let caller = new_caller();
+        let created = host
+            .invite_as(
+                InvitationKind::InPerson,
+                vec!["tcp://127.0.0.1:1".into()],
+                role("client"),
+            )
+            .unwrap();
+        let ticket = Ticket::from_fragment(&created.fragment).unwrap();
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let accepting = host.clone();
+        let accept = tokio::spawn(async move { accepting.accept(a).await });
+        let join = caller.join(b, &ticket, Arrival::InAppScan, "laptop");
+        tokio::pin!(join);
+        let request = tokio::select! {
+            request = next_request(&mut events) => request,
+            _ = &mut join => panic!("the join ended before the owner was asked"),
+        };
+        host.approve_as(&request, Some(role("member"))).unwrap();
+        let (_conn, outcome) = within("join", join).await.unwrap();
+        accept.abort();
+        match outcome {
+            crate::caller::JoinOutcome::Paired(paired) => {
+                assert_eq!(paired.role.as_str(), "member")
+            }
+            other => panic!("not paired: {other:?}"),
+        }
+        assert_eq!(
+            role_of(&host, &caller.identity()),
+            Some(("member".into(), 1))
+        );
+        match next_role_event(&mut events).await {
+            HostEvent::Enrolled { role, .. } => assert_eq!(role.as_str(), "member"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// `grant.add` with a role makes a grant with it; an existing grant is
+    /// returned with its own role, never widened.
+    #[tokio::test]
+    async fn adding_a_grant_takes_its_role_and_never_changes_an_existing_one() {
+        let (host, _events) = host_in(None);
+        let device = SoftwareKey::generate(&mut os_rng()).public_key();
+        let (made, already) = host
+            .add_grant_as(device, "phone".into(), None, Some(role("viewer")))
+            .unwrap();
+        assert!(!already);
+        assert_eq!(made.role.as_str(), "viewer");
+        let (again, already) = host
+            .add_grant_as(device, "phone".into(), None, Some(Role::owner()))
+            .unwrap();
+        assert!(already);
+        assert_eq!((again.id, again.role.as_str()), (made.id, "viewer"));
+        let (plain, _) = host.add_grant(device, "phone".into(), None).unwrap();
+        assert_eq!(plain.role.as_str(), "viewer");
+    }
+
+    /// A role edit is saved, then takes effect in place: same grant id,
+    /// revision 2, its connection closed with `CANCELLED` (not
+    /// `GRANT_REVOKED`), and a restart keeps it.
+    #[tokio::test]
+    async fn a_role_edit_is_saved_kept_in_place_and_closes_with_cancelled() {
+        let dir = fresh_dir("role-edit");
+        let (host, mut events) = host_in(Some(dir.clone()));
+        let (caller, id, hosted, dialled) = connected(&host).await;
+        let (now, changed) = host.set_role(id, 1, role("viewer")).await.unwrap();
+        assert!(changed);
+        assert_eq!((now.id, now.role.as_str(), now.revision), (id, "viewer", 2));
+        assert_eq!(
+            within("closed", dialled.closed()).await,
+            CloseReason::Peer(ErrorCode::Cancelled)
+        );
+        drop(hosted);
+        assert_eq!(
+            next_role_event(&mut events).await,
+            HostEvent::RoleChanged {
+                grant: id,
+                role: role("viewer"),
+                revision: 2
+            }
+        );
+        drop(host);
+        let (host, _events) = host_in(Some(dir.clone()));
+        assert_eq!(
+            role_of(&host, &caller.identity()),
+            Some(("viewer".into(), 2))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stale revision changes nothing and closes nothing; the same role
+    /// at the current revision is no change.
+    #[tokio::test]
+    async fn a_stale_role_edit_changes_nothing() {
+        let (host, _events) = host_in(None);
+        let (caller, id, _hosted, dialled) = connected(&host).await;
+        assert!(host.set_role(id, 1, role("viewer")).await.unwrap().1);
+        assert!(matches!(
+            host.set_role(id, 1, Role::owner()).await,
+            Err(RoleEditError::RevisionConflict)
+        ));
+        assert_eq!(
+            role_of(&host, &caller.identity()),
+            Some(("viewer".into(), 2))
+        );
+        let (now, changed) = host.set_role(id, 2, role("viewer")).await.unwrap();
+        assert!(!changed);
+        assert_eq!(now.revision, 2);
+        assert!(matches!(
+            host.set_role(GrantId(999), 1, role("viewer")).await,
+            Err(RoleEditError::NoGrant)
+        ));
+        drop(dialled);
+    }
+
+    /// The save fails with the old table in place: nothing changes, in
+    /// memory, on disk or on the wire.
+    #[tokio::test]
+    async fn a_role_edit_whose_save_failed_changes_nothing() {
+        use crate::private::faults::{plan_replaces, Fault};
+        let dir = fresh_dir("role-not-saved");
+        let (host, _events) = host_in(Some(dir.clone()));
+        let (caller, id, hosted, dialled) = connected(&host).await;
+        plan_replaces(GrantStore::in_dir(&dir).path(), &[Fault::BeforeRename]);
+        assert!(matches!(
+            host.set_role(id, 1, role("viewer")).await,
+            Err(RoleEditError::NotSaved(_))
+        ));
+        assert_eq!(
+            role_of(&host, &caller.identity()),
+            Some(("owner".into(), 1))
+        );
+        let stream = dialled
+            .open_stream(PriorityClass::Interactive, "terminal")
+            .await
+            .unwrap();
+        stream.writer.write(b"still").await.unwrap();
+        assert!(within("still served", hosted.accept_stream())
+            .await
+            .is_some());
+        drop(host);
+        let (host, _events) = host_in(Some(dir.clone()));
+        assert_eq!(
+            role_of(&host, &caller.identity()),
+            Some(("owner".into(), 1))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The save's outcome is unknown (the rename landed, its sync failed):
+    /// the edit is not acknowledged, the grant is served under neither role
+    /// (its connection closes, a new one is refused, it has no served
+    /// grant) until the stored table is read back, and then under the
+    /// stored role.
+    #[tokio::test]
+    async fn a_role_edit_with_an_unknown_outcome_serves_neither_role_until_read_back() {
+        use crate::private::faults::{plan_replaces, Fault};
+        let dir = fresh_dir("role-unsettled");
+        let (host, mut events) = host_in(Some(dir.clone()));
+        host.shared.ticker_paused.store(true, Ordering::SeqCst);
+        let (caller, id, _hosted, dialled) = connected(&host).await;
+        plan_replaces(GrantStore::in_dir(&dir).path(), &[Fault::AfterRename]);
+        assert!(matches!(
+            host.set_role(id, 1, role("viewer")).await,
+            Err(RoleEditError::Unsettled(_))
+        ));
+        assert!(within("closed", dialled.closed()).await != CloseReason::PipeClosed);
+        assert!(host.live_grant(&caller.identity()).is_none());
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let (hosted, _dialled) = tokio::join!(host.accept(a), caller.dial(b, host.identity()));
+        let hosted = hosted.unwrap();
+        assert_eq!(host.grant_of(hosted.id()), None);
+        assert_eq!(
+            within("refused", hosted.closed()).await,
+            CloseReason::Local(ErrorCode::InternalError)
+        );
+
+        host.shared.ticker_paused.store(false, Ordering::SeqCst);
+        assert_eq!(
+            next_role_event(&mut events).await,
+            HostEvent::RoleChanged {
+                grant: id,
+                role: role("viewer"),
+                revision: 2
+            }
+        );
+        let served = host.live_grant(&caller.identity()).unwrap();
+        assert_eq!((served.role.as_str(), served.revision), ("viewer", 2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A removal signed by a device whose owner grant was narrowed is
+    /// refused: a fresh one, one signed before the edit, and a resend of a
+    /// journaled one, which is refused before the journal is looked at.
+    #[tokio::test]
+    async fn a_demoted_signer_cannot_remove() {
+        use mousse_net_core::removal::{Removal, RemovalId, RemovalResult};
+        let (host, _events) = host_in(None);
+        let admin = SoftwareKey::generate(&mut os_rng());
+        let admin_grant = grant(&host, admin.public_key());
+        let target = new_caller();
+        let target_grant = grant(&host, target.identity());
+        let signed = |id: u8| {
+            let record = Removal {
+                signer: admin.public_key(),
+                recipient: host.identity(),
+                removed: target.identity(),
+                grant: target_grant,
+                id: RemovalId([id; 16]),
+                issued_at: host.shared.clock.now(),
+            };
+            SignedRemoval::sign(record, &admin).unwrap()
+        };
+        let earlier = signed(1);
+        let journaled = Journaled {
+            record_hash: earlier.record_hash(),
+            result: RemovalResult::Applied,
+        };
+        assert!(
+            host.set_role(admin_grant, 1, role("member"))
+                .await
+                .unwrap()
+                .1
+        );
+        for (removal, known) in [
+            (signed(2), None),
+            (earlier.clone(), None),
+            (earlier, Some(journaled)),
+        ] {
+            let applied = host
+                .apply_removal(&removal, 3600, |_| known, |_| Ok(()))
+                .unwrap();
+            assert_eq!(applied.decision, Decision::Refuse);
+        }
+        assert!(granted(&host, &target.identity()));
+    }
+
+    /// A signer promoted to owner by an edit whose save's outcome is
+    /// unknown holds no served owner grant: its removal is refused although
+    /// the table in memory says owner.
+    #[tokio::test]
+    async fn a_signer_whose_promotion_has_not_settled_cannot_remove() {
+        use crate::private::faults::{plan_replaces, Fault};
+        use mousse_net_core::removal::{Removal, RemovalId};
+        let dir = fresh_dir("role-unsettled-signer");
+        let (host, _events) = host_in(Some(dir.clone()));
+        host.shared.ticker_paused.store(true, Ordering::SeqCst);
+        let admin = SoftwareKey::generate(&mut os_rng());
+        let (admin_grant, _) = host
+            .add_grant_as(
+                admin.public_key(),
+                "tablet".into(),
+                None,
+                Some(role("member")),
+            )
+            .unwrap();
+        let target = new_caller();
+        let target_grant = grant(&host, target.identity());
+        lock(&host.shared).persist().unwrap();
+        plan_replaces(GrantStore::in_dir(&dir).path(), &[Fault::AfterRename]);
+        assert!(matches!(
+            host.set_role(admin_grant.id, 1, Role::owner()).await,
+            Err(RoleEditError::Unsettled(_))
+        ));
+        assert_eq!(
+            role_of(&host, &admin.public_key()),
+            Some(("owner".into(), 2))
+        );
+        let record = Removal {
+            signer: admin.public_key(),
+            recipient: host.identity(),
+            removed: target.identity(),
+            grant: target_grant,
+            id: RemovalId([3; 16]),
+            issued_at: host.shared.clock.now(),
+        };
+        let removal = SignedRemoval::sign(record, &admin).unwrap();
+        let applied = host
+            .apply_removal(&removal, 3600, |_| None, |_| Ok(()))
+            .unwrap();
+        assert_eq!(applied.decision, Decision::Refuse);
+        assert!(granted(&host, &target.identity()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A signed removal whose save fails sets the admission fence under
+    /// the lock it saved under: a role edit after it is refused as paused,
+    /// before the caller pauses networking, and changes nothing.
+    #[tokio::test]
+    async fn a_role_edit_after_a_removal_failed_to_save_is_paused() {
+        use crate::private::faults::{plan_replaces, Fault};
+        use mousse_net_core::removal::{Removal, RemovalId, RemovalResult};
+        let dir = fresh_dir("role-edit-paused");
+        let (host, _events) = host_in(Some(dir.clone()));
+        host.shared.ticker_paused.store(true, Ordering::SeqCst);
+        let admin = SoftwareKey::generate(&mut os_rng());
+        host.add_grant_as(admin.public_key(), "tablet".into(), None, None)
+            .unwrap();
+        let target = new_caller();
+        let target_grant = grant(&host, target.identity());
+        let other = new_caller();
+        let other_grant = grant(&host, other.identity());
+        lock(&host.shared).persist().unwrap();
+        let record = Removal {
+            signer: admin.public_key(),
+            recipient: host.identity(),
+            removed: target.identity(),
+            grant: target_grant,
+            id: RemovalId([4; 16]),
+            issued_at: host.shared.clock.now(),
+        };
+        let removal = SignedRemoval::sign(record, &admin).unwrap();
+        plan_replaces(GrantStore::in_dir(&dir).path(), &[Fault::BeforeRename]);
+        let applied = host
+            .apply_removal(&removal, 3600, |_| None, |_| Ok(()))
+            .unwrap();
+        assert_eq!(applied.decision.result(), RemovalResult::Applied);
+        assert!(applied.saved.is_err());
+        assert!(host.fence_set());
+        assert!(matches!(
+            host.set_role(other_grant, 1, role("viewer")).await,
+            Err(RoleEditError::Paused)
+        ));
+        assert_eq!(role_of(&host, &other.identity()), Some(("owner".into(), 1)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A grant for a connection's peer is refused while networking is
+    /// paused, checked under the lock a failed removal sets the fence
+    /// under; the connection stays live and nothing is granted.
+    #[tokio::test]
+    async fn a_connected_grant_is_refused_while_paused() {
+        let (host, _events) = host_in(None);
+        let (_caller, _id, hosted, _dialled) = connected(&host).await;
+        let other = new_caller();
+        host.set_fence(true);
+        assert!(matches!(
+            host.add_grant_connected(&hosted, false, other.identity(), "x".into(), role("viewer")),
+            Err(ConnectedGrantError::Paused)
+        ));
+        assert!(host.live_grant(&other.identity()).is_none());
+    }
+
+    /// The peer's `GOAWAY` makes its connection closing at once, before the
+    /// driver is done and while the gate still reads live: no grant is
+    /// committed on it, nor is the grant it is live under answered.
+    #[tokio::test]
+    async fn no_grant_is_made_or_answered_on_a_connection_the_peer_is_closing() {
+        let (host, _events) = host_in(None);
+        let (caller, _id, hosted, dialled) = connected(&host).await;
+        dialled.close(ErrorCode::NoError);
+        within("closing", async {
+            while !hosted.is_closing() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let other = new_caller();
+        assert!(matches!(
+            host.add_grant_connected(&hosted, false, other.identity(), "x".into(), role("viewer")),
+            Err(ConnectedGrantError::Closing)
+        ));
+        assert!(host.live_grant(&other.identity()).is_none());
+        assert!(matches!(
+            host.add_grant_connected(&hosted, true, caller.identity(), "x".into(), role("viewer")),
+            Err(ConnectedGrantError::Closing)
+        ));
+    }
+
+    /// The grant an inbound connection is live under is answered only once
+    /// the table is saved: after an earlier save failed, a failing save
+    /// answers `NotSaved`, and the next one saves what was pending.
+    #[tokio::test]
+    async fn an_existing_grant_is_answered_only_once_the_table_is_saved() {
+        use crate::private::faults::{plan_replaces, Fault};
+        let dir = fresh_dir("connected-unsaved");
+        let (host, _events) = host_in(Some(dir.clone()));
+        host.shared.ticker_paused.store(true, Ordering::SeqCst);
+        let (caller, id, hosted, _dialled) = connected(&host).await;
+        let store = GrantStore::in_dir(&dir);
+        let other = new_caller();
+        plan_replaces(store.path(), &[Fault::BeforeRename]);
+        assert!(host
+            .add_grant_as(other.identity(), "other".into(), None, None)
+            .is_err());
+        plan_replaces(store.path(), &[Fault::BeforeRename]);
+        assert!(matches!(
+            host.add_grant_connected(&hosted, true, caller.identity(), "x".into(), role("viewer")),
+            Err(ConnectedGrantError::NotSaved(_))
+        ));
+        let (grant, already) = host
+            .add_grant_connected(&hosted, true, caller.identity(), "x".into(), role("viewer"))
+            .unwrap();
+        assert_eq!((grant.id, already), (id, true));
+        let stored = store.load().unwrap();
+        assert!(stored
+            .live_grant(&other.identity(), host.shared.clock.now())
+            .is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

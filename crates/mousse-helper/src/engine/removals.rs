@@ -75,6 +75,16 @@ pub async fn serve_removal(engine: Arc<Engine>, stream: MuxStream) {
     }
 }
 
+/// Whether the caller of `conn` gets the grant list: its grant has role
+/// `owner`. Must-fail control (tests only): any granted caller does, so a
+/// demoted owner keeps getting it.
+fn gets_grant_list(engine: &Engine, conn: &Connection) -> bool {
+    if cfg!(mousse_control = "demoted-owner-keeps-grants") {
+        return engine.host.grant_of(conn.id()).is_some();
+    }
+    engine.is_owner_conn(conn)
+}
+
 /// Send this host's grant list on `mousse-grants` to the caller of the
 /// inbound connection `conn`, once `opened` says the caller has opened a
 /// stream, and again on every change, while the caller's grant has role
@@ -87,7 +97,7 @@ pub async fn publish_grants(
     if opened.wait_for(|o| *o).await.is_err() {
         return;
     }
-    if conn.minor().unwrap_or(0) < REMOVAL_MIN_MINOR || !engine.is_owner_conn(&conn) {
+    if conn.minor().unwrap_or(0) < REMOVAL_MIN_MINOR || !gets_grant_list(&engine, &conn) {
         return;
     }
     let mut changes = engine.host.grants_changed();
@@ -103,7 +113,12 @@ pub async fn publish_grants(
     let (_reader, writer) = stream.split();
     loop {
         changes.borrow_and_update();
-        let owner = conn.upgrade().is_some_and(|c| engine.is_owner_conn(&c));
+        // A demotion closes the connection with `CANCELLED` under the host
+        // lock (which drops what was queued on it), and the edit is
+        // answered only once nothing queued can leave, so a list written
+        // after this check passed cannot reach a demoted caller; a change
+        // seen here ends the stream.
+        let owner = conn.upgrade().is_some_and(|c| gets_grant_list(&engine, &c));
         if !owner {
             writer.reset(ErrorCode::Cancelled);
             return;

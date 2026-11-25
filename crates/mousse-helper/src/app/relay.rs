@@ -77,7 +77,8 @@ use mousse_net_io::rng::random_bytes;
 
 use crate::engine::stream as engine_stream;
 use mousse_net_io::store::{
-    hex, identity_from_hex, short_id, unhex, Approval, ApprovalStore, PeerStore,
+    hex, identity_from_hex, short_id, unhex, Approval, ApprovalStore, CompletionRecord,
+    CompletionRelay, CompletionStore, PeerStore, PeersLock,
 };
 use mousse_net_io::{ConnStatus, Connection, MuxStream, NetError};
 use serde_json::{json, Map, Value};
@@ -86,7 +87,7 @@ use tokio::task::AbortHandle;
 use zeroize::Zeroizing;
 
 use super::relay_store::{
-    fixed, Files, GrantKey, OldKey, OwnRelay, PeerRelay, PendingKey, Recovery,
+    fixed, Files, GrantKey, OldKey, OwnRelay, PeerRelay, PeersFile, PendingKey, Recovery,
 };
 
 /// Hosted relays from Plus (Phase 4).
@@ -244,7 +245,7 @@ fn dial_within() -> Duration {
 /// route only public or tailnet (§B.11), so a host's ticket or manifest
 /// cannot point its callers at their LAN. Debug builds also take loopback,
 /// for tests on one computer.
-fn relay_class_ok(class: AddrClass, own: bool, loopback: bool) -> bool {
+pub(super) fn relay_class_ok(class: AddrClass, own: bool, loopback: bool) -> bool {
     match class {
         AddrClass::Forbidden => false,
         AddrClass::Public | AddrClass::Tailnet => true,
@@ -360,6 +361,23 @@ fn add_approval(
         .map_err(|e| e.to_string())
 }
 
+/// `peer.relay.disallow`: drop the approval of `destination` for
+/// `identity`, and take it out of that host's link completion records, so
+/// no replay of one approves it again until the owner does. Under the
+/// peers lock. Whether there was an approval.
+fn disallow(shared: &Shared, identity: &str, destination: &str) -> Result<bool, String> {
+    let peers = PeerStore::in_dir(&shared.info.state_dir);
+    let held = peers.lock().map_err(|e| e.to_string())?;
+    CompletionStore::in_dir(&shared.info.state_dir)
+        .drop_destination(&held, identity, destination)
+        .map_err(|e| e.to_string())?;
+    ApprovalStore::in_dir(&shared.info.state_dir)
+        .update(&held, |list| {
+            list.retain(|a| !(a.identity == identity && a.destination == destination))
+        })
+        .map_err(|e| e.to_string())
+}
+
 /// Drop the approval of `destination` for `identity`; whether there was one.
 fn remove_approval(shared: &Shared, identity: &str, destination: &str) -> Result<bool, String> {
     let peers = PeerStore::in_dir(&shared.info.state_dir);
@@ -430,6 +448,7 @@ fn set_status(shared: &Shared, relay: &str, status: Status) {
 /// Start every own relay's registrations, then keep the allow-set and the
 /// manifest current. Runs for the life of the channel.
 pub async fn run(shared: Arc<Shared>) {
+    prune_keys(&shared);
     if shared.relay.seed().is_err() {
         return;
     }
@@ -881,9 +900,14 @@ fn recovery_allows(shared: &Shared, conn: &Connection) -> bool {
 /// Caller keys of live grants, oldest grant first, capped at 256; then the
 /// fingerprints past the cap (for the "limit 256" note).
 fn listed_callers(shared: &Shared) -> (Vec<(u64, [u8; 32])>, Vec<u64>) {
+    let keys = shared.relay.files.grants().unwrap_or_default().keys;
+    listed_callers_in(shared, &keys)
+}
+
+/// [`listed_callers`] with the caller keys given.
+fn listed_callers_in(shared: &Shared, keys: &[GrantKey]) -> (Vec<(u64, [u8; 32])>, Vec<u64>) {
     let mut grants = shared.host.grants();
     grants.sort_by_key(|g| g.id.0);
-    let keys = shared.relay.files.grants().unwrap_or_default().keys;
     let mut listed = Vec::new();
     let mut over = Vec::new();
     for g in grants {
@@ -930,25 +954,38 @@ fn compute_allow(shared: &Shared) -> AllowSet {
             expires_at: i.expires_at,
         })
         .collect();
-    if !cfg!(mousse_control = "no-pairing-recovery") {
-        let grants: HashSet<u64> = shared.host.grants().iter().map(|g| g.id.0).collect();
-        let keyed: HashSet<u64> = listed.iter().map(|(g, _)| *g).collect();
-        for r in shared.relay.files.grants().unwrap_or_default().recovery {
-            if r.expires_at > t && grants.contains(&r.grant) && !keyed.contains(&r.grant) {
-                if let Some(tag_hash) = fixed::<32>(&r.tag_hash) {
-                    invitations.push(InvitationEntry {
-                        tag_hash,
-                        expires_at: r.expires_at,
-                    });
-                }
-            }
-        }
-    }
+    let recovery = shared.relay.files.grants().unwrap_or_default().recovery;
+    invitations.extend(recovery_entries(shared, &recovery, &listed, t));
     invitations.truncate(ALLOW_INVITATIONS_MAX);
     AllowSet {
         callers: listed.into_iter().map(|(_, fp)| fp).collect(),
         invitations,
     }
+}
+
+/// The recovery entries the allow-set lists at `t`: unexpired, of a live
+/// grant that has no caller key listed yet (§B.7).
+fn recovery_entries(
+    shared: &Shared,
+    recovery: &[Recovery],
+    listed: &[(u64, [u8; 32])],
+    t: u64,
+) -> Vec<InvitationEntry> {
+    if cfg!(mousse_control = "no-pairing-recovery") {
+        return Vec::new();
+    }
+    let grants: HashSet<u64> = shared.host.grants().iter().map(|g| g.id.0).collect();
+    let keyed: HashSet<u64> = listed.iter().map(|(g, _)| *g).collect();
+    recovery
+        .iter()
+        .filter(|r| r.expires_at > t && grants.contains(&r.grant) && !keyed.contains(&r.grant))
+        .filter_map(|r| {
+            Some(InvitationEntry {
+                tag_hash: fixed::<32>(&r.tag_hash)?,
+                expires_at: r.expires_at,
+            })
+        })
+        .collect()
 }
 
 /// Push the allow-set to every own relay if it changed.
@@ -964,8 +1001,12 @@ pub fn refresh_allow(shared: &Shared) {
     });
 }
 
-/// Drop caller keys and recovery entries of grants that are gone.
+/// Drop caller keys and recovery entries of grants that are gone: after
+/// each removal, and at start, for a removal that a crash stopped before
+/// this ran. The grants are read under the lock a new key is saved under,
+/// so a key that arrives meanwhile stays.
 fn prune_keys(shared: &Shared) {
+    let _io = guard(&shared.relay.io);
     let live: HashSet<(u64, String)> = shared
         .host
         .grants()
@@ -973,7 +1014,6 @@ fn prune_keys(shared: &Shared) {
         .map(|g| (g.id.0, hex(g.identity.as_bytes())))
         .collect();
     let ids: HashSet<u64> = live.iter().map(|(g, _)| *g).collect();
-    let _io = guard(&shared.relay.io);
     let Ok(mut file) = shared.relay.files.grants() else {
         return;
     };
@@ -984,20 +1024,37 @@ fn prune_keys(shared: &Shared) {
     file.recovery
         .retain(|r| ids.contains(&r.grant) && r.expires_at > t);
     if before != (file.keys.len(), file.recovery.len()) {
-        let _ = shared.relay.files.save_grants(file);
+        if let Err(e) = shared.relay.files.save_grants(file) {
+            applog::line(format!("dropping relay keys of removed grants failed: {e}"));
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
 // Invitations
 
-/// The `relay://` hints of this computer's registered relays, for tickets.
+/// The `relay://` hints of this computer's registered relays, for tickets;
+/// none when `relays.json` cannot be read (the 1.1 invitation path).
 pub fn ticket_hints(shared: &Shared) -> Vec<String> {
-    let Ok(file) = shared.relay.files.relays() else {
-        return Vec::new();
-    };
+    own_relay_hints(shared).map(|o| o.hints).unwrap_or_default()
+}
+
+/// This computer's own relays as a way to offer (`docs/pairing-flow-design.md`
+/// §2 and §3).
+pub struct OwnRelayHints {
+    /// Relays set (`relay.enroll`), registered or not.
+    pub configured: usize,
+    /// The hints of the registered ones, in `relays.json` order.
+    pub hints: Vec<String>,
+}
+
+/// [`ticket_hints`], with how many relays are set, or why `relays.json`
+/// could not be read.
+pub fn own_relay_hints(shared: &Shared) -> Result<OwnRelayHints, String> {
+    let file = shared.relay.files.relays()?;
     let st = guard(&shared.relay.status);
-    file.relays
+    let hints = file
+        .relays
         .iter()
         .filter(|r| st.get(&r.relay).is_some_and(|s| s.state == "registered"))
         .filter_map(|r| {
@@ -1013,24 +1070,89 @@ pub fn ticket_hints(shared: &Shared) -> Vec<String> {
                 .to_hint(),
             )
         })
-        .collect()
+        .collect();
+    Ok(OwnRelayHints {
+        configured: file.relays.len(),
+        hints,
+    })
 }
 
-/// A new invitation whose ticket carries a relay hint: list its tag.
-pub fn on_invite(shared: &Shared, ticket: &Ticket) {
+/// Why a relay invitation was not made ([`invite_with_slot`]).
+pub enum SlotRefused {
+    /// Every allow-set invitation slot is held by an open invitation or a
+    /// recovery entry.
+    Full,
+    /// The relay state could not be read.
+    Store(String),
+    /// Making the invitation failed.
+    Create(NetError),
+}
+
+/// Allow-set invitation slots in use: open invitations that carry a relay
+/// hint, and recovery entries (§B.7), as [`compute_allow`] lists them
+/// before its cap.
+fn slots_in_use(shared: &Shared, open: &[OpenInvite]) -> Result<usize, String> {
+    let file = shared.relay.files.grants()?;
+    let (listed, _) = listed_callers_in(shared, &file.keys);
+    let t = now();
+    let invitations = open.iter().filter(|i| i.expires_at > t).count();
+    Ok(invitations + recovery_entries(shared, &file.recovery, &listed, t).len())
+}
+
+/// Whether an allow-set slot is free for a new relay invitation now.
+pub fn slot_free(shared: &Shared) -> Result<bool, String> {
+    let open = guard(&shared.relay.invites);
+    Ok(slots_in_use(shared, &open)? < ALLOW_INVITATIONS_MAX)
+}
+
+/// Make a relay invitation with `create` in a free allow-set slot. The
+/// check, the invitation and its listing happen under one lock, so two
+/// requests for the last slot cannot both get it, and a new invitation
+/// never displaces an open one or a recovery entry. Nothing is listed when
+/// `create` fails.
+pub fn invite_with_slot(
+    shared: &Shared,
+    create: impl FnOnce() -> Result<mousse_net_core::pairing::CreatedInvitation, NetError>,
+) -> Result<mousse_net_core::pairing::CreatedInvitation, SlotRefused> {
+    let mut open = guard(&shared.relay.invites);
+    let used = slots_in_use(shared, &open).map_err(SlotRefused::Store)?;
+    // Must-fail control: the new invitation takes a slot in use.
+    if used >= ALLOW_INVITATIONS_MAX && !cfg!(mousse_control = "relay-reservation-overbooks") {
+        return Err(SlotRefused::Full);
+    }
+    let created = create().map_err(SlotRefused::Create)?;
+    if let Some(entry) = open_invite(&created.ticket) {
+        open.push(entry);
+    }
+    drop(open);
+    refresh_allow(shared);
+    Ok(created)
+}
+
+/// The allow-set entry of a new invitation, if its ticket carries a relay
+/// hint.
+fn open_invite(ticket: &Ticket) -> Option<OpenInvite> {
     if !ticket
         .routes
         .iter()
         .any(|r| RelayRoute::parse_hint(r).is_some())
     {
-        return;
+        return None;
     }
     let tag = invitation_tag(&ticket.invitation, &ticket.secret);
-    guard(&shared.relay.invites).push(OpenInvite {
+    Some(OpenInvite {
         invitation: ticket.invitation,
         tag_hash: tag_hash(&tag),
         expires_at: ticket.expires_at.secs(),
-    });
+    })
+}
+
+/// A new invitation whose ticket carries a relay hint: list its tag.
+pub fn on_invite(shared: &Shared, ticket: &Ticket) {
+    let Some(entry) = open_invite(ticket) else {
+        return;
+    };
+    guard(&shared.relay.invites).push(entry);
     refresh_allow(shared);
 }
 
@@ -1212,6 +1334,7 @@ pub async fn serve_keys(shared: Arc<Shared>, conn: Arc<Connection>, stream: MuxS
         refuse(ErrorCode::RefusedStream, "no live grant on the connection");
         return;
     };
+    crate::peer::crash_point("keys-grant-read");
     let Ok(seed) = shared.relay.seed() else {
         refuse(ErrorCode::RefusedStream, "no relay seed");
         return;
@@ -1220,6 +1343,12 @@ pub async fn serve_keys(shared: Arc<Shared>, conn: Arc<Connection>, stream: MuxS
     let fp = caller_key.fingerprint();
     let salt = {
         let _io = guard(&shared.relay.io);
+        // The grant may have ended (or been replaced) since it was read; a
+        // key for it would erase the replacement's.
+        if shared.host.grant_of(conn.id()).map(|g| g.id) != Some(grant.id) {
+            refuse(ErrorCode::RefusedStream, "the grant ended meanwhile");
+            return;
+        }
         let mut file = match shared.relay.files.grants() {
             Ok(file) => file,
             Err(e) => {
@@ -1356,8 +1485,12 @@ pub async fn ensure_keys(shared: &Arc<Shared>, conn: &Connection) {
             short_id(&pin)
         ));
     };
-    let had = match peer_entry(shared, &pin) {
-        Ok(p) => open_secret(shared, &pin, SEALED_PAIR_SECRET, p.pair_secret.as_deref()),
+    // The newest pairing as the exchange starts: the secret is that one's.
+    let (had, pairing) = match peer_entry(shared, &pin) {
+        Ok(p) => (
+            open_secret(shared, &pin, SEALED_PAIR_SECRET, p.pair_secret.as_deref()),
+            p.pairing,
+        ),
         Err(e) => return failed(e),
     };
     let key = match caller_key(shared, &pin) {
@@ -1388,27 +1521,55 @@ pub async fn ensure_keys(shared: &Arc<Shared>, conn: &Connection) {
         Ok(Err(e)) => return failed(e),
         Err(_) => return failed("no answer in time".into()),
     };
+    crate::peer::crash_point("keys-answered");
     let Ok(secret) = decode_keys_answer(&answer) else {
         return failed("malformed answer".into());
     };
     let secret = Zeroizing::new(secret);
-    if had.is_some_and(|h| *h == *secret) {
-        return;
-    }
-    let sealed = match seal_secret(shared, &pin, SEALED_PAIR_SECRET, &secret) {
-        Ok(sealed) => sealed,
-        Err(e) => return failed(e),
+    let new = had.is_none_or(|h| *h != *secret);
+    let sealed = if new {
+        match seal_secret(shared, &pin, SEALED_PAIR_SECRET, &secret) {
+            Ok(sealed) => Some(sealed),
+            Err(e) => return failed(e),
+        }
+    } else {
+        None
     };
-    let stored = update_peer(shared, &pin, |p| {
-        p.pair_secret = Some(sealed);
-        p.join_tag = None;
-    });
-    if let Err(e) = &stored {
-        failed(e.clone());
-    }
-    if stored.is_ok() {
-        applog::line(format!("caller key enrolled with {}", short_id(&pin)));
-        shared.event(json!({"ev": "peer.keys", "identity": hex(pin.as_bytes())}));
+    // The secret is for `pairing`: a tag from it or before it is done
+    // with, one from a newer pairing stays until that one's keys come.
+    // A slow exchange of an older pairing never overwrites the secret a
+    // newer pairing already stored.
+    let stored = (|| -> Result<bool, String> {
+        peer_entry(shared, &pin)?;
+        let key = hex(pin.as_bytes());
+        let _io = guard(&shared.relay.io);
+        let mut file = shared.relay.files.peers()?;
+        let p = entry_mut(&mut file, &key);
+        let before = p.clone();
+        let current = pairing >= p.keys_pairing;
+        let wrote = match sealed {
+            Some(sealed) if current => {
+                p.pair_secret = Some(sealed);
+                true
+            }
+            _ => false,
+        };
+        p.keys_pairing = p.keys_pairing.max(pairing);
+        if p.tag_pairing <= p.keys_pairing {
+            p.join_tag = None;
+        }
+        if *p != before {
+            shared.relay.files.save_peers(file)?;
+        }
+        Ok(wrote)
+    })();
+    match stored {
+        Err(e) => failed(e),
+        Ok(true) => {
+            applog::line(format!("caller key enrolled with {}", short_id(&pin)));
+            shared.event(json!({"ev": "peer.keys", "identity": hex(pin.as_bytes())}));
+        }
+        Ok(false) => {}
     }
 }
 
@@ -1709,9 +1870,11 @@ pub fn candidates(shared: &Shared, pin: &IdentityPublicKey) -> Vec<Candidate> {
     fresh
 }
 
-/// Dial one relay route to `pin`: `CALL` with the caller key (or `JOIN`
-/// with the ticket's tag until the host answered `mousse-keys`), then the
-/// peer TLS pinned to the host.
+/// Dial one relay route to `pin`: `CALL` with the caller key, or, when the
+/// relay does not admit it and the ticket's tag is still current, `JOIN`
+/// with the tag; then the peer TLS pinned to the host. `CALL` comes first
+/// because the host may list the key before this device stored the pair
+/// secret, and then holds the tag no more.
 pub async fn dial_route(
     shared: &Shared,
     pin: &IdentityPublicKey,
@@ -1728,8 +1891,7 @@ pub async fn dial_route(
     let entry = peer_entry(shared, pin).map_err(NetError::Store)?;
     let key = caller_key(shared, pin).map_err(NetError::Store)?;
     let join_tag = entry
-        .pair_secret
-        .is_none()
+        .tag_is_current()
         .then(|| open_secret(shared, pin, SEALED_JOIN_TAG, entry.join_tag.as_deref()))
         .flatten();
     let addrs = resolve(shared.caller.addr_policy(), &route.endpoint, false).await?;
@@ -1738,11 +1900,16 @@ pub async fn dial_route(
     }
     let mut last = NetError::Relay(RelayError::Unreachable);
     for addr in addrs {
-        let pipe = match join_tag {
-            Some(ref tag) if class == Class::Interactive => {
+        let called = dial_call(&addr, route.relay, route.handle, &key, class, dial_within()).await;
+        let pipe = match (called, &join_tag) {
+            // A refusal the relay delays past our dial limit ends in a
+            // timeout, so that falls back to the tag too.
+            (Err(RelayError::Unreachable | RelayError::Timeout), Some(tag))
+                if class == Class::Interactive =>
+            {
                 dial_join(&addr, route.relay, route.handle, **tag, dial_within()).await
             }
-            _ => dial_call(&addr, route.relay, route.handle, &key, class, dial_within()).await,
+            (called, _) => called,
         };
         let pipe = match pipe {
             Ok(p) => p,
@@ -1852,45 +2019,307 @@ pub async fn dial_join_route(
     Err(last)
 }
 
-/// A join through `route` finished: keep the route, its approval and the
-/// tag (until the host answers `mousse-keys`).
-pub fn after_join(shared: &Shared, ticket: &Ticket, route: &RelayRoute, tag: [u8; 32]) {
-    let pin = ticket.host_identity;
-    let hint = route.to_hint();
-    let sealed = seal_secret(shared, &pin, SEALED_JOIN_TAG, &tag).ok();
-    let _ = update_peer(shared, &pin, |p| {
-        if !p.ticket_routes.contains(&hint) {
-            p.ticket_routes.push(hint.clone());
+/// The relay entry for the host `key` (hex) in `file`, made if missing.
+fn entry_mut<'f>(file: &'f mut PeersFile, key: &str) -> &'f mut PeerRelay {
+    let at = match file.peers.iter().position(|p| p.identity == key) {
+        Some(at) => at,
+        None => {
+            file.peers.push(PeerRelay {
+                identity: key.to_owned(),
+                salt: hex(&random_bytes::<16>()),
+                ..PeerRelay::default()
+            });
+            file.peers.len() - 1
         }
-        if p.pair_secret.is_none() {
-            p.join_tag = sealed;
-        }
-    });
-    let _ = add_approval(
-        shared,
-        &hex(pin.as_bytes()),
-        &route.endpoint.destination(),
-        "ticket",
-    );
+    };
+    &mut file.peers[at]
 }
 
-/// A ticket's relay hints the owner approved at Connect, kept with the
-/// host even when the join went another way.
-pub fn approve_ticket_routes(shared: &Shared, ticket: &Ticket, approved: &[String]) {
-    for (route, _) in join_candidates(ticket, approved) {
-        let hint = route.to_hint();
-        let _ = update_peer(shared, &ticket.host_identity, |p| {
-            if !p.ticket_routes.contains(&hint) {
-                p.ticket_routes.push(hint.clone());
+/// The ticket's invitation tag, sealed for this endpoint. A join tries a
+/// relay route only once it is sealed, so the way back through the relay
+/// can be stored (pairing-flow design §9).
+pub fn seal_join_tag(shared: &Shared, ticket: &Ticket) -> Result<String, String> {
+    let tag = invitation_tag(&ticket.invitation, &ticket.secret);
+    seal_secret(shared, &ticket.host_identity, SEALED_JOIN_TAG, &tag)
+}
+
+/// A join that made no completion record finished: an in-person join, or
+/// one that found this device paired already. The ticket's relay hints
+/// the owner approved, and their approvals, are kept with the host, even
+/// when the join went another way. A new pairing (`paired`) takes the
+/// next number on the host's relay entry, above its link records not
+/// replayed yet, so no older link record's tag replaces its own. When it went through a relay (`via`), the sealed tag
+/// is kept until the host answers `mousse-keys` for it, also when the pair
+/// secret stored is from an earlier pairing.
+pub fn after_join(
+    shared: &Shared,
+    ticket: &Ticket,
+    approved: &[String],
+    via: Option<&RelayRoute>,
+    sealed: Option<&str>,
+    paired: bool,
+) {
+    let key = hex(ticket.host_identity.as_bytes());
+    let candidates = join_candidates(ticket, approved);
+    let kept = (|| -> Result<(), String> {
+        let peers = PeerStore::in_dir(&shared.info.state_dir);
+        let held = peers.lock().map_err(|e| e.to_string())?;
+        // A link record not replayed yet may hold a number above the
+        // entry's, also one taken in this same second.
+        let recorded = if paired {
+            recorded_pairing(shared, &held, &key)
+                .map_err(|e| e.to_string())?
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        {
+            let _io = guard(&shared.relay.io);
+            let mut file = shared.relay.files.peers()?;
+            let p = entry_mut(&mut file, &key);
+            for (route, _) in &candidates {
+                let hint = route.to_hint();
+                if !p.ticket_routes.contains(&hint) {
+                    p.ticket_routes.push(hint);
+                }
             }
-        });
-        let _ = add_approval(
-            shared,
-            &hex(ticket.host_identity.as_bytes()),
-            &route.endpoint.destination(),
-            "ticket",
-        );
+            if paired {
+                p.pairing = p.pairing.max(recorded);
+                p.pairing = p.next_pairing(now());
+            }
+            if let (Some(_), Some(sealed)) = (via, sealed) {
+                if p.pair_secret.is_none() || p.pairing > p.keys_pairing {
+                    p.join_tag = Some(sealed.to_owned());
+                    p.tag_pairing = p.pairing;
+                }
+            }
+            shared.relay.files.save_peers(file)?;
+        }
+        let mut approvals: Vec<Approval> = Vec::new();
+        for (route, _) in &candidates {
+            let destination = route.endpoint.destination();
+            if !approvals.iter().any(|a| a.destination == destination) {
+                approvals.push(Approval {
+                    identity: key.clone(),
+                    destination,
+                    source: "ticket".into(),
+                    at: now(),
+                });
+            }
+        }
+        ApprovalStore::in_dir(&shared.info.state_dir)
+            .add(&held, &approvals)
+            .map_err(|e| e.to_string())
+    })();
+    if let Err(e) = kept {
+        applog::line(format!("keeping a ticket's relay routes failed: {e}"));
     }
+}
+
+/// What a "Send link" join keeps in its completion record for the
+/// ticket's relay routes the owner approved (pairing-flow design §9): the
+/// hints, their destinations and the ticket's tag, `sealed` for this
+/// endpoint ([`seal_join_tag`]). The pairing's number and the tag's
+/// expiry are filled in once it paired ([`prepare_completion`]). A join
+/// with no relay route approved gets one too, with no routes and no tag,
+/// so every link pairing takes a number: a newer pairing of any kind ends
+/// the tag of an older one whose record is not replayed yet.
+pub fn completion_relay(
+    ticket: &Ticket,
+    approved: &[String],
+    sealed: Option<&str>,
+) -> Option<CompletionRelay> {
+    // Must-fail control: the record holds no relay writes, which are made
+    // after it as before, so a crash between the two loses them.
+    if cfg!(mousse_control = "completion-omits-relay-admission") {
+        return None;
+    }
+    let candidates = join_candidates(ticket, approved);
+    let mut relay = CompletionRelay::default();
+    let Some((_, tag)) = candidates.first() else {
+        return Some(relay);
+    };
+    for (route, _) in &candidates {
+        let hint = route.to_hint();
+        if !relay.routes.contains(&hint) {
+            relay.routes.push(hint);
+        }
+        let destination = route.endpoint.destination();
+        if !relay.destinations.contains(&destination) {
+            relay.destinations.push(destination);
+        }
+    }
+    // Must-fail control: the tag is written in the clear.
+    relay.join_tag = if cfg!(mousse_control = "completion-stores-clear-tag") {
+        Some(hex(tag))
+    } else {
+        sealed.map(str::to_owned)
+    };
+    Some(relay)
+}
+
+/// The newest pairing number in the host `identity`'s (hex) completion
+/// records: one a failed write has not replayed yet is above the number
+/// on its relay entry. `None` when no record of the host has a relay part.
+/// Under the peers lock `_held`.
+fn recorded_pairing(
+    shared: &Shared,
+    _held: &PeersLock<'_>,
+    identity: &str,
+) -> Result<Option<u64>, NetError> {
+    Ok(CompletionStore::in_dir(&shared.info.state_dir)
+        .list()?
+        .iter()
+        .filter(|(_, r)| r.host_identity == identity)
+        .filter_map(|(_, r)| r.relay.as_ref().map(|relay| relay.pairing))
+        .max())
+}
+
+/// A link join paired at `at` (Unix seconds, the PAIRED time), under the
+/// peers lock: the record's relay part, if there is one, takes the next
+/// pairing number for the host, above its relay entry's and its other
+/// records', and the tag's expiry. The replay of the record, under the
+/// same lock, keeps the number on the relay entry. Nothing is written
+/// here, so a relay entry that cannot be saved keeps the record (it is
+/// reported `store`, and replayed later); one that cannot be read numbers
+/// from the records and the clock, so its record is at worst not the
+/// newest and restores no tag. The tag is restored no later than the host
+/// keeps its recovery entry or the record is kept, whichever ends first.
+pub fn prepare_completion(
+    shared: &Shared,
+    held: &PeersLock<'_>,
+    ticket: &Ticket,
+    at: u64,
+    relay: Option<&mut CompletionRelay>,
+) -> Result<(), NetError> {
+    let Some(relay) = relay else {
+        return Ok(());
+    };
+    let key = hex(ticket.host_identity.as_bytes());
+    let entry = {
+        let _io = guard(&shared.relay.io);
+        shared
+            .relay
+            .files
+            .peers()
+            .ok()
+            .and_then(|file| file.peers.into_iter().find(|p| p.identity == key))
+            .unwrap_or_default()
+    };
+    let newest = entry
+        .pairing
+        .max(recorded_pairing(shared, held, &key)?.unwrap_or(0));
+    let limits = limits();
+    relay.pairing = PeerRelay {
+        pairing: newest,
+        ..PeerRelay::default()
+    }
+    .next_pairing(at);
+    relay.tag_expires_at = at.saturating_add(limits.via_relay_rejoin_secs()).min(
+        ticket
+            .expires_at
+            .secs()
+            .saturating_add(limits.join_done_keep_secs()),
+    );
+    Ok(())
+}
+
+/// The host `identity` (hex) lost its grant here, which drops its
+/// completion records (Phase 1b §1.3): the pairings numbered so far end,
+/// also one only a record holds, so a record of one restores no relay
+/// writes, also one a failed delete left behind. The end is at least 1, so
+/// a record from before pairing numbers (number 0) ends too. Under the
+/// peers lock `held`.
+pub fn end_pairings(shared: &Shared, held: &PeersLock<'_>, identity: &str) -> Result<(), NetError> {
+    let recorded = recorded_pairing(shared, held, identity)?;
+    let _io = guard(&shared.relay.io);
+    let mut file = shared.relay.files.peers().map_err(NetError::Store)?;
+    if recorded.is_none() && !file.peers.iter().any(|p| p.identity == identity) {
+        return Ok(());
+    }
+    let p = entry_mut(&mut file, identity);
+    let ended = p.pairing.max(recorded.unwrap_or(0)).max(1);
+    if p.ended == ended {
+        return Ok(());
+    }
+    p.ended = ended;
+    p.pairing = ended;
+    shared.relay.files.save_peers(file).map_err(NetError::Store)
+}
+
+/// Make the relay writes of the completion record `record` again, under
+/// the peers lock `held` (a removal of the host deletes the record under
+/// it, so nothing is restored after one): the hints go into the host's
+/// entry in `relay-peers.json`, then their destinations become `ticket`
+/// approvals. Nothing is restored from a pairing that ended
+/// ([`end_pairings`]). The sealed tag goes back only before it expires,
+/// from the host's newest pairing, and while the host has not answered
+/// `mousse-keys` for that pairing. Each write is idempotent; an error is
+/// returned, so the pairing is not reported complete.
+pub fn replay_completion(
+    shared: &Shared,
+    held: &PeersLock<'_>,
+    record: &CompletionRecord,
+) -> Result<(), NetError> {
+    let Some(relay) = &record.relay else {
+        return Ok(());
+    };
+    let pin = identity_from_hex(&record.host_identity)?;
+    let dir = &shared.info.state_dir;
+    // Must-fail control: a tag past its time, or from an older pairing, or
+    // after the host's keys arrived for it, comes back.
+    let retired_too = cfg!(mousse_control = "completion-replays-retired-tag");
+    let tag = match relay.join_tag.as_deref() {
+        // The control build wrote it in the clear.
+        Some(clear) if cfg!(mousse_control = "completion-stores-clear-tag") => {
+            fixed::<32>(clear).and_then(|tag| seal_secret(shared, &pin, SEALED_JOIN_TAG, &tag).ok())
+        }
+        tag => tag.map(str::to_owned),
+    };
+    let routes: Vec<&String> = relay
+        .routes
+        .iter()
+        .filter(|h| RelayRoute::parse_hint(h).is_some())
+        .collect();
+    {
+        let _io = guard(&shared.relay.io);
+        let mut file = shared.relay.files.peers().map_err(NetError::Store)?;
+        let p = entry_mut(&mut file, &record.host_identity);
+        if p.ended > 0 && relay.pairing <= p.ended {
+            return Ok(());
+        }
+        for hint in &routes {
+            if !p.ticket_routes.contains(hint) {
+                p.ticket_routes.push((*hint).clone());
+            }
+        }
+        let newest = relay.pairing >= p.pairing;
+        p.pairing = p.pairing.max(relay.pairing);
+        let live = retired_too
+            || (now() <= relay.tag_expires_at && newest && relay.pairing > p.keys_pairing);
+        if let Some(tag) = tag.filter(|_| live) {
+            p.join_tag = Some(tag);
+            p.tag_pairing = relay.pairing;
+        }
+        shared
+            .relay
+            .files
+            .save_peers(file)
+            .map_err(NetError::Store)?;
+    }
+    crate::peer::crash_point("link-relay-routes-saved");
+    let approvals: Vec<Approval> = relay
+        .destinations
+        .iter()
+        .filter(|d| RelayEndpoint::from_destination(d).is_some())
+        .map(|destination| Approval {
+            identity: record.host_identity.clone(),
+            destination: destination.clone(),
+            source: "ticket".into(),
+            at: record.at,
+        })
+        .collect();
+    ApprovalStore::in_dir(dir).add(held, &approvals)
 }
 
 // ---------------------------------------------------------------------------
@@ -1987,7 +2416,7 @@ pub fn on_request(shared: &Arc<Shared>, id: Value, op: &str, map: &Map<String, V
                         add_approval(shared, &key, &destination, APPROVAL_SOURCE_MANIFEST)
                             .map(|()| true)
                     } else {
-                        remove_approval(shared, &key, &destination)
+                        disallow(shared, &key, &destination)
                     };
                     match done {
                         Ok(changed) => {

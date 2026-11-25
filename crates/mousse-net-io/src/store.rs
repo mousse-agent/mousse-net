@@ -50,6 +50,13 @@ pub fn hex(bytes: &[u8]) -> String {
 /// The grants file format. Version 2 added `next_grant_id`.
 const GRANT_FILE_VERSION: u32 = 2;
 
+/// The grants file format of a table holding a grant whose role is not
+/// `owner`. Version 3 adds nothing a version 2 reader could not parse; it
+/// exists so a helper that reads version 2 only refuses the file instead of
+/// serving every grant in it as `owner`. A table of owner grants only is
+/// still written as version 2.
+const RESTRICTED_GRANT_FILE_VERSION: u32 = 3;
+
 /// A 16-byte owner (profile id) from hex.
 pub fn owner_from_hex(text: &str) -> Option<OwnerRef> {
     let bytes: [u8; OwnerRef::LEN] = unhex(text).ok()?.try_into().ok()?;
@@ -196,6 +203,18 @@ struct GrantRecord {
     /// and in files written before receipts were kept.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     enrolled_by: Option<String>,
+    /// The role's revision, one higher after each edit. Absent in files
+    /// written before roles could be edited, and for revision 1.
+    #[serde(default = "first_revision", skip_serializing_if = "is_first_revision")]
+    revision: u64,
+}
+
+fn first_revision() -> u64 {
+    1
+}
+
+fn is_first_revision(revision: &u64) -> bool {
+    *revision == 1
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -287,8 +306,23 @@ impl EnrollmentSaveError {
 }
 
 fn file_of(table: &GrantTable) -> GrantFile {
+    // A grant not `owner`, or one whose role was ever edited: an older
+    // helper would serve the first as owner, and would drop the revision
+    // of the second on its next save (back to 1, so a stale edit made
+    // against an older revision could apply again after an upgrade).
+    let restricted = table
+        .grants()
+        .any(|g| g.role.as_str() != Role::OWNER || g.revision > 1);
+    // Must-fail control (tests only): the version is not raised, so an
+    // older helper loads a restricted grant and serves it as owner.
+    let version = if restricted && !cfg!(mousse_control = "restricted-store-readable-by-old-helper")
+    {
+        RESTRICTED_GRANT_FILE_VERSION
+    } else {
+        GRANT_FILE_VERSION
+    };
     GrantFile {
-        version: GRANT_FILE_VERSION,
+        version,
         next_grant_id: table.next_grant_id(),
         grants: table
             .grants()
@@ -302,6 +336,7 @@ fn file_of(table: &GrantTable) -> GrantFile {
                 granted_at: g.granted_at.secs(),
                 expires_at: g.expires_at.map(|t| t.secs()),
                 enrolled_by: g.enrolled_by.map(|i| hex(&i.0)),
+                revision: g.revision,
             })
             .collect(),
         denials: table
@@ -472,7 +507,7 @@ impl GrantStore {
 
 /// The table in `file`, read from `origin`.
 fn table_of(file: GrantFile, origin: &Path) -> Result<GrantTable, NetError> {
-    if file.version != GRANT_FILE_VERSION {
+    if file.version != GRANT_FILE_VERSION && file.version != RESTRICTED_GRANT_FILE_VERSION {
         return Err(NetError::Store(format!(
             "{}: unsupported version {}",
             origin.display(),
@@ -490,6 +525,8 @@ fn table_of(file: GrantFile, origin: &Path) -> Result<GrantTable, NetError> {
             identity: identity_from_hex(&g.identity)?,
             name: g.name,
             role: Role::new(&g.role).map_err(|_| bad("role"))?,
+            // Revision 0 is refused by `GrantTable::restore`.
+            revision: g.revision,
             source: GrantSource::Local,
             authorizing_owner: owner_from_hex(&g.authorizing_owner).ok_or_else(|| bad("owner"))?,
             adopted_into: None,
@@ -815,6 +852,35 @@ pub struct CompletionRecord {
     pub expires_at: u64,
     /// When the join finished (Unix seconds).
     pub at: u64,
+    /// What the join keeps for the ticket's relay routes the owner
+    /// approved (pairing-flow design §9). Absent when there were none,
+    /// and in records from before it; a helper from before it ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<CompletionRelay>,
+}
+
+/// The relay part of a [`CompletionRecord`]: the writes a "Send link" join
+/// makes for the ticket's approved relay routes, so a relay-only pairing
+/// that stopped part way can still be reached again.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompletionRelay {
+    /// The ticket's approved `relay://` hints, kept with the host.
+    pub routes: Vec<String>,
+    /// Their destinations (`relay://<endpoint>`), approved for the host.
+    pub destinations: Vec<String>,
+    /// The ticket's invitation tag, sealed for this endpoint (hex), when
+    /// the join went through a relay: the way back through it until the
+    /// host answers `mousse-keys`. Never stored in the clear.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join_tag: Option<String>,
+    /// After this (Unix seconds) the tag is not restored.
+    #[serde(default)]
+    pub tag_expires_at: u64,
+    /// The pairing's number with its host, kept on the host's relay entry
+    /// too: a record of an older pairing, or of one that ended, never
+    /// replaces what a newer one stored.
+    #[serde(default)]
+    pub pairing: u64,
 }
 
 /// The completion records in the `joins` folder, beside the flow records.
@@ -911,7 +977,35 @@ impl CompletionStore {
                 removed.push(hash);
             }
         }
+        // The deletions survive a power loss before the removal answers.
+        if !removed.is_empty() {
+            crate::private::sync_dir(&self.dir).map_err(|e| store_err(&self.dir, e))?;
+        }
         Ok(removed)
+    }
+
+    /// The owner disallowed `destination` for the host `identity` (hex):
+    /// take it out of that host's records, so no replay approves it again.
+    pub fn drop_destination(
+        &self,
+        _held: &PeersLock<'_>,
+        identity: &str,
+        destination: &str,
+    ) -> Result<(), NetError> {
+        for (_, mut record) in self.list()? {
+            if record.host_identity != identity {
+                continue;
+            }
+            let before = record.clone();
+            record.approvals.retain(|a| a.destination != destination);
+            if let Some(relay) = &mut record.relay {
+                relay.destinations.retain(|d| d != destination);
+            }
+            if record != before {
+                self.save(&record)?;
+            }
+        }
+        Ok(())
     }
 
     /// Delete the records whose ticket expired more than `keep_secs`
@@ -1212,6 +1306,166 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
             .collect();
         assert!(leftovers.is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// What a helper that reads version 2 only does with the grant store
+    /// in `dir`, frozen from the loader before roles could be chosen: it
+    /// reads the table an enrollment journal holds while one is pending,
+    /// else `grants.json`, and refuses any version but 2. `true` if it
+    /// would load the table.
+    fn version_2_loader_accepts(dir: &Path) -> bool {
+        #[derive(Deserialize)]
+        struct File {
+            version: u32,
+        }
+        #[derive(Deserialize)]
+        struct Pending {
+            version: u32,
+            enrollments: Vec<serde_json::Value>,
+            #[serde(default)]
+            in_force: Option<File>,
+        }
+        let pending: Option<Pending> = fs::read(dir.join("grants-pending.json"))
+            .ok()
+            .map(|b| serde_json::from_slice(&b).unwrap());
+        let file = match pending.filter(|p| !p.enrollments.is_empty()) {
+            Some(p) if p.version == 2 => match p.in_force {
+                Some(file) => file,
+                None => return false,
+            },
+            Some(_) => return false,
+            None => match fs::read(dir.join("grants.json")) {
+                Ok(bytes) => serde_json::from_slice(&bytes).unwrap(),
+                Err(_) => return true,
+            },
+        };
+        file.version == 2
+    }
+
+    fn grant_with(table: &mut GrantTable, role: &str) -> GrantId {
+        let identity = SoftwareKey::generate(&mut os_rng()).public_key();
+        let new = NewGrant {
+            identity,
+            name: "tablet".into(),
+            role: Role::new(role).unwrap(),
+            authorizing_owner: OwnerRef::from_bytes([1; 16]),
+            expires_at: None,
+            enrolled_by: None,
+        };
+        table.add(new, UnixTime(1)).unwrap().0
+    }
+
+    /// Owner grants only: still version 2, which an older helper reads.
+    #[test]
+    fn a_table_of_owner_grants_stays_readable_by_an_older_helper() {
+        let dir = temp_dir("owner-only");
+        let store = GrantStore::in_dir(&dir);
+        let mut table = GrantTable::new();
+        grant_with(&mut table, Role::OWNER);
+        store.save(&table).unwrap();
+        assert!(version_2_loader_accepts(&dir));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Once a grant's role is not owner, an older helper (which would serve
+    /// it as owner) refuses the file; this helper reads it, with the role
+    /// and revision.
+    #[test]
+    fn a_restricted_grant_makes_the_file_unreadable_by_an_older_helper() {
+        let dir = temp_dir("restricted");
+        let store = GrantStore::in_dir(&dir);
+        let mut table = GrantTable::new();
+        let id = grant_with(&mut table, Role::OWNER);
+        table
+            .set_role(id, 1, Role::new("viewer").unwrap(), UnixTime(2))
+            .unwrap();
+        store.save(&table).unwrap();
+        assert!(!version_2_loader_accepts(&dir));
+        let loaded = store.load().unwrap();
+        let g = loaded.get(id).unwrap();
+        assert_eq!((g.role.as_str(), g.revision), ("viewer", 2));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A grant edited back to owner keeps a revision above 1, which an
+    /// older helper would drop on its next save: owner rev 1, viewer rev 2,
+    /// owner rev 3. The file stays one an older helper refuses, in
+    /// `grants.json` and in an enrollment journal's table, and the
+    /// revision comes back.
+    #[test]
+    fn an_owner_grant_edited_back_keeps_the_file_unreadable_by_an_older_helper() {
+        use crate::private::faults::{plan_replaces, Fault};
+        let dir = temp_dir("edited-back");
+        let store = GrantStore::in_dir(&dir);
+        let mut table = GrantTable::new();
+        let id = grant_with(&mut table, Role::OWNER);
+        table
+            .set_role(id, 1, Role::new("viewer").unwrap(), UnixTime(2))
+            .unwrap();
+        table.set_role(id, 2, Role::owner(), UnixTime(3)).unwrap();
+        assert!(table.grants().all(|g| g.role.as_str() == Role::OWNER));
+        store.save(&table).unwrap();
+        assert!(!version_2_loader_accepts(&dir));
+        let loaded = store.load().unwrap();
+        let g = loaded.get(id).unwrap();
+        assert_eq!((g.role.as_str(), g.revision), (Role::OWNER, 3));
+
+        // The same table kept in force by an enrollment journal.
+        let mut next = table.clone();
+        let new = grant_with(&mut next, Role::OWNER);
+        let identity = next.get(new).unwrap().identity;
+        plan_replaces(store.path(), &[Fault::BeforeRename]);
+        let pending = PendingEnrollment {
+            grant: new,
+            identity,
+            invitation: InvitationId([3; 16]),
+        };
+        assert!(store.save_enrollment(&table, &next, &[pending]).is_err());
+        assert!(store.load_pending().unwrap().is_some());
+        assert!(!version_2_loader_accepts(&dir));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The table an enrollment journal keeps in force is versioned the
+    /// same way: an older helper refuses a restricted one there too.
+    #[test]
+    fn a_restricted_table_in_an_enrollment_journal_is_unreadable_by_an_older_helper() {
+        use crate::private::faults::{plan_replaces, Fault};
+        let dir = temp_dir("restricted-pending");
+        let store = GrantStore::in_dir(&dir);
+        let mut before = GrantTable::new();
+        grant_with(&mut before, "member");
+        store.save(&before).unwrap();
+        let mut table = before.clone();
+        let id = grant_with(&mut table, Role::OWNER);
+        let identity = table.get(id).unwrap().identity;
+        // The table's write fails: the journal stays, holding `before`.
+        plan_replaces(store.path(), &[Fault::BeforeRename]);
+        let pending = PendingEnrollment {
+            grant: id,
+            identity,
+            invitation: InvitationId([2; 16]),
+        };
+        assert!(store.save_enrollment(&before, &table, &[pending]).is_err());
+        assert!(store.load_pending().unwrap().is_some());
+        assert!(!version_2_loader_accepts(&dir));
+        assert_eq!(store.load().unwrap().grants().count(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A file written before revisions were kept loads with revision 1.
+    #[test]
+    fn a_grant_from_a_file_without_revisions_has_revision_1() {
+        let dir = temp_dir("migrated");
+        let store = GrantStore::in_dir(&dir);
+        let mut table = GrantTable::new();
+        let id = grant_with(&mut table, Role::OWNER);
+        store.save(&table).unwrap();
+        let text = fs::read_to_string(store.path()).unwrap();
+        assert!(!text.contains("revision"));
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.get(id).unwrap().revision, 1);
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1555,6 +1809,156 @@ mod tests {
             record.routes_to_try(),
             vec!["tcp://10.0.0.3:7443", "tcp://10.0.0.2:7443"]
         );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn completion(
+        hash: u8,
+        host: &str,
+        at: u64,
+        relay: Option<CompletionRelay>,
+    ) -> CompletionRecord {
+        CompletionRecord {
+            ticket_hash: hex(&[hash; 32]),
+            host_identity: host.into(),
+            outcome: COMPLETION_PAIRED.into(),
+            peer: PeerRecord {
+                name: "hostB".into(),
+                identity: host.into(),
+                role: "owner".into(),
+                routes: vec!["tcp://10.0.0.2:7443".into()],
+                last_route: Some("tcp://10.0.0.2:7443".into()),
+                addresses: Vec::new(),
+                offered: Vec::new(),
+                paired_at: at,
+            },
+            approvals: Vec::new(),
+            expires_at: at + 900,
+            at,
+            relay,
+        }
+    }
+
+    fn relay_part() -> CompletionRelay {
+        CompletionRelay {
+            routes: vec!["relay://relay.example:443/AAAA/BBBB".into()],
+            destinations: vec!["relay://relay.example:443".into()],
+            join_tag: Some("5ea1ed".into()),
+            tag_expires_at: 1_700_000_600,
+            pairing: 1_700_000_000,
+        }
+    }
+
+    /// A completion record as a helper from before the relay part writes
+    /// and reads it.
+    #[derive(Serialize, Deserialize)]
+    struct CompletionBefore {
+        ticket_hash: String,
+        host_identity: String,
+        outcome: String,
+        peer: PeerRecord,
+        approvals: Vec<Approval>,
+        expires_at: u64,
+        at: u64,
+    }
+
+    #[test]
+    fn a_completion_record_keeps_its_relay_part_through_a_save() {
+        let dir = temp_dir("done-relay");
+        let store = CompletionStore::in_dir(&dir);
+        let record = completion(5, "ab", 1_700_000_000, Some(relay_part()));
+        store.save(&record).unwrap();
+        assert_eq!(store.load(&[5; 32]).unwrap(), Some(record));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_completion_record_from_before_the_relay_part_still_loads() {
+        let dir = temp_dir("done-old");
+        let store = CompletionStore::in_dir(&dir);
+        let record = completion(6, "ab", 1_700_000_000, None);
+        let old = CompletionBefore {
+            ticket_hash: record.ticket_hash.clone(),
+            host_identity: record.host_identity.clone(),
+            outcome: record.outcome.clone(),
+            peer: record.peer.clone(),
+            approvals: Vec::new(),
+            expires_at: record.expires_at,
+            at: record.at,
+        };
+        fs::create_dir_all(dir.join("joins")).unwrap();
+        fs::write(store.path(&[6; 32]), serde_json::to_vec(&old).unwrap()).unwrap();
+        assert_eq!(store.load(&[6; 32]).unwrap(), Some(record));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_helper_from_before_reads_a_record_with_the_relay_part() {
+        let dir = temp_dir("done-new");
+        let store = CompletionStore::in_dir(&dir);
+        let record = completion(7, "ab", 1_700_000_000, Some(relay_part()));
+        store.save(&record).unwrap();
+        let bytes = fs::read(store.path(&[7; 32])).unwrap();
+        let old: CompletionBefore = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(old.peer, record.peer);
+        assert_eq!((old.at, old.expires_at), (record.at, record.expires_at));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_record_with_no_relay_part_is_written_as_before() {
+        let dir = temp_dir("done-same");
+        let store = CompletionStore::in_dir(&dir);
+        store
+            .save(&completion(8, "ab", 1_700_000_000, None))
+            .unwrap();
+        let bytes = fs::read(store.path(&[8; 32])).unwrap();
+        let fields: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&bytes).unwrap();
+        assert!(!fields.contains_key("relay"), "{fields:?}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn deleting_a_hosts_records_is_an_error_until_the_folder_is_synced() {
+        let dir = temp_dir("done-sync");
+        let store = CompletionStore::in_dir(&dir);
+        store
+            .save(&completion(1, "ab", 100, Some(relay_part())))
+            .unwrap();
+        let peers = PeerStore::in_dir(&dir);
+        let held = peers.lock().unwrap();
+        crate::private::faults::fail_syncs(&dir.join("joins"), 1);
+        assert!(store.remove_naming(&held, "ab").is_err());
+        drop(held);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_disallowed_destination_leaves_only_that_hosts_records() {
+        let dir = temp_dir("done-disallow");
+        let store = CompletionStore::in_dir(&dir);
+        let destination = "relay://relay.example:443";
+        let approval = |host: &str| Approval {
+            identity: host.into(),
+            destination: destination.into(),
+            source: "ticket".into(),
+            at: 100,
+        };
+        let mut mine = completion(1, "ab", 100, Some(relay_part()));
+        mine.approvals = vec![approval("ab")];
+        let mut other = completion(2, "cd", 100, Some(relay_part()));
+        other.approvals = vec![approval("cd")];
+        store.save(&mine).unwrap();
+        store.save(&other).unwrap();
+        let peers = PeerStore::in_dir(&dir);
+        let held = peers.lock().unwrap();
+        store.drop_destination(&held, "ab", destination).unwrap();
+        drop(held);
+        let mine = store.load(&[1; 32]).unwrap().unwrap();
+        assert!(mine.approvals.is_empty());
+        assert!(mine.relay.unwrap().destinations.is_empty());
+        assert_eq!(store.load(&[2; 32]).unwrap(), Some(other));
         fs::remove_dir_all(&dir).unwrap();
     }
 }

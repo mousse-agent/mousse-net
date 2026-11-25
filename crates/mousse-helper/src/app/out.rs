@@ -29,6 +29,9 @@ struct Item {
     meta: Meta,
     /// The connection a `conn.*` event is about (coalesced per connection).
     conn_event: Option<u64>,
+    /// The stream a `stream.incoming` event announces: dropped with the
+    /// stream if it is reset before the event is written.
+    announces: Option<u32>,
 }
 
 /// The queues.
@@ -65,7 +68,47 @@ impl Out {
             bytes: frame::json(value),
             meta: Meta::Json,
             conn_event: None,
+            announces: None,
         });
+    }
+
+    /// Queue the event that announces stream `handle` to the app
+    /// (`stream.incoming`). [`Out::unannounce`] takes it back while it
+    /// waits.
+    pub fn announce(&mut self, handle: u32, value: &serde_json::Value) {
+        self.push_control(Item {
+            bytes: frame::json(value),
+            meta: Meta::Json,
+            conn_event: None,
+            announces: Some(handle),
+        });
+    }
+
+    /// Drop the announcement of `handle` if it was not written yet: `true`
+    /// if it was dropped (the app never hears of the stream).
+    pub fn unannounce(&mut self, handle: u32) -> bool {
+        let announced = |i: &Item| i.announces == Some(handle);
+        let mut dropped = 0;
+        let mut bytes = 0;
+        self.control.retain(|i| {
+            let hit = announced(i);
+            if hit {
+                dropped += 1;
+                bytes += i.bytes.len();
+            }
+            !hit
+        });
+        #[cfg(mousse_control = "fifo-writer")]
+        self.fifo.retain(|i| {
+            let hit = announced(i);
+            if hit {
+                dropped += 1;
+                bytes += i.bytes.len();
+            }
+            !hit
+        });
+        self.control_bytes = self.control_bytes.saturating_sub(bytes);
+        dropped > 0
     }
 
     /// Queue a `conn.*` event; it replaces one about the same connection
@@ -75,6 +118,7 @@ impl Out {
             bytes: frame::json(value),
             meta: Meta::Json,
             conn_event: Some(conn),
+            announces: None,
         };
         #[cfg(mousse_control = "fifo-writer")]
         {
@@ -115,6 +159,7 @@ impl Out {
                     bytes: frame::credit(handle, n as u32),
                     meta: Meta::Credit,
                     conn_event: None,
+                    announces: None,
                 });
             }
         }
@@ -139,6 +184,7 @@ impl Out {
                 fin,
             },
             conn_event: None,
+            announces: None,
         };
         #[cfg(mousse_control = "fifo-writer")]
         {
@@ -167,6 +213,7 @@ impl Out {
                 fin: true,
             },
             conn_event: None,
+            announces: None,
         });
     }
 
@@ -300,5 +347,28 @@ mod tests {
         out.credit(4, 9);
         assert_eq!(out.discard(4), 3);
         assert!(out.next().is_none());
+    }
+
+    /// A stream's announcement waiting to be written is taken back with
+    /// the stream; other events stay.
+    #[test]
+    fn a_waiting_announcement_is_taken_back() {
+        let mut out = Out::default();
+        out.announce(7, &json!({"ev": "stream.incoming", "handle": 7}));
+        out.announce(8, &json!({"ev": "stream.incoming", "handle": 8}));
+        out.json(&json!({"ev": "x"}));
+        assert!(out.unannounce(7));
+        assert!(!out.unannounce(7));
+        let mut left = Vec::new();
+        while let Some((bytes, _)) = out.next() {
+            left.push(String::from_utf8_lossy(&bytes).into_owned());
+        }
+        assert_eq!(left.len(), 2, "{left:?}");
+        assert!(left[0].contains("\"handle\":8"), "{left:?}");
+        assert_eq!(out.control_bytes(), 0);
+        // Once written, it cannot be taken back.
+        out.announce(9, &json!({"ev": "stream.incoming", "handle": 9}));
+        out.next().unwrap();
+        assert!(!out.unannounce(9));
     }
 }
