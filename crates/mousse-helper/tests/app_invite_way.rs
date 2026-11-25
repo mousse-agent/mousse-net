@@ -558,6 +558,73 @@ fn an_unreadable_store_is_store_failed() {
     }
 }
 
+/// The app's managed tunnel (`routes.managed_tunnel`) is a `tunnel`
+/// candidate: once published the way is ready and a `tunnel` ticket
+/// carries it, after a configured tunnel; once withdrawn the way has
+/// nothing to offer again. Other ways never carry it, and the request
+/// refuses a field it does not know.
+#[test]
+fn a_managed_tunnel_makes_the_tunnel_way_ready() {
+    const MANAGED: &str = "wss://managed.example:443/mousse-net/1";
+    let end = Endpoint::init("iw-managed");
+    let mut a = end.app("hostA", &[]);
+    let hello = hello12(&mut a);
+    let features = hello["features"].as_array().unwrap();
+    assert!(features.contains(&json!("managed-tunnel")), "{hello}");
+    assert_eq!(hello["managed_tunnel"], true, "{hello}");
+    let tunnel_state = |a: &mut App| {
+        let available = a.call("routes.available", json!({}));
+        let w = way_of(&available, "tunnel");
+        (w["state"].clone(), w["reason"].clone(), w["routes"].clone())
+    };
+    let not_configured = (json!("unavailable"), json!("not_configured"), json!([]));
+    assert_eq!(tunnel_state(&mut a), not_configured);
+    let refused = a.request("invite.create", json!({"way": "tunnel"}));
+    assert_eq!(refused["reason"], "not_configured", "{refused}");
+
+    a.call("routes.managed_tunnel", json!({"route": MANAGED}));
+    assert_eq!(
+        tunnel_state(&mut a),
+        (json!("ready"), Value::Null, json!([MANAGED]))
+    );
+    let reply = a.call("invite.create", json!({"way": "tunnel"}));
+    assert_eq!(routes_in(&reply), [MANAGED], "{reply}");
+    assert_eq!(reply["ways"], json!(["tunnel"]));
+    let link = a.call(
+        "invite.create",
+        json!({"kind": "link", "way": "tunnel", "route": MANAGED}),
+    );
+    assert_eq!(routes_in(&link), [MANAGED], "{link}");
+    let lan = a.call("invite.create", json!({"way": "lan"}));
+    assert!(!routes_in(&lan).contains(&MANAGED.to_owned()), "{lan}");
+
+    let unknown = a.request(
+        "routes.managed_tunnel",
+        json!({"route": MANAGED, "way": "tunnel"}),
+    );
+    assert_eq!(unknown["error"], "bad_request", "{unknown}");
+    assert_eq!(
+        tunnel_state(&mut a).0,
+        "ready",
+        "a refused request changes nothing"
+    );
+
+    a.call("routes.managed_tunnel", json!({"route": null}));
+    assert_eq!(tunnel_state(&mut a), not_configured);
+    let refused = a.request("invite.create", json!({"way": "tunnel", "route": MANAGED}));
+    assert_eq!(refused["error"], "way_unavailable", "{refused}");
+    drop(a);
+
+    // With a configured tunnel, the managed one comes after it.
+    let both = Endpoint::init("iw-managed-both");
+    let mut b = both.app_args("hostA", &[], &["--tunnel", "wss://t.example/mousse-net/1"]);
+    hello12(&mut b);
+    b.call("routes.managed_tunnel", json!({"route": MANAGED}));
+    assert_eq!(tunnel_state(&mut b).2, json!([TUNNEL, MANAGED]));
+    let reply = b.call("invite.create", json!({"way": "tunnel"}));
+    assert_eq!(routes_in(&reply), [TUNNEL, MANAGED], "{reply}");
+}
+
 /// A way that is off, waits for a restart, has no interface or is not
 /// configured reports that reason; the healthy way stays selectable.
 #[test]

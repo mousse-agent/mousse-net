@@ -93,6 +93,7 @@ pub const FEATURES: &[&str] = &[
     "grant-revoke-local",
     GRANT_ROLES,
     GRANT_ADD_CONNECTED,
+    "managed-tunnel",
 ];
 
 /// The feature an app lists in its hello `features` to take streams of

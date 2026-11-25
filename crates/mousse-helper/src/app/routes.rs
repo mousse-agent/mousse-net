@@ -9,7 +9,9 @@
 //!   advertises with the interfaces now.
 //! - `routes.managed_tunnel {route}` → `{routes}` adds a running app
 //!   tunnel to new invitations. `null` withdraws it. This route is kept in
-//!   memory and does not affect the saved owner routes.
+//!   memory and does not affect the saved owner routes. It is a candidate
+//!   of the `tunnel` way for `routes.available` and `invite.create {way}`
+//!   (feature `managed-tunnel`; `docs/pairing-flow-design.md` §1 to §3).
 //! - `routes.test {route}` → `{ok, ms}` or `{ok: false, reason, why}`:
 //!   dials this helper's own `tcp`, `ws` or `wss` route pinned to its own
 //!   identity, and closes once step 1 passed, before step 2. A failure
@@ -132,6 +134,13 @@ pub fn config(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
 
 /// An app-owned route that was verified by the app through `routes.test`.
 pub fn managed_tunnel(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
+    // A 1.2 operation: a field it does not know is refused, not ignored.
+    if let Some(unknown) = map
+        .keys()
+        .find(|k| !["op", "id", "route"].contains(&k.as_str()))
+    {
+        return error(id, "bad_request", format!("unknown field {unknown:?}"));
+    }
     let route = match map.get("route") {
         Some(Value::Null) => None,
         Some(Value::String(text)) => {

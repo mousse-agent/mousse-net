@@ -62,14 +62,15 @@ impl Inventory {
 }
 
 /// The tunnel origins this computer serves now: the configured and
-/// command-line tunnels, while the WebSocket listener runs. The managed
-/// tunnel of pull request #10 is added here once it merges.
+/// command-line tunnels, then the app's managed tunnel
+/// (`routes.managed_tunnel`), while the WebSocket listener runs.
 fn tunnel_origins(shared: &Shared, listen: &ListenState) -> Vec<String> {
     if shared.info.ws_port.is_none() {
         return Vec::new();
     }
     let mut out: Vec<String> = Vec::new();
-    for text in listen.config.tunnels.iter().chain(&listen.extra) {
+    let configured = listen.config.tunnels.iter().chain(&listen.extra);
+    for text in configured.chain(&listen.managed_tunnel) {
         if let Ok(route) = LocalRoute::parse(text) {
             out.push(route.uri());
         }
@@ -407,7 +408,11 @@ fn why_not(
             }
         }
         "public" if !running.public.is_empty() => (NA, "not_bound"),
-        "tunnel" if !running.tunnels.is_empty() || !inventory.listen.extra.is_empty() => {
+        "tunnel"
+            if !running.tunnels.is_empty()
+                || !inventory.listen.extra.is_empty()
+                || inventory.listen.managed_tunnel.is_some() =>
+        {
             (NA, "origin_unavailable")
         }
         "relay" => match inventory.relays {
