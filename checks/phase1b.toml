@@ -45,6 +45,7 @@ control = [
   { name = "stale-renewal-routes", breaks = "renewals dial the remembered list after an edit", env = { RUSTFLAGS = '--cfg mousse_control="stale-renewal-routes"' } },
   { name = "unbounded-candidates", breaks = "the search ignores DIAL_MAX_CANDIDATES and DIAL_SEARCH_MS", env = { RUSTFLAGS = '--cfg mousse_control="unbounded-candidates"' } },
   { name = "ssh-races-lan", breaks = "ssh candidates start with tcp ones", env = { RUSTFLAGS = '--cfg mousse_control="ssh-races-lan"' } },
+  { name = "no-lan-head-start", breaks = "tailnet candidates start with LAN ones, so a faster tailnet wins", env = { RUSTFLAGS = '--cfg mousse_control="no-lan-head-start"' } },
   { name = "bind-all-lan-off", breaks = "the listener binds 0.0.0.0 with LAN off", env = { RUSTFLAGS = '--cfg mousse_control="bind-all-lan-off"' } },
 ]
 

@@ -34,6 +34,7 @@ mod budget;
 mod changes;
 mod engine_ops;
 mod frame;
+mod lan;
 mod out;
 mod pairing;
 mod paths;
@@ -223,6 +224,10 @@ struct ConnEntry {
     caller_opened: bool,
     /// Outbound through a relay: the route, for its bulk companion.
     via: Option<mousse_net_core::relay_endpoint::RelayRoute>,
+    /// The class of its route as `conn.up` named it (`lan`, `tailnet`, ...).
+    class: Option<String>,
+    /// When it was published.
+    since: tokio::time::Instant,
     /// How often `peer.forget` had removed the peer when this was published
     /// ([`Core::peer_gen`]): once it differs, the path is closing.
     gen: u64,
@@ -632,6 +637,11 @@ impl Shared {
                     reopen,
                     caller_opened: false,
                     via: None,
+                    class: fields
+                        .pointer("/route/class")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    since: tokio::time::Instant::now(),
                     gen,
                 },
             );
@@ -647,6 +657,7 @@ impl Shared {
             if !inbound {
                 let shared = self.clone();
                 tokio::spawn(async move { relay::ensure_keys(&shared, &conn).await });
+                self.keep.lan.wake();
             }
             no
         };
@@ -680,6 +691,11 @@ impl Shared {
         drop(core);
         relay::conn_gone(self, no);
         if !entry.inbound {
+            if entry.class.as_deref() == Some(mousse_net_io::RouteClass::Lan.name()) {
+                self.keep
+                    .lan
+                    .lan_down(entry.identity, entry.since.elapsed(), &self.limits);
+            }
             self.keep.kick(paths::Kick::Look);
             if entry.via.is_some() {
                 let shared = self.clone();

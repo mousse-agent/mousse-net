@@ -11,8 +11,9 @@
 //!   (a jump of the monotonic clock). Either way every connection must
 //!   answer a `PING` within `WAKE_PING_MS` or it is closed as dead, the
 //!   browse cache is dropped, and every paired host without a path is
-//!   dialled again at once, its backoff reset. (`serve` also announces the
-//!   mDNS record again.)
+//!   dialled again at once, its backoff reset, and every host reached off
+//!   the LAN is probed on it again soon. (`serve` also announces the mDNS
+//!   record again.)
 //! - **Test hooks**, debug builds only: `MOUSSE_HELPER_INTERFACES_FILE`
 //!   names a file whose lines are the interface list, read at every poll;
 //!   `MOUSSE_HELPER_MANUAL_CLOCK=1` runs the helper on a clock the app moves
@@ -161,6 +162,10 @@ pub async fn on_change(shared: Arc<Shared>, change: NetChange) {
         });
     }
     while pings.join_next().await.is_some() {}
+    shared
+        .keep
+        .lan
+        .rearm(crate::limits::ms(shared.limits.lan_probe_first_ms()));
     shared.keep.kick(paths::Kick::Reset(None));
 }
 

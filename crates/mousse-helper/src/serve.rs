@@ -492,10 +492,21 @@ pub async fn run(
         // The ssh tier opens SSH routes set up by `ssh.resolve` (Phase 1b §3).
         let ssh = Arc::new(crate::ssh::Ssh::new(endpoint.dir()));
         caller.use_ssh_dialer(Arc::new(crate::ssh::Dialer(ssh.clone())));
-        // Renewals search from the store as it is then (Phase 1b §1.5).
+        // mDNS only where the helper advertises too (never on loopback,
+        // never with LAN off); debug builds may read a browse file instead.
+        let browse = crate::app::browse_source(opts.mdns && lan_on).map(|source| {
+            Arc::new(CachedBrowse::new(
+                source,
+                clock.clone(),
+                crate::limits::get().net.io(),
+            ))
+        });
+        // Renewals search from the store as it is then, with the browse
+        // (Phase 1b §1.4 and §1.5).
         caller.use_candidates(Arc::new(crate::app::StoreCandidates {
             dir: endpoint.dir().to_path_buf(),
             policy: caller.addr_policy().clone(),
+            browse: browse.clone(),
         }));
         let info = crate::app::AppInfo {
             identity: real_identity,
@@ -505,15 +516,7 @@ pub async fn run(
             ws_port,
             listen: listen.clone(),
             state_dir: endpoint.dir().to_path_buf(),
-            // mDNS only where the helper advertises too (never on
-            // loopback); debug builds may read a browse file instead.
-            browse: crate::app::browse_source(opts.mdns && lan_on).map(|source| {
-                Arc::new(CachedBrowse::new(
-                    source,
-                    clock.clone(),
-                    crate::limits::get().net.io(),
-                ))
-            }),
+            browse,
             manual_clock,
             signer: signer.clone(),
             endpoint_id: endpoint.endpoint_id().to_owned(),

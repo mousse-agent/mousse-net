@@ -18,12 +18,16 @@
 //! - **Candidates**, built from the store for every search, renewals
 //!   included: the last working route, the owner's addresses, the hints;
 //!   each must pass the automatic rule or have an approval for that peer,
-//!   the last working route too. The browse source (mDNS, cached) runs
-//!   beside the search and what it finds joins the `tcp` tier, under the
-//!   automatic rule only.
+//!   the last working route too. The browse source (mDNS, cached) adds
+//!   the hosts it found, under the automatic rule only: fresh cached
+//!   results at once, a new browse's as they arrive.
 //! - **Dialling** is [`Caller::search`](mousse_net_io::Caller::search):
-//!   bounded tiers, a pin mismatch moves on, the host's own refusal stops
-//!   the search. Any change to a host's addresses or approvals bumps the
+//!   LAN first, then tailnet, public and tunnel, then SSH; the last
+//!   working route only breaks ties within its class. A pin mismatch moves
+//!   on, the host's own refusal stops the search.
+//! - **Moving to the LAN** ([`super::lan`]): a host reached any other way
+//!   is probed on its LAN candidates in the background, and a LAN path
+//!   that answers as the host takes over. Any change to a host's addresses or approvals bumps the
 //!   caller's route generation for it ([`Caller::forget_routes`]), and a
 //!   last working route that lost its approval is dropped.
 //! - **Keep connected.** Once the app said `hello`, the helper keeps one
@@ -43,7 +47,7 @@ use std::time::Duration;
 
 use mousse_net_core::identity::IdentityPublicKey;
 use mousse_net_core::pairing::Route;
-use mousse_net_io::discovery::BrowseSource;
+use mousse_net_io::discovery::{BrowseSource, CachedBrowse};
 use mousse_net_io::pipe::{AddrPolicy, LocalRoute, RouteKind};
 use mousse_net_io::store::{
     hex, identity_from_hex, short_id, Approval, ApprovalStore, PeerRecord, PeerStore,
@@ -324,7 +328,8 @@ fn stored_route(text: &str, owner: bool) -> Option<LocalRoute> {
 
 /// The search for `record`'s host from the store as it is now, without
 /// the browse: the last working route, the owner's addresses, the hints,
-/// each allowed by the automatic rule or an approval.
+/// each allowed by the automatic rule or an approval. The caller dials
+/// them by class, so this order counts only within a class.
 pub fn stored_search(policy: &AddrPolicy, dir: &Path, record: &PeerRecord) -> Search {
     let allowed = Allowed::load(dir);
     let may = |route: &LocalRoute| allowed.allows(policy, &record.identity, route);
@@ -334,17 +339,12 @@ pub fn stored_search(policy: &AddrPolicy, dir: &Path, record: &PeerRecord) -> Se
         .and_then(|r| stored_route(r, true))
         // The control build dials the last working route unchecked.
         .filter(|r| cfg!(mousse_control = "unapproved-last-route") || may(r));
-    let ssh_first = last.as_ref().is_some_and(|r| r.kind() == RouteKind::Ssh);
     let mut out: Vec<LocalRoute> = last.into_iter().collect();
     if cfg!(mousse_control = "no-rediscovery") && !out.is_empty() {
         // The control build tries only the last working route. A pairing
         // that has none yet (its first dial) still uses its addresses, so
         // the control breaks finding a host that moved and nothing else.
-        return Search {
-            candidates: out,
-            ssh_first,
-            later: None,
-        };
+        return Search::of(out);
     }
     let owner = record.addresses.iter().map(|r| (r, true));
     let hints = record.routes.iter().map(|r| (r, false));
@@ -355,28 +355,65 @@ pub fn stored_search(policy: &AddrPolicy, dir: &Path, record: &PeerRecord) -> Se
             }
         }
     }
-    Search {
-        candidates: out,
-        ssh_first,
-        later: None,
-    }
+    Search::of(out)
 }
 
-/// Renewals build their search from the store, as every dial does.
+/// Add the browse to `search`: fresh cached results now, as candidates,
+/// and a new browse's as they arrive. Only hosts under the automatic rule
+/// (a LAN address) count. Without a browse source (LAN off, or a loopback
+/// helper) nothing is browsed.
+pub fn with_browse(
+    mut search: Search,
+    policy: &AddrPolicy,
+    browse: Option<&Arc<CachedBrowse>>,
+) -> Search {
+    let Some(browse) = browse.filter(|_| !cfg!(mousse_control = "no-rediscovery")) else {
+        return search;
+    };
+    for addr in browse.cached().unwrap_or_default() {
+        let route = LocalRoute::tcp(addr);
+        if policy.automatic(&route) && !search.candidates.contains(&route) {
+            search.candidates.push(route);
+        }
+    }
+    let (browse, policy) = (browse.clone(), policy.clone());
+    search.later = Some(Box::pin(async move {
+        match browse.addresses().await {
+            Ok(found) => found
+                .into_iter()
+                .map(LocalRoute::tcp)
+                .filter(|r| policy.automatic(r))
+                .collect(),
+            Err(e) => {
+                applog::line(format!("browse failed: {e}"));
+                Vec::new()
+            }
+        }
+    }));
+    search
+}
+
+/// Renewals build their search from the store, as every dial does, with
+/// the browse.
 pub struct StoreCandidates {
     pub dir: PathBuf,
     pub policy: AddrPolicy,
+    pub browse: Option<Arc<CachedBrowse>>,
 }
 
 impl CandidateSource for StoreCandidates {
     fn search(&self, pin: &IdentityPublicKey) -> Search {
         let key = hex(pin.as_bytes());
-        PeerStore::in_dir(&self.dir)
+        let stored = PeerStore::in_dir(&self.dir)
             .load()
             .ok()
             .and_then(|peers| peers.into_iter().find(|p| p.identity == key))
-            .map(|record| stored_search(&self.policy, &self.dir, &record))
-            .unwrap_or_default()
+            .map(|record| stored_search(&self.policy, &self.dir, &record));
+        match stored {
+            Some(search) => with_browse(search, &self.policy, self.browse.as_ref()),
+            // Not paired any more: nothing to dial.
+            None => Search::default(),
+        }
     }
 }
 
@@ -458,28 +495,12 @@ async fn reach_local(
     record: &PeerRecord,
 ) -> Result<(Connection, Reached), NetError> {
     let pin = record.pin()?;
-    let policy = shared.caller.addr_policy().clone();
-    let mut search = stored_search(&policy, &shared.info.state_dir, record);
-    let browse = shared
-        .info
-        .browse
-        .clone()
-        .filter(|_| !cfg!(mousse_control = "no-rediscovery"));
-    if let Some(browse) = browse {
-        search.later = Some(Box::pin(async move {
-            match browse.addresses().await {
-                Ok(found) => found
-                    .into_iter()
-                    .map(LocalRoute::tcp)
-                    .filter(|r| policy.automatic(r))
-                    .collect(),
-                Err(e) => {
-                    applog::line(format!("browse failed: {e}"));
-                    Vec::new()
-                }
-            }
-        }));
-    }
+    let policy = shared.caller.addr_policy();
+    let search = with_browse(
+        stored_search(policy, &shared.info.state_dir, record),
+        policy,
+        shared.info.browse.as_ref(),
+    );
     shared.caller.search(search, pin).await
 }
 
@@ -557,7 +578,9 @@ pub struct Keep {
     ends: Mutex<HashMap<IdentityPublicKey, (u64, Option<Failure>)>>,
     /// Hosts reached through a relay whose direct routes are being tried
     /// ([`upgrade`]).
-    upgrading: Mutex<HashSet<IdentityPublicKey>>,
+    pub(super) upgrading: Mutex<HashSet<IdentityPublicKey>>,
+    /// Moving hosts reached off the LAN to it ([`super::lan`]).
+    pub(super) lan: super::lan::Lan,
 }
 
 /// Something the keeper should look at.
@@ -580,12 +603,13 @@ impl Keep {
                 kicks,
                 ends: Mutex::default(),
                 upgrading: Mutex::default(),
+                lan: super::lan::Lan::default(),
             },
             receiver,
         )
     }
 
-    fn lock_for(&self, pin: IdentityPublicKey) -> Arc<tokio::sync::Mutex<()>> {
+    pub(super) fn lock_for(&self, pin: IdentityPublicKey) -> Arc<tokio::sync::Mutex<()>> {
         self.locks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -610,8 +634,10 @@ impl Keep {
     }
 
     /// Queue work for the keeper, including the first hello before it runs.
+    /// The LAN probes look again too.
     pub fn kick(&self, kick: Kick) {
         let _ = self.kicks.send(kick);
+        self.lan.wake();
     }
 }
 
@@ -787,6 +813,11 @@ async fn upgrade(shared: Arc<Shared>, pin: IdentityPublicKey, relay: u64, gen: u
         };
         match tried {
             Ok((conn, used)) => {
+                // A LAN path that passed step 1 wins without a race.
+                if used.class == mousse_net_io::RouteClass::Lan {
+                    switch_to(&shared, pin, relay, gen, conn, &used, &record);
+                    return;
+                }
                 let direct = round_trip(&conn).await;
                 let through = round_trip(&relayed).await;
                 if direct_wins(direct, through, margin) {
@@ -835,9 +866,10 @@ async fn round_trip(conn: &Connection) -> Option<Duration> {
     best
 }
 
-/// Announce the direct path `conn` and ask the app to move its streams to
-/// it from the relayed path `from`.
-fn switch_to(
+/// Announce the path `conn` and ask the app to move its streams to it from
+/// the path `from` (relayed, or on the LAN probe any other). If `from`
+/// went meanwhile, `conn` is simply the host's path: `conn.up` says so.
+pub(super) fn switch_to(
     shared: &Arc<Shared>,
     pin: IdentityPublicKey,
     from: u64,
@@ -854,13 +886,13 @@ fn switch_to(
         return;
     };
     applog::line(format!(
-        "moving {} from the relay to {} (conn {no})",
+        "moving {} from conn {from} to {} (conn {no})",
         short_id(&pin),
         used.route
     ));
     let mut core = super::lock(&shared.core);
-    if let Some(entry) = core.conns.get_mut(&no) {
-        entry.reopen = true;
+    // Published as the caller's candidate: the app reopens on it.
+    if core.conns.get(&no).is_some_and(|entry| entry.reopen) {
         core.out.json(&json!({
             "ev": "path.reopen",
             "identity": hex(pin.as_bytes()),
@@ -1023,6 +1055,7 @@ pub async fn keep_connected(shared: Arc<Shared>, mut kicks: mpsc::UnboundedRecei
             None => return,
         }
     }
+    tokio::spawn(super::lan::run(shared.clone()));
     loop {
         let now = Instant::now();
         if !shared.removal.is_paused() {

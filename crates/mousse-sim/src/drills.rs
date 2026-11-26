@@ -30,6 +30,19 @@ pub(crate) const HANDSHAKE_VARIANTS: &[&str] = &[
     "restart",
 ];
 
+/// Every handshake variant: the picked ones, and `lan-flap`, which half the
+/// `path-switch` seeds run.
+pub(crate) const HANDSHAKE_ALL: &[&str] = &[
+    "windows",
+    "wrong-pin",
+    "expiry-mid-channel",
+    "renewal",
+    "path-switch",
+    "lan-flap",
+    "removal",
+    "restart",
+];
+
 pub(crate) const SHARED_VARIANTS: &[&str] = &[
     "deny-on-one",
     "remove-on-one",
@@ -302,7 +315,12 @@ fn pairing_limits(world: &mut World) -> &'static str {
 // ---- handshake -----------------------------------------------------------------------
 
 fn handshake(world: &mut World) -> &'static str {
-    let variant = world.sim.pick(HANDSHAKE_VARIANTS);
+    let mut variant = world.sim.pick(HANDSHAKE_VARIANTS);
+    // Half the path-switch seeds flap the LAN instead (drawn here so the
+    // other variants keep their seeds).
+    if variant == "path-switch" && world.sim.chance(500) {
+        variant = "lan-flap";
+    }
     header(world, variant);
     let s = &mut world.sim;
     let wide = [
@@ -339,7 +357,7 @@ fn handshake(world: &mut World) -> &'static str {
 
     let s = &mut world.sim;
     s.drop_permille = match variant {
-        "path-switch" => 200,
+        "path-switch" | "lan-flap" => 200,
         _ => s.pick(&[0, 0, 50, 200]),
     };
     s.drop_max = 30_000;
@@ -426,6 +444,41 @@ fn handshake(world: &mut World) -> &'static str {
             while at < end {
                 world.at(at, Script::PathSwitch { dev: laptop });
                 at += world.sim.range(MIN, 15 * MIN);
+            }
+        }
+        "lan-flap" => {
+            // The LAN comes and goes. While it is down the laptop moves to
+            // the tailnet; soon after it heals the LAN probe moves the
+            // laptop back, sometimes into a LAN that drops again within
+            // seconds (a flap), while the move is still being confirmed.
+            let mut at = world.sim.range(30 * SEC, 5 * MIN);
+            while at < end {
+                let down = world.sim.range(2 * SEC, 3 * MIN);
+                world.at(
+                    at,
+                    Script::Partition {
+                        route: lan,
+                        on: true,
+                    },
+                );
+                let away = at + world.sim.range(0, down);
+                world.at(away, Script::PathSwitch { dev: laptop });
+                let healed = at + down;
+                world.at(
+                    healed,
+                    Script::Partition {
+                        route: lan,
+                        on: false,
+                    },
+                );
+                let probe = healed + world.sim.range(SEC, 30 * SEC);
+                world.at(probe, Script::PathSwitch { dev: laptop });
+                at = if world.sim.chance(500) {
+                    // Flap: down again while or just after the move.
+                    probe + world.sim.range(0, 5 * SEC)
+                } else {
+                    probe + world.sim.range(MIN, 20 * MIN)
+                };
             }
         }
         "removal" => {

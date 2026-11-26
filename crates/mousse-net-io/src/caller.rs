@@ -49,19 +49,27 @@
 //!   the connection with `NOT_AUTHORIZED` (wire.md 8.2), and the join ends
 //!   without reconnecting.
 //! - **Search** ([`Caller::search`], Phase 1b §1.4): at most
-//!   `DIAL_MAX_CANDIDATES` candidates, in the order given, in three tiers.
-//!   `tcp` starts at once, `DIAL_PARALLEL` tries at a time, each
-//!   `DIAL_TIMEOUT_MS`; candidates found later (a browse) join it as they
-//!   arrive. `ws`/`wss` starts `TIER_HEAD_START_MS` later (at once with no
-//!   `tcp` candidate), each try `WS_DIAL_TIMEOUT_MS`. `ssh` runs one try at
-//!   a time, each `SSH_DIAL_TIMEOUT_MS`, starting when the first two tiers
-//!   are done or `DIAL_FAST_TIERS_MS` into the search, whichever is first;
-//!   after `TIER_HEAD_START_MS` instead when the last working route was
-//!   `ssh`. The whole search ends after `DIAL_SEARCH_MS`. Each try
-//!   resolves its route once ([`pipe::resolve`]) and dials exactly the
-//!   addresses that gives; `ws`/`wss` and `ssh` pipes come from the
-//!   [`RouteDialer`]s the app gave ([`Caller::use_ws_dialer`],
-//!   [`Caller::use_ssh_dialer`]).
+//!   `DIAL_MAX_CANDIDATES` candidates, by class: LAN, then tailnet, then
+//!   public `tcp` and `ws`/`wss` (a tunnel), then `ssh`. Within a class
+//!   they keep the order given, so the last working route only breaks
+//!   ties. A `tcp` route to a name takes the class of the best address it
+//!   resolves to, resolved once for the whole search. `DIAL_LAN_RESERVED`
+//!   of the places are kept for LAN candidates, so browse results (which
+//!   join as they arrive) still fit. LAN starts at once, `DIAL_PARALLEL`
+//!   tries at a time per class, each `DIAL_TIMEOUT_MS`. Tailnet starts
+//!   `LAN_HEAD_START_MS` later when a LAN candidate was known at the start,
+//!   or a name resolved to a LAN address before it started (at once
+//!   otherwise: a browse still running never holds it back). Classes after
+//!   LAN wait while names are being resolved.
+//!   Public and tunnel candidates start `TIER_HEAD_START_MS` after
+//!   tailnet (at once with no LAN or tailnet candidate), each `ws` try
+//!   `WS_DIAL_TIMEOUT_MS`. `ssh` runs one try at a time, each
+//!   `SSH_DIAL_TIMEOUT_MS`, starting `DIAL_FAST_TIERS_MS` into the search.
+//!   A class starts early once every class before it is done. The whole
+//!   search ends after `DIAL_SEARCH_MS`. Each try dials exactly the
+//!   addresses its route resolved to ([`pipe::resolve`]); `ws`/`wss` and
+//!   `ssh` pipes come from the [`RouteDialer`]s the app gave
+//!   ([`Caller::use_ws_dialer`], [`Caller::use_ssh_dialer`]).
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -145,13 +153,11 @@ pub type LaterCandidates = Pin<Box<dyn Future<Output = Vec<LocalRoute>> + Send>>
 #[derive(Default)]
 pub struct Search {
     /// In order: the last working route, the owner's addresses, then
-    /// approved hints, already filtered by the approvals.
+    /// approved hints, already filtered by the approvals. The search dials
+    /// them by class; this order decides within a class.
     pub candidates: Vec<LocalRoute>,
-    /// The last working route was `ssh`: the `ssh` tier starts after
-    /// `TIER_HEAD_START_MS` instead of waiting for the faster tiers.
-    pub ssh_first: bool,
     /// More `tcp` candidates found while the search runs (an mDNS browse);
-    /// they join the `tcp` tier as they arrive, after the others.
+    /// they join their class as they arrive, after the others.
     pub later: Option<LaterCandidates>,
 }
 
@@ -258,6 +264,10 @@ struct Paths {
     route_gens: HashMap<IdentityPublicKey, u64>,
     /// Bumped with every host's generation.
     all_gen: u64,
+    /// Per pinned host, held by whatever is bringing up a path to replace
+    /// the current one in the background: a renewal, the app's LAN probe
+    /// ([`Caller::try_path_turn`]).
+    turns: HashMap<IdentityPublicKey, Arc<tokio::sync::Mutex<()>>>,
 }
 
 impl Paths {
@@ -427,9 +437,18 @@ type Tried = (LocalRoute, Result<Passed, NetError>);
 
 impl Dialing {
     /// One try: each address of `route` in turn, until one passes step 1.
-    async fn attempt(&self, route: &LocalRoute) -> Result<Passed, NetError> {
+    /// `targets` are its addresses when the search resolved them already.
+    async fn attempt(
+        &self,
+        route: &LocalRoute,
+        targets: Option<Targets>,
+    ) -> Result<Passed, NetError> {
+        let targets = match targets {
+            Some(targets) => targets,
+            None => self.opener.targets(route).await?,
+        };
         let mut last = None;
-        for (addr, class) in self.opener.targets(route).await? {
+        for (addr, class) in targets {
             let tried = async {
                 let pipe = self.opener.open(route, addr).await?;
                 tls::connect(pipe, &self.own, self.pin, self.clock.clone(), self.tls).await
@@ -443,22 +462,54 @@ impl Dialing {
     }
 }
 
-/// The tier of a route kind: `tcp`, `ws`, `ssh`.
-fn tier(kind: RouteKind) -> usize {
-    match kind {
-        RouteKind::Tcp => 0,
-        RouteKind::Ws => 1,
-        RouteKind::Ssh => 2,
+/// Where one try dials: each address with its class (`None` for `ssh`).
+type Targets = Vec<(Option<SocketAddr>, RouteClass)>;
+
+/// The order a search dials classes in (Phase 1b §1.4): LAN, tailnet,
+/// public and tunnel, ssh.
+const CLASSES: usize = 4;
+
+/// The place of a path class in that order.
+fn rank(class: RouteClass) -> usize {
+    match class {
+        RouteClass::Lan => 0,
+        RouteClass::Tailnet => 1,
+        RouteClass::Public | RouteClass::Tunnel => 2,
+        RouteClass::Ssh => 3,
     }
+}
+
+/// The place of `route` in the search's order, when it is known without a
+/// lookup: `None` for a `tcp` route to a name.
+pub fn route_rank(policy: &AddrPolicy, route: &LocalRoute) -> Option<usize> {
+    match route.kind() {
+        RouteKind::Ssh => Some(rank(RouteClass::Ssh)),
+        RouteKind::Ws => Some(rank(RouteClass::Tunnel)),
+        RouteKind::Tcp => match (route.ip(), route.port()) {
+            (Some(ip), Some(port)) => Some(rank(RouteClass::of_tcp(
+                policy.class_of(SocketAddr::new(ip, port)),
+            ))),
+            _ => None,
+        },
+    }
+}
+
+/// Whether `route` is a LAN candidate as far as is known without a lookup.
+pub fn is_lan_route(policy: &AddrPolicy, route: &LocalRoute) -> bool {
+    route_rank(policy, route) == Some(rank(RouteClass::Lan))
 }
 
 /// What woke a search.
 enum Woke {
     Try(Option<Result<(tokio::task::Id, Box<Tried>), tokio::task::JoinError>>),
+    Ranked(Option<Result<Ranked, tokio::task::JoinError>>),
     Later(Vec<LocalRoute>),
     Tick,
     Deadline,
 }
+
+/// A name a search resolved: its route and where it leads, or why not.
+type Ranked = (LocalRoute, Result<Targets, NetError>);
 
 fn lock(paths: &Mutex<Paths>) -> MutexGuard<'_, Paths> {
     paths.lock().unwrap_or_else(|e| e.into_inner())
@@ -821,10 +872,32 @@ where
             .is_some_and(|c| c.conn == conn.id() && c.phase == CandidatePhase::Reopening)
     }
 
+    fn path_turn(&self, pin: &IdentityPublicKey) -> Arc<tokio::sync::Mutex<()>> {
+        lock(&self.paths).turns.entry(*pin).or_default().clone()
+    }
+
+    /// The turn to bring up a path that replaces `pin`'s current one in the
+    /// background, if nothing else is: no renewal searching, no candidate
+    /// path waiting to be reopened. Hold it until the new path is the
+    /// candidate; a renewal that comes due meanwhile waits for it.
+    pub fn try_path_turn(
+        &self,
+        pin: &IdentityPublicKey,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let turn = self.path_turn(pin).try_lock_owned().ok()?;
+        let busy = lock(&self.paths)
+            .sessions
+            .get(pin)
+            .is_some_and(|session| session.candidate().is_some());
+        (!busy).then_some(turn)
+    }
+
     /// Bring up a new path to `pin` for a renewal: live, not yet current.
     /// The search comes from the candidate source, built now; without one,
-    /// from the routes kept at this generation.
+    /// from the routes kept at this generation. One at a time with the
+    /// app's own background path changes ([`Caller::try_path_turn`]).
     async fn renew(&self, pin: IdentityPublicKey) -> Result<(Connection, Reached), NetError> {
+        let _turn = self.path_turn(&pin).lock_owned().await;
         let stale = cfg!(mousse_control = "stale-renewal-routes");
         let (gen, remembered) = {
             let paths = lock(&self.paths);
@@ -1094,7 +1167,7 @@ where
             opener: self.opener.clone(),
         };
         let within = self.opener.within(route.kind());
-        let (stream, _, _) = tokio::time::timeout(within, dialing.attempt(route))
+        let (stream, _, _) = tokio::time::timeout(within, dialing.attempt(route, None))
             .await
             .unwrap_or(Err(NetError::Timeout("route test")))?;
         drop(stream);
@@ -1140,42 +1213,26 @@ where
                 .unwrap_or(1)
                 .max(1)
         };
+        // Places only LAN candidates take: at most half, so other classes
+        // always have some.
+        let reserved = usize::try_from(io.dial_lan_reserved())
+            .unwrap_or(0)
+            .min(max / 2);
         let parallel = usize::try_from(io.dial_parallel()).unwrap_or(1).max(1);
+        let policy = self.opener.addrs.clone();
         let mut taken: Vec<LocalRoute> = Vec::new();
-        let mut queues: [VecDeque<LocalRoute>; 3] = Default::default();
-        let take = |route: LocalRoute,
-                    taken: &mut Vec<LocalRoute>,
-                    queues: &mut [VecDeque<LocalRoute>; 3]| {
-            if taken.len() < max && !taken.contains(&route) {
-                taken.push(route.clone());
-                queues[tier(route.kind())].push_back(route);
-            }
+        let mut wide_taken = 0usize;
+        let mut queues: [VecDeque<(LocalRoute, Option<Targets>)>; CLASSES] = Default::default();
+        // Takes `route` into the search if it fits: LAN candidates up to
+        // `max`, the others up to `max - reserved`. `class` is `None` for a
+        // name not resolved yet, which counts as not LAN.
+        let fits = |class: Option<usize>, taken: &[LocalRoute], wide_taken: usize| {
+            taken.len() < max && (class == Some(0) || wide_taken < max - reserved)
         };
         let Search {
             candidates,
-            ssh_first,
             mut later,
         } = search;
-        for route in candidates {
-            take(route, &mut taken, &mut queues);
-        }
-        let start = Instant::now();
-        let deadline = (!unbounded).then(|| start + ms(io.dial_search_ms()));
-        let head = ms(io.tier_head_start_ms());
-        let ws_at = if queues[0].is_empty() && later.is_none() {
-            start
-        } else {
-            start + head
-        };
-        let mut ssh_at = if ssh_first {
-            start + head
-        } else {
-            start + ms(io.dial_fast_tiers_ms())
-        };
-        // The control build starts ssh with tcp.
-        if cfg!(mousse_control = "ssh-races-lan") {
-            ssh_at = start;
-        }
         let dialing = Dialing {
             own: self.certs.current()?,
             pin,
@@ -1183,51 +1240,125 @@ where
             tls: self.policy,
             opener: self.opener.clone(),
         };
+        // Names resolve once, for their class and for the try.
+        let mut ranking: tokio::task::JoinSet<Ranked> = tokio::task::JoinSet::new();
+        let mut known: Vec<(usize, LocalRoute)> = Vec::new();
+        for route in candidates {
+            if taken.contains(&route) {
+                continue;
+            }
+            let class = route_rank(&policy, &route);
+            if !fits(class, &taken, wide_taken) {
+                continue;
+            }
+            taken.push(route.clone());
+            match class {
+                Some(class) => {
+                    if class != 0 {
+                        wide_taken += 1;
+                    }
+                    known.push((class, route));
+                }
+                None => {
+                    wide_taken += 1;
+                    let opener = dialing.opener.clone();
+                    let within = opener.within(route.kind());
+                    ranking.spawn(async move {
+                        let targets = tokio::time::timeout(within, opener.targets(&route))
+                            .await
+                            .unwrap_or(Err(NetError::Timeout("resolve the candidate")));
+                        (route, targets)
+                    });
+                }
+            }
+        }
+        // By class; the order given within one.
+        known.sort_by_key(|(class, _)| *class);
+        for (class, route) in known {
+            queues[class].push_back((route, None));
+        }
+        let start = Instant::now();
+        let deadline = (!unbounded).then(|| start + ms(io.dial_search_ms()));
+        let head = ms(io.tier_head_start_ms());
+        // The control build gives LAN no head start over tailnet.
+        let lan_head = if cfg!(mousse_control = "no-lan-head-start") {
+            Duration::ZERO
+        } else {
+            ms(io.lan_head_start_ms())
+        };
+        let tailnet_at = if queues[0].is_empty() {
+            start
+        } else {
+            start + lan_head
+        };
+        let nearer = !queues[0].is_empty()
+            || !queues[1].is_empty()
+            || !ranking.is_empty()
+            || later.is_some();
+        let mut at = [
+            start,
+            tailnet_at,
+            if nearer { tailnet_at + head } else { start },
+            start + ms(io.dial_fast_tiers_ms()),
+        ];
+        // The control build starts ssh with tcp.
+        if cfg!(mousse_control = "ssh-races-lan") {
+            at[3] = start;
+        }
         let mut tries = tokio::task::JoinSet::new();
         let mut kinds: HashMap<tokio::task::Id, usize> = HashMap::new();
-        let mut running = [0usize; 3];
+        let mut running = [0usize; CLASSES];
+        let mut started = [false; CLASSES];
         let mut last = None;
         let mut step1 = Step1Failures::default();
         loop {
             let now = Instant::now();
-            let fast_done = later.is_none()
-                && queues[0].is_empty()
-                && queues[1].is_empty()
-                && running[0] == 0
-                && running[1] == 0;
-            if fast_done && now < ssh_at {
-                ssh_at = now;
+            // A class starts early once every class before it is done. A
+            // browse still running holds back only public, tunnel and ssh.
+            for (t, at) in at.iter_mut().enumerate().skip(1) {
+                let before_done = ranking.is_empty()
+                    && (t == 1 || later.is_none())
+                    && (0..t).all(|u| queues[u].is_empty() && running[u] == 0);
+                if before_done && now < *at {
+                    *at = now;
+                }
             }
-            for (t, opens) in [(0, true), (1, now >= ws_at), (2, now >= ssh_at)] {
-                let cap = if t == 2 { 1 } else { parallel };
-                while opens && running[t] < cap {
-                    let Some(route) = queues[t].pop_front() else {
+            for t in 0..CLASSES {
+                let cap = if t == 3 { 1 } else { parallel };
+                // Names being resolved may be LAN: the others wait for them.
+                while now >= at[t] && running[t] < cap && (t == 0 || ranking.is_empty()) {
+                    let Some((route, targets)) = queues[t].pop_front() else {
                         break;
                     };
                     let within = dialing.opener.within(route.kind());
                     let d = dialing.clone();
                     let handle = tries.spawn(async move {
-                        let result = tokio::time::timeout(within, d.attempt(&route))
+                        let result = tokio::time::timeout(within, d.attempt(&route, targets))
                             .await
                             .unwrap_or(Err(NetError::Timeout("candidate address")));
                         (route, result)
                     });
                     kinds.insert(handle.id(), t);
                     running[t] += 1;
+                    started[t] = true;
                 }
             }
-            if tries.is_empty() && later.is_none() && queues.iter().all(VecDeque::is_empty) {
+            if tries.is_empty()
+                && ranking.is_empty()
+                && later.is_none()
+                && queues.iter().all(VecDeque::is_empty)
+            {
                 break;
             }
-            let tick = [(1, ws_at), (2, ssh_at)]
-                .into_iter()
-                .filter(|(t, at)| !queues[*t].is_empty() && *at > now)
-                .map(|(_, at)| at)
+            let tick = (1..CLASSES)
+                .filter(|t| !queues[*t].is_empty() && at[*t] > now)
+                .map(|t| at[t])
                 .min();
             let woke = tokio::select! {
                 joined = tries.join_next_with_id(), if !tries.is_empty() => {
                     Woke::Try(joined.map(|r| r.map(|(id, tried)| (id, Box::new(tried)))))
                 }
+                ranked = ranking.join_next(), if !ranking.is_empty() => Woke::Ranked(ranked),
                 found = async {
                     match later.as_mut() {
                         Some(found) => found.await,
@@ -1248,16 +1379,49 @@ where
                 } => Woke::Deadline,
             };
             let (route, result) = match woke {
-                Woke::Tick | Woke::Try(None) => continue,
+                Woke::Tick | Woke::Try(None) | Woke::Ranked(None) | Woke::Ranked(Some(Err(_))) => {
+                    continue
+                }
+                Woke::Ranked(Some(Ok((route, targets)))) => {
+                    match targets {
+                        Ok(mut targets) => {
+                            // The best address first; the name takes its class.
+                            targets.sort_by_key(|(_, class)| rank(*class));
+                            let class = targets.first().map_or(2, |(_, c)| rank(*c));
+                            // A LAN name known before the tailnet started
+                            // gets the LAN's head start.
+                            if class == 0 && !started[1] {
+                                at[1] = at[1].max(start + lan_head);
+                                at[2] = at[2].max(at[1] + head);
+                            }
+                            queues[class].push_back((route, Some(targets)));
+                        }
+                        // Resolved to nothing that may be dialled: a try
+                        // that failed.
+                        Err(e) => last = Some(e),
+                    }
+                    continue;
+                }
                 Woke::Later(found) => {
                     later = None;
                     for route in found {
-                        take(route, &mut taken, &mut queues);
+                        let class = route_rank(&policy, &route);
+                        if taken.contains(&route) || !fits(class, &taken, wide_taken) {
+                            continue;
+                        }
+                        // Browse results are IP literals.
+                        let Some(class) = class else { continue };
+                        taken.push(route.clone());
+                        if class != 0 {
+                            wide_taken += 1;
+                        }
+                        queues[class].push_back((route, None));
                     }
                     continue;
                 }
                 Woke::Deadline => {
                     tries.abort_all();
+                    ranking.abort_all();
                     return Err(NetError::Timeout("search for the host (DIAL_SEARCH_MS)"));
                 }
                 Woke::Try(Some(Err(e))) => {
@@ -1279,6 +1443,7 @@ where
                     // Step 1 passed: this is the pinned host. The other
                     // tries end here.
                     tries.abort_all();
+                    ranking.abort_all();
                     let id = self.admit(pin, &handshake)?;
                     let conn = self.start(id, stream, handshake, pin, None);
                     return match conn.settled(false).await {
