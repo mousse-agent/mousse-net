@@ -524,17 +524,18 @@ async fn ssh_starts_at_dial_fast_tiers_ms_and_can_win() {
     assert_eq!(starts[0].1, None, "ssh resolves its own target");
 }
 
-/// When the last working route was `ssh`, the `ssh` tier starts after the
-/// head start instead of waiting for the faster tiers.
+/// An `ssh` route first in the list (the last working route) still waits
+/// for the faster classes: the last working route only breaks ties within
+/// its class.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ssh_starts_after_the_head_start_when_the_last_route_was_ssh() {
+async fn ssh_first_in_the_list_still_waits_for_the_faster_classes() {
     let e = engine().await;
     let (dead, _) = silent().await;
     let mut caller = granted(
         &e,
         Arc::new(ManualClock::new()),
         &[
-            ("DIAL_TIMEOUT_MS", 10_000),
+            ("DIAL_TIMEOUT_MS", 1_500),
             ("DIAL_FAST_TIERS_MS", 60_000),
             ("TIER_HEAD_START_MS", 400),
         ],
@@ -542,23 +543,288 @@ async fn ssh_starts_after_the_head_start_when_the_last_route_was_ssh() {
     let seen = Seen::default();
     let t0 = Instant::now();
     caller.use_ssh_dialer(standin(t0, &seen, Some(e.addr)));
-    let search = Search {
-        candidates: vec![route("ssh://me@box"), tcp(dead)],
-        ssh_first: true,
-        later: None,
-    };
     let (_conn, reached) = within(
         "the search",
         Duration::from_secs(20),
-        caller.search(search, e.host.identity()),
+        caller.search(
+            Search::of(vec![route("ssh://me@box"), tcp(dead)]),
+            e.host.identity(),
+        ),
     )
     .await
     .unwrap();
     assert_eq!(reached.class, RouteClass::Ssh);
     let start = seen.starts()[0].0;
     assert!(
-        start >= Duration::from_millis(350) && start < Duration::from_secs(5),
-        "{start:?}"
+        start >= Duration::from_millis(1_300),
+        "ssh started at {start:?}"
+    );
+}
+
+/// A loopback relay to `to` that waits `delay` before it connects on;
+/// counts the connections it took.
+async fn slow_relay(to: SocketAddr, delay: Duration) -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let count = Arc::new(AtomicUsize::new(0));
+    let seen = count.clone();
+    tokio::spawn(async move {
+        while let Ok((mut inbound, _)) = listener.accept().await {
+            seen.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                if let Ok(mut outbound) = tokio::net::TcpStream::connect(to).await {
+                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                }
+            });
+        }
+    });
+    (addr, count)
+}
+
+/// A caller that takes the loopback ports `tailnet` as tailnet addresses.
+fn with_tailnet(caller: &mut Caller, tailnet: &[SocketAddr]) {
+    let map: Vec<String> = tailnet
+        .iter()
+        .map(|a| format!("{}=tailnet", a.port()))
+        .collect();
+    caller.use_addr_policy(AddrPolicy::debug().with_class_map(&map.join(",")).unwrap());
+}
+
+/// The class order (Phase 1b §1.4), the reported case: a host reached
+/// both on the LAN and over the tailnet. A tailnet candidate that answers
+/// first, and comes first in the list (its last working route), does not
+/// win while a known LAN candidate is still within its head start; it is
+/// not even dialled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_known_lan_candidate_wins_over_a_faster_tailnet_one() {
+    let e = engine().await;
+    let (lan, _) = slow_relay(e.addr, Duration::from_millis(300)).await;
+    let (tail, tail_taken) = relay(e.addr).await;
+    let mut caller = granted(
+        &e,
+        Arc::new(ManualClock::new()),
+        &[("LAN_HEAD_START_MS", 3_000)],
+    );
+    with_tailnet(&mut caller, &[tail]);
+    let (_conn, reached) = within(
+        "the search",
+        Duration::from_secs(15),
+        caller.search(Search::of(vec![tcp(tail), tcp(lan)]), e.host.identity()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reached.class, RouteClass::Lan);
+    assert_eq!(reached.route, tcp(lan));
+    assert_eq!(
+        tail_taken.load(Ordering::SeqCst),
+        0,
+        "the tailnet was dialled"
+    );
+}
+
+/// Tailnet candidates start at once when no LAN candidate is known: a
+/// browse that is still running never holds them back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_running_browse_does_not_hold_back_the_tailnet() {
+    let e = engine().await;
+    let (tail, _) = relay(e.addr).await;
+    let mut caller = granted(
+        &e,
+        Arc::new(ManualClock::new()),
+        &[
+            ("LAN_HEAD_START_MS", 10_000),
+            ("TIER_HEAD_START_MS", 10_000),
+        ],
+    );
+    with_tailnet(&mut caller, &[tail]);
+    let search = Search {
+        candidates: vec![tcp(tail)],
+        later: Some(Box::pin(std::future::pending())),
+        ..Search::default()
+    };
+    let t0 = Instant::now();
+    let (_conn, reached) = within(
+        "the search",
+        Duration::from_secs(15),
+        caller.search(search, e.host.identity()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reached.class, RouteClass::Tailnet);
+    assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+}
+
+/// The tailnet does not wait out the LAN head start once every LAN
+/// candidate failed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_tailnet_starts_once_the_lan_candidates_failed() {
+    let e = engine().await;
+    let closed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap()
+    };
+    let (tail, _) = relay(e.addr).await;
+    let mut caller = granted(
+        &e,
+        Arc::new(ManualClock::new()),
+        &[("LAN_HEAD_START_MS", 10_000)],
+    );
+    with_tailnet(&mut caller, &[tail]);
+    let t0 = Instant::now();
+    let (_conn, reached) = within(
+        "the search",
+        Duration::from_secs(15),
+        caller.search(Search::of(vec![tcp(closed), tcp(tail)]), e.host.identity()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reached.class, RouteClass::Tailnet);
+    assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+}
+
+/// Browse results still fit when the other candidates fill
+/// DIAL_MAX_CANDIDATES: places are kept for LAN candidates.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_browse_result_fits_when_the_candidates_are_full() {
+    let e = engine().await;
+    let mut dead = Vec::new();
+    for _ in 0..6 {
+        dead.push(silent().await.0);
+    }
+    let mut caller = granted(
+        &e,
+        Arc::new(ManualClock::new()),
+        &[("DIAL_MAX_CANDIDATES", 4), ("DIAL_TIMEOUT_MS", 10_000)],
+    );
+    with_tailnet(&mut caller, &dead);
+    let host = e.addr;
+    let search = Search {
+        candidates: dead.iter().map(|a| tcp(*a)).collect(),
+        later: Some(Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            vec![tcp(host)]
+        })),
+        ..Search::default()
+    };
+    let (_conn, reached) = within(
+        "the search",
+        Duration::from_secs(15),
+        caller.search(search, e.host.identity()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reached.route, tcp(host));
+    assert_eq!(reached.class, RouteClass::Lan);
+}
+
+/// The bound takes candidates in class order: internet ones that come
+/// first in the list never take the places a later tailnet one needs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn earlier_internet_candidates_leave_room_for_a_tailnet_one() {
+    let e = engine().await;
+    let (tail, _) = relay(e.addr).await;
+    let mut public = Vec::new();
+    for _ in 0..3 {
+        public.push(silent().await.0);
+    }
+    // Four places, two of them kept for LAN: two for everything else.
+    let mut caller = granted(
+        &e,
+        Arc::new(ManualClock::new()),
+        &[("DIAL_MAX_CANDIDATES", 4), ("DIAL_TIMEOUT_MS", 10_000)],
+    );
+    let mut map: Vec<String> = public
+        .iter()
+        .map(|a| format!("{}=public", a.port()))
+        .collect();
+    map.push(format!("{}=tailnet", tail.port()));
+    caller.use_addr_policy(AddrPolicy::debug().with_class_map(&map.join(",")).unwrap());
+    let mut candidates: Vec<LocalRoute> = public.iter().map(|a| tcp(*a)).collect();
+    candidates.push(tcp(tail));
+    let (_conn, reached) = within(
+        "the search",
+        Duration::from_secs(15),
+        caller.search(Search::of(candidates), e.host.identity()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reached.route, tcp(tail));
+    assert_eq!(reached.class, RouteClass::Tailnet);
+}
+
+/// A host whose LAN keeps dropping (`lan_demoted`): its LAN candidates
+/// dial after the tailnet, with no head start, so a working tailnet wins
+/// before the LAN is tried; with no tailnet, the LAN is still dialled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_demoted_lan_dials_after_the_tailnet_but_is_still_dialled() {
+    let e = engine().await;
+    let (lan, lan_taken) = relay(e.addr).await;
+    let (tail, _) = slow_relay(e.addr, Duration::from_millis(300)).await;
+    let mut caller = granted(
+        &e,
+        Arc::new(ManualClock::new()),
+        &[("LAN_HEAD_START_MS", 3_000), ("TIER_HEAD_START_MS", 3_000)],
+    );
+    with_tailnet(&mut caller, &[tail]);
+    let demoted = |candidates| Search {
+        candidates,
+        lan_demoted: true,
+        ..Search::default()
+    };
+    let (_conn, reached) = within(
+        "the search",
+        Duration::from_secs(15),
+        caller.search(demoted(vec![tcp(lan), tcp(tail)]), e.host.identity()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reached.class, RouteClass::Tailnet);
+    assert_eq!(lan_taken.load(Ordering::SeqCst), 0, "the LAN was dialled");
+    let (_conn, reached) = within(
+        "the LAN-only search",
+        Duration::from_secs(15),
+        caller.search(demoted(vec![tcp(lan)]), e.host.identity()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reached.class, RouteClass::Lan);
+}
+
+/// A name takes the class of the address it resolves to: a name of a LAN
+/// address beats a tailnet literal that comes first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_name_is_ranked_by_the_address_it_resolves_to() {
+    let e = engine().await;
+    let (lan, _) = slow_relay(e.addr, Duration::from_millis(300)).await;
+    let (tail, tail_taken) = relay(e.addr).await;
+    let mut caller = granted(
+        &e,
+        Arc::new(ManualClock::new()),
+        &[("LAN_HEAD_START_MS", 3_000)],
+    );
+    with_tailnet(&mut caller, &[tail]);
+    caller.use_resolver(Arc::new(Answers {
+        calls: AtomicUsize::new(0),
+        answers: vec![vec![lan]],
+    }));
+    let named = route(&format!("tcp://desk.test:{}", lan.port()));
+    let (_conn, reached) = within(
+        "the search",
+        Duration::from_secs(15),
+        caller.search(
+            Search::of(vec![tcp(tail), named.clone()]),
+            e.host.identity(),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reached.route, named);
+    assert_eq!(reached.class, RouteClass::Lan);
+    assert_eq!(
+        tail_taken.load(Ordering::SeqCst),
+        0,
+        "the tailnet was dialled"
     );
 }
 
@@ -1631,4 +1897,84 @@ fn a_renewed_path_carries_its_route() {
             .cloned()
     });
     assert_eq!(inbound["route"], tailnet, "{inbound}");
+}
+
+/// A loopback forwarder to `target` that waits `delay` before it connects
+/// on.
+fn slow_forwarder(target: &str, delay: Duration) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let route = format!("tcp://{}", listener.local_addr().unwrap());
+    let target = target.trim_start_matches("tcp://").to_owned();
+    std::thread::spawn(move || {
+        for inbound in listener.incoming().flatten() {
+            let target = target.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(delay);
+                let Ok(outbound) = std::net::TcpStream::connect(&target) else {
+                    return;
+                };
+                let (mut in_r, mut out_w) =
+                    (inbound.try_clone().unwrap(), outbound.try_clone().unwrap());
+                std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut in_r, &mut out_w);
+                });
+                let (mut out_r, mut in_w) = (outbound, inbound);
+                let _ = std::io::copy(&mut out_r, &mut in_w);
+            });
+        }
+    });
+    route
+}
+
+/// A renewal searches with the browse and the class order too: a path on
+/// the tailnet is renewed on the LAN once the browse finds the host there.
+/// (The background LAN probe is held off, so the renewal is what moves.)
+#[test]
+fn a_renewal_on_the_tailnet_moves_to_the_lan_the_browse_found() {
+    let clock = [("MOUSSE_HELPER_MANUAL_CLOCK", std::path::Path::new("1"))];
+    let a_end = Endpoint::init("rla");
+    let b_end = Endpoint::init("rlb");
+    let browse = b_end.dir.join("browse-hosts.txt");
+    std::fs::write(&browse, "").unwrap();
+    let mut a = a_end.app_raw("hostA", &[], 0, &clock);
+    a.hello();
+    let a_route = route_of(&mut a);
+    let tail = slow_forwarder(&a_route, Duration::from_millis(400));
+    let tail_port = tail.rsplit(':').next().unwrap().to_owned();
+    let map = format!("{tail_port}=tailnet");
+    let raw = [clock[0], ("MOUSSE_HELPER_BROWSE_FILE", browse.as_path())];
+    let mut b = b_end.app_raw(
+        "peerB",
+        &[
+            ("TEST_CLASS_MAP", &map),
+            ("BROWSE_CACHE_MS", "0"),
+            ("LAN_PROBE_FIRST_MS", "600000"),
+            ("LAN_PROBE_MAX_MS", "600000"),
+        ],
+        0,
+        &raw,
+    );
+    b.hello();
+    trust(&mut a, &mut b, &[]);
+    b.call(
+        "peer.addresses.set",
+        json!({"identity": a.identity, "routes": [tail]}),
+    );
+    let a_id = a.identity.clone();
+    let first = b.event("conn.up", |m| {
+        m["dir"] == "out" && m["identity"] == a_id.as_str()
+    });
+    assert_eq!(first["route"]["class"], "tailnet", "{first}");
+    std::fs::write(
+        &browse,
+        format!("{}\n", a_route.trim_start_matches("tcp://")),
+    )
+    .unwrap();
+    let deadline = first["deadline"].as_i64().unwrap();
+    clocks_to_renewal(&mut a, &mut b, deadline);
+    let reopen = b.event("path.reopen", |m| m["identity"] == a_id.as_str());
+    assert_eq!(reopen["from"], first["conn"]);
+    let renewed = reopen["conn"].clone();
+    let up = b.event("conn.up", |m| m["conn"] == renewed);
+    assert_eq!(up["route"]["class"], "lan", "{up}");
 }

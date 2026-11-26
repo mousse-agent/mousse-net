@@ -56,11 +56,15 @@ mousse_net_core::define_limits! {
         dial_parallel = "DIAL_PARALLEL": 4, [1, 64];
         /// Caller: how long one candidate address may take to connect and pass step 1 before the next is tried (Phase 1a §6).
         dial_timeout_ms = "DIAL_TIMEOUT_MS": 2_000, [100, 60_000];
-        /// Caller: candidates kept for one search, in order: the last working route, the owner's addresses, approved hints, then browse results (Phase 1b §1.4).
+        /// Caller: candidates kept for one search, LAN first, then tailnet, public and tunnel, then ssh; the last working route first within its class (Phase 1b §1.4).
         dial_max_candidates = "DIAL_MAX_CANDIDATES": 16, [1, 64];
-        /// Caller: wait after the `tcp` tier starts before `ws`/`wss` candidates start (at once when there is no `tcp` candidate; Phase 1b §1.4).
+        /// Caller: of those, places only LAN candidates may take, so browse results that arrive late still fit (at most half of DIAL_MAX_CANDIDATES; Phase 1b §1.4).
+        dial_lan_reserved = "DIAL_LAN_RESERVED": 4, [0, 32];
+        /// Caller: when a LAN candidate is known at the start of a search, how long tailnet candidates wait for it (they start at once when the LAN ones are done; Phase 1b §1.4).
+        lan_head_start_ms = "LAN_HEAD_START_MS": 1_000, [0, 10_000];
+        /// Caller: wait after tailnet candidates start before public `tcp` and `ws`/`wss` candidates start (at once with no LAN or tailnet candidate; Phase 1b §1.4).
         tier_head_start_ms = "TIER_HEAD_START_MS": 500, [0, 10_000];
-        /// Caller: latest start of the `ssh` tier, from the start of the search; it starts earlier once the `tcp` and `ws` tiers are done (Phase 1b §1.4).
+        /// Caller: latest start of the `ssh` tier, from the start of the search; it starts earlier once every other class is done (Phase 1b §1.4).
         dial_fast_tiers_ms = "DIAL_FAST_TIERS_MS": 12_000, [1_000, 60_000];
         /// Caller: one whole search across every tier; past it the search ends unreachable (Phase 1b §1.4).
         dial_search_ms = "DIAL_SEARCH_MS": 45_000, [5_000, 300_000];

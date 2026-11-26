@@ -250,6 +250,14 @@ impl CachedBrowse {
         Ok(found)
     }
 
+    /// The cached results while they are fresh, without browsing: `None`
+    /// when there are none or a browse is running.
+    pub fn cached(&self) -> Option<Vec<SocketAddr>> {
+        let cache = self.cache.try_lock().ok()?;
+        let (at, found) = cache.as_ref()?;
+        (self.clock.mono() < at.plus(self.keep_ms)).then(|| found.clone())
+    }
+
     /// Forget the cached results (the network changed).
     pub async fn forget(&self) {
         *self.cache.lock().await = None;

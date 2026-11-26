@@ -34,6 +34,7 @@ mod budget;
 mod changes;
 mod engine_ops;
 mod frame;
+mod lan;
 mod out;
 mod pairing;
 mod paths;
@@ -42,6 +43,7 @@ mod relay_store;
 mod routes;
 
 pub use changes::{clock, interface_ips, interface_source};
+pub use lan::LanFlaps;
 pub use paths::{browse_source, StoreCandidates};
 pub(crate) use relay::dial_join_route;
 
@@ -131,6 +133,9 @@ pub struct AppInfo {
     pub state_dir: PathBuf,
     /// Where to look for paired hosts that moved (Phase 1a §6).
     pub browse: Option<Arc<mousse_net_io::discovery::CachedBrowse>>,
+    /// Hosts whose LAN paths keep dropping (shared with
+    /// [`StoreCandidates`]).
+    pub lan_flaps: Arc<LanFlaps>,
     /// The identity key, to sign this host's manifest.
     pub signer: mousse_net_io::SharedSigner,
     /// The endpoint id and where its identity is kept: the relay seed is
@@ -223,6 +228,10 @@ struct ConnEntry {
     caller_opened: bool,
     /// Outbound through a relay: the route, for its bulk companion.
     via: Option<mousse_net_core::relay_endpoint::RelayRoute>,
+    /// The class of its route as `conn.up` named it (`lan`, `tailnet`, ...).
+    class: Option<String>,
+    /// When it was published.
+    since: tokio::time::Instant,
     /// How often `peer.forget` had removed the peer when this was published
     /// ([`Core::peer_gen`]): once it differs, the path is closing.
     gen: u64,
@@ -292,6 +301,8 @@ enum Stale {
     Paused,
     /// Its peer was forgotten meanwhile.
     Forgotten,
+    /// Its routes changed meanwhile.
+    Rerouted,
 }
 
 fn lock(core: &Mutex<Core>) -> MutexGuard<'_, Core> {
@@ -552,7 +563,16 @@ impl Shared {
         inbound: bool,
         fields: Value,
     ) -> Result<u64, Stale> {
-        self.publish(conn, inbound, None, fields)
+        self.publish(conn, inbound, None, None, fields)
+    }
+
+    /// The routes of `pin` changed (an address set, an approval given or
+    /// taken back, the host forgotten): the caller's route generation is
+    /// bumped under the core lock, which a path that must still match it
+    /// is published under ([`Shared::add_outbound_routed`]).
+    fn forget_routes(&self, pin: &IdentityPublicKey) {
+        let _core = lock(&self.core);
+        self.caller.forget_routes(Some(pin));
     }
 
     /// The generation of `pin` (see `Core::peer_gen`).
@@ -574,7 +594,19 @@ impl Shared {
         gen: u64,
         fields: Value,
     ) -> Result<u64, Stale> {
-        self.publish(conn, false, Some(gen), fields)
+        self.publish(conn, false, Some(gen), None, fields)
+    }
+
+    /// [`Shared::add_outbound`] for a path found on `pin`'s routes at
+    /// route generation `routes`: if they changed since, it is closed.
+    fn add_outbound_routed(
+        self: &Arc<Self>,
+        conn: Connection,
+        gen: u64,
+        routes: u64,
+        fields: Value,
+    ) -> Result<u64, Stale> {
+        self.publish(conn, false, Some(gen), Some(routes), fields)
     }
 
     /// Note that outbound connection `no` runs through a relay route.
@@ -589,6 +621,7 @@ impl Shared {
         conn: Connection,
         inbound: bool,
         gen: Option<u64>,
+        routes: Option<u64>,
         mut fields: Value,
     ) -> Result<u64, Stale> {
         let identity = *conn.peer();
@@ -616,6 +649,16 @@ impl Shared {
                     return Err(Stale::Forgotten);
                 }
             }
+            // Route edits bump the generation under this lock.
+            if routes.is_some_and(|routes| self.caller.route_generation(&identity) != routes) {
+                drop(core);
+                conn.close(ErrorCode::Cancelled);
+                applog::line(format!(
+                    "closed a new path to {}: its routes changed meanwhile",
+                    short_id(&identity)
+                ));
+                return Err(Stale::Rerouted);
+            }
             // Under the core lock `path.reopened` takes, so the app can
             // reopen this path as soon as it sees `conn.up`.
             let reopen = !inbound && self.caller.is_reopening(&conn);
@@ -632,6 +675,11 @@ impl Shared {
                     reopen,
                     caller_opened: false,
                     via: None,
+                    class: fields
+                        .pointer("/route/class")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    since: tokio::time::Instant::now(),
                     gen,
                 },
             );
@@ -647,6 +695,7 @@ impl Shared {
             if !inbound {
                 let shared = self.clone();
                 tokio::spawn(async move { relay::ensure_keys(&shared, &conn).await });
+                self.keep.lan.wake();
             }
             no
         };
@@ -680,6 +729,11 @@ impl Shared {
         drop(core);
         relay::conn_gone(self, no);
         if !entry.inbound {
+            if entry.class.as_deref() == Some(mousse_net_io::RouteClass::Lan.name()) {
+                self.info
+                    .lan_flaps
+                    .lan_down(entry.identity, entry.since.elapsed(), &self.limits);
+            }
             self.keep.kick(paths::Kick::Look);
             if entry.via.is_some() {
                 let shared = self.clone();

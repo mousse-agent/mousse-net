@@ -32,9 +32,11 @@ part B), so "Send link" is in scope and its checks are not DEFERRED.
    its source. A peer can never make this computer run `ssh`. Loopback is
    dialled in release builds only as an owner-entered plain `ws` address,
    the local hop of a tunnel client.
-3. **Dial in bounded tiers:** `tcp`, then `ws` after a head start, then
-   `ssh` (§1.4). An SSH login is never raced against a LAN path, unless the
-   last working route was SSH.
+3. **The LAN first, in bounded classes:** LAN, then tailnet, then
+   internet and tunnel, then SSH (§1.4). The last working route only
+   breaks ties within its class, so an SSH login is never raced against a
+   LAN path, and a host reached another way moves to the LAN once it
+   answers there.
 4. **Adding over SSH is its own bootstrap** (§3.4). It uses no invitation,
    no CPace and no wire change. After the owner consents on A, B grants A
    through its daemon, and A pins B from the reply of the verified SSH
@@ -178,21 +180,33 @@ is an allowlist: an address in none of the first three rows is
 
 - **Candidates.** The list is built from the current store on every
   search, never from a remembered list (§1.5), and filtered through the
-  approvals (§1.3). The order is: last working route, owner addresses,
-  approved hints, then browse results. At most `DIAL_MAX_CANDIDATES` are
-  kept, in that order.
-- **Concurrency.** Each tier keeps 1a's race, `DIAL_PARALLEL` tries at
-  once.
-- **Tiers:**
-  1. **`tcp`**, each try `DIAL_TIMEOUT_MS`. mDNS browse runs beside it, up
-     to `BROWSE_WAIT_MS`, and its results join the tier's queue as they
-     arrive.
-  2. **`ws`/`wss`**, starting `TIER_HEAD_START_MS` after tier 1 (at once if
-     tier 1 is empty). Each try gets `WS_DIAL_TIMEOUT_MS`.
-  3. **`ssh`**, one route at a time, each try `SSH_DIAL_TIMEOUT_MS`. It
-     starts when tiers 1 and 2 are finished, or `DIAL_FAST_TIERS_MS` after
-     the search began, whichever comes first. When the last working route
-     was `ssh`, it starts after `TIER_HEAD_START_MS` instead.
+  approvals (§1.3). Each candidate gets the class of its address
+  (`AddrPolicy::class_of`); a hostname gets the class of the best address
+  it resolves to, within the try's timeout, and the classes after LAN wait
+  while names resolve. The order is by class: LAN, tailnet, internet and
+  tunnel, then SSH. Within a class the last working route comes first,
+  then owner addresses, approved hints, then browse results. At most
+  `DIAL_MAX_CANDIDATES` are dialled, and `DIAL_LAN_RESERVED` of those
+  places (at most half) are kept for LAN candidates, browse results
+  included.
+- **Concurrency.** Each class keeps 1a's race, `DIAL_PARALLEL` tries at
+  once. A `tcp` try gets `DIAL_TIMEOUT_MS`, a `ws`/`wss` one
+  `WS_DIAL_TIMEOUT_MS`, an `ssh` one `SSH_DIAL_TIMEOUT_MS`.
+- **Classes:**
+  1. **LAN**, at once. The mDNS browse runs beside it, up to
+     `BROWSE_WAIT_MS`, and its results join as they arrive; fresh cached
+     results are candidates from the start.
+  2. **Tailnet**, `LAN_HEAD_START_MS` after LAN when a LAN candidate was
+     known at the start (stored, owner-entered, a fresh browse, or a name
+     that resolved to the LAN). With no known LAN candidate it starts at
+     once: a browse still running never holds the tailnet back. It starts
+     early once every LAN candidate failed.
+  3. **Internet and tunnel**, `TIER_HEAD_START_MS` after the tailnet (at
+     once if there is no LAN or tailnet candidate), or earlier once every
+     class before it is done.
+  4. **SSH**, one route at a time. It starts when every other class is
+     done, or `DIAL_FAST_TIERS_MS` after the search began, whichever comes
+     first, also when the last working route was `ssh`.
 - **Whole search:** ends with `unreachable` after `DIAL_SEARCH_MS`.
 - **Winner:** the first try to pass step 1 wins, as in 1a. A pin mismatch
   moves on, and the host's own refusal stops the search.
@@ -202,9 +216,26 @@ is an allowlist: an address in none of the first three rows is
   named `auth_denied`, `host_key_changed` or `host_key_unknown` is not
   retried (`retry_ms: null`) until the owner acts. Repeated denied logins
   trip fail2ban and `ufw limit`.
-- **No upgrade while connected.** A path that came up over `ws` or `ssh`
-  stays until it drops or renews. The renewal or reconnect dials in tier
-  order with the current list. A live upgrade is Phase 2 work.
+- **Renewals** search the same way, browse included, so a renewal on the
+  tailnet comes back on the LAN when the LAN answers.
+- **Moving to the LAN while connected.** A host reached any way but the
+  LAN is probed in the background on its LAN candidates only (stored LAN
+  literals and browse results under the automatic rule), first
+  `LAN_PROBE_FIRST_MS` after it came up, then after waits that double up
+  to `LAN_PROBE_MAX_MS`, each within a fifth either way. A network change
+  or a wake starts the waits over. At most `LAN_PROBE_PARALLEL` probes
+  run, one per host. A LAN path that passes step 1 with the pinned key
+  takes over as a renewal does: `conn.up`, then `path.reopen {from}`; the
+  old path stays until the app answers `path.reopened`. There is no
+  round-trip race. A pin mismatch leaves the live path alone. A probe
+  never runs beside a dial, a renewal or another new path for the host,
+  and it is dropped if the computer pauses, the host is forgotten or its
+  addresses or approvals change meanwhile. A LAN path that ends within
+  `LAN_STABLE_MS` holds probes off for `LAN_FLAP_COOLDOWN_MS`, doubling up
+  to `LAN_FLAP_COOLDOWN_MAX_MS`; meanwhile the keeper's redials and
+  renewals still dial the LAN, but after the tailnet (`lan_demoted`). A relayed host is left to the relay's
+  own upgrade (`RELAY_SWITCH_MARGIN_MS`), where a LAN path always takes over. With
+  this computer's LAN off there is no browse.
 
 ### 1.5 This computer's own routes
 
@@ -1267,9 +1298,17 @@ written.
 | `MOUSSE_NET_WS_MESSAGE_MAX_BYTES` | 65536 | tighten only; the floor is set while building (§15) | One received ws message |
 | `MOUSSE_NET_IPC_LINE_MAX_BYTES` | 65536 | 1024 to 65536 (tighten) | One IPC line |
 | `MOUSSE_NET_IPC_FIRST_LINE_WAIT_MS` | 2000 | 100 to 2000 (tighten) | Time for the first IPC line |
-| `MOUSSE_NET_TIER_HEAD_START_MS` | 500 | 0 to 10000 | Wait before `ws` candidates start |
+| `MOUSSE_NET_LAN_HEAD_START_MS` | 1000 | 0 to 10000 | Wait before tailnet candidates start, when a LAN one is known |
+| `MOUSSE_NET_TIER_HEAD_START_MS` | 500 | 0 to 10000 | Wait before internet and tunnel candidates start |
 | `MOUSSE_NET_DIAL_MAX_CANDIDATES` | 16 | 1 to 64 | Candidates per search |
-| `MOUSSE_NET_DIAL_FAST_TIERS_MS` | 12000 | 1000 to 60000 | Latest start of the `ssh` tier |
+| `MOUSSE_NET_DIAL_LAN_RESERVED` | 4 | 0 to 32 | Of those, places kept for LAN candidates |
+| `MOUSSE_NET_DIAL_FAST_TIERS_MS` | 12000 | 1000 to 60000 | Latest start of SSH candidates |
+| `MOUSSE_NET_LAN_PROBE_FIRST_MS` | 5000 | 100 to 600000 | First LAN probe of a host reached another way |
+| `MOUSSE_NET_LAN_PROBE_MAX_MS` | 300000 | 100 to 3600000 | Longest wait between LAN probes |
+| `MOUSSE_NET_LAN_PROBE_PARALLEL` | 2 | 1 to 16 | LAN probes at once |
+| `MOUSSE_NET_LAN_STABLE_MS` | 60000 | 1000 to 3600000 | A LAN path shorter than this is a flap |
+| `MOUSSE_NET_LAN_FLAP_COOLDOWN_MS` | 60000 | 1000 to 3600000 | No LAN probe after a flap, doubling |
+| `MOUSSE_NET_LAN_FLAP_COOLDOWN_MAX_MS` | 1800000 | 1000 to 86400000 | Longest flap hold-off |
 | `MOUSSE_NET_DIAL_SEARCH_MS` | 45000 | 5000 to 300000 | One whole search |
 | `MOUSSE_NET_WS_DIAL_TIMEOUT_MS` | 10000 | 500 to 60000 | One `ws` try: connect, outer TLS, upgrade, step 1 |
 | `MOUSSE_NET_SSH_DIAL_TIMEOUT_MS` | 20000 | 1000 to 120000 | One `ssh` try: login, marker, remote `pipe`, step 1 |
@@ -1392,6 +1431,7 @@ control = [
   { name = "stale-renewal-routes", breaks = "renewals dial the remembered list after an edit", env = { RUSTFLAGS = '--cfg mousse_control="stale-renewal-routes"' } },
   { name = "unbounded-candidates", breaks = "the search ignores DIAL_MAX_CANDIDATES and DIAL_SEARCH_MS", env = { RUSTFLAGS = '--cfg mousse_control="unbounded-candidates"' } },
   { name = "ssh-races-lan", breaks = "ssh candidates start with tcp ones", env = { RUSTFLAGS = '--cfg mousse_control="ssh-races-lan"' } },
+  { name = "no-lan-head-start", breaks = "tailnet candidates start with LAN ones, so a faster tailnet wins", env = { RUSTFLAGS = '--cfg mousse_control="no-lan-head-start"' } },
   { name = "bind-all-lan-off", breaks = "the listener binds 0.0.0.0 with LAN off", env = { RUSTFLAGS = '--cfg mousse_control="bind-all-lan-off"' } },
 ]
 

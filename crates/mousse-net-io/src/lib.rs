@@ -45,8 +45,8 @@ pub mod watch;
 
 pub use admission::StreamAdmission;
 pub use caller::{
-    Caller, CandidateSource, CodeEntry, JoinOutcome, LaterCandidates, NoCode, PathEvent, Reached,
-    RouteClass, Search, Step1Failures,
+    is_lan_route, route_rank, Caller, CandidateSource, CodeEntry, JoinOutcome, LaterCandidates,
+    NoCode, PathEvent, Reached, RouteClass, Search, Step1Failures,
 };
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use conn::{
@@ -115,6 +115,7 @@ pub type SharedSigner = Arc<dyn IdentitySigner + Send + Sync>;
         mousse_control = "stale-renewal-routes",
         mousse_control = "unbounded-candidates",
         mousse_control = "ssh-races-lan",
+        mousse_control = "no-lan-head-start",
         mousse_control = "bind-all-lan-off",
         mousse_control = "pin-stored-memory-only",
         mousse_control = "restricted-store-readable-by-old-helper",
@@ -175,6 +176,7 @@ compile_error!("a mousse_control build has a deliberate defect and is for tests 
     mousse_control = "stale-renewal-routes",
     mousse_control = "unbounded-candidates",
     mousse_control = "ssh-races-lan",
+    mousse_control = "no-lan-head-start",
     mousse_control = "bind-all-lan-off",
     mousse_control = "pin-stored-memory-only",
     mousse_control = "restricted-store-readable-by-old-helper",
@@ -285,6 +287,8 @@ pub const CONTROL: Option<&str> = if cfg!(mousse_control = "skip-pin-check") {
     Some("unbounded-candidates")
 } else if cfg!(mousse_control = "ssh-races-lan") {
     Some("ssh-races-lan")
+} else if cfg!(mousse_control = "no-lan-head-start") {
+    Some("no-lan-head-start")
 } else if cfg!(mousse_control = "bind-all-lan-off") {
     Some("bind-all-lan-off")
 } else {

@@ -95,8 +95,20 @@ mousse_net_core::define_limits! {
         keep_retry_first_ms = "KEEP_RETRY_FIRST_MS": 1_000, [10, 60_000];
         /// Keep connected: longest wait between redials of a host that could not be reached; not below the first wait.
         keep_retry_max_ms = "KEEP_RETRY_MAX_MS": 60_000, [10, 3_600_000];
-        /// Relay first: a direct path takes over from a relayed one unless the relayed path's round trip is shorter by more than this.
+        /// Relay first: a direct path takes over from a relayed one unless the relayed path's round trip is shorter by more than this (a LAN path always does).
         relay_switch_margin_ms = "RELAY_SWITCH_MARGIN_MS": 20, [0, 1_000];
+        /// Moving to the LAN: wait after a host is reached another way before its LAN candidates are first probed; each next wait doubles (Phase 1b §1.4).
+        lan_probe_first_ms = "LAN_PROBE_FIRST_MS": 5_000, [100, 600_000];
+        /// Moving to the LAN: longest wait between probes of one host; not below the first.
+        lan_probe_max_ms = "LAN_PROBE_MAX_MS": 300_000, [100, 3_600_000];
+        /// Moving to the LAN: hosts probed at once (one probe per host).
+        lan_probe_parallel = "LAN_PROBE_PARALLEL": 2, [1, 16];
+        /// Moving to the LAN: a LAN path that ends sooner than this after it came up counts as a flap.
+        lan_stable_ms = "LAN_STABLE_MS": 60_000, [1_000, 3_600_000];
+        /// Moving to the LAN: how long a flap holds off the next probe of that host, and its redials and renewals try the LAN after the tailnet; each next flap doubles it.
+        lan_flap_cooldown_ms = "LAN_FLAP_COOLDOWN_MS": 60_000, [1_000, 3_600_000];
+        /// Moving to the LAN: longest hold-off after flaps; not below the first.
+        lan_flap_cooldown_max_ms = "LAN_FLAP_COOLDOWN_MAX_MS": 1_800_000, [1_000, 86_400_000];
         /// Oldest removal ("remove on all my hosts") a host accepts or an admin device keeps queued; also how long a host keeps removal ids (tighten only).
         removal_max_age_secs = "REMOVAL_MAX_AGE_SECS": 2_592_000, [86_400, 2_592_000];
         /// How long one side of `mousse-removal` waits for the other's message (the removal, or the host's answer).
@@ -234,6 +246,18 @@ mousse_net_core::define_limits! {
             return Err(LimitError::Conflict(format!(
                 "KEEP_RETRY_MAX_MS ({}) is below KEEP_RETRY_FIRST_MS ({})",
                 h.keep_retry_max_ms, h.keep_retry_first_ms
+            )));
+        }
+        if h.lan_probe_max_ms < h.lan_probe_first_ms {
+            return Err(LimitError::Conflict(format!(
+                "LAN_PROBE_MAX_MS ({}) is below LAN_PROBE_FIRST_MS ({})",
+                h.lan_probe_max_ms, h.lan_probe_first_ms
+            )));
+        }
+        if h.lan_flap_cooldown_max_ms < h.lan_flap_cooldown_ms {
+            return Err(LimitError::Conflict(format!(
+                "LAN_FLAP_COOLDOWN_MAX_MS ({}) is below LAN_FLAP_COOLDOWN_MS ({})",
+                h.lan_flap_cooldown_max_ms, h.lan_flap_cooldown_ms
             )));
         }
     }

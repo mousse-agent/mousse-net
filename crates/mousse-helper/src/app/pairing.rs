@@ -837,7 +837,7 @@ async fn join(
             if ticket.kind == InvitationKind::InPerson && !already {
                 store_ticket_approvals(&shared, &ticket, &approved_routes);
             }
-            shared.caller.forget_routes(Some(&ticket.host_identity));
+            shared.forget_routes(&ticket.host_identity);
             let linked = ticket.kind == InvitationKind::SendLink && !already;
             if linked {
                 crate::peer::crash_point("link-joined");
@@ -881,7 +881,8 @@ async fn join(
                     })
                 }
                 Err(super::Stale::Paused) => paused(&shared, &id),
-                Err(super::Stale::Forgotten) => error(
+                // A join checks no route generation: never rerouted.
+                Err(super::Stale::Forgotten | super::Stale::Rerouted) => error(
                     &id,
                     "forgotten",
                     "the host was removed while this device was joining it",
@@ -1134,7 +1135,7 @@ fn remove_grant(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value 
             applog::line(format!("dropping link completion records failed: {e}"));
         }
         if let Ok(pin) = identity_from_hex(identity) {
-            shared.caller.forget_routes(Some(&pin));
+            shared.forget_routes(&pin);
         }
     }
     match removed {
@@ -1238,7 +1239,7 @@ fn forget_peer(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
         Ok(tickets) => settle(shared, &tickets),
         Err(e) => return error(id, "store_failed", e.to_string()),
     }
-    shared.caller.forget_routes(Some(&identity));
+    shared.forget_routes(&identity);
     super::relay::forget_peer(shared, &identity);
     // Its outbound connections go with it, and so do those still opening:
     // a dial or renewal that started before publishes nothing.

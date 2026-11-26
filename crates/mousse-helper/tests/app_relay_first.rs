@@ -5,7 +5,10 @@
 //! direct path drops, the relay carries the host again.
 //!
 //! Host A is reached directly only through a loopback proxy this file
-//! runs, which can add delay or cut every connection.
+//! runs, which can add delay or cut every connection. Loopback counts as
+//! the LAN in test builds, and a LAN path always takes over; the proxy's
+//! port is labelled tailnet (`MOUSSE_NET_TEST_CLASS_MAP`) where the round
+//! trip has to decide.
 //!
 //! A "Send link" pairing that can only go through a relay is reached
 //! through it again after a crash at each point after its completion
@@ -117,7 +120,8 @@ struct Fx {
     proxy: Proxy,
 }
 
-fn setup(tag: &str, delay: Duration) -> Fx {
+/// `class`: what B counts the proxy's route as, when not the LAN.
+fn setup(tag: &str, delay: Duration, class: Option<&str>) -> Fx {
     let relay = Relay::start();
     let a_end = Endpoint::init(&format!("{tag}a"));
     let b_end = Endpoint::init(&format!("{tag}b"));
@@ -161,7 +165,15 @@ fn setup(tag: &str, delay: Duration) -> Fx {
         json!({"identity": a.identity, "routes": [proxy.route]}),
     );
     b.kill();
-    b = b_end.app("peerB", &FAST);
+    let map = class.map(|class| {
+        let port = proxy.route.rsplit(':').next().unwrap();
+        format!("{port}={class}")
+    });
+    let mut env = FAST.to_vec();
+    if let Some(map) = &map {
+        env.push(("TEST_CLASS_MAP", map));
+    }
+    b = b_end.app("peerB", &env);
     b.hello();
     Fx {
         _relay: relay,
@@ -212,7 +224,7 @@ fn carry(from: &mut App, conn: u64, to: &mut App, bytes: &[u8]) {
 
 #[test]
 fn a_host_with_a_relay_route_is_reached_through_the_relay_first() {
-    let fx = setup("rf1", Duration::ZERO);
+    let fx = setup("rf1", Duration::ZERO, None);
     let first = nth_up(&fx.b, 0);
     assert_eq!(first["route"]["kind"], "relay", "{first}");
 }
@@ -222,7 +234,7 @@ fn a_host_with_a_relay_route_is_reached_through_the_relay_first() {
 /// and the direct one carries them.
 #[test]
 fn a_faster_direct_path_takes_over_with_streams_intact() {
-    let mut fx = setup("rf2", Duration::ZERO);
+    let mut fx = setup("rf2", Duration::ZERO, None);
     let relayed = nth_up(&fx.b, 0);
     assert_eq!(relayed["route"]["kind"], "relay", "{relayed}");
     let relayed = relayed["conn"].as_u64().unwrap();
@@ -245,7 +257,7 @@ fn a_faster_direct_path_takes_over_with_streams_intact() {
 
 #[test]
 fn a_slower_direct_path_does_not_take_over() {
-    let mut fx = setup("rf3", Duration::from_millis(100));
+    let mut fx = setup("rf3", Duration::from_millis(100), Some("tailnet"));
     let relayed = nth_up(&fx.b, 0);
     assert_eq!(relayed["route"]["kind"], "relay", "{relayed}");
     let relayed = relayed["conn"].as_u64().unwrap();
@@ -269,9 +281,26 @@ fn a_slower_direct_path_does_not_take_over() {
     carry(&mut fx.b, relayed, &mut fx.a, b"still relayed");
 }
 
+/// The LAN wins over a relay whatever the round trips.
+#[test]
+fn a_slower_lan_path_still_takes_over() {
+    let mut fx = setup("rf5", Duration::from_millis(100), None);
+    let relayed = nth_up(&fx.b, 0);
+    assert_eq!(relayed["route"]["kind"], "relay", "{relayed}");
+    let relayed = relayed["conn"].as_u64().unwrap();
+    let reopen = fx.b.event("path.reopen", |m| m["from"] == relayed);
+    let direct = reopen["conn"].as_u64().unwrap();
+    let up = fx.b.event("conn.up", |m| m["conn"] == direct);
+    assert_eq!(up["route"]["class"], "lan", "{up}");
+    fx.b.call("path.reopened", json!({"conn": direct}));
+    let down = fx.b.event("conn.down", |m| m["conn"] == relayed);
+    assert_eq!(down["reason"], "path_replaced", "{down}");
+    carry(&mut fx.b, direct, &mut fx.a, b"on the LAN");
+}
+
 #[test]
 fn the_relay_carries_the_host_again_when_the_direct_path_drops() {
-    let mut fx = setup("rf4", Duration::ZERO);
+    let mut fx = setup("rf4", Duration::ZERO, None);
     let relayed = nth_up(&fx.b, 0)["conn"].as_u64().unwrap();
     let reopen = fx.b.event("path.reopen", |m| m["from"] == relayed);
     let direct = reopen["conn"].as_u64().unwrap();

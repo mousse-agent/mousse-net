@@ -81,7 +81,7 @@ impl Drill {
     /// The variants this drill picks from.
     pub fn variants(self) -> &'static [&'static str] {
         match self {
-            Drill::Handshake => drills::HANDSHAKE_VARIANTS,
+            Drill::Handshake => drills::HANDSHAKE_ALL,
             Drill::PairingLimits => drills::PAIRING_VARIANTS,
             Drill::SharedEndpoints => drills::SHARED_VARIANTS,
             Drill::RelayAdmission => relay::RELAY_VARIANTS,
