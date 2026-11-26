@@ -1163,6 +1163,58 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// With this Mac's real Keychain: a key and a relay seed an earlier build
+    /// kept there move to their files on first use, and keep working once
+    /// the entries are gone. The test binary writes the entries itself, so
+    /// the Keychain trusts it and nothing asks the user; it removes them at
+    /// the end. Run by hand on a Mac:
+    /// `cargo test -p mousse-net-io -- --ignored keychain_secrets_move`.
+    #[cfg(all(target_os = "macos", feature = "os-keystore"))]
+    #[test]
+    #[ignore]
+    fn keychain_secrets_move_to_their_files_on_an_ad_hoc_build() {
+        struct Entries(Vec<String>);
+        impl Drop for Entries {
+            fn drop(&mut self) {
+                for user in &self.0 {
+                    let _ = os_keystore::delete(user);
+                }
+            }
+        }
+        assert!(!Keystore::default().in_use());
+        let dir = temp_dir("idkeychain");
+        let id = hex(&random_bytes::<16>());
+        let entries = Entries(vec![keyring_user(&id), relay_seed_user(&id)]);
+        // What an earlier build left: both secrets in the Keychain.
+        let key = SoftwareKey::generate(&mut os_rng());
+        os_keystore::set(&entries.0[0], key.secret_bytes().as_slice()).unwrap();
+        let seed = random_bytes::<32>();
+        os_keystore::set(&entries.0[1], &seed).unwrap();
+        let store = IdentityStore::new(&dir);
+        store
+            .write_file(&IdentityFile {
+                version: 1,
+                public_key: hex(key.public_key().as_bytes()),
+                storage: KeyStorage::OsKeystore.name().into(),
+                keyring_user: Some(entries.0[0].clone()),
+            })
+            .unwrap();
+
+        let loaded = store.load(false).unwrap();
+        assert_eq!(loaded.public_key(), key.public_key());
+        assert_eq!(loaded.storage(), KeyStorage::File);
+        assert_eq!(record(&dir, IDENTITY_FILE).storage, "file");
+        let moved = relay_seed(&dir, &id, loaded.storage()).unwrap();
+        assert_eq!(moved.as_slice(), seed);
+
+        // From now on only the files are used.
+        drop(entries);
+        assert_eq!(store.load(false).unwrap().public_key(), key.public_key());
+        let again = relay_seed(&dir, &id, KeyStorage::File).unwrap();
+        assert_eq!(again.as_slice(), seed);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn each_endpoint_has_its_own_keystore_entry() {
         assert_eq!(keyring_user("ab12"), "endpoint-ab12");
