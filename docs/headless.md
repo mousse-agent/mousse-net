@@ -12,7 +12,8 @@ One Mousse endpoint on a server with no app (design `docs/phase34-design.md`
   picks the file even when a keystore is there. `init --headless` does the
   same without serving. The file key is protected by file permissions only:
   anyone with root on the server, or a copy of its disk, has the key
-  (`spec/threat-model.md`).
+  (`spec/threat-model.md`). On macOS a helper with no stable signature (ad
+  hoc or unsigned) always uses the file, never the Keychain.
 - **Pairing:** `invite --qr` prints the ticket as a QR code in the terminal
   for the phone's in-app scanner, and asks "Is the device next to you?" for
   each request. `invite --link` shows a code to type on the joining device

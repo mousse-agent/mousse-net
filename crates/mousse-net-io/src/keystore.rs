@@ -14,6 +14,16 @@
 //! It exists for tests, and must be asked for explicitly both when the
 //! identity is created and every time it is loaded.
 //!
+//! On macOS the Keychain trusts a program by its code signature. A build
+//! with no stable signature (ad hoc or unsigned, so no Team ID) gets a new
+//! one with every build, and the Keychain would ask the user again for every
+//! item after each update. Such a build never writes to the Keychain: new
+//! secrets go to owner-only files ([`KeyStorage::File`]), and a secret an
+//! earlier build kept in the Keychain is read once, the first time it is
+//! loaded, written to its owner-only file, and read from there from then on.
+//! The Keychain entry is left in place, since removing it can ask the user
+//! too. A Developer ID build and other systems use the OS keystore as before.
+//!
 //! The same store keeps the endpoint's **Plus key** ([`IdentityStore::plus_key`],
 //! Phase 4): a separate P-256 key made when the endpoint first links to
 //! Plus, so Plus never learns the identity key. It lives in `plus-key.json`
@@ -126,6 +136,7 @@ pub struct IdentityStore {
     insecure_file: &'static str,
     file_key_file: &'static str,
     user_suffix: &'static str,
+    keystore: Keystore,
 }
 
 impl IdentityStore {
@@ -137,6 +148,7 @@ impl IdentityStore {
             insecure_file: INSECURE_KEY_FILE,
             file_key_file: FILE_KEY_FILE,
             user_suffix: "",
+            keystore: Keystore::default(),
         }
     }
 
@@ -148,7 +160,14 @@ impl IdentityStore {
             insecure_file: PLUS_INSECURE_FILE,
             file_key_file: PLUS_FILE_KEY_FILE,
             user_suffix: "-plus",
+            keystore: Keystore::default(),
         }
+    }
+
+    #[cfg(test)]
+    fn with_keystore(mut self, keystore: Keystore) -> Self {
+        self.keystore = keystore;
+        self
     }
 
     /// Whether an identity exists here.
@@ -158,7 +177,9 @@ impl IdentityStore {
 
     /// Create a new identity for the endpoint `endpoint_id`. Fails if one
     /// exists. The keystore entry is named after the endpoint, so two
-    /// endpoints under one OS user get two separate keys.
+    /// endpoints under one OS user get two separate keys. Where this process
+    /// keeps away from the OS keystore, a keystore `storage` means
+    /// [`KeyStorage::File`].
     pub fn create(
         &self,
         storage: KeyStorage,
@@ -172,9 +193,15 @@ impl IdentityStore {
         }
         crate::private::make_private_dir(&self.dir)
             .map_err(|e| NetError::Store(format!("{}: {e}", self.dir.display())))?;
+        let storage = match storage {
+            KeyStorage::OsKeystore | KeyStorage::KeystoreOrFile if !self.keystore.in_use() => {
+                KeyStorage::File
+            }
+            other => other,
+        };
         let key = SoftwareKey::generate(&mut os_rng());
         let secret = key.secret_bytes();
-        let in_keystore = |user: &str| os_keystore::set(user, secret.as_slice());
+        let in_keystore = |user: &str| self.keystore.set(user, secret.as_slice());
         let in_file = |name: &str| -> Result<(), NetError> {
             // write_atomic makes the file owner-only before any byte.
             let text = Zeroizing::new(hex(secret.as_slice()));
@@ -205,15 +232,18 @@ impl IdentityStore {
                 (KeyStorage::InsecureFile, None)
             }
         };
-        let file = IdentityFile {
+        self.write_file(&IdentityFile {
             version: 1,
             public_key: hex(key.public_key().as_bytes()),
             storage: storage.name().into(),
             keyring_user,
-        };
-        let bytes = serde_json::to_vec_pretty(&file).map_err(|e| NetError::Store(e.to_string()))?;
-        write_atomic(&self.dir.join(self.file), &bytes)?;
+        })?;
         Ok(StoredIdentity { key, storage })
+    }
+
+    fn write_file(&self, file: &IdentityFile) -> Result<(), NetError> {
+        let bytes = serde_json::to_vec_pretty(file).map_err(|e| NetError::Store(e.to_string()))?;
+        write_atomic(&self.dir.join(self.file), &bytes)
     }
 
     fn read_file(&self) -> Result<IdentityFile, NetError> {
@@ -235,16 +265,25 @@ impl IdentityStore {
 
     /// Load the identity. A plain-file identity loads only with
     /// `allow_insecure_file`.
+    ///
+    /// Where this process keeps away from the OS keystore, a keystore-held
+    /// secret is read from the keystore this once and moved to its
+    /// owner-only file, and the identity then records [`KeyStorage::File`].
+    /// If the keystore refuses, loading fails as it always has. If the move
+    /// can't be written, the key still loads and the move is tried again on
+    /// the next load.
     pub fn load(&self, allow_insecure_file: bool) -> Result<StoredIdentity, NetError> {
         let file = self.read_file()?;
         let expected = identity_from_hex(&file.public_key)?;
+        let mut move_to_file = false;
         let (secret, storage) = match file.storage.as_str() {
             "os-keystore" => {
                 let user = file
                     .keyring_user
                     .as_deref()
                     .ok_or_else(|| NetError::Store("identity file has no keystore entry".into()))?;
-                let secret = os_keystore::get(user)?;
+                let secret = self.keystore.get(user)?;
+                move_to_file = !self.keystore.in_use();
                 (secret, KeyStorage::OsKeystore)
             }
             "file" => {
@@ -288,14 +327,37 @@ impl IdentityStore {
                 "identity secret does not match the recorded public key".into(),
             ));
         }
+        let storage = if move_to_file && self.move_to_file(&file, bytes.as_slice()).is_ok() {
+            KeyStorage::File
+        } else {
+            storage
+        };
         Ok(StoredIdentity { key, storage })
     }
 
-    /// Delete the identity: the keystore entry and the files.
+    /// Write a keystore-held secret to the owner-only key file, then record
+    /// that the identity is kept there. Until the record is written the
+    /// keystore entry stays the one in use.
+    fn move_to_file(&self, file: &IdentityFile, secret: &[u8]) -> Result<(), NetError> {
+        let text = Zeroizing::new(hex(secret));
+        write_atomic(&self.dir.join(self.file_key_file), text.as_bytes())?;
+        self.write_file(&IdentityFile {
+            version: 1,
+            public_key: file.public_key.clone(),
+            storage: KeyStorage::File.name().into(),
+            keyring_user: None,
+        })
+    }
+
+    /// Delete the identity: the keystore entry and the files. Where this
+    /// process keeps away from the OS keystore, an entry there is left in
+    /// place, since removing it can ask the user.
     pub fn delete(&self) -> Result<(), NetError> {
         let file = self.read_file()?;
         if let Some(user) = file.keyring_user.as_deref() {
-            os_keystore::delete(user)?;
+            if self.keystore.in_use() {
+                self.keystore.delete(user)?;
+            }
         }
         for name in [self.file, self.insecure_file, self.file_key_file] {
             let path = self.dir.join(name);
@@ -356,10 +418,25 @@ pub fn relay_seed_user(endpoint_id: &str) -> String {
 /// helper's state files, and the secrets a caller is given (a host's pair
 /// secret, a ticket's invitation tag) are stored sealed under a key derived
 /// from it, so no other relay secret is ever written to a plain file.
+///
+/// Where this process keeps away from the OS keystore, the seed is kept in
+/// its owner-only file whatever `storage` says. When that file does not
+/// exist yet, a seed an earlier build kept in the keystore is read this once
+/// and moved there; if the keystore refuses, this fails rather than making a
+/// new seed.
 pub fn relay_seed(
     dir: &Path,
     endpoint_id: &str,
     storage: KeyStorage,
+) -> Result<Zeroizing<[u8; 32]>, NetError> {
+    relay_seed_in(dir, endpoint_id, storage, &Keystore::default())
+}
+
+fn relay_seed_in(
+    dir: &Path,
+    endpoint_id: &str,
+    storage: KeyStorage,
+    keystore: &Keystore,
 ) -> Result<Zeroizing<[u8; 32]>, NetError> {
     let parse = |secret: &[u8]| -> Result<Zeroizing<[u8; 32]>, NetError> {
         let bytes: [u8; 32] = secret
@@ -367,21 +444,22 @@ pub fn relay_seed(
             .map_err(|_| NetError::Store("the relay seed has the wrong length".into()))?;
         Ok(Zeroizing::new(bytes))
     };
+    let user = relay_seed_user(endpoint_id);
     match storage {
-        KeyStorage::OsKeystore | KeyStorage::KeystoreOrFile => {
-            let user = relay_seed_user(endpoint_id);
-            match os_keystore::get_if_any(&user)? {
+        KeyStorage::OsKeystore | KeyStorage::KeystoreOrFile if keystore.in_use() => {
+            match keystore.get_if_any(&user)? {
                 Some(secret) => parse(&secret),
                 None => {
                     let seed = Zeroizing::new(random_bytes::<32>());
-                    os_keystore::set(&user, seed.as_slice())?;
+                    keystore.set(&user, seed.as_slice())?;
                     Ok(seed)
                 }
             }
         }
-        KeyStorage::File | KeyStorage::InsecureFile => {
+        _ => {
+            let insecure = storage == KeyStorage::InsecureFile;
             let path = dir.join(RELAY_SEED_FILE);
-            if storage == KeyStorage::File && path.exists() {
+            if !insecure && path.exists() {
                 check_owner_only(&path)?;
             }
             match fs::read_to_string(&path) {
@@ -390,7 +468,15 @@ pub fn relay_seed(
                     parse(&Zeroizing::new(unhex(text.trim())?))
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    let seed = Zeroizing::new(random_bytes::<32>());
+                    let earlier = if !insecure && !keystore.in_use() {
+                        keystore.get_if_any(&user)?
+                    } else {
+                        None
+                    };
+                    let seed = match earlier {
+                        Some(secret) => parse(&secret)?,
+                        None => Zeroizing::new(random_bytes::<32>()),
+                    };
                     let text = Zeroizing::new(hex(seed.as_slice()));
                     write_atomic(&path, text.as_bytes())?;
                     Ok(seed)
@@ -399,6 +485,132 @@ pub fn relay_seed(
             }
         }
     }
+}
+
+/// The OS keystore as the stores reach it, and whether this process uses
+/// it. Tests put a stand-in here.
+#[derive(Clone, Debug, Default)]
+struct Keystore {
+    #[cfg(test)]
+    fake: Option<std::sync::Arc<tests::FakeKeystore>>,
+}
+
+impl Keystore {
+    /// Whether this process keeps secrets in the OS keystore. False on a
+    /// macOS build with no stable signature, which keeps them in owner-only
+    /// files instead. A build without the keystore says true, so asking
+    /// for it fails as before.
+    fn in_use(&self) -> bool {
+        #[cfg(test)]
+        if let Some(fake) = &self.fake {
+            return fake.trusted();
+        }
+        !(cfg!(feature = "os-keystore") && platform_avoids_keystore())
+    }
+
+    fn set(&self, user: &str, secret: &[u8]) -> Result<(), NetError> {
+        #[cfg(test)]
+        if let Some(fake) = &self.fake {
+            return fake.set(user, secret);
+        }
+        os_keystore::set(user, secret)
+    }
+
+    fn get(&self, user: &str) -> Result<Zeroizing<Vec<u8>>, NetError> {
+        #[cfg(test)]
+        if let Some(fake) = &self.fake {
+            return fake.get(user);
+        }
+        os_keystore::get(user)
+    }
+
+    fn get_if_any(&self, user: &str) -> Result<Option<Zeroizing<Vec<u8>>>, NetError> {
+        #[cfg(test)]
+        if let Some(fake) = &self.fake {
+            return fake.get_if_any(user);
+        }
+        os_keystore::get_if_any(user)
+    }
+
+    fn delete(&self, user: &str) -> Result<(), NetError> {
+        #[cfg(test)]
+        if let Some(fake) = &self.fake {
+            return fake.delete(user);
+        }
+        os_keystore::delete(user)
+    }
+}
+
+/// Whether the running program keeps away from the OS keystore: on macOS,
+/// when it has no stable code signature, checked once per process.
+#[cfg(target_os = "macos")]
+fn platform_avoids_keystore() -> bool {
+    static AVOIDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVOIDS.get_or_init(|| !signed_with_stable_identity())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn platform_avoids_keystore() -> bool {
+    false
+}
+
+/// Whether the running executable has a stable signature, as `codesign`
+/// reports it. If `codesign` can't be run or doesn't answer within five
+/// seconds, the answer is yes, which keeps the keystore as before.
+#[cfg(target_os = "macos")]
+fn signed_with_stable_identity() -> bool {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    let Ok(exe) = std::env::current_exe() else {
+        return true;
+    };
+    let Ok(mut child) = Command::new("/usr/bin/codesign")
+        .args(["--display", "--verbose=2"])
+        .arg(&exe)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    else {
+        return true;
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return true;
+            }
+        }
+    }
+    // The report is a few hundred bytes, well within a pipe's buffer.
+    let mut details = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_string(&mut details);
+    }
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.read_to_string(&mut details);
+    }
+    stable_mac_signature(&details)
+}
+
+/// Whether `codesign --display --verbose=2` output shows a stable signature:
+/// one with a Team ID, or any signature that is neither ad hoc nor missing.
+/// An ad hoc signature names the exact binary, so it changes every build.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn stable_mac_signature(details: &str) -> bool {
+    let team = details
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("TeamIdentifier="));
+    if team.is_some_and(|team| team != "not set") {
+        return true;
+    }
+    !(details.lines().any(|line| line.trim() == "Signature=adhoc")
+        || details.contains("code object is not signed at all"))
 }
 
 /// A secret as it is written to the OS keystore: lowercase hex text.
@@ -498,6 +710,9 @@ mod os_keystore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir =
@@ -602,6 +817,352 @@ mod tests {
         assert_eq!(keystore_secret(&secret).as_slice(), secret);
     }
 
+    /// A keystore in memory that counts every call, for the builds a test
+    /// can't be: one with a stable signature, one without, a keystore that
+    /// refuses.
+    #[derive(Debug, Default)]
+    pub(super) struct FakeKeystore {
+        trusted: AtomicBool,
+        refuse: AtomicBool,
+        calls: AtomicUsize,
+        entries: Mutex<HashMap<String, Vec<u8>>>,
+    }
+
+    impl FakeKeystore {
+        fn new(trusted: bool) -> Arc<Self> {
+            let fake = Arc::new(Self::default());
+            fake.trusted.store(trusted, Ordering::SeqCst);
+            fake
+        }
+
+        fn keystore(self: &Arc<Self>) -> Keystore {
+            Keystore {
+                fake: Some(self.clone()),
+            }
+        }
+
+        pub(super) fn trusted(&self) -> bool {
+            self.trusted.load(Ordering::SeqCst)
+        }
+
+        /// The next build: same keystore, other signature.
+        fn update_to(&self, trusted: bool) {
+            self.trusted.store(trusted, Ordering::SeqCst);
+            self.calls.store(0, Ordering::SeqCst);
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn holds(&self, user: &str) -> bool {
+            self.entries.lock().unwrap().contains_key(user)
+        }
+
+        fn ask(&self) -> Result<(), NetError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.refuse.load(Ordering::SeqCst) {
+                return Err(NetError::Store("keystore: the user refused".into()));
+            }
+            Ok(())
+        }
+
+        pub(super) fn set(&self, user: &str, secret: &[u8]) -> Result<(), NetError> {
+            self.ask()?;
+            self.entries
+                .lock()
+                .unwrap()
+                .insert(user.into(), secret.to_vec());
+            Ok(())
+        }
+
+        pub(super) fn get(&self, user: &str) -> Result<Zeroizing<Vec<u8>>, NetError> {
+            self.get_if_any(user)?
+                .ok_or_else(|| NetError::Store("keystore: no entry".into()))
+        }
+
+        pub(super) fn get_if_any(
+            &self,
+            user: &str,
+        ) -> Result<Option<Zeroizing<Vec<u8>>>, NetError> {
+            self.ask()?;
+            Ok(self
+                .entries
+                .lock()
+                .unwrap()
+                .get(user)
+                .map(|s| Zeroizing::new(s.clone())))
+        }
+
+        pub(super) fn delete(&self, user: &str) -> Result<(), NetError> {
+            self.ask()?;
+            self.entries.lock().unwrap().remove(user);
+            Ok(())
+        }
+    }
+
+    fn mode(path: &Path) -> u32 {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::metadata(path).unwrap().permissions().mode() & 0o777
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            0o600
+        }
+    }
+
+    fn record(dir: &Path, name: &str) -> IdentityFile {
+        serde_json::from_slice(&fs::read(dir.join(name)).unwrap()).unwrap()
+    }
+
+    /// The identity key and the Plus key, which share the store's code.
+    fn stores(dir: &Path, keystore: &Keystore) -> [(IdentityStore, &'static str); 2] {
+        [
+            (
+                IdentityStore::new(dir).with_keystore(keystore.clone()),
+                "endpoint-ep1",
+            ),
+            (
+                IdentityStore::plus_key(dir).with_keystore(keystore.clone()),
+                "endpoint-ep1-plus",
+            ),
+        ]
+    }
+
+    /// `codesign --display --verbose=2` as macOS prints it for each kind of
+    /// build.
+    #[test]
+    fn only_a_signature_that_survives_a_rebuild_counts_as_stable() {
+        let rows = [
+            // A nightly: linker-signed ad hoc, no Team ID.
+            (
+                "Executable=/Applications/Mousse.app/Contents/Resources/net-helper/mousse-helper\n\
+                 Identifier=mousse-helper-55554944c40c\nFormat=Mach-O thin (arm64)\n\
+                 CodeDirectory v=20400 size=1 flags=0x20002(adhoc,linker-signed) hashes=1+0 location=embedded\n\
+                 Signature=adhoc\nInfo.plist=not bound\nTeamIdentifier=not set\nSealed Resources=none\n",
+                false,
+            ),
+            // Not signed at all (Intel builds are not linker-signed).
+            ("/x/mousse-helper: code object is not signed at all\n", false),
+            // Developer ID.
+            (
+                "Identifier=mousse-helper\nAuthority=Developer ID Application: Example (ABCDE12345)\n\
+                 Authority=Developer ID Certification Authority\nAuthority=Apple Root CA\n\
+                 TeamIdentifier=ABCDE12345\n",
+                true,
+            ),
+            // A certificate with no Team ID: its identity does not change
+            // with the build, as the app decides it too.
+            (
+                "Identifier=mousse-helper\nAuthority=Local Signing\nTeamIdentifier=not set\n",
+                true,
+            ),
+        ];
+        for (details, stable) in rows {
+            assert_eq!(stable_mac_signature(details), stable, "{details}");
+        }
+    }
+
+    /// The real check, on this test binary: cargo leaves it ad hoc signed
+    /// (Apple silicon) or unsigned (Intel), as a nightly helper is. Through
+    /// the public API, a new key goes to a file.
+    #[cfg(all(target_os = "macos", feature = "os-keystore"))]
+    #[test]
+    fn an_ad_hoc_signed_mac_build_keeps_new_keys_out_of_the_keychain() {
+        assert!(!signed_with_stable_identity());
+        assert!(!Keystore::default().in_use());
+        let dir = temp_dir("idmac");
+        let store = IdentityStore::new(&dir);
+        let id = hex(&random_bytes::<16>());
+        let created = store.create(KeyStorage::OsKeystore, &id).unwrap();
+        if created.storage() == KeyStorage::OsKeystore {
+            let _ = store.delete();
+            panic!("the key went to the keychain");
+        }
+        assert_eq!(created.storage(), KeyStorage::File);
+        assert_eq!(store.load(false).unwrap().storage(), KeyStorage::File);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn without_a_stable_signature_new_keys_go_to_owner_only_files() {
+        // Rows: the storage asked for, and whether the build is trusted.
+        let rows = [
+            (KeyStorage::OsKeystore, false, KeyStorage::File),
+            (KeyStorage::KeystoreOrFile, false, KeyStorage::File),
+            (KeyStorage::File, false, KeyStorage::File),
+            // Control: a Developer ID build still uses the keystore.
+            (KeyStorage::OsKeystore, true, KeyStorage::OsKeystore),
+            (KeyStorage::KeystoreOrFile, true, KeyStorage::OsKeystore),
+        ];
+        for (asked, trusted, kept) in rows {
+            let fake = FakeKeystore::new(trusted);
+            let dir = temp_dir("idnew");
+            for (store, user) in stores(&dir, &fake.keystore()) {
+                let created = store.create(asked, "ep1").unwrap();
+                assert_eq!(created.storage(), kept, "{asked:?} trusted={trusted}");
+                let loaded = store.load(false).unwrap();
+                assert_eq!(loaded.public_key(), created.public_key());
+                assert_eq!(loaded.storage(), kept);
+                assert_eq!(fake.holds(user), kept == KeyStorage::OsKeystore);
+                if kept == KeyStorage::File {
+                    assert_eq!(mode(&dir.join(store.file_key_file)), 0o600);
+                }
+            }
+            if !trusted {
+                assert_eq!(fake.calls(), 0, "{asked:?}: the keystore was asked");
+            }
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_keystore_key_moves_to_its_file_once_and_is_never_asked_for_again() {
+        let fake = FakeKeystore::new(true);
+        let dir = temp_dir("idmove");
+        let created: Vec<_> = stores(&dir, &fake.keystore())
+            .iter()
+            .map(|(store, _)| store.create(KeyStorage::OsKeystore, "ep1").unwrap())
+            .collect();
+        fake.update_to(false);
+        for ((store, user), created) in stores(&dir, &fake.keystore()).iter().zip(&created) {
+            let before = fake.calls();
+            let loaded = store.load(false).unwrap();
+            assert_eq!(loaded.public_key(), created.public_key());
+            assert_eq!(loaded.storage(), KeyStorage::File);
+            assert_eq!(fake.calls(), before + 1);
+            let moved = record(&dir, store.file);
+            assert_eq!(moved.storage, "file");
+            assert_eq!(moved.keyring_user, None);
+            assert_eq!(mode(&dir.join(store.file_key_file)), 0o600);
+            // Removing the entry could ask the user, so it stays.
+            assert!(fake.holds(user));
+            for _ in 0..3 {
+                let again = store.load(false).unwrap();
+                assert_eq!(again.public_key(), created.public_key());
+                assert_eq!(again.storage(), KeyStorage::File);
+            }
+            assert_eq!(fake.calls(), before + 1, "asked again after the move");
+        }
+        // A Developer ID build later reads the file and leaves it there.
+        fake.update_to(true);
+        for (store, _) in stores(&dir, &fake.keystore()) {
+            assert_eq!(store.load(false).unwrap().storage(), KeyStorage::File);
+        }
+        assert_eq!(fake.calls(), 0);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_keystore_key_that_cant_be_read_fails_the_load_and_changes_nothing() {
+        // Rows: the keystore refuses (denied, locked), or the entry is gone.
+        for refused in [true, false] {
+            let fake = FakeKeystore::new(true);
+            let dir = temp_dir("idrefuse");
+            let (store, user) = stores(&dir, &fake.keystore())[0].clone();
+            let created = store.create(KeyStorage::OsKeystore, "ep1").unwrap();
+            let entry = fake.entries.lock().unwrap().get(user).cloned().unwrap();
+            let before = fs::read(dir.join(IDENTITY_FILE)).unwrap();
+            fake.update_to(false);
+            if refused {
+                fake.refuse.store(true, Ordering::SeqCst);
+            } else {
+                fake.entries.lock().unwrap().remove(user);
+            }
+            assert!(store.load(false).is_err());
+            assert_eq!(fs::read(dir.join(IDENTITY_FILE)).unwrap(), before);
+            assert!(!dir.join(FILE_KEY_FILE).exists());
+            // No new identity was made in its place: once the keystore
+            // answers, the same key loads and moves.
+            fake.refuse.store(false, Ordering::SeqCst);
+            fake.entries.lock().unwrap().insert(user.into(), entry);
+            let loaded = store.load(false).unwrap();
+            assert_eq!(loaded.public_key(), created.public_key());
+            assert_eq!(loaded.storage(), KeyStorage::File);
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn without_a_stable_signature_deleting_leaves_the_keystore_alone() {
+        let fake = FakeKeystore::new(true);
+        let dir = temp_dir("iddelete");
+        let store = IdentityStore::new(&dir).with_keystore(fake.keystore());
+        store.create(KeyStorage::OsKeystore, "ep1").unwrap();
+        fake.update_to(false);
+        store.delete().unwrap();
+        assert!(!store.exists());
+        assert_eq!(fake.calls(), 0);
+        assert!(fake.holds("endpoint-ep1"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_relay_seed_moves_to_its_file_once() {
+        let user = relay_seed_user("ep1");
+        // An earlier build kept the seed in the keystore. After the move the
+        // helper passes File (the identity's storage now); OsKeystore is
+        // read the same way.
+        for asked in [KeyStorage::File, KeyStorage::OsKeystore] {
+            let fake = FakeKeystore::new(true);
+            let dir = temp_dir("seedmove");
+            let earlier =
+                relay_seed_in(&dir, "ep1", KeyStorage::OsKeystore, &fake.keystore()).unwrap();
+            fake.update_to(false);
+            for _ in 0..3 {
+                let seed = relay_seed_in(&dir, "ep1", asked, &fake.keystore()).unwrap();
+                assert_eq!(seed.as_slice(), earlier.as_slice(), "{asked:?}");
+            }
+            assert_eq!(fake.calls(), 1, "{asked:?}");
+            assert_eq!(mode(&dir.join(RELAY_SEED_FILE)), 0o600);
+            assert!(fake.holds(&user));
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_relay_seed_with_no_earlier_copy_is_made_in_its_file() {
+        // Rows: (trusted, asked) -> keystore calls. Without a stable
+        // signature, one lookup finds nothing (macOS doesn't ask the user
+        // about an entry that isn't there); a trusted File endpoint never
+        // looks.
+        let rows = [
+            (false, KeyStorage::OsKeystore, 1),
+            (false, KeyStorage::File, 1),
+            (false, KeyStorage::InsecureFile, 0),
+            (true, KeyStorage::File, 0),
+        ];
+        for (trusted, asked, calls) in rows {
+            let fake = FakeKeystore::new(trusted);
+            let dir = temp_dir("seednew");
+            let made = relay_seed_in(&dir, "ep1", asked, &fake.keystore()).unwrap();
+            let again = relay_seed_in(&dir, "ep1", asked, &fake.keystore()).unwrap();
+            assert_eq!(made.as_slice(), again.as_slice());
+            assert_eq!(fake.calls(), calls, "trusted={trusted} {asked:?}");
+            assert!(!fake.holds(&relay_seed_user("ep1")));
+            assert!(dir.join(RELAY_SEED_FILE).exists());
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_relay_seed_the_keystore_refuses_is_not_replaced() {
+        let fake = FakeKeystore::new(true);
+        let dir = temp_dir("seedrefuse");
+        let earlier = relay_seed_in(&dir, "ep1", KeyStorage::OsKeystore, &fake.keystore()).unwrap();
+        fake.update_to(false);
+        fake.refuse.store(true, Ordering::SeqCst);
+        assert!(relay_seed_in(&dir, "ep1", KeyStorage::File, &fake.keystore()).is_err());
+        assert!(!dir.join(RELAY_SEED_FILE).exists());
+        fake.refuse.store(false, Ordering::SeqCst);
+        let seed = relay_seed_in(&dir, "ep1", KeyStorage::File, &fake.keystore()).unwrap();
+        assert_eq!(seed.as_slice(), earlier.as_slice());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn each_endpoint_has_its_own_keystore_entry() {
         assert_eq!(keyring_user("ab12"), "endpoint-ab12");
@@ -610,10 +1171,15 @@ mod tests {
 
     /// Writes two endpoints' entries to this machine's real keystore under
     /// one OS user, checks they stay separate, and deletes them. Run by
-    /// hand: `cargo test -p mousse-net-io -- --ignored os_keystore`.
+    /// hand: `cargo test -p mousse-net-io -- --ignored os_keystore`. A
+    /// test binary on macOS has no stable signature, so it never uses the
+    /// Keychain and this has nothing to check there.
     #[test]
     #[ignore]
     fn os_keystore_two_endpoints_round_trip() {
+        if !Keystore::default().in_use() {
+            return;
+        }
         let a_dir = temp_dir("idos-a");
         let b_dir = temp_dir("idos-b");
         let a = IdentityStore::new(&a_dir);
