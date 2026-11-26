@@ -159,6 +159,11 @@ pub struct Search {
     /// More `tcp` candidates found while the search runs (an mDNS browse);
     /// they join their class as they arrive, after the others.
     pub later: Option<LaterCandidates>,
+    /// The host's LAN paths keep dropping soon after they come up: LAN
+    /// candidates rank with internet and tunnel ones, after the tailnet,
+    /// with no head start and no reserved places. Still dialled, never
+    /// left out.
+    pub lan_demoted: bool,
 }
 
 impl Search {
@@ -1215,9 +1220,20 @@ where
         };
         // Places only LAN candidates take: at most half, so other classes
         // always have some.
-        let reserved = usize::try_from(io.dial_lan_reserved())
-            .unwrap_or(0)
-            .min(max / 2);
+        let Search {
+            candidates,
+            mut later,
+            lan_demoted,
+        } = search;
+        // A demoted LAN dials as an internet route would.
+        let place = |class: usize| if lan_demoted && class == 0 { 2 } else { class };
+        let reserved = if lan_demoted {
+            0
+        } else {
+            usize::try_from(io.dial_lan_reserved())
+                .unwrap_or(0)
+                .min(max / 2)
+        };
         let parallel = usize::try_from(io.dial_parallel()).unwrap_or(1).max(1);
         let policy = self.opener.addrs.clone();
         let mut taken: Vec<LocalRoute> = Vec::new();
@@ -1229,10 +1245,6 @@ where
         let fits = |class: Option<usize>, taken: &[LocalRoute], wide_taken: usize| {
             taken.len() < max && (class == Some(0) || wide_taken < max - reserved)
         };
-        let Search {
-            candidates,
-            mut later,
-        } = search;
         let dialing = Dialing {
             own: self.certs.current()?,
             pin,
@@ -1243,11 +1255,18 @@ where
         // Names resolve once, for their class and for the try.
         let mut ranking: tokio::task::JoinSet<Ranked> = tokio::task::JoinSet::new();
         let mut known: Vec<(usize, LocalRoute)> = Vec::new();
-        for route in candidates {
+        // Taken in class order, the order given within a class, so early
+        // candidates of a later class never crowd out an earlier one. A
+        // name not resolved yet may be LAN: it comes right after LAN.
+        let mut candidates: Vec<(Option<usize>, LocalRoute)> = candidates
+            .into_iter()
+            .map(|route| (route_rank(&policy, &route).map(place), route))
+            .collect();
+        candidates.sort_by_key(|(class, _)| class.map_or(1, |c| 2 * c));
+        for (class, route) in candidates {
             if taken.contains(&route) {
                 continue;
             }
-            let class = route_rank(&policy, &route);
             if !fits(class, &taken, wide_taken) {
                 continue;
             }
@@ -1387,7 +1406,7 @@ where
                         Ok(mut targets) => {
                             // The best address first; the name takes its class.
                             targets.sort_by_key(|(_, class)| rank(*class));
-                            let class = targets.first().map_or(2, |(_, c)| rank(*c));
+                            let class = place(targets.first().map_or(2, |(_, c)| rank(*c)));
                             // A LAN name known before the tailnet started
                             // gets the LAN's head start.
                             if class == 0 && !started[1] {
@@ -1405,7 +1424,7 @@ where
                 Woke::Later(found) => {
                     later = None;
                     for route in found {
-                        let class = route_rank(&policy, &route);
+                        let class = route_rank(&policy, &route).map(place);
                         if taken.contains(&route) || !fits(class, &taken, wide_taken) {
                             continue;
                         }

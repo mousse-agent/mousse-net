@@ -12,6 +12,7 @@ mod common;
 
 use std::collections::HashSet;
 use std::net::TcpListener;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -609,6 +610,14 @@ impl Fwd {
         self.up.store(true, Ordering::SeqCst);
     }
 
+    /// Cut every connection through it but keep taking new ones: a LAN
+    /// that answers and then drops.
+    fn drop_all(&self) {
+        for stream in self.held.lock().unwrap().drain(..) {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
     fn accepted(&self) -> usize {
         self.accepted.load(Ordering::SeqCst)
     }
@@ -625,10 +634,18 @@ struct OffLan {
     tail: Fwd,
     browse: std::path::PathBuf,
     first: u64,
+    /// The file B holds at its test hook point, if one was given.
+    hold: Option<std::path::PathBuf>,
     _ends: (Endpoint, Endpoint),
 }
 
 fn off_lan(tag: &str, b_env: &[(&str, &str)]) -> OffLan {
+    off_lan_with(tag, b_env, None)
+}
+
+/// [`off_lan`], B holding at the test hook point `hold` (see
+/// `MOUSSE_HELPER_TEST_HOLD`).
+fn off_lan_with(tag: &str, b_env: &[(&str, &str)], hold: Option<&str>) -> OffLan {
     let a_end = Endpoint::init(&format!("{tag}a"));
     let b_end = Endpoint::init(&format!("{tag}b"));
     let browse = b_end.dir.join("browse-hosts.txt");
@@ -647,7 +664,15 @@ fn off_lan(tag: &str, b_env: &[(&str, &str)]) -> OffLan {
         ("LAN_PROBE_MAX_MS", "400"),
     ];
     env.extend_from_slice(b_env);
-    let mut b = b_end.app_with("peerB", &env, 0, Some(&browse));
+    let hold_file = hold.map(|_| b_end.dir.join("held"));
+    let hold_var = hold
+        .zip(hold_file.as_ref())
+        .map(|(point, file)| format!("{point}={}", file.display()));
+    let mut raw: Vec<(&str, &Path)> = vec![("MOUSSE_HELPER_BROWSE_FILE", browse.as_path())];
+    if let Some(var) = &hold_var {
+        raw.push(("MOUSSE_HELPER_TEST_HOLD", Path::new(var)));
+    }
+    let mut b = b_end.app_raw("peerB", &env, 0, &raw);
     b.hello();
     trust(&mut a, &mut b, &[]);
     b.call(
@@ -665,6 +690,7 @@ fn off_lan(tag: &str, b_env: &[(&str, &str)]) -> OffLan {
         b,
         tail,
         browse,
+        hold: hold_file,
         _ends: (a_end, b_end),
     }
 }
@@ -732,6 +758,36 @@ fn a_host_reached_over_the_tailnet_moves_to_the_lan_and_back() {
     );
 }
 
+/// A LAN that still answers but dropped a short-lived path is not
+/// redialled first: while the flap cools down, the keeper's redial goes to
+/// the tailnet ahead of the LAN, so it does not land on the same unstable
+/// path again.
+#[test]
+fn a_lan_that_answers_but_keeps_dropping_is_redialled_after_the_tailnet() {
+    let mut fx = off_lan("lnd", &[("LAN_FLAP_COOLDOWN_MS", "60000")]);
+    let a_id = fx.a.identity.clone();
+    let lan = forwarder(&route_of(&mut fx.a), Duration::ZERO);
+    list_browse(&fx, &[&lan.route]);
+    let first = fx.first;
+    let reopen = fx.b.event("path.reopen", |m| m["from"] == first);
+    let moved = reopen["conn"].as_u64().unwrap();
+    fx.b.call("path.reopened", json!({"conn": moved}));
+    fx.b.event("conn.down", |m| m["conn"] == first);
+    // The LAN drops the path but still answers: the redial takes the
+    // tailnet. Then the tailnet drops too: still cooling, the redial takes
+    // the tailnet again rather than the LAN.
+    let mut live = moved;
+    for (round, path) in [&lan, &fx.tail].into_iter().enumerate() {
+        let seen = outbound_ups(&fx.b, &a_id);
+        path.drop_all();
+        fx.b.event("conn.down", |m| m["conn"] == live);
+        wait_outbound(&fx.b, &a_id, seen);
+        let back = fx.b.events("conn.up").last().cloned().unwrap();
+        assert_eq!(back["route"]["class"], "tailnet", "round {round}: {back}");
+        live = back["conn"].as_u64().unwrap();
+    }
+}
+
 /// What the browse finds that is not this host on the LAN never touches
 /// the live path: another endpoint on a LAN address fails its pin, and a
 /// host the browse lists at a tailnet address is never dialled (the
@@ -793,4 +849,38 @@ fn a_change_while_a_lan_probe_opens_leaves_no_lan_path() {
         assert!(lan_ups.is_empty(), "{change}: {lan_ups:?}");
         assert!(fx.b.events("path.reopen").is_empty(), "{change}");
     }
+}
+
+/// A route edit that lands after a LAN probe's last check, just before its
+/// path would be announced: the edit bumps the route generation under the
+/// lock the announcement checks it under, so the path is closed, never
+/// announced, and the live one is kept.
+#[test]
+fn a_route_edit_just_before_a_lan_path_is_announced_leaves_no_lan_path() {
+    let mut fx = off_lan_with("lnr", &[], Some("lan-publish"));
+    let hold = fx.hold.clone().unwrap();
+    let lan = forwarder(&route_of(&mut fx.a), Duration::ZERO);
+    list_browse(&fx, &[&lan.route]);
+    let start = std::time::Instant::now();
+    while !hold.exists() {
+        assert!(start.elapsed() < WAIT, "the probe never reached the hold");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let a_id = fx.a.identity.clone();
+    let tail = fx.tail.route.clone();
+    fx.b.call(
+        "peer.addresses.set",
+        json!({"identity": a_id, "routes": [tail]}),
+    );
+    list_browse(&fx, &[]);
+    std::fs::remove_file(&hold).unwrap();
+    std::thread::sleep(Duration::from_millis(800));
+    let lan_ups: Vec<Value> =
+        fx.b.events("conn.up")
+            .into_iter()
+            .filter(|m| m["route"]["class"] == "lan")
+            .collect();
+    assert!(lan_ups.is_empty(), "{lan_ups:?}");
+    assert!(fx.b.events("path.reopen").is_empty());
+    assert!(downs(&fx.b, fx.first).is_empty());
 }

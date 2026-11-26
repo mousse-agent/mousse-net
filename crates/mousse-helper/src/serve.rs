@@ -503,10 +503,12 @@ pub async fn run(
         });
         // Renewals search from the store as it is then, with the browse
         // (Phase 1b §1.4 and §1.5).
+        let lan_flaps = Arc::new(crate::app::LanFlaps::default());
         caller.use_candidates(Arc::new(crate::app::StoreCandidates {
             dir: endpoint.dir().to_path_buf(),
             policy: caller.addr_policy().clone(),
             browse: browse.clone(),
+            flaps: lan_flaps.clone(),
         }));
         let info = crate::app::AppInfo {
             identity: real_identity,
@@ -517,6 +519,7 @@ pub async fn run(
             listen: listen.clone(),
             state_dir: endpoint.dir().to_path_buf(),
             browse,
+            lan_flaps,
             manual_clock,
             signer: signer.clone(),
             endpoint_id: endpoint.endpoint_id().to_owned(),

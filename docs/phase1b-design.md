@@ -232,7 +232,8 @@ is an allowlist: an address in none of the first three rows is
   and it is dropped if the computer pauses, the host is forgotten or its
   addresses or approvals change meanwhile. A LAN path that ends within
   `LAN_STABLE_MS` holds probes off for `LAN_FLAP_COOLDOWN_MS`, doubling up
-  to `LAN_FLAP_COOLDOWN_MAX_MS`. A relayed host is left to the relay's
+  to `LAN_FLAP_COOLDOWN_MAX_MS`; meanwhile the keeper's redials and
+  renewals still dial the LAN, but after the tailnet (`lan_demoted`). A relayed host is left to the relay's
   own upgrade (`RELAY_SWITCH_MARGIN_MS`), where a LAN path always takes over. With
   this computer's LAN off there is no browse.
 

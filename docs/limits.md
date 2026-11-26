@@ -121,7 +121,7 @@ spec's value: it can only be tightened.
 | `MOUSSE_NET_LAN_PROBE_MAX_MS` | 300000 | 100 to 3600000 | App mode: longest wait between those probes, which double from the first; not below the first. |
 | `MOUSSE_NET_LAN_PROBE_PARALLEL` | 2 | 1 to 16 | App mode: LAN probes running at once, one per host. |
 | `MOUSSE_NET_LAN_STABLE_MS` | 60000 | 1000 to 3600000 | App mode: a LAN path that ends sooner than this after coming up counts as a flap. |
-| `MOUSSE_NET_LAN_FLAP_COOLDOWN_MS` | 60000 | 1000 to 3600000 | App mode: no LAN probe for this long after a flap; it doubles with each flap. A LAN path that lasts resets it. |
+| `MOUSSE_NET_LAN_FLAP_COOLDOWN_MS` | 60000 | 1000 to 3600000 | App mode: no LAN probe for this long after a flap, and redials and renewals try the LAN after the tailnet; it doubles with each flap. A LAN path that lasts resets it. |
 | `MOUSSE_NET_LAN_FLAP_COOLDOWN_MAX_MS` | 1800000 | 1000 to 86400000 | App mode: longest of those hold-offs; not below the first. |
 | `MOUSSE_NET_REMOVAL_MAX_AGE_SECS` | 2592000 | 86400 to 2592000 | "Remove on all my hosts" (Phase 4 Part D): the oldest removal a host accepts and an admin device keeps queued, and how long a host keeps removal ids. Tighten only. |
 | `MOUSSE_NET_REMOVAL_ANSWER_WAIT_MS` | 10000 | 1000 to 120000 | How long one side of `mousse-removal` waits for the other's message (the signed removal, or the host's answer). |

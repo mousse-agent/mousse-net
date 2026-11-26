@@ -105,7 +105,7 @@ mousse_net_core::define_limits! {
         lan_probe_parallel = "LAN_PROBE_PARALLEL": 2, [1, 16];
         /// Moving to the LAN: a LAN path that ends sooner than this after it came up counts as a flap.
         lan_stable_ms = "LAN_STABLE_MS": 60_000, [1_000, 3_600_000];
-        /// Moving to the LAN: how long a flap holds off the next probe of that host; each next flap doubles it.
+        /// Moving to the LAN: how long a flap holds off the next probe of that host, and its redials and renewals try the LAN after the tailnet; each next flap doubles it.
         lan_flap_cooldown_ms = "LAN_FLAP_COOLDOWN_MS": 60_000, [1_000, 3_600_000];
         /// Moving to the LAN: longest hold-off after flaps; not below the first.
         lan_flap_cooldown_max_ms = "LAN_FLAP_COOLDOWN_MAX_MS": 1_800_000, [1_000, 86_400_000];

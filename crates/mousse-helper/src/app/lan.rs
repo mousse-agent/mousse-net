@@ -26,8 +26,10 @@
 //!   before it switches; otherwise the new path is closed.
 //! - **Flapping.** A LAN path that ends within `LAN_STABLE_MS` of coming up
 //!   holds probes off for `LAN_FLAP_COOLDOWN_MS`, doubling with each such
-//!   end up to `LAN_FLAP_COOLDOWN_MAX_MS`; one that lasts resets it. When
-//!   the LAN path ends, the keeper dials again as always (LAN first).
+//!   end up to `LAN_FLAP_COOLDOWN_MAX_MS`; one that lasts resets it. While
+//!   that holds, the keeper's redials and renewals dial the host's LAN
+//!   after its tailnet (`Search::lan_demoted`), so a LAN that answers but
+//!   keeps dropping is not taken again and again; it is still dialled.
 //! - **Relayed hosts** are left to the relay's own upgrade, which dials
 //!   LAN first too.
 
@@ -66,8 +68,14 @@ struct Flaps {
 #[derive(Default)]
 pub struct Lan {
     hosts: Mutex<HashMap<IdentityPublicKey, Host>>,
-    flaps: Mutex<HashMap<IdentityPublicKey, Flaps>>,
     wake: Notify,
+}
+
+/// Each host's LAN flaps, shared by the probes and every search for the
+/// host (the keeper's dials and the caller's renewals).
+#[derive(Default)]
+pub struct LanFlaps {
+    map: Mutex<HashMap<IdentityPublicKey, Flaps>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -100,7 +108,9 @@ impl Lan {
         }
         self.wake();
     }
+}
 
+impl LanFlaps {
     /// A LAN path to `pin` ended after `lasted`.
     pub fn lan_down(
         &self,
@@ -111,7 +121,7 @@ impl Lan {
         let stable = crate::limits::ms(limits.lan_stable_ms());
         let first = crate::limits::ms(limits.lan_flap_cooldown_ms());
         let longest = crate::limits::ms(limits.lan_flap_cooldown_max_ms());
-        let mut flaps = lock(&self.flaps);
+        let mut flaps = lock(&self.map);
         if lasted >= stable {
             flaps.remove(&pin);
             return;
@@ -130,10 +140,15 @@ impl Lan {
     }
 
     fn held_off(&self, pin: &IdentityPublicKey, now: Instant) -> Option<Instant> {
-        lock(&self.flaps)
+        lock(&self.map)
             .get(pin)
             .map(|f| f.until)
             .filter(|until| *until > now)
+    }
+
+    /// Whether `pin`'s LAN is held off now: its searches dial it late.
+    pub fn cooling(&self, pin: &IdentityPublicKey) -> bool {
+        self.held_off(pin, Instant::now()).is_some()
     }
 }
 
@@ -237,8 +252,20 @@ async fn probe(shared: &Arc<Shared>, pin: IdentityPublicKey, from: u64) -> Probe
         conn.close(mousse_net_core::ErrorCode::Cancelled);
         return Probed::Nothing;
     }
+    // Test hook: a route edit lands here, after the last check.
+    crate::peer::crash_point("lan-publish");
     // If the old path ended meanwhile, this one is simply the host's path.
-    paths::switch_to(shared, pin, from, gen, conn, &used, &record);
+    // Published only if the routes are still those it was found on: an
+    // edit bumps their generation under the lock this checks it under.
+    paths::switch_to(
+        shared,
+        pin,
+        from,
+        (gen, Some(routes_gen)),
+        conn,
+        &used,
+        &record,
+    );
     Probed::Moved
 }
 
@@ -280,7 +307,7 @@ pub async fn run(shared: Arc<Shared>) {
                 if host.running || now < host.due || running >= parallel {
                     continue;
                 }
-                if let Some(until) = lan.held_off(&pin, now) {
+                if let Some(until) = shared.info.lan_flaps.held_off(&pin, now) {
                     host.due = until;
                     continue;
                 }

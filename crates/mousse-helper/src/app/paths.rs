@@ -399,6 +399,8 @@ pub struct StoreCandidates {
     pub dir: PathBuf,
     pub policy: AddrPolicy,
     pub browse: Option<Arc<CachedBrowse>>,
+    /// A host whose LAN keeps dropping dials it after its tailnet.
+    pub flaps: Arc<super::LanFlaps>,
 }
 
 impl CandidateSource for StoreCandidates {
@@ -410,7 +412,10 @@ impl CandidateSource for StoreCandidates {
             .and_then(|peers| peers.into_iter().find(|p| p.identity == key))
             .map(|record| stored_search(&self.policy, &self.dir, &record));
         match stored {
-            Some(search) => with_browse(search, &self.policy, self.browse.as_ref()),
+            Some(search) => Search {
+                lan_demoted: self.flaps.cooling(pin),
+                ..with_browse(search, &self.policy, self.browse.as_ref())
+            },
             // Not paired any more: nothing to dial.
             None => Search::default(),
         }
@@ -437,7 +442,7 @@ pub(super) fn approvals_changed(shared: &Shared, identity: &IdentityPublicKey) {
             }
         }
     });
-    shared.caller.forget_routes(Some(identity));
+    shared.forget_routes(identity);
 }
 
 /// How a dial reached its host.
@@ -496,11 +501,15 @@ async fn reach_local(
 ) -> Result<(Connection, Reached), NetError> {
     let pin = record.pin()?;
     let policy = shared.caller.addr_policy();
-    let search = with_browse(
-        stored_search(policy, &shared.info.state_dir, record),
-        policy,
-        shared.info.browse.as_ref(),
-    );
+    let search = Search {
+        // A LAN that keeps dropping is dialled after the tailnet.
+        lan_demoted: shared.info.lan_flaps.cooling(&pin),
+        ..with_browse(
+            stored_search(policy, &shared.info.state_dir, record),
+            policy,
+            shared.info.browse.as_ref(),
+        )
+    };
     shared.caller.search(search, pin).await
 }
 
@@ -744,7 +753,8 @@ pub async fn dial(
     let no = match shared.add_outbound(conn, gen, fields) {
         Ok(no) => no,
         Err(super::Stale::Paused) => return Err(DialError::Paused),
-        Err(super::Stale::Forgotten) => {
+        // A dial checks no route generation: never rerouted.
+        Err(super::Stale::Forgotten | super::Stale::Rerouted) => {
             return Err(DialError::NoPeer("forgotten while the path opened".into()))
         }
     };
@@ -815,13 +825,13 @@ async fn upgrade(shared: Arc<Shared>, pin: IdentityPublicKey, relay: u64, gen: u
             Ok((conn, used)) => {
                 // A LAN path that passed step 1 wins without a race.
                 if used.class == mousse_net_io::RouteClass::Lan {
-                    switch_to(&shared, pin, relay, gen, conn, &used, &record);
+                    switch_to(&shared, pin, relay, (gen, None), conn, &used, &record);
                     return;
                 }
                 let direct = round_trip(&conn).await;
                 let through = round_trip(&relayed).await;
                 if direct_wins(direct, through, margin) {
-                    switch_to(&shared, pin, relay, gen, conn, &used, &record);
+                    switch_to(&shared, pin, relay, (gen, None), conn, &used, &record);
                     return;
                 }
                 applog::line(format!(
@@ -869,11 +879,13 @@ async fn round_trip(conn: &Connection) -> Option<Duration> {
 /// Announce the path `conn` and ask the app to move its streams to it from
 /// the path `from` (relayed, or on the LAN probe any other). If `from`
 /// went meanwhile, `conn` is simply the host's path: `conn.up` says so.
+/// `fence` is the peer generation and, if given, the route generation the
+/// search started at.
 pub(super) fn switch_to(
     shared: &Arc<Shared>,
     pin: IdentityPublicKey,
     from: u64,
-    gen: u64,
+    (gen, routes): (u64, Option<u64>),
     conn: Connection,
     used: &Reached,
     record: &PeerRecord,
@@ -881,8 +893,13 @@ pub(super) fn switch_to(
     let _ = PeerStore::in_dir(&shared.info.state_dir).note_route(&pin, used.route.uri());
     let role = super::pairing::role_text(&record.role);
     let fields = json!({"dir": "out", "role": role, "route": route_json(used)});
-    // Checks the pause and the generation, as every new outbound path.
-    let Ok(no) = shared.add_outbound(conn, gen, fields) else {
+    // Checks the pause and the generation, as every new outbound path,
+    // and the route generation the search started at, if given.
+    let added = match routes {
+        Some(routes) => shared.add_outbound_routed(conn, gen, routes, fields),
+        None => shared.add_outbound(conn, gen, fields),
+    };
+    let Ok(no) = added else {
         return;
     };
     applog::line(format!(
