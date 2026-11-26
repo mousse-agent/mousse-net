@@ -289,6 +289,11 @@ pub async fn run(
     let key = endpoint
         .load_identity(insecure_file_key)
         .map_err(|e| e.to_string())?;
+    if let Some(e) = key.move_failed() {
+        crate::applog::line(format!(
+            "the identity key could not be moved to its owner-only file yet ({e}); it is tried again at the next start"
+        ));
+    }
     let real_identity = endpoint.identity();
     let key_storage = key.storage();
     let (clock, manual_clock) = crate::app::clock();

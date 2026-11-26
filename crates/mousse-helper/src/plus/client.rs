@@ -290,6 +290,11 @@ impl Plus {
             store.create(self.storage, &self.endpoint_id)
         }
         .map_err(|e| Failure::Local(format!("Plus key: {e}")))?;
+        if let Some(e) = stored.move_failed() {
+            applog::line(format!(
+                "the Plus key could not be moved to its owner-only file yet ({e}); it is tried again on its next use"
+            ));
+        }
         let key = stored.software_key().clone();
         *slot = Some(key.clone());
         Ok(key)
