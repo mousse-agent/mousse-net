@@ -6,14 +6,21 @@
 //!
 //! A refusal is noted when a connection with a device that holds a grant
 //! here, or that this computer pins, closes with `UNSUPPORTED_VERSION`
-//! after its `HELLO` was read, whichever side closed it. The first
-//! connection with that device that agrees a version clears it. Only the
-//! app-mode helper writes the file; the copy in memory is the truth while
-//! it runs, and a failed write is logged and tried again at the next change.
+//! after its `HELLO` was read, whichever side closed it. A connection with
+//! that device that agrees a version clears it. Outcomes apply in the
+//! order they were seen, so a clear that arrives late never removes a newer
+//! refusal. The file also keeps when each device last raised
+//! `peer.incompatible`, so neither a restart nor a clear lets it raise
+//! again within the gap.
+//!
+//! Only the app-mode helper writes the file; the copy in memory is the
+//! truth while it runs. A failed write is logged and the copy marked
+//! unsaved: every later call that may write tries again, also when it
+//! changes nothing.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use mousse_net_core::identity::IdentityPublicKey;
@@ -53,24 +60,38 @@ impl Refusal {
     }
 }
 
+/// When a device last raised `peer.incompatible`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct Notice {
+    identity: String,
+    /// Unix seconds.
+    at: u64,
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct RefusalFile {
     #[serde(default)]
     version: u32,
     #[serde(default)]
     refusals: Vec<Refusal>,
+    #[serde(default)]
+    notices: Vec<Notice>,
 }
 
-/// The store and, in memory only, when each device last raised
-/// `peer.incompatible`.
+/// The copy in memory.
+#[derive(Default)]
+struct Held {
+    file: RefusalFile,
+    /// The last write failed: the file is behind this copy.
+    unsaved: bool,
+    /// Per device, when the outcome applied last was seen.
+    seen: HashMap<String, Instant>,
+}
+
+/// The store.
 pub struct Refusals {
     path: PathBuf,
-    list: Mutex<Option<Vec<Refusal>>>,
-    raised: Mutex<HashMap<IdentityPublicKey, Instant>>,
-}
-
-fn guard<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
+    held: Mutex<Option<Held>>,
 }
 
 impl Refusals {
@@ -78,107 +99,137 @@ impl Refusals {
     pub fn in_dir(dir: &Path) -> Self {
         Self {
             path: dir.join(FILE),
-            list: Mutex::new(None),
-            raised: Mutex::new(HashMap::new()),
+            held: Mutex::new(None),
         }
     }
 
-    /// Read the file once; an unreadable one counts as empty.
-    fn loaded<'a>(&self, held: &'a mut Option<Vec<Refusal>>) -> &'a mut Vec<Refusal> {
-        held.get_or_insert_with(|| {
-            std::fs::read(&self.path)
+    /// Run `f` on the copy in memory, read from the file the first time;
+    /// an unreadable file counts as empty.
+    fn with<R>(&self, f: impl FnOnce(&mut Held) -> R) -> R {
+        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        let held = held.get_or_insert_with(|| Held {
+            file: std::fs::read(&self.path)
                 .ok()
                 .and_then(|b| serde_json::from_slice::<RefusalFile>(&b).ok())
-                .map(|f| f.refusals)
-                .unwrap_or_default()
-        })
+                .unwrap_or_default(),
+            ..Held::default()
+        });
+        f(held)
     }
 
-    fn save(&self, list: &[Refusal]) {
-        let file = RefusalFile {
-            version: 1,
-            refusals: list.to_vec(),
-        };
-        let written = serde_json::to_vec(&file)
+    /// Write the copy if `changed` or still unsaved.
+    fn save(&self, held: &mut Held, changed: bool) {
+        if !changed && !held.unsaved {
+            return;
+        }
+        held.file.version = 1;
+        let written = serde_json::to_vec(&held.file)
             .map_err(|e| e.to_string())
             .and_then(|bytes| write_atomic(&self.path, &bytes).map_err(|e| e.to_string()));
+        held.unsaved = written.is_err();
         if let Err(e) = written {
             applog::line(format!("version refusals: saving failed: {e}"));
         }
     }
 
+    /// Whether an outcome for `key` seen at `seen` is not older than the
+    /// one applied last; if so it becomes the last.
+    fn in_order(held: &mut Held, key: &str, seen: Instant) -> bool {
+        match held.seen.get(key) {
+            Some(last) if seen < *last => false,
+            _ => {
+                held.seen.insert(key.to_owned(), seen);
+                true
+            }
+        }
+    }
+
     /// The last refusal of `identity` (hex), if one is kept.
     pub fn get(&self, identity: &str) -> Option<Refusal> {
-        let mut held = guard(&self.list);
-        self.loaded(&mut held)
-            .iter()
-            .find(|r| r.identity == identity)
-            .cloned()
+        self.with(|held| {
+            held.file
+                .refusals
+                .iter()
+                .find(|r| r.identity == identity)
+                .cloned()
+        })
     }
 
-    /// Whether a refusal of `identity` is kept.
-    pub fn holds(&self, identity: &IdentityPublicKey) -> bool {
-        let key = hex(identity.as_bytes());
-        let mut held = guard(&self.list);
-        self.loaded(&mut held).iter().any(|r| r.identity == key)
-    }
-
-    /// Note a refusal of `identity`. Written only when it is new or its
-    /// minors changed. Returns the refusal as kept.
+    /// Note a refusal of `identity`, seen at `seen`. Kept unless an outcome
+    /// seen later was applied already; written when it is new or its minors
+    /// changed. Returns whether it was kept.
     pub fn note(
         &self,
         identity: &IdentityPublicKey,
         peer_minor: u64,
         local_minor: u64,
         now: u64,
-    ) -> Refusal {
+        seen: Instant,
+    ) -> bool {
         let key = hex(identity.as_bytes());
-        let mut held = guard(&self.list);
-        let list = self.loaded(&mut held);
-        if let Some(kept) = list.iter().find(|r| {
-            r.identity == key && r.peer_minor == peer_minor && r.local_minor == local_minor
-        }) {
-            return kept.clone();
-        }
-        list.retain(|r| r.identity != key);
-        let refusal = Refusal {
-            identity: key,
-            peer_minor,
-            local_minor,
-            since: now,
-        };
-        list.push(refusal.clone());
-        self.save(list);
-        refusal
-    }
-
-    /// A connection with `identity` agreed a version: its refusal goes.
-    /// Returns whether one was kept.
-    pub fn clear(&self, identity: &IdentityPublicKey) -> bool {
-        let key = hex(identity.as_bytes());
-        let mut held = guard(&self.list);
-        let list = self.loaded(&mut held);
-        let before = list.len();
-        list.retain(|r| r.identity != key);
-        if list.len() == before {
-            return false;
-        }
-        self.save(list);
-        guard(&self.raised).remove(identity);
-        true
-    }
-
-    /// Whether `identity` may raise `peer.incompatible` now: not within
-    /// `gap` of the last time it did. Taking the turn counts as raising.
-    pub fn take_turn(&self, identity: &IdentityPublicKey, now: Instant, gap: Duration) -> bool {
-        let mut raised = guard(&self.raised);
-        match raised.get(identity) {
-            Some(last) if now.saturating_duration_since(*last) < gap => false,
-            _ => {
-                raised.insert(*identity, now);
-                true
+        self.with(|held| {
+            if !Self::in_order(held, &key, seen) {
+                self.save(held, false);
+                return false;
             }
-        }
+            let list = &mut held.file.refusals;
+            let same = list.iter().any(|r| {
+                r.identity == key && r.peer_minor == peer_minor && r.local_minor == local_minor
+            });
+            if !same {
+                list.retain(|r| r.identity != key);
+                list.push(Refusal {
+                    identity: key,
+                    peer_minor,
+                    local_minor,
+                    since: now,
+                });
+            }
+            self.save(held, !same);
+            true
+        })
+    }
+
+    /// A connection with `identity` agreed a version, seen at `seen`: its
+    /// refusal goes, unless a refusal seen later was noted already.
+    /// Returns whether one was removed.
+    pub fn clear(&self, identity: &IdentityPublicKey, seen: Instant) -> bool {
+        let key = hex(identity.as_bytes());
+        self.with(|held| {
+            if !Self::in_order(held, &key, seen) {
+                self.save(held, false);
+                return false;
+            }
+            let before = held.file.refusals.len();
+            held.file.refusals.retain(|r| r.identity != key);
+            let removed = held.file.refusals.len() != before;
+            self.save(held, removed);
+            removed
+        })
+    }
+
+    /// Whether `identity` may raise `peer.incompatible` now (`now` in unix
+    /// seconds): not within `gap` of the last time it did, before a restart
+    /// or a clear too. Taking the turn counts as raising, and is written.
+    pub fn take_turn(&self, identity: &IdentityPublicKey, now: u64, gap: Duration) -> bool {
+        let key = hex(identity.as_bytes());
+        let gap = gap.as_secs();
+        self.with(|held| {
+            // A time ahead of now (the clock went back) does not hold a turn.
+            let recent = |n: &Notice| n.at <= now && now - n.at < gap;
+            let notices = &mut held.file.notices;
+            if notices.iter().any(|n| n.identity == key && recent(n)) {
+                self.save(held, false);
+                return false;
+            }
+            notices.retain(|n| n.identity != key && recent(n));
+            notices.push(Notice {
+                identity: key,
+                at: now,
+            });
+            self.save(held, true);
+            true
+        })
     }
 }
 
@@ -206,10 +257,11 @@ mod tests {
         let d = dir("keep");
         let (a, b) = (key(), key());
         let store = Refusals::in_dir(&d);
-        store.note(&a, 1, 3, 100);
-        store.note(&b, 4, 3, 100);
+        let t0 = Instant::now();
+        store.note(&a, 1, 3, 100, t0);
+        store.note(&b, 4, 3, 100, t0);
         // The same minors again keep the first time.
-        assert_eq!(store.note(&a, 1, 3, 200).since, 100);
+        store.note(&a, 1, 3, 200, t0);
         let again = Refusals::in_dir(&d);
         let ka = hex(a.as_bytes());
         assert_eq!(
@@ -221,8 +273,8 @@ mod tests {
                 since: 100
             })
         );
-        assert!(again.clear(&a));
-        assert!(!again.clear(&a));
+        assert!(again.clear(&a, t0));
+        assert!(!again.clear(&a, t0));
         let third = Refusals::in_dir(&d);
         assert_eq!(third.get(&ka), None);
         assert!(third.get(&hex(b.as_bytes())).is_some());
@@ -230,14 +282,69 @@ mod tests {
     }
 
     #[test]
-    fn a_device_raises_at_most_once_per_gap() {
-        let store = Refusals::in_dir(&dir("turn"));
+    fn a_failed_write_is_tried_again_by_the_next_call_that_changes_nothing() {
+        let d = dir("retry");
+        let a = key();
+        let ka = hex(a.as_bytes());
+        // A folder where the file goes: every write fails.
+        std::fs::create_dir(d.join(FILE)).unwrap();
+        let store = Refusals::in_dir(&d);
+        let t0 = Instant::now();
+        store.note(&a, 1, 3, 100, t0);
+        std::fs::remove_dir(d.join(FILE)).unwrap();
+        // The same refusal again: nothing changes, the write happens.
+        store.note(&a, 1, 3, 200, t0);
+        assert!(Refusals::in_dir(&d).get(&ka).is_some());
+
+        // A clear whose write failed is written by the next call too.
+        std::fs::remove_file(d.join(FILE)).unwrap();
+        std::fs::create_dir(d.join(FILE)).unwrap();
+        assert!(store.clear(&a, t0));
+        std::fs::remove_dir(d.join(FILE)).unwrap();
+        std::fs::write(
+            d.join(FILE),
+            serde_json::to_vec(&json!({"version": 1, "refusals": [{
+                "identity": ka, "peer_minor": 1, "local_minor": 3, "since": 100
+            }]}))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!store.clear(&a, t0));
+        assert_eq!(Refusals::in_dir(&d).get(&ka), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_late_clear_never_removes_a_refusal_seen_after_it() {
+        let store = Refusals::in_dir(&dir("order"));
+        let a = key();
+        let ka = hex(a.as_bytes());
+        let agreed = Instant::now();
+        let refused = agreed + Duration::from_millis(5);
+        store.note(&a, 1, 3, 100, refused);
+        // The agreement was seen before the refusal: it changes nothing.
+        assert!(!store.clear(&a, agreed));
+        assert!(store.get(&ka).is_some());
+        // An agreement seen after it clears it.
+        assert!(store.clear(&a, refused + Duration::from_millis(5)));
+        assert_eq!(store.get(&ka), None);
+    }
+
+    #[test]
+    fn a_device_raises_at_most_once_per_gap_across_a_restart_and_a_clear() {
+        let d = dir("turn");
         let (a, b) = (key(), key());
         let gap = Duration::from_secs(3_600);
-        let t0 = Instant::now();
-        assert!(store.take_turn(&a, t0, gap));
-        assert!(!store.take_turn(&a, t0 + Duration::from_secs(3_599), gap));
-        assert!(store.take_turn(&b, t0, gap));
-        assert!(store.take_turn(&a, t0 + gap, gap));
+        let store = Refusals::in_dir(&d);
+        assert!(store.take_turn(&a, 1_000, gap));
+        assert!(!store.take_turn(&a, 4_599, gap));
+        assert!(store.take_turn(&b, 1_000, gap));
+        // A clear and a restart keep the turn taken.
+        store.note(&a, 1, 3, 1_000, Instant::now());
+        store.clear(&a, Instant::now());
+        let again = Refusals::in_dir(&d);
+        assert!(!again.take_turn(&a, 4_599, gap));
+        assert!(again.take_turn(&a, 4_600, gap));
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

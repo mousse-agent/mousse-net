@@ -94,7 +94,10 @@ Additions only. A 1.2 helper serves a 1.1 app unchanged.
     then, so the lower of the two names the computer that has to update).
     It is kept in `version-refusals.json` next to `peers.json`, so it
     outlives a restart, and goes once a connection with the device agrees a
-    version (shortly after that connection's `conn.up`).
+    version, before that connection's `conn.up` (unless a refusal was seen
+    after the agreement). The time of the last `peer.incompatible` is kept
+    in the same file, so a restart or a clear does not raise it again
+    within the gap.
   - The keeper never parks a host refused for version: it tries it again
     at `KEEP_RETRY_MAX_MS`. `dial` tries it at once ("Check again").
 

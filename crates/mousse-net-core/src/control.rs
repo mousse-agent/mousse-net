@@ -289,6 +289,15 @@ pub fn negotiate_version(
     Ok(agreed)
 }
 
+/// Whether a peer whose `HELLO` named `peer_minor` accepts `agreed`. A peer
+/// speaks its newest minor and the one before it (wire.md 2), so it closes
+/// with `UNSUPPORTED_VERSION` below that. A side that sees this may close
+/// first: a caller then never goes live on a connection the host refuses
+/// as soon as it reads the caller's `HELLO`.
+pub fn peer_accepts(agreed: u64, peer_minor: u64) -> bool {
+    agreed >= peer_minor.saturating_sub(1)
+}
+
 /// What one received `HELLO` did to a connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HelloOutcome {
@@ -366,6 +375,15 @@ mod tests {
             negotiate_version(local, 0, 4),
             Err(ErrorCode::UnsupportedVersion)
         );
+    }
+
+    #[test]
+    fn a_peer_accepts_its_newest_minor_and_the_one_before() {
+        assert!(peer_accepts(3, 3));
+        assert!(peer_accepts(2, 3));
+        assert!(!peer_accepts(1, 3));
+        assert!(peer_accepts(0, 0));
+        assert!(peer_accepts(0, 1));
     }
 
     #[test]

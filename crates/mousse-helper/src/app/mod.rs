@@ -391,6 +391,9 @@ impl App {
             limits,
             engine,
         });
+        // Read the refusals file off the path every new connection takes.
+        let warm = shared.clone();
+        tokio::spawn(async move { warm.refusals.get("") });
         tokio::spawn(read_stdin(shared.clone()));
         tokio::spawn(write_stdout(shared.clone()));
         tokio::spawn(pairing::watch_pause(shared.clone()));
@@ -570,18 +573,31 @@ impl Shared {
 
     /// A connection with the paired device `identity` closed with
     /// `UNSUPPORTED_VERSION` after its `HELLO` named `peer_minor`: kept as
-    /// its last refusal. On a dial, the dial's own error tells the app.
+    /// its last refusal, as seen now. On a dial, the dial's own error tells
+    /// the app.
     fn note_version_refusal(&self, identity: IdentityPublicKey, peer_minor: u64) {
         self.refusals.note(
             &identity,
             peer_minor,
             mousse_net_io::conn::local_minor(),
             crate::peer::now_secs(),
+            tokio::time::Instant::now(),
         );
         applog::line(format!(
             "{} speaks minor versions up to {peer_minor}: no common version",
             short_id(&identity)
         ));
+    }
+
+    /// A connection with `identity` agreed a version, seen at `seen`: its
+    /// refusal for version goes, unless one seen later was kept.
+    fn clear_refusal(&self, identity: &IdentityPublicKey, seen: tokio::time::Instant) {
+        if self.refusals.clear(identity, seen) {
+            applog::line(format!(
+                "{} agreed a version: its refusal is cleared",
+                short_id(identity)
+            ));
+        }
     }
 
     /// An incoming connection from `identity` closed with
@@ -604,7 +620,7 @@ impl Shared {
         let gap = crate::limits::ms(self.limits.peer_incompatible_gap_ms());
         if self
             .refusals
-            .take_turn(&identity, tokio::time::Instant::now(), gap)
+            .take_turn(&identity, crate::peer::now_secs(), gap)
         {
             self.event(json!({
                 "ev": "peer.incompatible",
@@ -742,6 +758,12 @@ impl Shared {
                     gen,
                 },
             );
+            // A connection that agreed a version clears the device's
+            // refusal for version before the app hears of it.
+            let agreed_at = conn.minor().and(conn.hello_at());
+            if let Some(seen) = agreed_at {
+                self.clear_refusal(&identity, seen);
+            }
             fields["ev"] = json!("conn.up");
             fields["conn"] = json!(no);
             fields["identity"] = json!(hex(identity.as_bytes()));
@@ -751,16 +773,15 @@ impl Shared {
             core.out.conn_event(no, &fields);
             self.queued(&core);
             tokio::spawn(conn_task(self.clone(), no, conn.clone(), inbound));
-            if self.refusals.holds(&identity) {
-                // The first connection that agrees a version clears the
-                // device's refusal for version.
+            if agreed_at.is_none() {
+                // The peer's `HELLO` is still on its way: its agreement
+                // clears the refusal when it comes.
                 let (shared, conn) = (self.clone(), conn.clone());
                 tokio::spawn(async move {
-                    if conn.hello_minor().await.is_some() && shared.refusals.clear(&identity) {
-                        applog::line(format!(
-                            "{} agreed a version: its refusal is cleared",
-                            short_id(&identity)
-                        ));
+                    if conn.hello_minor().await.is_some() {
+                        if let Some(seen) = conn.hello_at() {
+                            shared.clear_refusal(&identity, seen);
+                        }
                     }
                 });
             }

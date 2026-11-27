@@ -1920,6 +1920,9 @@ pub async fn dial_route(
         };
         match tokio::time::timeout(dial_within(), shared.caller.dial(pipe, *pin)).await {
             Ok(Ok(conn)) => return Ok(conn),
+            // The pinned host itself shares no version with this computer:
+            // another address of the relay changes nothing.
+            Ok(Err(e @ NetError::Version { .. })) => return Err(e),
             Ok(Err(e)) => last = e,
             Err(_) => last = NetError::Timeout("peer TLS through the relay"),
         }
