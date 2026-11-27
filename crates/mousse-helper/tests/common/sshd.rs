@@ -8,16 +8,20 @@
 //!   (`HOME`, `MOUSSE_HOME`, ...) and the home as working directory:
 //!   - Unix: through `/bin/sh -c <command>`, as OpenSSH does with a POSIX
 //!     login shell, so the remote command form of §3.3 runs as written;
-//!   - Windows (Windows remotes are not supported in 1b, so this only
-//!     stands in for a Unix remote on the PC): the one command form Mousse
-//!     sends, `exec /bin/sh -c '"$HOME"/.mousse/bin/<launcher> <args>'`, is
+//!   - Windows (standing in for a Unix remote on the PC): the `sh` command
+//!     form, `exec /bin/sh -c '"$HOME"/.mousse/bin/<launcher> <args>'`, is
 //!     read here and the launcher named in [`Config::launchers`] runs with
 //!     those arguments. A launcher that is not there fails as `sh` does
 //!     (`not found`, exit 127).
 //! - Launchers may be the built-in echo stand-in for `mousse-cli net-engine
 //!   ssh`: the marker, then stdin echoed back.
-//! - [`Shell::WindowsCmd`] answers every command as a Windows `cmd` remote
-//!   does to `exec` (exit 1, "'exec' is not recognized ...").
+//! - [`Shell::WindowsCmd`] and [`Shell::WindowsPowershell`] stand in for a Windows
+//!   remote on every OS: the `sh` form fails as `cmd` or PowerShell answer
+//!   `exec` ("'exec' is not recognized ..."), and the Windows form
+//!   `.\.mousse\bin\<launcher>.cmd <args>` runs the launcher from
+//!   [`Config::launchers`], or fails as they do when it is missing. Real
+//!   `cmd.exe` and `powershell.exe` run the same strings in
+//!   `mousse-net-io/tests/windows_shells.rs`.
 //! - Wires stdin, stdout, stderr (extended data 1) and the exit status.
 //! - Can print a login-shell preamble on stdout before the command's output.
 //! - Kills the child's whole tree when the channel or session ends (a Unix
@@ -32,7 +36,7 @@ use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use russh::keys::{Algorithm, HashAlg, PrivateKey, PublicKey};
@@ -52,8 +56,13 @@ pub enum Shell {
     /// Unix: `/bin/sh -c <command>`. Windows: the §3.3 command form, read
     /// here (see the module docs).
     Default,
-    /// A Windows `cmd` remote: `exec` is not a command there.
+    /// A Windows remote whose OpenSSH default shell is `cmd`: `exec` is
+    /// not a command there; `.\.mousse\bin\<launcher>.cmd <args>` runs the
+    /// launcher.
     WindowsCmd,
+    /// The same with PowerShell as the default shell, which says so in its
+    /// own words and takes `; exit $LASTEXITCODE` after the launcher.
+    WindowsPowershell,
 }
 
 /// What a launcher in `~/.mousse/bin` runs (Windows only; on Unix the
@@ -101,6 +110,8 @@ pub fn sha256(key: &PublicKey) -> String {
 pub struct TestSshd {
     pub addr: SocketAddr,
     pub host_key: PublicKey,
+    /// Every exec request's command, in order.
+    seen: Arc<Mutex<Vec<String>>>,
     stop: Option<server::RunningServerHandle>,
     rt: Option<tokio::runtime::Runtime>,
 }
@@ -117,12 +128,14 @@ impl TestSshd {
             .enable_all()
             .build()
             .expect("sshd runtime");
+        let seen = Arc::new(Mutex::new(Vec::new()));
         let (addr, host_key, stop) = rt
-            .block_on(serve(config, port))
+            .block_on(serve(config, port, seen.clone()))
             .expect("start the test sshd");
         Self {
             addr,
             host_key,
+            seen,
             stop: Some(stop),
             rt: Some(rt),
         }
@@ -130,6 +143,12 @@ impl TestSshd {
 
     pub fn port(&self) -> u16 {
         self.addr.port()
+    }
+
+    /// The commands exec requests ran so far, in order (one per session
+    /// that ran a command).
+    pub fn commands(&self) -> Vec<String> {
+        self.seen.lock().unwrap().clone()
     }
 
     /// `SHA256:<base64>`, as `ssh-keygen -l` prints it.
@@ -157,6 +176,7 @@ impl Drop for TestSshd {
 async fn serve(
     config: Config,
     port: u16,
+    seen: Arc<Mutex<Vec<String>>>,
 ) -> std::io::Result<(SocketAddr, PublicKey, server::RunningServerHandle)> {
     let listener = TcpListener::bind(("127.0.0.1", port)).await?;
     let addr = listener.local_addr()?;
@@ -177,6 +197,7 @@ async fn serve(
         cwd: config.cwd,
         preamble: config.preamble,
         launchers: config.launchers,
+        seen,
     });
     let mut server = Factory { shared };
     let (handle_tx, handle_rx) = oneshot::channel();
@@ -198,6 +219,7 @@ struct Shared {
     cwd: Option<PathBuf>,
     preamble: Vec<u8>,
     launchers: HashMap<String, Launcher>,
+    seen: Arc<Mutex<Vec<String>>>,
 }
 
 struct Factory {
@@ -281,6 +303,7 @@ impl server::Handler for Conn {
             return Ok(());
         };
         let command = String::from_utf8_lossy(command).into_owned();
+        self.shared.seen.lock().unwrap().push(command.clone());
         let preamble = self.shared.preamble.clone();
         match plan(&self.shared, &command) {
             Plan::Child(cmd) => {
@@ -344,16 +367,70 @@ impl server::Handler for Conn {
     }
 }
 
-fn plan(shared: &Shared, command: &str) -> Plan {
-    if let Shell::WindowsCmd = shared.shell {
-        let word = command.split_whitespace().next().unwrap_or("");
-        return Plan::Fail {
+/// What `cmd` or PowerShell says for a command it cannot find, and the
+/// exit it ends with (PowerShell's `; exit $LASTEXITCODE` exits 0 then).
+fn not_recognized(shell: &Shell, word: &str) -> Plan {
+    match shell {
+        Shell::WindowsPowershell => Plan::Fail {
+            stderr: format!(
+                "{word} : The term '{word}' is not recognized as the name of a cmdlet, function, script file, or operable program. Check the spelling of the name, or if a path was included, verify that the path is correct and try again.\r\n    + FullyQualifiedErrorId : CommandNotFoundException\r\n"
+            )
+            .into_bytes(),
+            code: if word == "exec" { 1 } else { 0 },
+        },
+        _ => Plan::Fail {
             stderr: format!(
                 "'{word}' is not recognized as an internal or external command,\r\noperable program or batch file.\r\n"
             )
             .into_bytes(),
             code: 1,
-        };
+        },
+    }
+}
+
+/// A Windows shell: the `sh` form fails on `exec`; the Windows form
+/// `.\.mousse\bin\<launcher>.cmd <args>` (PowerShell: then `; exit
+/// $LASTEXITCODE`) runs the launcher named in [`Config::launchers`].
+fn plan_windows(shared: &Shared, command: &str) -> Plan {
+    let line = match shared.shell {
+        Shell::WindowsPowershell => command.strip_suffix("; exit $LASTEXITCODE"),
+        _ => Some(command),
+    };
+    let first = command.split_whitespace().next().unwrap_or("");
+    let Some(line) = line else {
+        return not_recognized(&shared.shell, first);
+    };
+    let mut words = line.split(' ');
+    let word = words.next().unwrap_or("");
+    let Some(name) = word
+        .strip_prefix(".\\.mousse\\bin\\")
+        .and_then(|w| w.strip_suffix(".cmd"))
+    else {
+        return not_recognized(&shared.shell, word);
+    };
+    let args: Vec<&str> = words.collect();
+    let no_folder = shared
+        .cwd
+        .as_ref()
+        .is_some_and(|home| !home.join(".mousse").join("bin").is_dir());
+    match shared.launchers.get(name) {
+        None if no_folder && matches!(shared.shell, Shell::WindowsCmd) => Plan::Fail {
+            stderr: b"The system cannot find the path specified.\r\n".to_vec(),
+            code: 1,
+        },
+        None => not_recognized(&shared.shell, word),
+        Some(Launcher::Echo) => Plan::Echo,
+        Some(Launcher::Program { path, env }) => {
+            let mut cmd = Command::new(path);
+            cmd.args(&args).envs(env.iter().map(|(k, v)| (k, v)));
+            Plan::Child(cmd)
+        }
+    }
+}
+
+fn plan(shared: &Shared, command: &str) -> Plan {
+    if matches!(shared.shell, Shell::WindowsCmd | Shell::WindowsPowershell) {
+        return plan_windows(shared, command);
     }
     if cfg!(unix) {
         let mut cmd = Command::new("/bin/sh");

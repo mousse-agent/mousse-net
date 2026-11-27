@@ -165,22 +165,94 @@ fn plain_token(token: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
+/// The remote account's default shell, which runs the remote command
+/// (§3.3). A route starts out not knowing it and tries [`RemoteShell::Sh`]
+/// first; a Windows shell's answer to that names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RemoteShell {
+    /// A POSIX login shell (or fish or zsh, which never parse the inner
+    /// command).
+    Sh,
+    /// Windows OpenSSH's default, `cmd.exe /c`.
+    Cmd,
+    /// Windows PowerShell or PowerShell 7 as OpenSSH's default shell.
+    PowerShell,
+}
+
+impl RemoteShell {
+    /// The name the app and the route file use.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Sh => "sh",
+            Self::Cmd => "cmd",
+            Self::PowerShell => "powershell",
+        }
+    }
+
+    /// The shell a name stands for.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "sh" => Some(Self::Sh),
+            "cmd" => Some(Self::Cmd),
+            "powershell" => Some(Self::PowerShell),
+            _ => None,
+        }
+    }
+
+    /// The Windows shell that answered the `sh` form, from its stderr:
+    /// `cmd` says "is not recognized as an internal or external command",
+    /// PowerShell "is not recognized as the name of a cmdlet" (5.1) or "as
+    /// a name of a cmdlet" (7). English Windows only; another shell, or
+    /// another language, is `None`.
+    pub fn windows_of(stderr: &str) -> Option<Self> {
+        if stderr.contains("is not recognized as an internal or external command") {
+            Some(Self::Cmd)
+        } else if stderr.contains("is not recognized as the name of a cmdlet")
+            || stderr.contains("is not recognized as a name of a cmdlet")
+        {
+            Some(Self::PowerShell)
+        } else {
+            None
+        }
+    }
+}
+
 /// The remote command for a launcher in the remote's `~/.mousse/bin`
-/// (§3.3): `exec /bin/sh -c '"$HOME"/.mousse/bin/<launcher> <args>'`, so a
-/// login shell like fish or zsh never parses the inner command. Only
-/// plain tokens are taken, so nothing needs quoting.
-pub fn remote_command(launcher: &str, args: &[&str]) -> Result<String, NetError> {
+/// (§3.3). Only plain tokens are taken, so nothing needs quoting.
+///
+/// - [`RemoteShell::Sh`]: `exec /bin/sh -c '"$HOME"/.mousse/bin/<launcher>
+///   <args>'`, so a login shell like fish or zsh never parses the inner
+///   command.
+/// - [`RemoteShell::Cmd`]: `.\.mousse\bin\<launcher>.cmd <args>`. Windows
+///   OpenSSH starts the session in the profile folder, so the path is
+///   relative to it: no quotes, no `%VAR%`, no spaces, whatever the user's
+///   folder is called.
+/// - [`RemoteShell::PowerShell`]: the same, then `; exit $LASTEXITCODE`:
+///   PowerShell passes stdin and stdout through to the launcher byte for
+///   byte, but would end with its own exit code, not the launcher's.
+pub fn remote_command(
+    shell: RemoteShell,
+    launcher: &str,
+    args: &[&str],
+) -> Result<String, NetError> {
     if !plain_token(launcher) || !args.iter().all(|a| plain_token(a)) {
         return Err(NetError::Refused(
             "a remote command takes plain words only".into(),
         ));
     }
-    let mut inner = format!("\"$HOME\"/.mousse/bin/{launcher}");
+    let mut line = match shell {
+        RemoteShell::Sh => format!("\"$HOME\"/.mousse/bin/{launcher}"),
+        RemoteShell::Cmd | RemoteShell::PowerShell => format!(".\\.mousse\\bin\\{launcher}.cmd"),
+    };
     for arg in args {
-        inner.push(' ');
-        inner.push_str(arg);
+        line.push(' ');
+        line.push_str(arg);
     }
-    Ok(format!("exec /bin/sh -c '{inner}'"))
+    Ok(match shell {
+        RemoteShell::Sh => format!("exec /bin/sh -c '{line}'"),
+        RemoteShell::Cmd => line,
+        RemoteShell::PowerShell => format!("{line}; exit $LASTEXITCODE"),
+    })
 }
 
 /// One route's constrained config, and what the connection window counts
@@ -297,7 +369,9 @@ pub enum SshReason {
     /// Anything else, a missing marker or a refused `pipe` (exit 4)
     /// included.
     RemoteFailed,
-    /// The remote runs `cmd` or PowerShell: not supported in 1b (§16, S1).
+    /// A Windows shell answered the `sh` form. `ssh.run` then names the
+    /// shell and tries its own form; the reason stays only for a shell it
+    /// cannot name (another language, or bash on Windows).
     WindowsRemoteUnsupported,
 }
 
@@ -344,9 +418,18 @@ pub mod pipe_exit {
     pub const REFUSED: i32 = 4;
 }
 
-/// The reason for a call that ended with exit `code` (`None`: killed) and
-/// this stderr (S1's texts, §16).
+/// The reason for a call in the `sh` form that ended with exit `code`
+/// (`None`: killed) and this stderr (S1's texts, §16).
 pub fn reason_of(code: Option<i32>, stderr: &str) -> SshReason {
+    reason_of_after(RemoteShell::Sh, code, stderr)
+}
+
+/// The reason for a call that ran the remote command in `shell`'s form and
+/// ended with exit `code` (`None`: killed) and this stderr. After a
+/// Windows form, a launcher `cmd` or PowerShell cannot find ("is not
+/// recognized", or "The system cannot find the path specified" when
+/// `.mousse\bin` is missing) is `remote_not_installed`.
+pub fn reason_of_after(shell: RemoteShell, code: Option<i32>, stderr: &str) -> SshReason {
     let has = |s: &str| stderr.contains(s);
     // The client's own failures (exit 255).
     if has("REMOTE HOST IDENTIFICATION HAS CHANGED")
@@ -374,12 +457,17 @@ pub fn reason_of(code: Option<i32>, stderr: &str) -> SshReason {
     {
         return SshReason::Unreachable;
     }
-    // A Windows remote: `cmd` or PowerShell did not know `exec`.
-    if has("is not recognized as an internal or external command")
-        || has("is not recognized as the name of a cmdlet")
-        || has("is not recognized as a name of a cmdlet")
-    {
-        return SshReason::WindowsRemoteUnsupported;
+    if shell == RemoteShell::Sh {
+        // A Windows remote: `cmd` or PowerShell did not know `exec`.
+        if has("is not recognized as an internal or external command")
+            || has("is not recognized as the name of a cmdlet")
+            || has("is not recognized as a name of a cmdlet")
+        {
+            return SshReason::WindowsRemoteUnsupported;
+        }
+    } else if has("is not recognized as") || has("The system cannot find the path specified") {
+        // The Windows form: no launcher in `.mousse\bin`.
+        return SshReason::RemoteNotInstalled;
     }
     // The remote `pipe`.
     if has("mousse-pipe: not_running") {
@@ -586,9 +674,15 @@ pub struct CallOutput {
 }
 
 impl CallOutput {
-    /// The reason it failed, from its exit and stderr.
+    /// The reason it failed, from its exit and stderr, for a call without
+    /// a remote command or with the `sh` form.
     pub fn reason(&self) -> SshReason {
         reason_of(self.code, &self.stderr)
+    }
+
+    /// The reason it failed, for a remote command in `shell`'s form.
+    pub fn reason_after(&self, shell: RemoteShell) -> SshReason {
+        reason_of_after(shell, self.code, &self.stderr)
     }
 }
 
@@ -656,14 +750,16 @@ pub async fn run(
     })
 }
 
-/// Open a pipe: `ssh` runs `remote` through the route's config, and the
-/// pipe starts after the marker. Fails with an [`SshReason`] if no marker
-/// comes by `within` (the caller's `SSH_DIAL_TIMEOUT_MS` covers this and
-/// step 1 on top). The window place is taken first.
+/// Open a pipe: `ssh` runs `remote` (in `shell`'s form) through the route's
+/// config, and the pipe starts after the marker. Fails with an
+/// [`SshReason`] if no marker comes by `within` (the caller's
+/// `SSH_DIAL_TIMEOUT_MS` covers this and step 1 on top). The window place
+/// is taken first.
 pub async fn dial(
     params: &SshParams,
     window: &SshWindow,
     target: &SshTarget,
+    shell: RemoteShell,
     remote: &str,
     within: Duration,
     on_wait: impl FnMut(Duration),
@@ -730,7 +826,7 @@ pub async fn dial(
                 } else {
                     text.trim().to_owned()
                 };
-                return Err(failed(reason_of(code, &text), detail));
+                return Err(failed(reason_of_after(shell, code, &text), detail));
             }
             Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
         }
@@ -876,14 +972,102 @@ mod tests {
         assert!(config_path(Path::new("/a/b\nc")).is_none());
     }
 
+    /// After the Windows form, a missing launcher is `remote_not_installed`,
+    /// never `windows_remote_unsupported`; what the client or the remote
+    /// `pipe` says is read as after the `sh` form.
+    #[test]
+    fn stderr_after_a_windows_form_maps_to_a_reason() {
+        let cmd_missing = "'.\\.mousse\\bin\\mousse-cli.cmd' is not recognized as an internal or external command,\r\noperable program or batch file.\r\n";
+        let ps_missing = ".\\.mousse\\bin\\mousse-cli.cmd : The term '.\\.mousse\\bin\\mousse-cli.cmd' is not recognized as the name of a cmdlet, function, script file, or operable program.";
+        let no_folder = "The system cannot find the path specified.\r\n";
+        for shell in [RemoteShell::Cmd, RemoteShell::PowerShell] {
+            let cases: [(Option<i32>, &str, SshReason); 7] = [
+                (Some(1), cmd_missing, SshReason::RemoteNotInstalled),
+                (Some(0), ps_missing, SshReason::RemoteNotInstalled),
+                (Some(1), no_folder, SshReason::RemoteNotInstalled),
+                (
+                    Some(255),
+                    "u@h: Permission denied (publickey).",
+                    SshReason::AuthDenied,
+                ),
+                (
+                    Some(2),
+                    "mousse-pipe: not_running",
+                    SshReason::RemoteNotRunning,
+                ),
+                (
+                    Some(3),
+                    "mousse-pipe: no_endpoint",
+                    SshReason::RemoteNoEndpoint,
+                ),
+                (Some(4), "mousse-pipe: refused", SshReason::RemoteFailed),
+            ];
+            for (code, text, want) in cases {
+                assert_eq!(
+                    reason_of_after(shell, code, text),
+                    want,
+                    "{shell:?} {text:?}"
+                );
+            }
+        }
+        // The same texts after the `sh` form: a Windows shell answered.
+        assert_eq!(
+            reason_of_after(RemoteShell::Sh, Some(1), cmd_missing),
+            SshReason::WindowsRemoteUnsupported
+        );
+        assert_eq!(
+            reason_of(Some(1), "exec : The term 'exec' is not recognized as the name of a cmdlet, function, script file, or operable program."),
+            SshReason::WindowsRemoteUnsupported
+        );
+    }
+
+    #[test]
+    fn the_windows_shell_is_named_by_its_answer_to_the_sh_form() {
+        let cases = [
+            ("'exec' is not recognized as an internal or external command,\r\noperable program or batch file.", Some(RemoteShell::Cmd)),
+            ("exec : The term 'exec' is not recognized as the name of a cmdlet, function, script file, or operable program.", Some(RemoteShell::PowerShell)),
+            ("exec: The term 'exec' is not recognized as a name of a cmdlet, function, script file, or executable program.", Some(RemoteShell::PowerShell)),
+            ("\"exec\" wird nicht als interner oder externer Befehl erkannt.", None),
+            ("/bin/sh: 1: /home/u/.mousse/bin/mousse-cli: not found", None),
+            ("", None),
+        ];
+        for (text, want) in cases {
+            assert_eq!(RemoteShell::windows_of(text), want, "{text:?}");
+        }
+        for shell in [RemoteShell::Sh, RemoteShell::Cmd, RemoteShell::PowerShell] {
+            assert_eq!(RemoteShell::parse(shell.name()), Some(shell));
+        }
+        assert_eq!(RemoteShell::parse("bash"), None);
+    }
+
     #[test]
     fn remote_commands_take_plain_words_only() {
+        let sel = "abcdefghijklmnopqrstuvwxyz";
+        let args = ["pipe", "--profile", sel];
         assert_eq!(
-            remote_command("mousse-helper", &["pipe", "--profile", "abcdefghijklmnopqrstuvwxyz"]).unwrap(),
+            remote_command(RemoteShell::Sh, "mousse-helper", &args).unwrap(),
             "exec /bin/sh -c '\"$HOME\"/.mousse/bin/mousse-helper pipe --profile abcdefghijklmnopqrstuvwxyz'"
         );
-        for bad in ["a b", "a'b", "$(x)", "", "a;b"] {
-            assert!(remote_command("mousse-helper", &[bad]).is_err(), "{bad:?}");
+        assert_eq!(
+            remote_command(RemoteShell::Cmd, "mousse-helper", &args).unwrap(),
+            ".\\.mousse\\bin\\mousse-helper.cmd pipe --profile abcdefghijklmnopqrstuvwxyz"
+        );
+        assert_eq!(
+            remote_command(
+                RemoteShell::PowerShell,
+                "mousse-cli",
+                &["net-engine", "ssh"]
+            )
+            .unwrap(),
+            ".\\.mousse\\bin\\mousse-cli.cmd net-engine ssh; exit $LASTEXITCODE"
+        );
+        for shell in [RemoteShell::Sh, RemoteShell::Cmd, RemoteShell::PowerShell] {
+            for bad in ["a b", "a'b", "$(x)", "", "a;b", "a&b", "%x%", "a\"b"] {
+                assert!(
+                    remote_command(shell, "mousse-helper", &[bad]).is_err(),
+                    "{shell:?} {bad:?}"
+                );
+            }
         }
     }
 

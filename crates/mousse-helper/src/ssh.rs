@@ -31,8 +31,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use mousse_net_io::pipe::ssh::{
-    self as sshpipe, config_path, find_marker, MarkerSearch, SshParams, SshReason, SshTarget,
-    SshWindow, MARKER,
+    self as sshpipe, config_path, find_marker, MarkerSearch, RemoteShell, SshParams, SshReason,
+    SshTarget, SshWindow, MARKER,
 };
 use mousse_net_io::pipe::{BoxPipe, DialFuture, LocalRoute, RouteDialer};
 use mousse_net_io::rng::random_bytes;
@@ -251,8 +251,8 @@ impl Ssh {
                     Some(Value::Object(r)) => r.clone(),
                     _ => return Err(fail("bad_request", "ssh.run needs request (an object)")),
                 };
-                let reply = self.run(&id, &Value::Object(request), &event).await?;
-                Ok(json!({ "reply": reply }))
+                let (reply, shell) = self.run(&id, &Value::Object(request), &event).await?;
+                Ok(json!({ "reply": reply, "shell": shell.name() }))
             }
             "ssh.forget" => {
                 let id = route_id(str_field("route_id").unwrap_or(""))?;
@@ -286,14 +286,31 @@ impl Ssh {
     }
 
     fn target(&self, id: &str) -> Result<SshTarget, Fail> {
+        Ok(self.target_and_shell(id)?.0)
+    }
+
+    /// The route's target, and the remote shell it has learned or was
+    /// bound with (`None`: not known yet).
+    fn target_and_shell(&self, id: &str) -> Result<(SshTarget, Option<RemoteShell>), Fail> {
         let route = self.route(id)?;
-        Ok(SshTarget {
+        let shell = route.shell.as_deref().and_then(RemoteShell::parse);
+        let target = SshTarget {
             conf: self.conf_path(id),
             alias: alias(id),
             host: route.hostname,
             port: route.port,
             user_target: route.target,
-        })
+        };
+        Ok((target, shell))
+    }
+
+    /// Keep the shell `ssh.run` learned for route `id`, if it still exists.
+    fn save_shell(&self, id: &str, shell: RemoteShell) -> Result<(), Fail> {
+        let _held = self.files_lock();
+        let mut route = self.route(id)?;
+        route.shell = Some(shell.name().to_owned());
+        let meta = serde_json::to_vec(&route).map_err(|e| fail("store_failed", e.to_string()))?;
+        write_atomic(&self.meta_path(id), &meta).map_err(|e| fail("store_failed", e.to_string()))
     }
 
     /// The deadline of one setup call, and the window notice.
@@ -363,6 +380,11 @@ impl Ssh {
         let conf = write_conf(&id, &hostname, ssh_port, &ssh_user, &kh, &resolved)?;
         write_atomic(&self.conf_path(&id), conf.as_bytes())
             .map_err(|e| fail("store_failed", e.to_string()))?;
+        // The pin and the shell learned for the route hold only for the
+        // same server.
+        let same = before
+            .as_ref()
+            .is_some_and(|b| b.hostname == hostname && b.port == ssh_port);
         let route = RouteFile {
             target: text.to_owned(),
             user: ssh_user.clone(),
@@ -373,12 +395,14 @@ impl Ssh {
                 .cloned()
                 .unwrap_or_default(),
             selector: before.as_ref().and_then(|b| b.selector.clone()),
-            shell: before.as_ref().and_then(|b| b.shell.clone()),
+            shell: before
+                .as_ref()
+                .filter(|_| same)
+                .and_then(|b| b.shell.clone()),
         };
         let meta = serde_json::to_vec(&route).map_err(|e| fail("store_failed", e.to_string()))?;
         write_atomic(&self.meta_path(&id), &meta)
             .map_err(|e| fail("store_failed", e.to_string()))?;
-        let same = before.is_some_and(|b| b.hostname == hostname && b.port == ssh_port);
         let pinned = if same {
             self.pinned_key(&id).is_some()
         } else {
@@ -587,18 +611,54 @@ impl Ssh {
 
     /// `ssh.run {route_id, request}`: one setup session running `mousse-cli
     /// net-engine ssh` on the remote, the request on stdin, the reply after
-    /// the marker.
+    /// the marker. Answers the reply and the remote shell it ran in.
+    ///
+    /// A route whose shell is not known yet, or is kept as `sh`, runs the
+    /// `sh` form. When a Windows shell answers that it does not know
+    /// `exec`, its answer names the shell (`cmd` or PowerShell), which is
+    /// kept for the route, and the request runs once more in that shell's
+    /// form: one more connection, once per route.
     async fn run(
         &self,
         id: &str,
         request: &Value,
         event: &(impl Fn(Value) + Send + Sync),
-    ) -> Result<Value, Fail> {
-        let target = self.target(id)?;
-        let remote = sshpipe::remote_command("mousse-cli", &["net-engine", "ssh"])?;
+    ) -> Result<(Value, RemoteShell), Fail> {
+        let (target, kept) = self.target_and_shell(id)?;
         let mut input =
             serde_json::to_vec(request).map_err(|e| fail("bad_request", e.to_string()))?;
         input.push(b'\n');
+        let mut shell = kept.unwrap_or(RemoteShell::Sh);
+        loop {
+            match self.run_in(id, &target, shell, input.clone(), event).await {
+                Ok(reply) => return Ok((reply, shell)),
+                Err(Ran::Windows(found)) if shell == RemoteShell::Sh => {
+                    self.save_shell(id, found)?;
+                    shell = found;
+                }
+                Err(Ran::Windows(_)) => {
+                    // Not reached: only the `sh` form names a shell.
+                    return Err(fail(
+                        SshReason::WindowsRemoteUnsupported.name(),
+                        "a Windows shell answered twice",
+                    ));
+                }
+                Err(Ran::Failed(f)) => return Err(f),
+            }
+        }
+    }
+
+    /// One `ssh.run` session in `shell`'s form.
+    async fn run_in(
+        &self,
+        id: &str,
+        target: &SshTarget,
+        shell: RemoteShell,
+        input: Vec<u8>,
+        event: &(impl Fn(Value) + Send + Sync),
+    ) -> Result<Value, Ran> {
+        let remote = sshpipe::remote_command(shell, "mousse-cli", &["net-engine", "ssh"])
+            .map_err(|e| Ran::Failed(e.into()))?;
         let preamble = self.params.preamble_max_bytes;
         let cap = preamble
             .saturating_add(MARKER.len())
@@ -606,43 +666,49 @@ impl Ssh {
         let out = sshpipe::run(
             &self.params,
             &self.window,
-            &target,
+            target,
             &[],
             Some(&remote),
             input,
             cap,
             self.setup_deadline(),
-            waiting(id, &target, event),
+            waiting(id, target, event),
         )
-        .await?;
+        .await
+        .map_err(|e| Ran::Failed(e.into()))?;
         let at = match find_marker(&out.stdout, preamble) {
             MarkerSearch::After(at) => at,
-            MarkerSearch::TooLong => return Err(fail(
+            MarkerSearch::TooLong => return Err(Ran::Failed(fail(
                 SshReason::RemoteFailed.name(),
                 "the remote printed text before the Mousse marker (past SSH_PREAMBLE_MAX_BYTES)",
-            )),
+            ))),
             MarkerSearch::More => {
-                let reason = out.reason();
+                let reason = out.reason_after(shell);
+                if reason == SshReason::WindowsRemoteUnsupported {
+                    if let Some(found) = RemoteShell::windows_of(&out.stderr) {
+                        return Err(Ran::Windows(found));
+                    }
+                }
                 let detail = if out.stderr.trim().is_empty() {
                     "no Mousse marker in the remote's output".to_owned()
                 } else {
                     out.stderr.trim().to_owned()
                 };
-                return Err(fail(reason.name(), detail));
+                return Err(Ran::Failed(fail(reason.name(), detail)));
             }
         };
         let reply = &out.stdout[at..];
         if out.overflow || reply.len() > self.reply_max {
-            return Err(fail(
+            return Err(Ran::Failed(fail(
                 SshReason::RemoteFailed.name(),
                 "the reply is longer than SSH_REPLY_MAX_BYTES",
-            ));
+            )));
         }
         serde_json::from_slice(reply).map_err(|e| {
-            fail(
+            Ran::Failed(fail(
                 SshReason::RemoteFailed.name(),
                 format!("the reply is not JSON: {e}"),
-            )
+            ))
         })
     }
 
@@ -672,12 +738,17 @@ impl Ssh {
         within: Duration,
         on_wait: impl FnMut(Duration),
     ) -> Result<sshpipe::SshPipe, NetError> {
-        let target = self.target(id).map_err(|f| NetError::Refused(f.reason))?;
-        let remote = sshpipe::remote_command("mousse-helper", &["pipe", "--profile", selector])?;
+        let (target, shell) = self
+            .target_and_shell(id)
+            .map_err(|f| NetError::Refused(f.reason))?;
+        let shell = shell.unwrap_or(RemoteShell::Sh);
+        let remote =
+            sshpipe::remote_command(shell, "mousse-helper", &["pipe", "--profile", selector])?;
         sshpipe::dial(
             &self.params,
             &self.window,
             &target,
+            shell,
             &remote,
             within,
             on_wait,
@@ -687,28 +758,22 @@ impl Ssh {
 
     /// `peer.addresses.set`'s SSH entry `{route_id, selector, shell}` (§7):
     /// the route set up by `ssh.resolve` now reaches the remote profile
-    /// `selector`. Returns the address stored for the peer,
-    /// `ssh://mousse-<route_id>`. Only an `sh` remote is supported in 1b.
+    /// `selector`, through its shell (`sh`, `cmd` or `powershell`, as
+    /// `ssh.run` answered; `sh` when not given). Returns the address stored
+    /// for the peer, `ssh://mousse-<route_id>`.
     pub fn bind(&self, fields: &Map<String, Value>) -> Result<String, Fail> {
         let text = |k: &str| fields.get(k).and_then(Value::as_str);
         let id = route_id(text("route_id").unwrap_or(""))?;
         let selector = text("selector")
             .filter(|s| crate::pipe::is_selector(s))
             .ok_or_else(|| fail("bad_route", "selector must be 26 characters of [a-z2-7]"))?;
-        match text("shell").unwrap_or("sh") {
-            "sh" => {}
-            "cmd" | "powershell" => {
-                return Err(fail(
-                    SshReason::WindowsRemoteUnsupported.name(),
-                    "Adding a Windows computer over SSH isn't supported yet.",
-                ))
-            }
-            other => return Err(fail("bad_route", format!("unknown shell {other:?}"))),
-        }
+        let given = text("shell").unwrap_or("sh");
+        let shell = RemoteShell::parse(given)
+            .ok_or_else(|| fail("bad_route", format!("unknown shell {given:?}")))?;
         let _held = self.files_lock();
         let mut route = self.route(&id)?;
         route.selector = Some(selector.to_owned());
-        route.shell = Some("sh".into());
+        route.shell = Some(shell.name().to_owned());
         let meta = serde_json::to_vec(&route).map_err(|e| fail("store_failed", e.to_string()))?;
         write_atomic(&self.meta_path(&id), &meta)
             .map_err(|e| fail("store_failed", e.to_string()))?;
@@ -757,6 +822,14 @@ impl RouteDialer for Dialer {
             Ok(Box::new(pipe) as BoxPipe)
         })
     }
+}
+
+/// How one `ssh.run` session in a given form failed.
+enum Ran {
+    /// A Windows shell answered the `sh` form; it is this one.
+    Windows(RemoteShell),
+    /// Any other failure, as the app sees it.
+    Failed(Fail),
 }
 
 /// The `ssh.waiting` event for a wait in the window.
