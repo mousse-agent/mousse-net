@@ -218,6 +218,16 @@
       "error": "bad_character",
       "input": "K7QM2XPA9RTE!",
       "name": "bad_character_after_twelve"
+    },
+    {
+      "error": "bad_character",
+      "input": "K7QM2XPA9RTEX!",
+      "name": "bad_character_after_thirteen"
+    },
+    {
+      "error": "bad_character",
+      "input": "K7QM2XPA9RTſ",
+      "name": "long_s_is_not_ascii"
     }
   ]
 }

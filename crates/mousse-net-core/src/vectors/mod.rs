@@ -1363,6 +1363,8 @@ fn direct_code_vectors() -> J {
         ("no_break_space", "K7QM\u{a0}2XPA9RTE"),
         ("bad_character_before_length", "K7QM!"),
         ("bad_character_after_twelve", "K7QM2XPA9RTE!"),
+        ("bad_character_after_thirteen", "K7QM2XPA9RTEX!"),
+        ("long_s_is_not_ascii", "K7QM2XPA9RT\u{17f}"),
     ]
     .iter()
     .map(|(name, input)| {
