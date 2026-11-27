@@ -94,6 +94,11 @@ negotiated again and not an error. A side does not wait for the peer's
 `HELLO` before sending its own next messages (section 8). Vectors:
 `hello.json` `cases` and `repeated`.
 
+A side that closes with `UNSUPPORTED_VERSION` sends its own `HELLO` again
+just before the `GOAWAY`, so the peer learns its newest minor even if the
+first one had not left yet; a peer that had it ignores the second, as
+above.
+
 ## 3. Canonical CBOR
 
 Every structured record in this protocol (session record, ticket, join-proof

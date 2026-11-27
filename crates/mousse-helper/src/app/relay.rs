@@ -1937,7 +1937,7 @@ pub async fn reach(
         match dial_route(shared, pin, &c.route, Class::Interactive).await {
             Ok(conn) => return Ok((conn, c.route)),
             // The host itself refused: no other route changes that.
-            Err(e @ NetError::Closed(_)) => return Err(e),
+            Err(e @ (NetError::Closed(_) | NetError::Version { .. })) => return Err(e),
             Err(e) => last = Some(e),
         }
     }

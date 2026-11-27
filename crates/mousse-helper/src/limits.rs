@@ -171,6 +171,8 @@ mousse_net_core::define_limits! {
         join_probes_max = "JOIN_PROBES_MAX": 2, [1, 2];
         /// App mode: after an inbound connection is live, how long the caller's `HELLO` may take before the connection is closed unannounced.
         inbound_hello_wait_ms = "INBOUND_HELLO_WAIT_MS": 10_000, [100, 60_000];
+        /// App mode: the shortest time between two `peer.incompatible` events for one device (`docs/pair-with-ip-design.md` §5).
+        peer_incompatible_gap_ms = "PEER_INCOMPATIBLE_GAP_MS": 3_600_000, [1_000, 86_400_000];
         /// Checks only: how long `init` waits before it makes the endpoint, so a check can stop the app during the first start. Run for the app (`--app`), its stdin closing still ends it at once.
         init_hold_ms = "INIT_HOLD_MS": 0, [0, 60_000];
         /// Through a relay: connect, outer TLS, upgrade, `CALL` or `JOIN`, the splice and step 1, for one try; above the relay's refusal deadline (Phase 3 §B.6).

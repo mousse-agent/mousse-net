@@ -38,6 +38,7 @@ mod lan;
 mod out;
 mod pairing;
 mod paths;
+mod refusals;
 mod relay;
 mod relay_store;
 mod routes;
@@ -66,8 +67,8 @@ use mousse_net_core::{ErrorCode, BOTH_WAYS_MIN_MINOR};
 use mousse_net_io::pipe::RouteKind;
 use mousse_net_io::store::{hex, short_id};
 use mousse_net_io::{
-    Caller, CloseReason, Connection, Host, HostEvent, ListenerKind, MuxStream, NetError,
-    RouteClass, StreamAdmission, StreamReader, StreamWriter,
+    Caller, CloseReason, ConnStatus, Connection, Host, HostEvent, ListenerKind, MuxStream,
+    NetError, RouteClass, StreamAdmission, StreamReader, StreamWriter,
 };
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -96,6 +97,9 @@ pub const FEATURES: &[&str] = &[
     GRANT_ROLES,
     GRANT_ADD_CONNECTED,
     "managed-tunnel",
+    // `unsupported_version {peer_minor}`, `peer.incompatible` and
+    // `version_refusal` on peer and grant rows (`refusals.rs`).
+    "version-refusals",
 ];
 
 /// The feature an app lists in its hello `features` to take streams of
@@ -192,6 +196,8 @@ struct Shared {
     admission: Arc<StreamAdmission>,
     pairing: Mutex<pairing::State>,
     keep: paths::Keep,
+    /// The last refusal for version, per paired device.
+    refusals: refusals::Refusals,
     relay: relay::State,
     /// SSH routes: `ssh.*` and the connection window (Phase 1b §3).
     ssh: Arc<crate::ssh::Ssh>,
@@ -378,6 +384,7 @@ impl App {
             removal,
             pairing: Mutex::new(pairing::State::new(info.name.clone())),
             keep,
+            refusals: refusals::Refusals::in_dir(&info.state_dir),
             relay: relay::State::new(&info),
             ssh: info.ssh.clone(),
             info,
@@ -447,6 +454,12 @@ impl App {
         // Must-fail control: announce the connection before step 2 settles.
         let wait_for_live = !cfg!(mousse_control = "inbound-before-live");
         if wait_for_live && !self.caller_hello(&conn, &peer).await {
+            if let ConnStatus::Closed(reason) = conn.status() {
+                if let NetError::Version { peer_minor, .. } = conn.closed_error(reason) {
+                    self.shared
+                        .inbound_version_refused(*conn.peer(), peer_minor);
+                }
+            }
             return None;
         }
         let grant = self.shared.host.grant_of(conn.id());
@@ -553,6 +566,52 @@ impl Shared {
         let mut core = lock(&self.core);
         core.out.json(&value);
         self.queued(&core);
+    }
+
+    /// A connection with the paired device `identity` closed with
+    /// `UNSUPPORTED_VERSION` after its `HELLO` named `peer_minor`: kept as
+    /// its last refusal. On a dial, the dial's own error tells the app.
+    fn note_version_refusal(&self, identity: IdentityPublicKey, peer_minor: u64) {
+        self.refusals.note(
+            &identity,
+            peer_minor,
+            mousse_net_io::conn::local_minor(),
+            crate::peer::now_secs(),
+        );
+        applog::line(format!(
+            "{} speaks minor versions up to {peer_minor}: no common version",
+            short_id(&identity)
+        ));
+    }
+
+    /// An incoming connection from `identity` closed with
+    /// `UNSUPPORTED_VERSION` after its `HELLO` named `peer_minor`. From a
+    /// device that holds a grant here or that this computer pins, it is kept
+    /// as its last refusal and `peer.incompatible` tells the app, at most
+    /// once per `PEER_INCOMPATIBLE_GAP_MS`; unknown identities raise
+    /// nothing.
+    fn inbound_version_refused(&self, identity: IdentityPublicKey, peer_minor: u64) {
+        let pinned = || {
+            let key = hex(identity.as_bytes());
+            mousse_net_io::store::PeerStore::in_dir(&self.info.state_dir)
+                .load()
+                .is_ok_and(|list| list.iter().any(|p| p.identity == key))
+        };
+        if self.host.live_grant(&identity).is_none() && !pinned() {
+            return;
+        }
+        self.note_version_refusal(identity, peer_minor);
+        let gap = crate::limits::ms(self.limits.peer_incompatible_gap_ms());
+        if self
+            .refusals
+            .take_turn(&identity, tokio::time::Instant::now(), gap)
+        {
+            self.event(json!({
+                "ev": "peer.incompatible",
+                "identity": hex(identity.as_bytes()),
+                "peer_minor": peer_minor,
+            }));
+        }
     }
 
     /// Publish a connection: `conn.up`. While networking is paused it is
@@ -692,6 +751,19 @@ impl Shared {
             core.out.conn_event(no, &fields);
             self.queued(&core);
             tokio::spawn(conn_task(self.clone(), no, conn.clone(), inbound));
+            if self.refusals.holds(&identity) {
+                // The first connection that agrees a version clears the
+                // device's refusal for version.
+                let (shared, conn) = (self.clone(), conn.clone());
+                tokio::spawn(async move {
+                    if conn.hello_minor().await.is_some() && shared.refusals.clear(&identity) {
+                        applog::line(format!(
+                            "{} agreed a version: its refusal is cleared",
+                            short_id(&identity)
+                        ));
+                    }
+                });
+            }
             if !inbound {
                 let shared = self.clone();
                 tokio::spawn(async move { relay::ensure_keys(&shared, &conn).await });
