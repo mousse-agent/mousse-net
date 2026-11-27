@@ -16,7 +16,8 @@ use mousse_net_core::identity::{IdentityPublicKey, RawSignature, SoftwareKey};
 use mousse_net_core::mux::{decode_frame, Frame, Mux, MuxEvent, MuxRole, PriorityClass, StreamId};
 use mousse_net_core::pairing::{
     attempt_sid, binding_transcript, join_proof_input, join_proof_mac, verify_join_proof,
-    AttemptId, InvitationId, InvitationKind, Route, RouteHost, Ticket, TicketSecret,
+    AttemptId, DirectCode, InvitationId, InvitationKind, Route, RouteHost, Ticket, TicketSecret,
+    DIRECT_CODE_ALPHABET,
 };
 use mousse_net_core::session::{PeerSession, SessionEvent};
 use mousse_net_core::session_cert::{self, PendingCertificate, SessionKey, ValidityWindow};
@@ -54,6 +55,7 @@ fn checked_in(name: &str) -> Option<String> {
         "cbor.json",
         "control.json",
         "der-raw.json",
+        "direct-code.json",
         "hello.json",
         "join-proof.json",
         "mux.json",
@@ -684,6 +686,37 @@ fn canonical_cbor() {
     for case in list(&doc["invalid"]) {
         let err = cbor::decode(&unhex(&case["hex"])).expect_err(s(&case["description"]));
         assert_eq!(err.code(), s(&case["error"]), "{}", s(&case["description"]));
+    }
+}
+
+#[test]
+fn direct_codes() {
+    let doc = load("direct-code.json");
+    assert_eq!(s(&doc["alphabet"]).as_bytes(), DIRECT_CODE_ALPHABET);
+    let check = |name: &str, code: &DirectCode, case: &J| {
+        assert_eq!(code.as_str(), s(&case["code"]), "{name}");
+        assert_eq!(code.lookup().as_str(), s(&case["lookup"]), "{name}");
+        assert_eq!(
+            code.secret().as_bytes().as_slice(),
+            unhex(&case["secret"]),
+            "{name}"
+        );
+    };
+    for case in list(&doc["draws"]) {
+        let name = s(&case["name"]);
+        let code = DirectCode::from_draw(&fixed(&case["draw"]));
+        check(name, &code, case);
+        assert_eq!(code.to_display().as_str(), s(&case["display"]), "{name}");
+    }
+    for case in list(&doc["accepted"]) {
+        let name = s(&case["name"]);
+        let code = DirectCode::parse(s(&case["input"])).unwrap_or_else(|e| panic!("{name}: {e}"));
+        check(name, &code, case);
+    }
+    for case in list(&doc["rejected"]) {
+        let name = s(&case["name"]);
+        let err = DirectCode::parse(s(&case["input"])).expect_err(name);
+        assert_eq!(err.code(), s(&case["error"]), "{name}");
     }
 }
 

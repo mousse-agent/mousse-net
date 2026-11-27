@@ -1,0 +1,223 @@
+{
+  "accepted": [
+    {
+      "code": "K7QM2XPA9RTE",
+      "input": "K7QM2XPA9RTE",
+      "lookup": "K7QM",
+      "name": "canonical",
+      "secret": "3258504139525445"
+    },
+    {
+      "code": "K7QM2XPA9RTE",
+      "input": "K7QM-2XPA-9RTE",
+      "lookup": "K7QM",
+      "name": "display_form",
+      "secret": "3258504139525445"
+    },
+    {
+      "code": "K7QM2XPA9RTE",
+      "input": "k7qm-2xpa-9rte",
+      "lookup": "K7QM",
+      "name": "lowercase",
+      "secret": "3258504139525445"
+    },
+    {
+      "code": "K7QM2XPA9RTE",
+      "input": "k7Qm2xPa9rTe",
+      "lookup": "K7QM",
+      "name": "mixed_case",
+      "secret": "3258504139525445"
+    },
+    {
+      "code": "K7QM2XPA9RTE",
+      "input": "K7QM 2XPA 9RTE",
+      "lookup": "K7QM",
+      "name": "spaces",
+      "secret": "3258504139525445"
+    },
+    {
+      "code": "K7QM2XPA9RTE",
+      "input": "  K7QM2XPA9RTE  ",
+      "lookup": "K7QM",
+      "name": "leading_and_trailing_spaces",
+      "secret": "3258504139525445"
+    },
+    {
+      "code": "K7QM2XPA9RTE",
+      "input": "--K7QM--2XPA--9RTE--",
+      "lookup": "K7QM",
+      "name": "extra_dashes",
+      "secret": "3258504139525445"
+    },
+    {
+      "code": "K7QM2XPA9RTE",
+      "input": "K 7-Q M2X-P A9R-T E",
+      "lookup": "K7QM",
+      "name": "spaces_and_dashes_anywhere",
+      "secret": "3258504139525445"
+    },
+    {
+      "code": "000000000000",
+      "input": "OoOo-0000-0000",
+      "lookup": "0000",
+      "name": "o_reads_as_zero",
+      "secret": "3030303030303030"
+    },
+    {
+      "code": "111111111111",
+      "input": "IiLl-1111-1111",
+      "lookup": "1111",
+      "name": "i_and_l_read_as_one",
+      "secret": "3131313131313131"
+    },
+    {
+      "code": "011011011011",
+      "input": "oil0-ilo1-loil",
+      "lookup": "0110",
+      "name": "all_folding_lowercase",
+      "secret": "3131303131303131"
+    }
+  ],
+  "alphabet": "0123456789ABCDEFGHJKMNPQRSTVWXYZ",
+  "description": "The direct code (spec wire.md 10.9). `draws`: 12 drawn bytes to the code, its display form, the lookup (characters 1 to 4) and the secret (characters 5 to 12, as hex of their ASCII bytes). `accepted`: typed text to the canonical code. `rejected`: typed text that is not a code, with the error; a bad character is reported before a wrong length.",
+  "draws": [
+    {
+      "code": "000000000000",
+      "display": "0000-0000-0000",
+      "draw": "000000000000000000000000",
+      "lookup": "0000",
+      "name": "all_zero",
+      "secret": "3030303030303030"
+    },
+    {
+      "code": "ZZZZZZZZZZZZ",
+      "display": "ZZZZ-ZZZZ-ZZZZ",
+      "draw": "ffffffffffffffffffffffff",
+      "lookup": "ZZZZ",
+      "name": "all_ones",
+      "secret": "5a5a5a5a5a5a5a5a"
+    },
+    {
+      "code": "0123456789AB",
+      "display": "0123-4567-89AB",
+      "draw": "000102030405060708090a0b",
+      "lookup": "0123",
+      "name": "digits",
+      "secret": "3435363738394142"
+    },
+    {
+      "code": "0123456789AB",
+      "display": "0123-4567-89AB",
+      "draw": "e0e1e2e3e4e5e6e7e8e9eaeb",
+      "lookup": "0123",
+      "name": "high_bits_ignored",
+      "secret": "3435363738394142"
+    },
+    {
+      "code": "ABCDEFGHJKMN",
+      "display": "ABCD-EFGH-JKMN",
+      "draw": "0a0b0c0d0e0f101112131415",
+      "lookup": "ABCD",
+      "name": "first_letters",
+      "secret": "454647484a4b4d4e"
+    },
+    {
+      "code": "MNPQRSTVWXYZ",
+      "display": "MNPQ-RSTV-WXYZ",
+      "draw": "1415161718191a1b1c1d1e1f",
+      "lookup": "MNPQ",
+      "name": "last_letters",
+      "secret": "525354565758595a"
+    },
+    {
+      "code": "Q4P4JJX7XC4W",
+      "display": "Q4P4-JJX7-XC4W",
+      "draw": "570416449232bd07fdecc45c",
+      "lookup": "Q4P4",
+      "name": "seeded",
+      "secret": "4a4a583758433457"
+    }
+  ],
+  "rejected": [
+    {
+      "error": "wrong_length",
+      "input": "",
+      "name": "empty"
+    },
+    {
+      "error": "wrong_length",
+      "input": " - - ",
+      "name": "only_separators"
+    },
+    {
+      "error": "wrong_length",
+      "input": "K7QM-2XPA-9RT",
+      "name": "eleven_characters"
+    },
+    {
+      "error": "wrong_length",
+      "input": "K7QM-2XPA-9RTEX",
+      "name": "thirteen_characters"
+    },
+    {
+      "error": "bad_character",
+      "input": "K7QM-2XPA-9RTU",
+      "name": "u_is_not_in_the_alphabet"
+    },
+    {
+      "error": "bad_character",
+      "input": "k7qm-2xpa-9rtu",
+      "name": "lowercase_u"
+    },
+    {
+      "error": "bad_character",
+      "input": "K7QM.2XPA.9RTE",
+      "name": "dot_separator"
+    },
+    {
+      "error": "bad_character",
+      "input": "K7QM_2XPA_9RTE",
+      "name": "underscore_separator"
+    },
+    {
+      "error": "bad_character",
+      "input": "K7QM\t2XPA9RTE",
+      "name": "tab"
+    },
+    {
+      "error": "bad_character",
+      "input": "K7QM2XPA9RTE\n",
+      "name": "newline"
+    },
+    {
+      "error": "bad_character",
+      "input": "K7QM-2XPA-9RTÉ",
+      "name": "non_ascii_letter"
+    },
+    {
+      "error": "bad_character",
+      "input": "１２３４５６７８９０１２",
+      "name": "fullwidth_digits"
+    },
+    {
+      "error": "bad_character",
+      "input": "K7QМ-2XPA-9RTО",
+      "name": "cyrillic_o"
+    },
+    {
+      "error": "bad_character",
+      "input": "K7QM 2XPA9RTE",
+      "name": "no_break_space"
+    },
+    {
+      "error": "bad_character",
+      "input": "K7QM!",
+      "name": "bad_character_before_length"
+    },
+    {
+      "error": "bad_character",
+      "input": "K7QM2XPA9RTE!",
+      "name": "bad_character_after_twelve"
+    }
+  ]
+}
