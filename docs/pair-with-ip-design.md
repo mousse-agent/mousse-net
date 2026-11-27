@@ -653,7 +653,7 @@ lookup (all three judges found that A and C let a far end that changes keys
 reset the count), the pairing-only caller gate, approval requests that
 outlive a connection. From A: clearing the pending record on decline, the
 entry rules, the vector that checks nothing before `msg_a` depends on the
-secret, the copy that names the first four characters. From the judges: the
+secret. From the judges: the
 passed attempt that `end_if_exhausted` would end, the joiner's short device
 id. **Changed from C:** its per-source miss limit is replaced by the 1 s
 hold, because a block per IPv6 /64 lets any neighbour lock out an honest
