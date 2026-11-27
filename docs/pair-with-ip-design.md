@@ -33,17 +33,19 @@ authenticate with nothing but an address and a short secret.
    grants nothing.
 4. **Wrong code.** The joiner says the code didn't work and how many tries
    are left. The host keeps showing the same code.
-5. **Wrong address.** Nothing there: "Can't reach that address." Another
-   Mousse computer or a typo in the first four characters: "No open
-   invitation there. Check the address and the first four characters." Not
+5. **Wrong address.** Nothing there: "Can't reach that address." Not
    Mousse: "Can't reach Mousse at that address."
-6. **Expired, used up, cancelled, host restarted:** "This code is no longer
-   open. Ask for a new one."
+6. **No open invitation** (another Mousse computer, a typo in the first four
+   characters, expired, used up, cancelled, host restarted): one message,
+   "No open invitation at that address. Check the address and code, or ask
+   for a new code." The host gives the same answer for all of these on
+   purpose.
 7. **Lost connection after the code passed:** the joiner reconnects on its
    own and learns the outcome without the code (§1.6). If the owner tapped
    Allow while it was away, it is paired as soon as it is back.
-8. **Joiner cancels while waiting for Allow:** the host's prompt goes away
-   and nothing is granted.
+8. **Joiner cancels while waiting for Allow:** nothing stays granted. The
+   host's prompt goes away when the cancel reaches it, at once if the
+   joiner is connected, otherwise when it next reaches the host.
 9. **Undo:** Remove works as for any grant.
 
 ### Rules
@@ -64,7 +66,10 @@ authenticate with nothing but an address and a short secret.
 7. `mousse-net-core` does no I/O and builds for `wasm32-unknown-unknown`.
 8. Every new limit is a named default with a `MOUSSE_NET_*` variable;
    limits that bound security are clamped (`docs/limits.md`).
-9. The code and everything derived from it are zeroized and never logged.
+9. The code and everything derived from it are never logged. In the engine
+   and the helper they are zeroized; the app's dialog drops its copy when it
+   closes (a renderer string cannot be wiped, as for the 6-digit code
+   today).
 10. A paired device that this change cuts off (§5) is shown as needing an
     update, and stays disabled until it is updated.
 
@@ -120,7 +125,7 @@ authenticate with nothing but an address and a short secret.
 | **Joiner pending record:** `L`, host key, `I`, address | same store | From a verified host confirmation until the outcome is settled (§1.6) |
 | Grant with receipt `I` | `GrantTable` / `GrantStore`, unchanged | Durable |
 | Pin, the typed address as an owner route, tailnet approval, completion record | helper `peer.rs` and `app/pairing.rs`, after `PAIRED` only | Durable |
-| Last refusal for version, per paired identity (§5) | helper, in its peer store; cleared by the next connection that negotiates a version | Durable |
+| Last refusal for version, per paired identity (§5) | helper, in a small store of its own next to the peer store, so a device that only uses this computer gets no `PeerRecord` (a peer record is an outbound pin the keeper dials, io `store.rs:557`); cleared by the next connection that negotiates a version | Durable |
 | "Needs update notice shown" per device (§5) | app settings | Durable |
 | Dialogs and device row | app `EnginePairing` (`src/mms/netEngine/pairing.ts`), `LetDeviceInDialog.tsx`, `UseComputerDialog.tsx` | |
 
@@ -161,7 +166,10 @@ counted as the proof (`authz.rs:390-396`).
 
 1. **Dial.** The joiner parses `<IPv4>:<port>` or `[<IPv6>]:<port>` with the
    route grammar (`pairing/route.rs`); no DNS in this version. It approves
-   exactly that destination and dials it.
+   exactly that destination and dials it. The host shows IPv4 addresses
+   only, as its LAN and tailnet inventory does today
+   (`app/pairing/availability.rs:81`); an IPv6-only network is out of scope
+   for this version.
 2. **TLS** with `connect_unpinned` (§1.3). A handshake that is not Mousse
    is "Can't reach Mousse at that address".
 3. **`HELLO`** both ways. Unlike other connections (`wire.md` §2, §8 step
@@ -176,17 +184,25 @@ counted as the proof (`authz.rs:390-396`).
    from step 2 is not:
    - an open kind-3 invitation with this `L`: `AUTHORIZED {1: join_only,
      2: I}`;
-   - no match: the host holds the connection for `DIRECT_MISS_HOLD_MS`
-     (1 s), keeping its pre-authorization place, then closes with
+   - no match: the host holds the connection open for
+     `DIRECT_MISS_HOLD_MS` (1 s), and with it its pre-authorization place
+     (the place is freed only when the connection is torn down), then
+     closes with
      `INVITATION_INVALID`. A device that already holds a grant gets the
      same close, so a typo reads as a typo, never as "already paired".
-   - Kind 3 is answered only on the TCP listener, the one the `lan` and
-     `tailnet` ways use. On a `ws` or pipe connection `JOIN_DIRECT` closes
-     with `INVITATION_INVALID`, so an invitation made for the local network
-     cannot be looked up through a tunnel.
+   - Kind 3 is answered only on connections accepted by the TCP listener,
+     the one the `lan` and `tailnet` ways use. Anything else closes with
+     `INVITATION_INVALID`: `ws`, pipe, and relay circuits. Relay circuits
+     today enter through `Host::accept`, which registers them as TCP with no
+     admission place (io `host.rs:908-911`, helper `app/relay.rs:768`); io
+     gives them their own listener kind before `JOIN_DIRECT` is enabled
+     (phase 2), so an invitation made for the local network cannot be
+     looked up through a tunnel or a relay.
    - From a live connection (a device that already holds a grant),
-     `JOIN_DIRECT` first takes a new pre-authorization place, as a re-pair
-     does today (io `host.rs:1772-1795`); with none free it closes with
+     `JOIN_DIRECT` first takes a new pre-authorization place, counted
+     against its source address (a re-pair today takes one without a
+     source, io `host.rs:1772-1795`, `preauth.rs:230`); with none free it
+     closes with
      `INTERNAL_ERROR` and the joiner says the computer is busy.
 5. **Attempt.** The joiner debits its ledger entry for `L` (durable) and
    sends `CODE_EXCHANGE {A, msg_a}` with a fresh attempt id `A`. The host
@@ -203,7 +219,11 @@ counted as the proof (`authz.rs:390-396`).
 8. **Allow.** The host verifies `Ta` and opens an **approval request keyed
    by (invitation, joiner identity)**, not by connection (today's request id
    is `"{conn}-{fingerprint}"`, `crates/mousse-helper/src/app/pairing.rs:197-202`).
-   The owner sees the name, the short device id and the access level.
+   The owner sees the name, the short device id and the access level. The
+   access level and name the owner picks belong to that request, not to the
+   invitation: today the app stores the chosen access per invitation
+   (app `src/mms/netEngine/pairing.ts:318`, `store.ts:369`), which a second
+   request could overwrite. Enrollment reads the winning request's values.
    - **One request per identity.** The same identity passing again (a new
      Connect) keeps its request: same id, no second prompt. Another identity
      that passes gets its own request. Allowing one enrolls it, consumes the
@@ -218,11 +238,19 @@ counted as the proof (`authz.rs:390-396`).
      `PAIRED`. Enrollment always happens on a connection of that identity,
      so the pause fence and step 3 of 10.8 apply as today, and a joiner that
      gave up is never granted.
-   - **Joiner cancels.** It sends `CODE_ABORT {A, CANCELLED}` and closes
-     with `CANCELLED`; the host drops the request and its prompt. If the
-     joiner is away when the person cancels, it clears its pending record
-     and does not come back, so an allowed request is never claimed. Only a
-     close without `CANCELLED` keeps the request.
+   - **Joiner cancels.** Connected: it sends `CODE_ABORT {A, CANCELLED}`
+     and closes with `CANCELLED`; the host drops the request and its prompt.
+     Away: the joiner marks its pending record cancelled and delivers the
+     cancel on its next connection (§1.6). Until then the host's prompt
+     shows the request as away; an Allow there is never claimed, because a
+     cancelled joiner reconnects only to cancel. Only a close without
+     `CANCELLED` keeps the request.
+   - **Cancel crossing Allow.** The cancel wins. A `CANCELLED` that arrives
+     on the connection after the host enrolled it, or a cancel delivered by
+     recovery for a grant with receipt `I`, removes that grant (it has never
+     carried a stream: the joiner never pinned the host) and closes with
+     `CANCELLED`. A joiner that cancelled ignores a `PAIRED` that crosses its
+     cancel and pins nothing.
    - **Decline** closes with `PAIRING_DECLINED` and ends the invitation.
    - **The Allow window.** A request may be answered and claimed until
      `DIRECT_ALLOW_WINDOW_SECS` (300 s) after its identity passed the code,
@@ -233,7 +261,11 @@ counted as the proof (`authz.rs:390-396`).
      when another connection closes (`host.rs:793-800`).
 9. **Joiner finishes.** On `PAIRED` it pins the host key, stores the typed
    address as an owner route (and the tailnet approval when it is one),
-   writes its completion record and clears the pending record.
+   writes its completion record, keyed by `I`, and clears the pending
+   record. The app learns of a completion it missed (one finished by a
+   start-up recovery) from `join.status`, which lists direct completions by
+   `I`, and acknowledges it with `join.ack {invitation: I}`; today both are
+   keyed by ticket hash (`app/pairing.rs:949`).
 
 ### 1.5 Binding
 
@@ -263,20 +295,35 @@ wrong code; a new ceremony is a new kind.
 ### 1.6 Recovery after a lost connection
 
 A joiner with a pending record reconnects **pinned** to the host key it
-verified, sends `HELLO`, then `JOIN_DIRECT {L, name, receipt: I}`. No code is
-needed. The host answers:
+verified, sends `HELLO`, then `JOIN_DIRECT {1: L, 2: name, 3: receipt I,
+4?: cancel}`. No code is needed. A pinned caller expects an `AUTHORIZED`
+before `PAIRED` (`authz.rs:417`, `wire.md` 8.2), so every answer that
+enrolls is preceded by one. The host answers:
 
-- a grant for this identity with receipt `I`: `PAIRED {host name, role}`
-  (also after a host restart);
-- this identity's request was allowed while it was away: enrollment now,
-  then `PAIRED`;
+- with `cancel`: removes the request, or the grant with receipt `I` for this
+  identity (§1.4 step 8, "Cancel crossing Allow"), and closes with
+  `CANCELLED`;
+- a grant for this identity with receipt `I`: step 2 already sent
+  `AUTHORIZED {live}`; then `PAIRED {host name, role}` (also after a host
+  restart);
+- this identity's request was allowed while it was away: `AUTHORIZED
+  {join_only, I}`, enrollment, then `PAIRED`;
 - this identity's request still waits for Allow: `AUTHORIZED {join_only,
   I}`; the request (same id, same prompt) now points at this connection;
+- the invitation is open and this identity has no request (the connection
+  dropped before the host had `msg_c`): `AUTHORIZED {join_only, I,
+  not_received}`; the joiner clears its pending record and says "The
+  connection dropped before the code arrived. Connect again" with the tries
+  left. The code is typed again; it is never stored;
 - this identity's request was declined or cancelled: a close with
-  `PAIRING_DECLINED` or `CANCELLED`;
+  `PAIRING_DECLINED` or `CANCELLED`. The host keeps that outcome with the
+  invitation until its Allow window ends, then forgets it;
 - anything else (expired, consumed by another device, host restarted with
-  no grant, another identity): `INVITATION_INVALID`. Only the identity that
-  passed the code learns that it was declined.
+  no grant, another identity, a forgotten outcome): `INVITATION_INVALID`.
+  Only the identity that passed the code learns that it was declined.
+
+`not_received` is `AUTHORIZED` key 3 (`true`), sent only in answer to a
+`JOIN_DIRECT` with a receipt.
 
 The joiner clears the pending record on `PAIRED` (once the pin is stored)
 and on `PAIRING_DECLINED`, `CANCELLED`, `INVITATION_INVALID` and
@@ -284,11 +331,12 @@ and on `PAIRING_DECLINED`, `CANCELLED`, `INVITATION_INVALID` and
 `INTERNAL_ERROR`, `NOT_AUTHORIZED` after the 10 s wait, a broken connection.
 Today `PAIRING_DECLINED` leaves the mark
 (`crates/mousse-net-core/src/pairing/joiner.rs:787-789`) because kinds 1 and
-2 never decline after it; kind 3 does. A record kept past the Allow window
-plus 10 minutes is dropped. The helper retries a kept record with backoff
-and on start-up, as `pairing.recover()` does today (app
-`NetEngineService.ts:2127`); `join.direct` with an `L` that has a pending
-record resumes it instead of starting over.
+2 never decline after it; kind 3 does. A kept record is never dropped by a
+timer: the host may hold the grant and answers by receipt for as long as it
+has it. The helper retries it with backoff up to once an hour and on
+start-up, as `pairing.recover()` does today (app `NetEngineService.ts:2127`).
+`join.direct` resumes a pending record only when both the typed address and
+`L` match it; otherwise it starts a new flow.
 
 ## 2. Spec changes
 
@@ -317,9 +365,11 @@ record resumes it instead of starting over.
   recovery, limits, the joiner's records (`{1: "mousse-direct-joiner-v1", 2:
   L, 3: attempts left, 4: first debit time}` and `{1:
   "mousse-direct-pending-v1", 2: L, 3: host key, 4: I, 5: address, 6: time
-  the host's confirmation verified}`).
+  the host's confirmation verified, 7: cancelled (0 or 1)}`).
 - **`wire.md` 11.** Type 7 `JOIN_DIRECT {0: 7, 1: text (4), 2: text (1 to
-  128 bytes), 3?: bytes (16)}`; `AUTHORIZED` key 2, bytes (16), only with
+  128 bytes), 3?: bytes (16), 4?: true}` (key 4, cancel, only with key 3);
+  `AUTHORIZED` key 2, bytes (16), and key 3, `true` (not received, only
+  with key 2 in answer to a `JOIN_DIRECT` with a receipt), only with
   `join_only` on `agreed ≥ 4` in answer to `JOIN_DIRECT`. **§12:** no new
   codes.
 - **`cpace.md` §4.** The `PRS` rule is per kind: 6 ASCII digits for kind 2,
@@ -358,11 +408,15 @@ invitation, at most 600 s, is gone.
 ## 3. Security
 
 - **Guessing at the real host:** at most 5 / 2^40 per invitation.
-- **A fake endpoint at the typed address** gets one guess per Connect (it
-  must send `Tb` before it sees anything that depends on the code), at most
-  5 per typed lookup in 24 h, whatever keys it shows.
-- **Together:** at most 10 / 2^40 ≈ 9.1 × 10^-12 per invitation, about 1 in
-  110 billion. A sent link today is 6 in 1 000 000 (`threat-model.md`).
+- **A fake endpoint at the typed address** gets one online guess per
+  Connect: `msg_a` depends on the code only through the CPace generator,
+  which gives it a single online test, as `cpace.md` §8 note 2 says for
+  kind 2. At most 5 per typed lookup in 24 h on one joiner profile, whatever
+  keys it shows.
+- **Together:** at most 10 / 2^40 ≈ 9.1 × 10^-12 for one invitation and one
+  joiner profile, about 1 in 110 billion. Each further profile into which
+  the same code is typed adds up to 5 / 2^40. A sent link today is 6 in
+  1 000 000 (`threat-model.md`).
 - **Offline:** CPace gives no offline test from a failed or a successful
   transcript; `L`, `I` and `D` do not depend on `S`.
 - **In the middle:** a TLS-terminating attacker has a different exporter
@@ -398,10 +452,16 @@ invitation, at most 600 s, is gone.
   `invite.ended`. `approval` already carries the short device id
   (`app/pairing.rs:1268-1273`).
 - Changed for kind 3: an `approval` request's id is per (invitation,
-  identity), it gains `state: connected | away`, and it is re-sent with the
-  same id when the joiner reconnects or leaves. `approval.answer` on an
-  `away` request marks it allowed (§1.4 step 8); a joiner's cancel or the
-  end of its Allow window ends it with `approval.ended`.
+  identity). It gains `state: connected | away` and `decision: pending |
+  allowed`, and it is re-sent with the same id whenever either changes, so
+  "Waiting for <name> to reconnect" survives an app restart (today the app
+  drops a prompt after either answer, app `pairing.ts:339`).
+  `approval.answer {request, yes, role?}` carries the access level for that
+  request; on an `away` request it marks it allowed (§1.4 step 8). A
+  joiner's cancel, another request's enrollment or the end of its Allow
+  window ends it with `approval.ended`.
+- `join.status` lists direct completions by `I`; `join.ack {invitation: I}`
+  acknowledges one (§1.4 step 9).
 - `join.direct {address, code}` → `join.progress {step: connecting |
   checking_code | awaiting_approval | reconnecting, short_id}`, then the
   join reply or an error: `bad_address`, `bad_code`, `unreachable`,
@@ -462,7 +522,10 @@ remote actions; Remove and the update actions stay. The row says which
 computer has to update and how, with the existing update ways
 (`computerUpdateWay`): over SSH when this computer installed it (that path
 does not need the engine connection), otherwise "Update Mousse on <name> to
-use it from here."
+use it from here." The recorded refusal selects the update way by itself:
+today `computerUpdateWay` returns nothing unless the version label is
+"Behind" (app `computerUpdate.ts:23-25`), which a nightly on another channel
+never gets, and that would hide its SSH update.
 
 **It clears by itself.** The helper's keeper does not park a host that
 refused for version (today it parks only on `not_authorized` and
@@ -489,9 +552,12 @@ older" row belong to that change, not this one.
 
 - **Easy:** kind 3 lives in its own files and messages; kinds 1 and 2 and
   their vectors do not move. A random `I` keeps receipts unique. The Allow
-  step can be dropped later without a wire change. A public port forward,
-  a DNS name or an mDNS pick needs only the helper's address parsing to
-  widen: nothing in core or on the wire names the address.
+  step can be dropped later without a wire change. A DNS name or an mDNS
+  pick needs only the helper's address parsing to widen: nothing in core or
+  on the wire names the address. A tunnel needs a per-invitation transport
+  policy in place of "TCP listener only"; a relay also needs an admission
+  step before peer TLS, since relay `JOIN` today takes a handle and a tag
+  derived from a ticket secret (`spec/relay.md` 4).
 - **Hard:** the dial without a pin, kept to one entry point and one gate
   state. Approval requests that outlive a connection (§1.4 step 8). The
   minor-2 cut-off and its messages (§5). A typo in the first
@@ -538,9 +604,11 @@ stream, Remove.
 
 **The bump is last.** `PROTOCOL_MINOR_VERSION` (`crates/mousse-net-core/src/lib.rs:168`)
 is what `HELLO` sends, and nightlies are cut from the engine pin every day.
-Phases 1 to 3 land with the constant at 3, their kind-3 paths reached only
-in tests that raise the minor through the existing test hook, so no build in
-between cuts anyone off or advertises a feature it cannot serve.
+Phases 1 to 3 land with the constant at 3. The existing test hook can only
+lower the minor (`MOUSSE_NET_TEST_HELLO_MINOR`, io `conn.rs:80-95`), so
+phase 1 adds a debug-only way to speak minor 4 for tests; the kind-3 paths
+are reached only through it, and no build in between cuts anyone off or
+advertises a feature it cannot serve.
 
 Not checked by these commands: two real computers on one LAN and on
 Tailscale, which address comes first with virtual adapters on Windows, and
@@ -592,12 +660,17 @@ hold, because a block per IPv6 /64 lets any neighbour lock out an honest
 joiner; the name stays in `JOIN_DIRECT`, before the code, as a sent link
 does today.
 
-**After review of this document:** approval requests keyed by invitation
-and identity, with enrollment only on a connection of that identity, the
-joiner's explicit cancel and the Allow window; kind 3 answered only on the
-TCP listener; a separate `DirectHostPairing` and `DirectRecords`; the
-keeper keeps probing a Needs update host; the minor bump as its own last
-step. The update warning before installing was dropped from this change,
+**After review of this document** (two reviews): approval requests keyed
+by invitation and identity, carrying their own access level, with
+enrollment only on a connection of that identity, the Allow window, the
+joiner's cancel (delivered later when it is away, and winning over a
+crossing Allow), pending records kept until the host answers, a "not
+received" answer for a code that never arrived; kind 3 answered only on
+TCP listener connections, with relay circuits given their own kind; a
+separate `DirectHostPairing` and `DirectRecords`; direct completions by
+`I`; one message for every "no open invitation"; the keeper keeps probing a
+Needs update host; the minor bump as its own last step with a test-only
+way to speak minor 4. The update warning before installing was dropped from this change,
 because no stable release carries a minor-2 helper (§5).
 
 **Worth revisiting** if minor-2 nightlies turn out to be common in the field
