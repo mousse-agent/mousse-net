@@ -57,6 +57,7 @@ function outcome(expected, fn) {
     const code = directCodeFromDraw(bytes(item.draw));
     same(code, item);
     assert.equal(displayDirectCode(code.code), item.display);
+    same(parseDirectCode(item.display), item);
   });
   for (const item of v.accepted) add(`accepted ${item.name}`, () => same(parseDirectCode(item.input), item));
   for (const item of v.rejected) add(`rejected ${item.name}`, () => outcome(item.error, () => parseDirectCode(item.input)));

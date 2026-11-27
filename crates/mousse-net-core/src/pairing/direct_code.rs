@@ -269,25 +269,29 @@ mod tests {
     #[test]
     fn nothing_derived_from_the_code_shows_in_debug() {
         let code = DirectCode::parse("K7QM-2XPA-9RTE").expect("valid");
-        for shown in [
-            format!("{code:?}"),
-            format!("{:?}", code.lookup()),
-            format!("{:?}", code.secret()),
-        ] {
-            for part in ["K7QM", "2XPA", "9RTE"] {
-                assert!(!shown.contains(part), "{shown}");
-            }
-        }
+        assert_eq!(code.to_display().as_str(), "K7QM-2XPA-9RTE");
+        assert_eq!(format!("{code:?}"), "DirectCode(****-****-****)");
+        assert_eq!(format!("{:?}", code.lookup()), "DirectLookup(****)");
+        assert_eq!(format!("{:?}", code.secret()), "DirectSecret(..)");
     }
 
     #[test]
     fn secret_compare_sees_every_byte() {
         let a = DirectCode::parse("K7QM2XPA9RTE").expect("valid");
-        let b = DirectCode::parse("K7QM2XPA9RTF").expect("valid");
-        let c = DirectCode::parse("K7QM3XPA9RTE").expect("valid");
-        assert_ne!(a.secret(), b.secret());
-        assert_ne!(a.secret(), c.secret());
-        assert_eq!(a.lookup(), b.lookup());
-        assert_ne!(a, b);
+        // Same secret under another lookup.
+        let other_lookup = DirectCode::parse("0000-2XPA-9RTE").expect("valid");
+        assert_ne!(a.lookup(), other_lookup.lookup());
+        assert_eq!(a.secret(), other_lookup.secret());
+        assert_ne!(a, other_lookup);
+
+        // One mismatch at each of the eight secret positions.
+        for i in DIRECT_LOOKUP_LEN..DIRECT_CODE_LEN {
+            let mut text = a.as_str().as_bytes().to_vec();
+            text[i] = if text[i] == b'Z' { b'Y' } else { b'Z' };
+            let b = DirectCode::parse(std::str::from_utf8(&text).expect("ascii")).expect("valid");
+            assert_eq!(a.lookup(), b.lookup(), "position {i}");
+            assert_ne!(a.secret(), b.secret(), "position {i}");
+            assert_ne!(a, b, "position {i}");
+        }
     }
 }

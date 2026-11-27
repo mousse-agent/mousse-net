@@ -32,14 +32,18 @@ export function displayDirectCode(code: string): string {
 // O read as 0 and I, L as 1. A bad character is reported before a wrong
 // length.
 export function parseDirectCode(text: string): DirectCode {
+  // Keep at most 12 characters, but read every one so a later bad character
+  // is still bad_character.
   let code = '';
+  let length = 0;
   for (const unit of text) {
     if (unit === ' ' || unit === '-') continue;
     const c = unit.length === 1 && unit.charCodeAt(0) < 0x80 ? unit.toUpperCase() : '';
     const folded = c === 'O' ? '0' : c === 'I' || c === 'L' ? '1' : c;
     if (folded === '' || !DIRECT_CODE_ALPHABET.includes(folded)) throw new Error('bad_character');
-    code += folded;
+    if (length < LENGTH) code += folded;
+    length += 1;
   }
-  if (code.length !== LENGTH) throw new Error('wrong_length');
+  if (length !== LENGTH) throw new Error('wrong_length');
   return parts(code);
 }
