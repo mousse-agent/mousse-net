@@ -13,6 +13,7 @@
 //! as responder. This module owns the binding transcript and session id it
 //! must use, attempt limits and atomic one-enrollment consumption.
 
+mod direct_code;
 mod exchange;
 mod host;
 mod joiner;
@@ -22,6 +23,10 @@ mod ticket;
 
 use std::fmt;
 
+pub use direct_code::{
+    DirectCode, DirectCodeError, DirectLookup, DirectSecret, DIRECT_CODE_ALPHABET, DIRECT_CODE_LEN,
+    DIRECT_LOOKUP_LEN, DIRECT_SECRET_LEN,
+};
 #[cfg(feature = "insecure-test-exchange")]
 pub use exchange::insecure;
 pub use exchange::{
