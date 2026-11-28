@@ -26,9 +26,9 @@ use mousse_net_core::grants::{GrantEvent, GrantTable, OwnerRef, Role};
 use mousse_net_core::identity::IdentityPublicKey;
 use mousse_net_core::mux::{Mux, MuxEvent, MuxRole, PriorityClass};
 use mousse_net_core::pairing::{
-    CpaceExchangeFactory, DirectAddress, DirectEnd, DirectHostAction, DirectHostPairing,
-    DirectInvitationParams, DirectLookup, DirectPaired, DirectRequestId, InvitationId,
-    DIRECT_CODE_ALPHABET,
+    AttemptId, CpaceExchangeFactory, DirectAddress, DirectEnd, DirectHostAction, DirectHostPairing,
+    DirectInvitationParams, DirectLookup, DirectPaired, DirectPending, DirectRequestId,
+    InvitationId, DIRECT_CODE_ALPHABET,
 };
 use mousse_net_core::{ConnectionId, ErrorCode, UnixTime};
 use mousse_net_io::certs::CertManager;
@@ -436,13 +436,13 @@ async fn serve(
                                 continue;
                             }
                             if let ControlMessage::CodeAbort { code, .. } = &m {
-                                state.lock().unwrap().log.push(format!("abort:{}", code.name()));
+                                state.lock().unwrap().log.push(format!("abort:{conn}:{}", code.name()));
                             }
                             on_message(&state, &clock, conn, peer, &exporter, m);
                         }
                         MuxEvent::StreamOpened { .. } => on_stream(&state, &clock, conn),
                         MuxEvent::GoAway { code } => {
-                            state.lock().unwrap().log.push(format!("goaway:{}", code.name()));
+                            state.lock().unwrap().log.push(format!("goaway:{conn}:{}", code.name()));
                             peer_closed = Some(Some(code));
                             break 'run;
                         }
@@ -664,12 +664,26 @@ fn wrong_secret(code: &str) -> String {
 
 fn ledger(records: &dyn DirectRecords, code: &str) -> Option<u8> {
     let lookup = DirectLookup::from_canonical(&code[..4]).unwrap();
-    records.load(&lookup).unwrap().0.map(|l| l.attempts_left)
+    let anywhere = DirectAddress::parse("127.0.0.1:1").unwrap();
+    records
+        .load(&lookup, &anywhere)
+        .unwrap()
+        .0
+        .map(|l| l.attempts_left)
 }
 
 fn pending_count(records: &dyn DirectRecords, code: &str) -> usize {
     let lookup = DirectLookup::from_canonical(&code[..4]).unwrap();
-    records.load(&lookup).unwrap().1.len()
+    let found = records.pending_slots().unwrap();
+    assert!(found.unreadable.is_empty(), "{:?}", found.unreadable);
+    found.slots.iter().filter(|s| s.lookup == lookup).count()
+}
+
+/// The pending record kept at `host`'s address.
+fn pending_at(records: &dyn DirectRecords, host: &TestHost) -> Option<DirectPending> {
+    let lookup = DirectLookup::from_canonical(&host.code[..4]).unwrap();
+    let address = DirectAddress::parse(&host.address()).unwrap();
+    records.load(&lookup, &address).unwrap().1
 }
 
 fn disk(tag: &str) -> (Arc<dyn DirectRecords>, PathBuf) {
@@ -829,7 +843,11 @@ async fn a_lost_paired_is_learned_by_recovery_after_a_restart() {
     assert!(joiner.pins.stored.lock().unwrap().is_empty());
 
     let again = joiner.restarted();
-    let mut joins = again.caller.resume_direct(&again.setup, "laptop").unwrap();
+    let mut joins = again
+        .caller
+        .resume_direct(&again.setup, "laptop")
+        .unwrap()
+        .joins;
     assert_eq!(joins.len(), 1);
     let mut join = joins.remove(0);
     let paired = until(&mut join, |e| matches!(e, DirectEvent::Paired(_))).await;
@@ -881,19 +899,29 @@ async fn a_cancel_while_connected_ends_the_request() {
     assert_eq!(next(&mut join).await, DirectEvent::CodePassed);
     join.cancel().unwrap();
     assert_eq!(next(&mut join).await, DirectEvent::Away);
-    wait_for("the host's cancel", || {
-        host.logged("approval_ended:Cancelled")
+    // The abort, then the close, on the connection the code passed on.
+    let cancelled = ErrorCode::Cancelled.name();
+    let goaway_end = format!(":{cancelled}");
+    wait_for("the cancel's GOAWAY", || {
+        host.log()
+            .iter()
+            .any(|l| l.starts_with("goaway:") && l.ends_with(&goaway_end))
     })
     .await;
-    // The abort, then the close, on the connection the code passed on.
-    let abort = format!("abort:{}", ErrorCode::Cancelled.name());
-    let goaway = format!("goaway:{}", ErrorCode::Cancelled.name());
     let log = host.log();
-    let at = |what: &str| log.iter().position(|l| *l == what);
-    assert!(
-        matches!((at(&abort), at(&goaway)), (Some(a), Some(g)) if a < g),
-        "{log:?}"
-    );
+    let goaway = log
+        .iter()
+        .position(|l| l.starts_with("goaway:") && l.ends_with(&goaway_end))
+        .unwrap();
+    let conn = log[goaway]
+        .strip_prefix("goaway:")
+        .and_then(|l| l.strip_suffix(&goaway_end))
+        .unwrap();
+    let abort = log
+        .iter()
+        .position(|l| *l == format!("abort:{conn}:{cancelled}"));
+    assert!(abort.is_some_and(|a| a < goaway), "{log:?}");
+    assert!(host.logged("approval_ended:Cancelled"), "{log:?}");
     let joined = within("cancel", join.finish()).await.unwrap();
     assert_eq!(joined.end, DirectEnd::Closed(Some(ErrorCode::Cancelled)));
     assert_eq!(pending_count(&*records, &host.code), 0);
@@ -913,8 +941,7 @@ async fn a_cancel_while_away_reaches_the_host_with_the_recovery() {
     host.break_all();
     assert_eq!(next(&mut join).await, DirectEvent::Away);
     join.cancel().unwrap();
-    let lookup = DirectLookup::from_canonical(&host.code[..4]).unwrap();
-    assert!(records.load(&lookup).unwrap().1[0].cancelled);
+    assert!(pending_at(&*records, &host).unwrap().cancelled);
     let joined = within("cancel away", join.finish()).await.unwrap();
     assert_eq!(joined.end, DirectEnd::Closed(Some(ErrorCode::Cancelled)));
     assert!(host.logged("approval_ended:Cancelled"));
@@ -973,14 +1000,15 @@ impl DirectRecords for CrashAfter {
     fn load(
         &self,
         lookup: &DirectLookup,
+        address: &DirectAddress,
     ) -> Result<
         (
             Option<mousse_net_core::pairing::DirectLedger>,
-            Vec<mousse_net_core::pairing::DirectPending>,
+            Option<DirectPending>,
         ),
         NetError,
     > {
-        self.inner.load(lookup)
+        self.inner.load(lookup, address)
     }
 
     fn swap_ledger(
@@ -1003,7 +1031,7 @@ impl DirectRecords for CrashAfter {
         self.landed()
     }
 
-    fn pending_slots(&self) -> Result<Vec<mousse_net_io::PendingSlot>, NetError> {
+    fn pending_slots(&self) -> Result<mousse_net_io::PendingSlots, NetError> {
         self.inner.pending_slots()
     }
 }
@@ -1059,7 +1087,11 @@ async fn crash_points_leave_what_a_restart_needs() {
     assert_eq!(pending_count(&*store, &host.code), 1);
     assert!(!host.logged("approval"), "msg_c went out: {:?}", host.log());
     let again = Joiner::with_signer(joiner.signer.clone(), store.clone());
-    let mut joins = again.caller.resume_direct(&again.setup, "laptop").unwrap();
+    let mut joins = again
+        .caller
+        .resume_direct(&again.setup, "laptop")
+        .unwrap()
+        .joins;
     let joined = within("recovery 2", joins.remove(0).finish())
         .await
         .unwrap();
@@ -1083,7 +1115,11 @@ async fn crash_points_leave_what_a_restart_needs() {
     assert_eq!(pending_count(&*store, &host.code), 1);
     assert!(joiner.pins.stored.lock().unwrap().is_empty());
     let again = joiner.restarted();
-    let mut joins = again.caller.resume_direct(&again.setup, "laptop").unwrap();
+    let mut joins = again
+        .caller
+        .resume_direct(&again.setup, "laptop")
+        .unwrap()
+        .joins;
     let joined = within("recovery 3", joins.remove(0).finish())
         .await
         .unwrap();
@@ -1137,7 +1173,11 @@ async fn startup_recovers_every_kept_record_one_flow_at_a_time() {
     }
     assert_eq!(pending_count(&*records, code), 2);
     let again = joiner.restarted();
-    let joins = again.caller.resume_direct(&again.setup, "laptop").unwrap();
+    let joins = again
+        .caller
+        .resume_direct(&again.setup, "laptop")
+        .unwrap()
+        .joins;
     assert_eq!(joins.len(), 2);
     for join in joins {
         let joined = within("recovery", join.finish()).await.unwrap();
@@ -1149,8 +1189,9 @@ async fn startup_recovers_every_kept_record_one_flow_at_a_time() {
 }
 
 /// At startup a damaged record stops only its own flow: that flow fails and
-/// its events end, and a healthy record under another lookup is still
-/// recovered and pairs.
+/// its events end, and a healthy record under the same lookup is still
+/// recovered and pairs. A file kept as a pending record whose name does
+/// not read is reported.
 #[tokio::test]
 async fn a_damaged_record_stops_only_its_own_recovery() {
     minor_4();
@@ -1165,20 +1206,22 @@ async fn a_damaged_record_stops_only_its_own_recovery() {
     join.stop();
     wait_for("the request away", || host.logged("approval:Away")).await;
     host.allow(joiner.identity()).await;
-    // Another lookup's record that does not read.
-    let other = if host.code.starts_with("ZZZZ") {
-        "YYYY"
-    } else {
-        "ZZZZ"
-    };
-    let damaged = DirectRecordStore::in_dir(&dir).pending_path(
-        &DirectLookup::from_canonical(other).unwrap(),
+    // A record under the same lookup, at another address, that does not
+    // read; and a file whose name does not read.
+    let lookup = DirectLookup::from_canonical(&host.code[..4]).unwrap();
+    let store = DirectRecordStore::in_dir(&dir);
+    let damaged = store.pending_path(
+        &lookup,
         &DirectAddress::parse("192.168.1.20:47100").unwrap(),
     );
-    std::fs::write(damaged, b"junk").unwrap();
+    std::fs::write(&damaged, b"junk").unwrap();
+    let misnamed = damaged.with_file_name(format!("{}-zz.pending", lookup.as_str()));
+    std::fs::write(&misnamed, b"junk").unwrap();
 
     let again = joiner.restarted();
-    let joins = again.caller.resume_direct(&again.setup, "laptop").unwrap();
+    let resumed = again.caller.resume_direct(&again.setup, "laptop").unwrap();
+    assert_eq!(resumed.unreadable.len(), 1);
+    let joins = resumed.joins;
     assert_eq!(joins.len(), 2);
     let (mut failed, mut paired) = (0, 0);
     for mut join in joins {
@@ -1196,7 +1239,9 @@ async fn a_damaged_record_stops_only_its_own_recovery() {
         }
     }
     assert_eq!((failed, paired), (1, 1));
-    assert_eq!(pending_count(&*records, &host.code), 0);
+    assert_eq!(pending_at(&*records, &host), None);
+    // The damaged record and the misnamed file are left as they are.
+    assert!(damaged.exists() && misnamed.exists());
     std::fs::remove_dir_all(dir).ok();
 }
 
@@ -1218,7 +1263,11 @@ async fn a_recovery_never_shows_its_certificate_to_another_key_at_the_address() 
     let other = TestHost::start_at(addr, new_signer()).await;
 
     let again = joiner.restarted();
-    let mut joins = again.caller.resume_direct(&again.setup, "laptop").unwrap();
+    let mut joins = again
+        .caller
+        .resume_direct(&again.setup, "laptop")
+        .unwrap()
+        .joins;
     assert_eq!(joins.len(), 1);
     let mut join = joins.remove(0);
     assert_eq!(next(&mut join).await, DirectEvent::Away);
@@ -1230,4 +1279,152 @@ async fn a_recovery_never_shows_its_certificate_to_another_key_at_the_address() 
     assert_eq!(pending_count(&*records, &code), 1);
     join.stop();
     std::fs::remove_dir_all(dir).ok();
+}
+
+/// A first contact joins the host's session only once it pairs: a Connect
+/// that fails leaves a path this device already has to that host alone.
+#[tokio::test]
+async fn a_first_contact_displaces_no_path_unless_it_pairs() {
+    minor_4();
+    let host = TestHost::start(new_signer(), None, DIRECT_MINOR_VERSION).await;
+    let joiner = Joiner::new(Arc::new(MemoryDirectRecords::default()));
+    let pipe = tokio::net::TcpStream::connect(host.addr).await.unwrap();
+    let path = within(
+        "the existing path",
+        joiner.caller.connect(pipe, host.identity),
+    )
+    .await
+    .unwrap();
+    let joined = within(
+        "wrong secret",
+        joiner.join(&host, &wrong_secret(&host.code)).finish(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(joined.end, DirectEnd::CodeFailed { attempts_left: 4 });
+    // The existing path's own close is the next thing the host hears from
+    // it; a path the Connect displaced would have closed with
+    // PATH_REPLACED before.
+    path.close(ErrorCode::NoError);
+    let no_error = format!(":{}", ErrorCode::NoError.name());
+    wait_for("the path's own close", || {
+        host.log()
+            .iter()
+            .any(|l| l.starts_with("goaway:") && l.ends_with(&no_error))
+    })
+    .await;
+    let replaced = format!(":{}", ErrorCode::PathReplaced.name());
+    assert!(
+        !host.log().iter().any(|l| l.ends_with(&replaced)),
+        "{:?}",
+        host.log()
+    );
+}
+
+/// A cancel made right after startup, before the recovery has loaded
+/// anything, is taken: once the records are loaded the recovery marks its
+/// record cancelled.
+#[tokio::test(flavor = "current_thread")]
+async fn a_cancel_right_after_startup_is_taken() {
+    minor_4();
+    let records: Arc<dyn DirectRecords> = Arc::new(MemoryDirectRecords::default());
+    let lookup = DirectLookup::from_canonical("K7QM").unwrap();
+    // Nobody listens here: the recovery's dial fails, and it stays away.
+    let free = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = DirectAddress::parse(&free.local_addr().unwrap().to_string()).unwrap();
+    drop(free);
+    let kept = DirectPending {
+        lookup: lookup.clone(),
+        host: *CertManager::new(new_signer(), Arc::new(SystemClock::new()))
+            .current()
+            .unwrap()
+            .identity(),
+        invitation: InvitationId([7; 16]),
+        address,
+        verified_at: UnixTime(1_790_000_000),
+        cancelled: false,
+        attempt: AttemptId([5; 16]),
+    };
+    records
+        .swap_pending(&lookup, &address, None, Some(&kept))
+        .unwrap();
+    let joiner = Joiner::new(records.clone());
+    let mut resumed = joiner
+        .caller
+        .resume_direct(&joiner.setup, "laptop")
+        .unwrap();
+    let join = resumed.joins.remove(0);
+    // Before the task has run at all.
+    join.cancel().unwrap();
+    wait_for("the cancel marked", || {
+        records
+            .load(&lookup, &address)
+            .unwrap()
+            .1
+            .is_some_and(|p| p.cancelled)
+    })
+    .await;
+    join.stop();
+}
+
+/// A record store that panics when it loads.
+#[derive(Default)]
+struct PanicsOnLoad(MemoryDirectRecords);
+
+impl DirectRecords for PanicsOnLoad {
+    fn hold(
+        &self,
+        lookup: &DirectLookup,
+    ) -> Result<Option<mousse_net_io::store::FlowHold>, NetError> {
+        self.0.hold(lookup)
+    }
+
+    fn load(
+        &self,
+        _lookup: &DirectLookup,
+        _address: &DirectAddress,
+    ) -> Result<
+        (
+            Option<mousse_net_core::pairing::DirectLedger>,
+            Option<DirectPending>,
+        ),
+        NetError,
+    > {
+        panic!("the store failed to load");
+    }
+
+    fn swap_ledger(
+        &self,
+        expected: Option<&mousse_net_core::pairing::DirectLedger>,
+        record: &mousse_net_core::pairing::DirectLedger,
+    ) -> Result<(), NetError> {
+        self.0.swap_ledger(expected, record)
+    }
+
+    fn swap_pending(
+        &self,
+        lookup: &DirectLookup,
+        address: &DirectAddress,
+        expected: Option<&DirectPending>,
+        record: Option<&DirectPending>,
+    ) -> Result<(), NetError> {
+        self.0.swap_pending(lookup, address, expected, record)
+    }
+
+    fn pending_slots(&self) -> Result<mousse_net_io::PendingSlots, NetError> {
+        self.0.pending_slots()
+    }
+}
+
+/// The event stream ends even when the flow's task panics.
+#[tokio::test]
+async fn the_events_end_when_the_flow_panics() {
+    minor_4();
+    let joiner = Joiner::new(Arc::new(PanicsOnLoad::default()));
+    let mut join = joiner
+        .caller
+        .join_direct(&joiner.setup, "127.0.0.1:1", "K7QM-2XPA-9RTE", "laptop")
+        .unwrap();
+    assert_eq!(drain(&mut join).await, Vec::new());
+    assert!(within("the panic", join.finish()).await.is_err());
 }

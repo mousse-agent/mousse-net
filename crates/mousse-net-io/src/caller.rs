@@ -110,7 +110,7 @@ use crate::tls::{self, Handshake, TlsPolicy};
 use crate::SharedSigner;
 
 mod direct;
-pub use direct::{DirectEvent, DirectJoin, DirectJoined, DirectPins, DirectSetup};
+pub use direct::{DirectEvent, DirectJoin, DirectJoined, DirectPins, DirectResumed, DirectSetup};
 
 /// How pairing ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -962,7 +962,7 @@ where
         handshake: &Handshake,
     ) -> Result<ConnectionId, NetError> {
         let conn = self.next_conn_id();
-        self.admit_as(conn, pin, handshake)?;
+        self.admit_in(&mut lock(&self.paths), conn, pin, handshake)?;
         Ok(conn)
     }
 
@@ -971,14 +971,14 @@ where
     }
 
     /// Admit `conn`, already authenticated as `pin`, into that peer's
-    /// session as a new path.
-    fn admit_as(
+    /// session as a new path, under the paths lock `paths`.
+    fn admit_in(
         &self,
+        paths: &mut Paths,
         conn: ConnectionId,
         pin: IdentityPublicKey,
         handshake: &Handshake,
     ) -> Result<(), NetError> {
-        let mut paths = lock(&self.paths);
         let session = paths
             .sessions
             .entry(pin)

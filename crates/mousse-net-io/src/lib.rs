@@ -50,14 +50,16 @@ pub mod watch;
 pub use admission::{HelloSeen, Room, StreamAdmission, BOT_LABELS};
 pub use caller::{
     is_lan_route, route_rank, Caller, CandidateSource, CodeEntry, DirectEvent, DirectJoin,
-    DirectJoined, DirectPins, DirectSetup, JoinOutcome, LaterCandidates, NoCode, PathEvent,
-    Reached, RouteClass, Search, Step1Failures,
+    DirectJoined, DirectPins, DirectResumed, DirectSetup, JoinOutcome, LaterCandidates, NoCode,
+    PathEvent, Reached, RouteClass, Search, Step1Failures,
 };
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use conn::{
     CloseReason, ConnStatus, Connection, LivePermit, MuxStream, StreamReader, StreamWriter,
 };
-pub use direct_records::{DirectRecordStore, DirectRecords, MemoryDirectRecords, PendingSlot};
+pub use direct_records::{
+    DirectRecordStore, DirectRecords, MemoryDirectRecords, PendingSlot, PendingSlots,
+};
 pub use endpoint::{Endpoint, PortChoice};
 pub use error::NetError;
 pub use host::{
