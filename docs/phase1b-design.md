@@ -417,12 +417,35 @@ in a terminal. The ideas come from v1 (`transports/ssh.ts:157-205`,
 - **App-run profiles only.** SSH reaches profiles that Mousse runs, through
   their selector. A standalone `serve` is not reachable over SSH in 1b, and
   `pipe` has no `--state` form.
-- **Windows remotes** (`cmd` form, `.cmd` launchers) are in 1b only if S1
-  is clean: key logon reaches a GUI-session helper's named pipe, the remote
-  process exits when the session is killed, and a space in the path works.
-  Otherwise SSH add refuses a Windows remote with "Adding a Windows
-  computer over SSH isn't supported yet." PowerShell as the remote default
-  shell is not supported in 1b.
+- **Windows remotes** (Windows OpenSSH Server, its default shell `cmd` or
+  PowerShell). On Windows the launchers are `mousse-helper.cmd` and
+  `mousse-cli.cmd` in `%MOUSSE_HOME%\bin`: `@echo off`, `setlocal
+  DisableDelayedExpansion`, `set "MOUSSE_HOME=<home>"`, the target with
+  `%*` (`call` for the app's own `mousse-cli.cmd`), `exit /b %ERRORLEVEL%`.
+  `cmd` reads a `.cmd` file in the OEM code page, so paths are written
+  relative to `%USERPROFILE%` or `%LOCALAPPDATA%` where they can be, else as
+  printable ASCII, with `%` written `%%` (`%%%%` on a `call` line). A path
+  neither way can hold gets no launcher, and the app logs why.
+  `MOUSSE_HOME` is exactly the app's string: the daemon's pipe name is a
+  digest of it.
+- **Command form (`cmd`):** `.\.mousse\bin\<launcher>.cmd <args>`. Windows
+  OpenSSH starts the session in the profile folder, so the path is
+  relative: no quotes, no `%VAR%`, no spaces, whatever the user folder is
+  called. **(`powershell`):** the same, then `; exit $LASTEXITCODE`;
+  PowerShell passes stdin and stdout to the launcher byte for byte, but
+  would otherwise end with its own exit code.
+- **Which shell.** A route starts with its shell unknown. `ssh.run` tries
+  the `sh` form; when the answer says `exec` "is not recognized as an
+  internal or external command" (`cmd`) or "as the name of a cmdlet" / "as
+  a name of a cmdlet" (PowerShell 5.1 / 7), the helper keeps that shell in
+  the route's record, runs the request once more in its form, and answers
+  `shell` beside `reply`. Later sessions and pipe dials use the kept
+  shell; a route kept as `sh` that gets that answer learns it again. The
+  app passes the shell to `peer.addresses.set`. Resolving the route again
+  keeps the shell only for the same host and port. A Windows shell the
+  helper cannot name (another display language, or bash as the default
+  shell on Windows) stays `windows_remote_unsupported`; bash on Windows is
+  out of scope.
 - **Marker.** `pipe` and `mousse-cli net-engine ssh` write the line
   `mousse-ssh/1` to stdout before anything else. The client discards
   everything up to and including that line, at most
@@ -489,7 +512,8 @@ confirmed, plus the SSH login.
      label, networking, identity?}]}`. That is every profile of that OS
      account, paired elsewhere or not. It holds no paths.
    - A missing launcher (`127`, or "not found") is `remote_not_installed`.
-     For a Windows remote, see §3.3.
+     For a Windows remote, "is not recognized" or "The system cannot find
+     the path specified" after the Windows form is too (§3.3).
 3. **A, the owner picks** an existing profile, or "New profile" with a
    label. The list never hides or refuses a profile because it belongs to
    another set of devices, as the PLAN requires.
@@ -580,7 +604,8 @@ and any remote where the daemon is not running. Both answer
 
 **SSH connections per add:** a key fetch when the route has no pin, then
 sessions 1 and 2, then the pipe dial. That is four, under the window's
-five. Adding the SSH route to a computer A already pairs with skips step 4
+five. A Windows remote takes one more, once per route, for session 1 in
+the `sh` form: five. Adding the SSH route to a computer A already pairs with skips step 4
 on A: A holds B's pin and is granted, so it only stores the route.
 
 ### 3.5 Errors shown (one line each; details in the tooltip)
@@ -589,13 +614,13 @@ on A: A holds B's pin and is granted, so it only stores the route.
 |---|---|
 | `auth_denied` | "SSH sign-in was refused. Mousse uses your SSH keys or agent, never a password." |
 | `host_key_changed` | "<host>'s SSH key changed." Check and trust again |
-| `remote_not_installed` | "Mousse isn't installed for <user> on <host>." |
+| `remote_not_installed` | "Mousse isn't installed for <user> on <host>, or needs an update. Install or update it there, then open it once." |
 | `remote_not_running` | "Mousse isn't running for <user> on <host>. Sign in there and open it once." |
 | `remote_no_endpoint` | "That profile is gone on <host>." |
 | `remote_failed` | "Mousse on <host> didn't answer as expected." |
 | `removed` | "<host> removed this computer's access." Add again |
 | `ssh_proxy_unsupported` | "Jump hosts aren't supported yet." |
-| `windows_remote_unsupported` | "Adding a Windows computer over SSH isn't supported yet." (only if S1 fails) |
+| `windows_remote_unsupported` | "Adding a Windows computer over SSH isn't supported yet." (only for a Windows shell the helper cannot name, §3.3) |
 
 ### 3.6 Direction and journals
 
@@ -1723,8 +1748,10 @@ E = engine repo (`phase-1b`), M = Mousse (`net-engine-1b`).
 **Risks**
 
 1. **Windows as an SSH remote.** The shell, launcher and named-pipe access
-   differ. v1 never supported it. S1 decides, and on failure Windows
-   remotes are refused with `windows_remote_unsupported`.
+   differ. v1 never supported it. Settled by S1 item 8: supported with
+   `cmd` or PowerShell as the default shell (§3.3). The shell is told from
+   English error text; another display language stays
+   `windows_remote_unsupported`.
 2. **Internet exposure.** Port forwards and tunnels put the listener on
    the internet. Security still rests on the pin and step 2, which every
    route shares and Phase 0 vectors cover. Denial of service is not
@@ -1841,12 +1868,23 @@ S1, the pipe:
    `not found` (`remote_not_installed`). Windows `ssh.exe` with
    `ConnectTimeout` prints nothing for a refused port at `LogLevel=ERROR`,
    so exit 255 with empty stderr maps to `unreachable`.
-8. Windows remotes: **no-go.** A key logon reaching a GUI-session pipe was
-   not tested (an S4U task needs admin rights here; no `sshd` installed),
-   nor `sshd`'s session teardown. The `cmd /c` form works only as
-   `""<launcher>" <args>"` (a path with `&` or parentheses breaks the plain
-   form). SSH add refuses Windows remotes with
-   `windows_remote_unsupported` in 1b.
+8. Windows remotes: **go** (measured 2026-11-28 over SSH into Windows 11
+   with OpenSSH Server, default shell `cmd`, code page 437, from another
+   PC). The session starts in `%USERPROFILE%`. The installed `mousse-helper
+   pipe --profile <selector>` run over SSH reached the GUI session's
+   helper (it printed the marker, which it does only after the helper's
+   `{"ok":true}`), so an SSH logon opens the helper's named pipe. Killing
+   the SSH client ended the remote `pipe` within 5 s. stdin passes through
+   `cmd` unchanged. The earlier `&` and parentheses problem was the plain
+   form with an absolute path; the relative form `.\.mousse\bin\<launcher>.cmd`
+   has none, and the launcher quotes its target. Through real `cmd.exe /c`
+   and `powershell.exe -c` (5.1), every byte value, CRLF and 1 MiB of
+   random bytes round-trip unchanged through a `.cmd` launcher, the exit
+   code passes through (PowerShell only with `; exit $LASTEXITCODE`), and
+   targets in folders with a space, `&`, `(`, `%` and non-ASCII names work
+   (`mousse-net-io/tests/windows_shells.rs`). Same run: the packaged
+   `mousse-cli.cmd net-engine ssh` read an empty stdin in `--cli` mode
+   (Electron's main process); Mousse runs it as plain Node.
 
 S2, route policy:
 

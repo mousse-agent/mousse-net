@@ -10,7 +10,8 @@
 //!
 //! A third kind, **direct** (Pair with IP, kind 3), has no ticket: the joiner
 //! types the host's address and a 12-character code ([`DirectCode`]). It has
-//! its own host machine, [`DirectHostPairing`].
+//! its own host machine, [`DirectHostPairing`], and joiner machine,
+//! [`DirectJoinerPairing`].
 //!
 //! The code exchange itself sits behind [`CodeExchange`]; the real one is
 //! CPace ([`CpaceExchangeFactory`]), with the joiner as initiator and the host
@@ -19,6 +20,7 @@
 
 mod direct_code;
 mod direct_host;
+mod direct_joiner;
 mod exchange;
 mod host;
 mod joiner;
@@ -36,6 +38,11 @@ pub use direct_host::{
     ApprovalEnd, CreatedDirectInvitation, DirectApproval, DirectHostAction, DirectHostError,
     DirectHostPairing, DirectInvitationParams, DirectInvitationStatus, DirectRequestId,
     RequestDecision, RequestPresence,
+};
+pub use direct_joiner::{
+    DirectAddress, DirectEnd, DirectJoinError, DirectJoinerAction, DirectJoinerPairing,
+    DirectJoinerState, DirectLedger, DirectPaired, DirectPending, DIRECT_JOINER_ATTEMPTS,
+    DIRECT_LEDGER_DOMAIN, DIRECT_LEDGER_LIFE_SECS, DIRECT_PENDING_DOMAIN,
 };
 #[cfg(feature = "insecure-test-exchange")]
 pub use exchange::insecure;

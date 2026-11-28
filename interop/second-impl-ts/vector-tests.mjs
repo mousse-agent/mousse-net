@@ -7,11 +7,12 @@ import { authenticateNativePeer, checkRaw, DerReader, derToRaw, issueCertificate
 import * as cpace from './cpace.ts';
 import { DIRECT_CODE_ALPHABET, directCode, directCodeFromDraw, directCpaceInputs, directInviteDigest, directTranscript,
   displayDirectCode, parseDirectCode } from './direct-code.ts';
+import { decodeLedger, decodePending, encodeLedger, encodePending } from './direct-joiner.ts';
 import { PairingJoiner, trafficOf } from './pairing.ts';
 import { Gate, step2, Streams } from './session.ts';
 import * as relay from './relay.ts';
 import * as wire from './wire.ts';
-import { memoryFlowStore, replayAttemptSequence, replayBeforeMsgA, replayDirectSequence,
+import { memoryFlowStore, replayAttemptSequence, replayBeforeMsgA, replayDirectJoinerSequence, replayDirectSequence,
   replayEndToEnd } from './pairing-replay.mjs';
 
 const directory = new URL('../../spec/vectors/', import.meta.url);
@@ -507,6 +508,30 @@ function outcome(expected, fn) {
   const [v, add] = file('direct-host.json');
   for (const sequence of v.sequences) add(sequence.name, () => replayDirectSequence(sequence, v.conventions));
   add('before_msg_a', () => replayBeforeMsgA(v.before_msg_a, v.conventions));
+}
+
+{
+  const [v, add] = file('direct-joiner.json');
+  for (const sequence of v.sequences) add(sequence.name, () => replayDirectJoinerSequence(sequence, v.conventions));
+  // Both record formats with times above 2^53 - 1: read whole, written back byte for byte.
+  for (const item of v.records) {
+    add(`records ${item.kind}`, () => {
+      if (item.kind === 'ledger') {
+        const ledger = decodeLedger(bytes(item.bytes), item.lookup);
+        assert.deepEqual(ledger, { lookup: item.lookup, left: item.attempts_left, firstDebit: BigInt(item.first_debit) });
+        matches(encodeLedger(ledger), item.bytes);
+      } else {
+        const pending = decodePending(bytes(item.bytes), item.lookup);
+        assert.equal(hex(pending.host), item.host);
+        assert.equal(hex(pending.invitation), item.invitation);
+        assert.equal(pending.address, item.address);
+        assert.equal(pending.verifiedAt, BigInt(item.verified_at));
+        assert.equal(pending.cancelled, item.cancelled);
+        assert.equal(hex(pending.attempt), item.attempt);
+        matches(encodePending(pending), item.bytes);
+      }
+    });
+  }
 }
 
 {

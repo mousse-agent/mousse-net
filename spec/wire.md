@@ -1394,9 +1394,6 @@ bound to the old one closes with `GRANT_REVOKED`.
 
 ### 10.9 Direct flow
 
-*The joiner's side (its attempt ledger and pending record) follows; this
-section gives the code, the binding and the host's side.*
-
 The direct flow pairs two endpoints with no ticket: the host shows its
 address and a **direct code**, and the joiner's owner types both. The host
 owner then allows the device, as in person (10.4).
@@ -1683,6 +1680,167 @@ grant enrollment made, provisional or committed, with receipt `I` and the
 mark that a direct invitation made it (section 7, 10.8), stored with the
 grant table; recovery reads it, also after a restart. Vectors:
 `direct-host.json`.
+
+#### Joiner
+
+**Before dialing.** The joiner reads the typed address with the route
+grammar (10.2.1): `<IPv4>:<port>` or `[<IPv6>]:<port>`, leading and
+trailing spaces dropped, no DNS names, and no IPv4-mapped IPv6 address
+(`::ffff:0:0/96`; the IPv4 form is typed instead); anything else is
+`bad_address`. It
+reads the code as "Code" above; a text that is not a code is `bad_code`.
+The address is read first. Neither error dials or spends an attempt.
+
+**Hold.** One flow at a time works on a typed lookup. A flow first takes the
+lookup's **hold** (a lock the operating system releases if the app dies),
+then loads the ledger and the pending records under it; when another flow
+on the device has it, a new flow ends at once (busy) and nothing is loaded
+or dialled. The flow keeps the hold until it ends, or until its
+connection ends with its pending record kept (it is away), after its last
+write; going on from away, for a recovery connection or a cancel, takes it
+again and reloads the records, so a flow never acts on a record another
+flow changed since. A flow that already has a pending record takes only
+that record again, the one its own attempt `A` wrote (key 8): a newer
+record at the same address belongs to another flow, and when its own is
+gone the flow ends (settled) and acts on nothing. A cancel that cannot take
+the hold leaves the flow away and the record as it was. A recovery that
+cannot take it dials nothing and stays away. A flow whose dial fails
+before TLS is up (no answer, or a recovery's pinned TLS meeting another
+key) gives the hold back: a first contact ends (closed, with no code), a
+recovery stays away with its record for a later try. A flow keeps the hold while its pin is being
+stored (step 7): nothing on the connection, a second `PAIRED` or a
+protocol error included, ends the flow or gives the hold back before the
+pin is stored. A pin that cannot be stored is a failed write: the pending
+record stays, the joiner closes with `INTERNAL_ERROR`, gives the hold back,
+and the flow ends. A start with no attempts left for the
+typed lookup ends with `ATTEMPTS_EXHAUSTED` before dialing.
+
+**Ledger.** The joiner counts its attempts per **typed lookup**, not per key
+the far end shows, in a durable record stored under `L`:
+
+```
+{1: "mousse-direct-joiner-v1", 2: L (text, 4), 3: attempts left (0 to 5),
+ 4: time of the first debit (uint)}
+```
+
+A start has `DIRECT_JOINER_ATTEMPTS` (5) attempts when no record counts. A
+record counts until 24 hours (86 400 s, fixed) after its first debit; after
+that a start begins with every attempt again, and its first debit sets a
+new first-debit time. The record is read again at the debit: when its 24
+hours ended after the start, the debit begins a new record (every attempt
+but this one, first debit now), still written against the record as
+loaded. A record for another lookup is refused. A far end
+that shows a new identity key on every connection therefore still draws
+from the same count.
+
+**Pending record.** Once the host's confirmation verified, the host key
+and `I` are authenticated. The joiner stores, under `L` and the typed
+address (one record per lookup and address; a flow at another address
+never replaces it):
+
+```
+{1: "mousse-direct-pending-v1", 2: L (text, 4), 3: host identity key (65 bytes),
+ 4: I (16 bytes), 5: address (text, canonical: the IPv4 dotted form, or
+ the IPv6 form of RFC 5952 in hex groups, lowercase, in brackets; then ":"
+ and the port),
+ 6: time the host's confirmation verified (uint), 7: cancelled (0 or 1),
+ 8: A, the attempt that passed (16 bytes)}
+```
+
+A record whose address text is not in that canonical form is refused.
+Every write of either record is durable **before** what depends on it goes
+out, and is a compare and swap on the stored record as this flow last read
+or wrote it, as in 10.7. A write that fails or finds the record changed
+sends nothing that waited for it; the joiner closes with `INTERNAL_ERROR`
+(a connection that was to close after the write, as on a cancel, is still
+up and closes so) and the flow ends. Times in both records are uints up to
+2^64 - 1; a reader keeps every bit.
+
+**First contact.** One flow is one Connect; it runs at most one attempt.
+
+1. The joiner dials the typed address with no pin (5.4). A far end that
+   shows the joiner's own identity key ends the flow (own device); the
+   joiner closes with `PAIRING_FAILED` and sends nothing else.
+2. It waits for the host's `HELLO`. With `agreed < 4` it closes with
+   `UNSUPPORTED_VERSION`: the host needs an update. Otherwise it sends
+   `JOIN_DIRECT {1: L, 2: name}`.
+3. A first `AUTHORIZED {live}` is step 2's notice, not the answer. The
+   answer is `AUTHORIZED {join_only, I}` (with key 3 it is a protocol error
+   here) or a close: a host close with `INVITATION_INVALID` means no open
+   invitation, with nothing debited.
+4. On the answer it debits: it writes the ledger with one attempt fewer
+   (the first debit also sets the first-debit time), then sends
+   `CODE_EXCHANGE {A, msg_a}` with a fresh attempt id `A`. With no attempts
+   left it closes with `ATTEMPTS_EXHAUSTED` instead.
+5. It checks `Tb` in `msg_b`. If it fails, it sends `CODE_ABORT {A,
+   PAIRING_FAILED}` and closes with `PAIRING_FAILED` (`ATTEMPTS_EXHAUSTED`
+   when none are left); the next try is a new Connect. A `CODE_ABORT` from
+   the host for `A` ends the flow the same way, without the joiner's
+   `CODE_ABORT`; after the code passed (step 6) it only closes the
+   connection with `PAIRING_FAILED`, and the pending record stays.
+6. If `Tb` verifies, it writes the pending record, then shows "Waiting for
+   Allow" and sends `CODE_EXCHANGE {A, msg_c}`.
+7. It accepts `PAIRED` only now (or on a recovery, below), and never once
+   it has cancelled (except as the answer to its cancelling recovery,
+   below). It then stores the pin, the typed address as an owner route and
+   a completion record keyed by `I`, makes the connection live (8.2,
+   pairing only), and only then deletes the pending record. It opens no
+   stream before this point. Its first stream frame on a connection to the
+   host commits the host's provisional grant (8.1); when it opens one is up
+   to the application (`direct-joiner.json` has it open one at once on the
+   pairing connection).
+
+**Ends that settle a pending record.** A close by the host with
+`PAIRING_DECLINED`, `CANCELLED`, `INVITATION_INVALID` or
+`ATTEMPTS_EXHAUSTED` deletes the pending record and ends the flow; so do
+`PAIRED` (after the pin) and `not_received` (below). Every other end keeps
+it: a broken connection, `INTERNAL_ERROR` (a paused or busy host),
+`NOT_AUTHORIZED` after the 10 s wait for an answer (8.2), a protocol error,
+a host that now agrees a minor below 4. No timer drops a kept record: the
+joiner recovers it later, with backoff, and when it starts.
+
+**Recovery.** While a pending record exists, every connection of the flow
+is a recovery, dialled **pinned** to its host key at its address. After the
+host's `HELLO` (minor 4 or more, as above) the joiner sends `JOIN_DIRECT
+{1: L, 2: name, 3: I}`, with key 4 when the record is marked cancelled; no
+code is needed, and none of the ledger's attempts: a recovery runs with
+none left. A Connect whose typed address and lookup match a stored pending
+record resumes it as a recovery instead of starting a new attempt. Any
+other Connect starts a new flow; pending records at other addresses stay as
+they are, each recovered on its own. A recovery sends `JOIN_DIRECT` and
+waits for the answer for 10 s, as a first contact does (8.2); an
+`AUTHORIZED {live}` alone does not end that wait. A host that now agrees a
+minor below 4 does not end a recovery: the joiner closes with
+`UNSUPPORTED_VERSION` and stays away with its record, for a later try. The
+answers:
+
+- `AUTHORIZED {live}` (step 2's, or the host's own when it binds the
+  connection to a grant that appeared after step 2), then `PAIRED`:
+  enrolled (from the grant's receipt); as step 7;
+- `AUTHORIZED {join_only, I}`: the request waits for Allow ("Waiting for
+  Allow"), or it was allowed while away and `PAIRED` follows; an `I` other
+  than the record's is a protocol error;
+- `AUTHORIZED {join_only, I, not_received}`: the host never had this
+  device's confirmation. The joiner deletes the pending record, closes with
+  `NO_ERROR` and tells the person to connect again with the code (the code
+  is never stored), with the attempts left;
+- a close: as "Ends that settle a pending record".
+
+**Cancel.** Before the code passed, a cancel ends the flow: a running
+attempt is aborted with `CODE_ABORT {A, CANCELLED}` (its debit stays) and
+the connection closes with `CANCELLED`. After it passed, the joiner first
+marks the pending record cancelled (durably); connected, it then sends
+`CODE_ABORT {A, CANCELLED}` on the connection that ran the attempt and
+closes with `CANCELLED` (on a recovery connection, which ran no attempt, it
+only closes with `CANCELLED`). Either way the record stays until a recovery,
+which carries the cancel flag, hears the host's settling answer, so a
+cancel that crossed the host's Allow still reaches the host. A joiner that
+cancelled ignores a `PAIRED` that crosses its cancel and pins nothing. A
+`PAIRED` in answer to the recovery that carries the cancel flag is the
+host's settling answer: the grant committed before the cancel arrived (a
+device that already held a grant committed it through another of its
+connections), and the joiner takes it as step 7.
+Vectors: `direct-joiner.json`.
 
 ## 11. Control messages
 
