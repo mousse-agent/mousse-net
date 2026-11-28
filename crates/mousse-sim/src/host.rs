@@ -75,12 +75,7 @@ pub(crate) struct HostDev {
 const PROFILE_ID: [u8; OwnerRef::LEN] = [0x51; OwnerRef::LEN];
 
 fn classify(msg: &ControlMessage) -> Traffic {
-    match msg {
-        ControlMessage::Hello { .. } => Traffic::Hello,
-        ControlMessage::JoinProof { .. } => Traffic::JoinProof,
-        ControlMessage::CodeExchange { .. } | ControlMessage::CodeAbort { .. } => Traffic::Pairing,
-        ControlMessage::Authorized { .. } | ControlMessage::Paired { .. } => Traffic::HostOnly,
-    }
+    Traffic::of(msg)
 }
 
 impl HostDev {
@@ -497,7 +492,14 @@ impl HostDev {
                 );
                 self.pairing.on_code_abort(conn, attempt)
             }
-            ControlMessage::Authorized { .. } | ControlMessage::Paired { .. } => return,
+            ControlMessage::Authorized { .. }
+            | ControlMessage::AuthorizedDirect { .. }
+            | ControlMessage::Paired { .. } => return,
+            // The simulation speaks minor 3, where JOIN_DIRECT is not defined.
+            ControlMessage::JoinDirect { .. } => {
+                self.close(sim, conn, ErrorCode::ProtocolError);
+                return;
+            }
         };
         self.apply(sim, actions);
     }

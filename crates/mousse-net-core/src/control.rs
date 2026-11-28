@@ -7,8 +7,13 @@ use std::fmt;
 
 use crate::cbor::{self, FieldError, Fields, Value};
 use crate::grants::{validate_name, Role};
-use crate::pairing::{AttemptId, InvitationId};
+use crate::pairing::{AttemptId, DirectLookup, InvitationId};
 use crate::{ErrorCode, PROTOCOL_MINOR_VERSION, PROTOCOL_VERSION};
+
+/// The minor version that adds `JOIN_DIRECT` and `AUTHORIZED` keys 2 and 3
+/// (Pair with IP). Neither is defined on a connection that agreed an older
+/// minor version.
+pub const DIRECT_MINOR_VERSION: u64 = 4;
 
 /// Largest encoded control message, in bytes.
 pub const MAX_CONTROL_MESSAGE: usize = 16_384;
@@ -23,6 +28,16 @@ pub enum AuthorizedState {
     Live = 1,
     /// Join-only: pairing messages only.
     JoinOnly = 2,
+}
+
+/// The recovery part of a `JOIN_DIRECT` (keys 3 and 4): a joiner that lost
+/// its connection after the code passed asks by receipt, with no code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirectRecovery {
+    /// Key 3: the invitation id the host's confirmation authenticated.
+    pub receipt: InvitationId,
+    /// Key 4: the joiner cancels its request (or the grant it made).
+    pub cancel: bool,
 }
 
 /// One control message.
@@ -72,6 +87,26 @@ pub enum ControlMessage {
         /// The role the new grant carries.
         role: Role,
     },
+    /// Type 7, caller to host (minor 4): look up a direct invitation
+    /// (Pair with IP) by the code's first 4 characters.
+    JoinDirect {
+        /// Key 1: the lookup `L`.
+        lookup: DirectLookup,
+        /// Key 2: the joining computer's name (1 to 128 bytes).
+        name: String,
+        /// Keys 3 and 4, only when recovering.
+        recovery: Option<DirectRecovery>,
+    },
+    /// Type 2 with key 2 (minor 4), host to caller: `AUTHORIZED {join_only}`
+    /// in answer to `JOIN_DIRECT`, naming the direct invitation.
+    AuthorizedDirect {
+        /// Key 2: the invitation id `I`.
+        invitation: InvitationId,
+        /// Key 3: the host has no request from this identity (it never
+        /// received the joiner's confirmation). Only in answer to a
+        /// `JOIN_DIRECT` with a receipt.
+        not_received: bool,
+    },
 }
 
 impl fmt::Debug for ControlMessage {
@@ -96,6 +131,18 @@ impl fmt::Debug for ControlMessage {
             ControlMessage::Paired { host_name, role } => {
                 write!(f, "Paired({host_name:?}, {role:?})")
             }
+            ControlMessage::JoinDirect {
+                lookup,
+                name,
+                recovery,
+            } => write!(f, "JoinDirect({lookup:?}, {name:?}, {recovery:?})"),
+            ControlMessage::AuthorizedDirect {
+                invitation,
+                not_received,
+            } => write!(
+                f,
+                "AuthorizedDirect({invitation:?}, not_received: {not_received})"
+            ),
         }
     }
 }
@@ -135,12 +182,29 @@ impl ControlMessage {
     pub fn type_number(&self) -> u64 {
         match self {
             ControlMessage::Hello { .. } => 1,
-            ControlMessage::Authorized { .. } => 2,
+            ControlMessage::Authorized { .. } | ControlMessage::AuthorizedDirect { .. } => 2,
             ControlMessage::JoinProof { .. } => 3,
             ControlMessage::CodeExchange { .. } => 4,
             ControlMessage::CodeAbort { .. } => 5,
             ControlMessage::Paired { .. } => 6,
+            ControlMessage::JoinDirect { .. } => 7,
         }
+    }
+
+    /// The oldest agreed minor version on which this message is defined.
+    pub fn since_minor(&self) -> u64 {
+        match self {
+            ControlMessage::JoinDirect { .. } | ControlMessage::AuthorizedDirect { .. } => {
+                DIRECT_MINOR_VERSION
+            }
+            _ => 0,
+        }
+    }
+
+    /// Whether this message is defined on a connection that agreed minor
+    /// version `agreed`. A receiver closes with `PROTOCOL_ERROR` otherwise.
+    pub fn defined_at(&self, agreed: u64) -> bool {
+        self.since_minor() <= agreed
     }
 
     /// Canonical CBOR encoding.
@@ -176,8 +240,47 @@ impl ControlMessage {
                 entries.push((1, Value::Text(host_name.clone())));
                 entries.push((2, Value::Text(role.as_str().to_owned())));
             }
+            ControlMessage::JoinDirect {
+                lookup,
+                name,
+                recovery,
+            } => {
+                entries.push((1, Value::Text(lookup.as_str().to_owned())));
+                entries.push((2, Value::Text(name.clone())));
+                if let Some(recovery) = recovery {
+                    entries.push((3, Value::Bytes(recovery.receipt.0.to_vec())));
+                    if recovery.cancel {
+                        entries.push((4, Value::Uint(1)));
+                    }
+                }
+            }
+            ControlMessage::AuthorizedDirect {
+                invitation,
+                not_received,
+            } => {
+                entries.push((1, Value::Uint(AuthorizedState::JoinOnly as u64)));
+                entries.push((2, Value::Bytes(invitation.0.to_vec())));
+                if *not_received {
+                    entries.push((3, Value::Uint(1)));
+                }
+            }
         }
         cbor::encode(&Value::Map(entries))
+    }
+
+    /// Decode and validate one message received on a connection that agreed
+    /// minor version `agreed`. A message the agreed version does not define
+    /// is rejected as a decoder of that version rejects it: `JOIN_DIRECT` as
+    /// an unknown type, `AUTHORIZED` key 2 as an unknown field.
+    pub fn decode_at(bytes: &[u8], agreed: u64) -> Result<Self, ControlError> {
+        let message = Self::decode(bytes)?;
+        if message.defined_at(agreed) {
+            return Ok(message);
+        }
+        Err(match message {
+            ControlMessage::AuthorizedDirect { .. } => FieldError::Unknown(2).into(),
+            other => ControlError::UnknownType(other.type_number()),
+        })
     }
 
     /// Decode and validate one message.
@@ -192,13 +295,24 @@ impl ControlMessage {
                 major_version: f.uint(1)?,
                 minor_version: f.uint(2)?,
             },
-            2 => ControlMessage::Authorized {
-                state: match f.uint(1)? {
+            2 => {
+                let state = match f.uint(1)? {
                     1 => AuthorizedState::Live,
                     2 => AuthorizedState::JoinOnly,
                     _ => return Err(FieldError::Invalid(1).into()),
-                },
-            },
+                };
+                let invitation = optional_fixed::<16>(&mut f, 2)?;
+                let not_received = optional_flag(&mut f, 3)?;
+                match (invitation, state) {
+                    (None, _) if not_received => return Err(FieldError::Invalid(3).into()),
+                    (None, state) => ControlMessage::Authorized { state },
+                    (Some(_), AuthorizedState::Live) => return Err(FieldError::Invalid(2).into()),
+                    (Some(id), AuthorizedState::JoinOnly) => ControlMessage::AuthorizedDirect {
+                        invitation: InvitationId(id),
+                        not_received,
+                    },
+                }
+            }
             3 => {
                 let invitation = InvitationId(f.fixed::<16>(1)?);
                 let mac = f.fixed::<32>(2)?;
@@ -231,10 +345,51 @@ impl ControlMessage {
                 let role = Role::new(&f.text(2)?).map_err(|_| FieldError::Invalid(2))?;
                 ControlMessage::Paired { host_name, role }
             }
+            7 => {
+                let lookup =
+                    DirectLookup::from_canonical(&f.text(1)?).ok_or(FieldError::Invalid(1))?;
+                let name = f.text(2)?;
+                validate_name(&name).map_err(|_| FieldError::Invalid(2))?;
+                let receipt = optional_fixed::<16>(&mut f, 3)?;
+                let cancel = optional_flag(&mut f, 4)?;
+                let recovery = match receipt {
+                    Some(id) => Some(DirectRecovery {
+                        receipt: InvitationId(id),
+                        cancel,
+                    }),
+                    None if cancel => return Err(FieldError::Invalid(4).into()),
+                    None => None,
+                };
+                ControlMessage::JoinDirect {
+                    lookup,
+                    name,
+                    recovery,
+                }
+            }
             other => return Err(ControlError::UnknownType(other)),
         };
         f.finish()?;
         Ok(message)
+    }
+}
+
+/// An optional byte string of exactly `N` bytes.
+fn optional_fixed<const N: usize>(f: &mut Fields, key: u64) -> Result<Option<[u8; N]>, FieldError> {
+    match f.optional(key) {
+        None => Ok(None),
+        Some(Value::Bytes(b)) => b.try_into().map(Some).map_err(|_| FieldError::Invalid(key)),
+        Some(_) => Err(FieldError::WrongType(key)),
+    }
+}
+
+/// An optional flag: absent is false, `1` is true, anything else is
+/// rejected (canonical CBOR has no `true`, wire.md 3).
+fn optional_flag(f: &mut Fields, key: u64) -> Result<bool, FieldError> {
+    match f.optional(key) {
+        None => Ok(false),
+        Some(Value::Uint(1)) => Ok(true),
+        Some(Value::Uint(_)) => Err(FieldError::Invalid(key)),
+        Some(_) => Err(FieldError::WrongType(key)),
     }
 }
 

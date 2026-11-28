@@ -107,6 +107,8 @@ fn type_name(m: &ControlMessage) -> &'static str {
         ControlMessage::CodeExchange { .. } => "CODE_EXCHANGE",
         ControlMessage::CodeAbort { .. } => "CODE_ABORT",
         ControlMessage::Paired { .. } => "PAIRED",
+        ControlMessage::JoinDirect { .. } => "JOIN_DIRECT",
+        ControlMessage::AuthorizedDirect { .. } => "AUTHORIZED",
     }
 }
 

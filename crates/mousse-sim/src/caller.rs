@@ -600,7 +600,10 @@ impl CallerDev {
                     }
                     ControlMessage::CodeAbort { attempt, .. } => flow.on_code_abort(attempt),
                     ControlMessage::Paired { host_name, role } => flow.on_paired(host_name, role),
-                    ControlMessage::JoinProof { .. } => {
+                    // Caller-only, or not defined at the simulation's minor 3.
+                    ControlMessage::JoinProof { .. }
+                    | ControlMessage::JoinDirect { .. }
+                    | ControlMessage::AuthorizedDirect { .. } => {
                         return self.close(sim, conn, ErrorCode::ProtocolError)
                     }
                 };

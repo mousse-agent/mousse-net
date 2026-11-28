@@ -145,6 +145,17 @@ impl fmt::Debug for DirectCode {
 pub struct DirectLookup([u8; DIRECT_LOOKUP_LEN]);
 
 impl DirectLookup {
+    /// A lookup as it travels in `JOIN_DIRECT`: exactly 4 characters of
+    /// [`DIRECT_CODE_ALPHABET`], canonical (no folding, no separators).
+    pub fn from_canonical(text: &str) -> Option<Self> {
+        let bytes: [u8; DIRECT_LOOKUP_LEN] = text.as_bytes().try_into().ok()?;
+        if bytes.iter().all(|c| DIRECT_CODE_ALPHABET.contains(c)) {
+            Some(Self(bytes))
+        } else {
+            None
+        }
+    }
+
     /// The 4 characters as text.
     pub fn as_str(&self) -> &str {
         // Always ASCII from the alphabet.

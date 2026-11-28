@@ -18,14 +18,20 @@ const wireError = (value: number) => errorNumber(readError(value));
 
 export type Control =
   | { type: 'HELLO'; major: UInt; minor: UInt }
-  | { type: 'AUTHORIZED'; state: 'live' | 'join_only' }
+  // `invitation` and `notReceived` (keys 2 and 3, minor 4) only with join_only.
+  | { type: 'AUTHORIZED'; state: 'live' | 'join_only'; invitation?: Uint8Array; notReceived?: true }
   | { type: 'JOIN_PROOF'; invitation: Uint8Array; mac: Uint8Array; name: string }
   | { type: 'CODE_EXCHANGE'; attempt: Uint8Array; payload: Uint8Array }
   | { type: 'CODE_ABORT'; attempt: Uint8Array; code: number }
-  | { type: 'PAIRED'; name: string; role: string };
+  | { type: 'PAIRED'; name: string; role: string }
+  // Minor 4; `cancel` only with `receipt`.
+  | { type: 'JOIN_DIRECT'; lookup: string; name: string; receipt?: Uint8Array; cancel?: true };
 
 export type Version = { major: UInt; minor: UInt };
 export const hello = { type: 'HELLO', major: 1, minor: 3 } as const;
+/** The minor version that adds JOIN_DIRECT and AUTHORIZED keys 2 and 3. */
+export const directMinor = 4;
+const lookupPattern = /^[0-9A-HJKMNP-TV-Z]{4}$/;
 export function negotiate(local: Version, peer: Version): UInt {
   const agreed = BigInt(local.minor) < BigInt(peer.minor) ? local.minor : peer.minor;
   requireThat(BigInt(local.major) === BigInt(peer.major) && BigInt(agreed) >= BigInt(local.minor) - 1n,
@@ -33,19 +39,33 @@ export function negotiate(local: Version, peer: Version): UInt {
   return agreed;
 }
 
-function decodeControlRecord(value: Value): Control {
-  requireThat(fields(value, 0, 1, 2) || fields(value, 0, 1) || fields(value, 0, 1, 2, 3), 'protocol_error');
+function decodeControlRecord(value: Value, minor: number): Control {
+  requireThat(fields(value, 0, 1, 2) || fields(value, 0, 1) || fields(value, 0, 1, 2, 3) ||
+    fields(value, 0, 1, 2, 3, 4), 'protocol_error');
   const type = value.get(0n);
   const first = value.get(1n);
   const second = value.get(2n);
   const third = value.get(3n);
+  const direct = minor >= directMinor;
   switch (type) {
     case 1n:
       requireThat(value.size === 3 && uint(first) && uint(second), 'protocol_error');
       return { type: 'HELLO', major: first, minor: second };
     case 2n:
-      requireThat(value.size === 2 && (first === 1n || first === 2n), 'protocol_error');
-      return { type: 'AUTHORIZED', state: first === 1n ? 'live' : 'join_only' };
+      if (value.size === 2) {
+        requireThat(first === 1n || first === 2n, 'protocol_error');
+        return { type: 'AUTHORIZED', state: first === 1n ? 'live' : 'join_only' };
+      }
+      requireThat(direct && value.size <= 4 && first === 2n && byteString(second, 16) &&
+        (value.size === 3 || third === 1n), 'protocol_error');
+      return { type: 'AUTHORIZED', state: 'join_only', invitation: second, ...(value.size === 4 ? { notReceived: true } : {}) };
+    case 7n: {
+      const fourth = value.get(4n);
+      requireThat(direct && typeof first === 'string' && lookupPattern.test(first) && textString(second, 1, 128) &&
+        (value.size === 3 || byteString(third, 16)) && (value.size <= 4 || fourth === 1n), 'protocol_error');
+      return { type: 'JOIN_DIRECT', lookup: first, name: second,
+        ...(value.size >= 4 ? { receipt: third as Uint8Array } : {}), ...(value.size === 5 ? { cancel: true } : {}) };
+    }
     case 3n:
       requireThat(value.size === 4 && byteString(first, 16) && byteString(second, 32) &&
         textString(third, 1, 128), 'protocol_error');
@@ -64,9 +84,10 @@ function decodeControlRecord(value: Value): Control {
   }
 }
 
-export function decodeControl(data: Uint8Array): Control {
+/** Decode a control message on a connection that agreed minor version `minor`. */
+export function decodeControl(data: Uint8Array, minor: number = hello.minor): Control {
   requireThat(data.length <= 16384, 'protocol_error');
-  try { return decodeControlRecord(decode(data)); }
+  try { return decodeControlRecord(decode(data), minor); }
   catch { return fail('protocol_error'); }
 }
 
@@ -74,14 +95,19 @@ export function encodeControl(message: Control): Buffer {
   let value: Value;
   switch (message.type) {
     case 'HELLO': value = record([0, 1], [1, message.major], [2, message.minor]); break;
-    case 'AUTHORIZED': value = record([0, 2], [1, message.state === 'live' ? 1 : 2]); break;
+    case 'AUTHORIZED': value = record([0, 2], [1, message.state === 'live' ? 1 : 2],
+      ...(message.invitation ? [[2, message.invitation] as [number, Value]] : []),
+      ...(message.notReceived ? [[3, 1] as [number, Value]] : [])); break;
     case 'JOIN_PROOF': value = record([0, 3], [1, message.invitation], [2, message.mac], [3, message.name]); break;
     case 'CODE_EXCHANGE': value = record([0, 4], [1, message.attempt], [2, message.payload]); break;
     case 'CODE_ABORT': value = record([0, 5], [1, message.attempt], [2, message.code]); break;
     case 'PAIRED': value = record([0, 6], [1, message.name], [2, message.role]); break;
+    case 'JOIN_DIRECT': value = record([0, 7], [1, message.lookup], [2, message.name],
+      ...(message.receipt ? [[3, message.receipt] as [number, Value]] : []),
+      ...(message.cancel ? [[4, 1] as [number, Value]] : [])); break;
   }
   const encoded = encode(value);
-  decodeControl(encoded);
+  decodeControl(encoded, directMinor);
   return encoded;
 }
 

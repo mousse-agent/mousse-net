@@ -21,9 +21,11 @@ use rand_core::{Rng, SeedableRng, TryCryptoRng, TryRng};
 use serde_json::{json, Value as J};
 use sha2::Sha256;
 
+use crate::cbor::FieldError;
 use crate::cbor::{self, Value};
 use crate::control::{
-    negotiate_version, AuthorizedState, ControlMessage, HelloOutcome, HelloState, VersionSupport,
+    negotiate_version, AuthorizedState, ControlError, ControlMessage, DirectRecovery, HelloOutcome,
+    HelloState, VersionSupport, DIRECT_MINOR_VERSION,
 };
 use crate::grants::{GrantTable, OwnerRef, Role};
 use crate::identity::{IdentityPublicKey, RawSignature, SoftwareKey};
@@ -36,7 +38,7 @@ use crate::pairing::{
     RouteHost, SessionExporters, Ticket, TicketSecret, JOIN_PROOF_KEY_INFO, SID_DOMAIN,
     TICKET_VERSION,
 };
-use crate::pairing::{DirectCode, DIRECT_CODE_ALPHABET, DIRECT_CODE_LEN};
+use crate::pairing::{DirectCode, DirectLookup, DIRECT_CODE_ALPHABET, DIRECT_CODE_LEN};
 use crate::session_cert::{
     self, build_certificate, PendingCertificate, SessionKey, ValidityWindow,
 };
@@ -575,7 +577,7 @@ fn authz_vectors() -> J {
     let a = hex(identity(&IDENTITY_A).public_key().as_bytes());
     let b = hex(identity(&IDENTITY_B).public_key().as_bytes());
     let now = T + 60;
-    json!({
+    let mut doc = json!({
         "description": "Step 2 on the host after step 1 passed (`cases`), and the caller's gate (`caller_cases`). Host cases: `grants` and `denied` set up the table (grants added in order, then denials), the gate opens at wall time `now` and monotonic time 0 ms, then `steps` run in order. Caller cases: the gate starts awaiting AUTHORIZED; `sent_join_proof` means this side queued a JOIN_PROOF; `promote` means the joiner accepted PAIRED; `host_stream` asks what the host identity `host` may do on a stream it opened, from the caller endpoint's own `local_grants` at `now` (the role of its live grant, or none; wire.md 8.2); `state` is the gate state after the step. Verdicts: allow, ignore, close:<code>.",
         "identities": { "a": a, "b": b },
         "cases": [
@@ -814,7 +816,156 @@ fn authz_vectors() -> J {
                 ],
             },
         ],
-    })
+    });
+    doc["description"] = json!(format!(
+        "{} {}",
+        s_of(&doc["description"]),
+        "Host traffic `join_direct` is a JOIN_DIRECT, which follows the JOIN_PROOF rows. Caller cases with `start` `pairing_only` begin in the pairing-only state of an unpinned Pair with IP connection (wire.md 8.2), shown as `pairing_only:<step>`; `promote_direct` means the pairing layer verified the host's confirmation and accepted PAIRED."
+    ));
+    extend(&mut doc["cases"], direct_host_cases(now));
+    extend(&mut doc["caller_cases"], direct_caller_cases());
+    doc
+}
+
+fn s_of(v: &J) -> &str {
+    v.as_str().expect("string")
+}
+
+fn extend(list: &mut J, more: Vec<J>) {
+    list.as_array_mut().expect("array").extend(more);
+}
+
+/// Host gate rows for `JOIN_DIRECT` (Pair with IP): those of `JOIN_PROOF`.
+fn direct_host_cases(now: u64) -> Vec<J> {
+    vec![
+        json!({
+            "name": "no_grant_join_direct",
+            "description": "A JOIN_DIRECT from a device with no grant is let through like a JOIN_PROOF; once admitted, the connection is pairing only.",
+            "grants": [], "denied": [], "peer": "b", "now": now,
+            "step2": "await_join_proof",
+            "steps": [
+                { "op": "check", "traffic": "join_direct", "verdict": "allow" },
+                { "op": "admit_join_only" },
+                { "op": "check", "traffic": "pairing", "verdict": "allow" },
+                { "op": "check", "traffic": "join_direct", "verdict": "close:protocol_error" },
+            ],
+        }),
+        json!({
+            "name": "live_grant_one_join_direct",
+            "description": "A granted device may send one JOIN_DIRECT or JOIN_PROOF, before any stream; a second one of either closes.",
+            "grants": [{ "identity": "a", "role": "owner", "expires_at": null }], "denied": [], "peer": "a", "now": now,
+            "step2": "live",
+            "steps": [
+                { "op": "check", "traffic": "join_direct", "verdict": "allow" },
+                { "op": "check", "traffic": "join_proof", "verdict": "close:protocol_error" },
+            ],
+        }),
+        json!({
+            "name": "live_grant_join_direct_after_stream",
+            "grants": [{ "identity": "a", "role": "owner", "expires_at": null }], "denied": [], "peer": "a", "now": now,
+            "step2": "live",
+            "steps": [
+                { "op": "check", "traffic": "stream", "verdict": "allow" },
+                { "op": "check", "traffic": "join_direct", "verdict": "close:protocol_error" },
+            ],
+        }),
+    ]
+}
+
+/// The pairing-only caller state, and `JOIN_DIRECT` as the proof on a
+/// pinned (recovery) connection.
+fn direct_caller_cases() -> Vec<J> {
+    vec![
+        json!({
+            "name": "pairing_only_pairs",
+            "description": "An unpinned Pair with IP connection: the host answers JOIN_DIRECT with AUTHORIZED join_only, the code exchange runs, PAIRED arrives, and only promote_direct makes the connection live.",
+            "start": "pairing_only",
+            "steps": [
+                { "op": "check", "traffic": "hello", "verdict": "allow", "state": "pairing_only:awaiting_answer" },
+                { "op": "check", "traffic": "keepalive", "verdict": "allow", "state": "pairing_only:awaiting_answer" },
+                { "op": "check", "traffic": "authorized_join_only", "verdict": "allow", "state": "pairing_only:join_only" },
+                { "op": "check", "traffic": "pairing", "verdict": "allow", "state": "pairing_only:join_only" },
+                { "op": "promote_direct", "state": "pairing_only:join_only" },
+                { "op": "check", "traffic": "paired", "verdict": "allow", "state": "pairing_only:paired" },
+                { "op": "check", "traffic": "pairing", "verdict": "ignore", "state": "pairing_only:paired" },
+                { "op": "promote_direct", "state": "live" },
+                { "op": "check", "traffic": "stream", "verdict": "allow", "state": "live" },
+            ],
+        }),
+        json!({
+            "name": "pairing_only_live_notice_then_answer",
+            "description": "The host already grants this device: step 2's AUTHORIZED live is only a notice and the connection stays pairing only.",
+            "start": "pairing_only",
+            "steps": [
+                { "op": "check", "traffic": "authorized_live", "verdict": "allow", "state": "pairing_only:notice_seen" },
+                { "op": "check", "traffic": "authorized_join_only", "verdict": "allow", "state": "pairing_only:join_only" },
+            ],
+        }),
+        json!({
+            "name": "pairing_only_second_authorized_live",
+            "start": "pairing_only",
+            "steps": [
+                { "op": "check", "traffic": "authorized_live", "verdict": "allow", "state": "pairing_only:notice_seen" },
+                { "op": "check", "traffic": "authorized_live", "verdict": "close:protocol_error", "state": "closed:protocol_error" },
+            ],
+        }),
+        json!({
+            "name": "pairing_only_code_exchange_before_join_only",
+            "start": "pairing_only",
+            "steps": [
+                { "op": "check", "traffic": "authorized_live", "verdict": "allow", "state": "pairing_only:notice_seen" },
+                { "op": "check", "traffic": "pairing", "verdict": "close:protocol_error", "state": "closed:protocol_error" },
+            ],
+        }),
+        json!({
+            "name": "pairing_only_paired_before_join_only",
+            "start": "pairing_only",
+            "steps": [
+                { "op": "check", "traffic": "paired", "verdict": "close:protocol_error", "state": "closed:protocol_error" },
+            ],
+        }),
+        json!({
+            "name": "pairing_only_refuses_streams",
+            "description": "No stream at any step before promote_direct.",
+            "start": "pairing_only",
+            "steps": [
+                { "op": "check", "traffic": "authorized_join_only", "verdict": "allow", "state": "pairing_only:join_only" },
+                { "op": "check", "traffic": "paired", "verdict": "allow", "state": "pairing_only:paired" },
+                { "op": "check", "traffic": "stream", "verdict": "close:protocol_error", "state": "closed:protocol_error" },
+            ],
+        }),
+        json!({
+            "name": "pairing_only_stream_first",
+            "start": "pairing_only",
+            "steps": [
+                { "op": "check", "traffic": "stream", "verdict": "close:protocol_error", "state": "closed:protocol_error" },
+            ],
+        }),
+        json!({
+            "name": "pairing_only_second_join_only",
+            "start": "pairing_only",
+            "steps": [
+                { "op": "check", "traffic": "authorized_join_only", "verdict": "allow", "state": "pairing_only:join_only" },
+                { "op": "check", "traffic": "authorized_join_only", "verdict": "close:protocol_error", "state": "closed:protocol_error" },
+            ],
+        }),
+        json!({
+            "name": "pairing_only_join_direct_from_host",
+            "start": "pairing_only",
+            "steps": [
+                { "op": "check", "traffic": "caller_only", "verdict": "close:protocol_error", "state": "closed:protocol_error" },
+            ],
+        }),
+        json!({
+            "name": "recovery_join_direct_is_the_proof",
+            "description": "A pinned recovery connection: the JOIN_DIRECT counts as the proof, so step 2's AUTHORIZED live is the notice and PAIRED (the grant with receipt I) answers it.",
+            "steps": [
+                { "op": "sent_join_proof", "state": "awaiting_authorization" },
+                { "op": "check", "traffic": "authorized_live", "verdict": "allow", "state": "awaiting_proof_answer" },
+                { "op": "check", "traffic": "paired", "verdict": "allow", "state": "live" },
+            ],
+        }),
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -1614,7 +1765,7 @@ fn control_vectors() -> J {
             role: Role::owner(),
         },
     ];
-    let valid: Vec<J> = messages
+    let mut valid: Vec<J> = messages
         .iter()
         .map(|m| {
             let bytes = m.encode();
@@ -1622,8 +1773,69 @@ fn control_vectors() -> J {
             json!({ "type": m.type_number(), "hex": hex(&bytes) })
         })
         .collect();
+    let lookup = DirectLookup::from_canonical("K7QM").expect("lookup");
+    let receipt = InvitationId([0xcc; 16]);
+    let direct = [
+        (
+            "join_direct",
+            ControlMessage::JoinDirect {
+                lookup: lookup.clone(),
+                name: "Laptop".into(),
+                recovery: None,
+            },
+        ),
+        (
+            "join_direct_recovery",
+            ControlMessage::JoinDirect {
+                lookup: lookup.clone(),
+                name: "Laptop".into(),
+                recovery: Some(DirectRecovery {
+                    receipt,
+                    cancel: false,
+                }),
+            },
+        ),
+        (
+            "join_direct_cancel",
+            ControlMessage::JoinDirect {
+                lookup,
+                name: "Laptop".into(),
+                recovery: Some(DirectRecovery {
+                    receipt,
+                    cancel: true,
+                }),
+            },
+        ),
+        (
+            "authorized_direct",
+            ControlMessage::AuthorizedDirect {
+                invitation: receipt,
+                not_received: false,
+            },
+        ),
+        (
+            "authorized_direct_not_received",
+            ControlMessage::AuthorizedDirect {
+                invitation: receipt,
+                not_received: true,
+            },
+        ),
+    ];
+    let mut before_minor_4 = Vec::new();
+    for (name, m) in &direct {
+        let bytes = m.encode();
+        assert_eq!(
+            &ControlMessage::decode_at(&bytes, DIRECT_MINOR_VERSION).expect("round trip"),
+            m
+        );
+        valid.push(json!({ "name": name, "type": m.type_number(), "minor": DIRECT_MINOR_VERSION, "hex": hex(&bytes) }));
+        let error = ControlMessage::decode_at(&bytes, DIRECT_MINOR_VERSION - 1)
+            .expect_err("not at minor 3");
+        before_minor_4
+            .push(json!({ "name": name, "hex": hex(&bytes), "error": control_error_name(&error) }));
+    }
     let enc = |entries: Vec<(u64, Value)>| hex(&cbor::encode(&Value::Map(entries)));
-    json!({
+    let mut doc = json!({
         "description": "Control messages (spec wire.md, \"Control messages\"). Valid messages decode and re-encode to `hex`. Invalid ones are rejected; the connection closes with protocol_error.",
         "valid": valid,
         "invalid": [
@@ -1649,7 +1861,196 @@ fn control_vectors() -> J {
                 (0, Value::Uint(4)), (1, Value::Bytes(vec![0; 16])), (2, Value::Bytes(vec![0; 1025])),
             ]) },
         ],
-    })
+    });
+    extend(&mut doc["invalid"], direct_invalid_controls());
+    doc["before_minor_4"] = json!(before_minor_4);
+    doc["description"] = json!(format!(
+        "{} {}",
+        s_of(&doc["description"]),
+        "Cases with `minor` hold messages defined from that agreed minor version on (JOIN_DIRECT, AUTHORIZED keys 2 and 3, wire.md 11); they are decoded as on a connection that agreed it. Every rejection closes with protocol_error; for diagnostics, the minor-4 cases also name the first rule broken in `error`: unknown_type, missing:<key>, unknown_field:<key>, wrong_type:<key>, invalid:<key> or cbor. `before_minor_4`: valid minor-4 messages received on a connection that agreed minor 3, rejected as a minor-3 decoder rejects them."
+    ));
+    doc
+}
+
+/// The name of a control-message error in vectors.
+fn control_error_name(e: &ControlError) -> String {
+    match e {
+        ControlError::TooLarge => "too_large".into(),
+        ControlError::UnknownType(_) => "unknown_type".into(),
+        ControlError::Field(FieldError::Cbor(_)) => "cbor".into(),
+        ControlError::Field(FieldError::NotAMap) => "not_a_map".into(),
+        ControlError::Field(FieldError::Missing(k)) => format!("missing:{k}"),
+        ControlError::Field(FieldError::Unknown(k)) => format!("unknown_field:{k}"),
+        ControlError::Field(FieldError::WrongType(k)) => format!("wrong_type:{k}"),
+        ControlError::Field(FieldError::Invalid(k)) => format!("invalid:{k}"),
+    }
+}
+
+/// Malformed `JOIN_DIRECT` and `AUTHORIZED` keys 2 and 3, decoded at minor 4.
+fn direct_invalid_controls() -> Vec<J> {
+    let id = || Value::Bytes(vec![0xcc; 16]);
+    let text = |s: &str| Value::Text(s.into());
+    let join = |extra: Vec<(u64, Value)>| {
+        let mut e = vec![(0, Value::Uint(7)), (1, text("K7QM")), (2, text("Laptop"))];
+        e.extend(extra);
+        e
+    };
+    let authorized = |state: u64, extra: Vec<(u64, Value)>| {
+        let mut e = vec![(0, Value::Uint(2)), (1, Value::Uint(state))];
+        e.extend(extra);
+        e
+    };
+    // Canonical CBOR has no `true` (wire.md 3): the last value byte `01`
+    // becomes `f5`.
+    let with_true = |entries: Vec<(u64, Value)>| {
+        let mut bytes = cbor::encode(&Value::Map(entries));
+        if let Some(last) = bytes.last_mut() {
+            *last = 0xf5;
+        }
+        bytes
+    };
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        (
+            "join_direct_lookup_3_characters",
+            cbor::encode(&Value::Map(vec![
+                (0, Value::Uint(7)),
+                (1, text("K7Q")),
+                (2, text("Laptop")),
+            ])),
+        ),
+        (
+            "join_direct_lookup_5_characters",
+            cbor::encode(&Value::Map(vec![
+                (0, Value::Uint(7)),
+                (1, text("K7QM2")),
+                (2, text("Laptop")),
+            ])),
+        ),
+        (
+            "join_direct_lookup_lowercase",
+            cbor::encode(&Value::Map(vec![
+                (0, Value::Uint(7)),
+                (1, text("k7qm")),
+                (2, text("Laptop")),
+            ])),
+        ),
+        (
+            "join_direct_lookup_letter_o",
+            cbor::encode(&Value::Map(vec![
+                (0, Value::Uint(7)),
+                (1, text("K7QO")),
+                (2, text("Laptop")),
+            ])),
+        ),
+        (
+            "join_direct_lookup_as_bytes",
+            cbor::encode(&Value::Map(vec![
+                (0, Value::Uint(7)),
+                (1, Value::Bytes(b"K7QM".to_vec())),
+                (2, text("Laptop")),
+            ])),
+        ),
+        (
+            "join_direct_without_lookup",
+            cbor::encode(&Value::Map(vec![(0, Value::Uint(7)), (2, text("Laptop"))])),
+        ),
+        (
+            "join_direct_without_name",
+            cbor::encode(&Value::Map(vec![(0, Value::Uint(7)), (1, text("K7QM"))])),
+        ),
+        (
+            "join_direct_empty_name",
+            cbor::encode(&Value::Map(vec![
+                (0, Value::Uint(7)),
+                (1, text("K7QM")),
+                (2, text("")),
+            ])),
+        ),
+        (
+            "join_direct_name_129_bytes",
+            cbor::encode(&Value::Map(vec![
+                (0, Value::Uint(7)),
+                (1, text("K7QM")),
+                (2, text(&"n".repeat(129))),
+            ])),
+        ),
+        (
+            "join_direct_receipt_15_bytes",
+            cbor::encode(&Value::Map(join(vec![(3, Value::Bytes(vec![0xcc; 15]))]))),
+        ),
+        (
+            "join_direct_receipt_as_text",
+            cbor::encode(&Value::Map(join(vec![(3, text("receipt"))]))),
+        ),
+        (
+            "join_direct_cancel_without_receipt",
+            cbor::encode(&Value::Map(join(vec![(4, Value::Uint(1))]))),
+        ),
+        (
+            "join_direct_cancel_0",
+            cbor::encode(&Value::Map(join(vec![(3, id()), (4, Value::Uint(0))]))),
+        ),
+        (
+            "join_direct_cancel_2",
+            cbor::encode(&Value::Map(join(vec![(3, id()), (4, Value::Uint(2))]))),
+        ),
+        (
+            "join_direct_cancel_true",
+            with_true(join(vec![(3, id()), (4, Value::Uint(1))])),
+        ),
+        (
+            "join_direct_extra_key",
+            cbor::encode(&Value::Map(join(vec![(3, id()), (5, Value::Uint(1))]))),
+        ),
+        (
+            "authorized_invitation_with_live",
+            cbor::encode(&Value::Map(authorized(1, vec![(2, id())]))),
+        ),
+        (
+            "authorized_invitation_15_bytes",
+            cbor::encode(&Value::Map(authorized(
+                2,
+                vec![(2, Value::Bytes(vec![0xcc; 15]))],
+            ))),
+        ),
+        (
+            "authorized_not_received_without_invitation",
+            cbor::encode(&Value::Map(authorized(2, vec![(3, Value::Uint(1))]))),
+        ),
+        (
+            "authorized_not_received_with_live",
+            cbor::encode(&Value::Map(authorized(
+                1,
+                vec![(2, id()), (3, Value::Uint(1))],
+            ))),
+        ),
+        (
+            "authorized_not_received_0",
+            cbor::encode(&Value::Map(authorized(
+                2,
+                vec![(2, id()), (3, Value::Uint(0))],
+            ))),
+        ),
+        (
+            "authorized_not_received_true",
+            with_true(authorized(2, vec![(2, id()), (3, Value::Uint(1))])),
+        ),
+        (
+            "authorized_extra_key",
+            cbor::encode(&Value::Map(authorized(
+                2,
+                vec![(2, id()), (4, Value::Uint(1))],
+            ))),
+        ),
+    ];
+    cases
+        .into_iter()
+        .map(|(name, bytes)| {
+            let error = ControlMessage::decode_at(&bytes, DIRECT_MINOR_VERSION)
+                .expect_err("invalid control message");
+            json!({ "name": name, "minor": DIRECT_MINOR_VERSION, "hex": hex(&bytes), "error": control_error_name(&error) })
+        })
+        .collect()
 }
 
 fn hello_vectors() -> J {

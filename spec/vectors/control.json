@@ -1,5 +1,32 @@
 {
-  "description": "Control messages (spec wire.md, \"Control messages\"). Valid messages decode and re-encode to `hex`. Invalid ones are rejected; the connection closes with protocol_error.",
+  "before_minor_4": [
+    {
+      "error": "unknown_type",
+      "hex": "a3000701644b37514d02664c6170746f70",
+      "name": "join_direct"
+    },
+    {
+      "error": "unknown_type",
+      "hex": "a4000701644b37514d02664c6170746f700350cccccccccccccccccccccccccccccccc",
+      "name": "join_direct_recovery"
+    },
+    {
+      "error": "unknown_type",
+      "hex": "a5000701644b37514d02664c6170746f700350cccccccccccccccccccccccccccccccc0401",
+      "name": "join_direct_cancel"
+    },
+    {
+      "error": "unknown_field:2",
+      "hex": "a3000201020250cccccccccccccccccccccccccccccccc",
+      "name": "authorized_direct"
+    },
+    {
+      "error": "unknown_field:2",
+      "hex": "a4000201020250cccccccccccccccccccccccccccccccc0301",
+      "name": "authorized_direct_not_received"
+    }
+  ],
+  "description": "Control messages (spec wire.md, \"Control messages\"). Valid messages decode and re-encode to `hex`. Invalid ones are rejected; the connection closes with protocol_error. Cases with `minor` hold messages defined from that agreed minor version on (JOIN_DIRECT, AUTHORIZED keys 2 and 3, wire.md 11); they are decoded as on a connection that agreed it. Every rejection closes with protocol_error; for diagnostics, the minor-4 cases also name the first rule broken in `error`: unknown_type, missing:<key>, unknown_field:<key>, wrong_type:<key>, invalid:<key> or cbor. `before_minor_4`: valid minor-4 messages received on a connection that agreed minor 3, rejected as a minor-3 decoder rejects them.",
   "invalid": [
     {
       "hex": "a1001863",
@@ -44,6 +71,144 @@
     {
       "hex": "a30004015000000000000000000000000000000000025904010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
       "name": "code_exchange_payload_1025_bytes"
+    },
+    {
+      "error": "invalid:1",
+      "hex": "a3000701634b375102664c6170746f70",
+      "minor": 4,
+      "name": "join_direct_lookup_3_characters"
+    },
+    {
+      "error": "invalid:1",
+      "hex": "a3000701654b37514d3202664c6170746f70",
+      "minor": 4,
+      "name": "join_direct_lookup_5_characters"
+    },
+    {
+      "error": "invalid:1",
+      "hex": "a3000701646b37716d02664c6170746f70",
+      "minor": 4,
+      "name": "join_direct_lookup_lowercase"
+    },
+    {
+      "error": "invalid:1",
+      "hex": "a3000701644b37514f02664c6170746f70",
+      "minor": 4,
+      "name": "join_direct_lookup_letter_o"
+    },
+    {
+      "error": "wrong_type:1",
+      "hex": "a3000701444b37514d02664c6170746f70",
+      "minor": 4,
+      "name": "join_direct_lookup_as_bytes"
+    },
+    {
+      "error": "missing:1",
+      "hex": "a2000702664c6170746f70",
+      "minor": 4,
+      "name": "join_direct_without_lookup"
+    },
+    {
+      "error": "missing:2",
+      "hex": "a2000701644b37514d",
+      "minor": 4,
+      "name": "join_direct_without_name"
+    },
+    {
+      "error": "invalid:2",
+      "hex": "a3000701644b37514d0260",
+      "minor": 4,
+      "name": "join_direct_empty_name"
+    },
+    {
+      "error": "invalid:2",
+      "hex": "a3000701644b37514d0278816e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e6e",
+      "minor": 4,
+      "name": "join_direct_name_129_bytes"
+    },
+    {
+      "error": "invalid:3",
+      "hex": "a4000701644b37514d02664c6170746f70034fcccccccccccccccccccccccccccccc",
+      "minor": 4,
+      "name": "join_direct_receipt_15_bytes"
+    },
+    {
+      "error": "wrong_type:3",
+      "hex": "a4000701644b37514d02664c6170746f70036772656365697074",
+      "minor": 4,
+      "name": "join_direct_receipt_as_text"
+    },
+    {
+      "error": "invalid:4",
+      "hex": "a4000701644b37514d02664c6170746f700401",
+      "minor": 4,
+      "name": "join_direct_cancel_without_receipt"
+    },
+    {
+      "error": "invalid:4",
+      "hex": "a5000701644b37514d02664c6170746f700350cccccccccccccccccccccccccccccccc0400",
+      "minor": 4,
+      "name": "join_direct_cancel_0"
+    },
+    {
+      "error": "invalid:4",
+      "hex": "a5000701644b37514d02664c6170746f700350cccccccccccccccccccccccccccccccc0402",
+      "minor": 4,
+      "name": "join_direct_cancel_2"
+    },
+    {
+      "error": "cbor",
+      "hex": "a5000701644b37514d02664c6170746f700350cccccccccccccccccccccccccccccccc04f5",
+      "minor": 4,
+      "name": "join_direct_cancel_true"
+    },
+    {
+      "error": "unknown_field:5",
+      "hex": "a5000701644b37514d02664c6170746f700350cccccccccccccccccccccccccccccccc0501",
+      "minor": 4,
+      "name": "join_direct_extra_key"
+    },
+    {
+      "error": "invalid:2",
+      "hex": "a3000201010250cccccccccccccccccccccccccccccccc",
+      "minor": 4,
+      "name": "authorized_invitation_with_live"
+    },
+    {
+      "error": "invalid:2",
+      "hex": "a300020102024fcccccccccccccccccccccccccccccc",
+      "minor": 4,
+      "name": "authorized_invitation_15_bytes"
+    },
+    {
+      "error": "invalid:3",
+      "hex": "a3000201020301",
+      "minor": 4,
+      "name": "authorized_not_received_without_invitation"
+    },
+    {
+      "error": "invalid:2",
+      "hex": "a4000201010250cccccccccccccccccccccccccccccccc0301",
+      "minor": 4,
+      "name": "authorized_not_received_with_live"
+    },
+    {
+      "error": "invalid:3",
+      "hex": "a4000201020250cccccccccccccccccccccccccccccccc0300",
+      "minor": 4,
+      "name": "authorized_not_received_0"
+    },
+    {
+      "error": "cbor",
+      "hex": "a4000201020250cccccccccccccccccccccccccccccccc03f5",
+      "minor": 4,
+      "name": "authorized_not_received_true"
+    },
+    {
+      "error": "unknown_field:4",
+      "hex": "a4000201020250cccccccccccccccccccccccccccccccc0401",
+      "minor": 4,
+      "name": "authorized_extra_key"
     }
   ],
   "valid": [
@@ -78,6 +243,36 @@
     {
       "hex": "a3000601644465736b02656f776e6572",
       "type": 6
+    },
+    {
+      "hex": "a3000701644b37514d02664c6170746f70",
+      "minor": 4,
+      "name": "join_direct",
+      "type": 7
+    },
+    {
+      "hex": "a4000701644b37514d02664c6170746f700350cccccccccccccccccccccccccccccccc",
+      "minor": 4,
+      "name": "join_direct_recovery",
+      "type": 7
+    },
+    {
+      "hex": "a5000701644b37514d02664c6170746f700350cccccccccccccccccccccccccccccccc0401",
+      "minor": 4,
+      "name": "join_direct_cancel",
+      "type": 7
+    },
+    {
+      "hex": "a3000201020250cccccccccccccccccccccccccccccccc",
+      "minor": 4,
+      "name": "authorized_direct",
+      "type": 2
+    },
+    {
+      "hex": "a4000201020250cccccccccccccccccccccccccccccccc0301",
+      "minor": 4,
+      "name": "authorized_direct_not_received",
+      "type": 2
     }
   ]
 }

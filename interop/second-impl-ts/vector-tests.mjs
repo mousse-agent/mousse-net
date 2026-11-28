@@ -185,9 +185,11 @@ function outcome(expected, fn) {
     }
   });
   for (const item of v.caller_cases) add(item.name, () => {
-    const gate = new Gate('caller');
+    const gate = item.start === 'pairing_only' ? Gate.pairingOnly() : new Gate('caller');
+    assert.ok(item.start === undefined || item.start === 'pairing_only', `unknown start ${item.start}`);
     for (const step of item.steps) {
       if (step.op === 'promote') gate.promote();
+      else if (step.op === 'promote_direct') gate.promoteDirect();
       else if (step.op === 'sent_join_proof') gate.sentJoinProof(step.mono_ms ?? 0);
       else if (step.op === 'host_stream') {
         const localGrants = item.local_grants.map(grant => ({ ...grant, identity: v.identities[grant.identity] }));
@@ -278,13 +280,18 @@ function outcome(expected, fn) {
 
 {
   const [v, add] = file('control.json');
-  const names = ['HELLO', 'AUTHORIZED', 'JOIN_PROOF', 'CODE_EXCHANGE', 'CODE_ABORT', 'PAIRED'];
-  for (const [i, item] of v.valid.entries()) add(`valid ${i + 1}`, () => {
-    const message = wire.decodeControl(bytes(item.hex));
+  const names = ['HELLO', 'AUTHORIZED', 'JOIN_PROOF', 'CODE_EXCHANGE', 'CODE_ABORT', 'PAIRED', 'JOIN_DIRECT'];
+  for (const [i, item] of v.valid.entries()) add(item.name ?? `valid ${i + 1}`, () => {
+    const message = wire.decodeControl(bytes(item.hex), item.minor);
     assert.equal(message.type, names[item.type - 1]);
     matches(wire.encodeControl(message), item.hex);
   });
-  for (const item of v.invalid) add(item.name, () => outcome('protocol_error', () => wire.decodeControl(bytes(item.hex))));
+  for (const item of v.invalid) add(item.name, () =>
+    outcome('protocol_error', () => wire.decodeControl(bytes(item.hex), item.minor)));
+  for (const item of v.before_minor_4) add(`before minor 4 / ${item.name}`, () => {
+    wire.decodeControl(bytes(item.hex), wire.directMinor);
+    outcome('protocol_error', () => wire.decodeControl(bytes(item.hex), wire.directMinor - 1));
+  });
 }
 
 {
