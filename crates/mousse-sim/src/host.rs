@@ -311,7 +311,7 @@ impl HostDev {
     fn on_mux_event(&mut self, sim: &mut Sim, conn: ConnectionId, event: MuxEvent) {
         match event {
             MuxEvent::Control(bytes) => {
-                let msg = match ControlMessage::decode(&bytes) {
+                let msg = match crate::sim::decode_control(&bytes) {
                     Ok(m) => m,
                     Err(_) => return self.close(sim, conn, ErrorCode::ProtocolError),
                 };
@@ -495,7 +495,8 @@ impl HostDev {
             ControlMessage::Authorized { .. }
             | ControlMessage::AuthorizedDirect { .. }
             | ControlMessage::Paired { .. } => return,
-            // The simulation speaks minor 3, where JOIN_DIRECT is not defined.
+            // Not defined at the simulation's minor: never decodes
+            // (`decode_control`).
             ControlMessage::JoinDirect { .. } => {
                 self.close(sim, conn, ErrorCode::ProtocolError);
                 return;

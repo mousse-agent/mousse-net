@@ -1813,6 +1813,7 @@ mod tests {
     /// The test hook speaks an older minor, or the Pair with IP minor
     /// before the build's own reaches it (with the one before it), and
     /// nothing else newer.
+    #[cfg(debug_assertions)]
     #[test]
     fn the_test_hook_speaks_older_minors_and_the_pair_with_ip_minor_only() {
         let local = VersionSupport::LOCAL;

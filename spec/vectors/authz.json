@@ -531,28 +531,6 @@
           "verdict": "close:protocol_error"
         }
       ]
-    },
-    {
-      "description": "A pinned recovery connection: the JOIN_DIRECT counts as the proof, so step 2's AUTHORIZED live is the notice and PAIRED (the grant with receipt I) answers it.",
-      "name": "recovery_join_direct_is_the_proof",
-      "steps": [
-        {
-          "op": "sent_join_proof",
-          "state": "awaiting_authorization"
-        },
-        {
-          "op": "check",
-          "state": "awaiting_proof_answer",
-          "traffic": "authorized_live",
-          "verdict": "allow"
-        },
-        {
-          "op": "check",
-          "state": "live",
-          "traffic": "paired",
-          "verdict": "allow"
-        }
-      ]
     }
   ],
   "cases": [
@@ -895,6 +873,47 @@
         {
           "op": "check",
           "traffic": "pairing",
+          "verdict": "allow"
+        },
+        {
+          "op": "check",
+          "traffic": "join_direct",
+          "verdict": "close:protocol_error"
+        }
+      ]
+    },
+    {
+      "denied": [],
+      "description": "One proof per connection, even before the host admits it: a JOIN_PROOF after a JOIN_DIRECT closes.",
+      "grants": [],
+      "name": "no_grant_two_proofs_before_admission",
+      "now": 1790000060,
+      "peer": "b",
+      "step2": "await_join_proof",
+      "steps": [
+        {
+          "op": "check",
+          "traffic": "join_direct",
+          "verdict": "allow"
+        },
+        {
+          "op": "check",
+          "traffic": "join_proof",
+          "verdict": "close:protocol_error"
+        }
+      ]
+    },
+    {
+      "denied": [],
+      "grants": [],
+      "name": "no_grant_join_direct_after_join_proof",
+      "now": 1790000060,
+      "peer": "b",
+      "step2": "await_join_proof",
+      "steps": [
+        {
+          "op": "check",
+          "traffic": "join_proof",
           "verdict": "allow"
         },
         {

@@ -632,7 +632,7 @@ connection's state:
 | Traffic | Awaiting proof | Join-only | Live |
 |---|---|---|---|
 | `PING`, `PONG`, `HELLO`, `GOAWAY` | allow | allow | allow |
-| `JOIN_PROOF`, `JOIN_DIRECT` | allow | close `PROTOCOL_ERROR` | allow once (one of the two), before any stream frame; otherwise close `PROTOCOL_ERROR` |
+| `JOIN_PROOF`, `JOIN_DIRECT` | allow once (one of the two); a second closes `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` | allow once (one of the two), before any stream frame; otherwise close `PROTOCOL_ERROR` |
 | `CODE_EXCHANGE`, `CODE_ABORT` | close `NOT_AUTHORIZED` | allow | ignore |
 | Any stream frame (`OPEN`, `DATA`, `CREDIT`, `FIN`, `RESET`) | close `NOT_AUTHORIZED` | close `NOT_AUTHORIZED` | allow |
 | `AUTHORIZED`, `PAIRED` (host-only messages) | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` |
@@ -675,7 +675,9 @@ everything else is ignored. Vectors: `authz.json` `caller_cases`.
 the caller starts that connection in its own state, **pairing only**, and
 not in the table above. It can do nothing but this pairing: it accepts
 `HELLO`, `AUTHORIZED`, `CODE_EXCHANGE`, `CODE_ABORT`, `PAIRED`, `GOAWAY` and
-keepalive, and never a stream. It becomes live only when the joiner has
+keepalive (`PING`, `PONG`), and never a stream. Keepalive is needed here:
+the host may wait up to 5 minutes for its person to allow the join, longer
+than the 45 s idle timeout (9.4). It becomes live only when the joiner has
 verified the host's code-exchange confirmation and accepted `PAIRED`;
 `AUTHORIZED {live}` never makes it live.
 

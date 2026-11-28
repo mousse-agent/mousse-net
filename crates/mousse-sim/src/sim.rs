@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use mousse_net_core::control::ControlMessage;
+use mousse_net_core::control::{ControlError, ControlMessage, VersionSupport};
 use mousse_net_core::identity::IdentityPublicKey;
 use mousse_net_core::mux::{frame_type, Mux, MuxRole};
 use mousse_net_core::pairing::SessionExporters;
@@ -20,6 +20,14 @@ use crate::world::Script;
 use crate::{Bug, RunConfig};
 
 pub(crate) type DevId = usize;
+
+/// Decode a control message as the simulation's connections agree it: every
+/// device speaks [`VersionSupport::LOCAL`], so a message that minor does not
+/// define (Pair with IP's, from minor 4) is malformed before either gate
+/// sees it.
+pub(crate) fn decode_control(bytes: &[u8]) -> Result<ControlMessage, ControlError> {
+    ControlMessage::decode_at(bytes, VersionSupport::LOCAL.minor)
+}
 
 /// Which end of a pipe. The client dialled; the server accepted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -500,5 +508,40 @@ pub(crate) fn flush_endpoint(sim: &mut Sim, dev: DevId, ep: &mut Endpoint) -> bo
         true
     } else {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mousse_net_core::control::{AuthorizedState, DIRECT_MINOR_VERSION};
+    use mousse_net_core::pairing::{DirectLookup, InvitationId};
+
+    // The simulation speaks a minor before Pair with IP's.
+    const _: () = assert!(VersionSupport::LOCAL.minor < DIRECT_MINOR_VERSION);
+
+    /// A minor-4 `AUTHORIZED` or `JOIN_DIRECT` never reaches a simulated
+    /// gate: a paired caller would otherwise read the `AUTHORIZED` as
+    /// join-only and stay open.
+    #[test]
+    fn messages_from_a_later_minor_are_malformed() {
+        let direct = [
+            ControlMessage::AuthorizedDirect {
+                invitation: InvitationId([7; 16]),
+                not_received: false,
+            },
+            ControlMessage::JoinDirect {
+                lookup: DirectLookup::from_canonical("K7QM").unwrap(),
+                name: "laptop".into(),
+                recovery: None,
+            },
+        ];
+        for message in direct {
+            assert!(decode_control(&message.encode()).is_err(), "{message:?}");
+        }
+        let live = ControlMessage::Authorized {
+            state: AuthorizedState::Live,
+        };
+        assert_eq!(decode_control(&live.encode()), Ok(live));
     }
 }

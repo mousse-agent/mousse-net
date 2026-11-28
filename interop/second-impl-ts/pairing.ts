@@ -40,11 +40,13 @@ function close(conn: number, gate: Gate, code: ErrorName): Effect {
   return { conn, close: code };
 }
 
-function traffic(message: Control): Traffic {
+/** The gate class of a control message received from the peer. */
+export function trafficOf(message: Control): Traffic {
   switch (message.type) {
     case 'HELLO': return 'hello';
     case 'AUTHORIZED': return message.state === 'live' ? 'authorized_live' : 'authorized_join_only';
     case 'JOIN_PROOF': return 'join_proof';
+    case 'JOIN_DIRECT': return 'join_direct';
     case 'CODE_EXCHANGE':
     case 'CODE_ABORT': return 'pairing';
     case 'PAIRED': return 'paired';
@@ -52,7 +54,7 @@ function traffic(message: Control): Traffic {
 }
 
 function checked(gate: Gate, conn: number, msg: Control): Effect[] | undefined {
-  const verdict = gate.check(traffic(msg));
+  const verdict = gate.check(trafficOf(msg));
   if (verdict === 'allow') return;
   if (verdict === 'ignore') return [{ ignored: true }];
   return [{ conn, close: verdict.slice(6) as ErrorName }];

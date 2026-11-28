@@ -223,7 +223,12 @@ impl ConnectionGate {
             (GateState::Closed(_), _) => Verdict::Ignore,
             (_, Keepalive | Hello | GoAway) => Verdict::Allow,
             (_, HostOnly) => Verdict::Close(ErrorCode::ProtocolError),
-            (GateState::AwaitingJoinProof { .. }, JoinProof) => Verdict::Allow,
+            // One proof per connection (wire.md 8): `JOIN_PROOF` and
+            // `JOIN_DIRECT` share it, even before the host admits either.
+            (GateState::AwaitingJoinProof { .. }, JoinProof) if !self.proof_seen => Verdict::Allow,
+            (GateState::AwaitingJoinProof { .. }, JoinProof) => {
+                Verdict::Close(ErrorCode::ProtocolError)
+            }
             #[cfg(not(any(mousse_control = "break-authz", mousse_control = "admit-ungranted")))]
             (GateState::AwaitingJoinProof { .. }, Pairing | Stream) => {
                 Verdict::Close(ErrorCode::NotAuthorized)

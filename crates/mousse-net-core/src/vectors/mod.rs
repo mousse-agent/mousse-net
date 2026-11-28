@@ -851,6 +851,25 @@ fn direct_host_cases(now: u64) -> Vec<J> {
             ],
         }),
         json!({
+            "name": "no_grant_two_proofs_before_admission",
+            "description": "One proof per connection, even before the host admits it: a JOIN_PROOF after a JOIN_DIRECT closes.",
+            "grants": [], "denied": [], "peer": "b", "now": now,
+            "step2": "await_join_proof",
+            "steps": [
+                { "op": "check", "traffic": "join_direct", "verdict": "allow" },
+                { "op": "check", "traffic": "join_proof", "verdict": "close:protocol_error" },
+            ],
+        }),
+        json!({
+            "name": "no_grant_join_direct_after_join_proof",
+            "grants": [], "denied": [], "peer": "b", "now": now,
+            "step2": "await_join_proof",
+            "steps": [
+                { "op": "check", "traffic": "join_proof", "verdict": "allow" },
+                { "op": "check", "traffic": "join_direct", "verdict": "close:protocol_error" },
+            ],
+        }),
+        json!({
             "name": "live_grant_one_join_direct",
             "description": "A granted device may send one JOIN_DIRECT or JOIN_PROOF, before any stream; a second one of either closes.",
             "grants": [{ "identity": "a", "role": "owner", "expires_at": null }], "denied": [], "peer": "a", "now": now,
@@ -872,8 +891,7 @@ fn direct_host_cases(now: u64) -> Vec<J> {
     ]
 }
 
-/// The pairing-only caller state, and `JOIN_DIRECT` as the proof on a
-/// pinned (recovery) connection.
+/// The pairing-only caller state.
 fn direct_caller_cases() -> Vec<J> {
     vec![
         json!({
@@ -954,15 +972,6 @@ fn direct_caller_cases() -> Vec<J> {
             "start": "pairing_only",
             "steps": [
                 { "op": "check", "traffic": "caller_only", "verdict": "close:protocol_error", "state": "closed:protocol_error" },
-            ],
-        }),
-        json!({
-            "name": "recovery_join_direct_is_the_proof",
-            "description": "A pinned recovery connection: the JOIN_DIRECT counts as the proof, so step 2's AUTHORIZED live is the notice and PAIRED (the grant with receipt I) answers it.",
-            "steps": [
-                { "op": "sent_join_proof", "state": "awaiting_authorization" },
-                { "op": "check", "traffic": "authorized_live", "verdict": "allow", "state": "awaiting_proof_answer" },
-                { "op": "check", "traffic": "paired", "verdict": "allow", "state": "live" },
             ],
         }),
     ]
