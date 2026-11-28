@@ -500,6 +500,7 @@ function directWire(host, labels, now, conns) {
   const out = [];
   const closed = [];
   const held = [];
+  const paired = [];
   for (const connection of conns.values()) connection.inbox = [];
   const label = identity => labels.get(identity) ?? identity;
   const record = (from, conn, message) => out.push({ send: { conn, control: hex(encodeControl(message)), from } });
@@ -509,6 +510,7 @@ function directWire(host, labels, now, conns) {
       if ('send' in effect) {
         if (effect.send.type === 'HELLO') continue;
         record('host', effect.conn, effect.send);
+        if (effect.send.type === 'PAIRED') paired.push([effect.conn, effect.send.role]);
         conns.get(effect.conn)?.inbox.push(onWireDirect(effect.send));
       } else if ('close' in effect) {
         closed.push([effect.conn, effect.close]);
@@ -532,6 +534,16 @@ function directWire(host, labels, now, conns) {
       } else if ('enrollment_undone' in effect) {
         const { grant, identity } = effect.enrollment_undone;
         out.push({ enrollment_undone: { grant, joiner: label(identity) } });
+      } else if ('committed' in effect) {
+        const { conn, grant, identity } = effect.committed;
+        out.push({ committed: { conn, grant, joiner: label(identity) } });
+      } else if ('grant_closes' in effect) {
+        // Grant-table closes are listed as one event, not in `closed`.
+        out.push(effect);
+        for (const conn of effect.grant_closes.conns) {
+          const connection = conns.get(conn);
+          if (connection) connection.closed = true;
+        }
       } else if ('invitation_ended' in effect) out.push({ invitation_ended: effect.invitation_ended.code });
       else if (!('version' in effect) && !('ignored' in effect)) out.push(effect);
     }
@@ -554,11 +566,15 @@ function directWire(host, labels, now, conns) {
     return connection;
   }
 
-  return { host, now, out, closed, held, conns, fromHost, toHost, open };
+  // `dial` unless the connection exists.
+  const dialled = (from, conn, joiner) => conns.get(conn) ?? open(from, conn, joiner);
+
+  return { host, now, out, closed, held, paired, conns, fromHost, toHost, open, dialled };
 }
 
 // The scripted joiner's attempt: msg_a, check msg_b, then msg_c (or CODE_ABORT and a close).
-function directAttempt(wire, conn, code, invitation, hostKey, lose) {
+// `lose` msg_c: the connection breaks first; `hold` msg_c: it stays on its way until `deliver`.
+function directAttempt(wire, conn, code, invitation, hostKey, lose, hold) {
   const connection = wire.conns.get(conn);
   const { joiner, from, exporters } = connection;
   const attempt = joiner.draws.bytes(16, 'attempt_id');
@@ -593,7 +609,9 @@ function directAttempt(wire, conn, code, invitation, hostKey, lose) {
     wire.fromHost(wire.host.drop(conn, wire.now()));
     return;
   }
-  wire.toHost(from, conn, { type: 'CODE_EXCHANGE', attempt, payload: confirmation.message });
+  const msgC = { type: 'CODE_EXCHANGE', attempt, payload: confirmation.message };
+  if (hold === 'msg_c') connection.heldMessage = msgC;
+  else wire.toHost(from, conn, msgC);
 }
 
 export function replayDirectSequence(sequence, conventions) {
@@ -617,10 +635,13 @@ export function replayDirectSequence(sequence, conventions) {
     const joiner = step.joiner === undefined ? undefined : joinerOf(step.joiner);
     let result;
     switch (step.op) {
+      case 'dial':
+        wire.open(step.joiner, step.conn, joiner);
+        break;
       case 'connect':
       case 'recover': {
         assert.ok(step.lookup === undefined || step.lookup === 'wrong');
-        wire.open(step.joiner, step.conn, joiner);
+        wire.dialled(step.joiner, step.conn, joiner);
         const message = step.op === 'connect'
           ? { type: 'JOIN_DIRECT', lookup: step.lookup === 'wrong' ? wrongLookup(code.lookup) : code.lookup,
             name: step.joiner }
@@ -632,8 +653,18 @@ export function replayDirectSequence(sequence, conventions) {
       case 'submit': {
         assert.ok(step.code === 'right' || step.code === 'wrong');
         assert.ok(step.lose === undefined || step.lose === 'msg_c');
+        assert.ok(step.hold === undefined || step.hold === 'msg_c');
         const secret = step.code === 'right' ? code : directCode(code.lookup + wrongSecret(code.code.slice(4)));
-        directAttempt(wire, step.conn, secret, invitation, hostKey, step.lose);
+        directAttempt(wire, step.conn, secret, invitation, hostKey, step.lose, step.hold);
+        break;
+      }
+      case 'deliver': {
+        const connection = conns.get(step.conn);
+        const message = connection.heldMessage;
+        assert.ok(message, `${name}: nothing held`);
+        connection.heldMessage = undefined;
+        if (connection.closed) wire.out.push({ undelivered: { conn: step.conn } });
+        else wire.toHost(step.joiner, step.conn, message);
         break;
       }
       case 'inject': {
@@ -643,22 +674,35 @@ export function replayDirectSequence(sequence, conventions) {
         break;
       }
       case 'cancel': {
-        wire.toHost(step.joiner, step.conn, { type: 'CODE_ABORT', attempt: joiner.attempt, code: errorNumber('cancelled') });
+        assert.ok(step.abort === undefined || step.abort === 'lost');
+        assert.ok(step.goaway === undefined || step.goaway === 'lost');
+        const abort = { type: 'CODE_ABORT', attempt: joiner.attempt, code: errorNumber('cancelled') };
+        if (step.abort === 'lost') {
+          wire.out.push({ lost: { conn: step.conn, control: hex(encodeControl(abort)), from: step.joiner } });
+        } else wire.toHost(step.joiner, step.conn, abort);
         // Its close is listed, and reaches the host, only if the host has not closed the connection.
         const connection = conns.get(step.conn);
         if (!connection.closed) {
           connection.closed = true;
-          wire.out.push({ close: { code: 'cancelled', conn: step.conn, from: step.joiner } });
-          wire.fromHost(host.lost(step.conn, now, 'cancelled'));
+          if (step.goaway === 'lost') wire.fromHost(host.drop(step.conn, now));
+          else {
+            wire.out.push({ close: { code: 'cancelled', conn: step.conn, from: step.joiner } });
+            wire.fromHost(host.lost(step.conn, now, 'cancelled'));
+          }
         }
         break;
       }
       case 'drop':
         wire.fromHost(host.drop(step.conn, now));
         break;
+      case 'stream':
+        wire.fromHost(host.stream(step.conn, now));
+        break;
       case 'allow':
       case 'decline': {
-        const answer = host[step.op](invitation, joiner.identity, now);
+        const answer = step.op === 'allow'
+          ? host.allow(invitation, joiner.identity, now, step.role)
+          : host.decline(invitation, joiner.identity, now);
         result = answer.result;
         wire.fromHost(answer.effects);
         break;
@@ -669,6 +713,15 @@ export function replayDirectSequence(sequence, conventions) {
       case 'tick':
         wire.fromHost(host.tick(now));
         break;
+      case 'old_grant':
+        // A ticket pairing whose invitation id has the bytes of I.
+        host.addTicketGrant(joiner.identity, `${step.joiner} (old)`, 'owner', invitation, now);
+        break;
+      case 'restart':
+        host.restart();
+        wire.out.push({ restart: true });
+        for (const connection of conns.values()) connection.closed = true;
+        break;
       default:
         assert.fail(`unknown operation ${step.op}`);
     }
@@ -676,11 +729,18 @@ export function replayDirectSequence(sequence, conventions) {
     assert.deepEqual(wire.closed, step.closed ?? [], `${name} closed`);
     assert.deepEqual(wire.held, step.held ?? [], `${name} held`);
     const snapshot = host.snapshot(invitation);
+    const order = (x, y) => {
+      for (let i = 0; i < Math.max(x.length, y.length); i++) {
+        if (x[i] !== y[i]) return (x[i] ?? '') < (y[i] ?? '') ? -1 : 1;
+      }
+      return 0;
+    };
     const actual = {
       host_status: snapshot.status,
       host_attempts_left: snapshot.attempts_left,
       requests: snapshot.requests.map(([identity, presence, decision]) => [label(identity), presence, decision]),
-      granted: snapshot.granted.map(label),
+      grants: host.grantTable().map(({ identity, name, role, kind }) => [label(identity), name, role, kind]).sort(order),
+      paired: wire.paired,
       result,
     };
     for (const key of Object.keys(actual)) {

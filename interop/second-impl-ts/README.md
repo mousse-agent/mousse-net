@@ -6,7 +6,9 @@ from the protocol spec, and the self-mode relay admission of
 and builds its kind-3 binding (`direct-code.ts`), reads and writes the
 minor-4 Pair with IP messages (`JOIN_DIRECT`, `AUTHORIZED` keys 2 and 3),
 runs the host side of Pair with IP (`direct-host.ts`: invitations, lookup,
-attempts, approval requests and recovery), and runs the caller's
+attempts, approval requests, provisional grants that commit on the first
+stream frame, the host gate's "commit first" and cancel exception of
+wire.md 8.1, and recovery), and runs the caller's
 pairing-only gate (wire.md 8.2). A TLS transport supplies the peer identity and the two TLS
 exporters. The package issues and verifies session certificates,
 signs and verifies TLS CertificateVerify bytes, and checks the negotiated
@@ -40,7 +42,7 @@ npm test
 
 The tests print case counts by vector file and end with `PASS second-impl` or
 `FAIL second-impl`. They replay sixteen pairing flows,
-twelve attempt sequences and the twenty-three Pair with IP host sequences
+twelve attempt sequences and the thirty-six Pair with IP host sequences
 of `direct-host.json` (with its `before_msg_a` section) with the supplied
 random draws, and compare the resulting messages and host events byte for
 byte. The two kind-3 CPace runs (`pairing_runs`) are rebuilt from their

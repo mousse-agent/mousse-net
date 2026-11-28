@@ -1566,9 +1566,10 @@ connections bound to that grant.
 - **Before it is made,** at Allow or when a recovery claims an Allow, the
   host checks everything that can fail: the identity is not denied, and
   the grant expiry, if any, is still ahead. A failed check changes nothing
-  in the grant table. Allow is refused (`grant_expired`, or `denied`); at a
-  claim the invitation ends with `INVITATION_INVALID` and the connection
-  closes with it.
+  in the grant table. Allow is refused (`denied`, checked first, or
+  `grant_expired`); at a claim the invitation ends with
+  `INVITATION_INVALID` (its requests, the allowed one too, end as
+  dismissed) and the connection closes with it.
 - **It commits** on the first stream frame of any connection bound to it:
   the connection the host enrolled, a recovery connection, or the joiner's
   first ordinary connection after `PAIRED`. The I/O layer reports that
@@ -1583,7 +1584,10 @@ connections bound to that grant.
 - **It is removed** by a cancel (above), by a denial of the identity, at its
   expiry, and when another direct invitation makes a new provisional grant
   for the identity. Its connections close with `GRANT_REVOKED` (the
-  cancelling connection with `CANCELLED`).
+  cancelling connection with `CANCELLED`), before the host reports the
+  removal.
+- On the enrolled connection, a `CODE_ABORT` for the attempt that passed
+  with any code other than `CANCELLED` passes the gate and is ignored.
 
 A recovery opens no stream before the host's answer (section 8, step 4), so
 a joiner that cancelled never commits the grant it is cancelling. A device
@@ -1597,9 +1601,9 @@ reconnects **pinned** to the host key it verified and sends `JOIN_DIRECT
 {1: L, 2: name, 3: I, 4?: 1}` (key 4: it cancels). No code is needed. The
 host answers, in this order:
 
-1. a provisional or committed grant for this identity, made by a direct
-   invitation, with receipt `I` (also after a restart; a receipt from a
-   ticket never matches): with the cancel flag, a provisional grant is
+1. an unexpired provisional or committed grant for this identity, made by
+   a direct invitation, with receipt `I` (also after a restart; a receipt
+   from a ticket never matches): with the cancel flag, a provisional grant is
    removed and the host closes with `CANCELLED`. Otherwise, and for a
    committed grant whatever the flag, the host answers `PAIRED {host name,
    role}` with the grant's role. When step 2 did not bind the connection to
