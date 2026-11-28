@@ -286,6 +286,9 @@ pub(crate) enum Cmd {
     Release(StreamId, u64),
     Control(ControlMessage),
     Close(ErrorCode),
+    /// A role's step from outside the driver, applied as one: control
+    /// messages that come with a close go out before its `GOAWAY`.
+    Apply(Outbox),
     Status(ConnStatus),
     Code(PairingCode),
     /// Answered when the peer's next `PONG` arrives.
@@ -996,7 +999,6 @@ pub(crate) fn spawn<P: Pipe>(
         minor,
         peer_hello,
         own_hello_out: false,
-        role_heard_hello: false,
         peer: start.peer,
         inbound: start.side == MuxRole::Host,
         reason: None,
@@ -1041,8 +1043,6 @@ struct Driver {
     /// This side's own `HELLO`, the mux's first frame, has gone to the
     /// writer. Closing drops what the mux still holds.
     own_hello_out: bool,
-    /// [`Role::on_hello`] ran.
-    role_heard_hello: bool,
     /// The peer's identity, proven in step 1.
     peer: IdentityPublicKey,
     /// The peer dialled this endpoint.
@@ -1410,6 +1410,11 @@ impl Driver {
                 }
             }
             Cmd::Close(code) => self.close(code),
+            Cmd::Apply(out) => {
+                if self.refuse_if_expired().is_none() {
+                    self.apply(out);
+                }
+            }
             Cmd::Status(status) => {
                 let _ = self.status.send(status);
             }
@@ -1710,8 +1715,9 @@ impl Driver {
                     return;
                 };
                 if matches!(message, ControlMessage::Hello { .. }) {
-                    if let Some(minor) = self.hello.agreed().filter(|_| !self.role_heard_hello) {
-                        self.role_heard_hello = true;
+                    // Only the peer's first HELLO gets here: the gate
+                    // ignores a repeat.
+                    if let Some(minor) = self.hello.agreed() {
                         let mut out = Outbox::default();
                         self.role.on_hello(minor, &mut out);
                         self.apply(out);

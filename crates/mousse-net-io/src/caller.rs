@@ -961,7 +961,23 @@ where
         pin: IdentityPublicKey,
         handshake: &Handshake,
     ) -> Result<ConnectionId, NetError> {
-        let conn = ConnectionId(self.next_conn.fetch_add(1, Ordering::Relaxed));
+        let conn = self.next_conn_id();
+        self.admit_as(conn, pin, handshake)?;
+        Ok(conn)
+    }
+
+    fn next_conn_id(&self) -> ConnectionId {
+        ConnectionId(self.next_conn.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Admit `conn`, already authenticated as `pin`, into that peer's
+    /// session as a new path.
+    fn admit_as(
+        &self,
+        conn: ConnectionId,
+        pin: IdentityPublicKey,
+        handshake: &Handshake,
+    ) -> Result<(), NetError> {
         let mut paths = lock(&self.paths);
         let session = paths
             .sessions
@@ -987,7 +1003,7 @@ where
         paths.run(events);
         match refused {
             Some(e) => Err(e),
-            None => Ok(conn),
+            None => Ok(()),
         }
     }
 

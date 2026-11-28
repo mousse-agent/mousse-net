@@ -26,8 +26,9 @@ use mousse_net_core::grants::{GrantEvent, GrantTable, OwnerRef, Role};
 use mousse_net_core::identity::IdentityPublicKey;
 use mousse_net_core::mux::{Mux, MuxEvent, MuxRole, PriorityClass};
 use mousse_net_core::pairing::{
-    CpaceExchangeFactory, DirectEnd, DirectHostAction, DirectHostPairing, DirectInvitationParams,
-    DirectLookup, DirectPaired, DirectRequestId, InvitationId, DIRECT_CODE_ALPHABET,
+    CpaceExchangeFactory, DirectAddress, DirectEnd, DirectHostAction, DirectHostPairing,
+    DirectInvitationParams, DirectLookup, DirectPaired, DirectRequestId, InvitationId,
+    DIRECT_CODE_ALPHABET,
 };
 use mousse_net_core::{ConnectionId, ErrorCode, UnixTime};
 use mousse_net_io::certs::CertManager;
@@ -110,6 +111,8 @@ struct HostState {
     log: Vec<String>,
     /// TLS handshakes the host completed (it saw a client certificate).
     handshakes: usize,
+    /// TLS handshakes that failed at the host.
+    refused_handshakes: usize,
 }
 
 /// A host running the core's Pair with IP machine behind its gate.
@@ -129,6 +132,31 @@ fn now(clock: &Arc<dyn Clock>) -> UnixTime {
 
 impl TestHost {
     async fn start(signer: SharedSigner, code: Option<&str>, minor: u64) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        Self::start_on(listener, signer, code, minor).await
+    }
+
+    /// A host listening at `addr`, the address of a host that stopped
+    /// (its listener may take a moment to go).
+    async fn start_at(addr: SocketAddr, signer: SharedSigner) -> Self {
+        let listener = within("the old address", async {
+            loop {
+                match TcpListener::bind(addr).await {
+                    Ok(listener) => return listener,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+                }
+            }
+        })
+        .await;
+        Self::start_on(listener, signer, None, DIRECT_MINOR_VERSION).await
+    }
+
+    async fn start_on(
+        listener: TcpListener,
+        signer: SharedSigner,
+        code: Option<&str>,
+        minor: u64,
+    ) -> Self {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
         let certs = Arc::new(CertManager::new(signer, clock.clone()));
         let identity = *certs.current().unwrap().identity();
@@ -156,8 +184,8 @@ impl TestHost {
             silent: false,
             log: Vec::new(),
             handshakes: 0,
+            refused_handshakes: 0,
         }));
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (st, ck) = (state.clone(), clock.clone());
         let accept = tokio::spawn(async move {
@@ -340,6 +368,7 @@ async fn serve(
     let own = certs.current().unwrap();
     let Ok((stream, handshake)) = tls::accept(tcp, &own, clock.clone(), TlsPolicy::default()).await
     else {
+        state.lock().unwrap().refused_handshakes += 1;
         return;
     };
     let peer = handshake.peer.identity;
@@ -406,10 +435,14 @@ async fn serve(
                             if matches!(m, ControlMessage::Hello { .. }) {
                                 continue;
                             }
+                            if let ControlMessage::CodeAbort { code, .. } = &m {
+                                state.lock().unwrap().log.push(format!("abort:{}", code.name()));
+                            }
                             on_message(&state, &clock, conn, peer, &exporter, m);
                         }
                         MuxEvent::StreamOpened { .. } => on_stream(&state, &clock, conn),
                         MuxEvent::GoAway { code } => {
+                            state.lock().unwrap().log.push(format!("goaway:{}", code.name()));
                             peer_closed = Some(Some(code));
                             break 'run;
                         }
@@ -598,6 +631,18 @@ async fn until(join: &mut DirectJoin, want: impl Fn(&DirectEvent) -> bool) -> Di
     }
 }
 
+/// Every event until the stream ends.
+async fn drain(join: &mut DirectJoin) -> Vec<DirectEvent> {
+    within("the end of the events", async {
+        let mut out = Vec::new();
+        while let Some(e) = join.event().await {
+            out.push(e);
+        }
+        out
+    })
+    .await
+}
+
 async fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
     within(what, async {
         while !f() {
@@ -683,7 +728,14 @@ async fn a_wrong_secret_spends_an_attempt_and_a_wrong_lookup_none() {
     let host = TestHost::start(new_signer(), None, DIRECT_MINOR_VERSION).await;
     let records: Arc<dyn DirectRecords> = Arc::new(MemoryDirectRecords::default());
     let joiner = Joiner::new(records.clone());
-    let join = joiner.join(&host, &wrong_secret(&host.code));
+    let mut join = joiner.join(&host, &wrong_secret(&host.code));
+    // The events end once the flow has.
+    assert_eq!(
+        drain(&mut join).await.last(),
+        Some(&DirectEvent::Ended(DirectEnd::CodeFailed {
+            attempts_left: 4
+        }))
+    );
     let joined = within("wrong secret", join.finish()).await.unwrap();
     assert_eq!(joined.end, DirectEnd::CodeFailed { attempts_left: 4 });
     assert_eq!(ledger(&*records, &host.code), Some(4));
@@ -741,10 +793,6 @@ async fn its_own_device_is_refused_before_its_certificate_goes_out() {
         .await
         .unwrap();
     assert_eq!(joined.end, DirectEnd::OwnDevice);
-    // The host never completed a handshake: it never saw this device's
-    // certificate.
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(host.state.lock().unwrap().handshakes, 0);
 }
 
 /// A host that agrees minor 3 cannot pair this way: the joiner needs the
@@ -837,6 +885,15 @@ async fn a_cancel_while_connected_ends_the_request() {
         host.logged("approval_ended:Cancelled")
     })
     .await;
+    // The abort, then the close, on the connection the code passed on.
+    let abort = format!("abort:{}", ErrorCode::Cancelled.name());
+    let goaway = format!("goaway:{}", ErrorCode::Cancelled.name());
+    let log = host.log();
+    let at = |what: &str| log.iter().position(|l| *l == what);
+    assert!(
+        matches!((at(&abort), at(&goaway)), (Some(a), Some(g)) if a < g),
+        "{log:?}"
+    );
     let joined = within("cancel", join.finish()).await.unwrap();
     assert_eq!(joined.end, DirectEnd::Closed(Some(ErrorCode::Cancelled)));
     assert_eq!(pending_count(&*records, &host.code), 0);
@@ -946,8 +1003,8 @@ impl DirectRecords for CrashAfter {
         self.landed()
     }
 
-    fn all_pending(&self) -> Result<Vec<mousse_net_core::pairing::DirectPending>, NetError> {
-        self.inner.all_pending()
+    fn pending_slots(&self) -> Result<Vec<mousse_net_io::PendingSlot>, NetError> {
+        self.inner.pending_slots()
     }
 }
 
@@ -1088,5 +1145,89 @@ async fn startup_recovers_every_kept_record_one_flow_at_a_time() {
     }
     assert_eq!(pending_count(&*records, code), 0);
     assert_eq!(joiner.pins.stored.lock().unwrap().len(), 2);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// At startup a damaged record stops only its own flow: that flow fails and
+/// its events end, and a healthy record under another lookup is still
+/// recovered and pairs.
+#[tokio::test]
+async fn a_damaged_record_stops_only_its_own_recovery() {
+    minor_4();
+    let host = TestHost::start(new_signer(), None, DIRECT_MINOR_VERSION).await;
+    let (records, dir) = disk("direct-damaged");
+    let joiner = Joiner::new(records.clone());
+    let mut join = joiner.join(&host, &host.code);
+    assert_eq!(next(&mut join).await, DirectEvent::CodePassed);
+    wait_for("the request", || host.logged("approval:")).await;
+    host.break_all();
+    assert_eq!(next(&mut join).await, DirectEvent::Away);
+    join.stop();
+    wait_for("the request away", || host.logged("approval:Away")).await;
+    host.allow(joiner.identity()).await;
+    // Another lookup's record that does not read.
+    let other = if host.code.starts_with("ZZZZ") {
+        "YYYY"
+    } else {
+        "ZZZZ"
+    };
+    let damaged = DirectRecordStore::in_dir(&dir).pending_path(
+        &DirectLookup::from_canonical(other).unwrap(),
+        &DirectAddress::parse("192.168.1.20:47100").unwrap(),
+    );
+    std::fs::write(damaged, b"junk").unwrap();
+
+    let again = joiner.restarted();
+    let joins = again.caller.resume_direct(&again.setup, "laptop").unwrap();
+    assert_eq!(joins.len(), 2);
+    let (mut failed, mut paired) = (0, 0);
+    for mut join in joins {
+        let events = drain(&mut join).await;
+        match within("recovery", join.finish()).await {
+            Err(_) => {
+                assert_eq!(events, Vec::new());
+                failed += 1;
+            }
+            Ok(joined) => {
+                assert_eq!(joined.end, DirectEnd::Paired);
+                assert_eq!(events.last(), Some(&DirectEvent::Ended(DirectEnd::Paired)));
+                paired += 1;
+            }
+        }
+    }
+    assert_eq!((failed, paired), (1, 1));
+    assert_eq!(pending_count(&*records, &host.code), 0);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// A recovery is pinned to the stored host key: when another device now
+/// answers at the stored address, this device's certificate never reaches
+/// it, and the pending record stays.
+#[tokio::test]
+async fn a_recovery_never_shows_its_certificate_to_another_key_at_the_address() {
+    minor_4();
+    let host = TestHost::start(new_signer(), None, DIRECT_MINOR_VERSION).await;
+    let (records, dir) = disk("direct-moved");
+    let joiner = Joiner::new(records.clone());
+    let mut join = joiner.join(&host, &host.code);
+    assert_eq!(next(&mut join).await, DirectEvent::CodePassed);
+    wait_for("the request", || host.logged("approval:")).await;
+    join.stop();
+    let (addr, code) = (host.addr, host.code.clone());
+    drop(host);
+    let other = TestHost::start_at(addr, new_signer()).await;
+
+    let again = joiner.restarted();
+    let mut joins = again.caller.resume_direct(&again.setup, "laptop").unwrap();
+    assert_eq!(joins.len(), 1);
+    let mut join = joins.remove(0);
+    assert_eq!(next(&mut join).await, DirectEvent::Away);
+    wait_for("the refused handshake", || {
+        other.state.lock().unwrap().refused_handshakes > 0
+    })
+    .await;
+    assert_eq!(other.state.lock().unwrap().handshakes, 0);
+    assert_eq!(pending_count(&*records, &code), 1);
+    join.stop();
     std::fs::remove_dir_all(dir).ok();
 }

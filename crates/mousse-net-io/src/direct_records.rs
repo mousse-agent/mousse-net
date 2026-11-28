@@ -9,7 +9,9 @@ use std::fs::{self, File, TryLockError};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use mousse_net_core::pairing::{DirectAddress, DirectLedger, DirectLookup, DirectPending};
+use mousse_net_core::pairing::{
+    AttemptId, DirectAddress, DirectLedger, DirectLookup, DirectPending,
+};
 
 use crate::error::NetError;
 use crate::store::{hex, unhex, write_atomic, FlowHold};
@@ -46,8 +48,25 @@ pub trait DirectRecords: Send + Sync {
         expected: Option<&DirectPending>,
         record: Option<&DirectPending>,
     ) -> Result<(), NetError>;
-    /// Every pending record that can be read, for recovery at startup.
-    fn all_pending(&self) -> Result<Vec<DirectPending>, NetError>;
+    /// Where pending records are kept, for recovery at startup: their
+    /// lookup and address, and the attempt each was written by if it reads.
+    /// Nothing here is validated; each flow loads and checks its own
+    /// lookup's records under that lookup's hold, so a damaged record
+    /// stops only its own flow.
+    fn pending_slots(&self) -> Result<Vec<PendingSlot>, NetError>;
+}
+
+/// A pending record found at startup ([`DirectRecords::pending_slots`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingSlot {
+    /// The typed lookup it is kept under.
+    pub lookup: DirectLookup,
+    /// The typed address it is kept at.
+    pub address: DirectAddress,
+    /// The attempt that wrote it, or `None` when the record does not read.
+    /// A recovery takes only this attempt's record: one written later at
+    /// the same lookup and address belongs to the flow that wrote it.
+    pub attempt: Option<AttemptId>,
 }
 
 fn changed_under_us() -> NetError {
@@ -142,9 +161,19 @@ impl DirectRecords for MemoryDirectRecords {
         Ok(())
     }
 
-    fn all_pending(&self) -> Result<Vec<DirectPending>, NetError> {
+    fn pending_slots(&self) -> Result<Vec<PendingSlot>, NetError> {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(inner.pending.values().cloned().collect())
+        let mut slots: Vec<PendingSlot> = inner
+            .pending
+            .values()
+            .map(|p| PendingSlot {
+                lookup: p.lookup.clone(),
+                address: p.address,
+                attempt: Some(p.attempt),
+            })
+            .collect();
+        slots.sort_by_key(|s| (s.lookup.as_str().to_owned(), s.address.to_text()));
+        Ok(slots)
     }
 }
 
@@ -239,7 +268,9 @@ impl DirectRecordStore {
     }
 
     /// The pending records' (lookup, address) by file name, `lookup` only
-    /// when given.
+    /// when given. A file under `lookup` whose name does not read is an
+    /// error; listing every lookup (`None`) leaves it to that lookup's own
+    /// load.
     fn pending_names(
         &self,
         lookup: Option<&DirectLookup>,
@@ -270,6 +301,7 @@ impl DirectRecordStore {
                 .and_then(|t| DirectAddress::parse(&t).filter(|p| p.to_text() == t));
             match address {
                 Some(address) => out.push((l, address)),
+                None if lookup.is_none() => {}
                 // A pending record whose name does not read is never
                 // skipped silently: it may hold a code that passed.
                 None => return Err(store_err(&entry.path(), "not a pending record's name")),
@@ -336,22 +368,39 @@ impl DirectRecords for DirectRecordStore {
             return Err(changed_under_us());
         }
         let path = self.pending_path(lookup, address);
-        match record {
-            Some(r) => write_atomic(&path, &r.to_bytes()),
-            None => match fs::remove_file(&path) {
-                Ok(()) => crate::private::sync_dir(&self.dir).map_err(|e| store_err(&self.dir, e)),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(store_err(&path, e)),
-            },
+        match (record, expected) {
+            (Some(r), _) => write_atomic(&path, &r.to_bytes()),
+            (None, None) => Ok(()),
+            // Deleting is a durable move out of the `.pending` names (on
+            // Windows a write-through move; elsewhere a rename and a folder
+            // sync), so a power loss cannot bring back a record already
+            // reported gone. The moved file is removed after.
+            (None, Some(_)) => {
+                let gone = path.with_extension("gone");
+                crate::private::replace_durably(&path, &gone).map_err(|e| store_err(&path, e))?;
+                let _ = fs::remove_file(&gone);
+                Ok(())
+            }
         }
     }
 
-    fn all_pending(&self) -> Result<Vec<DirectPending>, NetError> {
+    fn pending_slots(&self) -> Result<Vec<PendingSlot>, NetError> {
         let mut out = Vec::new();
-        for (l, address) in self.pending_names(None)? {
-            if let Some(p) = self.read_pending(&l, &address)? {
-                out.push(p);
-            }
+        for (lookup, address) in self.pending_names(None)? {
+            let path = self.pending_path(&lookup, &address);
+            let Some(bytes) = read_optional(&path).unwrap_or(Some(Vec::new())) else {
+                // Gone since the listing: settled by another flow.
+                continue;
+            };
+            let attempt = DirectPending::from_bytes(&bytes)
+                .ok()
+                .filter(|p| p.lookup == lookup && p.address == address)
+                .map(|p| p.attempt);
+            out.push(PendingSlot {
+                lookup,
+                address,
+                attempt,
+            });
         }
         Ok(out)
     }
@@ -444,9 +493,12 @@ mod tests {
                 .swap_pending(&k7qm, &a.address, Some(&a), None)
                 .unwrap();
             assert_eq!(store.load(&k7qm).unwrap().1, vec![b.clone()]);
-            let mut all = store.all_pending().unwrap();
-            all.sort_by_key(|p| p.lookup.as_str().to_owned());
-            assert_eq!(all, vec![c, b]);
+            let slot = |p: &DirectPending| PendingSlot {
+                lookup: p.lookup.clone(),
+                address: p.address,
+                attempt: Some(p.attempt),
+            };
+            assert_eq!(store.pending_slots().unwrap(), vec![slot(&c), slot(&b)]);
             if let Some(dir) = dir {
                 assert!(crate::private::is_owner_only(&dir.join("direct")).unwrap());
                 fs::remove_dir_all(&dir).unwrap();
@@ -469,6 +521,135 @@ mod tests {
                 fs::remove_dir_all(&dir).unwrap();
             }
         }
+    }
+
+    /// The hold is the OS's: a lookup another process holds is refused
+    /// here, another lookup is not, and the hold goes when that process
+    /// dies.
+    #[test]
+    fn a_lookup_held_by_another_process_is_refused_until_that_process_dies() {
+        let k7qm = DirectLookup::from_canonical("K7QM").unwrap();
+        let other = DirectLookup::from_canonical("ABCD").unwrap();
+        let dir = temp_dir("direct-hold");
+        let ready = dir.join("ready");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "direct_records::tests::hold_in_child",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("MOUSSE_TEST_HOLD_DIR", &dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let start = std::time::Instant::now();
+        while !ready.exists() {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(60),
+                "the child never took the hold"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let store = DirectRecordStore::in_dir(&dir);
+        assert!(store.hold(&k7qm).unwrap().is_none());
+        assert!(store.hold(&other).unwrap().is_some());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let start = std::time::Instant::now();
+        loop {
+            if store.hold(&k7qm).unwrap().is_some() {
+                break;
+            }
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(10),
+                "the hold outlived its process"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The other process of the test above: holds K7QM and waits to be
+    /// killed. Does nothing when run on its own.
+    #[test]
+    #[ignore = "run by a_lookup_held_by_another_process_is_refused_until_that_process_dies"]
+    fn hold_in_child() {
+        let Some(dir) = std::env::var_os("MOUSSE_TEST_HOLD_DIR") else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let store = DirectRecordStore::in_dir(&dir);
+        let k7qm = DirectLookup::from_canonical("K7QM").unwrap();
+        let _held = store.hold(&k7qm).unwrap().expect("free");
+        fs::write(dir.join("ready"), b"").unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(120));
+    }
+
+    /// Deleting a pending record is a durable move: when the move fails the
+    /// record is still there and the delete is not reported done.
+    #[test]
+    fn a_pending_record_is_deleted_only_by_a_durable_move() {
+        let k7qm = DirectLookup::from_canonical("K7QM").unwrap();
+        let dir = temp_dir("direct-delete");
+        let store = DirectRecordStore::in_dir(&dir);
+        let a = pending(&k7qm, "192.168.1.20:47100");
+        store
+            .swap_pending(&k7qm, &a.address, None, Some(&a))
+            .unwrap();
+        let path = store.pending_path(&k7qm, &a.address);
+        crate::private::faults::plan_replaces(
+            &path.with_extension("gone"),
+            &[crate::private::faults::Fault::BeforeRename],
+        );
+        assert!(store
+            .swap_pending(&k7qm, &a.address, Some(&a), None)
+            .is_err());
+        assert_eq!(store.load(&k7qm).unwrap().1, vec![a.clone()]);
+        store
+            .swap_pending(&k7qm, &a.address, Some(&a), None)
+            .unwrap();
+        assert_eq!(store.load(&k7qm).unwrap().1, Vec::new());
+        assert_eq!(
+            fs::read_dir(store.dir.clone())
+                .unwrap()
+                .filter(|e| {
+                    e.as_ref()
+                        .unwrap()
+                        .path()
+                        .extension()
+                        .is_some_and(|x| x == "gone" || x == "pending")
+                })
+                .count(),
+            0
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Startup lists where records are without validating them: a damaged
+    /// record is still listed (its attempt unread), for its own flow to
+    /// load and report.
+    #[test]
+    fn startup_lists_a_damaged_record_without_reading_it_as_valid() {
+        let k7qm = DirectLookup::from_canonical("K7QM").unwrap();
+        let dir = temp_dir("direct-slots");
+        let store = DirectRecordStore::in_dir(&dir);
+        let a = pending(&k7qm, "192.168.1.20:47100");
+        store
+            .swap_pending(&k7qm, &a.address, None, Some(&a))
+            .unwrap();
+        fs::write(store.pending_path(&k7qm, &a.address), b"junk").unwrap();
+        assert_eq!(
+            store.pending_slots().unwrap(),
+            vec![PendingSlot {
+                lookup: k7qm.clone(),
+                address: a.address,
+                attempt: None,
+            }]
+        );
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A record that does not read, or is filed under another lookup or

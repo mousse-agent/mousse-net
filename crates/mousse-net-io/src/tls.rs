@@ -6,7 +6,7 @@
 //!   stored pin (or, on first contact, the ticket's host identity) on every
 //!   connection. The host passes no pin; step 2 decides what the peer may do.
 //! - The one unpinned dial is a Pair with IP first contact
-//!   ([`connect_unpinned`], wire.md 5.4): every check but the pin, and the
+//!   (`connect_unpinned`, wire.md 5.4): every check but the pin, and the
 //!   far end may be neither this endpoint nor a denied identity. What it
 //!   shows is only a candidate until the code exchange confirms it.
 //! - No session resumption, no tickets, no PSK and no early data, so every
@@ -16,6 +16,7 @@
 //!   before any application data (wire.md 5.4).
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -162,6 +163,33 @@ impl ResolvesClientCert for OwnCert {
     }
 }
 
+/// The client side's own certificate, noting whether the host asked for
+/// it and it went out: step 1 is mutual (wire.md 5.4), so a handshake the
+/// host finished without client authentication is refused.
+#[derive(Debug)]
+struct ClientCert {
+    own: OwnCert,
+    sent: Arc<AtomicBool>,
+}
+
+impl ResolvesClientCert for ClientCert {
+    fn resolve(
+        &self,
+        root_hint_subjects: &[&[u8]],
+        sigschemes: &[SignatureScheme],
+    ) -> Option<Arc<CertifiedKey>> {
+        let key = ResolvesClientCert::resolve(&self.own, root_hint_subjects, sigschemes);
+        if key.is_some() {
+            self.sent.store(true, Ordering::SeqCst);
+        }
+        key
+    }
+
+    fn has_certs(&self) -> bool {
+        true
+    }
+}
+
 impl ResolvesServerCert for OwnCert {
     fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         Some(self.0.clone())
@@ -256,7 +284,7 @@ impl ServerCertVerifier for PinnedHostVerifier {
     }
 }
 
-/// Why an unpinned dial ([`connect_unpinned`]) refused the far end before
+/// Why an unpinned dial (`connect_unpinned`) refused the far end before
 /// this device's certificate went out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnpinnedRefusal {
@@ -277,7 +305,7 @@ impl fmt::Display for UnpinnedRefusal {
 
 impl std::error::Error for UnpinnedRefusal {}
 
-/// Whether this profile denied an identity, for [`connect_unpinned`].
+/// Whether this profile denied an identity, for `connect_unpinned`.
 pub type DeniedCheck = Arc<dyn Fn(&IdentityPublicKey) -> bool + Send + Sync>;
 
 /// Caller side of a Pair with IP first contact (wire.md 5.4): checks 1 to 8
@@ -423,7 +451,7 @@ pub fn client_config(
     clock: Arc<dyn Clock>,
     policy: TlsPolicy,
 ) -> Result<Arc<ClientConfig>, NetError> {
-    client_config_on(provider(), own, pin, clock, policy)
+    client_config_on(provider(), own, pin, clock, policy).map(|(config, _)| config)
 }
 
 fn client_config_on(
@@ -432,7 +460,7 @@ fn client_config_on(
     pin: IdentityPublicKey,
     clock: Arc<dyn Clock>,
     policy: TlsPolicy,
-) -> Result<Arc<ClientConfig>, NetError> {
+) -> Result<(Arc<ClientConfig>, Arc<AtomicBool>), NetError> {
     let verifier = Arc::new(PinnedHostVerifier {
         pin,
         clock: clock.clone(),
@@ -441,23 +469,41 @@ fn client_config_on(
     client_config_with(provider, own, verifier, clock)
 }
 
+/// A client configuration, and the flag set once this device's
+/// certificate went out as client authentication.
 fn client_config_with(
     provider: Arc<CryptoProvider>,
     own: &SessionCertificate,
     verifier: Arc<dyn ServerCertVerifier>,
     clock: Arc<dyn Clock>,
-) -> Result<Arc<ClientConfig>, NetError> {
+) -> Result<(Arc<ClientConfig>, Arc<AtomicBool>), NetError> {
+    let sent = Arc::new(AtomicBool::new(false));
     let mut config = ClientConfig::builder_with_details(provider, Arc::new(ClockTime(clock)))
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| NetError::Tls(e.to_string()))?
         .dangerous()
         .with_custom_certificate_verifier(verifier)
-        .with_client_cert_resolver(Arc::new(OwnCert(certified_key(own))));
+        .with_client_cert_resolver(Arc::new(ClientCert {
+            own: OwnCert(certified_key(own)),
+            sent: sent.clone(),
+        }));
     config.alpn_protocols = vec![ALPN.to_vec()];
     config.resumption = Resumption::disabled();
     config.enable_early_data = false;
     config.enable_sni = false;
-    Ok(Arc::new(config))
+    Ok((Arc::new(config), sent))
+}
+
+/// Step 1 is mutual (wire.md 5.4): a host that finished the handshake
+/// without asking for this device's certificate is refused.
+fn check_client_auth(sent: &AtomicBool) -> Result<(), NetError> {
+    if sent.load(Ordering::SeqCst) {
+        Ok(())
+    } else {
+        Err(NetError::Tls(
+            "the host did not authenticate this device".into(),
+        ))
+    }
 }
 
 /// A client certificate resolver that presents `own`, for test tools that
@@ -575,7 +621,7 @@ pub async fn connect<P: Pipe>(
     clock: Arc<dyn Clock>,
     policy: TlsPolicy,
 ) -> Result<(TlsStream<P>, Handshake), NetError> {
-    let config = client_config(own, pin, clock.clone(), policy)?;
+    let (config, sent) = client_config_on(provider(), own, pin, clock.clone(), policy)?;
     let name = ServerName::try_from("mousse-session").map_err(|e| NetError::Tls(e.to_string()))?;
     let stream = tokio::time::timeout(
         policy.handshake_timeout,
@@ -584,6 +630,7 @@ pub async fn connect<P: Pipe>(
     .await
     .map_err(|_| NetError::Timeout("TLS handshake"))?
     .map_err(map_handshake_error)?;
+    check_client_auth(&sent)?;
     let conn = stream.get_ref().1;
     let exporters =
         exporters(|label| conn.export_keying_material([0u8; 32], label.as_bytes(), None))?;
@@ -599,7 +646,7 @@ pub async fn connect<P: Pipe>(
 /// a candidate: the connection is pairing only (8.2) until the host's
 /// confirmation verifies. Every other dial, a Pair with IP recovery
 /// included, is pinned ([`connect`]).
-pub async fn connect_unpinned<P: Pipe>(
+pub(crate) async fn connect_unpinned<P: Pipe>(
     pipe: P,
     own: &SessionCertificate,
     denied: DeniedCheck,
@@ -612,7 +659,7 @@ pub async fn connect_unpinned<P: Pipe>(
         clock: clock.clone(),
         skew_secs: policy.skew_secs,
     });
-    let config = client_config_with(provider(), own, verifier, clock.clone())?;
+    let (config, sent) = client_config_with(provider(), own, verifier, clock.clone())?;
     let name = ServerName::try_from("mousse-session").map_err(|e| NetError::Tls(e.to_string()))?;
     let stream = tokio::time::timeout(
         policy.handshake_timeout,
@@ -621,6 +668,7 @@ pub async fn connect_unpinned<P: Pipe>(
     .await
     .map_err(|_| NetError::Timeout("TLS handshake"))?
     .map_err(map_handshake_error)?;
+    check_client_auth(&sent)?;
     let conn = stream.get_ref().1;
     let exporters =
         exporters(|label| conn.export_keying_material([0u8; 32], label.as_bytes(), None))?;
@@ -681,7 +729,7 @@ mod tests {
         classical
             .kx_groups
             .retain(|g| g.name() == NamedGroup::X25519);
-        let config = client_config_on(
+        let (config, _) = client_config_on(
             Arc::new(classical),
             &caller,
             *host.identity(),
@@ -798,6 +846,57 @@ mod tests {
 
     fn nobody_denied() -> DeniedCheck {
         Arc::new(|_| false)
+    }
+
+    /// wire.md 5.4: step 1 is mutual. A host that finishes the handshake
+    /// without asking for the caller's certificate is refused, by the
+    /// unpinned first contact and by a pinned dial alike.
+    #[tokio::test]
+    async fn a_host_that_never_asked_for_the_callers_certificate_is_refused() {
+        let clock = Arc::new(ManualClock::new());
+        let (caller, host) = (cert(clock.clone()), cert(clock.clone()));
+        let server = || {
+            let mut config =
+                ServerConfig::builder_with_details(provider(), Arc::new(ClockTime(clock.clone())))
+                    .with_protocol_versions(&[&rustls::version::TLS13])
+                    .unwrap()
+                    .with_no_client_auth()
+                    .with_cert_resolver(Arc::new(OwnCert(certified_key(&host))));
+            config.alpn_protocols = vec![ALPN.to_vec()];
+            TlsAcceptor::from(Arc::new(config))
+        };
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let (dialled, _) = tokio::join!(
+            connect_unpinned(
+                a,
+                &caller,
+                nobody_denied(),
+                clock.clone(),
+                TlsPolicy::default()
+            ),
+            server().accept(b),
+        );
+        assert!(
+            matches!(&dialled, Err(NetError::Tls(e)) if e.contains("authenticate")),
+            "{:?}",
+            dialled.err()
+        );
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let (dialled, _) = tokio::join!(
+            connect(
+                a,
+                &caller,
+                *host.identity(),
+                clock.clone(),
+                TlsPolicy::default()
+            ),
+            server().accept(b),
+        );
+        assert!(
+            matches!(&dialled, Err(NetError::Tls(e)) if e.contains("authenticate")),
+            "{:?}",
+            dialled.err()
+        );
     }
 
     /// wire.md 5.4: a Pair with IP first contact pins nothing; the host it

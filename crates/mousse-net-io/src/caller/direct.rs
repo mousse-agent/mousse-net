@@ -11,7 +11,10 @@
 //!   Every write is a compare and swap, durable before what waits for it
 //!   goes out.
 //! - The host's pin is stored ([`DirectPins`]) only after the host's
-//!   confirmation verified and `PAIRED` arrived; then the gate goes live.
+//!   confirmation verified and `PAIRED` arrived; the gate goes live, and
+//!   only then is the pending record deleted and the flow over.
+//! - Only the connection the flow is on reaches the pairing: a connection
+//!   the flow left (a cancel, a timeout) closes on its own.
 //! - A kept pending record is recovered with backoff while the flow runs,
 //!   and at startup ([`Caller::resume_direct`]).
 
@@ -19,11 +22,10 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use mousse_net_core::authz::{CallerGate, CallerTraffic, Traffic, Verdict};
-use mousse_net_core::control::ControlMessage;
-use mousse_net_core::identity::IdentityPublicKey;
+use mousse_net_core::control::{AuthorizedState, ControlMessage};
 use mousse_net_core::mux::MuxRole;
 use mousse_net_core::pairing::{
-    CodeExchangeFactory, DirectAddress, DirectEnd, DirectJoinError, DirectJoinerAction,
+    AttemptId, CodeExchangeFactory, DirectEnd, DirectJoinError, DirectJoinerAction,
     DirectJoinerPairing, DirectJoinerState, DirectLookup, DirectPaired, EXPORTER_LEN,
 };
 use mousse_net_core::{ConnectionId, ErrorCode, Millis};
@@ -38,7 +40,7 @@ use crate::limits::ms;
 use crate::pipe::connect_addr;
 use crate::rng::os_rng;
 use crate::store::FlowHold;
-use crate::tls::{self, DeniedCheck, UnpinnedRefusal};
+use crate::tls::{self, DeniedCheck, Handshake, UnpinnedRefusal};
 
 /// Where a joiner stores what a Pair with IP pairing gives it.
 pub trait DirectPins: Send + Sync {
@@ -103,8 +105,8 @@ pub struct DirectJoin {
 }
 
 impl DirectJoin {
-    /// The next event, or `None` once the flow has ended and every event
-    /// was read.
+    /// The next event, or `None` once the flow has ended (or failed, or
+    /// stopped) and every event was read.
     pub async fn event(&mut self) -> Option<DirectEvent> {
         self.events.recv().await
     }
@@ -112,7 +114,8 @@ impl DirectJoin {
     /// The person cancelled (wire.md 10.9): before the code passed this
     /// ends the flow; after, the pending record is marked cancelled first,
     /// and the cancel reaches the host now (connected) or with the next
-    /// recovery (away).
+    /// recovery (away). A recovery at startup waiting for its lookup's hold
+    /// marks its record once it has the hold.
     pub fn cancel(&self) -> Result<(), DirectJoinError> {
         (self.cancel)()
     }
@@ -126,26 +129,40 @@ impl DirectJoin {
 
     /// Stop the flow where it is, as when the app quits: its connection
     /// closes, its hold goes, and what it stored stays for the next start
-    /// ([`Caller::resume_direct`]).
+    /// ([`Caller::resume_direct`]). Nothing the connection still receives
+    /// reaches the flow.
     pub fn stop(self) {
-        self.task.abort();
         (self.stop)();
+        self.task.abort();
     }
 }
 
 /// One flow, shared by its driver task, its connection's role and the
-/// handle's cancel.
+/// handle.
 struct DirectFlow<F: CodeExchangeFactory> {
     pairing: DirectJoinerPairing<F>,
     setup: DirectSetup,
     hold: Option<FlowHold>,
-    events: mpsc::UnboundedSender<DirectEvent>,
+    /// The UI's events; gone once the flow is over.
+    events: Option<mpsc::UnboundedSender<DirectEvent>>,
     state: watch::Sender<DirectJoinerState>,
-    /// The live connection's commands, while one is up.
-    conn: Option<mpsc::UnboundedSender<Cmd>>,
+    /// The connection the flow is on, and its commands. Only that
+    /// connection's role reaches the pairing.
+    active: Option<(ConnectionId, mpsc::UnboundedSender<Cmd>)>,
     /// A store failure that ended the flow.
     failed: Option<NetError>,
     clock: Arc<dyn Clock>,
+    /// The handle stopped the flow: nothing more reaches the pairing.
+    stopped: bool,
+    /// A recovery at startup that has not loaded its records yet: the
+    /// attempt whose record it recovers (`None` when that record did not
+    /// read at startup).
+    startup: Option<Option<AttemptId>>,
+    /// A recovery at startup whose lookup another flow holds: it asks
+    /// again later.
+    waiting_hold: bool,
+    /// The handle cancelled while [`Self::waiting_hold`].
+    cancel_wanted: bool,
 }
 
 type SharedDirect<F> = Arc<Mutex<DirectFlow<F>>>;
@@ -158,11 +175,56 @@ fn lock_flow<F: CodeExchangeFactory>(flow: &Mutex<DirectFlow<F>>) -> MutexGuard<
 enum Wire {
     Send(ControlMessage),
     Close(ErrorCode),
-    /// The pin is stored: the connection's gate goes live.
+    /// The pin is stored: the connection's gate goes live, then the pin is
+    /// acknowledged to the pairing.
     Live,
 }
 
+/// The pairing is on a connection in `state`.
+fn on_connection(state: DirectJoinerState) -> bool {
+    matches!(
+        state,
+        DirectJoinerState::AwaitingHello
+            | DirectJoinerState::AwaitingAnswer
+            | DirectJoinerState::Exchanging
+            | DirectJoinerState::AwaitingAllow
+            | DirectJoinerState::Paired
+    )
+}
+
+/// A close code that settles a pending record (as core's joiner reads
+/// them). Only the host's `GOAWAY` may carry one to the pairing: this
+/// side's own close says nothing about the host's answer.
+fn settles(code: ErrorCode) -> bool {
+    matches!(
+        code,
+        ErrorCode::PairingDeclined
+            | ErrorCode::Cancelled
+            | ErrorCode::InvitationInvalid
+            | ErrorCode::AttemptsExhausted
+    )
+}
+
 impl<F: CodeExchangeFactory> DirectFlow<F> {
+    fn emit(&self, event: DirectEvent) {
+        if let Some(events) = &self.events {
+            let _ = events.send(event);
+        }
+    }
+
+    /// Run `f` on the pairing and carry out what it asks, unless the flow
+    /// was stopped.
+    fn step(
+        &mut self,
+        f: impl FnOnce(&mut DirectJoinerPairing<F>) -> Vec<DirectJoinerAction>,
+    ) -> Vec<Wire> {
+        if self.stopped {
+            return Vec::new();
+        }
+        let actions = f(&mut self.pairing);
+        self.run(actions)
+    }
+
     /// Carry out `actions` in order: the hold, the loads, every write (each
     /// a compare and swap, acknowledged before what waits for it is
     /// released) and the pin; report the UI's events. Returns what the
@@ -196,11 +258,14 @@ impl<F: CodeExchangeFactory> DirectFlow<F> {
                         Err(_) => self.pairing.on_persist_failed(),
                     }
                 }
+                // The pin is acknowledged to the pairing (which deletes
+                // the pending record and ends the flow) only once the
+                // connection is live: `Wire::Live`.
                 DirectJoinerAction::Paired(paired) => match self.setup.pins.store(&paired) {
                     Ok(()) => {
-                        let _ = self.events.send(DirectEvent::Paired(paired));
+                        self.emit(DirectEvent::Paired(paired));
                         out.push(Wire::Live);
-                        self.pairing.on_pin_stored()
+                        Vec::new()
                     }
                     Err(_) => self.pairing.on_persist_failed(),
                 },
@@ -213,15 +278,15 @@ impl<F: CodeExchangeFactory> DirectFlow<F> {
                     Vec::new()
                 }
                 DirectJoinerAction::CodePassed => {
-                    let _ = self.events.send(DirectEvent::CodePassed);
+                    self.emit(DirectEvent::CodePassed);
                     Vec::new()
                 }
                 DirectJoinerAction::Away => {
-                    let _ = self.events.send(DirectEvent::Away);
+                    self.emit(DirectEvent::Away);
                     Vec::new()
                 }
                 DirectJoinerAction::Ended(end) => {
-                    let _ = self.events.send(DirectEvent::Ended(end));
+                    self.emit(DirectEvent::Ended(end));
                     Vec::new()
                 }
             };
@@ -237,10 +302,25 @@ impl<F: CodeExchangeFactory> DirectFlow<F> {
     fn acquire(&mut self, lookup: &DirectLookup) -> Vec<DirectJoinerAction> {
         match self.setup.records.hold(lookup) {
             Ok(Some(hold)) => match self.setup.records.load(lookup) {
-                Ok((ledger, pending)) => {
+                Ok((ledger, mut pending)) => {
                     self.hold = Some(hold);
+                    self.waiting_hold = false;
+                    // A recovery at startup takes only the record of the
+                    // attempt it was started for: a record written since
+                    // at the same address belongs to the flow that wrote
+                    // it, and without its own the recovery is settled.
+                    if let Some(attempt) = self.startup.take() {
+                        let address = self.pairing.address();
+                        pending.retain(|p| p.address != address || Some(p.attempt) == attempt);
+                    }
                     let now = self.clock.now();
-                    self.pairing.on_records(ledger.as_ref(), &pending, now)
+                    let mut actions = self.pairing.on_records(ledger.as_ref(), &pending, now);
+                    if std::mem::take(&mut self.cancel_wanted)
+                        && self.pairing.state() == DirectJoinerState::Connecting
+                    {
+                        actions.extend(self.pairing.cancel().unwrap_or_default());
+                    }
+                    actions
                 }
                 // A record that cannot be read never reads as "none": the
                 // flow stops here, its hold given back.
@@ -249,6 +329,12 @@ impl<F: CodeExchangeFactory> DirectFlow<F> {
                     Vec::new()
                 }
             },
+            // Another flow has the lookup. A recovery at startup is not
+            // over: it asks again later.
+            Ok(None) if self.startup.is_some() => {
+                self.waiting_hold = true;
+                Vec::new()
+            }
             Ok(None) => self.pairing.on_hold_refused(),
             Err(e) => {
                 self.failed = Some(e);
@@ -257,21 +343,71 @@ impl<F: CodeExchangeFactory> DirectFlow<F> {
         }
     }
 
-    /// Hand `wire` to the live connection (a cancel from the handle).
+    /// A recovery at startup asks for its lookup's hold again.
+    fn retry_hold(&mut self) {
+        if std::mem::take(&mut self.waiting_hold) {
+            self.step(|p| p.start());
+        }
+    }
+
+    /// `conn` is the connection the flow is on.
+    fn owns(&self, conn: ConnectionId) -> bool {
+        !self.stopped && self.active.as_ref().is_some_and(|(id, _)| *id == conn)
+    }
+
+    /// The pairing left its connection (away, ended, or ended paired with
+    /// the connection handed over): nothing more from it reaches the
+    /// pairing.
+    fn leave_connection_if_done(&mut self) {
+        if !on_connection(self.pairing.state()) {
+            self.active = None;
+        }
+    }
+
+    /// The handle's cancel.
+    fn cancel(&mut self) -> Result<(), DirectJoinError> {
+        if self.stopped {
+            return Err(DirectJoinError::WrongState);
+        }
+        if self.waiting_hold {
+            self.cancel_wanted = true;
+            return Ok(());
+        }
+        let actions = self.pairing.cancel()?;
+        let wire = self.run(actions);
+        self.to_connection(wire);
+        self.leave_connection_if_done();
+        Ok(())
+    }
+
+    /// The handle's stop: from here nothing reaches the pairing, the
+    /// connection closes, then the hold goes.
+    fn stop(&mut self) {
+        self.stopped = true;
+        if let Some((_, tx)) = self.active.take() {
+            let _ = tx.send(Cmd::Close(ErrorCode::NoError));
+        }
+        self.hold = None;
+        self.events = None;
+    }
+
+    /// Hand `wire` to the connection the flow is on (a cancel from the
+    /// handle), as one step: messages that come with a close go out before
+    /// its `GOAWAY`.
     fn to_connection(&self, wire: Vec<Wire>) {
-        let Some(tx) = &self.conn else {
+        let Some((_, tx)) = &self.active else {
             return;
         };
+        let mut out = Outbox::default();
         for w in wire {
             match w {
-                Wire::Send(m) => {
-                    let _ = tx.send(Cmd::Control(m));
-                }
-                Wire::Close(code) => {
-                    let _ = tx.send(Cmd::Close(code));
-                }
+                Wire::Send(m) => out.control.push(m),
+                Wire::Close(code) => out.close = Some(code),
                 Wire::Live => {}
             }
+        }
+        if !out.control.is_empty() || out.close.is_some() {
+            let _ = tx.send(Cmd::Apply(out));
         }
     }
 }
@@ -281,11 +417,13 @@ struct DirectRole<F: CodeExchangeFactory> {
     flow: SharedDirect<F>,
     gate: CallerGate,
     answer_due: Option<Millis>,
+    /// The gate went live with the pin stored: acknowledge the pin to the
+    /// pairing on the next wake.
+    ack_due: bool,
     answer_wait_ms: u64,
     clock: Arc<dyn Clock>,
     paths: Arc<Mutex<Paths>>,
     conn: ConnectionId,
-    peer: IdentityPublicKey,
 }
 
 impl<F: CodeExchangeFactory> DirectRole<F> {
@@ -312,22 +450,37 @@ impl<F: CodeExchangeFactory> DirectRole<F> {
                     if self.gate.is_live() {
                         out.status = Some(ConnStatus::Live);
                     }
+                    self.ack_due = true;
                 }
             }
         }
     }
 
+    /// Run `f` on the pairing if this is the flow's connection.
     fn step(
         &mut self,
         f: impl FnOnce(&mut DirectJoinerPairing<F>) -> Vec<DirectJoinerAction>,
         out: &mut Outbox,
-    ) {
+    ) -> bool {
         let wire = {
             let mut flow = lock_flow(&self.flow);
-            let actions = f(&mut flow.pairing);
-            flow.run(actions)
+            if !flow.owns(self.conn) {
+                return false;
+            }
+            let wire = flow.step(f);
+            flow.leave_connection_if_done();
+            wire
         };
         self.apply(wire, out);
+        true
+    }
+
+    /// The pin is stored and the gate is live: the pairing deletes the
+    /// pending record and ends paired.
+    fn ack_pin(&mut self, out: &mut Outbox) {
+        if std::mem::take(&mut self.ack_due) {
+            self.step(|p| p.on_pin_stored(), out);
+        }
     }
 }
 
@@ -346,10 +499,14 @@ where
     }
 
     fn wake_at(&self) -> Option<Millis> {
+        if self.ack_due {
+            return Some(Millis(0));
+        }
         self.answer_due
     }
 
     fn on_wake(&mut self, mono: Millis, out: &mut Outbox) {
+        self.ack_pin(out);
         if self.answer_due.is_some_and(|due| mono >= due) {
             self.answer_due = None;
             // Nothing happens unless the answer is still awaited.
@@ -369,7 +526,13 @@ where
 
     fn on_control(&mut self, message: ControlMessage, out: &mut Outbox) {
         let now = self.clock.now();
-        match message {
+        let live_notice = matches!(
+            message,
+            ControlMessage::Authorized {
+                state: AuthorizedState::Live
+            }
+        );
+        let handled = match message {
             ControlMessage::Authorized { state } => self.step(|p| p.on_authorized(state), out),
             ControlMessage::AuthorizedDirect {
                 invitation,
@@ -387,10 +550,17 @@ where
             ControlMessage::Paired { host_name, role } => {
                 self.step(|p| p.on_paired(host_name, role), out)
             }
-            _ => {
-                self.gate.close(ErrorCode::ProtocolError);
-                out.close = Some(ErrorCode::ProtocolError);
-            }
+            _ => false,
+        };
+        if handled {
+            return;
+        }
+        // Not the flow's connection (any more), or a message the joiner
+        // never takes. A paired connection may still hear the host's
+        // `AUTHORIZED live`; anything else ends this connection only.
+        if !(live_notice && self.gate.is_live()) {
+            self.gate.close(ErrorCode::ProtocolError);
+            out.close = Some(ErrorCode::ProtocolError);
         }
     }
 
@@ -399,16 +569,26 @@ where
     }
 
     fn on_closed(&mut self, reason: &CloseReason) {
+        // A pin already stored is acknowledged first: the outcome stands.
+        let mut out = Outbox::default();
+        self.ack_pin(&mut out);
         {
             let mut flow = lock_flow(&self.flow);
-            flow.conn = None;
-            let actions = flow.pairing.on_closed(reason.code());
-            flow.run(actions);
+            if flow.owns(self.conn) {
+                flow.active = None;
+                // Only the host's GOAWAY settles a pending record.
+                let code = match reason {
+                    CloseReason::Peer(code) => Some(*code),
+                    CloseReason::Local(code) if !settles(*code) => Some(*code),
+                    _ => None,
+                };
+                flow.step(|p| p.on_closed(code));
+            }
         }
         self.gate.close(reason.code().unwrap_or(ErrorCode::NoError));
         let mut paths = lock(&self.paths);
         paths.conns.remove(&self.conn);
-        if let Some(session) = paths.sessions.get_mut(&self.peer) {
+        for session in paths.sessions.values_mut() {
             session.on_path_closed(self.conn);
         }
     }
@@ -427,6 +607,13 @@ impl Backoff {
         self.next = self.next.saturating_mul(2).min(self.max);
         ms(this)
     }
+}
+
+/// A started connection and its step 1, kept to admit it into the host's
+/// session once the pairing succeeds.
+struct Dialled {
+    connection: Connection,
+    handshake: Handshake,
 }
 
 impl<F> Caller<F>
@@ -459,24 +646,27 @@ where
     }
 
     /// Recover every kept pending record (at startup): one flow each, as a
-    /// pinned recovery with no code. A flow whose lookup another flow holds
-    /// tries again with backoff.
+    /// pinned recovery with no code. Only where the records are is read
+    /// here; each flow loads and checks its own under its lookup's hold, so
+    /// a damaged record ends only its own flow. A flow whose lookup another
+    /// flow holds asks again with backoff.
     pub fn resume_direct(
         self: &Arc<Self>,
         setup: &DirectSetup,
         name: &str,
     ) -> Result<Vec<DirectJoin>, NetError> {
         let mut joins = Vec::new();
-        for pending in setup.records.all_pending()? {
-            let resume = Resume {
-                address: pending.address,
-                lookup: pending.lookup.clone(),
-                name: name.to_owned(),
-            };
-            let pairing = resume
-                .pairing(self)
-                .map_err(|e| NetError::Refused(format!("pair with ip: {}", e.name())))?;
-            joins.push(self.spawn_direct(pairing, setup.clone(), Some(resume)));
+        for slot in setup.records.pending_slots()? {
+            let pairing = DirectJoinerPairing::resume(
+                slot.address,
+                slot.lookup,
+                self.identity(),
+                name,
+                self.factory.clone(),
+                self.limits.core(),
+            )
+            .map_err(|e| NetError::Refused(format!("pair with ip: {}", e.name())))?;
+            joins.push(self.spawn_direct(pairing, setup.clone(), Some(slot.attempt)));
         }
         Ok(joins)
     }
@@ -485,7 +675,7 @@ where
         self: &Arc<Self>,
         pairing: DirectJoinerPairing<F>,
         setup: DirectSetup,
-        resume: Option<Resume>,
+        startup: Option<Option<AttemptId>>,
     ) -> DirectJoin {
         let (events_tx, events) = mpsc::unbounded_channel();
         let (state_tx, state) = watch::channel(pairing.state());
@@ -493,28 +683,29 @@ where
             pairing,
             setup,
             hold: None,
-            events: events_tx,
+            events: Some(events_tx),
             state: state_tx,
-            conn: None,
+            active: None,
             failed: None,
             clock: self.clock.clone(),
+            stopped: false,
+            startup,
+            waiting_hold: false,
+            cancel_wanted: false,
         }));
         let cancelling = flow.clone();
-        let cancel = Box::new(move || {
-            let mut f = lock_flow(&cancelling);
-            let actions = f.pairing.cancel()?;
-            let wire = f.run(actions);
-            f.to_connection(wire);
-            Ok(())
-        });
+        let cancel = Box::new(move || lock_flow(&cancelling).cancel());
         let stopping = flow.clone();
-        let stop = Box::new(move || {
-            let mut f = lock_flow(&stopping);
-            f.hold = None;
-            f.to_connection(vec![Wire::Close(ErrorCode::NoError)]);
-        });
+        let stop = Box::new(move || lock_flow(&stopping).stop());
         let caller = self.clone();
-        let task = tokio::spawn(async move { caller.drive_direct(flow, state, resume).await });
+        let task = tokio::spawn(async move {
+            let result = caller.drive_direct(&flow, state).await;
+            // The flow is over: the event stream ends, whatever the end.
+            let mut f = lock_flow(&flow);
+            f.events = None;
+            f.hold = None;
+            result
+        });
         DirectJoin {
             events,
             cancel,
@@ -524,47 +715,33 @@ where
     }
 
     async fn drive_direct(
-        self: Arc<Self>,
-        flow: SharedDirect<F>,
+        &self,
+        flow: &SharedDirect<F>,
         mut state: watch::Receiver<DirectJoinerState>,
-        resume: Option<Resume>,
     ) -> Result<DirectJoined, NetError> {
         let io = *self.limits.io();
         let mut backoff = Backoff {
             next: io.direct_retry_first_ms(),
             max: io.direct_retry_max_ms(),
         };
-        {
-            let mut f = lock_flow(&flow);
-            let actions = f.pairing.start();
-            f.run(actions);
-        }
+        lock_flow(flow).step(|p| p.start());
         loop {
-            let current = {
-                let mut f = lock_flow(&flow);
+            let (current, waiting) = {
+                let mut f = lock_flow(flow);
+                if f.stopped {
+                    return Err(NetError::Refused("the join was stopped".into()));
+                }
                 if let Some(e) = f.failed.take() {
-                    f.hold = None;
                     return Err(e);
                 }
-                f.pairing.state()
+                (f.pairing.state(), f.waiting_hold)
             };
             match current {
                 // A recovery at startup whose lookup another flow has:
-                // try again later, from the records as they are then.
-                DirectJoinerState::Ended(DirectEnd::Busy) if resume.is_some() => {
+                // ask again later, and load the records as they are then.
+                DirectJoinerState::Holding if waiting => {
                     tokio::time::sleep(backoff.wait()).await;
-                    let Some(resume) = &resume else {
-                        unreachable!("checked above");
-                    };
-                    let pairing = resume
-                        .pairing(&self)
-                        .map_err(|e| NetError::Refused(format!("pair with ip: {}", e.name())))?;
-                    // The same shared flow goes on, so the handle's cancel
-                    // and stop reach the new try.
-                    let mut f = lock_flow(&flow);
-                    f.pairing = pairing;
-                    let actions = f.pairing.start();
-                    f.run(actions);
+                    lock_flow(flow).retry_hold();
                 }
                 DirectJoinerState::Ended(end) => {
                     return Ok(DirectJoined {
@@ -577,19 +754,15 @@ where
                     state.borrow_and_update();
                     tokio::select! {
                         _ = tokio::time::sleep(wait) => {
-                            let mut f = lock_flow(&flow);
-                            let actions = f.pairing.start();
-                            f.run(actions);
+                            lock_flow(flow).step(|p| p.start());
                         }
                         // A cancel while away may end the flow.
                         _ = state.changed() => {}
                     }
                 }
                 DirectJoinerState::Connecting => {
-                    if let Some(connection) = self.dial_direct(&flow).await {
-                        if let Some(joined) =
-                            self.follow_direct(&flow, &mut state, connection).await
-                        {
+                    if let Some(dialled) = self.dial_direct(flow).await {
+                        if let Some(joined) = self.follow_direct(&mut state, dialled).await {
                             return Ok(joined);
                         }
                     }
@@ -607,9 +780,12 @@ where
     /// Dial the typed address: unpinned on a first contact, pinned to the
     /// stored host key on a recovery. Returns the started connection, or
     /// `None` when the flow moved on without one.
-    async fn dial_direct(&self, flow: &SharedDirect<F>) -> Option<Connection> {
+    async fn dial_direct(&self, flow: &SharedDirect<F>) -> Option<Dialled> {
         let (address, pin, denied) = {
             let f = lock_flow(flow);
+            if f.stopped {
+                return None;
+            }
             (
                 f.pairing.address(),
                 f.pairing.pinned_host(),
@@ -617,9 +793,7 @@ where
             )
         };
         let failed = |flow: &SharedDirect<F>| {
-            let mut f = lock_flow(flow);
-            let actions = f.pairing.on_dial_failed();
-            f.run(actions);
+            lock_flow(flow).step(|p| p.on_dial_failed());
             None
         };
         let own = match self.certs.current() {
@@ -644,37 +818,29 @@ where
             // The far end is this device: refused before this side's
             // certificate went out. The flow ends as "own device".
             Err(NetError::PairPeer(UnpinnedRefusal::OwnEndpoint)) => {
-                let mut f = lock_flow(flow);
                 let own_key = self.identity();
-                let actions = f.pairing.on_connected(own_key, [0u8; EXPORTER_LEN]);
-                f.run(actions);
+                lock_flow(flow).step(|p| p.on_connected(own_key, [0u8; EXPORTER_LEN]));
                 return None;
             }
             Err(_) => return failed(flow),
         };
         let peer = handshake.peer.identity;
+        let conn = self.next_conn_id();
+        let (cmd_tx, cmd_rx) = conn::channel();
         {
             let mut f = lock_flow(flow);
-            let actions = f.pairing.on_connected(peer, handshake.exporters.pair);
-            f.run(actions);
-            // A cancel while the dial was outstanding, or a far end the
-            // flow refuses: the connection goes unused.
-            if f.pairing.state() != DirectJoinerState::AwaitingHello {
+            f.step(|p| p.on_connected(peer, handshake.exporters.pair));
+            // Stopped, a cancel while the dial was outstanding, or a far
+            // end the flow refuses: the connection goes unused.
+            if f.stopped || f.pairing.state() != DirectJoinerState::AwaitingHello {
                 return None;
             }
+            // The connection is not admitted into the host's session until
+            // the pairing succeeds: an unconfirmed identity displaces no
+            // path of a host already paired.
+            lock(&self.paths).conns.insert(conn, cmd_tx.clone());
+            f.active = Some((conn, cmd_tx.clone()));
         }
-        let conn = match self.admit(peer, &handshake) {
-            Ok(conn) => conn,
-            Err(_) => {
-                let mut f = lock_flow(flow);
-                let actions = f.pairing.on_closed(None);
-                f.run(actions);
-                return None;
-            }
-        };
-        let (cmd_tx, cmd_rx) = conn::channel();
-        lock(&self.paths).conns.insert(conn, cmd_tx.clone());
-        lock_flow(flow).conn = Some(cmd_tx.clone());
         let skew = self.limits.core().clock_skew_secs();
         let deadline = handshake
             .local_window
@@ -690,19 +856,19 @@ where
                 CallerGate::pairing_only()
             },
             answer_due: None,
+            ack_due: false,
             answer_wait_ms: self.limits.io().proof_answer_wait_ms(),
             clock: self.clock.clone(),
             paths: self.paths.clone(),
             conn,
-            peer,
         };
-        Some(conn::spawn(
+        let connection = conn::spawn(
             conn::Start {
                 tls: stream,
                 side: MuxRole::Caller,
                 conn,
                 peer,
-                kx_group: handshake.kx_group,
+                kx_group: handshake.kx_group.clone(),
                 deadline,
                 clock: self.clock.clone(),
                 limits: self.limits,
@@ -711,22 +877,38 @@ where
             Box::new(role),
             cmd_tx,
             cmd_rx,
-        ))
+        );
+        Some(Dialled {
+            connection,
+            handshake,
+        })
     }
 
-    /// Follow the flow on `connection` until it ends paired (the
-    /// connection is returned live), ends otherwise, or goes away.
+    /// Follow the flow on its connection until it ends paired (the
+    /// connection, now admitted into the host's session, is returned
+    /// live), ends otherwise, or goes away. The connection's role delivers
+    /// its close to the flow.
     async fn follow_direct(
         &self,
-        flow: &SharedDirect<F>,
         state: &mut watch::Receiver<DirectJoinerState>,
-        connection: Connection,
+        dialled: Dialled,
     ) -> Option<DirectJoined> {
-        let mut closed_seen = false;
         loop {
             let now = *state.borrow_and_update();
             match now {
                 DirectJoinerState::Ended(DirectEnd::Paired) => {
+                    let Dialled {
+                        connection,
+                        handshake,
+                    } = dialled;
+                    let peer = *connection.peer();
+                    if self.admit_as(connection.id(), peer, &handshake).is_err() {
+                        connection.close(ErrorCode::InternalError);
+                        return Some(DirectJoined {
+                            end: DirectEnd::Paired,
+                            connection: None,
+                        });
+                    }
                     self.promote_first(&connection);
                     return Some(DirectJoined {
                         end: DirectEnd::Paired,
@@ -734,47 +916,342 @@ where
                     });
                 }
                 DirectJoinerState::Ended(_) | DirectJoinerState::Away => return None,
-                _ if closed_seen => return None,
                 _ => {}
             }
-            tokio::select! {
-                changed = state.changed() => {
-                    if changed.is_err() {
-                        return None;
-                    }
-                }
-                reason = connection.closed(), if !closed_seen => {
-                    closed_seen = true;
-                    let mut f = lock_flow(flow);
-                    f.conn = None;
-                    let actions = f.pairing.on_closed(reason.code());
-                    f.run(actions);
-                }
+            if state.changed().await.is_err() {
+                return None;
             }
         }
     }
 }
 
-/// What a recovery at startup needs to start again.
-struct Resume {
-    address: DirectAddress,
-    lookup: DirectLookup,
-    name: String,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clock::ManualClock;
+    use crate::direct_records::MemoryDirectRecords;
+    use mousse_net_core::grants::Role;
+    use mousse_net_core::identity::{IdentityPublicKey, SoftwareKey};
+    use mousse_net_core::pairing::{
+        CpaceExchangeFactory, DirectAddress, DirectPending, InvitationId,
+    };
+    use mousse_net_core::{Limits, UnixTime};
 
-impl Resume {
-    fn pairing<F>(&self, caller: &Caller<F>) -> Result<DirectJoinerPairing<F>, DirectJoinError>
-    where
-        F: CodeExchangeFactory + Clone + Send + 'static,
-        F::Exchange: Send,
-    {
-        DirectJoinerPairing::resume(
-            self.address,
-            self.lookup.clone(),
-            caller.identity(),
-            &self.name,
-            caller.factory.clone(),
-            caller.limits.core(),
+    const ADDRESS: &str = "192.168.1.20:47100";
+
+    fn key() -> IdentityPublicKey {
+        SoftwareKey::generate(&mut os_rng()).public_key()
+    }
+
+    fn k7qm() -> DirectLookup {
+        DirectLookup::from_canonical("K7QM").unwrap()
+    }
+
+    fn record(host: IdentityPublicKey, attempt: u8) -> DirectPending {
+        DirectPending {
+            lookup: k7qm(),
+            host,
+            invitation: InvitationId([7; 16]),
+            address: DirectAddress::parse(ADDRESS).unwrap(),
+            verified_at: UnixTime(1_790_000_000),
+            cancelled: false,
+            attempt: AttemptId([attempt; 16]),
+        }
+    }
+
+    #[derive(Default)]
+    struct Pins(Mutex<Vec<DirectPaired>>);
+
+    impl DirectPins for Pins {
+        fn store(&self, paired: &DirectPaired) -> Result<(), NetError> {
+            self.0.lock().unwrap().push(paired.clone());
+            Ok(())
+        }
+    }
+
+    struct Rig {
+        flow: SharedDirect<CpaceExchangeFactory>,
+        records: Arc<MemoryDirectRecords>,
+        pins: Arc<Pins>,
+        events: mpsc::UnboundedReceiver<DirectEvent>,
+        host: IdentityPublicKey,
+        clock: Arc<ManualClock>,
+        paths: Arc<Mutex<Paths>>,
+    }
+
+    /// A recovery at startup of `stored` (the record kept at startup),
+    /// over a store holding `now`.
+    fn rig(stored: &DirectPending, now: &[DirectPending]) -> Rig {
+        let records = Arc::new(MemoryDirectRecords::default());
+        for p in now {
+            records
+                .swap_pending(&p.lookup, &p.address, None, Some(p))
+                .unwrap();
+        }
+        let pins = Arc::new(Pins::default());
+        let clock = Arc::new(ManualClock::new());
+        let pairing = DirectJoinerPairing::resume(
+            stored.address,
+            stored.lookup.clone(),
+            key(),
+            "laptop",
+            CpaceExchangeFactory,
+            &Limits::DEFAULT,
         )
+        .unwrap();
+        let (events_tx, events) = mpsc::unbounded_channel();
+        let (state, _) = watch::channel(pairing.state());
+        let flow = Arc::new(Mutex::new(DirectFlow {
+            pairing,
+            setup: DirectSetup {
+                records: records.clone(),
+                pins: pins.clone(),
+                denied: Arc::new(|_| false),
+            },
+            hold: None,
+            events: Some(events_tx),
+            state,
+            active: None,
+            failed: None,
+            clock: clock.clone(),
+            stopped: false,
+            startup: Some(Some(stored.attempt)),
+            waiting_hold: false,
+            cancel_wanted: false,
+        }));
+        Rig {
+            flow,
+            records,
+            pins,
+            events,
+            host: stored.host,
+            clock,
+            paths: Arc::new(Mutex::new(Paths::default())),
+        }
+    }
+
+    impl Rig {
+        fn state(&self) -> DirectJoinerState {
+            lock_flow(&self.flow).pairing.state()
+        }
+
+        fn stored(&self) -> Vec<DirectPending> {
+            self.records.load(&k7qm()).unwrap().1
+        }
+
+        fn drained(&mut self) -> Vec<DirectEvent> {
+            let mut out = Vec::new();
+            while let Ok(e) = self.events.try_recv() {
+                out.push(e);
+            }
+            out
+        }
+
+        /// The flow takes its hold and loads, then is on connection `id`
+        /// (its role returned), with the host's `HELLO` heard.
+        fn connect(&self, id: u64) -> DirectRole<CpaceExchangeFactory> {
+            let mut f = lock_flow(&self.flow);
+            if f.pairing.state() != DirectJoinerState::Connecting {
+                f.step(|p| p.start());
+            }
+            assert_eq!(f.pairing.state(), DirectJoinerState::Connecting);
+            f.step(|p| p.on_connected(self.host, [1; EXPORTER_LEN]));
+            let (tx, _rx) = mpsc::unbounded_channel();
+            f.active = Some((ConnectionId(id), tx));
+            drop(f);
+            let mut role = self.role(id);
+            let mut out = Outbox::default();
+            role.on_hello(4, &mut out);
+            assert!(matches!(
+                out.control.as_slice(),
+                [ControlMessage::JoinDirect { .. }]
+            ));
+            role
+        }
+
+        fn role(&self, id: u64) -> DirectRole<CpaceExchangeFactory> {
+            DirectRole {
+                flow: self.flow.clone(),
+                gate: CallerGate::new(),
+                answer_due: None,
+                ack_due: false,
+                answer_wait_ms: 10_000,
+                clock: self.clock.clone(),
+                paths: self.paths.clone(),
+                conn: ConnectionId(id),
+            }
+        }
+    }
+
+    /// Deliver `message` to `role` as the connection driver would: through
+    /// the gate first.
+    fn deliver(
+        role: &mut DirectRole<CpaceExchangeFactory>,
+        message: ControlMessage,
+        out: &mut Outbox,
+    ) {
+        let traffic = match &message {
+            ControlMessage::Paired { .. } | ControlMessage::Authorized { .. } => Traffic::JoinProof,
+            _ => Traffic::Pairing,
+        };
+        if role.check(traffic, Some(&message)) == Verdict::Allow {
+            role.on_control(message, out);
+        }
+    }
+
+    fn paired() -> ControlMessage {
+        ControlMessage::Paired {
+            host_name: "Studio".into(),
+            role: Role::owner(),
+        }
+    }
+
+    fn live() -> ControlMessage {
+        ControlMessage::Authorized {
+            state: AuthorizedState::Live,
+        }
+    }
+
+    /// A connection the flow left reaches nothing: its late local close
+    /// (`CANCELLED` from a cancel) and a late `PAIRED` arrive while the
+    /// next recovery waits for its answer, and the pending record, the
+    /// recovery and its connection stay as they were. On the flow's own
+    /// connection, only the host's `GOAWAY` settles the record, never this
+    /// side's own close code.
+    #[test]
+    fn a_connection_the_flow_left_never_reaches_it() {
+        let stored = record(key(), 1);
+        let mut rig = rig(&stored, std::slice::from_ref(&stored));
+        let mut old = rig.connect(1);
+        lock_flow(&rig.flow).cancel().unwrap();
+        assert_eq!(rig.state(), DirectJoinerState::Away);
+        // The recovery carrying the cancel is on connection 2 and waits
+        // for the host's answer.
+        let _new = rig.connect(2);
+        assert_eq!(rig.state(), DirectJoinerState::AwaitingAnswer);
+        let kept = rig.stored();
+        assert_eq!(kept.len(), 1);
+        assert!(kept[0].cancelled);
+        let mut out = Outbox::default();
+        old.on_control(paired(), &mut out);
+        old.on_closed(&CloseReason::Local(ErrorCode::Cancelled));
+        assert_eq!(rig.state(), DirectJoinerState::AwaitingAnswer);
+        assert_eq!(rig.stored(), kept);
+        assert!(rig.pins.0.lock().unwrap().is_empty());
+        assert!(lock_flow(&rig.flow).owns(ConnectionId(2)));
+
+        // This side's own CANCELLED on its own connection keeps the record.
+        let mut current = rig.role(2);
+        current.on_closed(&CloseReason::Local(ErrorCode::Cancelled));
+        assert_eq!(rig.state(), DirectJoinerState::Away);
+        assert_eq!(rig.stored(), kept);
+        rig.drained();
+    }
+
+    /// After the handle stopped the flow, a `PAIRED` its connection still
+    /// reads stores no pin and changes no record: the hold is gone, and
+    /// another process may own the lookup.
+    #[test]
+    fn a_stopped_flow_takes_nothing_from_its_connection() {
+        let stored = record(key(), 1);
+        let rig = rig(&stored, std::slice::from_ref(&stored));
+        let mut role = rig.connect(1);
+        let mut out = Outbox::default();
+        deliver(&mut role, live(), &mut out);
+        lock_flow(&rig.flow).stop();
+        assert!(lock_flow(&rig.flow).hold.is_none());
+        deliver(&mut role, paired(), &mut out);
+        role.on_wake(rig.clock.mono(), &mut out);
+        role.on_closed(&CloseReason::Local(ErrorCode::NoError));
+        assert!(rig.pins.0.lock().unwrap().is_empty());
+        assert_eq!(rig.stored(), vec![stored]);
+        assert_eq!(rig.state(), DirectJoinerState::AwaitingAnswer);
+    }
+
+    /// The gate goes live before the pin is acknowledged: when `PAIRED`
+    /// lands the connection is live, while the pending record stays and
+    /// the flow is not over until the next wake.
+    #[test]
+    fn the_connection_is_live_before_the_flow_ends_paired() {
+        let stored = record(key(), 1);
+        let mut rig = rig(&stored, std::slice::from_ref(&stored));
+        let mut role = rig.connect(1);
+        let mut out = Outbox::default();
+        deliver(&mut role, live(), &mut out);
+        let mut out = Outbox::default();
+        deliver(&mut role, paired(), &mut out);
+        assert!(matches!(out.status, Some(ConnStatus::Live)));
+        assert_eq!(rig.pins.0.lock().unwrap().len(), 1);
+        assert_eq!(rig.state(), DirectJoinerState::Paired);
+        assert_eq!(rig.stored(), vec![stored]);
+        assert_eq!(role.wake_at(), Some(Millis(0)));
+        let mut out = Outbox::default();
+        role.on_wake(rig.clock.mono(), &mut out);
+        assert_eq!(rig.state(), DirectJoinerState::Ended(DirectEnd::Paired));
+        assert!(rig.stored().is_empty());
+        assert_eq!(
+            rig.drained().last(),
+            Some(&DirectEvent::Ended(DirectEnd::Paired))
+        );
+    }
+
+    /// A recovery at startup takes only the record of the attempt it was
+    /// started for: a newer record at the same lookup and address belongs
+    /// to another flow, and the recovery ends settled without touching it.
+    #[test]
+    fn a_startup_recovery_never_takes_a_newer_attempts_record() {
+        let host = key();
+        let old = record(host, 1);
+        let newer = record(host, 2);
+        let mut rig = rig(&old, std::slice::from_ref(&newer));
+        lock_flow(&rig.flow).step(|p| p.start());
+        assert_eq!(rig.state(), DirectJoinerState::Ended(DirectEnd::Settled));
+        assert_eq!(rig.stored(), vec![newer]);
+        assert_eq!(rig.drained(), vec![DirectEvent::Ended(DirectEnd::Settled)]);
+        assert!(lock_flow(&rig.flow).cancel().is_err());
+    }
+
+    /// A recovery at startup whose lookup another flow holds is not over:
+    /// no `Ended(Busy)`, a cancel is taken while it waits, and once it has
+    /// the hold the cancel marks its own record.
+    #[test]
+    fn a_startup_recovery_waits_for_its_hold_and_keeps_a_cancel() {
+        let stored = record(key(), 1);
+        let mut rig = rig(&stored, std::slice::from_ref(&stored));
+        let other = rig.records.hold(&k7qm()).unwrap().unwrap();
+        lock_flow(&rig.flow).step(|p| p.start());
+        assert_eq!(rig.state(), DirectJoinerState::Holding);
+        assert!(lock_flow(&rig.flow).waiting_hold);
+        assert_eq!(rig.drained(), Vec::new());
+        lock_flow(&rig.flow).cancel().unwrap();
+        // Still held: it waits on.
+        lock_flow(&rig.flow).retry_hold();
+        assert_eq!(rig.state(), DirectJoinerState::Holding);
+        assert_eq!(rig.drained(), Vec::new());
+        drop(other);
+        lock_flow(&rig.flow).retry_hold();
+        assert_eq!(rig.state(), DirectJoinerState::Away);
+        let kept = rig.stored();
+        assert_eq!(kept.len(), 1);
+        assert!(kept[0].cancelled);
+        assert_eq!(kept[0].attempt, stored.attempt);
+        assert_eq!(rig.drained(), vec![DirectEvent::Away]);
+    }
+
+    /// A cancel while connected goes to the connection as one step: the
+    /// abort and then the close, so closing cannot drop the abort.
+    #[test]
+    fn a_connected_cancel_is_one_step_for_the_connection() {
+        let stored = record(key(), 1);
+        let rig = rig(&stored, std::slice::from_ref(&stored));
+        let _role = rig.connect(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        lock_flow(&rig.flow).active = Some((ConnectionId(1), tx));
+        lock_flow(&rig.flow).cancel().unwrap();
+        let Ok(Cmd::Apply(out)) = rx.try_recv() else {
+            panic!("not one step");
+        };
+        assert_eq!(out.close, Some(ErrorCode::Cancelled));
+        assert!(rx.try_recv().is_err());
     }
 }
