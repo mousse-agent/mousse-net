@@ -60,6 +60,7 @@ pub(crate) fn run(config: &RunConfig) -> RunOutcome {
         Drill::Handshake => handshake(&mut world),
         Drill::SharedEndpoints => shared_endpoints(&mut world),
         Drill::RelayAdmission => crate::relay::run(&mut world.sim),
+        Drill::PairingDirect => crate::direct::run(&mut world.sim),
     };
     world.run();
     let World { sim, .. } = world;

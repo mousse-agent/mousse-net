@@ -137,6 +137,11 @@ fn relay_admission_smoke() {
     smoke(Drill::RelayAdmission, 0..300);
 }
 
+#[test]
+fn pairing_direct_smoke() {
+    smoke(Drill::PairingDirect, 0..300);
+}
+
 /// Each planted bug is reported as its invariant within 100 seeds, and the
 /// same seed without the bug does not report it.
 #[test]
