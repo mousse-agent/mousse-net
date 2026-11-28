@@ -333,6 +333,65 @@ fn credit_comes_from_one_budget_with_a_reserve_for_interactive() {
     p.b.assert_clean();
 }
 
+/// Thread streams filling the credit budget never stall a bot's chat: it
+/// draws on a reserve of its own on top of the budget, which a bot's
+/// browser view can't take, whatever class it was opened with.
+#[test]
+fn threads_filling_the_credit_budget_never_stall_bot_chat() {
+    // 512 KiB shared, 128 KiB of it interactive only, 128 KiB more for
+    // bot chat and calls, 128 KiB a stream.
+    let budget = [
+        ("APP_CREDIT_BUDGET_BYTES", "524288"),
+        ("APP_CREDIT_INTERACTIVE_RESERVE_BYTES", "131072"),
+        ("APP_CREDIT_BOT_RESERVE_BYTES", "131072"),
+        ("APP_STREAM_CREDIT_BYTES", "131072"),
+    ];
+    let mut p = pair_up("botcredit", &[], &budget);
+    let total = |app: &App, h: u32| app.st().tx.get(&h).map(|t| t.credit_total).unwrap_or(0);
+    let full = |app: &App, hs: &[u32]| {
+        app.wait("full credit", WAIT, |st| {
+            hs.iter()
+                .all(|h| st.tx.get(h).is_some_and(|t| t.credit_total == 128 * KIB))
+                .then_some(())
+        })
+    };
+    // Threads take the whole shared budget.
+    let bulk = open_bulk(&mut p.b, p.b_conn, 3);
+    full(&p.b, &bulk);
+    let sub = p.b.open(p.b_conn, "mousse.sub", "interactive");
+    full(&p.b, &[sub]);
+    let extra = p.b.open(p.b_conn, "mousse.sub", "interactive");
+    // The browser view finds no credit, opened bulk or interactive: the
+    // bot reserve is not for pictures.
+    let views = [
+        p.b.open(p.b_conn, "mousse.botview", "bulk"),
+        p.b.open(p.b_conn, "mousse.botview", "interactive"),
+    ];
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(u(&p.b.stats()["app_credit_out_bytes"]), 512 * KIB);
+    assert_eq!(total(&p.b, extra), 0);
+    for v in views {
+        assert_eq!(total(&p.b, v), 0, "the view took reserved credit");
+    }
+    // A bot's chat gets the reserve at once, and its data moves: once the
+    // engine takes the bytes, the credit comes back to it.
+    let chat = p.b.open(p.b_conn, "mousse.botsub", "interactive");
+    full(&p.b, &[chat]);
+    p.b.send(chat, &pattern(128 * KIB as usize, 3), false);
+    p.b.wait("bot chat credit back", WAIT, |st| {
+        st.tx
+            .get(&chat)
+            .is_some_and(|t| t.credit_total == 256 * KIB)
+            .then_some(())
+    });
+    assert_eq!(total(&p.b, extra), 0, "a thread got bot credit");
+    for v in views {
+        assert_eq!(total(&p.b, v), 0, "the view got bot credit");
+    }
+    assert_eq!(u(&p.b.stats()["app_credit_out_bytes"]), 640 * KIB);
+    p.b.assert_clean();
+}
+
 #[test]
 fn interactive_data_overtakes_bulk_queued_for_a_stalled_app() {
     let mut p = pair_up("prio", &[], &[]);

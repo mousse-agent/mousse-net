@@ -190,7 +190,10 @@ and a final write stalled on credit with FIN queued behind it.
     and asserts they stay within these bounds.
 - **App credit.** Each side grants app-channel credit from an 8 MiB budget,
   at most 256 KiB per stream, with 1 MiB reserved for interactive streams.
-  A stream that cannot get credit waits.
+  A stream that cannot get credit waits. A further 4 MiB on top of the
+  budget is kept for a bot's chat and calls (`mousse.botsub`,
+  `mousse.botrpc`), which thread streams can't use; `mousse.botview`
+  counts as bulk and can't use either reserve.
 - **Control.** 1 MiB of queue is reserved for control. `conn.*` events are
   coalesced per connection.
 - **Read-ahead.** The engine's `StreamReader::read` returns wire credit
