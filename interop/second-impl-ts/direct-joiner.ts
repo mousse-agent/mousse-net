@@ -66,28 +66,32 @@ export interface DirectPending {
   address: string;
   verifiedAt: bigint;
   cancelled: boolean;
+  // A, the attempt that passed: it names the flow that wrote the record.
+  attempt: Uint8Array;
 }
 
 export const encodePending = (pending: DirectPending): Buffer =>
   encode(record([1, pendingDomain], [2, pending.lookup], [3, pending.host], [4, pending.invitation],
-    [5, pending.address], [6, pending.verifiedAt], [7, pending.cancelled ? 1 : 0]));
+    [5, pending.address], [6, pending.verifiedAt], [7, pending.cancelled ? 1 : 0], [8, pending.attempt]));
 
 /** A stored pending record; one for another lookup or with a non-canonical address is refused. */
 export function decodePending(data: Uint8Array, lookup: string): DirectPending {
   const value = decode(data);
-  requireThat(fields(value, 1, 2, 3, 4, 5, 6, 7) && value.get(1n) === pendingDomain, 'invalid_pending');
+  requireThat(fields(value, 1, 2, 3, 4, 5, 6, 7, 8) && value.get(1n) === pendingDomain, 'invalid_pending');
   const host = value.get(3n);
   const invitation = value.get(4n);
   const address = value.get(5n);
   const verifiedAt = value.get(6n);
   const cancelled = value.get(7n);
+  const attempt = value.get(8n);
   requireThat(byteString(host, 65) && validPoint(host) && byteString(invitation, 16) &&
-    textString(address, 1, 255) && isUint(verifiedAt) && isUint(cancelled, 1n), 'invalid_pending');
+    textString(address, 1, 255) && isUint(verifiedAt) && isUint(cancelled, 1n) && byteString(attempt, 16),
+  'invalid_pending');
   let canonical: string | undefined;
   try { canonical = parseDirectAddress(address); } catch { /* refused below */ }
   requireThat(canonical === address, 'invalid_pending');
   requireThat(value.get(2n) === lookup, 'pending_lookup');
-  return { lookup, host, invitation, address, verifiedAt, cancelled: cancelled === 1n };
+  return { lookup, host, invitation, address, verifiedAt, cancelled: cancelled === 1n, attempt };
 }
 
 export type DirectRecordKind = 'ledger' | 'pending';
@@ -149,6 +153,7 @@ export type DirectJoinerEffect =
   | { write_failed: true }
   | { hold: string }
   | { hold_refused: string }
+  | { dial_failed: number }
   | { release: string }
   | { joiner: DirectJoinerEvent }
   // The app's first stream on the paired connection (it commits the host's provisional grant).
@@ -205,6 +210,8 @@ export class DirectJoiner {
   private connection?: Connection;
   // Whether this flow has the lookup's hold.
   private holding = true;
+  // The pin is being stored (step 7): nothing on the connection ends the flow or gives the hold back.
+  private pinning = false;
   // The connection the flow ended paired on, live, until the app opens its first stream there.
   private paired_?: Connection;
 
@@ -321,11 +328,17 @@ export class DirectJoiner {
       return effects;
     }
     this.holding = true;
+    // A flow with a pending record takes only the one its own attempt wrote; a newer record at the same address
+    // belongs to another flow. When its own is gone it ends (settled) and acts on nothing.
+    const own = this.pending;
+    if (own && (!records.pending || !equalBytes(records.pending.attempt, own.attempt))) {
+      return [...effects, ...this.end('settled')];
+    }
     this.ledgerBytes = records.ledgerBytes;
     this.pendingBytes = records.pendingBytes;
     this.pending = records.pending;
     if (!this.pending) return [...effects, ...this.end('settled')];
-    return effects.length ? effects : undefined;
+    return effects;
   }
 
   private end(outcome: string): DirectJoinerEffect[] {
@@ -359,6 +372,8 @@ export class DirectJoiner {
       effects.push({ conn: connection.id, close: code });
     }
     this.closed();
+    // While the pin is being stored the connection closes, but the flow goes on and keeps the hold.
+    if (this.pinning) return effects;
     return [...effects, ...(this.pending && keepFlow ? this.away() : this.end(outcome))];
   }
 
@@ -368,15 +383,37 @@ export class DirectJoiner {
     return [...effects, ...this.fail('internal_error', 'closed:internal_error', false)];
   }
 
+  /**
+   * Before dialling: from away, take the hold and reload the records first. Returns what happened; the flow
+   * dials only when `dialling` is then true, pinned to `pin` on a recovery.
+   */
+  dial(): DirectJoinerEffect[] {
+    requireThat(this.state === 'ready' || this.state === 'away', 'wrong_state');
+    return this.retake() ?? [];
+  }
+
+  /** Whether the flow may dial now (it has the hold and has not ended). */
+  get dialling() { return this.holding && (this.state === 'ready' || this.state === 'away'); }
+
+  /** The host key a recovery's TLS is pinned to; none on a first contact (no pin, 5.4). */
+  get pin() { return this.pending?.host; }
+
+  /**
+   * The dial failed before TLS was up (no answer, or a recovery's pinned TLS met another key): the hold goes
+   * back; a first contact ends, a recovery stays away with its record.
+   */
+  dialFailed(id: number): DirectJoinerEffect[] {
+    const effects: DirectJoinerEffect[] = [{ dial_failed: id }];
+    return [...effects, ...(this.pending ? this.away() : this.end('closed'))];
+  }
+
   /** TLS is up and the joiner sees the far end's identity key. */
   connect(id: number, peer: Uint8Array, exporters: { pair: Uint8Array }): DirectJoinerEffect[] {
-    requireThat(this.state === 'ready' || this.state === 'away', 'wrong_state');
-    const held = this.retake();
-    if (held && (!this.holding || this.ended)) return held;
-    const effects = held ?? [];
+    requireThat(this.dialling, 'wrong_state');
     const recovery = this.pending !== undefined;
     // A recovery is dialled pinned to the record's host key: another key never connects.
-    if (recovery && !equalBytes(peer, this.pending!.host)) return [...effects, ...this.away()];
+    if (recovery && !equalBytes(peer, this.pending!.host)) return this.dialFailed(id);
+    const effects: DirectJoinerEffect[] = [];
     if (!recovery && equalBytes(peer, this.context.identity)) {
       return [...effects, { conn: id, close: 'pairing_failed' }, ...this.end('own_device')];
     }
@@ -480,7 +517,7 @@ export class DirectJoiner {
     attempt.initiator = undefined;
     confirmation.isk.fill(0);
     const pending: DirectPending = { lookup: this.lookup, host: connection.peer, invitation: this.invitation!,
-      address: this.address, verifiedAt: BigInt(now), cancelled: false };
+      address: this.address, verifiedAt: BigInt(now), cancelled: false, attempt: Uint8Array.from(attempt.id) };
     const effects: DirectJoinerEffect[] = [];
     if (!this.write('pending', encodePending(pending), effects)) {
       confirmation.message.fill(0);
@@ -527,6 +564,7 @@ export class DirectJoiner {
   // Step 7: PAIRED, only after the host's confirmation verified (or on a recovery), never once cancelled,
   // except as the settling answer to the recovery that carries the cancel flag (the grant committed first).
   private paired(connection: Connection, msg: Extract<Control, { type: 'PAIRED' }>): DirectJoinerEffect[] {
+    if (this.pinning) return this.fail('protocol_error');
     const pending = this.pending;
     if (pending?.cancelled && !(connection.recovery && connection.cancelling)) return [];
     const expected = connection.recovery ? this.state === 'recovering' || this.state === 'awaiting_allow'
@@ -534,7 +572,12 @@ export class DirectJoiner {
     if (!pending || !expected) return this.fail('protocol_error');
     const pairing = { host: pending.host, address: pending.address, invitation: pending.invitation, name: msg.name,
       role: msg.role };
-    try { this.context.store.savePairing(pairing); } catch { return this.failedWrite([{ write_failed: true }]); }
+    this.pinning = true;
+    try { this.context.store.savePairing(pairing); } catch {
+      this.pinning = false;
+      return this.failedWrite([{ write_failed: true }]);
+    }
+    this.pinning = false;
     const effects: DirectJoinerEffect[] = [{ joiner: { paired: { address: pairing.address, host: hex(pairing.host),
       invitation: hex(pairing.invitation), name: pairing.name, role: pairing.role } } }];
     const { gate } = connection;

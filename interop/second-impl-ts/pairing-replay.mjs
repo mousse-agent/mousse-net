@@ -896,6 +896,8 @@ export function replayDirectJoinerSequence(sequence, conventions) {
   let address;
   let lastConn;
   let transit = [];
+  // Flows set aside by `park`, by name.
+  const parked = new Map();
 
   for (const [index, step] of sequence.steps.entries()) {
     const name = `step ${index + 1} ${step.op}`;
@@ -1047,24 +1049,29 @@ export function replayDirectJoinerSequence(sequence, conventions) {
         assert.ok(step.lose === undefined || step.lose === 'msg_c');
         assert.ok(step.crash === undefined || step.crash === 'after_msg_c');
         const party = step.host === 'own' ? undefined : hostOf(step.host);
+        const peer = party ? party.identity : joinerIdentity;
+        // From away the flow first takes the hold and reloads; a refused hold dials nothing.
+        run(flow.dial());
+        if (!flow.dialling) break;
+        // The dial: no answer, or a recovery's TLS, pinned to the stored host key, meeting another key, fails it
+        // before TLS is up; no connection is left behind.
+        if (step.unreachable || (flow.pin && !equalBytes(flow.pin, peer))) {
+          run(flow.dialFailed(step.conn));
+          break;
+        }
         conns.set(step.conn, { party, lose: step.lose, crash: step.crash, silent: step.silent, exchanges: 0 });
         lastConn = step.conn;
         const exporters = { pair: Buffer.alloc(32, step.conn + 100) };
-        const effects = flow.connect(step.conn, party ? party.identity : joinerIdentity, exporters);
-        // From away the flow first takes the hold and reloads; then TLS, the host's step 2 and HELLOs.
-        const hello = effects.findIndex(effect => 'send' in effect);
-        run(hello < 0 ? effects : effects.slice(0, hello));
-        if (hello >= 0) {
-          if (party) {
-            // Step 2 with the host's gate, then the host's HELLO, which agrees on min(minor, 4).
-            fromHost(party, party.host.connect(step.conn, joinerIdentity, exporters, now), (conn, message) => {
-              if (message.type !== 'HELLO' || step.minor === undefined) return false;
-              queue.push({ conn, message: { ...message, minor: Math.min(step.minor, directMinor) } });
-              return true;
-            });
-          }
-          run(effects.slice(hello));
+        const effects = flow.connect(step.conn, peer, exporters);
+        if (party && effects.some(effect => 'send' in effect)) {
+          // Step 2 with the host's gate, then the host's HELLO, which agrees on min(minor, 4).
+          fromHost(party, party.host.connect(step.conn, joinerIdentity, exporters, now), (conn, message) => {
+            if (message.type !== 'HELLO' || step.minor === undefined) return false;
+            queue.push({ conn, message: { ...message, minor: Math.min(step.minor, directMinor) } });
+            return true;
+          });
         }
+        run(effects);
         if (step.silent && flow) {
           // No answer: the joiner's 10 s timer runs.
           out.push({ answer_timeout: step.conn });
@@ -1098,6 +1105,19 @@ export function replayDirectJoinerSequence(sequence, conventions) {
         break;
       case 'fail_next_write':
         store.failNext = true;
+        break;
+      case 'park':
+        // The current flow is set aside; ops act on no flow until the next start, resume or unpark.
+        assert.ok(flow && !parked.has(step.as), `${name}: nothing to park as ${step.as}`);
+        parked.set(step.as, flow);
+        flow = undefined;
+        break;
+      case 'unpark':
+        assert.ok(parked.has(step.flow), `${name}: no flow ${step.flow}`);
+        flow = parked.get(step.flow);
+        parked.delete(step.flow);
+        lookup = flow.lookup;
+        address = flow.address;
         break;
       default:
         assert.fail(`unknown operation ${step.op}`);

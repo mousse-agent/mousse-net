@@ -11,8 +11,10 @@ stream frame, the host gate's "commit first" and cancel exception of
 wire.md 8.1, and recovery), runs the joiner side
 (`direct-joiner.ts`: the typed address and code, the lookup's hold, the
 attempt ledger per typed lookup and the pending records per typed lookup
-and address, with their compare-and-swap writes under the hold and their
-times kept whole up to 2^64 - 1, first contact, the 10 s answer wait,
+and address, each naming the attempt that wrote it, with their
+compare-and-swap writes under the hold and their times kept whole up to
+2^64 - 1, first contact, a recovery's dial pinned to the stored host key,
+the 10 s answer wait,
 recovery and cancel, and the first stream once paired, which commits the
 host's provisional grant), and runs the caller's
 pairing-only gate (wire.md 8.2). A TLS transport supplies the peer identity and the two TLS
@@ -51,7 +53,7 @@ The tests print case counts by vector file and end with `PASS second-impl` or
 twelve attempt sequences and the fifty-three Pair with IP host sequences
 of `direct-host.json` (with its `before_msg_a` section) with the supplied
 random draws, and compare the resulting messages and host events byte for
-byte. The nineteen Pair with IP end-to-end sequences of `direct-joiner.json`
+byte. The twenty-two Pair with IP end-to-end sequences of `direct-joiner.json`
 run the joiner against that host (or a fake host) from their draws, every
 message through the receiving side's gate, and compare every message, close,
 record write and hold in order, then the joiner's state, ledger, pending

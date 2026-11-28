@@ -527,6 +527,7 @@ function outcome(expected, fn) {
         assert.equal(pending.address, item.address);
         assert.equal(pending.verifiedAt, BigInt(item.verified_at));
         assert.equal(pending.cancelled, item.cancelled);
+        assert.equal(hex(pending.attempt), item.attempt);
         matches(encodePending(pending), item.bytes);
       }
     });
