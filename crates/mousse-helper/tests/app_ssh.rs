@@ -704,7 +704,9 @@ fn a_long_preamble_or_reply_is_remote_failed() {
 }
 
 /// What the client and the remote say maps to a named reason: a missing
-/// launcher, a Windows remote, a refused login, nothing listening.
+/// launcher (also on a Windows remote whose Mousse writes no `.cmd`
+/// launchers yet, under `cmd` or PowerShell), a refused login, nothing
+/// listening.
 #[test]
 fn failures_are_named() {
     let fx = Fx::new("reasons");
@@ -719,6 +721,15 @@ fn failures_are_named() {
         "win",
         RemoteOpts {
             shell: Shell::WindowsCmd,
+            launchers: false,
+            ..RemoteOpts::default()
+        },
+    );
+    let powershell = fx.remote(
+        "ps",
+        RemoteOpts {
+            shell: Shell::WindowsPowershell,
+            launchers: false,
             ..RemoteOpts::default()
         },
     );
@@ -738,6 +749,7 @@ fn failures_are_named() {
     fx.hosts(&[
         ("bare", bare.port()),
         ("win", windows.port()),
+        ("ps", powershell.port()),
         ("stranger", stranger.port()),
         ("dead", dead),
     ]);
@@ -745,7 +757,8 @@ fn failures_are_named() {
     let request = json!({"op": "profiles"});
     for (target, want) in [
         ("bare", "remote_not_installed"),
-        ("win", "windows_remote_unsupported"),
+        ("win", "remote_not_installed"),
+        ("ps", "remote_not_installed"),
         ("stranger", "auth_denied"),
     ] {
         let route = resolve(&mut a, target);
@@ -1036,8 +1049,8 @@ fn ssh_limits_can_only_be_tightened() {
 
 /// The caller's `ssh` tier: an SSH address the owner set with
 /// `peer.addresses.set {route_id, selector, shell}` is what `dial` reaches
-/// the host over; a Windows shell is refused; `ssh.forget` drops the
-/// address and its approval.
+/// the host over; a shell it does not know is refused; `ssh.forget` drops
+/// the address and its approval.
 #[test]
 fn the_ssh_tier_dials_an_owner_ssh_address() {
     let fx = Fx::new("tier");
@@ -1055,15 +1068,11 @@ fn the_ssh_tier_dials_an_owner_ssh_address() {
         "peer.add",
         json!({"identity": identity, "name": "hostB", "routes": []}),
     );
-    let windows = a.request(
+    let bash = a.request(
         "peer.addresses.set",
-        json!({"identity": identity, "routes": [{"route_id": route, "selector": SEL, "shell": "cmd"}]}),
+        json!({"identity": identity, "routes": [{"route_id": route, "selector": SEL, "shell": "bash"}]}),
     );
-    assert_eq!(
-        error_of(&windows),
-        "windows_remote_unsupported",
-        "{windows}"
-    );
+    assert_eq!(error_of(&bash), "bad_route", "{bash}");
     let set = a.call(
         "peer.addresses.set",
         json!({"identity": identity, "routes": [{"route_id": route, "selector": SEL, "shell": "sh"}]}),
@@ -1136,4 +1145,187 @@ fn an_ssh_failure_only_the_owner_can_fix_is_not_retried() {
         .filter(|m| m["identity"] == identity.as_str() && m["why"] == "host_key_unknown")
         .count();
     assert_eq!(ssh_failures, 1, "keep connected logged in again");
+}
+
+// ---------------------------------------------------------------------
+// Windows remotes: `cmd` or PowerShell as OpenSSH's default shell.
+// ---------------------------------------------------------------------
+
+/// The `sh` form of `mousse-cli net-engine ssh`.
+const SH_CLI: &str = "exec /bin/sh -c '\"$HOME\"/.mousse/bin/mousse-cli net-engine ssh'";
+
+/// The Windows shells the test server stands in for: the shell, its name
+/// in replies and route files, and the form of `mousse-cli net-engine ssh`
+/// that runs in it.
+fn windows_shells() -> [(Shell, &'static str, &'static str); 2] {
+    [
+        (
+            Shell::WindowsCmd,
+            "cmd",
+            r".\.mousse\bin\mousse-cli.cmd net-engine ssh",
+        ),
+        (
+            Shell::WindowsPowershell,
+            "powershell",
+            r".\.mousse\bin\mousse-cli.cmd net-engine ssh; exit $LASTEXITCODE",
+        ),
+    ]
+}
+
+/// What `ssh.resolve` keeps for a route (`<state>/ssh/<route_id>.json`).
+fn route_file(end: &Endpoint, route: &str) -> Value {
+    let text = std::fs::read(end.dir.join("ssh").join(format!("{route}.json"))).unwrap();
+    serde_json::from_slice(&text).unwrap()
+}
+
+/// `ssh.run` on a route whose shell is not known tries the `sh` form; the
+/// Windows shell's answer names it, the route keeps it, and the request
+/// runs again in its form. Later runs take one connection, in that form.
+/// A route kept as `sh` (an earlier bind) that gets a Windows answer
+/// learns the shell again.
+#[test]
+fn ssh_run_learns_a_windows_shell_once_and_keeps_it() {
+    let fx = Fx::new("learn");
+    for (shell, name, form) in windows_shells() {
+        let r = fx.remote(
+            name,
+            RemoteOpts {
+                shell,
+                ..RemoteOpts::default()
+            },
+        );
+        fx.hosts(&[("box", r.port())]);
+        let (end, mut a) = fx.caller(&format!("learn{name}"), &[]);
+        let route = resolve(&mut a, "box");
+        assert_eq!(route_file(&end, &route)["shell"], Value::Null);
+        pin(&mut a, &route);
+        let request = json!({"op": "profiles"});
+        let got = a.call("ssh.run", json!({"route_id": route, "request": request}));
+        assert_eq!(got["reply"], request, "{got}");
+        assert_eq!(got["shell"], name, "{got}");
+        assert_eq!(route_file(&end, &route)["shell"], name);
+        assert_eq!(r.sshd.commands(), [SH_CLI, form]);
+
+        let got = a.call("ssh.run", json!({"route_id": route, "request": request}));
+        assert_eq!(got["shell"], name, "{got}");
+        assert_eq!(r.sshd.commands(), [SH_CLI, form, form]);
+
+        // Kept as `sh`, as an older bind wrote it. (Another caller: this
+        // one has used four of its five connections to the server.)
+        let (end, mut a) = fx.caller(&format!("learnsh{name}"), &[]);
+        let route = resolve(&mut a, "box");
+        pin(&mut a, &route);
+        let mut file = route_file(&end, &route);
+        file["shell"] = json!("sh");
+        std::fs::write(
+            end.dir.join("ssh").join(format!("{route}.json")),
+            file.to_string(),
+        )
+        .unwrap();
+        let got = a.call("ssh.run", json!({"route_id": route, "request": request}));
+        assert_eq!(got["shell"], name, "{got}");
+        assert_eq!(r.sshd.commands(), [SH_CLI, form, form, SH_CLI, form]);
+        assert_eq!(route_file(&end, &route)["shell"], name);
+    }
+}
+
+/// A Unix remote answers in the `sh` form, says so, and keeps one
+/// connection per run.
+#[test]
+fn ssh_run_names_the_sh_shell() {
+    let fx = Fx::new("shname");
+    let r = fx.remote("b", RemoteOpts::default());
+    fx.hosts(&[("box", r.port())]);
+    let (_end, mut a) = fx.caller("shname", &[]);
+    let route = resolve(&mut a, "box");
+    pin(&mut a, &route);
+    let got = a.call(
+        "ssh.run",
+        json!({"route_id": route, "request": {"op": "profiles"}}),
+    );
+    assert_eq!(got["shell"], "sh", "{got}");
+    assert_eq!(r.sshd.commands(), [SH_CLI]);
+}
+
+/// Adding a Windows computer stays within the connection window
+/// (`SSH_TARGET_CONNECTS`, 5): the key fetch, `profiles` in the `sh` form
+/// and again in the Windows form, `prepare`, then the pipe dial, which
+/// runs `mousse-helper pipe` in the learned form and carries the session.
+/// `peer.addresses.set` takes the Windows shell.
+#[test]
+fn a_windows_remote_is_added_and_dialled_within_the_window() {
+    let fx = Fx::new("winadd");
+    for (shell, name, _) in windows_shells() {
+        let r = fx.remote(
+            name,
+            RemoteOpts {
+                shell,
+                ..RemoteOpts::default()
+            },
+        );
+        fx.hosts(&[("box", r.port())]);
+        let (_a_end, mut a) = fx.caller(&format!("winadda{name}"), &[]);
+        let (b_end, mut b, pairing) = host_for(&mut a, &format!("winaddb{name}"));
+        r.publish(&[(SEL, &b_end.dir, true)]);
+        let route = resolve(&mut a, "box");
+        pin(&mut a, &route);
+        let profiles = json!({"op": "profiles"});
+        let got = a.call("ssh.run", json!({"route_id": route, "request": profiles}));
+        assert_eq!(got["shell"], name, "{got}");
+        let prepare = json!({"op": "prepare"});
+        a.call("ssh.run", json!({"route_id": route, "request": prepare}));
+        let reply = ssh_dial(&mut a, &route, SEL, &b.identity);
+        let conn = reply["conn"].as_u64().unwrap_or_else(|| panic!("{reply}"));
+        assert!(
+            a.events("ssh.waiting").is_empty(),
+            "the add waited in the window"
+        );
+        let pipe = r.sshd.commands().pop().unwrap();
+        assert!(
+            pipe.starts_with(&format!(
+                r".\.mousse\bin\mousse-helper.cmd pipe --profile {SEL}"
+            )),
+            "{pipe}"
+        );
+        exchange(&mut a, conn, &mut b, pairing, 200_000);
+
+        let identity = b.identity.clone();
+        let set = a.call(
+            "peer.addresses.set",
+            json!({"identity": identity, "routes": [{"route_id": route, "selector": SEL, "shell": name}]}),
+        );
+        assert_eq!(set["routes"], json!([format!("ssh://mousse-{route}")]));
+    }
+}
+
+/// Resolving a route again keeps its learned shell only while it reaches
+/// the same host and port; another server starts unknown again.
+#[test]
+fn resolving_again_keeps_the_shell_only_for_the_same_server() {
+    let fx = Fx::new("reshell");
+    let windows = fx.remote(
+        "win",
+        RemoteOpts {
+            shell: Shell::WindowsCmd,
+            ..RemoteOpts::default()
+        },
+    );
+    let unix = fx.remote("unix", RemoteOpts::default());
+    fx.hosts(&[("box", windows.port())]);
+    let (end, mut a) = fx.caller("reshell", &[]);
+    let route = resolve(&mut a, "box");
+    pin(&mut a, &route);
+    let request = json!({"op": "profiles"});
+    a.call("ssh.run", json!({"route_id": route, "request": request}));
+    assert_eq!(route_file(&end, &route)["shell"], "cmd");
+    a.call("ssh.resolve", json!({"target": "box", "route_id": route}));
+    assert_eq!(route_file(&end, &route)["shell"], "cmd");
+
+    fx.hosts(&[("box", unix.port())]);
+    a.call("ssh.resolve", json!({"target": "box", "route_id": route}));
+    assert_eq!(route_file(&end, &route)["shell"], Value::Null);
+    pin(&mut a, &route);
+    let got = a.call("ssh.run", json!({"route_id": route, "request": request}));
+    assert_eq!(got["shell"], "sh", "{got}");
+    assert_eq!(unix.sshd.commands(), [SH_CLI]);
 }
