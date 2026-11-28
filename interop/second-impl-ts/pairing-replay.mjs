@@ -1055,7 +1055,10 @@ export function replayDirectJoinerSequence(sequence, conventions) {
         if (!flow.dialling) break;
         // The dial: no answer, or a recovery's TLS, pinned to the stored host key, meeting another key, fails it
         // before TLS is up; no connection is left behind.
-        if (step.unreachable || (flow.pin && !equalBytes(flow.pin, peer))) {
+        // With `cancel_first` the person cancels while the dial is outstanding; the dial then fails.
+        if (step.cancel_first) run(flow.cancel());
+        if (step.cancel_first || step.unreachable || (flow.pin && !equalBytes(flow.pin, peer))) {
+          out.push({ dial_failed: step.conn });
           run(flow.dialFailed(step.conn));
           break;
         }

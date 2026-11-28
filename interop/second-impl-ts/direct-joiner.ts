@@ -400,11 +400,13 @@ export class DirectJoiner {
 
   /**
    * The dial failed before TLS was up (no answer, or a recovery's pinned TLS met another key): the hold goes
-   * back; a first contact ends, a recovery stays away with its record.
+   * back; a first contact ends, a recovery stays away with its record. One end per Connect: a dial failure
+   * after the flow ended, or after a cancel while the dial was outstanding, changes nothing and lists nothing.
+   * The I/O layer lists the failed dial itself.
    */
   dialFailed(id: number): DirectJoinerEffect[] {
-    const effects: DirectJoinerEffect[] = [{ dial_failed: id }];
-    return [...effects, ...(this.pending ? this.away() : this.end('closed'))];
+    if (!this.dialling) return [];
+    return this.pending ? this.away() : this.end('closed');
   }
 
   /** TLS is up and the joiner sees the far end's identity key. */
@@ -412,7 +414,7 @@ export class DirectJoiner {
     requireThat(this.dialling, 'wrong_state');
     const recovery = this.pending !== undefined;
     // A recovery is dialled pinned to the record's host key: another key never connects.
-    if (recovery && !equalBytes(peer, this.pending!.host)) return this.dialFailed(id);
+    if (recovery && !equalBytes(peer, this.pending!.host)) return [{ dial_failed: id }, ...this.dialFailed(id)];
     const effects: DirectJoinerEffect[] = [];
     if (!recovery && equalBytes(peer, this.context.identity)) {
       return [...effects, { conn: id, close: 'pairing_failed' }, ...this.end('own_device')];

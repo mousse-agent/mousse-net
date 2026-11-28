@@ -53,7 +53,7 @@ The tests print case counts by vector file and end with `PASS second-impl` or
 twelve attempt sequences and the fifty-three Pair with IP host sequences
 of `direct-host.json` (with its `before_msg_a` section) with the supplied
 random draws, and compare the resulting messages and host events byte for
-byte. The twenty-two Pair with IP end-to-end sequences of `direct-joiner.json`
+byte. The twenty-three Pair with IP end-to-end sequences of `direct-joiner.json`
 run the joiner against that host (or a fake host) from their draws, every
 message through the receiving side's gate, and compare every message, close,
 record write and hold in order, then the joiner's state, ledger, pending
