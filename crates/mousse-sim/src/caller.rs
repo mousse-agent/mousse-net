@@ -515,7 +515,7 @@ impl CallerDev {
 
     fn on_mux_event(&mut self, sim: &mut Sim, conn: ConnectionId, event: MuxEvent) {
         match event {
-            MuxEvent::Control(bytes) => match ControlMessage::decode(&bytes) {
+            MuxEvent::Control(bytes) => match crate::sim::decode_control(&bytes) {
                 Ok(msg) => {
                     if self.gate_allows(sim, conn, CallerTraffic::of(&msg)) {
                         self.on_control(sim, conn, msg)
@@ -600,7 +600,11 @@ impl CallerDev {
                     }
                     ControlMessage::CodeAbort { attempt, .. } => flow.on_code_abort(attempt),
                     ControlMessage::Paired { host_name, role } => flow.on_paired(host_name, role),
-                    ControlMessage::JoinProof { .. } => {
+                    // Caller-only; the others are not defined at the
+                    // simulation's minor and never decode (`decode_control`).
+                    ControlMessage::JoinProof { .. }
+                    | ControlMessage::JoinDirect { .. }
+                    | ControlMessage::AuthorizedDirect { .. } => {
                         return self.close(sim, conn, ErrorCode::ProtocolError)
                     }
                 };

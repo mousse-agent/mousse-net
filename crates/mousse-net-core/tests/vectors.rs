@@ -5,19 +5,21 @@
 use wasm_bindgen_test::wasm_bindgen_test as test;
 
 use mousse_net_core::authz::{
-    CallerGate, CallerGateState, CallerTraffic, ConnectionGate, GateState, Traffic, Verdict,
+    CallerGate, CallerGateState, CallerTraffic, ConnectionGate, GateState, PairingOnlyStep,
+    Traffic, Verdict,
 };
-use mousse_net_core::cbor;
+use mousse_net_core::cbor::{self, FieldError};
 use mousse_net_core::control::{
-    negotiate_version, AuthorizedState, ControlMessage, HelloOutcome, HelloState, VersionSupport,
+    negotiate_version, AuthorizedState, ControlError, ControlMessage, HelloOutcome, HelloState,
+    VersionSupport,
 };
 use mousse_net_core::grants::{GrantTable, NewGrant, OwnerRef, Role};
 use mousse_net_core::identity::{IdentityPublicKey, RawSignature, SoftwareKey};
 use mousse_net_core::mux::{decode_frame, Frame, Mux, MuxEvent, MuxRole, PriorityClass, StreamId};
 use mousse_net_core::pairing::{
     attempt_sid, binding_transcript, join_proof_input, join_proof_mac, verify_join_proof,
-    AttemptId, DirectCode, InvitationId, InvitationKind, Route, RouteHost, Ticket, TicketSecret,
-    DIRECT_CODE_ALPHABET,
+    AttemptId, DirectCode, DirectLookup, InvitationId, InvitationKind, Route, RouteHost, Ticket,
+    TicketSecret, DIRECT_CODE_ALPHABET,
 };
 use mousse_net_core::session::{PeerSession, SessionEvent};
 use mousse_net_core::session_cert::{self, PendingCertificate, SessionKey, ValidityWindow};
@@ -346,6 +348,11 @@ fn traffic(name: &str) -> Traffic {
         "hello" => Traffic::Hello,
         "goaway" => Traffic::GoAway,
         "join_proof" => Traffic::JoinProof,
+        "join_direct" => Traffic::of(&ControlMessage::JoinDirect {
+            lookup: DirectLookup::from_canonical("K7QM").expect("lookup"),
+            name: "Laptop".into(),
+            recovery: None,
+        }),
         "pairing" => Traffic::Pairing,
         "stream" => Traffic::Stream,
         "host_only" => Traffic::HostOnly,
@@ -441,6 +448,15 @@ fn caller_state_name(state: CallerGateState) -> String {
         CallerGateState::AwaitingProofAnswer => "awaiting_proof_answer".into(),
         CallerGateState::JoinOnly => "join_only".into(),
         CallerGateState::Live => "live".into(),
+        CallerGateState::PairingOnly(step) => format!(
+            "pairing_only:{}",
+            match step {
+                PairingOnlyStep::AwaitingAnswer => "awaiting_answer",
+                PairingOnlyStep::NoticeSeen => "notice_seen",
+                PairingOnlyStep::JoinOnly => "join_only",
+                PairingOnlyStep::Paired => "paired",
+            }
+        ),
         CallerGateState::Closed(code) => format!("closed:{}", code.name()),
     }
 }
@@ -469,7 +485,11 @@ fn caller_gate() {
                 )
                 .expect("add");
         }
-        let mut gate = CallerGate::new();
+        let mut gate = match case["start"].as_str() {
+            None => CallerGate::new(),
+            Some("pairing_only") => CallerGate::pairing_only(),
+            Some(other) => panic!("start {other}"),
+        };
         for step in list(&case["steps"]) {
             match s(&step["op"]) {
                 "check" => {
@@ -477,6 +497,7 @@ fn caller_gate() {
                     assert_eq!(got, s(&step["verdict"]), "{name}: {}", s(&step["traffic"]));
                 }
                 "promote" => gate.promote(),
+                "promote_direct" => gate.promote_direct(),
                 "sent_join_proof" => gate.sent_join_proof(),
                 "host_stream" => {
                     let host = key(&ids[s(&step["host"])]);
@@ -877,18 +898,48 @@ fn mux_frames() {
 #[test]
 fn control_messages() {
     let doc = load("control.json");
+    // Cases without `minor` hold for every agreed minor version this build
+    // speaks.
+    let minor = |case: &J| {
+        case["minor"]
+            .as_u64()
+            .unwrap_or(VersionSupport::LOCAL.minor)
+    };
     for case in list(&doc["valid"]) {
         let bytes = unhex(&case["hex"]);
-        let m = ControlMessage::decode(&bytes).expect("valid");
+        let m = ControlMessage::decode_at(&bytes, minor(case)).expect("valid");
         assert_eq!(m.type_number(), u(&case["type"]));
         assert_eq!(m.encode(), bytes);
     }
     for case in list(&doc["invalid"]) {
-        assert!(
-            ControlMessage::decode(&unhex(&case["hex"])).is_err(),
-            "{}",
-            s(&case["name"])
-        );
+        let got = ControlMessage::decode_at(&unhex(&case["hex"]), minor(case));
+        let name = s(&case["name"]);
+        let Err(error) = got else {
+            panic!("{name} decoded");
+        };
+        if let Some(expected) = case["error"].as_str() {
+            assert_eq!(control_error_name(&error), expected, "{name}");
+        }
+    }
+    for case in list(&doc["before_minor_4"]) {
+        let bytes = unhex(&case["hex"]);
+        let name = s(&case["name"]);
+        assert!(ControlMessage::decode_at(&bytes, 4).is_ok(), "{name}");
+        let error = ControlMessage::decode_at(&bytes, 3).expect_err(name);
+        assert_eq!(control_error_name(&error), s(&case["error"]), "{name}");
+    }
+}
+
+fn control_error_name(e: &ControlError) -> String {
+    match e {
+        ControlError::TooLarge => "too_large".into(),
+        ControlError::UnknownType(_) => "unknown_type".into(),
+        ControlError::Field(FieldError::Cbor(_)) => "cbor".into(),
+        ControlError::Field(FieldError::NotAMap) => "not_a_map".into(),
+        ControlError::Field(FieldError::Missing(k)) => format!("missing:{k}"),
+        ControlError::Field(FieldError::Unknown(k)) => format!("unknown_field:{k}"),
+        ControlError::Field(FieldError::WrongType(k)) => format!("wrong_type:{k}"),
+        ControlError::Field(FieldError::Invalid(k)) => format!("invalid:{k}"),
     }
 }
 

@@ -55,12 +55,19 @@ The code exchange used by "Send link" pairing (CPace) is specified in
 - **The ticket version fixes the pairing algorithms.** Ticket version `1`
   means CPace profile 1 ([`cpace.md`](cpace.md)), the join proof of 10.3 and
   the transcript of 10.5. There is no algorithm negotiation inside a
-  ticket version; a new profile needs a new ticket version.
+  ticket version; a new profile needs a new ticket version. A ticketless
+  kind has no ticket version: the algorithms of kind 3 (direct, 10.9) are
+  fixed by minor `4` and the ceremony version in its binding transcript.
 - **Security requirements never weaken within a major version.** A newer
   minor version may add requirements; it MUST NOT relax any MUST of this
   document (TLS policy in 5.4, the checks of 5.4, pins, grants, the join
   proof, attempt limits). Two compatible minors therefore always meet the
-  stricter set of rules.
+  stricter set of rules. One exception, on the caller only: on a
+  pairing-only connection the person started with Pair with IP (5.4, 8.2),
+  check 9 of 5.4 is replaced by the code exchange's confirmation over both
+  identity keys, and the caller trusts nothing from the host before it
+  verifies. The host's checks do not change, and every other dial,
+  including a Pair with IP recovery, is pinned.
 
 **Minor version negotiation.** Each side speaks one major version and a
 range of minor versions, from its oldest to its newest. An implementation
@@ -85,13 +92,21 @@ never sees them. Minor `3` makes one connection carry calls both ways: on a
 connection whose `agreed` minor is at least `3`, the host may open
 application streams, and the caller serves them under its own grant for the
 host (8, step 5). Below minor `3` a host opens no application stream, and a
-caller resets any it receives with `REFUSED_STREAM`.
+caller resets any it receives with `REFUSED_STREAM`. Minor `4` (draft: this
+version still sends minor `3`) adds Pair with IP: `JOIN_DIRECT` and
+`AUTHORIZED` keys 2 and 3 (section 11). They are defined only on a
+connection whose `agreed` minor is at least `4`; a receiver closes with
+`PROTOCOL_ERROR` on one that arrives below it, as on any message its
+version does not define. Vectors: `control.json` `before_minor_4`.
 
 **Only the first `HELLO` counts.** The peer's first `HELLO` on a connection
 fixes `agreed` or closes the connection. A later `HELLO` on the same
 connection has no effect, whatever its fields hold: it is ignored, not
 negotiated again and not an error. A side does not wait for the peer's
-`HELLO` before sending its own next messages (section 8). Vectors:
+`HELLO` before sending its own next messages (section 8), with one
+exception: a Pair with IP joiner waits for the host's `HELLO` before it
+sends `JOIN_DIRECT`, because it needs `agreed`. If `agreed` is below `4` it
+closes with `UNSUPPORTED_VERSION` (the host runs an older version). Vectors:
 `hello.json` `cases` and `repeated`.
 
 Since a peer speaks only its newest minor and the one before it, a side
@@ -359,6 +374,13 @@ Each side verifies the peer's certificate at its own wall time `now`, with an
   path switches alike;
 - **a joiner's first contact with a host**: the host endpoint's identity
   from the ticket;
+- **a Pair with IP joiner's first contact** (10.9): no pin. Checks 1 to 8
+  and 10 and the full TLS policy still apply, and the caller refuses a
+  certificate whose identity is its own endpoint's key or one this profile
+  denied before its own certificate goes out. The identity it saw is only a
+  candidate: the connection is pairing only (8.2) and the caller trusts that
+  identity only once the host's code-exchange confirmation verifies. A
+  recovery connection after that is pinned to the verified identity;
 - **a host accepting a connection**: no pin; step 2 decides (section 8).
 
 Pins belong to one endpoint. Another profile's endpoint on the same device
@@ -573,9 +595,15 @@ the TLS client and the **host** is the TLS server.
 
    On a join-only connection only pairing messages are allowed. When pairing
    enrolls the device, the connection becomes live under the new grant.
+
+   `JOIN_DIRECT` (Pair with IP, minor `4`) passes the host's gate exactly as
+   `JOIN_PROOF` does (8.1): from a connection awaiting a proof, or once from
+   a live one before any stream frame, and a connection may carry one of the
+   two at most. How the host answers it is in 10.9.
 4. **The caller opens streams first.** A host opens no stream on a
    connection until the caller has opened one. A caller that sent a
-   `JOIN_PROOF` opens no stream before the host's answer to it. So a host
+   `JOIN_PROOF` or a `JOIN_DIRECT` opens no stream before the host's answer
+   to it. So a host
    stream can never cross the answer to a proof. This rule only orders
    streams; it gives the host no authority (step 5).
 5. **Grants point one way.** Step 2 and the host's `AUTHORIZED` decide what
@@ -604,7 +632,7 @@ connection's state:
 | Traffic | Awaiting proof | Join-only | Live |
 |---|---|---|---|
 | `PING`, `PONG`, `HELLO`, `GOAWAY` | allow | allow | allow |
-| `JOIN_PROOF` | allow | close `PROTOCOL_ERROR` | allow once, before any stream frame; otherwise close `PROTOCOL_ERROR` |
+| `JOIN_PROOF`, `JOIN_DIRECT` | allow once (one of the two); a second closes `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` | allow once (one of the two), before any stream frame; otherwise close `PROTOCOL_ERROR` |
 | `CODE_EXCHANGE`, `CODE_ABORT` | close `NOT_AUTHORIZED` | allow | ignore |
 | Any stream frame (`OPEN`, `DATA`, `CREDIT`, `FIN`, `RESET`) | close `NOT_AUTHORIZED` | close `NOT_AUTHORIZED` | allow |
 | `AUTHORIZED`, `PAIRED` (host-only messages) | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` |
@@ -626,7 +654,8 @@ the host's answer to the proof (8, step 3). If it read the notice before its
 proof went out, it moves to awaiting the answer when it sends the proof. A
 caller that has had no answer 10 s after sending its proof closes the
 connection with `NOT_AUTHORIZED`; a joiner's flow then ends (10.6 rule
-7).
+7). On a pinned connection a `JOIN_DIRECT` (a Pair with IP recovery, 10.9)
+counts as the proof in all of this.
 
 | Traffic from the host | Awaiting `AUTHORIZED` | Awaiting the answer | Join-only | Live |
 |---|---|---|---|---|
@@ -635,12 +664,36 @@ connection with `NOT_AUTHORIZED`; a joiner's flow then ends (10.6 rule
 | `CODE_EXCHANGE`, `CODE_ABORT` | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` | allow | ignore |
 | `PAIRED` | close `PROTOCOL_ERROR` | allow, then live (the answer to the proof) | allow | close `PROTOCOL_ERROR` |
 | Any stream frame, including a stream the host opens | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` | allow |
-| `JOIN_PROOF` (caller-only message) | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` |
+| `JOIN_PROOF`, `JOIN_DIRECT` (caller-only messages) | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` |
 
 So a host can never open a stream on a caller that has not been told it is
 live. Being live lets the host's streams through this gate only; what they
 may do is decided by the caller's own grants (8, step 5). After a close,
 everything else is ignored. Vectors: `authz.json` `caller_cases`.
+
+**Pairing only.** The first contact of Pair with IP is not pinned (5.4), so
+the caller starts that connection in its own state, **pairing only**, and
+not in the table above. It can do nothing but this pairing: it accepts
+`HELLO`, `AUTHORIZED`, `CODE_EXCHANGE`, `CODE_ABORT`, `PAIRED`, `GOAWAY` and
+keepalive (`PING`, `PONG`), and never a stream. Keepalive is needed here:
+the host may wait up to 5 minutes for its person to allow the join, longer
+than the 45 s idle timeout (9.4). It becomes live only when the joiner has
+verified the host's code-exchange confirmation and accepted `PAIRED`;
+`AUTHORIZED {live}` never makes it live.
+
+| Traffic from the host | Awaiting the answer | Notice seen | Join-only | Paired |
+|---|---|---|---|---|
+| `PING`, `PONG`, `HELLO`, `GOAWAY` | allow | allow | allow | allow |
+| `AUTHORIZED {live}` | allow, then notice seen (step 2's notice for a device the host grants) | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` |
+| `AUTHORIZED {join_only}` | allow, then join-only | allow, then join-only | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` |
+| `CODE_EXCHANGE`, `CODE_ABORT` | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` | allow | ignore |
+| `PAIRED` | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` | allow, then paired | close `PROTOCOL_ERROR` |
+| Any stream frame | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` |
+| `JOIN_PROOF`, `JOIN_DIRECT` | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` | close `PROTOCOL_ERROR` |
+
+From paired, the connection is live once the joiner's pairing has verified
+the host's confirmation (10.9); until then nothing from the host is
+trusted. Vectors: `authz.json` caller cases with `start` `pairing_only`.
 
 ## 9. Mux
 
@@ -1355,11 +1408,18 @@ extra keys and field rule failures close the connection with
 | Type | Name | Direction | Fields |
 |---|---|---|---|
 | 1 | `HELLO` | both, first | `1`: uint major version, `2`: uint newest minor version (section 2) |
-| 2 | `AUTHORIZED` | host → caller | `1`: uint state, `1` live or `2` join-only. Sent at step 2, and once more as the answer to a `JOIN_PROOF` on a live connection (section 8). Authorizes the caller on the host only (section 8, step 5) |
+| 2 | `AUTHORIZED` | host → caller | `1`: uint state, `1` live or `2` join-only. Sent at step 2, and once more as the answer to a `JOIN_PROOF` on a live connection (section 8). Authorizes the caller on the host only (section 8, step 5). From minor `4`, in answer to a `JOIN_DIRECT` only: `2`?: bytes invitation id (16), only with join-only; `3`?: uint `1`, not received (the host has no request from this identity), only with key `2` and only in answer to a `JOIN_DIRECT` with a receipt |
 | 3 | `JOIN_PROOF` | caller → host | `1`: bytes invitation id (16), `2`: bytes mac (32), `3`: text joiner name (1–128 bytes, not covered by the MAC) |
 | 4 | `CODE_EXCHANGE` | both | `1`: bytes attempt id (16), `2`: bytes payload (1–1024) |
 | 5 | `CODE_ABORT` | both | `1`: bytes attempt id (16), `2`: uint error code (at most 65 535; unknown codes read as `INTERNAL_ERROR`) |
 | 6 | `PAIRED` | host → joiner | `1`: text host name (1–128 bytes), `2`: text role (section 7 rules). Sent on enrollment (10.8), and as the answer to a `JOIN_PROOF` on a live connection whose grant this invitation made (section 8, step 3) |
+| 7 | `JOIN_DIRECT` | caller → host, minor `4` | `1`: text lookup (exactly 4 characters of the code alphabet, canonical, 10.9), `2`: text joiner name (1–128 bytes), `3`?: bytes receipt, the invitation id (16), only when recovering, `4`?: uint `1`, cancel, only with key `3` |
+
+A flag (`AUTHORIZED` key `3`, `JOIN_DIRECT` key `4`) is absent when false
+and holds exactly `1` when true; any other value is a field rule failure
+(canonical CBOR has no `true`, section 3). `JOIN_DIRECT` and `AUTHORIZED`
+keys `2` and `3` are defined only on a connection whose `agreed` minor is
+at least `4` (section 2). Vectors: `control.json`.
 
 ## 12. Error codes
 

@@ -277,7 +277,7 @@ count as unknown names.
 | Variable | What it does |
 | --- | --- |
 | `MOUSSE_NET_TEST_EXTRA_ROOT` | A DER certificate file the outer `wss` TLS trusts besides the platform's roots, for a test tunnel stand-in (Phase 1b §4.2). Nothing is installed in an OS store. |
-| `MOUSSE_NET_TEST_HELLO_MINOR` | The helper speaks this older newest minor version (and the one before it), as a peer from before it does; a value at or above the build's own is ignored (wire.md 2). |
+| `MOUSSE_NET_TEST_HELLO_MINOR` | The helper speaks this older newest minor version (and the one before it), as a peer from before it does, or `4`, the Pair with IP minor, before the build's own minor reaches it; any other value at or above the build's own is ignored (wire.md 2). |
 | `MOUSSE_NET_TEST_CLASS_MAP` | Maps loopback ports to address classes, so checks can stand in for tailnet and public routes (Phase 1b §1.2): `<port>=<class>` entries (`lan`, `tailnet` or `public`) separated by commas, plus an optional `*=<class>` for every loopback port the map leaves out (otherwise `lan`). An inbound loopback connection takes the class of the listener port it arrived on when the map names that port. |
 | `MOUSSE_NET_SSH_BIN` | The `ssh` client to run instead of the system's (Phase 1b §3.1). |
 | `MOUSSE_NET_TEST_SSH_CONFIG` | The ssh config `ssh -G` reads instead of the user's own and the system's, so tests never read the owner's ssh config (Phase 1b §3.7). Every later call reads only the route's own config. |

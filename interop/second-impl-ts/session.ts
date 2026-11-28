@@ -5,10 +5,13 @@ import type { ErrorName, Frame, Version } from './wire.ts';
 
 export interface Grant { identity: string; expires_at: number | null; role: string; enrolled_by?: string }
 type Verdict = 'allow' | 'ignore' | `close:${ErrorName}`;
+// A Pair with IP first contact (unpinned): pairing only until promoteDirect.
+type PairingOnlyStep = 'awaiting_answer' | 'notice_seen' | 'join_only' | 'paired';
 type GateState = 'await_join_proof' | 'awaiting_authorization' | 'awaiting_proof_answer' |
-  'join_only' | 'live' | `closed:${ErrorName}`;
+  'join_only' | 'live' | `pairing_only:${PairingOnlyStep}` | `closed:${ErrorName}`;
+// `join_direct` is a JOIN_DIRECT received by the host: the JOIN_PROOF rows.
 export type Traffic = 'hello' | 'keepalive' | 'goaway' | 'stream' | 'paired' | 'pairing' |
-  'join_proof' | 'authorized_live' | 'authorized_join_only' | 'host_only' | 'caller_only';
+  'join_proof' | 'join_direct' | 'authorized_live' | 'authorized_join_only' | 'host_only' | 'caller_only';
 
 function liveGrant(peer: string, grants: Iterable<Grant>, now: number) {
   const grant = new Map(Array.from(grants, grant => [grant.identity, grant])).get(peer);
@@ -65,6 +68,19 @@ export class Gate {
     this.state = 'live';
   }
 
+  /** A caller gate for an unpinned Pair with IP connection. */
+  static pairingOnly(): Gate {
+    const gate = new Gate('caller');
+    gate.state = 'pairing_only:awaiting_answer';
+    gate.proofUsed = true;
+    return gate;
+  }
+
+  /** The pairing layer verified the host's confirmation and accepted PAIRED. */
+  promoteDirect() {
+    if (this.state === 'pairing_only:paired') this.state = 'live';
+  }
+
   timeout(now: number): ErrorName | null {
     const since = this.state === 'await_join_proof' ? this.start : this.proofSentAt;
     if (this.state.startsWith('closed:') || since === undefined || now - since < 10000) return null;
@@ -99,7 +115,7 @@ export class Gate {
     if (traffic === 'keepalive' || traffic === 'hello' || traffic === 'goaway') return 'allow';
 
     if (this.side === 'host') {
-      switch (traffic) {
+      switch (traffic === 'join_direct' ? 'join_proof' : traffic) {
         case 'stream':
           if (this.state !== 'live') return this.close('not_authorized');
           this.streamSeen = true;
@@ -115,6 +131,22 @@ export class Gate {
           return this.state === 'live' ? 'ignore' : this.close('not_authorized');
         default: return this.close('protocol_error');
       }
+    }
+
+    if (this.state.startsWith('pairing_only:')) {
+      const step = this.state.slice('pairing_only:'.length) as PairingOnlyStep;
+      const next: Partial<Record<Traffic, PairingOnlyStep>> = {
+        awaiting_answer: { authorized_live: 'notice_seen', authorized_join_only: 'join_only' },
+        notice_seen: { authorized_join_only: 'join_only' },
+        join_only: { pairing: 'join_only', paired: 'paired' },
+        paired: {},
+      }[step] as Partial<Record<Traffic, PairingOnlyStep>>;
+      // A late code-exchange message after PAIRED means nothing.
+      if (step === 'paired' && traffic === 'pairing') return 'ignore';
+      const to = next[traffic];
+      if (to === undefined) return this.close('protocol_error');
+      this.state = `pairing_only:${to}`;
+      return 'allow';
     }
 
     switch (traffic) {

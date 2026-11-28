@@ -340,6 +340,197 @@
           "verdict": "close:protocol_error"
         }
       ]
+    },
+    {
+      "description": "An unpinned Pair with IP connection: the host answers JOIN_DIRECT with AUTHORIZED join_only, the code exchange runs, PAIRED arrives, and only promote_direct makes the connection live.",
+      "name": "pairing_only_pairs",
+      "start": "pairing_only",
+      "steps": [
+        {
+          "op": "check",
+          "state": "pairing_only:awaiting_answer",
+          "traffic": "hello",
+          "verdict": "allow"
+        },
+        {
+          "op": "check",
+          "state": "pairing_only:awaiting_answer",
+          "traffic": "keepalive",
+          "verdict": "allow"
+        },
+        {
+          "op": "check",
+          "state": "pairing_only:join_only",
+          "traffic": "authorized_join_only",
+          "verdict": "allow"
+        },
+        {
+          "op": "check",
+          "state": "pairing_only:join_only",
+          "traffic": "pairing",
+          "verdict": "allow"
+        },
+        {
+          "op": "promote_direct",
+          "state": "pairing_only:join_only"
+        },
+        {
+          "op": "check",
+          "state": "pairing_only:paired",
+          "traffic": "paired",
+          "verdict": "allow"
+        },
+        {
+          "op": "check",
+          "state": "pairing_only:paired",
+          "traffic": "pairing",
+          "verdict": "ignore"
+        },
+        {
+          "op": "promote_direct",
+          "state": "live"
+        },
+        {
+          "op": "check",
+          "state": "live",
+          "traffic": "stream",
+          "verdict": "allow"
+        }
+      ]
+    },
+    {
+      "description": "The host already grants this device: step 2's AUTHORIZED live is only a notice and the connection stays pairing only.",
+      "name": "pairing_only_live_notice_then_answer",
+      "start": "pairing_only",
+      "steps": [
+        {
+          "op": "check",
+          "state": "pairing_only:notice_seen",
+          "traffic": "authorized_live",
+          "verdict": "allow"
+        },
+        {
+          "op": "check",
+          "state": "pairing_only:join_only",
+          "traffic": "authorized_join_only",
+          "verdict": "allow"
+        }
+      ]
+    },
+    {
+      "name": "pairing_only_second_authorized_live",
+      "start": "pairing_only",
+      "steps": [
+        {
+          "op": "check",
+          "state": "pairing_only:notice_seen",
+          "traffic": "authorized_live",
+          "verdict": "allow"
+        },
+        {
+          "op": "check",
+          "state": "closed:protocol_error",
+          "traffic": "authorized_live",
+          "verdict": "close:protocol_error"
+        }
+      ]
+    },
+    {
+      "name": "pairing_only_code_exchange_before_join_only",
+      "start": "pairing_only",
+      "steps": [
+        {
+          "op": "check",
+          "state": "pairing_only:notice_seen",
+          "traffic": "authorized_live",
+          "verdict": "allow"
+        },
+        {
+          "op": "check",
+          "state": "closed:protocol_error",
+          "traffic": "pairing",
+          "verdict": "close:protocol_error"
+        }
+      ]
+    },
+    {
+      "name": "pairing_only_paired_before_join_only",
+      "start": "pairing_only",
+      "steps": [
+        {
+          "op": "check",
+          "state": "closed:protocol_error",
+          "traffic": "paired",
+          "verdict": "close:protocol_error"
+        }
+      ]
+    },
+    {
+      "description": "No stream at any step before promote_direct.",
+      "name": "pairing_only_refuses_streams",
+      "start": "pairing_only",
+      "steps": [
+        {
+          "op": "check",
+          "state": "pairing_only:join_only",
+          "traffic": "authorized_join_only",
+          "verdict": "allow"
+        },
+        {
+          "op": "check",
+          "state": "pairing_only:paired",
+          "traffic": "paired",
+          "verdict": "allow"
+        },
+        {
+          "op": "check",
+          "state": "closed:protocol_error",
+          "traffic": "stream",
+          "verdict": "close:protocol_error"
+        }
+      ]
+    },
+    {
+      "name": "pairing_only_stream_first",
+      "start": "pairing_only",
+      "steps": [
+        {
+          "op": "check",
+          "state": "closed:protocol_error",
+          "traffic": "stream",
+          "verdict": "close:protocol_error"
+        }
+      ]
+    },
+    {
+      "name": "pairing_only_second_join_only",
+      "start": "pairing_only",
+      "steps": [
+        {
+          "op": "check",
+          "state": "pairing_only:join_only",
+          "traffic": "authorized_join_only",
+          "verdict": "allow"
+        },
+        {
+          "op": "check",
+          "state": "closed:protocol_error",
+          "traffic": "authorized_join_only",
+          "verdict": "close:protocol_error"
+        }
+      ]
+    },
+    {
+      "name": "pairing_only_join_direct_from_host",
+      "start": "pairing_only",
+      "steps": [
+        {
+          "op": "check",
+          "state": "closed:protocol_error",
+          "traffic": "caller_only",
+          "verdict": "close:protocol_error"
+        }
+      ]
     }
   ],
   "cases": [
@@ -661,9 +852,132 @@
           "verdict": "ignore"
         }
       ]
+    },
+    {
+      "denied": [],
+      "description": "A JOIN_DIRECT from a device with no grant is let through like a JOIN_PROOF; once admitted, the connection is pairing only.",
+      "grants": [],
+      "name": "no_grant_join_direct",
+      "now": 1790000060,
+      "peer": "b",
+      "step2": "await_join_proof",
+      "steps": [
+        {
+          "op": "check",
+          "traffic": "join_direct",
+          "verdict": "allow"
+        },
+        {
+          "op": "admit_join_only"
+        },
+        {
+          "op": "check",
+          "traffic": "pairing",
+          "verdict": "allow"
+        },
+        {
+          "op": "check",
+          "traffic": "join_direct",
+          "verdict": "close:protocol_error"
+        }
+      ]
+    },
+    {
+      "denied": [],
+      "description": "One proof per connection, even before the host admits it: a JOIN_PROOF after a JOIN_DIRECT closes.",
+      "grants": [],
+      "name": "no_grant_two_proofs_before_admission",
+      "now": 1790000060,
+      "peer": "b",
+      "step2": "await_join_proof",
+      "steps": [
+        {
+          "op": "check",
+          "traffic": "join_direct",
+          "verdict": "allow"
+        },
+        {
+          "op": "check",
+          "traffic": "join_proof",
+          "verdict": "close:protocol_error"
+        }
+      ]
+    },
+    {
+      "denied": [],
+      "grants": [],
+      "name": "no_grant_join_direct_after_join_proof",
+      "now": 1790000060,
+      "peer": "b",
+      "step2": "await_join_proof",
+      "steps": [
+        {
+          "op": "check",
+          "traffic": "join_proof",
+          "verdict": "allow"
+        },
+        {
+          "op": "check",
+          "traffic": "join_direct",
+          "verdict": "close:protocol_error"
+        }
+      ]
+    },
+    {
+      "denied": [],
+      "description": "A granted device may send one JOIN_DIRECT or JOIN_PROOF, before any stream; a second one of either closes.",
+      "grants": [
+        {
+          "expires_at": null,
+          "identity": "a",
+          "role": "owner"
+        }
+      ],
+      "name": "live_grant_one_join_direct",
+      "now": 1790000060,
+      "peer": "a",
+      "step2": "live",
+      "steps": [
+        {
+          "op": "check",
+          "traffic": "join_direct",
+          "verdict": "allow"
+        },
+        {
+          "op": "check",
+          "traffic": "join_proof",
+          "verdict": "close:protocol_error"
+        }
+      ]
+    },
+    {
+      "denied": [],
+      "grants": [
+        {
+          "expires_at": null,
+          "identity": "a",
+          "role": "owner"
+        }
+      ],
+      "name": "live_grant_join_direct_after_stream",
+      "now": 1790000060,
+      "peer": "a",
+      "step2": "live",
+      "steps": [
+        {
+          "op": "check",
+          "traffic": "stream",
+          "verdict": "allow"
+        },
+        {
+          "op": "check",
+          "traffic": "join_direct",
+          "verdict": "close:protocol_error"
+        }
+      ]
     }
   ],
-  "description": "Step 2 on the host after step 1 passed (`cases`), and the caller's gate (`caller_cases`). Host cases: `grants` and `denied` set up the table (grants added in order, then denials), the gate opens at wall time `now` and monotonic time 0 ms, then `steps` run in order. Caller cases: the gate starts awaiting AUTHORIZED; `sent_join_proof` means this side queued a JOIN_PROOF; `promote` means the joiner accepted PAIRED; `host_stream` asks what the host identity `host` may do on a stream it opened, from the caller endpoint's own `local_grants` at `now` (the role of its live grant, or none; wire.md 8.2); `state` is the gate state after the step. Verdicts: allow, ignore, close:<code>.",
+  "description": "Step 2 on the host after step 1 passed (`cases`), and the caller's gate (`caller_cases`). Host cases: `grants` and `denied` set up the table (grants added in order, then denials), the gate opens at wall time `now` and monotonic time 0 ms, then `steps` run in order. Caller cases: the gate starts awaiting AUTHORIZED; `sent_join_proof` means this side queued a JOIN_PROOF; `promote` means the joiner accepted PAIRED; `host_stream` asks what the host identity `host` may do on a stream it opened, from the caller endpoint's own `local_grants` at `now` (the role of its live grant, or none; wire.md 8.2); `state` is the gate state after the step. Verdicts: allow, ignore, close:<code>. Host traffic `join_direct` is a JOIN_DIRECT, which follows the JOIN_PROOF rows. Caller cases with `start` `pairing_only` begin in the pairing-only state of an unpinned Pair with IP connection (wire.md 8.2), shown as `pairing_only:<step>`; `promote_direct` means the pairing layer verified the host's confirmation and accepted PAIRED.",
   "identities": {
     "a": "040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794",
     "b": "04d65a93977caa3d1b081852ff57a79e465f1660577304baead505dd3a48589cf350185e895372df6221ea3a137557e473fddb6755f05bd507c3c533fce9c91285"

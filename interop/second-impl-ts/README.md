@@ -3,7 +3,9 @@
 This package implements the version 1 wire records and the pairing exchange
 from the protocol spec, and the self-mode relay admission of
 `spec/relay.md`. It also draws and reads the direct code of wire.md 10.9
-(`direct-code.ts`). A TLS transport supplies the peer identity and the two TLS
+(`direct-code.ts`), reads and writes the minor-4 Pair with IP messages
+(`JOIN_DIRECT`, `AUTHORIZED` keys 2 and 3), and runs the caller's
+pairing-only gate (wire.md 8.2). A TLS transport supplies the peer identity and the two TLS
 exporters. The package issues and verifies session certificates,
 signs and verifies TLS CertificateVerify bytes, and checks the negotiated
 handshake against the native TLS policy. The transport configures TLS from

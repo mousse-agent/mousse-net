@@ -39,6 +39,8 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 use mousse_net_core::authz::{Traffic, Verdict};
+#[allow(unused_imports)] // Used by the debug-only test hook and docs.
+use mousse_net_core::control::DIRECT_MINOR_VERSION;
 use mousse_net_core::control::{ControlMessage, HelloOutcome, HelloState, VersionSupport};
 use mousse_net_core::identity::IdentityPublicKey;
 use mousse_net_core::mux::{
@@ -78,28 +80,38 @@ pub(crate) struct DriverLimits {
     rx_chunk: usize,
 }
 
-/// The variable that makes a debug build speak an older newest minor
-/// version, as an older peer does (tests only; release builds ignore it).
+/// The variable that makes a debug build speak another newest minor
+/// version (tests only; release builds ignore it): an older one, as an
+/// older peer does, or the minor that adds Pair with IP
+/// ([`DIRECT_MINOR_VERSION`]) before the build's own minor reaches it.
 pub const TEST_HELLO_MINOR_VAR: &str = "MOUSSE_NET_TEST_HELLO_MINOR";
 
 /// The versions this side speaks: [`VersionSupport::LOCAL`], or in a debug
-/// build with [`TEST_HELLO_MINOR_VAR`] set, that newest minor (never above
-/// the build's own) and the one before it.
+/// build with [`TEST_HELLO_MINOR_VAR`] set, what `test_version` makes of it.
 fn local_version() -> VersionSupport {
-    let local = VersionSupport::LOCAL;
     #[cfg(debug_assertions)]
-    if let Some(minor) = std::env::var(TEST_HELLO_MINOR_VAR)
+    if let Some(version) = std::env::var(TEST_HELLO_MINOR_VAR)
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .filter(|m| *m < local.minor)
+        .and_then(test_version)
     {
-        return VersionSupport {
-            major: local.major,
-            minor,
-            oldest_minor: minor.saturating_sub(1),
-        };
+        return version;
     }
-    local
+    VersionSupport::LOCAL
+}
+
+/// The versions a debug build speaks when a test asks for newest minor
+/// `minor`: an older one than the build's own, or [`DIRECT_MINOR_VERSION`]
+/// (never anything else newer), with the one before it. `None` keeps
+/// [`VersionSupport::LOCAL`].
+#[cfg(debug_assertions)]
+fn test_version(minor: u64) -> Option<VersionSupport> {
+    let local = VersionSupport::LOCAL;
+    (minor < local.minor || minor == DIRECT_MINOR_VERSION).then_some(VersionSupport {
+        major: local.major,
+        minor,
+        oldest_minor: minor.saturating_sub(1),
+    })
 }
 
 /// The newest minor version this side sends in `HELLO`: the build's own, or
@@ -1012,17 +1024,7 @@ fn classify(frame: &Frame) -> Result<(Traffic, Option<ControlMessage>), ErrorCod
         Frame::GoAway { .. } => (Traffic::GoAway, None),
         Frame::Control { payload } => {
             let message = ControlMessage::decode(payload).map_err(|_| ErrorCode::ProtocolError)?;
-            let traffic = match &message {
-                ControlMessage::Hello { .. } => Traffic::Hello,
-                ControlMessage::JoinProof { .. } => Traffic::JoinProof,
-                ControlMessage::CodeExchange { .. } | ControlMessage::CodeAbort { .. } => {
-                    Traffic::Pairing
-                }
-                ControlMessage::Authorized { .. } | ControlMessage::Paired { .. } => {
-                    Traffic::HostOnly
-                }
-            };
-            (traffic, Some(message))
+            (Traffic::of(&message), Some(message))
         }
         _ => (Traffic::Stream, None),
     })
@@ -1599,8 +1601,15 @@ impl Driver {
                 }
             }
             Traffic::Keepalive | Traffic::GoAway => {}
-            _ if self.hello.agreed().is_none() => return Verdict::Close(ErrorCode::ProtocolError),
-            _ => {}
+            _ => match self.hello.agreed() {
+                None => return Verdict::Close(ErrorCode::ProtocolError),
+                // A message the agreed minor version does not define
+                // (JOIN_DIRECT and AUTHORIZED key 2 before minor 4).
+                Some(agreed) if message.is_some_and(|m| !m.defined_at(agreed)) => {
+                    return Verdict::Close(ErrorCode::ProtocolError)
+                }
+                Some(_) => {}
+            },
         }
         self.role.check(traffic, message)
     }
@@ -1799,6 +1808,24 @@ mod tests {
         tokio::time::timeout(WAIT, fut)
             .await
             .unwrap_or_else(|_| panic!("timed out: {what}"))
+    }
+
+    /// The test hook speaks an older minor, or the Pair with IP minor
+    /// before the build's own reaches it (with the one before it), and
+    /// nothing else newer.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_test_hook_speaks_older_minors_and_the_pair_with_ip_minor_only() {
+        let local = VersionSupport::LOCAL;
+        let direct = test_version(DIRECT_MINOR_VERSION).expect("pair with ip minor");
+        assert_eq!(
+            (direct.major, direct.minor, direct.oldest_minor),
+            (local.major, DIRECT_MINOR_VERSION, DIRECT_MINOR_VERSION - 1)
+        );
+        assert_eq!(test_version(DIRECT_MINOR_VERSION + 1), None);
+        assert_eq!(test_version(u64::MAX), None);
+        let older = test_version(2).expect("older minor");
+        assert_eq!((older.minor, older.oldest_minor), (2, 1));
     }
 
     /// A sleep moves the wall clock and the monotonic clock (which counts

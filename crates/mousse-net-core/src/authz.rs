@@ -21,7 +21,14 @@
 //! has made a join-only connection live). A caller that sent a `JOIN_PROOF`
 //! takes a first `AUTHORIZED {live}` as step 2's notice and waits for the
 //! host's answer to the proof: the next `AUTHORIZED`, or `PAIRED` when the
-//! host's grant came from that proof's invitation.
+//! host's grant came from that proof's invitation. On the host, `JOIN_DIRECT`
+//! (Pair with IP) follows the `JOIN_PROOF` rows; on a pinned caller it counts
+//! as the proof.
+//!
+//! An unpinned Pair with IP connection starts the caller gate in its own
+//! **pairing-only** state ([`CallerGate::pairing_only`]): no stream ever,
+//! and live only when the pairing layer says so after it verified the
+//! host's confirmation and `PAIRED`.
 //!
 //! **Grants point one way.** The host's grant lets the caller use the host;
 //! it says nothing about what the host may do on the caller. A live caller
@@ -77,7 +84,7 @@ pub enum Traffic {
     Hello,
     /// `GOAWAY`.
     GoAway,
-    /// `JOIN_PROOF`.
+    /// `JOIN_PROOF` or `JOIN_DIRECT`: both follow the same rows (wire.md 8).
     JoinProof,
     /// `CODE_EXCHANGE` or `CODE_ABORT`.
     Pairing,
@@ -94,11 +101,15 @@ impl Traffic {
     pub fn of(message: &ControlMessage) -> Traffic {
         match message {
             ControlMessage::Hello { .. } => Traffic::Hello,
-            ControlMessage::JoinProof { .. } => Traffic::JoinProof,
+            ControlMessage::JoinProof { .. } | ControlMessage::JoinDirect { .. } => {
+                Traffic::JoinProof
+            }
             ControlMessage::CodeExchange { .. } | ControlMessage::CodeAbort { .. } => {
                 Traffic::Pairing
             }
-            ControlMessage::Authorized { .. } | ControlMessage::Paired { .. } => Traffic::HostOnly,
+            ControlMessage::Authorized { .. }
+            | ControlMessage::AuthorizedDirect { .. }
+            | ControlMessage::Paired { .. } => Traffic::HostOnly,
         }
     }
 }
@@ -212,7 +223,12 @@ impl ConnectionGate {
             (GateState::Closed(_), _) => Verdict::Ignore,
             (_, Keepalive | Hello | GoAway) => Verdict::Allow,
             (_, HostOnly) => Verdict::Close(ErrorCode::ProtocolError),
-            (GateState::AwaitingJoinProof { .. }, JoinProof) => Verdict::Allow,
+            // One proof per connection (wire.md 8): `JOIN_PROOF` and
+            // `JOIN_DIRECT` share it, even before the host admits either.
+            (GateState::AwaitingJoinProof { .. }, JoinProof) if !self.proof_seen => Verdict::Allow,
+            (GateState::AwaitingJoinProof { .. }, JoinProof) => {
+                Verdict::Close(ErrorCode::ProtocolError)
+            }
             #[cfg(not(any(mousse_control = "break-authz", mousse_control = "admit-ungranted")))]
             (GateState::AwaitingJoinProof { .. }, Pairing | Stream) => {
                 Verdict::Close(ErrorCode::NotAuthorized)
@@ -320,7 +336,7 @@ pub enum CallerTraffic {
     /// Any stream frame: `OPEN`, `DATA`, `CREDIT`, `FIN`, `RESET`.
     Stream,
     /// A control message the caller never accepts from a host
-    /// (`JOIN_PROOF`).
+    /// (`JOIN_PROOF`, `JOIN_DIRECT`).
     CallerOnly,
 }
 
@@ -330,11 +346,16 @@ impl CallerTraffic {
         match message {
             ControlMessage::Hello { .. } => CallerTraffic::Hello,
             ControlMessage::Authorized { state } => CallerTraffic::Authorized(*state),
+            ControlMessage::AuthorizedDirect { .. } => {
+                CallerTraffic::Authorized(AuthorizedState::JoinOnly)
+            }
             ControlMessage::CodeExchange { .. } | ControlMessage::CodeAbort { .. } => {
                 CallerTraffic::Pairing
             }
             ControlMessage::Paired { .. } => CallerTraffic::Paired,
-            ControlMessage::JoinProof { .. } => CallerTraffic::CallerOnly,
+            ControlMessage::JoinProof { .. } | ControlMessage::JoinDirect { .. } => {
+                CallerTraffic::CallerOnly
+            }
         }
     }
 }
@@ -353,8 +374,26 @@ pub enum CallerGateState {
     JoinOnly,
     /// The host said live, or pairing finished: normal channels.
     Live,
+    /// An unpinned Pair with IP connection (wire.md 8.2): pairing messages
+    /// only, no streams, until the pairing layer has verified the host's
+    /// confirmation and `PAIRED` ([`CallerGate::promote_direct`]).
+    PairingOnly(PairingOnlyStep),
     /// Closed with this code.
     Closed(ErrorCode),
+}
+
+/// Where a pairing-only connection is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PairingOnlyStep {
+    /// Waiting for the host's answer to `JOIN_DIRECT`.
+    AwaitingAnswer,
+    /// The host said `AUTHORIZED {live}` (step 2's notice for a device it
+    /// already grants); its answer to `JOIN_DIRECT` is still due.
+    NoticeSeen,
+    /// The host said `AUTHORIZED {join_only}`: the code exchange may run.
+    JoinOnly,
+    /// `PAIRED` arrived; the connection waits for the pairing layer.
+    Paired,
 }
 
 /// The caller-side gate for one connection. Until the host has authorized
@@ -382,11 +421,25 @@ impl CallerGate {
         }
     }
 
-    /// This side sent a `JOIN_PROOF`. Call it when the proof is queued,
-    /// before reading anything else from the host. A host that already
-    /// grants this device says `AUTHORIZED {live}` first and then answers
-    /// the proof with a second `AUTHORIZED`, so the connection is not live
-    /// until that answer.
+    /// A Pair with IP first contact: an unpinned connection (wire.md 5.4)
+    /// that can do nothing but this pairing. It accepts `HELLO`,
+    /// `AUTHORIZED`, `CODE_EXCHANGE`, `CODE_ABORT`, `PAIRED`, `GOAWAY` and
+    /// keepalive, and refuses every stream. A second `AUTHORIZED {live}`,
+    /// and a code-exchange message before `AUTHORIZED {join_only}`, close
+    /// it. Only [`CallerGate::promote_direct`] makes it live.
+    pub fn pairing_only() -> Self {
+        Self {
+            state: CallerGateState::PairingOnly(PairingOnlyStep::AwaitingAnswer),
+            proof_sent: true,
+        }
+    }
+
+    /// This side sent a `JOIN_PROOF`, or a `JOIN_DIRECT` on a pinned
+    /// connection (recovery), which counts as the proof. Call it when the
+    /// message is queued, before reading anything else from the host. A
+    /// host that already grants this device says `AUTHORIZED {live}` first
+    /// and then answers the proof with a second `AUTHORIZED`, so the
+    /// connection is not live until that answer.
     pub fn sent_join_proof(&mut self) {
         self.proof_sent = true;
         // A `live` that was read before the proof went out is the notice.
@@ -414,6 +467,7 @@ impl CallerGate {
             (S::Closed(_), _) => Verdict::Ignore,
             (_, T::Keepalive | T::Hello | T::GoAway) => Verdict::Allow,
             (_, T::CallerOnly) => Verdict::Close(ErrorCode::ProtocolError),
+            (S::PairingOnly(step), traffic) => self.check_pairing_only(step, traffic),
             (S::AwaitingAuthorization, T::Authorized(state)) => {
                 self.state = match state {
                     AuthorizedState::Live if self.proof_sent => S::AwaitingProofAnswer,
@@ -451,6 +505,35 @@ impl CallerGate {
             self.state = S::Closed(code);
         }
         verdict
+    }
+
+    /// The rows of a pairing-only connection (wire.md 8.2), after
+    /// keepalive, `HELLO`, `GOAWAY` and caller-only messages.
+    fn check_pairing_only(&mut self, step: PairingOnlyStep, traffic: CallerTraffic) -> Verdict {
+        use CallerTraffic as T;
+        use PairingOnlyStep as P;
+        let next = match (step, traffic) {
+            (P::AwaitingAnswer, T::Authorized(AuthorizedState::Live)) => P::NoticeSeen,
+            (P::AwaitingAnswer | P::NoticeSeen, T::Authorized(AuthorizedState::JoinOnly)) => {
+                P::JoinOnly
+            }
+            (P::JoinOnly, T::Pairing) => P::JoinOnly,
+            (P::JoinOnly, T::Paired) => P::Paired,
+            // A late code-exchange message after `PAIRED` means nothing.
+            (P::Paired, T::Pairing) => return Verdict::Ignore,
+            _ => return Verdict::Close(ErrorCode::ProtocolError),
+        };
+        self.state = CallerGateState::PairingOnly(next);
+        Verdict::Allow
+    }
+
+    /// The pairing layer verified the host's confirmation and accepted
+    /// `PAIRED` on a pairing-only connection: it is live. Does nothing
+    /// before `PAIRED` has passed this gate, or on any other connection.
+    pub fn promote_direct(&mut self) {
+        if self.state == CallerGateState::PairingOnly(PairingOnlyStep::Paired) {
+            self.state = CallerGateState::Live;
+        }
     }
 
     /// The joiner's pairing accepted `PAIRED`
@@ -676,6 +759,36 @@ mod tests {
                 Verdict::Close(ErrorCode::ProtocolError)
             );
         }
+    }
+
+    /// Nothing but [`CallerGate::promote_direct`] after `PAIRED` makes a
+    /// pairing-only connection live: not the join-only promotion, not a
+    /// proof, not `AUTHORIZED {live}`.
+    #[test]
+    fn only_promote_direct_after_paired_makes_a_pairing_only_connection_live() {
+        let mut gate = CallerGate::pairing_only();
+        gate.sent_join_proof();
+        assert_eq!(
+            gate.check(CallerTraffic::Authorized(AuthorizedState::Live)),
+            Verdict::Allow
+        );
+        gate.promote();
+        gate.promote_direct();
+        assert!(!gate.is_live());
+        gate.check(CallerTraffic::Authorized(AuthorizedState::JoinOnly));
+        gate.promote();
+        gate.promote_direct();
+        assert!(!gate.is_live());
+        assert_eq!(gate.check(CallerTraffic::Paired), Verdict::Allow);
+        gate.promote();
+        gate.sent_join_proof();
+        assert!(!gate.is_live());
+        assert_eq!(
+            gate.host_stream_authority(&table_with(9), &id(9), NOW),
+            None
+        );
+        gate.promote_direct();
+        assert!(gate.is_live());
     }
 
     /// The host's `AUTHORIZED {live}` lets the caller use the host. It

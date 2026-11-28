@@ -152,8 +152,10 @@ separate `tls::connect_unpinned` with its own `UnpinnedPairVerifier`:
   confirmation verifies.
 
 The connection starts in a new caller gate state, **pairing only**: it
-accepts `HELLO`, `AUTHORIZED`, `CODE_EXCHANGE`, `CODE_ABORT`, `PAIRED` and
-`GOAWAY`, refuses every stream, and becomes live only on `PAIRED` after a
+accepts `HELLO`, `AUTHORIZED`, `CODE_EXCHANGE`, `CODE_ABORT`, `PAIRED`,
+`GOAWAY` and keepalive (`PING`, `PONG`: the Allow window lasts up to 5
+minutes and the idle timeout is 45 s, so the wait needs them), refuses
+every stream, and becomes live only on `PAIRED` after a
 verified host confirmation. A second `AUTHORIZED {live}`, and a
 `CODE_EXCHANGE` before `AUTHORIZED {join_only}`, close the connection.
 Today's `CallerGate` can pass through `Live` on a second `AUTHORIZED {live}`
@@ -322,7 +324,8 @@ enrolls is preceded by one. The host answers:
   no grant, another identity, a forgotten outcome): `INVITATION_INVALID`.
   Only the identity that passed the code learns that it was declined.
 
-`not_received` is `AUTHORIZED` key 3 (`true`), sent only in answer to a
+`not_received` is `AUTHORIZED` key 3 (absent when false, uint `1` when
+true), sent only in answer to a
 `JOIN_DIRECT` with a receipt.
 
 The joiner clears the pending record on `PAIRED` (once the pin is stored)
@@ -367,11 +370,12 @@ start-up, as `pairing.recover()` does today (app `NetEngineService.ts:2127`).
   "mousse-direct-pending-v1", 2: L, 3: host key, 4: I, 5: address, 6: time
   the host's confirmation verified, 7: cancelled (0 or 1)}`).
 - **`wire.md` 11.** Type 7 `JOIN_DIRECT {0: 7, 1: text (4), 2: text (1 to
-  128 bytes), 3?: bytes (16), 4?: true}` (key 4, cancel, only with key 3);
-  `AUTHORIZED` key 2, bytes (16), and key 3, `true` (not received, only
+  128 bytes), 3?: bytes (16), 4?: uint 1}` (key 4, cancel, only with key 3);
+  `AUTHORIZED` key 2, bytes (16), and key 3, uint `1` (not received, only
   with key 2 in answer to a `JOIN_DIRECT` with a receipt), only with
-  `join_only` on `agreed ≥ 4` in answer to `JOIN_DIRECT`. **§12:** no new
-  codes.
+  `join_only` on `agreed ≥ 4` in answer to `JOIN_DIRECT`. Both flags are
+  absent when false and uint `1` when true (canonical CBOR, `wire.md` 3,
+  has no `true`). **§12:** no new codes.
 - **`cpace.md` §4.** The `PRS` rule is per kind: 6 ASCII digits for kind 2,
   8 code characters for kind 3. One more full run in
   `cpace-ristretto255-sha512-mousse.json` with an 8-byte `PRS`.
