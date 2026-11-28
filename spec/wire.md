@@ -1746,9 +1746,12 @@ and the flow ends.
 6. If `Tb` verifies, it writes the pending record, then shows "Waiting for
    Allow" and sends `CODE_EXCHANGE {A, msg_c}`.
 7. It accepts `PAIRED` only now (or on a recovery, below), and never once
-   it has cancelled. It then stores the pin, the typed address as an owner
-   route and a completion record keyed by `I`, makes the connection live
-   (8.2, pairing only), and only then deletes the pending record.
+   it has cancelled (except as the answer to its cancelling recovery,
+   below). It then stores the pin, the typed address as an owner route and
+   a completion record keyed by `I`, makes the connection live (8.2,
+   pairing only), and only then deletes the pending record. Its first
+   stream frame on a connection to the host commits the host's provisional
+   grant (8.1); it opens none before this point.
 
 **Ends that settle a pending record.** A close by the host with
 `PAIRING_DECLINED`, `CANCELLED`, `INVITATION_INVALID` or
@@ -1770,8 +1773,9 @@ other Connect starts a new flow; if a pending record for the same lookup at
 another address is stored, that flow's own pending record replaces it (the
 write is compared against the record read at the start). The answers:
 
-- `PAIRED` after step 2's `AUTHORIZED {live}`: enrolled (from the grant's
-  receipt); as step 7;
+- `AUTHORIZED {live}` (step 2's, or the host's own when it binds the
+  connection to a grant that appeared after step 2), then `PAIRED`:
+  enrolled (from the grant's receipt); as step 7;
 - `AUTHORIZED {join_only, I}`: the request waits for Allow ("Waiting for
   Allow"), or it was allowed while away and `PAIRED` follows; an `I` other
   than the record's is a protocol error;
@@ -1790,7 +1794,11 @@ closes with `CANCELLED` (on a recovery connection, which ran no attempt, it
 only closes with `CANCELLED`). Either way the record stays until a recovery,
 which carries the cancel flag, hears the host's settling answer, so a
 cancel that crossed the host's Allow still reaches the host. A joiner that
-cancelled ignores a `PAIRED` that crosses its cancel and pins nothing.
+cancelled ignores a `PAIRED` that crosses its cancel and pins nothing. A
+`PAIRED` in answer to the recovery that carries the cancel flag is the
+host's settling answer: the grant committed before the cancel arrived (a
+device that already held a grant committed it through another of its
+connections), and the joiner takes it as step 7.
 Vectors: `direct-joiner.json`.
 
 ## 11. Control messages

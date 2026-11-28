@@ -339,3 +339,44 @@ fn flow_on_authorized(
 ) -> Vec<DirectJoinerAction> {
     flow.on_authorized_direct(invitation, false, T, rng)
 }
+
+/// wire.md 10.9: a `PAIRED` that answers the recovery carrying this
+/// device's cancel means the grant committed before the cancel arrived, so
+/// it is taken. One that crosses the cancel on another connection pins
+/// nothing.
+#[test]
+fn paired_in_answer_to_a_cancelling_recovery_is_taken() {
+    let pending = DirectPending {
+        lookup: lookup(),
+        host: key(1),
+        invitation: InvitationId([7; 16]),
+        address: DirectAddress::parse("10.0.0.2:47100").unwrap(),
+        verified_at: T,
+        cancelled: true,
+    };
+    let mut flow = DirectJoinerPairing::resume(
+        &pending,
+        key(2),
+        "Laptop",
+        CpaceExchangeFactory,
+        None,
+        T,
+        &Limits::DEFAULT,
+    )
+    .unwrap();
+    flow.on_connected(key(1), [9; 32]);
+    let sent = flow.on_hello(4);
+    assert!(matches!(
+        sent.as_slice(),
+        [DirectJoinerAction::Send(ControlMessage::JoinDirect {
+            recovery: Some(DirectRecovery { cancel: true, .. }),
+            ..
+        })]
+    ));
+    // Step 2's notice: the device holds the committed grant.
+    assert!(flow.on_authorized(AuthorizedState::Live).is_empty());
+    let paired = flow.on_paired("Desk".into(), Role::owner());
+    assert!(
+        matches!(paired.as_slice(), [DirectJoinerAction::Paired(p)] if p.invitation == pending.invitation)
+    );
+}

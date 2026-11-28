@@ -416,6 +416,8 @@ pub struct DirectJoinerPairing<F: CodeExchangeFactory> {
     attempt: Option<Attempt<F::Exchange>>,
     /// Step 2's `AUTHORIZED {live}` notice came on this connection.
     live_notice: bool,
+    /// This connection's `JOIN_DIRECT` carried the cancel flag.
+    cancel_sent: bool,
     in_flight: Option<Write>,
     held: Vec<DirectJoinerAction>,
 }
@@ -562,6 +564,7 @@ impl<F: CodeExchangeFactory> DirectJoinerPairing<F> {
             invitation: None,
             attempt: None,
             live_notice: false,
+            cancel_sent: false,
             in_flight: None,
             held: Vec::new(),
         })
@@ -663,6 +666,7 @@ impl<F: CodeExchangeFactory> DirectJoinerPairing<F> {
         self.invitation = None;
         self.attempt = None;
         self.live_notice = false;
+        self.cancel_sent = false;
         self.state = DirectJoinerState::AwaitingHello;
         Vec::new()
     }
@@ -686,6 +690,7 @@ impl<F: CodeExchangeFactory> DirectJoinerPairing<F> {
         } else {
             None
         };
+        self.cancel_sent = recovery.is_some_and(|r| r.cancel);
         self.state = DirectJoinerState::AwaitingAnswer;
         vec![DirectJoinerAction::Send(ControlMessage::JoinDirect {
             lookup: self.lookup.clone(),
@@ -895,13 +900,15 @@ impl<F: CodeExchangeFactory> DirectJoinerPairing<F> {
 
     /// The host sent `PAIRED`. Accepted only after this flow verified the
     /// host's confirmation (or, on a recovery, as the host's answer by
-    /// receipt), and never after this device cancelled: a `PAIRED` that
-    /// crosses the cancel pins nothing.
+    /// receipt). After this device cancelled, a `PAIRED` that crosses the
+    /// cancel pins nothing; but one that answers the recovery carrying the
+    /// cancel says the grant committed before the cancel arrived (wire.md
+    /// 10.9), and is taken.
     pub fn on_paired(&mut self, host_name: String, role: Role) -> Vec<DirectJoinerAction> {
         let Some(pending) = self.pending.clone() else {
             return self.protocol_error();
         };
-        if pending.cancelled {
+        if pending.cancelled && !self.cancel_sent {
             return Vec::new();
         }
         let ok = match self.state {

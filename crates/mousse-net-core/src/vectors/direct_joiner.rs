@@ -34,7 +34,7 @@ fn sequences() -> Vec<J> {
             "steps": [
                 { "op": "start", "code": "right", "result": "ok" },
                 { "op": "connect", "conn": 1, "host": "host", "state": "awaiting_allow", "ledger": 4, "pending": "pending", "pinned": false },
-                { "op": "allow", "state": "ended:paired", "pending": null, "pinned": true, "granted": true },
+                { "op": "allow", "state": "ended:paired", "pending": null, "pinned": true, "granted": "committed" },
             ],
         }),
         json!({
@@ -94,7 +94,7 @@ fn sequences() -> Vec<J> {
             "steps": [
                 { "op": "start", "code": "right", "result": "ok" },
                 { "op": "connect", "conn": 1, "host": "host" },
-                { "op": "decline", "state": "ended:closed:pairing_declined", "pending": null, "pinned": false, "granted": false },
+                { "op": "decline", "state": "ended:closed:pairing_declined", "pending": null, "pinned": false, "granted": null },
             ],
         }),
         json!({
@@ -103,7 +103,7 @@ fn sequences() -> Vec<J> {
             "steps": [
                 { "op": "start", "code": "right", "result": "ok" },
                 { "op": "connect", "conn": 1, "host": "host" },
-                { "op": "allow", "lose": "paired", "state": "away", "pending": "pending", "pinned": false, "granted": true },
+                { "op": "allow", "lose": "paired", "state": "away", "pending": "pending", "pinned": false, "granted": "provisional" },
                 { "op": "connect", "conn": 2, "host": "host", "state": "ended:paired", "pending": null, "pinned": true },
             ],
         }),
@@ -114,8 +114,8 @@ fn sequences() -> Vec<J> {
                 { "op": "start", "code": "right", "result": "ok" },
                 { "op": "connect", "conn": 1, "host": "host" },
                 { "op": "drop", "state": "away", "pending": "pending" },
-                { "op": "allow", "granted": false },
-                { "op": "connect", "conn": 2, "host": "host", "state": "ended:paired", "pending": null, "pinned": true, "granted": true },
+                { "op": "allow", "granted": null },
+                { "op": "connect", "conn": 2, "host": "host", "state": "ended:paired", "pending": null, "pinned": true, "granted": "committed" },
             ],
         }),
         json!({
@@ -125,7 +125,7 @@ fn sequences() -> Vec<J> {
                 { "op": "start", "code": "right", "result": "ok" },
                 { "op": "connect", "conn": 1, "host": "host" },
                 { "op": "cancel", "state": "away", "pending": "cancelled" },
-                { "op": "connect", "conn": 2, "host": "host", "state": "ended:closed:cancelled", "pending": null, "pinned": false, "granted": false },
+                { "op": "connect", "conn": 2, "host": "host", "state": "ended:closed:cancelled", "pending": null, "pinned": false, "granted": null },
             ],
         }),
         json!({
@@ -136,7 +136,7 @@ fn sequences() -> Vec<J> {
                 { "op": "connect", "conn": 1, "host": "host" },
                 { "op": "drop" },
                 { "op": "cancel", "state": "away", "pending": "cancelled" },
-                { "op": "connect", "conn": 2, "host": "host", "state": "ended:closed:cancelled", "pending": null, "granted": false },
+                { "op": "connect", "conn": 2, "host": "host", "state": "ended:closed:cancelled", "pending": null, "granted": null },
             ],
         }),
         json!({
@@ -145,9 +145,9 @@ fn sequences() -> Vec<J> {
             "steps": [
                 { "op": "start", "code": "right", "result": "ok" },
                 { "op": "connect", "conn": 1, "host": "host" },
-                { "op": "allow", "in_transit": true, "granted": true },
-                { "op": "cancel", "state": "away", "pending": "cancelled", "pinned": false, "granted": false },
-                { "op": "connect", "conn": 2, "host": "host", "state": "ended:closed:invitation_invalid", "pending": null, "pinned": false, "granted": false },
+                { "op": "allow", "in_transit": true, "granted": "provisional" },
+                { "op": "cancel", "state": "away", "pending": "cancelled", "pinned": false, "granted": null },
+                { "op": "connect", "conn": 2, "host": "host", "state": "ended:closed:invitation_invalid", "pending": null, "pinned": false, "granted": null },
             ],
         }),
         json!({
@@ -167,7 +167,7 @@ fn sequences() -> Vec<J> {
                 { "op": "connect", "conn": 1, "host": "host", "crash": "after_msg_c", "pending": "pending" },
                 { "op": "resume", "result": "ok" },
                 { "op": "connect", "conn": 2, "host": "host", "state": "awaiting_allow" },
-                { "op": "allow", "state": "ended:paired", "pending": null, "pinned": true, "granted": true },
+                { "op": "allow", "state": "ended:paired", "pending": null, "pinned": true, "granted": "committed" },
             ],
         }),
     ]
@@ -435,6 +435,10 @@ impl World {
                     );
                     to_joiner.push(close_marker(code));
                 }
+                DirectHostAction::Committed { conn, grant, .. } if conn.0 == self.conn => {
+                    self.out
+                        .push(json!({ "committed": { "conn": conn.0, "grant": grant.0 } }));
+                }
                 DirectHostAction::MissHold { conn, hold_ms } if conn.0 == self.conn => {
                     // The I/O layer holds the connection, then closes it.
                     self.out
@@ -448,6 +452,30 @@ impl World {
             }
         }
         to_joiner
+    }
+
+    /// Paired, the joiner's app opens its first stream on the connection,
+    /// if it is still up: the host's gate holds it until the host commits
+    /// the provisional grant (wire.md 8.1).
+    fn first_stream(&mut self) {
+        let Some(i) = self.host else {
+            return;
+        };
+        if !self.open {
+            return;
+        }
+        let (conn, now) = (ConnectionId(self.conn), self.now);
+        let h = &mut self.hosts[i];
+        let Some(grant) = h
+            .grants
+            .binding(conn)
+            .filter(|g| h.grants.is_provisional(*g))
+        else {
+            return;
+        };
+        self.out.push(json!({ "stream": self.conn }));
+        let actions = h.machine.on_first_stream(conn, grant, &mut h.grants, now);
+        let _ = self.host_did(actions);
     }
 
     /// The joiner's message reaches the host.
@@ -604,8 +632,12 @@ impl World {
                 Vec::new()
             }
             DirectJoinerAction::Ended(end) => {
+                let paired = matches!(end, DirectEnd::Paired);
                 self.out
                     .push(json!({ "joiner": { "ended": end_name(end) } }));
+                if paired {
+                    self.first_stream();
+                }
                 Vec::new()
             }
         }
@@ -713,13 +745,17 @@ impl World {
         if !self.open || self.host.is_none() {
             return;
         }
-        // Step 2 on the host: a live grant binds the connection and the
-        // host says AUTHORIZED {live} first.
+        // Step 2 on the host: a provisional or live grant binds the
+        // connection and the host says AUTHORIZED {live} first.
         let i = self.host.expect("host");
         let (conn, now, joiner) = (ConnectionId(self.conn), self.now, self.joiner_key);
-        let live = self.hosts[i].grants.live_grant(&joiner, now).map(|g| g.id);
+        let bound = match crate::authz::decide(&self.hosts[i].grants, &joiner, now) {
+            crate::authz::Step2::Live { grant, .. }
+            | crate::authz::Step2::Provisional { grant, .. } => Some(grant),
+            _ => None,
+        };
         let mut inbox = Vec::new();
-        if let Some(grant) = live {
+        if let Some(grant) = bound {
             self.hosts[i].grants.bind(conn, grant, now).expect("bind");
             let m = ControlMessage::Authorized {
                 state: AuthorizedState::Live,
@@ -892,14 +928,19 @@ fn run_sequence(seq: &J, listed: Option<&J>) -> J {
         if let Some(p) = step["pinned"].as_bool() {
             assert_eq!(!w.store.pins.is_empty(), p, "{ctx}: pinned");
         }
-        if let Some(g) = step["granted"].as_bool() {
+        if let Some(g) = step.get("granted") {
             let (joiner, now) = (w.joiner_key, w.now);
             let invitation = w.hosts[0].invitation;
-            let granted = w.hosts[0]
-                .grants
-                .live_grant(&joiner, now)
-                .is_some_and(|g| g.enrolled_by == Some(invitation));
-            assert_eq!(granted, g, "{ctx}: granted");
+            let grants = &w.hosts[0].grants;
+            let made = |g: &crate::grants::Grant| g.direct && g.enrolled_by == Some(invitation);
+            let got = if grants.live_grant(&joiner, now).is_some_and(made) {
+                Some("committed")
+            } else if grants.provisional_grant(&joiner, now).is_some_and(made) {
+                Some("provisional")
+            } else {
+                None
+            };
+            assert_eq!(got, g.as_str(), "{ctx}: granted");
         }
         let mut recorded = step.clone();
         recorded["out"] = J::Array(std::mem::take(&mut w.out));

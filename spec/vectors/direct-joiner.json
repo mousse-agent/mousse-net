@@ -107,7 +107,7 @@
           "state": "awaiting_allow"
         },
         {
-          "granted": true,
+          "granted": "committed",
           "op": "allow",
           "out": [
             {
@@ -137,6 +137,15 @@
             {
               "joiner": {
                 "ended": "paired"
+              }
+            },
+            {
+              "stream": 1
+            },
+            {
+              "committed": {
+                "conn": 1,
+                "grant": 0
               }
             }
           ],
@@ -1009,7 +1018,7 @@
           ]
         },
         {
-          "granted": false,
+          "granted": null,
           "op": "decline",
           "out": [
             {
@@ -1127,7 +1136,7 @@
           ]
         },
         {
-          "granted": true,
+          "granted": "provisional",
           "lose": "paired",
           "op": "allow",
           "out": [
@@ -1195,6 +1204,15 @@
             {
               "joiner": {
                 "ended": "paired"
+              }
+            },
+            {
+              "stream": 2
+            },
+            {
+              "committed": {
+                "conn": 2,
+                "grant": 0
               }
             }
           ],
@@ -1307,13 +1325,13 @@
           "state": "away"
         },
         {
-          "granted": false,
+          "granted": null,
           "op": "allow",
           "out": []
         },
         {
           "conn": 2,
-          "granted": true,
+          "granted": "committed",
           "host": "host",
           "op": "connect",
           "out": [
@@ -1361,6 +1379,15 @@
             {
               "joiner": {
                 "ended": "paired"
+              }
+            },
+            {
+              "stream": 2
+            },
+            {
+              "committed": {
+                "conn": 2,
+                "grant": 0
               }
             }
           ],
@@ -1498,7 +1525,7 @@
         },
         {
           "conn": 2,
-          "granted": false,
+          "granted": null,
           "host": "host",
           "op": "connect",
           "out": [
@@ -1652,7 +1679,7 @@
         },
         {
           "conn": 2,
-          "granted": false,
+          "granted": null,
           "host": "host",
           "op": "connect",
           "out": [
@@ -1777,7 +1804,7 @@
           ]
         },
         {
-          "granted": true,
+          "granted": "provisional",
           "in_transit": true,
           "op": "allow",
           "out": [
@@ -1791,7 +1818,7 @@
           ]
         },
         {
-          "granted": false,
+          "granted": null,
           "op": "cancel",
           "out": [
             {
@@ -1834,7 +1861,7 @@
         },
         {
           "conn": 2,
-          "granted": false,
+          "granted": null,
           "host": "host",
           "op": "connect",
           "out": [
@@ -2139,7 +2166,7 @@
           "state": "awaiting_allow"
         },
         {
-          "granted": true,
+          "granted": "committed",
           "op": "allow",
           "out": [
             {
@@ -2169,6 +2196,15 @@
             {
               "joiner": {
                 "ended": "paired"
+              }
+            },
+            {
+              "stream": 2
+            },
+            {
+              "committed": {
+                "conn": 2,
+                "grant": 0
               }
             }
           ],
