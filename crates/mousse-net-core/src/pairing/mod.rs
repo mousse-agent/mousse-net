@@ -36,8 +36,8 @@ pub use direct_code::{
 };
 pub use direct_host::{
     ApprovalEnd, CreatedDirectInvitation, DirectApproval, DirectHostAction, DirectHostError,
-    DirectHostPairing, DirectInvitationParams, DirectInvitationStatus, DirectRequestId,
-    RequestDecision, RequestPresence,
+    DirectHostPairing, DirectInvitationParams, DirectInvitationStatus, DirectRecords,
+    DirectRequestId, RequestDecision, RequestPresence,
 };
 pub use direct_joiner::{
     DirectAddress, DirectEnd, DirectJoinError, DirectJoinerAction, DirectJoinerPairing,

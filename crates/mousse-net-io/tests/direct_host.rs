@@ -22,7 +22,13 @@
 //! removals and commits stored before they are answered or released, the
 //! cancel acted on where it is admitted, the hold owning its place, an
 //! Allow on a connection already closed, ticket re-pair over relay, a
-//! failed enrollment save, and the place of a receipt recovery.
+//! failed enrollment save, and the place of a receipt recovery. Round two
+//! adds: a failed save puts the grant table and the enrollment records
+//! back together; a failed cancel keeps earlier unsaved changes waiting; a
+//! grant whose cancel was not stored commits nothing; a `GOAWAY` cancel
+//! counts where it is read and is stored before it is reported; an abort
+//! admitted before an Allow still cancels; and the one-proof rule on the
+//! enrolled connection after its commit.
 #![cfg(debug_assertions)]
 
 mod common;
@@ -138,6 +144,11 @@ impl DirectHost {
             GrantStore::in_dir(dir).path(),
             &vec![Fault::BeforeRename; n],
         );
+    }
+
+    /// Table writes work again.
+    fn heal_table_writes(&self) {
+        self.fail_table_writes(0);
     }
 
     /// The next enrollment save fails before anything changed on disk.
@@ -1065,7 +1076,11 @@ async fn a_cancel_past_the_gate_beats_a_later_first_stream() {
         if let Some(tx) = stopped_tx.take() {
             let _ = tx.send(());
         }
-        let _ = go_rx.recv_timeout(WAIT);
+        // Hand this worker's queue on while it waits, so the other
+        // connection's driver runs meanwhile.
+        tokio::task::block_in_place(|| {
+            let _ = go_rx.recv_timeout(WAIT);
+        });
         true
     });
     let attempt = first.attempt.expect("the attempt that passed");
@@ -1202,19 +1217,52 @@ async fn a_ticket_re_pair_and_receipt_still_work_over_a_relay() {
     assert!(matches!(outcome, JoinOutcome::Paired(_)), "{outcome:?}");
     conn.close(ErrorCode::NoError);
 
-    // Granted now: a new ticket pairs it again over the relay.
+    // Granted now, with the TCP pool full: the re-pair finds no place, so
+    // the proof opens nothing and the device stays as it is.
+    let pool = Limits::DEFAULT.io().preauth_tcp();
+    let mut full: Vec<_> = (0..pool)
+        .map(|_| host.host.admit(ListenerKind::Tcp, None).unwrap())
+        .collect();
     let second = ticket(&host);
     let pipe = relay_join(&host);
-    let (joined, ()) = tokio::join!(
-        within(
-            "re-pair",
-            caller.join(pipe, &second, Arrival::InAppScan, "laptop")
-        ),
-        host.approve_ticket()
+    let (_conn, outcome) = within(
+        "a re-pair with no place",
+        caller.join(pipe, &second, Arrival::InAppScan, "laptop"),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(outcome, JoinOutcome::AlreadyPaired),
+        "no place, no re-pair: {outcome:?}"
     );
+
+    // One place free: the re-pair takes it while it waits for the answer,
+    // and pairs.
+    full.pop();
+    let pipe = relay_join(&host);
+    let re_pair = caller.join(pipe, &second, Arrival::InAppScan, "laptop");
+    let answer = async {
+        loop {
+            match within("an in-person request", host.events.recv()).await {
+                Some(HostEvent::ApprovalRequested(request)) => {
+                    assert_eq!(
+                        host.host.preauth_stats().open(ListenerKind::Tcp),
+                        pool,
+                        "the re-pair holds a TCP place"
+                    );
+                    host.host.approve(&request).unwrap();
+                    return;
+                }
+                Some(_) => continue,
+                None => panic!("host events ended"),
+            }
+        }
+    };
+    let (joined, ()) = tokio::join!(within("re-pair", re_pair), answer);
     let (conn, outcome) = joined.unwrap();
     assert!(matches!(outcome, JoinOutcome::Paired(_)), "{outcome:?}");
     conn.close(ErrorCode::NoError);
+    drop(full);
 
     // The consumed ticket again: answered from the grant's receipt.
     let pipe = relay_join(&host);
@@ -1322,5 +1370,285 @@ async fn a_held_provisional_connection_ignores_its_stream_until_the_hold_ends() 
     assert!(started.elapsed() >= Duration::from_millis(HOLD_MS));
     assert_eq!(host.streams_served(), 0);
     assert!(host.provisional_of(&joiner.identity), "nothing committed");
+    host.stop().await;
+}
+
+/// Send `CODE_ABORT {CANCELLED}` for the attempt that passed on `peer`.
+async fn cancel_attempt(peer: &mut Peer) {
+    let attempt = peer.attempt.expect("the attempt that passed");
+    peer.say(ControlMessage::CodeAbort {
+        attempt,
+        code: ErrorCode::Cancelled,
+    })
+    .await;
+}
+
+/// Round 2, item 1. A recovery's cancel that cannot be stored puts back the
+/// grant and the records of the connection it was enrolled on, which stays
+/// open: that connection's own cancel still removes the grant.
+#[tokio::test]
+async fn a_recovery_cancel_that_cannot_be_stored_leaves_the_enrolled_cancel_working() {
+    minor_4();
+    let dir = temp_dir("direct-rollback-recovery");
+    let joiner = Joiner::new();
+    let mut host = DirectHost::start(new_signer(), Some(dir.clone())).await;
+    let invite = host.invite();
+    let mut first = enrolled(&mut host, &joiner, &invite).await;
+
+    host.fail_table_writes(1);
+    let mut other = ordinary(&host, &joiner).await;
+    other.recover(&invite, true).await;
+    assert_eq!(other.closed_with().await, ErrorCode::InternalError);
+    assert!(host.provisional_of(&joiner.identity));
+
+    cancel_attempt(&mut first).await;
+    assert_eq!(first.closed_with().await, ErrorCode::Cancelled);
+    host.until("the undo", |e| {
+        matches!(e, DirectEvent::EnrollmentUndone { .. })
+    })
+    .await;
+    assert!(!host.provisional_of(&joiner.identity));
+    host.stop().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Round 2, item 1. A second Pair with IP enrollment of the same device
+/// replaces its provisional grant; when that enrollment cannot be stored,
+/// the first grant comes back with the record of the connection it was
+/// enrolled on, which can still cancel it.
+#[tokio::test]
+async fn a_replacing_enrollment_that_cannot_be_stored_leaves_the_first_cancel_working() {
+    minor_4();
+    let dir = temp_dir("direct-rollback-replace");
+    let joiner = Joiner::new();
+    let mut host = DirectHost::start(new_signer(), Some(dir.clone())).await;
+    let first_invite = host.invite();
+    let mut first = enrolled(&mut host, &joiner, &first_invite).await;
+
+    // The same device, live under its provisional grant, passes a second
+    // invitation's code.
+    let second_invite = host.invite();
+    let mut second = ordinary(&host, &joiner).await;
+    let invitation = second.admitted(&second_invite.code).await;
+    assert!(second.attempt(&second_invite.code, invitation).await);
+    let request = prompted(&mut host).await;
+    assert_eq!(request.invitation, second_invite.invitation);
+    host.fail_enrollment_write();
+    assert!(host.host.allow_direct(&request, None).is_err());
+    assert_eq!(second.closed_with().await, ErrorCode::InternalError);
+    assert!(
+        host.provisional_of(&joiner.identity),
+        "the first grant is back"
+    );
+
+    cancel_attempt(&mut first).await;
+    assert_eq!(first.closed_with().await, ErrorCode::Cancelled);
+    assert!(!host.provisional_of(&joiner.identity));
+    host.stop().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Round 2, item 2. A cancel that cannot be stored does not drop an earlier
+/// change that is still waiting to be saved: the host keeps retrying it.
+#[tokio::test]
+async fn a_failed_cancel_save_keeps_an_earlier_unsaved_change_waiting() {
+    minor_4();
+    let dir = temp_dir("direct-unsaved");
+    let signer = new_signer();
+    let joiner = Joiner::new();
+    let mut host = DirectHost::start(signer.clone(), Some(dir.clone())).await;
+    let invite = host.invite();
+    let peer = enrolled(&mut host, &joiner, &invite).await;
+    peer.goaway(ErrorCode::NoError).await;
+    let denied = new_signer().public_key();
+    host.host.add_grant(denied, "old".into(), None).unwrap();
+
+    // The denial's save fails, then the cancel's (and any retry of the
+    // denial in between, until the disk heals).
+    host.fail_table_writes(1000);
+    assert!(host.host.deny(denied).is_err());
+    let mut other = ordinary(&host, &joiner).await;
+    other.recover(&invite, true).await;
+    assert_eq!(other.closed_with().await, ErrorCode::InternalError);
+    assert!(host.host.has_unsaved_changes(), "the denial still waits");
+    host.heal_table_writes();
+    within("the retried save", async {
+        while host.host.has_unsaved_changes() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    host.stop().await;
+
+    let host = DirectHost::start(signer, Some(dir.clone())).await;
+    assert!(
+        host.host.denials().iter().any(|d| d.identity == denied),
+        "the denial reached the disk"
+    );
+    host.stop().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Round 2, item 3. A provisional grant whose cancel could not be stored
+/// commits nothing: another connection's first stream is refused until the
+/// cancel is repeated, which removes the grant.
+#[tokio::test]
+async fn a_grant_whose_cancel_was_not_stored_commits_nothing() {
+    minor_4();
+    let dir = temp_dir("direct-cancel-pending");
+    let joiner = Joiner::new();
+    let mut host = DirectHost::start(new_signer(), Some(dir.clone())).await;
+    let invite = host.invite();
+    let peer = enrolled(&mut host, &joiner, &invite).await;
+    peer.goaway(ErrorCode::NoError).await;
+    let mut bound = ordinary(&host, &joiner).await;
+
+    host.fail_table_writes(1);
+    let mut other = ordinary(&host, &joiner).await;
+    other.recover(&invite, true).await;
+    assert_eq!(other.closed_with().await, ErrorCode::InternalError);
+
+    assert_eq!(bound.refused_stream().await, ErrorCode::InternalError);
+    assert_eq!(host.streams_served(), 0);
+    assert!(host.provisional_of(&joiner.identity) && !host.granted(&joiner.identity));
+
+    let mut other = ordinary(&host, &joiner).await;
+    other.recover(&invite, true).await;
+    assert_eq!(other.closed_with().await, ErrorCode::Cancelled);
+    assert!(!host.provisional_of(&joiner.identity) && !host.granted(&joiner.identity));
+    host.stop().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Round 2, item 4. A `GOAWAY {CANCELLED}` on the enrolled connection
+/// counts where it is read: a first stream on another connection while
+/// that connection is still being torn down commits nothing. The hook stops
+/// the closing driver right after the gate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_goaway_cancel_beats_a_later_first_stream() {
+    minor_4();
+    let mut host = DirectHost::start(new_signer(), None).await;
+    let joiner = Joiner::new();
+    let invite = host.invite();
+    let first = enrolled(&mut host, &joiner, &invite).await;
+    let mut second = ordinary(&host, &joiner).await;
+
+    let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel::<()>();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let mut stopped_tx = Some(stopped_tx);
+    host.host.set_after_goaway_check(move || {
+        if let Some(tx) = stopped_tx.take() {
+            let _ = tx.send(());
+        }
+        // Hand this worker's queue on while it waits, so the other
+        // connection's driver runs meanwhile.
+        tokio::task::block_in_place(|| {
+            let _ = go_rx.recv_timeout(WAIT);
+        });
+        true
+    });
+    first.goaway(ErrorCode::Cancelled).await;
+    within("the GOAWAY at the gate", stopped_rx).await.unwrap();
+    second.send_on_stream().await;
+    let second_got = second.next().await;
+    let _ = go_tx.send(());
+    assert_eq!(second_got, Got::GoAway(ErrorCode::GrantRevoked));
+    host.until("the undo", |e| {
+        matches!(e, DirectEvent::EnrollmentUndone { .. })
+    })
+    .await;
+    assert!(!host.provisional_of(&joiner.identity) && !host.granted(&joiner.identity));
+    host.stop().await;
+}
+
+/// Round 2, item 4. A `GOAWAY {CANCELLED}` whose removal cannot be stored
+/// reports nothing, and the grant it could not remove commits nothing.
+#[tokio::test]
+async fn a_goaway_cancel_that_cannot_be_stored_reports_nothing() {
+    minor_4();
+    let dir = temp_dir("direct-goaway-save");
+    let joiner = Joiner::new();
+    let mut host = DirectHost::start(new_signer(), Some(dir.clone())).await;
+    let invite = host.invite();
+    let first = enrolled(&mut host, &joiner, &invite).await;
+    let mut second = ordinary(&host, &joiner).await;
+
+    host.fail_table_writes(1);
+    first.goaway(ErrorCode::Cancelled).await;
+    assert_eq!(second.refused_stream().await, ErrorCode::InternalError);
+    assert!(
+        host.provisional_of(&joiner.identity),
+        "the grant is still there"
+    );
+    while let Ok(event) = host.events.try_recv() {
+        assert!(
+            !matches!(
+                event,
+                HostEvent::Direct(DirectEvent::EnrollmentUndone { .. })
+            ),
+            "a removal that is not stored is not reported"
+        );
+    }
+    host.stop().await;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Round 2, item 5. A `CODE_ABORT {CANCELLED}` the gate let in while the
+/// connection was join-only, overtaken by an Allow before it is handled,
+/// still cancels: the grant that Allow made is removed.
+#[tokio::test]
+async fn an_abort_admitted_before_an_allow_still_cancels() {
+    minor_4();
+    let mut host = DirectHost::start(new_signer(), None).await;
+    let joiner = Joiner::new();
+    let invite = host.invite();
+    let mut peer = passed(&mut host, &joiner, &invite).await;
+    let request = prompted(&mut host).await;
+
+    let allowing = host.host.clone();
+    host.host.set_after_pairing_check(move || {
+        allowing.allow_direct(&request, None).unwrap();
+        true
+    });
+    cancel_attempt(&mut peer).await;
+    assert_eq!(peer.closed_with().await, ErrorCode::Cancelled);
+    host.until("the undo", |e| {
+        matches!(e, DirectEvent::EnrollmentUndone { .. })
+    })
+    .await;
+    assert!(!host.provisional_of(&joiner.identity) && !host.granted(&joiner.identity));
+    host.stop().await;
+}
+
+/// Round 2, item 6. After the grant commits through another connection,
+/// the enrolled connection is live like any other. It already carried its
+/// one `JOIN_DIRECT`, so a second one there closes it with
+/// `PROTOCOL_ERROR` (wire.md 8.1) and leaves the grant as it is; a new
+/// connection looks codes up and recovers by receipt as usual.
+#[tokio::test]
+async fn after_a_commit_the_enrolled_connection_keeps_the_one_proof_rule() {
+    minor_4();
+    let mut host = DirectHost::start(new_signer(), None).await;
+    let joiner = Joiner::new();
+    let invite = host.invite();
+    let mut first = enrolled(&mut host, &joiner, &invite).await;
+    let mut second = ordinary(&host, &joiner).await;
+    second.echo().await;
+    host.until("the commit", |e| matches!(e, DirectEvent::Committed { .. }))
+        .await;
+
+    first.recover(&invite, false).await;
+    assert_eq!(first.closed_with().await, ErrorCode::ProtocolError);
+    assert!(host.granted(&joiner.identity));
+
+    let mut third = ordinary(&host, &joiner).await;
+    third.recover(&invite, false).await;
+    assert!(matches!(
+        third.control().await,
+        ControlMessage::Paired { .. }
+    ));
+    let next = host.invite();
+    let mut fourth = ordinary(&host, &joiner).await;
+    assert_eq!(fourth.admitted(&next.code).await, next.invitation);
     host.stop().await;
 }

@@ -1537,6 +1537,12 @@ impl Driver {
                     return;
                 }
             };
+            // A peer's GOAWAY counts where it is read: the role acts on its
+            // code now, in the same step as the gate, before anything else
+            // the role does can come between (a Pair with IP cancel).
+            if let Frame::GoAway { code } = &frame {
+                self.role.on_goaway(*code);
+            }
             let verdict = match classify(&frame) {
                 Err(code) => Verdict::Close(code),
                 Ok((traffic, message)) => self.gate(traffic, message.as_ref()),
@@ -1694,7 +1700,6 @@ impl Driver {
             }
             MuxEvent::GoAway { code } => {
                 self.reason.get_or_insert(CloseReason::Peer(code));
-                self.role.on_goaway(code);
             }
         }
     }

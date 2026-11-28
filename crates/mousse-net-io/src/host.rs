@@ -51,8 +51,9 @@ use mousse_net_core::mux::MuxRole;
 use mousse_net_core::pairing::{
     ApprovalEnd, BindingTranscript, CodeExchangeFactory, CpaceExchangeFactory, CreatedInvitation,
     DirectApproval, DirectCode, DirectHostAction, DirectHostPairing, DirectInvitationParams,
-    DirectInvitationStatus, DirectRequestId, ExchangeRole, HostAction, HostPairing, InvitationId,
-    InvitationKind, InvitationParams, InvitationStatus, PairingCode, SessionExporters, SID_LEN,
+    DirectInvitationStatus, DirectRecords, DirectRequestId, ExchangeRole, HostAction, HostPairing,
+    InvitationId, InvitationKind, InvitationParams, InvitationStatus, PairingCode,
+    SessionExporters, SID_LEN,
 };
 use mousse_net_core::removal::{self, Decision, Journaled, RemovalId, SignedRemoval};
 use mousse_net_core::{ConnectionId, ErrorCode, Millis, UnixTime};
@@ -267,6 +268,13 @@ pub enum DirectEvent {
     },
 }
 
+/// The state a Pair with IP step may change, taken before it
+/// ([`Inner::checkpoint`]).
+struct Checkpoint {
+    grants: GrantTable,
+    records: DirectRecords,
+}
+
 /// A new Pair with IP invitation ([`Host::invite_direct`]), ready to show.
 #[derive(Clone, Debug)]
 pub struct DirectInvite {
@@ -433,6 +441,10 @@ struct Inner<F: CodeExchangeFactory> {
     /// Connections held after a `JOIN_DIRECT` that found nothing, until
     /// this monotonic time; then they close with `INVITATION_INVALID`.
     holds: HashMap<ConnectionId, Millis>,
+    /// Provisional grants whose removal by their device's cancel could not
+    /// be stored: put back, and committing nothing until a cancel removes
+    /// them for good.
+    cancel_pending: HashSet<GrantId>,
     /// The pre-auth places of those misses, each kept until its hold ends
     /// even when its connection is gone sooner: a miss costs its source a
     /// place for the whole hold, however the peer leaves.
@@ -483,12 +495,27 @@ struct Shared<F: CodeExchangeFactory> {
     /// Tests run this after a pairing message passed the gate and before
     /// it is handled; it stays until it returns true. Debug builds only
     /// ([`Host::set_after_pairing_check`]).
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, debug_assertions))]
     after_pairing_check: Mutex<Option<PairingHook>>,
+    /// The same, after a peer's `GOAWAY` passed the gate
+    /// ([`Host::set_after_goaway_check`]).
+    #[cfg(any(test, debug_assertions))]
+    after_goaway_check: Mutex<Option<PairingHook>>,
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(test, debug_assertions))]
 type PairingHook = Box<dyn FnMut() -> bool + Send>;
+
+/// Run the hook in `slot`, if any; it stays until it returns true.
+#[cfg(any(test, debug_assertions))]
+fn run_hook(slot: &Mutex<Option<PairingHook>>) {
+    let hook = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(mut hook) = hook {
+        if !hook() {
+            *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(hook);
+        }
+    }
+}
 
 /// A host. Cheap to clone; all clones share state.
 pub struct Host<F: CodeExchangeFactory = CpaceExchangeFactory> {
@@ -1104,7 +1131,7 @@ where
     /// - anything else is saved after, as every grant change is.
     fn settle_direct(
         &mut self,
-        before: GrantTable,
+        before: Checkpoint,
         actions: Vec<DirectHostAction>,
     ) -> Result<(), NetError> {
         if actions
@@ -1116,31 +1143,37 @@ where
             self.apply_direct(actions, false);
             return stored;
         }
-        let answers_cancel = actions.iter().any(|a| {
-            matches!(
-                a,
-                DirectHostAction::Close {
-                    code: ErrorCode::Cancelled,
-                    ..
-                }
-            )
-        }) && actions
+        // A cancel's removal of a provisional grant (by `CODE_ABORT`,
+        // `GOAWAY` or recovery) is the only other change reported as
+        // `EnrollmentUndone` here: it is stored before anything about it
+        // is reported or answered.
+        let undone: Vec<GrantId> = actions
             .iter()
-            .any(|a| matches!(a, DirectHostAction::EnrollmentUndone { .. }));
-        if !answers_cancel {
+            .filter_map(|a| match a {
+                DirectHostAction::EnrollmentUndone { grant, .. } => Some(*grant),
+                _ => None,
+            })
+            .collect();
+        if undone.is_empty() {
             self.apply_direct(actions, true);
             return Ok(());
         }
         match self.save_strict() {
             Ok(()) => {
+                for grant in &undone {
+                    self.cancel_pending.remove(grant);
+                }
                 self.apply_direct(actions, false);
                 Ok(())
             }
             Err(failure) => {
-                // The disk may hold either table now: the one in memory is
-                // written again by the ticker, so both agree in the end.
-                self.unsaved = failure.in_place;
-                self.grants = before;
+                // The grant and the records that let its device cancel it
+                // come back together. It commits nothing until a cancel
+                // removes it for good, also when the write may have reached
+                // the disk (the ticker then writes the table in memory
+                // again, so both agree in the end).
+                self.roll_back(before, failure.in_place);
+                self.cancel_pending.extend(undone);
                 let actions = actions
                     .into_iter()
                     .filter_map(|a| match a {
@@ -1167,6 +1200,25 @@ where
         self.clock.mono()
     }
 
+    /// What a Pair with IP step may change, taken before it runs: the
+    /// grant table and the direct host's connection records, which go back
+    /// together when the step cannot be stored ([`Inner::roll_back`]).
+    fn checkpoint(&self) -> Checkpoint {
+        Checkpoint {
+            grants: self.grants.clone(),
+            records: self.direct.records(),
+        }
+    }
+
+    /// Put back the state of `checkpoint` after a save that failed. A
+    /// change that was already waiting to be saved still waits; one whose
+    /// write may have reached the disk (`in_place`) is written again.
+    fn roll_back(&mut self, checkpoint: Checkpoint, in_place: bool) {
+        self.grants = checkpoint.grants;
+        self.direct.restore_records(checkpoint.records);
+        self.unsaved |= in_place;
+    }
+
     /// The provisional grant of `identity` a direct invitation made, if
     /// any: what a denial would remove.
     fn direct_provisional_of(
@@ -1185,7 +1237,7 @@ where
     /// a restart would lose.
     fn commit_direct_enrollment(
         &mut self,
-        before: GrantTable,
+        before: Checkpoint,
         actions: Vec<DirectHostAction>,
     ) -> (Vec<DirectHostAction>, Result<(), NetError>) {
         let (enrolling, pending): (Vec<ConnectionId>, Vec<PendingEnrollment>) = actions
@@ -1215,7 +1267,7 @@ where
             return (actions, Ok(()));
         };
         self.grants_gen.send_modify(|g| *g += 1);
-        let failure = match store.save_enrollment(&before, &self.grants, &pending) {
+        let failure = match store.save_enrollment(&before.grants, &self.grants, &pending) {
             Ok(()) => {
                 self.unsaved = false;
                 return (actions, Ok(()));
@@ -1275,7 +1327,7 @@ where
         // Not stored, and not in force: the grant table goes back, and the
         // invitation ends instead of being consumed, as a restart would
         // find it. Its prompt ends as dismissed, not enrolled.
-        self.grants = before;
+        self.roll_back(before, false);
         let ended: Vec<InvitationId> = pending.iter().map(|p| p.invitation).collect();
         for invitation in &ended {
             self.direct.enrollment_not_stored(invitation);
@@ -1326,7 +1378,12 @@ where
         grant: GrantId,
         now: UnixTime,
     ) -> Result<(), ErrorCode> {
-        let before = self.grants.clone();
+        // A grant whose cancel could not be stored waits for that cancel.
+        if self.cancel_pending.contains(&grant) {
+            self.close_conn(conn, ErrorCode::InternalError);
+            return Err(ErrorCode::InternalError);
+        }
+        let before = self.checkpoint();
         let actions = self
             .direct
             .on_first_stream(conn, grant, &mut self.grants, now);
@@ -1344,7 +1401,7 @@ where
                     // one in memory, with the grant provisional and its
                     // enrolled connection still able to cancel it, and
                     // nothing runs on this frame.
-                    self.grants = before;
+                    self.roll_back(before, false);
                     self.close_conn(conn, ErrorCode::InternalError);
                     return Err(ErrorCode::InternalError);
                 }
@@ -1427,7 +1484,7 @@ where
                 }
             }
         }
-        let before = self.grants.clone();
+        let before = self.checkpoint();
         let actions = self.direct.on_join_direct(
             conn,
             peer,
@@ -1506,7 +1563,7 @@ where
         if !self.direct_conns.remove(&conn) {
             return;
         }
-        let before = self.grants.clone();
+        let before = self.checkpoint();
         let actions = self
             .direct
             .on_connection_closed(conn, Some(code), &mut self.grants, now);
@@ -1560,6 +1617,7 @@ where
                 direct_conns: HashSet::new(),
                 holds: HashMap::new(),
                 held_places: Vec::new(),
+                cancel_pending: HashSet::new(),
                 listened: HashMap::new(),
                 clock: config.clock.clone(),
                 gates: HashMap::new(),
@@ -1586,8 +1644,10 @@ where
             next_conn: AtomicU64::new(1),
             #[cfg(test)]
             ticker_paused: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(debug_assertions)]
+            #[cfg(any(test, debug_assertions))]
             after_pairing_check: Mutex::new(None),
+            #[cfg(any(test, debug_assertions))]
+            after_goaway_check: Mutex::new(None),
         });
         tokio::spawn(ticker(Arc::downgrade(&shared)));
         Ok((Self { shared }, events_rx))
@@ -1908,7 +1968,7 @@ where
         // Under this lock: a connection closed here before is not one the
         // device can be enrolled on.
         inner.sync_closed_direct(now);
-        let before = inner.grants.clone();
+        let before = inner.checkpoint();
         let actions = inner
             .direct
             .allow(request, role, &mut inner.grants, now)
@@ -1937,12 +1997,25 @@ where
     /// Tests: run `hook` on the connection's driver after a pairing message
     /// passed the gate and before it is handled, until it returns true.
     /// Debug builds only.
-    #[cfg(debug_assertions)]
+    #[cfg(any(test, debug_assertions))]
     #[doc(hidden)]
     pub fn set_after_pairing_check(&self, hook: impl FnMut() -> bool + Send + 'static) {
         *self
             .shared
             .after_pairing_check
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Box::new(hook));
+    }
+
+    /// Tests: run `hook` on the connection's driver after a peer's
+    /// `GOAWAY` passed the gate and before the connection is torn down,
+    /// until it returns true. Debug builds only.
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    pub fn set_after_goaway_check(&self, hook: impl FnMut() -> bool + Send + 'static) {
+        *self
+            .shared
+            .after_goaway_check
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(Box::new(hook));
     }
@@ -2615,7 +2688,7 @@ impl<F: CodeExchangeFactory> HostRole<F> {
         let verdict = gate.check_message(message);
         match (verdict, message) {
             (Verdict::Allow, ControlMessage::CodeAbort { attempt, code }) if cancel => {
-                let before = inner.grants.clone();
+                let before = inner.checkpoint();
                 let actions =
                     inner
                         .direct
@@ -2653,22 +2726,12 @@ where
         if verdict == Verdict::Allow && matches!(traffic, Traffic::Stream) {
             self.caller_opened = true;
         }
-        #[cfg(debug_assertions)]
-        if verdict == Verdict::Allow && matches!(traffic, Traffic::Pairing) {
-            let hook = self
-                .shared
-                .after_pairing_check
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take();
-            if let Some(mut hook) = hook {
-                if !hook() {
-                    *self
-                        .shared
-                        .after_pairing_check
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner()) = Some(hook);
-                }
+        #[cfg(any(test, debug_assertions))]
+        if verdict == Verdict::Allow {
+            match traffic {
+                Traffic::Pairing => run_hook(&self.shared.after_pairing_check),
+                Traffic::GoAway => run_hook(&self.shared.after_goaway_check),
+                _ => {}
             }
         }
         verdict
@@ -2693,7 +2756,14 @@ where
                 Some(GateState::JoinOnly { .. }),
                 ControlMessage::CodeExchange { .. } | ControlMessage::CodeAbort { .. }
             )
-        );
+        ) || (direct
+            // A `CODE_ABORT` the gate let in while join-only, overtaken by
+            // an Allow that enrolled this connection before it got here:
+            // still the device's cancel, of the grant that Allow made.
+            && matches!(
+                (inner.gates.get(&self.conn), &message),
+                (Some(gate), ControlMessage::CodeAbort { .. }) if gate.is_provisional()
+            ));
         if !admitted || !inner.serving() {
             return;
         }
@@ -2718,7 +2788,7 @@ where
             return;
         }
         if direct {
-            let before = inner.grants.clone();
+            let before = inner.checkpoint();
             let actions =
                 match message {
                     // A finished code exchange may enroll only through Allow;

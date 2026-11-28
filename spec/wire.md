@@ -1565,9 +1565,11 @@ the role the owner picks with the answer goes to that enrollment only.
   The cancel counts where it arrives: once the host has let the
   `CODE_ABORT` or the `GOAWAY` in, a first stream on another connection
   after it commits nothing. The host stores the removal before it answers
-  `CANCELLED`; when it cannot, the grant stays and the host closes with
-  `INTERNAL_ERROR`, so the joiner keeps its record and its next cancel
-  removes the grant.
+  `CANCELLED` or reports it; when it cannot, the grant stays and the host
+  closes with `INTERNAL_ERROR`, so the joiner keeps its record and its next
+  cancel removes the grant. Until that cancel is stored, the grant commits
+  nothing: a first stream on a connection bound to it closes with
+  `INTERNAL_ERROR`, even when the failed write may have reached the disk.
   A committed grant is never cancelled: the `CODE_ABORT` is ignored, the
   `GOAWAY` is an ordinary close, and a recovery's cancel is answered as a
   recovery without one (`PAIRED`).
