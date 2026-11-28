@@ -106,6 +106,8 @@ impl Endpoint {
 
     fn command(&self, args: &[&str]) -> Command {
         let mut cmd = Command::new(bin());
+        // Listen on loopback only, whatever the helper is told.
+        cmd.env("MOUSSE_HELPER_TEST_LOOPBACK", "1");
         cmd.arg("--state")
             .arg(&self.dir)
             .arg("--insecure-file-key")

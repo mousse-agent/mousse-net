@@ -338,6 +338,37 @@ fn a_pending_restart_hides_only_the_way_it_changes() {
     assert_eq!(public["routes"], json!(["tcp://p2.example:7443"]));
 }
 
+/// With LAN on, a test helper still opens its every-interface socket (no
+/// address left unbound) but listens on loopback only: it answers on
+/// 127.0.0.1 and not on this computer's other addresses.
+#[test]
+fn lan_on_in_a_test_listens_on_loopback_only() {
+    let end = Endpoint::init("iw-loop");
+    std::fs::write(
+        end.dir.join("routes.json"),
+        serde_json::to_vec(&json!({"lan": true})).unwrap(),
+    )
+    .unwrap();
+    let file = interfaces_file(&end, "lo0 127.0.0.1\n");
+    let mut a = app_with_interfaces(&end, &[], 0, &file);
+    let hello = hello12(&mut a);
+    assert_eq!(hello["unbound"], json!([]), "{hello}");
+    let port = hello["port"].as_u64().unwrap() as u16;
+    let wait = std::time::Duration::from_secs(2);
+    let at = |ip: std::net::IpAddr| std::net::SocketAddr::new(ip, port);
+    let local = std::net::TcpStream::connect_timeout(&at([127, 0, 0, 1].into()), wait);
+    assert!(local.is_ok(), "loopback: {local:?}");
+    let others = if_addrs::get_if_addrs()
+        .unwrap()
+        .into_iter()
+        .map(|i| i.ip())
+        .filter(|ip| ip.is_ipv4() && !ip.is_loopback());
+    for ip in others {
+        let reached = std::net::TcpStream::connect_timeout(&at(ip), wait);
+        assert!(reached.is_err(), "{ip} reached a test helper");
+    }
+}
+
 /// A candidate longer than a ticket holds is left out before readiness and
 /// before the cap: the way's other routes stay offered, and a way with
 /// only such a route says `route_too_long`.

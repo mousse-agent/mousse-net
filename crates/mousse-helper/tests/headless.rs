@@ -120,6 +120,8 @@ fn helper(args: &[&str]) -> Command {
         // A held lock is retried for this long before the second process
         // gives up.
         .env("MOUSSE_NET_ENDPOINT_LOCK_WAIT_MS", "300")
+        // Listen on loopback only, whatever the helper is told.
+        .env("MOUSSE_HELPER_TEST_LOOPBACK", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
