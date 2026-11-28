@@ -161,7 +161,7 @@ impl DirectLedger {
 /// A code that passed and whose outcome the joiner has not learned
 /// (wire.md 10.9, "Joiner records"): `{1: "mousse-direct-pending-v1", 2: L,
 /// 3: host key, 4: I, 5: address, 6: time the host's confirmation verified,
-/// 7: cancelled (0 or 1)}`.
+/// 7: cancelled (0 or 1), 8: A}`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DirectPending {
     /// The typed lookup.
@@ -176,6 +176,9 @@ pub struct DirectPending {
     pub verified_at: UnixTime,
     /// The joiner cancelled; the next connection delivers the cancel.
     pub cancelled: bool,
+    /// The attempt `A` that passed: which flow the record belongs to. A
+    /// flow going on from away takes only the record its own attempt wrote.
+    pub attempt: AttemptId,
 }
 
 impl DirectPending {
@@ -189,6 +192,7 @@ impl DirectPending {
             (5, Value::Text(self.address.to_text())),
             (6, Value::Uint(self.verified_at.0)),
             (7, Value::Uint(u64::from(self.cancelled))),
+            (8, Value::Bytes(self.attempt.0.to_vec())),
         ]))
     }
 
@@ -214,6 +218,7 @@ impl DirectPending {
             1 => true,
             _ => return Err(DirectJoinError::BadRecord),
         };
+        let attempt = AttemptId(f.fixed::<16>(8).map_err(bad)?);
         f.finish().map_err(bad)?;
         Ok(Self {
             lookup,
@@ -222,6 +227,7 @@ impl DirectPending {
             address,
             verified_at,
             cancelled,
+            attempt,
         })
     }
 }
@@ -608,7 +614,14 @@ impl<F: CodeExchangeFactory> DirectJoinerPairing<F> {
             .map_or(self.attempts_per_lookup, |l| {
                 l.attempts_left.min(self.attempts_per_lookup)
             });
-        let own = pending.iter().find(|p| p.address == self.address).cloned();
+        // A flow that already has a record takes only that one: the record
+        // its own attempt wrote. A newer record at the same address belongs
+        // to another flow, and this flow's own was settled.
+        let mine = self.pending_saved.as_ref().map(|p| p.attempt);
+        let own = pending
+            .iter()
+            .find(|p| p.address == self.address && mine.is_none_or(|a| p.attempt == a))
+            .cloned();
         self.pending_saved = own.clone();
         self.pending = own.clone();
         if own.is_none() {
@@ -720,6 +733,17 @@ impl<F: CodeExchangeFactory> DirectJoinerPairing<F> {
             ErrorCode::InternalError,
         ))));
         self.finish(actions)
+    }
+
+    /// The dial failed before TLS was up: unreachable, refused, or a
+    /// recovery's TLS, pinned to the stored host key, met another key. A
+    /// first contact ends; a recovery goes back away with its record, for a
+    /// later try. Either way the hold goes back.
+    pub fn on_dial_failed(&mut self) -> Vec<DirectJoinerAction> {
+        if self.state != DirectJoinerState::Connecting {
+            return Vec::new();
+        }
+        self.broken(None, false)
     }
 
     /// TLS is up with `host`, the key the far end showed (pinned on a
@@ -946,6 +970,7 @@ impl<F: CodeExchangeFactory> DirectJoinerPairing<F> {
                     address: self.address,
                     verified_at: now,
                     cancelled: false,
+                    attempt,
                 });
                 self.state = DirectJoinerState::AwaitingAllow;
                 let mut then = vec![DirectJoinerAction::CodePassed];
@@ -1145,6 +1170,15 @@ impl<F: CodeExchangeFactory> DirectJoinerPairing<F> {
     }
 
     fn broken_inner(&mut self, code: Option<ErrorCode>, close: bool) -> Vec<DirectJoinerAction> {
+        if self.state == DirectJoinerState::Paired {
+            // The pin is being stored: the outcome stands, and the hold
+            // stays until [`Self::on_pin_stored`]. Only the connection goes.
+            self.connected = false;
+            return match code.filter(|_| close) {
+                Some(code) => vec![DirectJoinerAction::Close(code)],
+                None => Vec::new(),
+            };
+        }
         self.attempt = None;
         self.held.clear();
         self.connected = false;

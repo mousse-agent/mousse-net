@@ -131,6 +131,7 @@ fn records_round_trip_and_refuse_what_they_cannot_hold() {
         invitation: InvitationId([7; 16]),
         address: DirectAddress::parse("[fe80::1]:47100").unwrap(),
         verified_at: T,
+        attempt: AttemptId([5; 16]),
         cancelled: true,
     };
     assert_eq!(
@@ -198,6 +199,7 @@ fn a_pending_record_resumes_only_at_its_address() {
         invitation: InvitationId([7; 16]),
         address: DirectAddress::parse("10.0.0.2:47100").unwrap(),
         verified_at: T,
+        attempt: AttemptId([5; 16]),
         cancelled: false,
     };
     let same = start("10.0.0.2:47100", CODE, None, Some(&pending), T).unwrap();
@@ -366,6 +368,7 @@ fn paired_in_answer_to_a_cancelling_recovery_is_taken() {
         invitation: InvitationId([7; 16]),
         address: DirectAddress::parse("10.0.0.2:47100").unwrap(),
         verified_at: T,
+        attempt: AttemptId([5; 16]),
         cancelled: true,
     };
     let mut flow = DirectJoinerPairing::resume(
@@ -444,6 +447,7 @@ fn a_failed_cancel_write_closes_the_live_connection() {
         invitation: InvitationId([7; 16]),
         address: DirectAddress::parse("10.0.0.2:47100").unwrap(),
         verified_at: T,
+        attempt: AttemptId([5; 16]),
         cancelled: false,
     };
     let mut flow = start("10.0.0.2:47100", CODE, None, Some(&pending), T).unwrap();
@@ -470,4 +474,80 @@ fn a_failed_cancel_write_closes_the_live_connection() {
             DirectJoinerAction::ReleaseHold(lookup()),
         ]
     );
+}
+
+/// wire.md 10.9 "Joiner": the hold stays while the pin is being stored. A
+/// second `PAIRED` (a protocol error) closes the connection, but the flow
+/// stays paired and keeps the hold until the pin is stored.
+#[test]
+fn the_hold_stays_while_the_pin_is_stored() {
+    let pending = DirectPending {
+        lookup: lookup(),
+        host: key(1),
+        invitation: InvitationId([7; 16]),
+        address: DirectAddress::parse("10.0.0.2:47100").unwrap(),
+        verified_at: T,
+        cancelled: false,
+        attempt: AttemptId([5; 16]),
+    };
+    let mut flow = start("10.0.0.2:47100", CODE, None, Some(&pending), T).unwrap();
+    flow.on_connected(key(1), [9; 32]);
+    flow.on_hello(4);
+    flow.on_authorized(AuthorizedState::Live);
+    let paired = flow.on_paired("Desk".into(), Role::owner());
+    assert!(matches!(paired.as_slice(), [DirectJoinerAction::Paired(_)]));
+    let again = flow.on_paired("Desk".into(), Role::owner());
+    assert_eq!(
+        again,
+        vec![DirectJoinerAction::Close(ErrorCode::ProtocolError)]
+    );
+    assert!(flow.on_closed(None).is_empty());
+    assert_eq!(flow.state(), DirectJoinerState::Paired);
+    let stored = flow.on_pin_stored();
+    assert!(matches!(
+        stored.as_slice(),
+        [DirectJoinerAction::PersistPending { record: None, .. }]
+    ));
+    assert_eq!(
+        flow.on_persisted(),
+        vec![
+            DirectJoinerAction::Ended(DirectEnd::Paired),
+            DirectJoinerAction::ReleaseHold(lookup()),
+        ]
+    );
+}
+
+/// A dial that fails before TLS is up: a first contact ends, a recovery
+/// goes back away with its record; the hold goes back either way.
+#[test]
+fn a_failed_dial_gives_the_hold_back() {
+    let mut first = start("10.0.0.2:47100", CODE, None, None, T).unwrap();
+    assert_eq!(first.state(), DirectJoinerState::Connecting);
+    assert_eq!(
+        first.on_dial_failed(),
+        vec![
+            DirectJoinerAction::Ended(DirectEnd::Closed(None)),
+            DirectJoinerAction::ReleaseHold(lookup()),
+        ]
+    );
+
+    let pending = DirectPending {
+        lookup: lookup(),
+        host: key(1),
+        invitation: InvitationId([7; 16]),
+        address: DirectAddress::parse("10.0.0.2:47100").unwrap(),
+        verified_at: T,
+        cancelled: false,
+        attempt: AttemptId([5; 16]),
+    };
+    let mut recovery = start("10.0.0.2:47100", CODE, None, Some(&pending), T).unwrap();
+    assert_eq!(
+        recovery.on_dial_failed(),
+        vec![
+            DirectJoinerAction::Away,
+            DirectJoinerAction::ReleaseHold(lookup()),
+        ]
+    );
+    assert_eq!(recovery.state(), DirectJoinerState::Away);
+    assert_eq!(recovery.pending(), Some(&pending));
 }

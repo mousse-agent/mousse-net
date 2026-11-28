@@ -2,7 +2,7 @@
 //! machine against the host machine, replayed byte for byte from listed
 //! random draws, with every write the joiner asks for.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
 
 use rand_core::{TryCryptoRng, TryRng};
@@ -14,7 +14,7 @@ use crate::control::{AuthorizedState, ControlMessage, DIRECT_MINOR_VERSION};
 use crate::grants::{GrantTable, OwnerRef, Role};
 use crate::identity::IdentityPublicKey;
 use crate::pairing::{
-    CpaceExchangeFactory, DirectAddress, DirectCode, DirectEnd, DirectHostAction,
+    AttemptId, CpaceExchangeFactory, DirectAddress, DirectCode, DirectEnd, DirectHostAction,
     DirectHostPairing, DirectInvitationParams, DirectJoinerAction, DirectJoinerPairing,
     DirectJoinerState, DirectLedger, DirectLookup, DirectPending, DirectRequestId, InvitationId,
     DIRECT_CODE_ALPHABET,
@@ -225,6 +225,43 @@ fn sequences() -> Vec<J> {
             ],
         }),
         json!({
+            "name": "an_old_flow_never_takes_a_newer_record",
+            "description": "Flow a loses its confirmation and goes away. A separate recovery learns not_received and clears a's record. A new Connect at the same address passes the code and goes away with its own pending record. Then the person cancels a: it takes the hold and reloads, finds no record its own attempt wrote, and ends as settled; the newer record stays as it was.",
+            "steps": [
+                { "op": "start", "code": "right", "result": "ok" },
+                { "op": "connect", "conn": 1, "host": "host", "lose": "msg_c", "state": "away", "pending": "pending" },
+                { "op": "park", "as": "a" },
+                { "op": "resume", "result": "ok" },
+                { "op": "connect", "conn": 2, "host": "host", "state": "ended:not_received:4", "pending": null },
+                { "op": "start", "code": "right", "result": "ok" },
+                { "op": "connect", "conn": 3, "host": "host", "state": "awaiting_allow", "pending": "pending" },
+                { "op": "drop", "state": "away", "held": false },
+                { "op": "park", "as": "c" },
+                { "op": "unpark", "flow": "a" },
+                { "op": "cancel", "state": "ended:settled", "pendings": [["192.168.1.20:47100", "pending"]], "held": false },
+            ],
+        }),
+        json!({
+            "name": "a_recovery_dial_is_pinned",
+            "description": "The confirmation is lost; the recovery's TLS is pinned to the stored host key. A far end at the address showing another key fails the dial: the flow goes back away with its record and gives the hold back. An unreachable address does the same. A refused hold dials nothing. The next recovery reaches the host.",
+            "steps": [
+                { "op": "start", "code": "right", "result": "ok" },
+                { "op": "connect", "conn": 1, "host": "host", "lose": "msg_c", "state": "away", "pending": "pending" },
+                { "op": "connect", "conn": 2, "host": "fake1", "state": "away", "pending": "pending", "held": false },
+                { "op": "connect", "conn": 3, "host": "host", "unreachable": true, "state": "away", "pending": "pending", "held": false },
+                { "op": "connect", "conn": 4, "host": "host", "held_elsewhere": true, "state": "away", "pending": "pending" },
+                { "op": "connect", "conn": 5, "host": "host", "state": "ended:not_received:4", "pending": null, "held": false },
+            ],
+        }),
+        json!({
+            "name": "an_unreachable_first_contact",
+            "description": "The typed address does not answer: the flow ends and gives the hold back; no attempt was spent.",
+            "steps": [
+                { "op": "start", "code": "right", "result": "ok" },
+                { "op": "connect", "conn": 1, "host": "host", "unreachable": true, "state": "ended:closed", "ledger": null, "held": false },
+            ],
+        }),
+        json!({
             "name": "a_silent_host",
             "description": "The host never answers JOIN_DIRECT. After the 10 s wait the joiner closes with not_authorized: a first contact ends; a recovery goes away and keeps its pending record.",
             "steps": [
@@ -404,6 +441,8 @@ struct World {
     joiner_key: IdentityPublicKey,
     joiner_rng: Draws,
     flow: Option<DirectJoinerPairing<CpaceExchangeFactory>>,
+    /// Flows set aside by `park`, with their typed address.
+    parked: BTreeMap<String, (DirectJoinerPairing<CpaceExchangeFactory>, String)>,
     store: Store,
     /// The current connection and the host on it (`None`: the own key).
     conn: u64,
@@ -438,6 +477,7 @@ impl World {
             joiner_key: identity(&JOINER_SECRET).public_key(),
             joiner_rng,
             flow: None,
+            parked: BTreeMap::new(),
             store: Store::default(),
             conn: 0,
             host: None,
@@ -988,8 +1028,10 @@ impl World {
         let exporter = pair_exporter(self.conn);
         if self.flow.as_ref().map(|f| f.state()) == Some(DirectJoinerState::Away) {
             // Going on from away: the hold and the records first.
+            self.store.held_elsewhere = step["held_elsewhere"].as_bool().unwrap_or(false);
             let actions = self.flow.as_mut().expect("a flow").start();
             self.pump(actions);
+            self.store.held_elsewhere = false;
             if self.flow.as_ref().map(|f| f.state()) != Some(DirectJoinerState::Connecting) {
                 self.open = false;
                 return;
@@ -1010,6 +1052,16 @@ impl World {
             self.host = Some(i);
             self.hosts[i].key
         };
+        // A recovery's TLS is pinned to the stored host key: another key
+        // fails the dial, as does an unreachable address.
+        let pin = self.flow.as_ref().and_then(|f| f.pinned_host());
+        if step["unreachable"].as_bool().unwrap_or(false) || pin.is_some_and(|p| p != key) {
+            self.open = false;
+            self.out.push(json!({ "dial_failed": self.conn }));
+            let actions = self.flow.as_mut().expect("a flow").on_dial_failed();
+            self.pump(actions);
+            return;
+        }
         let actions = self
             .flow
             .as_mut()
@@ -1129,6 +1181,17 @@ impl World {
                 });
             }
             "fail_next_write" => self.store.fail_next = true,
+            "park" => {
+                let flow = self.flow.take().expect("a flow");
+                let name = step["as"].as_str().expect("as").to_owned();
+                self.parked.insert(name, (flow, self.address.clone()));
+            }
+            "unpark" => {
+                let name = step["flow"].as_str().expect("flow");
+                let (flow, address) = self.parked.remove(name).expect("a parked flow");
+                self.flow = Some(flow);
+                self.address = address;
+            }
             "connect" => self.connect(step),
             "allow" => self.owner(step, true),
             "decline" => self.owner(step, false),
@@ -1298,23 +1361,24 @@ fn records() -> J {
         address: DirectAddress::parse("[fe80::1]:47100").expect("address"),
         verified_at: UnixTime(u64::MAX),
         cancelled: true,
+        attempt: AttemptId([0x41; 16]),
     };
     json!([
         { "kind": "ledger", "lookup": "K7QM", "attempts_left": 3, "first_debit": big.0.to_string(), "bytes": hex(&ledger.to_bytes()) },
-        { "kind": "pending", "lookup": "K7QM", "host": hex(pending.host.as_bytes()), "invitation": hex(&[0x49; 16]), "address": "[fe80::1]:47100", "verified_at": u64::MAX.to_string(), "cancelled": true, "bytes": hex(&pending.to_bytes()) },
+        { "kind": "pending", "lookup": "K7QM", "host": hex(pending.host.as_bytes()), "invitation": hex(&[0x49; 16]), "address": "[fe80::1]:47100", "verified_at": u64::MAX.to_string(), "cancelled": true, "attempt": hex(&[0x41; 16]), "bytes": hex(&pending.to_bytes()) },
     ])
 }
 
 pub(super) fn direct_joiner_vectors() -> J {
     let sequences: Vec<J> = sequences().iter().map(|s| run_sequence(s, None)).collect();
     json!({
-        "description": "Pair with IP end to end (wire.md 10.9): the joiner machine against the host machine of direct-host.json, with the real code exchange, replayed byte for byte from the listed draws. Each sequence starts with the real host (`host`) holding one invitation created at `conventions.time` (`code`). Ops: start (the person types `conventions.address` and a code: right, wrong (the right lookup, secret 00000000 or 00000001), other_lookup (lookup 0000 or 0001, the right secret), typed (`conventions.typed`); `result` ok or the refusal, before any dial), `address` (default `conventions.address`) is the typed address, and with `held_elsewhere` another flow holds the lookup for that step only), resume (a new flow for the pending record stored at `address`, no code), connect (from away, the flow first takes the hold and reloads its records; then TLS with `host` on `conn`: the joiner sees the far end's key, then the host's step 2 runs with its gate, then the host's HELLO agrees on min(`minor`, 4) (default 4); `own` shows the joiner's own key; `lose` msg_c breaks the connection instead of delivering the joiner's confirmation; `crash` after_msg_c stops the joiner's app right after its confirmation reached the host and breaks the connection, and its hold goes; `silent`: the host never answers JOIN_DIRECT and the joiner's answer timeout runs within the step, as if its 10 s had passed; the step's clock does not move), allow and decline (the real host's owner answers the joiner's request; `lose` paired breaks the connection instead of delivering PAIRED; with `in_transit` the host's messages stay on their way until the next cancel), drop (the connection breaks), cancel (the person cancels, with `held_elsewhere` while another flow holds the lookup for that step; host messages in transit then arrive), stored_ledger (a ledger stored before the sequence: `attempts_left`, first debit `first_debit_ago` seconds before `conventions.time`), fail_next_write (the next write the joiner asks for fails). The store keeps one ledger per typed lookup, one pending record per typed lookup and address, and the lookup's hold: a flow asks for it (`hold`, or `hold_refused` when another flow has it) and gets the records loaded under it, and gives it back (`release`); every write needs it. Every write the joiner asks for otherwise lands at once (compare-and-swap checked against the record at its address), and every pin is stored at once. Every message passes the receiving side's gate: the host's (wire.md 8.1; `gate` ignore when it drops one) and the joiner's (8.2, pairing-only on a first contact, pinned on a recovery); the joiner's app opens its first stream only when its gate is live. A host's miss hold is shown with the close the I/O layer makes after it. Expectations: `state` (the joiner flow's), `ledger` (attempts left in the stored ledger, or null), `pending` (the pending record stored at the flow's typed address: pending, cancelled or null), `pendings` (every stored pending record: address and state, sorted by address text), `held` (the lookup's hold is taken), `pinned` (the joiner stored a pin), `granted` (a grant the real host's direct invitation made for the joiner: committed, provisional or null). Once the joiner ends paired and its connection is still up, its app opens the first stream there, and the host commits the provisional grant before the stream goes on. `out`: in order, control messages (`send`), closes (`close`, with who closed), miss holds, broken connections, the joiner's writes (`persist_ledger`, `persist_pending`: expected and new record bytes, null for none), what the joiner tells its UI (`code_passed`, `paired`, `away`, `ended`), the app's first stream (`stream`, with the host gate's verdict) and the host's commit (`committed`), the hold (`hold`, `hold_refused`, `release`), a failed write (`write_failed`), an answer timeout, a crash, and host messages that arrive after a cancel. HELLOs are not listed. `records`: both record formats with times above 2^53 - 1 (as decimal strings), each with its canonical bytes; a reader keeps the whole uint and writes the same bytes back.",
+        "description": "Pair with IP end to end (wire.md 10.9): the joiner machine against the host machine of direct-host.json, with the real code exchange, replayed byte for byte from the listed draws. Each sequence starts with the real host (`host`) holding one invitation created at `conventions.time` (`code`). Ops: start (the person types `conventions.address` and a code: right, wrong (the right lookup, secret 00000000 or 00000001), other_lookup (lookup 0000 or 0001, the right secret), typed (`conventions.typed`); `result` ok or the refusal, before any dial), `address` (default `conventions.address`) is the typed address, and with `held_elsewhere` another flow holds the lookup for that step only), resume (a new flow for the pending record stored at `address`, no code), connect (from away, the flow first takes the hold and reloads its records, and dials nothing when the hold is refused (with `held_elsewhere` another flow holds it for that step); then TLS with `host` on `conn`, pinned to the stored host key on a recovery: another key fails the dial, as does `unreachable`, listed as dial_failed; the joiner sees the far end's key, then the host's step 2 runs with its gate, then the host's HELLO agrees on min(`minor`, 4) (default 4); `own` shows the joiner's own key; `lose` msg_c breaks the connection instead of delivering the joiner's confirmation; `crash` after_msg_c stops the joiner's app right after its confirmation reached the host and breaks the connection, and its hold goes; `silent`: the host never answers JOIN_DIRECT and the joiner's answer timeout runs within the step, as if its 10 s had passed; the step's clock does not move), allow and decline (the real host's owner answers the joiner's request; `lose` paired breaks the connection instead of delivering PAIRED; with `in_transit` the host's messages stay on their way until the next cancel), drop (the connection breaks), cancel (the person cancels, with `held_elsewhere` while another flow holds the lookup for that step; host messages in transit then arrive), stored_ledger (a ledger stored before the sequence: `attempts_left`, first debit `first_debit_ago` seconds before `conventions.time`), fail_next_write (the next write the joiner asks for fails), park (the current flow is set aside under `as`; ops then act on no flow until the next start, resume or unpark), unpark (flow `flow` is the current one again). The store keeps one ledger per typed lookup, one pending record per typed lookup and address, and the lookup's hold: a flow asks for it (`hold`, or `hold_refused` when another flow has it) and gets the records loaded under it, and gives it back (`release`); every write needs it. Every write the joiner asks for otherwise lands at once (compare-and-swap checked against the record at its address), and every pin is stored at once. Every message passes the receiving side's gate: the host's (wire.md 8.1; `gate` ignore when it drops one) and the joiner's (8.2, pairing-only on a first contact, pinned on a recovery); the joiner's app opens its first stream only when its gate is live. A host's miss hold is shown with the close the I/O layer makes after it. Expectations: `state` (the joiner flow's), `ledger` (attempts left in the stored ledger, or null), `pending` (the pending record stored at the flow's typed address: pending, cancelled or null), `pendings` (every stored pending record: address and state, sorted by address text), `held` (the lookup's hold is taken), `pinned` (the joiner stored a pin), `granted` (a grant the real host's direct invitation made for the joiner: committed, provisional or null). Once the joiner ends paired and its connection is still up, its app opens the first stream there, and the host commits the provisional grant before the stream goes on. `out`: in order, control messages (`send`), closes (`close`, with who closed), miss holds, broken connections, the joiner's writes (`persist_ledger`, `persist_pending`: expected and new record bytes, null for none), what the joiner tells its UI (`code_passed`, `paired`, `away`, `ended`), the app's first stream (`stream`, with the host gate's verdict) and the host's commit (`committed`), the hold (`hold`, `hold_refused`, `release`), a failed dial (`dial_failed`), a failed write (`write_failed`), an answer timeout, a crash, and host messages that arrive after a cancel. HELLOs are not listed. `records`: both record formats (the pending record with the attempt that passed) with times above 2^53 - 1 (as decimal strings), each with its canonical bytes; a reader keeps the whole uint and writes the same bytes back.",
         "conventions": {
             "time": T,
             "address": ADDRESS,
             "typed": TYPED,
             "joiner": { "identity_secret": hex(&JOINER_SECRET), "name": JOINER_NAME },
-            "hosts": "`host`: identity secret 0x11 repeated, name Desk, role owner, authorizing owner 0x51 repeated, the default limits. Fake host n (`fake1`, ...): identity secret 0x30 + its index (1 for the first fake) repeated; its invitation has the typed lookup and another secret.",
+            "hosts": "`host`: identity secret 0x11 repeated, name Desk, role owner, authorizing owner 0x51 repeated, the default limits. Fake host n (`fake1`, ...): identity secret 0x30 + its index (1 for the first fake) repeated; its invitation has the typed lookup and another secret, and is created when a step first names the fake host, before any TLS (also when that dial fails).",
             "exporters": "On connection n both ends see the pair exporter n + 100 repeated 32 times.",
             "draws": "Each party's random values in the order it takes them. Hosts: the invitation id (16), the code (12), then each attempt's yb (32), as in direct-host.json. Joiner: for each attempt the attempt id (16) and ya (32).",
         },

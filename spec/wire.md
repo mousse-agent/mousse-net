@@ -1694,8 +1694,18 @@ or dialled. The flow keeps the hold until it ends, or until its
 connection ends with its pending record kept (it is away), after its last
 write; going on from away, for a recovery connection or a cancel, takes it
 again and reloads the records, so a flow never acts on a record another
-flow changed since. A cancel that cannot take the hold leaves the flow
-away and the record as it was. A start with no attempts left for the
+flow changed since. A flow that already has a pending record takes only
+that record again, the one its own attempt `A` wrote (key 8): a newer
+record at the same address belongs to another flow, and when its own is
+gone the flow ends (settled) and acts on nothing. A cancel that cannot take
+the hold leaves the flow away and the record as it was. A recovery that
+cannot take it dials nothing and stays away. A flow whose dial fails
+before TLS is up (no answer, or a recovery's pinned TLS meeting another
+key) gives the hold back: a first contact ends (closed, with no code), a
+recovery stays away with its record for a later try. A flow keeps the hold while its pin is being
+stored (step 7): nothing on the connection, a second `PAIRED` or a
+protocol error included, ends the flow or gives the hold back before the
+pin is stored. A start with no attempts left for the
 typed lookup ends with `ATTEMPTS_EXHAUSTED` before dialing.
 
 **Ledger.** The joiner counts its attempts per **typed lookup**, not per key
@@ -1726,7 +1736,8 @@ never replaces it):
  4: I (16 bytes), 5: address (text, canonical: the IPv4 dotted form, or
  the IPv6 form of RFC 5952 in hex groups, lowercase, in brackets; then ":"
  and the port),
- 6: time the host's confirmation verified (uint), 7: cancelled (0 or 1)}
+ 6: time the host's confirmation verified (uint), 7: cancelled (0 or 1),
+ 8: A, the attempt that passed (16 bytes)}
 ```
 
 A record whose address text is not in that canonical form is refused.

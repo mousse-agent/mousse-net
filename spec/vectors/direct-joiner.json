@@ -3,7 +3,7 @@
     "address": "192.168.1.20:47100",
     "draws": "Each party's random values in the order it takes them. Hosts: the invitation id (16), the code (12), then each attempt's yb (32), as in direct-host.json. Joiner: for each attempt the attempt id (16) and ya (32).",
     "exporters": "On connection n both ends see the pair exporter n + 100 repeated 32 times.",
-    "hosts": "`host`: identity secret 0x11 repeated, name Desk, role owner, authorizing owner 0x51 repeated, the default limits. Fake host n (`fake1`, ...): identity secret 0x30 + its index (1 for the first fake) repeated; its invitation has the typed lookup and another secret.",
+    "hosts": "`host`: identity secret 0x11 repeated, name Desk, role owner, authorizing owner 0x51 repeated, the default limits. Fake host n (`fake1`, ...): identity secret 0x30 + its index (1 for the first fake) repeated; its invitation has the typed lookup and another secret, and is created when a step first names the fake host, before any TLS (also when that dial fails).",
     "joiner": {
       "identity_secret": "5050505050505050505050505050505050505050505050505050505050505050",
       "name": "Laptop"
@@ -11,7 +11,7 @@
     "time": 1790000000,
     "typed": "K7QM-2XPA-9RTE"
   },
-  "description": "Pair with IP end to end (wire.md 10.9): the joiner machine against the host machine of direct-host.json, with the real code exchange, replayed byte for byte from the listed draws. Each sequence starts with the real host (`host`) holding one invitation created at `conventions.time` (`code`). Ops: start (the person types `conventions.address` and a code: right, wrong (the right lookup, secret 00000000 or 00000001), other_lookup (lookup 0000 or 0001, the right secret), typed (`conventions.typed`); `result` ok or the refusal, before any dial), `address` (default `conventions.address`) is the typed address, and with `held_elsewhere` another flow holds the lookup for that step only), resume (a new flow for the pending record stored at `address`, no code), connect (from away, the flow first takes the hold and reloads its records; then TLS with `host` on `conn`: the joiner sees the far end's key, then the host's step 2 runs with its gate, then the host's HELLO agrees on min(`minor`, 4) (default 4); `own` shows the joiner's own key; `lose` msg_c breaks the connection instead of delivering the joiner's confirmation; `crash` after_msg_c stops the joiner's app right after its confirmation reached the host and breaks the connection, and its hold goes; `silent`: the host never answers JOIN_DIRECT and the joiner's answer timeout runs within the step, as if its 10 s had passed; the step's clock does not move), allow and decline (the real host's owner answers the joiner's request; `lose` paired breaks the connection instead of delivering PAIRED; with `in_transit` the host's messages stay on their way until the next cancel), drop (the connection breaks), cancel (the person cancels, with `held_elsewhere` while another flow holds the lookup for that step; host messages in transit then arrive), stored_ledger (a ledger stored before the sequence: `attempts_left`, first debit `first_debit_ago` seconds before `conventions.time`), fail_next_write (the next write the joiner asks for fails). The store keeps one ledger per typed lookup, one pending record per typed lookup and address, and the lookup's hold: a flow asks for it (`hold`, or `hold_refused` when another flow has it) and gets the records loaded under it, and gives it back (`release`); every write needs it. Every write the joiner asks for otherwise lands at once (compare-and-swap checked against the record at its address), and every pin is stored at once. Every message passes the receiving side's gate: the host's (wire.md 8.1; `gate` ignore when it drops one) and the joiner's (8.2, pairing-only on a first contact, pinned on a recovery); the joiner's app opens its first stream only when its gate is live. A host's miss hold is shown with the close the I/O layer makes after it. Expectations: `state` (the joiner flow's), `ledger` (attempts left in the stored ledger, or null), `pending` (the pending record stored at the flow's typed address: pending, cancelled or null), `pendings` (every stored pending record: address and state, sorted by address text), `held` (the lookup's hold is taken), `pinned` (the joiner stored a pin), `granted` (a grant the real host's direct invitation made for the joiner: committed, provisional or null). Once the joiner ends paired and its connection is still up, its app opens the first stream there, and the host commits the provisional grant before the stream goes on. `out`: in order, control messages (`send`), closes (`close`, with who closed), miss holds, broken connections, the joiner's writes (`persist_ledger`, `persist_pending`: expected and new record bytes, null for none), what the joiner tells its UI (`code_passed`, `paired`, `away`, `ended`), the app's first stream (`stream`, with the host gate's verdict) and the host's commit (`committed`), the hold (`hold`, `hold_refused`, `release`), a failed write (`write_failed`), an answer timeout, a crash, and host messages that arrive after a cancel. HELLOs are not listed. `records`: both record formats with times above 2^53 - 1 (as decimal strings), each with its canonical bytes; a reader keeps the whole uint and writes the same bytes back.",
+  "description": "Pair with IP end to end (wire.md 10.9): the joiner machine against the host machine of direct-host.json, with the real code exchange, replayed byte for byte from the listed draws. Each sequence starts with the real host (`host`) holding one invitation created at `conventions.time` (`code`). Ops: start (the person types `conventions.address` and a code: right, wrong (the right lookup, secret 00000000 or 00000001), other_lookup (lookup 0000 or 0001, the right secret), typed (`conventions.typed`); `result` ok or the refusal, before any dial), `address` (default `conventions.address`) is the typed address, and with `held_elsewhere` another flow holds the lookup for that step only), resume (a new flow for the pending record stored at `address`, no code), connect (from away, the flow first takes the hold and reloads its records, and dials nothing when the hold is refused (with `held_elsewhere` another flow holds it for that step); then TLS with `host` on `conn`, pinned to the stored host key on a recovery: another key fails the dial, as does `unreachable`, listed as dial_failed; the joiner sees the far end's key, then the host's step 2 runs with its gate, then the host's HELLO agrees on min(`minor`, 4) (default 4); `own` shows the joiner's own key; `lose` msg_c breaks the connection instead of delivering the joiner's confirmation; `crash` after_msg_c stops the joiner's app right after its confirmation reached the host and breaks the connection, and its hold goes; `silent`: the host never answers JOIN_DIRECT and the joiner's answer timeout runs within the step, as if its 10 s had passed; the step's clock does not move), allow and decline (the real host's owner answers the joiner's request; `lose` paired breaks the connection instead of delivering PAIRED; with `in_transit` the host's messages stay on their way until the next cancel), drop (the connection breaks), cancel (the person cancels, with `held_elsewhere` while another flow holds the lookup for that step; host messages in transit then arrive), stored_ledger (a ledger stored before the sequence: `attempts_left`, first debit `first_debit_ago` seconds before `conventions.time`), fail_next_write (the next write the joiner asks for fails), park (the current flow is set aside under `as`; ops then act on no flow until the next start, resume or unpark), unpark (flow `flow` is the current one again). The store keeps one ledger per typed lookup, one pending record per typed lookup and address, and the lookup's hold: a flow asks for it (`hold`, or `hold_refused` when another flow has it) and gets the records loaded under it, and gives it back (`release`); every write needs it. Every write the joiner asks for otherwise lands at once (compare-and-swap checked against the record at its address), and every pin is stored at once. Every message passes the receiving side's gate: the host's (wire.md 8.1; `gate` ignore when it drops one) and the joiner's (8.2, pairing-only on a first contact, pinned on a recovery); the joiner's app opens its first stream only when its gate is live. A host's miss hold is shown with the close the I/O layer makes after it. Expectations: `state` (the joiner flow's), `ledger` (attempts left in the stored ledger, or null), `pending` (the pending record stored at the flow's typed address: pending, cancelled or null), `pendings` (every stored pending record: address and state, sorted by address text), `held` (the lookup's hold is taken), `pinned` (the joiner stored a pin), `granted` (a grant the real host's direct invitation made for the joiner: committed, provisional or null). Once the joiner ends paired and its connection is still up, its app opens the first stream there, and the host commits the provisional grant before the stream goes on. `out`: in order, control messages (`send`), closes (`close`, with who closed), miss holds, broken connections, the joiner's writes (`persist_ledger`, `persist_pending`: expected and new record bytes, null for none), what the joiner tells its UI (`code_passed`, `paired`, `away`, `ended`), the app's first stream (`stream`, with the host gate's verdict) and the host's commit (`committed`), the hold (`hold`, `hold_refused`, `release`), a failed dial (`dial_failed`), a failed write (`write_failed`), an answer timeout, a crash, and host messages that arrive after a cancel. HELLOs are not listed. `records`: both record formats (the pending record with the attempt that passed) with times above 2^53 - 1 (as decimal strings), each with its canonical bytes; a reader keeps the whole uint and writes the same bytes back.",
   "records": [
     {
       "attempts_left": 3,
@@ -22,7 +22,8 @@
     },
     {
       "address": "[fe80::1]:47100",
-      "bytes": "a70178186d6f757373652d6469726563742d70656e64696e672d763102644b37514d035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794045049494949494949494949494949494949056f5b666538303a3a315d3a3437313030061bffffffffffffffff0701",
+      "attempt": "41414141414141414141414141414141",
+      "bytes": "a80178186d6f757373652d6469726563742d70656e64696e672d763102644b37514d035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794045049494949494949494949494949494949056f5b666538303a3a315d3a3437313030061bffffffffffffffff0701085041414141414141414141414141414141",
       "cancelled": true,
       "host": "040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794",
       "invitation": "49494949494949494949494949494949",
@@ -111,7 +112,7 @@
             {
               "persist_pending": {
                 "expected": null,
-                "record": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700"
+                "record": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b80070008509a9ec1a2a6c152e5b938b4dd05f045ad"
               }
             },
             {
@@ -153,7 +154,7 @@
             },
             {
               "persist_pending": {
-                "expected": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700",
+                "expected": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b80070008509a9ec1a2a6c152e5b938b4dd05f045ad",
                 "record": null
               }
             },
@@ -348,7 +349,7 @@
             {
               "persist_pending": {
                 "expected": null,
-                "record": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700"
+                "record": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700085084627a34f6c10de28b77f93ea341ef97"
               }
             },
             {
@@ -1114,7 +1115,7 @@
             {
               "persist_pending": {
                 "expected": null,
-                "record": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700"
+                "record": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b80070008509a9ec1a2a6c152e5b938b4dd05f045ad"
               }
             },
             {
@@ -1142,7 +1143,7 @@
             },
             {
               "persist_pending": {
-                "expected": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700",
+                "expected": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b80070008509a9ec1a2a6c152e5b938b4dd05f045ad",
                 "record": null
               }
             },
@@ -1239,7 +1240,7 @@
             {
               "persist_pending": {
                 "expected": null,
-                "record": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700"
+                "record": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b80070008509a9ec1a2a6c152e5b938b4dd05f045ad"
               }
             },
             {
@@ -1322,7 +1323,7 @@
             },
             {
               "persist_pending": {
-                "expected": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700",
+                "expected": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b80070008509a9ec1a2a6c152e5b938b4dd05f045ad",
                 "record": null
               }
             },
@@ -1431,7 +1432,7 @@
             {
               "persist_pending": {
                 "expected": null,
-                "record": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700"
+                "record": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b80070008509a9ec1a2a6c152e5b938b4dd05f045ad"
               }
             },
             {
@@ -1513,7 +1514,7 @@
             },
             {
               "persist_pending": {
-                "expected": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700",
+                "expected": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b80070008509a9ec1a2a6c152e5b938b4dd05f045ad",
                 "record": null
               }
             },
@@ -1622,7 +1623,7 @@
             {
               "persist_pending": {
                 "expected": null,
-                "record": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700"
+                "record": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b80070008509a9ec1a2a6c152e5b938b4dd05f045ad"
               }
             },
             {
@@ -1642,8 +1643,8 @@
           "out": [
             {
               "persist_pending": {
-                "expected": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700",
-                "record": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800701"
+                "expected": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b80070008509a9ec1a2a6c152e5b938b4dd05f045ad",
+                "record": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b80070108509a9ec1a2a6c152e5b938b4dd05f045ad"
               }
             },
             {
@@ -1702,7 +1703,7 @@
             },
             {
               "persist_pending": {
-                "expected": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800701",
+                "expected": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b80070108509a9ec1a2a6c152e5b938b4dd05f045ad",
                 "record": null
               }
             },
@@ -1799,7 +1800,7 @@
             {
               "persist_pending": {
                 "expected": null,
-                "record": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700"
+                "record": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b80070008509a9ec1a2a6c152e5b938b4dd05f045ad"
               }
             },
             {
@@ -1836,8 +1837,8 @@
             },
             {
               "persist_pending": {
-                "expected": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700",
-                "record": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800701"
+                "expected": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b80070008509a9ec1a2a6c152e5b938b4dd05f045ad",
+                "record": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b80070108509a9ec1a2a6c152e5b938b4dd05f045ad"
               }
             },
             {
@@ -1875,7 +1876,7 @@
             },
             {
               "persist_pending": {
-                "expected": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800701",
+                "expected": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b80070108509a9ec1a2a6c152e5b938b4dd05f045ad",
                 "record": null
               }
             },
@@ -1971,7 +1972,7 @@
             {
               "persist_pending": {
                 "expected": null,
-                "record": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700"
+                "record": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b80070008509a9ec1a2a6c152e5b938b4dd05f045ad"
               }
             },
             {
@@ -2006,8 +2007,8 @@
           "out": [
             {
               "persist_pending": {
-                "expected": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700",
-                "record": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800701"
+                "expected": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b80070008509a9ec1a2a6c152e5b938b4dd05f045ad",
+                "record": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b80070108509a9ec1a2a6c152e5b938b4dd05f045ad"
               }
             },
             {
@@ -2076,7 +2077,7 @@
             },
             {
               "persist_pending": {
-                "expected": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800701",
+                "expected": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b80070108509a9ec1a2a6c152e5b938b4dd05f045ad",
                 "record": null
               }
             },
@@ -2174,7 +2175,7 @@
             {
               "persist_pending": {
                 "expected": null,
-                "record": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700"
+                "record": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b80070008509a9ec1a2a6c152e5b938b4dd05f045ad"
               }
             },
             {
@@ -2218,7 +2219,7 @@
             },
             {
               "persist_pending": {
-                "expected": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700",
+                "expected": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b80070008509a9ec1a2a6c152e5b938b4dd05f045ad",
                 "record": null
               }
             },
@@ -2322,7 +2323,7 @@
             {
               "persist_pending": {
                 "expected": null,
-                "record": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700"
+                "record": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b80070008509a9ec1a2a6c152e5b938b4dd05f045ad"
               }
             },
             {
@@ -2402,7 +2403,7 @@
             },
             {
               "persist_pending": {
-                "expected": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700",
+                "expected": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b80070008509a9ec1a2a6c152e5b938b4dd05f045ad",
                 "record": null
               }
             },
@@ -2520,7 +2521,7 @@
             {
               "persist_pending": {
                 "expected": null,
-                "record": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700"
+                "record": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b80070008509a9ec1a2a6c152e5b938b4dd05f045ad"
               }
             },
             {
@@ -2560,8 +2561,8 @@
             },
             {
               "persist_pending": {
-                "expected": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700",
-                "record": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800701"
+                "expected": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b80070008509a9ec1a2a6c152e5b938b4dd05f045ad",
+                "record": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b80070108509a9ec1a2a6c152e5b938b4dd05f045ad"
               }
             },
             {
@@ -2627,7 +2628,7 @@
             {
               "persist_pending": {
                 "expected": null,
-                "record": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32313a3437313030061a6ab13b800700"
+                "record": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32313a3437313030061a6ab13b800700085084627a34f6c10de28b77f93ea341ef97"
               }
             },
             {
@@ -2699,7 +2700,7 @@
             },
             {
               "persist_pending": {
-                "expected": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800701",
+                "expected": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b80070108509a9ec1a2a6c152e5b938b4dd05f045ad",
                 "record": null
               }
             },
@@ -2752,7 +2753,7 @@
             },
             {
               "persist_pending": {
-                "expected": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32313a3437313030061a6ab13b800700",
+                "expected": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32313a3437313030061a6ab13b800700085084627a34f6c10de28b77f93ea341ef97",
                 "record": null
               }
             },
@@ -2865,7 +2866,7 @@
             {
               "persist_pending": {
                 "expected": null,
-                "record": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700"
+                "record": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b80070008509a9ec1a2a6c152e5b938b4dd05f045ad"
               }
             },
             {
@@ -2997,7 +2998,7 @@
             {
               "persist_pending": {
                 "expected": null,
-                "record": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b940700"
+                "record": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b94070008509a9ec1a2a6c152e5b938b4dd05f045ad"
               }
             },
             {
@@ -3093,7 +3094,7 @@
             {
               "persist_pending": {
                 "expected": null,
-                "record": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700"
+                "record": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b80070008509a9ec1a2a6c152e5b938b4dd05f045ad"
               }
             },
             {
@@ -3212,6 +3213,559 @@
           ],
           "pending": "pending",
           "state": "ended:closed:internal_error"
+        }
+      ]
+    },
+    {
+      "code": "DMMG-CYFD-DT44",
+      "description": "Flow a loses its confirmation and goes away. A separate recovery learns not_received and clears a's record. A new Connect at the same address passes the code and goes away with its own pending record. Then the person cancels a: it takes the hold and reloads, finds no record its own attempt wrote, and ends as settled; the newer record stays as it was.",
+      "draws": {
+        "host": [
+          {
+            "bytes": "b2125f5befebfd95faac46bc9e0e7433"
+          },
+          {
+            "bytes": "0df474300c3eef4ded9ae4c4"
+          },
+          {
+            "bytes": "e4794ee2bcc061439387ca193531e1f4d3a5a8ccd9140d3317abc21765feb579"
+          },
+          {
+            "bytes": "dfa2044170de3500199bbee88cee29164487708ac703d172edc113570b6bf288"
+          }
+        ],
+        "joiner": [
+          {
+            "bytes": "9a9ec1a2a6c152e5b938b4dd05f045ad"
+          },
+          {
+            "bytes": "e11a1b1776dff6485acc5921c49dcdd2b0a8148d9aa75b949e0af167af1766f4"
+          },
+          {
+            "bytes": "84627a34f6c10de28b77f93ea341ef97"
+          },
+          {
+            "bytes": "57826e19f83dc783b05426a652e9730a9b89c79caa62e007a8c5813556064b15"
+          }
+        ]
+      },
+      "name": "an_old_flow_never_takes_a_newer_record",
+      "steps": [
+        {
+          "code": "right",
+          "op": "start",
+          "out": [
+            {
+              "hold": "DMMG"
+            }
+          ],
+          "result": "ok"
+        },
+        {
+          "conn": 1,
+          "host": "host",
+          "lose": "msg_c",
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300070164444d4d4702664c6170746f70",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000201020250b2125f5befebfd95faac46bc9e0e7433",
+                "from": "host"
+              }
+            },
+            {
+              "persist_ledger": {
+                "expected": null,
+                "record": "a401776d6f757373652d6469726563742d6a6f696e65722d76310264444d4d470304041a6ab13b80"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02582220feaf9e313a8f6fbbd224fc0a9852d5e49f88b9b0d0b92b2cc12e352c2a971f7d00",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02586220169bdf6c0fd103749ebf2ffe4e0b840dcc04348d15fbb972cca9e36b1b277d5d003581ea7114c3f912695c1f757557fe6a540c83385b85a24a20e7a14ccf96c5fa4fe331cc3947be5a2763357ec811b5d6d7f022f777a01d57a2ff4a0adc23ab98",
+                "from": "host"
+              }
+            },
+            {
+              "persist_pending": {
+                "expected": null,
+                "record": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b80070008509a9ec1a2a6c152e5b938b4dd05f045ad"
+              }
+            },
+            {
+              "joiner": "code_passed"
+            },
+            {
+              "broken": 1
+            },
+            {
+              "joiner": "away"
+            },
+            {
+              "release": "DMMG"
+            }
+          ],
+          "pending": "pending",
+          "state": "away"
+        },
+        {
+          "as": "a",
+          "op": "park",
+          "out": []
+        },
+        {
+          "op": "resume",
+          "out": [
+            {
+              "hold": "DMMG"
+            }
+          ],
+          "result": "ok"
+        },
+        {
+          "conn": 2,
+          "host": "host",
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a400070164444d4d4702664c6170746f700350b2125f5befebfd95faac46bc9e0e7433",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a4000201020250b2125f5befebfd95faac46bc9e0e74330301",
+                "from": "host"
+              }
+            },
+            {
+              "persist_pending": {
+                "expected": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b80070008509a9ec1a2a6c152e5b938b4dd05f045ad",
+                "record": null
+              }
+            },
+            {
+              "close": {
+                "code": "no_error",
+                "conn": 2,
+                "from": "joiner"
+              }
+            },
+            {
+              "joiner": {
+                "ended": "not_received:4"
+              }
+            },
+            {
+              "release": "DMMG"
+            }
+          ],
+          "pending": null,
+          "state": "ended:not_received:4"
+        },
+        {
+          "code": "right",
+          "op": "start",
+          "out": [
+            {
+              "hold": "DMMG"
+            }
+          ],
+          "result": "ok"
+        },
+        {
+          "conn": 3,
+          "host": "host",
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 3,
+                "control": "a300070164444d4d4702664c6170746f70",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 3,
+                "control": "a3000201020250b2125f5befebfd95faac46bc9e0e7433",
+                "from": "host"
+              }
+            },
+            {
+              "persist_ledger": {
+                "expected": "a401776d6f757373652d6469726563742d6a6f696e65722d76310264444d4d470304041a6ab13b80",
+                "record": "a401776d6f757373652d6469726563742d6a6f696e65722d76310264444d4d470303041a6ab13b80"
+              }
+            },
+            {
+              "send": {
+                "conn": 3,
+                "control": "a30004015084627a34f6c10de28b77f93ea341ef97025822204a1da4c64270d9d90613c45d184016ac44bdb8e733625cb7b3a5f2e59e00ad6d00",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 3,
+                "control": "a30004015084627a34f6c10de28b77f93ea341ef97025862203cbd66ad3342f00ecdaf4ceafaf53ff6dd6281f33d5e552bf3b5c655ab83247c00fd91e14b37ed80df3eed79c98315e7dd0a94453a80525991c754b447b9222c9d736db685a416e6b0a958a40edab71932048ee6d26566c4a5b7b4f443fd124d06",
+                "from": "host"
+              }
+            },
+            {
+              "persist_pending": {
+                "expected": null,
+                "record": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700085084627a34f6c10de28b77f93ea341ef97"
+              }
+            },
+            {
+              "joiner": "code_passed"
+            },
+            {
+              "send": {
+                "conn": 3,
+                "control": "a30004015084627a34f6c10de28b77f93ea341ef97025840d2e4af7cb14705bbe60a31e3374a839d0104d9f7aaecbd2a9f9e138134858381544c36eb421f4f981e4e8ac1c22927f10315278f8740b6e59f7ccc0030a2eaf3",
+                "from": "joiner"
+              }
+            }
+          ],
+          "pending": "pending",
+          "state": "awaiting_allow"
+        },
+        {
+          "held": false,
+          "op": "drop",
+          "out": [
+            {
+              "broken": 3
+            },
+            {
+              "joiner": "away"
+            },
+            {
+              "release": "DMMG"
+            }
+          ],
+          "state": "away"
+        },
+        {
+          "as": "c",
+          "op": "park",
+          "out": []
+        },
+        {
+          "flow": "a",
+          "op": "unpark",
+          "out": []
+        },
+        {
+          "held": false,
+          "op": "cancel",
+          "out": [
+            {
+              "hold": "DMMG"
+            },
+            {
+              "joiner": {
+                "ended": "settled"
+              }
+            },
+            {
+              "release": "DMMG"
+            }
+          ],
+          "pendings": [
+            [
+              "192.168.1.20:47100",
+              "pending"
+            ]
+          ],
+          "state": "ended:settled"
+        }
+      ]
+    },
+    {
+      "code": "DMMG-CYFD-DT44",
+      "description": "The confirmation is lost; the recovery's TLS is pinned to the stored host key. A far end at the address showing another key fails the dial: the flow goes back away with its record and gives the hold back. An unreachable address does the same. A refused hold dials nothing. The next recovery reaches the host.",
+      "draws": {
+        "fake1": [
+          {
+            "bytes": "41414141414141414141414141414141"
+          },
+          {
+            "bytes": "130717141e1e1e1e1e1e1e1e"
+          }
+        ],
+        "host": [
+          {
+            "bytes": "b2125f5befebfd95faac46bc9e0e7433"
+          },
+          {
+            "bytes": "0df474300c3eef4ded9ae4c4"
+          },
+          {
+            "bytes": "e4794ee2bcc061439387ca193531e1f4d3a5a8ccd9140d3317abc21765feb579"
+          }
+        ],
+        "joiner": [
+          {
+            "bytes": "9a9ec1a2a6c152e5b938b4dd05f045ad"
+          },
+          {
+            "bytes": "e11a1b1776dff6485acc5921c49dcdd2b0a8148d9aa75b949e0af167af1766f4"
+          }
+        ]
+      },
+      "name": "a_recovery_dial_is_pinned",
+      "steps": [
+        {
+          "code": "right",
+          "op": "start",
+          "out": [
+            {
+              "hold": "DMMG"
+            }
+          ],
+          "result": "ok"
+        },
+        {
+          "conn": 1,
+          "host": "host",
+          "lose": "msg_c",
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300070164444d4d4702664c6170746f70",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000201020250b2125f5befebfd95faac46bc9e0e7433",
+                "from": "host"
+              }
+            },
+            {
+              "persist_ledger": {
+                "expected": null,
+                "record": "a401776d6f757373652d6469726563742d6a6f696e65722d76310264444d4d470304041a6ab13b80"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02582220feaf9e313a8f6fbbd224fc0a9852d5e49f88b9b0d0b92b2cc12e352c2a971f7d00",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02586220169bdf6c0fd103749ebf2ffe4e0b840dcc04348d15fbb972cca9e36b1b277d5d003581ea7114c3f912695c1f757557fe6a540c83385b85a24a20e7a14ccf96c5fa4fe331cc3947be5a2763357ec811b5d6d7f022f777a01d57a2ff4a0adc23ab98",
+                "from": "host"
+              }
+            },
+            {
+              "persist_pending": {
+                "expected": null,
+                "record": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b80070008509a9ec1a2a6c152e5b938b4dd05f045ad"
+              }
+            },
+            {
+              "joiner": "code_passed"
+            },
+            {
+              "broken": 1
+            },
+            {
+              "joiner": "away"
+            },
+            {
+              "release": "DMMG"
+            }
+          ],
+          "pending": "pending",
+          "state": "away"
+        },
+        {
+          "conn": 2,
+          "held": false,
+          "host": "fake1",
+          "op": "connect",
+          "out": [
+            {
+              "hold": "DMMG"
+            },
+            {
+              "dial_failed": 2
+            },
+            {
+              "joiner": "away"
+            },
+            {
+              "release": "DMMG"
+            }
+          ],
+          "pending": "pending",
+          "state": "away"
+        },
+        {
+          "conn": 3,
+          "held": false,
+          "host": "host",
+          "op": "connect",
+          "out": [
+            {
+              "hold": "DMMG"
+            },
+            {
+              "dial_failed": 3
+            },
+            {
+              "joiner": "away"
+            },
+            {
+              "release": "DMMG"
+            }
+          ],
+          "pending": "pending",
+          "state": "away",
+          "unreachable": true
+        },
+        {
+          "conn": 4,
+          "held_elsewhere": true,
+          "host": "host",
+          "op": "connect",
+          "out": [
+            {
+              "hold_refused": "DMMG"
+            },
+            {
+              "joiner": "away"
+            }
+          ],
+          "pending": "pending",
+          "state": "away"
+        },
+        {
+          "conn": 5,
+          "held": false,
+          "host": "host",
+          "op": "connect",
+          "out": [
+            {
+              "hold": "DMMG"
+            },
+            {
+              "send": {
+                "conn": 5,
+                "control": "a400070164444d4d4702664c6170746f700350b2125f5befebfd95faac46bc9e0e7433",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 5,
+                "control": "a4000201020250b2125f5befebfd95faac46bc9e0e74330301",
+                "from": "host"
+              }
+            },
+            {
+              "persist_pending": {
+                "expected": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b80070008509a9ec1a2a6c152e5b938b4dd05f045ad",
+                "record": null
+              }
+            },
+            {
+              "close": {
+                "code": "no_error",
+                "conn": 5,
+                "from": "joiner"
+              }
+            },
+            {
+              "joiner": {
+                "ended": "not_received:4"
+              }
+            },
+            {
+              "release": "DMMG"
+            }
+          ],
+          "pending": null,
+          "state": "ended:not_received:4"
+        }
+      ]
+    },
+    {
+      "code": "DMMG-CYFD-DT44",
+      "description": "The typed address does not answer: the flow ends and gives the hold back; no attempt was spent.",
+      "draws": {
+        "host": [
+          {
+            "bytes": "b2125f5befebfd95faac46bc9e0e7433"
+          },
+          {
+            "bytes": "0df474300c3eef4ded9ae4c4"
+          }
+        ],
+        "joiner": []
+      },
+      "name": "an_unreachable_first_contact",
+      "steps": [
+        {
+          "code": "right",
+          "op": "start",
+          "out": [
+            {
+              "hold": "DMMG"
+            }
+          ],
+          "result": "ok"
+        },
+        {
+          "conn": 1,
+          "held": false,
+          "host": "host",
+          "ledger": null,
+          "op": "connect",
+          "out": [
+            {
+              "dial_failed": 1
+            },
+            {
+              "joiner": {
+                "ended": "closed"
+              }
+            },
+            {
+              "release": "DMMG"
+            }
+          ],
+          "state": "ended:closed",
+          "unreachable": true
         }
       ]
     },
@@ -3339,7 +3893,7 @@
             {
               "persist_pending": {
                 "expected": null,
-                "record": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700"
+                "record": "a80178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b80070008509a9ec1a2a6c152e5b938b4dd05f045ad"
               }
             },
             {
