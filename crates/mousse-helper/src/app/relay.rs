@@ -765,7 +765,7 @@ async fn accept_incoming(
     class: Class,
     pipe: Box<WsPipe>,
 ) {
-    let conn = match shared.host.accept(pipe).await {
+    let conn = match shared.host.accept_relay(pipe).await {
         Ok(conn) => conn,
         Err(e) => {
             applog::line(format!("refused a relay circuit: {e}"));

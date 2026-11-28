@@ -35,7 +35,7 @@
 //! after the join-proof wait is refused even before the ticker runs.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
@@ -49,12 +49,15 @@ use mousse_net_core::grants::{
 use mousse_net_core::identity::IdentityPublicKey;
 use mousse_net_core::mux::MuxRole;
 use mousse_net_core::pairing::{
-    CodeExchangeFactory, CpaceExchangeFactory, CreatedInvitation, HostAction, HostPairing,
+    ApprovalEnd, BindingTranscript, CodeExchangeFactory, CpaceExchangeFactory, CreatedInvitation,
+    DirectApproval, DirectCode, DirectHostAction, DirectHostPairing, DirectInvitationParams,
+    DirectInvitationStatus, DirectRecords, DirectRequestId, ExchangeRole, HostAction, HostPairing,
     InvitationId, InvitationKind, InvitationParams, InvitationStatus, PairingCode,
-    SessionExporters,
+    SessionExporters, SID_LEN,
 };
 use mousse_net_core::removal::{self, Decision, Journaled, RemovalId, SignedRemoval};
 use mousse_net_core::{ConnectionId, ErrorCode, Millis, UnixTime};
+use rand_core::CryptoRng;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::admission::StreamAdmission;
@@ -65,7 +68,7 @@ use crate::endpoint::Endpoint;
 use crate::error::NetError;
 use crate::limits::{ms, Limits};
 use crate::pipe::Pipe;
-use crate::preauth::{ListenerKind, PreAuth, PreAuthFull, PreAuthSlot, PreAuthStats};
+use crate::preauth::{ListenerKind, PreAuth, PreAuthFull, PreAuthSlot, PreAuthStats, SourceKey};
 use crate::rng::os_rng;
 use crate::store::{EnrollmentSaveError, GrantStore, PendingEnrollment};
 use crate::tls::{self, TlsPolicy};
@@ -191,6 +194,123 @@ pub enum HostEvent {
     },
     /// Saving the grant table failed. The change is live in memory.
     StoreFailed(String),
+    /// Pair with IP (wire.md 10.9).
+    Direct(DirectEvent),
+}
+
+/// What a Pair with IP invitation tells the host application.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DirectEvent {
+    /// An attempt was debited: the code stays the same, with this many
+    /// attempts left.
+    Code {
+        /// The invitation.
+        invitation: InvitationId,
+        /// Attempts left.
+        attempts_left: u8,
+    },
+    /// Show, or update in place, the approval prompt of one request: one
+    /// per (invitation, identity that passed the code). Sent again with the
+    /// same request whenever its presence (connected or away) or its
+    /// decision (pending or allowed) changes. Answer with
+    /// [`Host::allow_direct`] or [`Host::decline_direct`].
+    Approval(DirectApproval),
+    /// Take the request's prompt away.
+    ApprovalEnded {
+        /// The request.
+        request: DirectRequestId,
+        /// Why.
+        reason: ApprovalEnd,
+    },
+    /// A device was enrolled and told it is paired. Its grant is
+    /// provisional until the first stream of a connection bound to it
+    /// commits it ([`DirectEvent::Committed`]), and a cancel from the
+    /// device may still remove it before that
+    /// ([`DirectEvent::EnrollmentUndone`]).
+    Enrolled {
+        /// The invitation it used.
+        invitation: InvitationId,
+        /// Its provisional grant.
+        grant: GrantId,
+        /// The device.
+        identity: IdentityPublicKey,
+        /// The grant's role.
+        role: Role,
+    },
+    /// A provisional grant committed: it is the device's grant now, saved,
+    /// and the device's older grant, if any, is gone.
+    Committed {
+        /// The grant.
+        grant: GrantId,
+        /// The device.
+        identity: IdentityPublicKey,
+    },
+    /// A provisional grant was removed before it committed: the device
+    /// cancelled across the Allow, the commit failed, it expired, the
+    /// device was denied, or a newer Pair with IP enrollment replaced it.
+    /// The device's older grant, if any, stays.
+    EnrollmentUndone {
+        /// The invitation that made it.
+        invitation: InvitationId,
+        /// The removed grant.
+        grant: GrantId,
+        /// The device.
+        identity: IdentityPublicKey,
+    },
+    /// The invitation ended without enrollment.
+    Ended {
+        /// The invitation.
+        invitation: InvitationId,
+        /// Why: `CANCELLED`, `PAIRING_DECLINED`, `ATTEMPTS_EXHAUSTED`, or
+        /// `INVITATION_INVALID` (expired, or an allowed device never came
+        /// back), or `INTERNAL_ERROR` when an enrollment could not be saved.
+        reason: ErrorCode,
+    },
+}
+
+/// The state a Pair with IP step may change, taken before it
+/// ([`Inner::checkpoint`]).
+struct Checkpoint {
+    grants: GrantTable,
+    records: DirectRecords,
+}
+
+/// A new Pair with IP invitation ([`Host::invite_direct`]), ready to show.
+#[derive(Clone, Debug)]
+pub struct DirectInvite {
+    /// The invitation id `I`.
+    pub invitation: InvitationId,
+    /// The code to show (zeroized on drop, never logged).
+    pub code: DirectCode,
+    /// The address to show with it, as given.
+    pub address: SocketAddr,
+    /// When it stops taking new attempts.
+    pub expires_at: UnixTime,
+    /// Code attempts it allows.
+    pub attempts_left: u8,
+}
+
+/// One code-exchange factory shared by the ticket pairing and Pair with IP.
+/// Both run under the host's lock, so the mutex is never contended; it only
+/// keeps the factory's bounds as they were (`Send`, not `Sync`).
+pub(crate) struct FactoryRef<F>(Arc<Mutex<F>>);
+
+impl<F: CodeExchangeFactory> CodeExchangeFactory for FactoryRef<F> {
+    type Exchange = F::Exchange;
+
+    fn start<R: CryptoRng + ?Sized>(
+        &self,
+        role: ExchangeRole,
+        password: &[u8],
+        binding: &BindingTranscript,
+        sid: &[u8; SID_LEN],
+        rng: &mut R,
+    ) -> Self::Exchange {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .start(role, password, binding, sid, rng)
+    }
 }
 
 /// Why [`Host::admit`] gave no place.
@@ -312,7 +432,27 @@ impl std::fmt::Display for Refusal {
 
 struct Inner<F: CodeExchangeFactory> {
     grants: GrantTable,
-    pairing: HostPairing<F>,
+    pairing: HostPairing<FactoryRef<F>>,
+    /// Pair with IP. A connection that sent `JOIN_DIRECT` belongs to it for
+    /// the rest of its pairing (`direct_conns`); every other one to
+    /// `pairing`.
+    direct: DirectHostPairing<FactoryRef<F>>,
+    direct_conns: HashSet<ConnectionId>,
+    /// Connections held after a `JOIN_DIRECT` that found nothing, until
+    /// this monotonic time; then they close with `INVITATION_INVALID`.
+    holds: HashMap<ConnectionId, Millis>,
+    /// Provisional grants whose removal by their device's cancel could not
+    /// be stored: put back, and committing nothing until a cancel removes
+    /// them for good.
+    cancel_pending: HashSet<GrantId>,
+    /// The pre-auth places of those misses, each kept until its hold ends
+    /// even when its connection is gone sooner: a miss costs its source a
+    /// place for the whole hold, however the peer leaves.
+    held_places: Vec<(Millis, PreAuthSlot)>,
+    /// Connections a listener accepted with a pre-auth place, and the
+    /// source address that place counted against (TCP). Only those of the
+    /// TCP listener answer Pair with IP.
+    listened: HashMap<ConnectionId, Option<SourceKey>>,
     gates: HashMap<ConnectionId, ConnectionGate>,
     conns: HashMap<ConnectionId, mpsc::UnboundedSender<Cmd>>,
     store: Option<GrantStore>,
@@ -336,6 +476,7 @@ struct Inner<F: CodeExchangeFactory> {
     events: mpsc::UnboundedSender<HostEvent>,
     /// Bumped on every change to the grant table ([`Host::grants_changed`]).
     grants_gen: watch::Sender<u64>,
+    clock: Arc<dyn Clock>,
 }
 
 struct Shared<F: CodeExchangeFactory> {
@@ -352,13 +493,29 @@ struct Shared<F: CodeExchangeFactory> {
     #[cfg(test)]
     ticker_paused: std::sync::atomic::AtomicBool,
     /// Tests run this after a pairing message passed the gate and before
-    /// it is handled; it stays until it returns true.
-    #[cfg(test)]
+    /// it is handled; it stays until it returns true. Debug builds only
+    /// ([`Host::set_after_pairing_check`]).
+    #[cfg(any(test, debug_assertions))]
     after_pairing_check: Mutex<Option<PairingHook>>,
+    /// The same, after a peer's `GOAWAY` passed the gate
+    /// ([`Host::set_after_goaway_check`]).
+    #[cfg(any(test, debug_assertions))]
+    after_goaway_check: Mutex<Option<PairingHook>>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 type PairingHook = Box<dyn FnMut() -> bool + Send>;
+
+/// Run the hook in `slot`, if any; it stays until it returns true.
+#[cfg(any(test, debug_assertions))]
+fn run_hook(slot: &Mutex<Option<PairingHook>>) {
+    let hook = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(mut hook) = hook {
+        if !hook() {
+            *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(hook);
+        }
+    }
+}
 
 /// A host. Cheap to clone; all clones share state.
 pub struct Host<F: CodeExchangeFactory = CpaceExchangeFactory> {
@@ -512,13 +669,15 @@ where
         self.kinds.get(&conn).copied().unwrap_or(ListenerKind::Tcp)
     }
 
-    /// Remove the grants past their expiry, close their connections and
-    /// save.
+    /// Remove the grants past their expiry, provisional ones too, close
+    /// their connections and save.
     fn expire_grants(&mut self, now: UnixTime) {
-        let before = self.grants.grants().count();
-        let events = self.grants.tick(now);
-        let changed = self.grants.grants().count() != before;
-        self.apply_grant_events(events);
+        let count = |t: &GrantTable| (t.grants().count(), t.provisional_grants().count());
+        let before = count(&self.grants);
+        let actions = self.direct.expire_grants(&mut self.grants, now);
+        let changed = count(&self.grants) != before;
+        // Saved once, below.
+        self.apply_direct(actions, false);
         if changed || self.unsaved {
             // A failure is reported as an event and retried by the ticker.
             let _ = self.persist();
@@ -806,6 +965,610 @@ where
             let _ = self.persist();
         }
     }
+
+    fn direct_event(&self, event: DirectEvent) {
+        let _ = self.events.send(HostEvent::Direct(event));
+    }
+
+    /// Carry out what Pair with IP asked for. An enrollment in `actions`
+    /// must have been saved first ([`Inner::commit_direct_enrollment`]);
+    /// `save`: whether a grant-table change among them is still to be
+    /// saved (false when the caller saved it already, or saves it itself).
+    fn apply_direct(&mut self, actions: Vec<DirectHostAction>, save: bool) {
+        let mut persist = false;
+        for action in actions {
+            match action {
+                DirectHostAction::Send { conn, message } => self.send(conn, Cmd::Control(message)),
+                DirectHostAction::Close { conn, code } => {
+                    self.holds.remove(&conn);
+                    self.close_conn(conn, code);
+                }
+                DirectHostAction::MissHold { conn, hold_ms } => {
+                    if let Some(gate) = self.gates.get_mut(&conn) {
+                        gate.hold();
+                    }
+                    // Must-fail control (tests only): the miss closes at once.
+                    if cfg!(mousse_control = "direct-miss-closes-at-once") {
+                        self.close_conn(conn, ErrorCode::InvitationInvalid);
+                        continue;
+                    }
+                    // The hold owns its pre-auth place from here: it is
+                    // freed when the hold ends, not when the peer leaves.
+                    let until = self.mono_now().plus(hold_ms);
+                    if let Some(slot) = self.slots.remove(&conn) {
+                        self.held_places.push((until, slot));
+                    }
+                    self.holds.insert(conn, until);
+                }
+                DirectHostAction::AdmittedJoinOnly { conn, invitation } => {
+                    if let Some(gate) = self.gates.get_mut(&conn) {
+                        gate.admit_join_only(invitation);
+                    }
+                    self.send(conn, Cmd::Status(ConnStatus::JoinOnly));
+                }
+                DirectHostAction::AttemptsLeft {
+                    invitation,
+                    attempts_left,
+                } => self.direct_event(DirectEvent::Code {
+                    invitation,
+                    attempts_left,
+                }),
+                DirectHostAction::Approval(approval) => {
+                    self.direct_event(DirectEvent::Approval(approval))
+                }
+                DirectHostAction::ApprovalEnded { request, reason } => {
+                    self.direct_event(DirectEvent::ApprovalEnded { request, reason })
+                }
+                DirectHostAction::Enrolled {
+                    invitation,
+                    conn,
+                    grant,
+                    identity,
+                    role,
+                    attempt,
+                } => {
+                    // Already saved by `commit_direct_enrollment`.
+                    if let Some(gate) = self.gates.get_mut(&conn) {
+                        gate.bind_direct(grant, true, attempt);
+                    }
+                    // Live: its pre-auth place is free again.
+                    self.slots.remove(&conn);
+                    self.send(conn, Cmd::Status(ConnStatus::Live));
+                    self.direct_event(DirectEvent::Enrolled {
+                        invitation,
+                        grant,
+                        identity,
+                        role,
+                    });
+                }
+                DirectHostAction::Bound {
+                    conn,
+                    grant,
+                    provisional,
+                } => {
+                    if let Some(gate) = self.gates.get_mut(&conn) {
+                        gate.bind_direct(grant, provisional, None);
+                    }
+                    self.slots.remove(&conn);
+                    self.send(conn, Cmd::Status(ConnStatus::Live));
+                }
+                DirectHostAction::Committed {
+                    grant,
+                    identity,
+                    bound,
+                    ..
+                } => {
+                    for conn in bound {
+                        if let Some(gate) = self.gates.get_mut(&conn) {
+                            gate.committed();
+                        }
+                    }
+                    self.direct_event(DirectEvent::Committed { grant, identity });
+                }
+                DirectHostAction::EnrollmentUndone {
+                    invitation,
+                    grant,
+                    identity,
+                } => {
+                    persist = true;
+                    self.direct_event(DirectEvent::EnrollmentUndone {
+                        invitation,
+                        grant,
+                        identity,
+                    });
+                }
+                DirectHostAction::InvitationEnded { invitation, reason } => {
+                    self.direct_event(DirectEvent::Ended { invitation, reason })
+                }
+                DirectHostAction::Grant(event) => {
+                    persist = true;
+                    self.apply_grant_events(vec![event]);
+                }
+            }
+        }
+        if persist && save {
+            // A failure is reported as an event and retried by the ticker.
+            let _ = self.persist();
+        }
+    }
+
+    /// Save the grant table now, and say whether it worked. On failure
+    /// [`HostEvent::StoreFailed`] goes out; `in_place` tells whether the
+    /// new table may be on disk anyway.
+    fn save_strict(&mut self) -> Result<(), crate::store::WriteFailure> {
+        self.grants_gen.send_modify(|g| *g += 1);
+        let Some(store) = self.store.clone() else {
+            return Ok(());
+        };
+        match store.save_checked(&self.grants) {
+            Ok(()) => {
+                self.unsaved = false;
+                self.reconcile = false;
+                self.settle_roles();
+                Ok(())
+            }
+            Err(failure) => {
+                let _ = self
+                    .events
+                    .send(HostEvent::StoreFailed(failure.error.to_string()));
+                Err(failure)
+            }
+        }
+    }
+
+    /// Save, then carry out, what a Pair with IP step asked for, `before`
+    /// being the grant table it ran on:
+    ///
+    /// - an enrollment is saved before the device hears `PAIRED`
+    ///   ([`Inner::commit_direct_enrollment`]); the error says it was not
+    ///   stored;
+    /// - a provisional grant removed by the device's cancel is saved before
+    ///   the cancel is answered with `CANCELLED`, which settles it for the
+    ///   device. When the save fails, the grant table goes back to
+    ///   `before` (the grant stays), and the device hears `INTERNAL_ERROR`
+    ///   instead: it keeps its record, and its next cancel removes the
+    ///   grant again;
+    /// - anything else is saved after, as every grant change is.
+    fn settle_direct(
+        &mut self,
+        before: Checkpoint,
+        actions: Vec<DirectHostAction>,
+    ) -> Result<(), NetError> {
+        if actions
+            .iter()
+            .any(|a| matches!(a, DirectHostAction::Enrolled { .. }))
+        {
+            let (actions, stored) = self.commit_direct_enrollment(before, actions);
+            // Saved with the enrollment, or put back with it.
+            self.apply_direct(actions, false);
+            return stored;
+        }
+        // A cancel's removal of a provisional grant (by `CODE_ABORT`,
+        // `GOAWAY` or recovery) is the only other change reported as
+        // `EnrollmentUndone` here: it is stored before anything about it
+        // is reported or answered.
+        let undone: Vec<GrantId> = actions
+            .iter()
+            .filter_map(|a| match a {
+                DirectHostAction::EnrollmentUndone { grant, .. } => Some(*grant),
+                _ => None,
+            })
+            .collect();
+        if undone.is_empty() {
+            self.apply_direct(actions, true);
+            return Ok(());
+        }
+        match self.save_strict() {
+            Ok(()) => {
+                for grant in &undone {
+                    self.cancel_pending.remove(grant);
+                }
+                self.apply_direct(actions, false);
+                Ok(())
+            }
+            Err(failure) => {
+                // The grant and the records that let its device cancel it
+                // come back together. It commits nothing until a cancel
+                // removes it for good, also when the write may have reached
+                // the disk (the ticker then writes the table in memory
+                // again, so both agree in the end).
+                self.roll_back(before, failure.in_place);
+                self.cancel_pending.extend(undone);
+                let actions = actions
+                    .into_iter()
+                    .filter_map(|a| match a {
+                        DirectHostAction::Grant(_) | DirectHostAction::EnrollmentUndone { .. } => {
+                            None
+                        }
+                        DirectHostAction::Close {
+                            conn,
+                            code: ErrorCode::Cancelled,
+                        } => Some(DirectHostAction::Close {
+                            conn,
+                            code: ErrorCode::InternalError,
+                        }),
+                        other => Some(other),
+                    })
+                    .collect();
+                self.apply_direct(actions, false);
+                Err(failure.error)
+            }
+        }
+    }
+
+    fn mono_now(&self) -> Millis {
+        self.clock.mono()
+    }
+
+    /// What a Pair with IP step may change, taken before it runs: the
+    /// grant table and the direct host's connection records, which go back
+    /// together when the step cannot be stored ([`Inner::roll_back`]).
+    fn checkpoint(&self) -> Checkpoint {
+        Checkpoint {
+            grants: self.grants.clone(),
+            records: self.direct.records(),
+        }
+    }
+
+    /// Put back the state of `checkpoint` after a save that failed. A
+    /// change that was already waiting to be saved still waits; one whose
+    /// write may have reached the disk (`in_place`) is written again.
+    fn roll_back(&mut self, checkpoint: Checkpoint, in_place: bool) {
+        self.grants = checkpoint.grants;
+        self.direct.restore_records(checkpoint.records);
+        self.unsaved |= in_place;
+    }
+
+    /// The provisional grant of `identity` a direct invitation made, if
+    /// any: what a denial would remove.
+    fn direct_provisional_of(
+        &self,
+        identity: &IdentityPublicKey,
+    ) -> Option<(InvitationId, GrantId)> {
+        self.grants
+            .provisional_grants()
+            .find(|g| g.identity == *identity && g.direct)
+            .and_then(|g| g.enrolled_by.map(|i| (i, g.id)))
+    }
+
+    /// [`Inner::commit_enrollment`] for Pair with IP: an enrollment is
+    /// saved, provisional grant and all, before the gate is bound or
+    /// `PAIRED` sent, so a device is never told it is paired under a grant
+    /// a restart would lose.
+    fn commit_direct_enrollment(
+        &mut self,
+        before: Checkpoint,
+        actions: Vec<DirectHostAction>,
+    ) -> (Vec<DirectHostAction>, Result<(), NetError>) {
+        let (enrolling, pending): (Vec<ConnectionId>, Vec<PendingEnrollment>) = actions
+            .iter()
+            .filter_map(|a| match a {
+                DirectHostAction::Enrolled {
+                    invitation,
+                    conn,
+                    grant,
+                    identity,
+                    ..
+                } => Some((
+                    *conn,
+                    PendingEnrollment {
+                        grant: *grant,
+                        identity: *identity,
+                        invitation: *invitation,
+                    },
+                )),
+                _ => None,
+            })
+            .unzip();
+        if enrolling.is_empty() {
+            return (actions, Ok(()));
+        }
+        let Some(store) = self.store.clone() else {
+            return (actions, Ok(()));
+        };
+        self.grants_gen.send_modify(|g| *g += 1);
+        let failure = match store.save_enrollment(&before.grants, &self.grants, &pending) {
+            Ok(()) => {
+                self.unsaved = false;
+                return (actions, Ok(()));
+            }
+            Err(f) => f,
+        };
+        let error = NetError::Store(failure.error().to_string());
+        let _ = self
+            .events
+            .send(HostEvent::StoreFailed(failure.error().to_string()));
+        let paired_to_enrolling = |a: &DirectHostAction| {
+            matches!(
+                a,
+                DirectHostAction::Send {
+                    conn,
+                    message: ControlMessage::Paired { .. },
+                } if enrolling.contains(conn)
+            )
+        };
+        if let EnrollmentSaveError::Unsettled(_) = failure {
+            // In force but not durable: kept as a restart would keep it;
+            // the device learns the outcome by recovery.
+            self.unsaved = true;
+            self.reconcile = true;
+            let conns: Vec<ConnectionId> = self.conns.keys().copied().collect();
+            for conn in conns {
+                self.close_conn(conn, ErrorCode::InternalError);
+            }
+            let actions = actions
+                .into_iter()
+                .filter(|a| !paired_to_enrolling(a))
+                .flat_map(|action| match action {
+                    DirectHostAction::Enrolled {
+                        invitation,
+                        conn,
+                        grant,
+                        identity,
+                        role,
+                        ..
+                    } => {
+                        self.direct_event(DirectEvent::Enrolled {
+                            invitation,
+                            grant,
+                            identity,
+                            role,
+                        });
+                        vec![DirectHostAction::Close {
+                            conn,
+                            code: ErrorCode::InternalError,
+                        }]
+                    }
+                    other => vec![other],
+                })
+                .collect();
+            return (actions, Err(error));
+        }
+        // Not stored, and not in force: the grant table goes back, and the
+        // invitation ends instead of being consumed, as a restart would
+        // find it. Its prompt ends as dismissed, not enrolled.
+        self.roll_back(before, false);
+        let ended: Vec<InvitationId> = pending.iter().map(|p| p.invitation).collect();
+        for invitation in &ended {
+            self.direct.enrollment_not_stored(invitation);
+        }
+        let actions = actions
+            .into_iter()
+            .filter(|a| !paired_to_enrolling(a))
+            .flat_map(|action| match action {
+                DirectHostAction::ApprovalEnded {
+                    request,
+                    reason: ApprovalEnd::Enrolled,
+                } if ended.contains(&request.invitation) => {
+                    vec![DirectHostAction::ApprovalEnded {
+                        request,
+                        reason: ApprovalEnd::Dismissed,
+                    }]
+                }
+                DirectHostAction::Enrolled {
+                    invitation, conn, ..
+                } => vec![
+                    DirectHostAction::Close {
+                        conn,
+                        code: ErrorCode::InternalError,
+                    },
+                    DirectHostAction::InvitationEnded {
+                        invitation,
+                        reason: ErrorCode::InternalError,
+                    },
+                ],
+                // The grant table is back as it was: nothing it reported
+                // happened.
+                DirectHostAction::Grant(_)
+                | DirectHostAction::EnrollmentUndone { .. }
+                | DirectHostAction::Bound { .. } => Vec::new(),
+                other => vec![other],
+            })
+            .collect();
+        (actions, Err(error))
+    }
+
+    /// The first stream frame of `conn`, bound to the provisional `grant`,
+    /// waits (wire.md 8.1): commit the grant, save the table, then let the
+    /// frame be checked again. An error is the code `conn` closed with; the
+    /// frame is dropped.
+    fn commit_direct(
+        &mut self,
+        conn: ConnectionId,
+        grant: GrantId,
+        now: UnixTime,
+    ) -> Result<(), ErrorCode> {
+        // A grant whose cancel could not be stored waits for that cancel.
+        if self.cancel_pending.contains(&grant) {
+            self.close_conn(conn, ErrorCode::InternalError);
+            return Err(ErrorCode::InternalError);
+        }
+        let before = self.checkpoint();
+        let actions = self
+            .direct
+            .on_first_stream(conn, grant, &mut self.grants, now);
+        let committed = actions
+            .iter()
+            .any(|a| matches!(a, DirectHostAction::Committed { .. }));
+        // Must-fail control (tests only): the frame goes on before the
+        // commit is saved.
+        let save = committed && !cfg!(mousse_control = "direct-commit-unsaved");
+        if save {
+            match self.save_strict() {
+                Ok(()) => {}
+                Err(failure) if !failure.in_place => {
+                    // The stored table is the one from before: so is the
+                    // one in memory, with the grant provisional and its
+                    // enrolled connection still able to cancel it, and
+                    // nothing runs on this frame.
+                    self.roll_back(before, false);
+                    self.close_conn(conn, ErrorCode::InternalError);
+                    return Err(ErrorCode::InternalError);
+                }
+                Err(_) => {
+                    // Committed in memory, maybe not on disk: serve nothing
+                    // until a save works, as for an unsettled enrollment.
+                    self.unsaved = true;
+                    self.reconcile = true;
+                    self.apply_direct(actions, false);
+                    let conns: Vec<ConnectionId> = self.conns.keys().copied().collect();
+                    for c in conns {
+                        self.close_conn(c, ErrorCode::InternalError);
+                    }
+                    return Err(ErrorCode::InternalError);
+                }
+            }
+        }
+        // Saved above already when it committed: once is enough.
+        self.apply_direct(actions, !save);
+        match self.gates.get(&conn).map(|g| g.state()) {
+            Some(GateState::Closed(code)) => Err(*code),
+            Some(_) => Ok(()),
+            None => Err(ErrorCode::InternalError),
+        }
+    }
+
+    /// A `JOIN_DIRECT` passed the gate of `conn` (wire.md 10.9, "Lookup").
+    #[allow(clippy::too_many_arguments)]
+    fn on_join_direct(
+        &mut self,
+        conn: ConnectionId,
+        peer: &IdentityPublicKey,
+        exporters: &SessionExporters,
+        message: ControlMessage,
+        from_live: bool,
+        preauth: &Arc<PreAuth>,
+        now: UnixTime,
+    ) {
+        let ControlMessage::JoinDirect {
+            lookup,
+            name,
+            recovery,
+        } = message
+        else {
+            return;
+        };
+        self.direct_conns.insert(conn);
+        let kind = self.kind_of(conn);
+        // Kind 3 is answered only on connections the TCP listener accepted:
+        // never through a WebSocket tunnel, the SSH pipe or a relay circuit.
+        // Must-fail control (tests only): any transport is answered.
+        let listened = self.listened.get(&conn).copied();
+        let tcp_listener = kind == ListenerKind::Tcp && listened.is_some();
+        if !tcp_listener && !cfg!(mousse_control = "direct-on-any-transport") {
+            self.close_conn(conn, ErrorCode::InvitationInvalid);
+            return;
+        }
+        // A paused host takes no pairing.
+        if self.fenced(kind) {
+            self.close_conn(conn, ErrorCode::InternalError);
+            return;
+        }
+        if from_live {
+            // A new place first, counted against the connection's source
+            // like any connection waiting for authorization: a granted
+            // device scanning lookups is held to the same rate. Must-fail
+            // control (tests only): counted against no source.
+            let source = if cfg!(mousse_control = "direct-live-place-without-source") {
+                None
+            } else {
+                listened.flatten()
+            };
+            match preauth.try_take_key(kind, source) {
+                Ok(slot) => {
+                    self.slots.insert(conn, slot);
+                }
+                Err(_) => {
+                    self.close_conn(conn, ErrorCode::InternalError);
+                    return;
+                }
+            }
+        }
+        let before = self.checkpoint();
+        let actions = self.direct.on_join_direct(
+            conn,
+            peer,
+            &exporters.pair,
+            &lookup,
+            &name,
+            recovery,
+            &mut self.grants,
+            now,
+        );
+        // A claim whose enrollment was not stored has been answered
+        // already (`INTERNAL_ERROR`).
+        let _ = self.settle_direct(before, actions);
+        // A recovery that ends live (answered by its grant's receipt) no
+        // longer waits for authorization: the place its lookup took is
+        // free again, also when step 2 had bound it to that grant already.
+        let live = matches!(
+            self.gates.get(&conn).map(|g| g.state()),
+            Some(GateState::Live { .. })
+        );
+        if live && !self.holds.contains_key(&conn) {
+            self.slots.remove(&conn);
+        }
+    }
+
+    /// Close the held connections whose hold is over at `mono`, and free
+    /// the places of every hold that is over, its connection gone or not.
+    fn end_holds(&mut self, mono: Millis) {
+        self.release_held_places(mono);
+        let due: Vec<ConnectionId> = self
+            .holds
+            .iter()
+            .filter(|(_, until)| mono >= **until)
+            .map(|(c, _)| *c)
+            .collect();
+        for conn in due {
+            self.holds.remove(&conn);
+            self.close_conn(conn, ErrorCode::InvitationInvalid);
+        }
+    }
+
+    /// Free the places of the holds that are over at `mono`, once each.
+    fn release_held_places(&mut self, mono: Millis) {
+        self.held_places.retain(|(until, _)| mono < *until);
+    }
+
+    /// Tell the direct host now about its connections this host closed
+    /// already (their drivers report the close later): an owner's answer
+    /// in between must see the device away, not enroll it on a closed
+    /// connection. A close the peer sent is reported when it arrives
+    /// ([`HostRole::on_goaway`]), so these closes are this side's.
+    fn sync_closed_direct(&mut self, now: UnixTime) {
+        let closed: Vec<ConnectionId> = self
+            .direct_conns
+            .iter()
+            .filter(|c| {
+                self.gates
+                    .get(c)
+                    .is_none_or(|g| matches!(g.state(), GateState::Closed(_)))
+            })
+            .copied()
+            .collect();
+        for conn in closed {
+            self.direct_conns.remove(&conn);
+            let actions = self
+                .direct
+                .on_connection_closed(conn, None, &mut self.grants, now);
+            self.apply_direct(actions, true);
+        }
+    }
+
+    /// The peer's `GOAWAY` arrived on a Pair with IP connection: act on
+    /// its code now, before the connection is torn down, so its cancel is
+    /// ordered where it arrived.
+    fn direct_goaway(&mut self, conn: ConnectionId, code: ErrorCode, now: UnixTime) {
+        if !self.direct_conns.remove(&conn) {
+            return;
+        }
+        let before = self.checkpoint();
+        let actions = self
+            .direct
+            .on_connection_closed(conn, Some(code), &mut self.grants, now);
+        let _ = self.settle_direct(before, actions);
+    }
 }
 
 impl<F> Host<F>
@@ -835,15 +1598,28 @@ where
             }
         };
         let (events, events_rx) = mpsc::unbounded_channel();
+        let factory = Arc::new(Mutex::new(factory));
         let shared = Arc::new(Shared {
             inner: Mutex::new(Inner {
                 grants,
                 pairing: HostPairing::with_limits(
                     identity,
                     config.name.clone(),
-                    factory,
+                    FactoryRef(factory.clone()),
                     config.limits.core(),
                 ),
+                direct: DirectHostPairing::with_limits(
+                    identity,
+                    config.name.clone(),
+                    FactoryRef(factory),
+                    config.limits.core(),
+                ),
+                direct_conns: HashSet::new(),
+                holds: HashMap::new(),
+                held_places: Vec::new(),
+                cancel_pending: HashSet::new(),
+                listened: HashMap::new(),
+                clock: config.clock.clone(),
                 gates: HashMap::new(),
                 conns: HashMap::new(),
                 store,
@@ -868,8 +1644,10 @@ where
             next_conn: AtomicU64::new(1),
             #[cfg(test)]
             ticker_paused: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             after_pairing_check: Mutex::new(None),
+            #[cfg(any(test, debug_assertions))]
+            after_goaway_check: Mutex::new(None),
         });
         tokio::spawn(ticker(Arc::downgrade(&shared)));
         Ok((Self { shared }, events_rx))
@@ -906,9 +1684,17 @@ where
     /// Run step 1 and step 2 on a new pipe and start its driver. A peer
     /// without a grant gets a connection that waits for a join proof. The
     /// connection counts as TCP and holds no pre-auth place; listeners use
-    /// [`Host::accept_admitted`].
+    /// [`Host::accept_admitted`]. No listener accepted it, so it is not
+    /// answered Pair with IP.
     pub async fn accept<P: Pipe>(&self, pipe: P) -> Result<Connection, NetError> {
         self.register(pipe, ListenerKind::Tcp, None).await
+    }
+
+    /// [`Host::accept`] for a circuit a relay spliced: it is of kind
+    /// [`ListenerKind::Relay`] and holds no pre-auth place here (the relay
+    /// admitted it). Pair with IP is never answered on it.
+    pub async fn accept_relay<P: Pipe>(&self, pipe: P) -> Result<Connection, NetError> {
+        self.register(pipe, ListenerKind::Relay, None).await
     }
 
     /// [`Host::accept`] for a connection that holds `slot`, taken by
@@ -961,6 +1747,7 @@ where
             // A live connection's place is free at once; any other holds
             // it until it is live or closed.
             if let Some(slot) = slot {
+                inner.listened.insert(conn, slot.source());
                 if !matches!(gate.state(), GateState::Live { .. }) {
                     inner.slots.insert(conn, slot);
                 }
@@ -1087,6 +1874,159 @@ where
         let actions = inner.commit_enrollment(before, actions);
         inner.apply(actions);
         Ok(())
+    }
+
+    /// Create a Pair with IP invitation (wire.md 10.9) to show with
+    /// `address`, the chosen local IPv4 address and port of the TCP listener
+    /// (the address is only shown: any connection of the TCP listener may
+    /// look the invitation up). A device that passes the code is offered
+    /// `role` unless the owner picks another with the answer. Takes lookups
+    /// for `DIRECT_INVITE_LIFETIME_SECS`; at most `DIRECT_MAX_OPEN` are open.
+    pub fn invite_direct(&self, address: SocketAddr, role: Role) -> Result<DirectInvite, NetError> {
+        let shown = match address {
+            SocketAddr::V4(v4) => !v4.ip().is_unspecified() && v4.port() != 0,
+            SocketAddr::V6(_) => false,
+        };
+        if !shown {
+            return Err(NetError::Refused(
+                "Pair with IP shows an IPv4 address with its port".into(),
+            ));
+        }
+        let params = DirectInvitationParams {
+            role,
+            authorizing_owner: self.shared.owner,
+            grant_expires_at: None,
+        };
+        let created = lock(&self.shared)
+            .direct
+            .create(params, self.shared.clock.now(), &mut os_rng())
+            .map_err(|e| NetError::Refused(e.to_string()))?;
+        Ok(DirectInvite {
+            invitation: created.invitation,
+            code: created.code,
+            address,
+            expires_at: created.expires_at,
+            attempts_left: created.attempts_left,
+        })
+    }
+
+    /// A Pair with IP invitation's code and the attempts it has left, while
+    /// it is open.
+    pub fn direct_code(&self, invitation: &InvitationId) -> Option<(DirectCode, u8)> {
+        let inner = lock(&self.shared);
+        let code = inner.direct.code(invitation)?.clone();
+        Some((code, inner.direct.attempts_left(invitation)?))
+    }
+
+    /// Where a Pair with IP invitation stands, while the host keeps it.
+    pub fn direct_status(&self, invitation: &InvitationId) -> Option<DirectInvitationStatus> {
+        lock(&self.shared).direct.status(invitation)
+    }
+
+    /// The approval prompts of a Pair with IP invitation that may still be
+    /// answered, as [`DirectEvent::Approval`] last showed them.
+    pub fn direct_approvals(&self, invitation: &InvitationId) -> Vec<DirectApproval> {
+        lock(&self.shared)
+            .direct
+            .approvals(invitation, self.shared.clock.now())
+    }
+
+    /// The owner cancelled a Pair with IP invitation: its connections close
+    /// with `CANCELLED` and nothing is granted.
+    pub fn cancel_direct(&self, invitation: &InvitationId) {
+        let mut inner = lock(&self.shared);
+        let actions = inner.direct.cancel(invitation);
+        inner.apply_direct(actions, true);
+    }
+
+    /// The owner allowed `request`, with `role` for this enrollment only
+    /// (`None`: the invitation's). A connected device is enrolled now, under
+    /// a provisional grant saved before `PAIRED` goes out; one that is away
+    /// is marked allowed and enrolled when it reconnects. Every other
+    /// request of the invitation ends. Refused while networking is paused.
+    ///
+    /// A device whose connection the host closed already, and the direct
+    /// host has not heard of yet, counts as away. When the enrollment cannot
+    /// be saved, the error is returned: nothing is granted and the
+    /// invitation ends with `INTERNAL_ERROR` (or, when the save may have
+    /// reached the disk, the enrollment stands and no grant is served until
+    /// a save works).
+    pub fn allow_direct(
+        &self,
+        request: &DirectRequestId,
+        role: Option<Role>,
+    ) -> Result<(), NetError> {
+        let mut inner = lock(&self.shared);
+        let inner = &mut *inner;
+        // The fence at enrollment. Control (tests only): not checked.
+        let fenced =
+            inner.fenced(ListenerKind::Tcp) && !cfg!(mousse_control = "enroll-while-paused");
+        if !inner.serving() || fenced {
+            return Err(NetError::Refused("networking is paused".into()));
+        }
+        let now = self.shared.clock.now();
+        // Under this lock: a connection closed here before is not one the
+        // device can be enrolled on.
+        inner.sync_closed_direct(now);
+        let before = inner.checkpoint();
+        let actions = inner
+            .direct
+            .allow(request, role, &mut inner.grants, now)
+            .map_err(|e| NetError::Refused(e.to_string()))?;
+        inner.settle_direct(before, actions)
+    }
+
+    /// The owner declined `request`: its device's connection closes with
+    /// `PAIRING_DECLINED`, which its recovery also gets until the request's
+    /// Allow window ends, and the invitation ends.
+    pub fn decline_direct(&self, request: &DirectRequestId) -> Result<(), NetError> {
+        let mut inner = lock(&self.shared);
+        let actions = inner
+            .direct
+            .decline(request, self.shared.clock.now())
+            .map_err(|e| NetError::Refused(e.to_string()))?;
+        inner.apply_direct(actions, true);
+        Ok(())
+    }
+
+    /// The listener kind `conn` was registered with, while it is open.
+    pub fn listener_kind(&self, conn: ConnectionId) -> Option<ListenerKind> {
+        lock(&self.shared).kinds.get(&conn).copied()
+    }
+
+    /// Tests: run `hook` on the connection's driver after a pairing message
+    /// passed the gate and before it is handled, until it returns true.
+    /// Debug builds only.
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    pub fn set_after_pairing_check(&self, hook: impl FnMut() -> bool + Send + 'static) {
+        *self
+            .shared
+            .after_pairing_check
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Box::new(hook));
+    }
+
+    /// Tests: run `hook` on the connection's driver after a peer's
+    /// `GOAWAY` passed the gate and before the connection is torn down,
+    /// until it returns true. Debug builds only.
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    pub fn set_after_goaway_check(&self, hook: impl FnMut() -> bool + Send + 'static) {
+        *self
+            .shared
+            .after_goaway_check
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Box::new(hook));
+    }
+
+    /// The provisional grants: made by Pair with IP and not committed yet.
+    pub fn provisional_grants(&self) -> Vec<Grant> {
+        lock(&self.shared)
+            .grants
+            .provisional_grants()
+            .cloned()
+            .collect()
     }
 
     /// The owner said no. The invitation ends.
@@ -1332,8 +2272,18 @@ where
     /// [`Host::remove_grant`]).
     pub fn deny(&self, identity: IdentityPublicKey) -> Result<(), NetError> {
         let mut inner = lock(&self.shared);
+        let provisional = inner.direct_provisional_of(&identity);
         let events = inner.grants.deny(identity, self.shared.clock.now());
         inner.apply_grant_events(events);
+        // A provisional grant goes with the denial; reported after its
+        // connections closed.
+        if let Some((invitation, grant)) = provisional {
+            inner.direct_event(DirectEvent::EnrollmentUndone {
+                invitation,
+                grant,
+                identity,
+            });
+        }
         inner.persist()
     }
 
@@ -1558,7 +2508,9 @@ where
     /// The name `PAIRED` sends from now on (1 to 128 bytes).
     pub fn set_name(&self, name: &str) -> Result<(), NetError> {
         validate_name(name).map_err(|e| NetError::Refused(e.to_string()))?;
-        lock(&self.shared).pairing.set_host_name(name.to_owned());
+        let mut inner = lock(&self.shared);
+        inner.pairing.set_host_name(name.to_owned());
+        inner.direct.set_host_name(name.to_owned());
         Ok(())
     }
 
@@ -1642,6 +2594,10 @@ async fn ticker<F: CodeExchangeFactory>(shared: Weak<Shared<F>>) {
         inner.reread_suspended();
         let actions = inner.pairing.tick(now);
         inner.apply(actions);
+        let actions = inner.direct.tick(now);
+        inner.apply_direct(actions, true);
+        // The drivers end their holds on time; this is the backstop.
+        inner.end_holds(mono);
         let overdue: Vec<(ConnectionId, ErrorCode)> = inner
             .gates
             .iter_mut()
@@ -1664,10 +2620,11 @@ struct HostRole<F: CodeExchangeFactory> {
 }
 
 impl<F: CodeExchangeFactory> HostRole<F> {
-    fn check_locked(&mut self, traffic: Traffic) -> Verdict {
+    fn check_locked(&mut self, traffic: Traffic, message: Option<&ControlMessage>) -> Verdict {
         let now = self.shared.clock.now();
         let mono = self.shared.clock.mono();
-        let mut inner = lock(&self.shared);
+        let mut guard = lock(&self.shared);
+        let inner = &mut *guard;
         // The join-proof wait first: a proof that arrives after it is
         // refused even if the ticker has not run yet.
         if let Some(code) = inner
@@ -1680,6 +2637,36 @@ impl<F: CodeExchangeFactory> HostRole<F> {
         if !inner.serving() && !matches!(traffic, Traffic::Keepalive | Traffic::GoAway) {
             return Verdict::Close(ErrorCode::InternalError);
         }
+        // Held after a miss: the gate's own verdict first (only keepalive,
+        // `HELLO` and `GOAWAY` pass; a stream frame is ignored, also on a
+        // live or provisional connection), so nothing below closes it
+        // before the hold's own close (wire.md 8.1).
+        if inner.holds.contains_key(&self.conn) {
+            return match inner.gates.get_mut(&self.conn) {
+                Some(gate) => gate.check(traffic),
+                None => Verdict::Close(ErrorCode::InternalError),
+            };
+        }
+        // Under a provisional grant (Pair with IP) the first stream frame
+        // waits: the grant commits, and is saved, before the frame goes on
+        // (wire.md 8.1). A held connection's gate ignores it instead.
+        if matches!(traffic, Traffic::Stream)
+            && inner
+                .gates
+                .get(&self.conn)
+                .is_some_and(|g| g.is_provisional())
+        {
+            let verdict = match inner.gates.get_mut(&self.conn) {
+                Some(gate) => gate.check(traffic),
+                None => Verdict::Close(ErrorCode::InternalError),
+            };
+            let Verdict::Commit(grant) = verdict else {
+                return verdict;
+            };
+            if let Err(code) = inner.commit_direct(self.conn, grant, now) {
+                return Verdict::Close(code);
+            }
+        }
         // Stream traffic needs the bound grant to be live now, not only when
         // the ticker last looked.
         if matches!(traffic, Traffic::Stream) && !inner.live_now(self.conn, now) {
@@ -1687,9 +2674,29 @@ impl<F: CodeExchangeFactory> HostRole<F> {
                 return Verdict::Close(*code);
             }
         }
-        match inner.gates.get_mut(&self.conn) {
-            Some(gate) => gate.check(traffic),
-            None => Verdict::Close(ErrorCode::InternalError),
+        let Some(gate) = inner.gates.get_mut(&self.conn) else {
+            return Verdict::Close(ErrorCode::InternalError);
+        };
+        let Some(message) = message else {
+            return gate.check(traffic);
+        };
+        // The one `CODE_ABORT` a provisional connection lets through
+        // (wire.md 8.1) is decided by the message, not its class, and acted
+        // on here, under the lock that admitted it: a first stream on
+        // another connection cannot commit the grant between the two.
+        let cancel = gate.is_provisional() && matches!(message, ControlMessage::CodeAbort { .. });
+        let verdict = gate.check_message(message);
+        match (verdict, message) {
+            (Verdict::Allow, ControlMessage::CodeAbort { attempt, code }) if cancel => {
+                let before = inner.checkpoint();
+                let actions =
+                    inner
+                        .direct
+                        .on_code_abort(self.conn, *attempt, *code, &mut inner.grants, now);
+                let _ = inner.settle_direct(before, actions);
+                Verdict::Ignore
+            }
+            _ => verdict,
         }
     }
 }
@@ -1714,27 +2721,17 @@ where
         }
     }
 
-    fn check(&mut self, traffic: Traffic, _message: Option<&ControlMessage>) -> Verdict {
-        let verdict = self.check_locked(traffic);
+    fn check(&mut self, traffic: Traffic, message: Option<&ControlMessage>) -> Verdict {
+        let verdict = self.check_locked(traffic, message);
         if verdict == Verdict::Allow && matches!(traffic, Traffic::Stream) {
             self.caller_opened = true;
         }
-        #[cfg(test)]
-        if verdict == Verdict::Allow && matches!(traffic, Traffic::Pairing) {
-            let hook = self
-                .shared
-                .after_pairing_check
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take();
-            if let Some(mut hook) = hook {
-                if !hook() {
-                    *self
-                        .shared
-                        .after_pairing_check
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner()) = Some(hook);
-                }
+        #[cfg(any(test, debug_assertions))]
+        if verdict == Verdict::Allow {
+            match traffic {
+                Traffic::Pairing => run_hook(&self.shared.after_pairing_check),
+                Traffic::GoAway => run_hook(&self.shared.after_goaway_check),
+                _ => {}
             }
         }
         verdict
@@ -1749,16 +2746,24 @@ where
         // only if the gate still admits it now, under the lock the pairing
         // step runs under. A removal or denial that closed the connection
         // in between wins.
+        let direct = inner.direct_conns.contains(&self.conn);
         let admitted = matches!(
             (inner.gates.get(&self.conn).map(|g| g.state()), &message),
             (
                 Some(GateState::AwaitingJoinProof { .. } | GateState::Live { .. }),
-                ControlMessage::JoinProof { .. }
+                ControlMessage::JoinProof { .. } | ControlMessage::JoinDirect { .. }
             ) | (
                 Some(GateState::JoinOnly { .. }),
                 ControlMessage::CodeExchange { .. } | ControlMessage::CodeAbort { .. }
             )
-        );
+        ) || (direct
+            // A `CODE_ABORT` the gate let in while join-only, overtaken by
+            // an Allow that enrolled this connection before it got here:
+            // still the device's cancel, of the grant that Allow made.
+            && matches!(
+                (inner.gates.get(&self.conn), &message),
+                (Some(gate), ControlMessage::CodeAbort { .. }) if gate.is_provisional()
+            ));
         if !admitted || !inner.serving() {
             return;
         }
@@ -1767,6 +2772,40 @@ where
             inner.gates.get(&self.conn).map(|g| g.state()),
             Some(GateState::Live { .. })
         );
+        let now = clock.now();
+        // Pair with IP: the connection is the direct host's from its
+        // `JOIN_DIRECT` to the end of its pairing.
+        if let ControlMessage::JoinDirect { .. } = message {
+            inner.on_join_direct(
+                self.conn,
+                &self.peer,
+                &self.exporters,
+                message,
+                from_live,
+                &self.shared.preauth,
+                now,
+            );
+            return;
+        }
+        if direct {
+            let before = inner.checkpoint();
+            let actions =
+                match message {
+                    // A finished code exchange may enroll only through Allow;
+                    // the fence at enrollment is checked there.
+                    ControlMessage::CodeExchange { attempt, payload } => inner
+                        .direct
+                        .on_code_exchange(self.conn, attempt, &payload, now, &mut os_rng()),
+                    ControlMessage::CodeAbort { attempt, code } => {
+                        inner
+                            .direct
+                            .on_code_abort(self.conn, attempt, code, &mut inner.grants, now)
+                    }
+                    _ => Vec::new(),
+                };
+            let _ = inner.settle_direct(before, actions);
+            return;
+        }
         let mut repair_slot = None;
         match &message {
             // A re-pair from live (§6.2): the fence, then a new place from
@@ -1779,7 +2818,14 @@ where
                 } else if cfg!(mousse_control = "repair-skips-slot") {
                     Some(None)
                 } else {
-                    self.shared.preauth.try_take_again(kind).ok().map(Some)
+                    // A relay circuit has no pool of its own: its ticket
+                    // re-pair draws on the TCP pool, as it did when relay
+                    // circuits counted as TCP.
+                    let pool = match kind {
+                        ListenerKind::Relay => ListenerKind::Tcp,
+                        other => other,
+                    };
+                    self.shared.preauth.try_take_again(pool).ok().map(Some)
                 };
                 match slot {
                     Some(slot) => repair_slot = slot,
@@ -1820,14 +2866,14 @@ where
                 &mac,
                 &name,
                 &inner.grants,
-                clock.now(),
+                now,
             ),
             ControlMessage::CodeExchange { attempt, payload } => inner.pairing.on_code_exchange(
                 self.conn,
                 attempt,
                 &payload,
                 &mut inner.grants,
-                clock.now(),
+                now,
                 &mut os_rng(),
             ),
             ControlMessage::CodeAbort { attempt, .. } => {
@@ -1858,17 +2904,32 @@ where
         inner.serving() && inner.live_now(self.conn, now)
     }
 
-    /// The join-proof deadline, so the driver checks it before it reads
-    /// on, not only when the ticker runs.
+    /// The join-proof deadline, or the end of a miss hold, so the driver
+    /// acts on it before it reads on, not only when the ticker runs.
     fn wake_at(&self) -> Option<Millis> {
-        match lock(&self.shared).gates.get(&self.conn).map(|g| g.state()) {
-            Some(GateState::AwaitingJoinProof { deadline }) => Some(*deadline),
-            _ => None,
+        let inner = lock(&self.shared);
+        if let Some(until) = inner.holds.get(&self.conn) {
+            return Some(*until);
         }
+        inner.gates.get(&self.conn).and_then(|g| g.poll_timeout())
     }
 
     fn on_wake(&mut self, mono: Millis, out: &mut Outbox) {
         let mut inner = lock(&self.shared);
+        // A miss hold closes only once it has run its full length.
+        if inner
+            .holds
+            .get(&self.conn)
+            .is_some_and(|until| mono >= *until)
+        {
+            inner.holds.remove(&self.conn);
+            inner.release_held_places(mono);
+            if let Some(gate) = inner.gates.get_mut(&self.conn) {
+                gate.close(ErrorCode::InvitationInvalid);
+            }
+            out.close = Some(ErrorCode::InvitationInvalid);
+            return;
+        }
         if let Some(code) = inner
             .gates
             .get_mut(&self.conn)
@@ -1878,16 +2939,41 @@ where
         }
     }
 
-    fn on_closed(&mut self, _reason: &CloseReason) {
+    /// A Pair with IP joiner's `GOAWAY` counts where it arrives: its
+    /// `CANCELLED` beats a first stream on another connection that comes
+    /// after it (wire.md 10.9, "Cancel crossing Allow").
+    fn on_goaway(&mut self, code: ErrorCode) {
+        let now = self.shared.clock.now();
+        lock(&self.shared).direct_goaway(self.conn, code, now);
+    }
+
+    fn on_closed(&mut self, reason: &CloseReason) {
         let shared = self.shared.clone();
-        let mut inner = lock(&shared);
+        let mut guard = lock(&shared);
+        let inner = &mut *guard;
         inner.gates.remove(&self.conn);
         inner.conns.remove(&self.conn);
         inner.slots.remove(&self.conn);
         inner.kinds.remove(&self.conn);
+        inner.holds.remove(&self.conn);
+        inner.listened.remove(&self.conn);
         inner.grants.unbind(self.conn);
         let actions = inner.pairing.on_connection_closed(self.conn);
         inner.apply(actions);
+        if inner.direct_conns.remove(&self.conn) {
+            // The joiner's own `GOAWAY` code: only `CANCELLED` from it ends
+            // its request, or a provisional grant made on this connection.
+            let peer_code = match reason {
+                CloseReason::Peer(code) => Some(*code),
+                _ => None,
+            };
+            let now = self.shared.clock.now();
+            let actions =
+                inner
+                    .direct
+                    .on_connection_closed(self.conn, peer_code, &mut inner.grants, now);
+            inner.apply_direct(actions, true);
+        }
     }
 }
 

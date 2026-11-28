@@ -64,10 +64,10 @@ RUSTFLAGS='--cfg mousse_control="break-authz"' cargo test -p mousse-net-core
 | `relay-successor-unchecked` | `SUCCESSOR` does not check the current key's proof. | `relay_admission`, `relay_admission_scenarios_hold` (`successor_without_current_key`) |
 | `relay-no-preaccept-budget` | Join circuits have no byte budget and no per-target cap. | `relay_admission`, `relay_admission_scenarios_hold` (`preaccept_over_budget`) |
 | `no-pin-relay` | The relay pin check passes any relay key. | `relay_admission`, `the_certificate_carries_the_identity_and_only_its_pin_passes` |
-| `direct-skip-allow` | Pair with IP enrolls as soon as the code passes, with no Allow. | `direct_host_sequences_hold` and the direct host tests |
-| `direct-enroll-without-connection` | Allow while the device is away makes the grant at once, with no connection of that device. | `direct_host_sequences_hold` (`allow_while_away_then_recovery`) |
-| `direct-allow-beats-cancel` | A joiner's cancel crossing an Allow leaves the provisional grant. | `direct_host_sequences_hold` (`cancel_crossing_allow_goaway_lost`), `a_cancelled_close_removes_only_a_provisional_grant` |
-| `direct-attempt-not-debited` | A Pair with IP attempt is not debited. | `direct_host_sequences_hold` |
+| `direct-skip-allow` | Pair with IP enrolls as soon as the code passes, with no Allow. | `direct_host_sequences_hold`, the direct host tests and `mousse-net-io` `direct_host` |
+| `direct-enroll-without-connection` | Allow while the device is away makes the grant at once, with no connection of that device. | `direct_host_sequences_hold` (`allow_while_away_then_recovery`), `allow_while_away_enrolls_on_the_recovery_connection` |
+| `direct-allow-beats-cancel` | A joiner's cancel crossing an Allow leaves the provisional grant. | `direct_host_sequences_hold` (`cancel_crossing_allow_goaway_lost`), `a_cancelled_close_removes_only_a_provisional_grant`, `a_cancel_crossing_allow_removes_the_provisional_grant` |
+| `direct-attempt-not-debited` | A Pair with IP attempt is not debited. | `direct_host_sequences_hold`, `the_code_then_allow_pairs_and_the_first_stream_commits` |
 | `direct-ledger-by-key` | The joiner does not read its stored count, as a ledger keyed by the far end's key would not for a far end that changes keys. | `direct_joiner_sequences_hold` (`far_end_changes_keys`) |
 | `direct-pin-before-paired` | The joiner pins the host as soon as its confirmation verifies, before `PAIRED`. | `direct_joiner_sequences_hold` |
 

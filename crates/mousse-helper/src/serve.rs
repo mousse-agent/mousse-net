@@ -948,6 +948,8 @@ fn on_event(state: &State, event: HostEvent) {
             role.as_str()
         )),
         HostEvent::StoreFailed(e) => print_line(format!("saving grants failed: {e}")),
+        // This command makes no Pair with IP invitations.
+        HostEvent::Direct(_) => {}
     }
 }
 

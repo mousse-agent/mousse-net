@@ -28,10 +28,14 @@ pub enum ListenerKind {
     Ws,
     /// The local IPC pipe an SSH login reaches.
     Pipe,
+    /// A circuit spliced by a relay ([`crate::Host::accept_relay`]). It has
+    /// no pool here: the relay admits it before it reaches this host, so a
+    /// place of this kind is never given.
+    Relay,
 }
 
 impl ListenerKind {
-    /// Every kind, in the order [`PreAuthStats`] lists them.
+    /// Every kind with a pool, in the order [`PreAuthStats`] lists them.
     pub const ALL: [ListenerKind; 3] = [Self::Tcp, Self::Ws, Self::Pipe];
 
     /// The name used in `stats` and logs.
@@ -40,23 +44,26 @@ impl ListenerKind {
             Self::Tcp => "tcp",
             Self::Ws => "ws",
             Self::Pipe => "pipe",
+            Self::Relay => "relay",
         }
     }
 
-    /// The limit that caps this kind's pool.
+    /// The limit that caps this kind's pool (none for relay circuits).
     pub fn limit_name(self) -> &'static str {
         match self {
             Self::Tcp => "PREAUTH_TCP",
             Self::Ws => "PREAUTH_WS",
             Self::Pipe => "PREAUTH_PIPE",
+            Self::Relay => "none",
         }
     }
 
-    fn index(self) -> usize {
+    fn index(self) -> Option<usize> {
         match self {
-            Self::Tcp => 0,
-            Self::Ws => 1,
-            Self::Pipe => 2,
+            Self::Tcp => Some(0),
+            Self::Ws => Some(1),
+            Self::Pipe => Some(2),
+            Self::Relay => None,
         }
     }
 }
@@ -122,12 +129,12 @@ pub struct PreAuthStats {
 impl PreAuthStats {
     /// Places of `kind` held now.
     pub fn open(&self, kind: ListenerKind) -> u64 {
-        self.open[kind.index()]
+        kind.index().map_or(0, |i| self.open[i])
     }
 
     /// Connections of `kind` refused since start.
     pub fn refused(&self, kind: ListenerKind) -> u64 {
-        self.refused[kind.index()]
+        kind.index().map_or(0, |i| self.refused[i])
     }
 }
 
@@ -192,14 +199,25 @@ impl PreAuth {
     }
 
     /// A place of `kind`, counted against `source` too when given (TCP).
+    /// Relay circuits have no pool: refused.
     pub fn try_take(
         self: &Arc<Self>,
         kind: ListenerKind,
         source: Option<IpAddr>,
     ) -> Result<PreAuthSlot, PreAuthFull> {
-        let source = source.map(SourceKey::of);
+        self.try_take_key(kind, source.map(SourceKey::of))
+    }
+
+    /// [`PreAuth::try_take`] with the source already reduced to its key.
+    pub(crate) fn try_take_key(
+        self: &Arc<Self>,
+        kind: ListenerKind,
+        source: Option<SourceKey>,
+    ) -> Result<PreAuthSlot, PreAuthFull> {
+        let Some(i) = kind.index() else {
+            return Err(PreAuthFull::Pool(kind));
+        };
         let mut st = self.lock();
-        let i = kind.index();
         let in_pool = if cfg!(mousse_control = "shared-preauth-pool") {
             // Control (tests only): every kind draws on one pool.
             st.open.iter().sum()
@@ -251,12 +269,19 @@ impl PreAuthSlot {
     pub fn kind(&self) -> ListenerKind {
         self.kind
     }
+
+    /// The source this place counts against, if any.
+    pub(crate) fn source(&self) -> Option<SourceKey> {
+        self.source
+    }
 }
 
 impl Drop for PreAuthSlot {
     fn drop(&mut self) {
         let mut st = self.pool.lock();
-        let i = self.kind.index();
+        let Some(i) = self.kind.index() else {
+            return;
+        };
         st.open[i] = st.open[i].saturating_sub(1);
         if let Some(key) = self.source {
             if let Some(n) = st.by_source.get_mut(&key) {

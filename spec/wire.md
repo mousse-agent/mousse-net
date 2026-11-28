@@ -649,9 +649,10 @@ follows the live column with two differences, until the grant commits:
 
 - **First stream frame.** The gate does not let it through on its own: it
   answers "commit first". The I/O layer has the host commit the grant
-  (10.9, "Provisional grant") before it releases that frame or anything
-  after it; when the commit fails, the connection closes with
-  `GRANT_REVOKED`. After the commit every connection bound to that grant,
+  (10.9, "Provisional grant") and store the grant table with it before it
+  releases that frame or anything after it; when the commit fails, the
+  connection closes with `GRANT_REVOKED`, and when it cannot be stored,
+  with `INTERNAL_ERROR`. After the commit every connection bound to that grant,
   not only the one whose frame committed it, is live as any other.
 - **Cancel.** On the connection the host enrolled after a code exchange, a
   `CODE_ABORT` whose attempt id is the attempt that passed on that
@@ -1475,11 +1476,14 @@ then sends `JOIN_DIRECT {1: L, 2: name}`. The name is the computer name, as
 for a sent link (10.3). `JOIN_DIRECT` passes the host's gate as
 `JOIN_PROOF` does (8.1); step 2 runs first as for any connection, and its
 `AUTHORIZED {live}` notice is not the answer. The host answers it only on a
-connection its TCP listener accepted; on any other (WebSocket, pipe, relay
-circuit) it closes with `INVITATION_INVALID`. From a live connection,
-`JOIN_DIRECT` first takes a new pre-authorization place counted against the
-connection's source address; with none free the host closes with
-`INTERNAL_ERROR`. Then, in this order:
+connection its TCP listener accepted, the one that took a
+pre-authorization place for it at accept; on any other (WebSocket, pipe,
+relay circuit, a connection no listener admitted) it closes with
+`INVITATION_INVALID` at once, with no hold. A host that admits no new
+connections for now (paused) closes it with `INTERNAL_ERROR`. From a live
+connection, `JOIN_DIRECT` first takes a new pre-authorization place counted
+against the connection's source address; with none free the host closes
+with `INTERNAL_ERROR`. Then, in this order:
 
 - the joiner's identity is the host's own, or denied here: close with
   `NOT_AUTHORIZED`, whatever the lookup;
@@ -1487,7 +1491,10 @@ connection's source address; with none free the host closes with
   join-only for it and the host answers `AUTHORIZED {1: join_only, 2: I}`;
 - anything else: the host holds the connection, and with it its
   pre-authorization place, for `DIRECT_MISS_HOLD_MS` (1000 ms), then closes
-  it with `INVITATION_INVALID`. The 10 s wait for a `JOIN_PROOF` (section 8,
+  it with `INVITATION_INVALID`. The place stays taken for the full hold
+  even when the joiner closes sooner. Until the hold ends, the connection
+  lets only `PING`, `PONG`, `HELLO` and `GOAWAY` through (8.1), also when it
+  was live. The 10 s wait for a `JOIN_PROOF` (section 8,
   step 2) stops for a held connection: the hold's close, after the full
   hold, is the only one. A device that holds a grant here gets the same
   answer. Every "no open invitation" (another endpoint's code, a typo
@@ -1560,6 +1567,14 @@ the role the owner picks with the answer goes to that enrollment only.
   (it passes the live gate, 8.1), or a `GOAWAY` with `CANCELLED`, on the
   connection the host enrolled, or a cancel by recovery, removes the
   provisional grant and nothing else, and the host closes with `CANCELLED`.
+  The cancel counts where it arrives: once the host has let the
+  `CODE_ABORT` or the `GOAWAY` in, a first stream on another connection
+  after it commits nothing. The host stores the removal before it answers
+  `CANCELLED` or reports it; when it cannot, the grant stays and the host
+  closes with `INTERNAL_ERROR`, so the joiner keeps its record and its next
+  cancel removes the grant. Until that cancel is stored, the grant commits
+  nothing: a first stream on a connection bound to it closes with
+  `INTERNAL_ERROR`, even when the failed write may have reached the disk.
   A committed grant is never cancelled: the `CODE_ABORT` is ignored, the
   `GOAWAY` is an ordinary close, and a recovery's cancel is answered as a
   recovery without one (`PAIRED`).
@@ -1590,7 +1605,8 @@ connections bound to that grant.
 - **It commits** on the first stream frame of any connection bound to it:
   the connection the host enrolled, a recovery connection, or the joiner's
   first ordinary connection after `PAIRED`. The I/O layer reports that
-  frame and has the commit done before it releases the stream (8.1).
+  frame and has the commit done and stored before it releases the stream
+  (8.1), so a restart never finds provisional a grant a stream ran under.
   Committing first checks that the identity is not denied and the grant has
   not expired, then, in one step, replaces the identity's grant, if any
   (its connections close with `GRANT_REVOKED`), and makes the provisional
