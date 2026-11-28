@@ -1,7 +1,8 @@
 // The joiner side of Pair with IP (wire.md 10.9 "Joiner"): the typed address
-// and code, the attempt ledger and the pending record (both stored under the
-// typed lookup L and written by compare and swap), first contact, the ends
-// that settle a pending record, recovery and cancel.
+// and code, the lookup's hold, the attempt ledger (stored under the typed
+// lookup L) and the pending records (under L and the typed address), both
+// written by compare and swap under the hold, first contact, the ends that
+// settle a pending record, recovery and cancel.
 
 import { equalBytes, validPoint } from './certificate.ts';
 import { byteString, decode, encode, fail, fields, hex, record, requireThat, textString, uint } from './cbor.ts';
@@ -20,6 +21,8 @@ import type { Control, ErrorName } from './wire.ts';
 export const directJoinerAttempts = 5;
 /** A ledger record counts for this long after its first debit (fixed). */
 export const ledgerWindowSecs = 86400;
+/** The wait for the answer to JOIN_DIRECT (8.2). */
+export const answerWaitSecs = 10;
 const ledgerDomain = 'mousse-direct-joiner-v1';
 const pendingDomain = 'mousse-direct-pending-v1';
 
@@ -37,10 +40,10 @@ export function parseDirectAddress(text: string): string {
   return `${hostText(route.tcp.host)}:${route.tcp.port}`;
 }
 
-const safeUint = (value: unknown, max = BigInt(Number.MAX_SAFE_INTEGER)) =>
-  typeof value === 'bigint' && uint(value, max);
+// Times in both records are uints up to 2^64 - 1, kept whole as bigint.
+const isUint = (value: unknown, max?: bigint): value is bigint => typeof value === 'bigint' && uint(value, max);
 
-export interface DirectLedger { lookup: string; left: number; firstDebit: number }
+export interface DirectLedger { lookup: string; left: number; firstDebit: bigint }
 
 export const encodeLedger = (ledger: DirectLedger): Buffer =>
   encode(record([1, ledgerDomain], [2, ledger.lookup], [3, ledger.left], [4, ledger.firstDebit]));
@@ -51,9 +54,9 @@ export function decodeLedger(data: Uint8Array, lookup: string): DirectLedger {
   requireThat(fields(value, 1, 2, 3, 4) && value.get(1n) === ledgerDomain, 'invalid_ledger');
   const left = value.get(3n);
   const firstDebit = value.get(4n);
-  requireThat(safeUint(left, BigInt(directJoinerAttempts)) && safeUint(firstDebit), 'invalid_ledger');
+  requireThat(isUint(left, BigInt(directJoinerAttempts)) && isUint(firstDebit), 'invalid_ledger');
   requireThat(value.get(2n) === lookup, 'ledger_lookup');
-  return { lookup, left: Number(left), firstDebit: Number(firstDebit) };
+  return { lookup, left: Number(left), firstDebit };
 }
 
 export interface DirectPending {
@@ -61,7 +64,7 @@ export interface DirectPending {
   host: Uint8Array;
   invitation: Uint8Array;
   address: string;
-  verifiedAt: number;
+  verifiedAt: bigint;
   cancelled: boolean;
 }
 
@@ -79,12 +82,12 @@ export function decodePending(data: Uint8Array, lookup: string): DirectPending {
   const verifiedAt = value.get(6n);
   const cancelled = value.get(7n);
   requireThat(byteString(host, 65) && validPoint(host) && byteString(invitation, 16) &&
-    textString(address, 1, 255) && safeUint(verifiedAt) && safeUint(cancelled, 1n), 'invalid_pending');
+    textString(address, 1, 255) && isUint(verifiedAt) && isUint(cancelled, 1n), 'invalid_pending');
   let canonical: string | undefined;
   try { canonical = parseDirectAddress(address); } catch { /* refused below */ }
   requireThat(canonical === address, 'invalid_pending');
   requireThat(value.get(2n) === lookup, 'pending_lookup');
-  return { lookup, host, invitation, address, verifiedAt: Number(verifiedAt), cancelled: cancelled === 1n };
+  return { lookup, host, invitation, address, verifiedAt, cancelled: cancelled === 1n };
 }
 
 export type DirectRecordKind = 'ledger' | 'pending';
@@ -98,13 +101,25 @@ export interface DirectPairing {
 }
 
 export interface DirectJoinerStore {
-  /** The ledger or pending record stored under lookup `lookup`. */
-  load(kind: DirectRecordKind, lookup: string): Uint8Array | undefined;
   /**
-   * Durably replace the record (`null` deletes it) only if the stored bytes are
-   * still `previous` (`undefined`: no record). Return false when they are not.
+   * Take the lookup's hold: one flow at a time works on a typed lookup. The
+   * operating system releases it if the app dies. False when another flow has it.
    */
-  save(kind: DirectRecordKind, lookup: string, next: Uint8Array | null, previous: Uint8Array | undefined): boolean;
+  acquire(lookup: string): boolean;
+  /** Give the lookup's hold back. */
+  release(lookup: string): void;
+  /**
+   * The ledger stored under `lookup`, or the pending record stored under
+   * `lookup` and the typed address `address`. Read under the hold.
+   */
+  load(kind: DirectRecordKind, lookup: string, address: string): Uint8Array | undefined;
+  /**
+   * Durably replace the record (`null` deletes it) only if the caller holds the
+   * lookup's hold and the stored bytes are still `previous` (`undefined`: no
+   * record). Return false otherwise.
+   */
+  save(kind: DirectRecordKind, lookup: string, address: string, next: Uint8Array | null,
+    previous: Uint8Array | undefined): boolean;
   /**
    * Durably store the pin, the typed address as an owner route and a completion
    * record keyed by the invitation id. Return only once durable; throw if not.
@@ -131,6 +146,10 @@ export type DirectJoinerEffect =
   | { close: ErrorName; conn: number }
   | { persist_ledger: { expected: string | null; record: string | null } }
   | { persist_pending: { expected: string | null; record: string | null } }
+  | { write_failed: true }
+  | { hold: string }
+  | { hold_refused: string }
+  | { release: string }
   | { joiner: DirectJoinerEvent }
   // The app's first stream on the paired connection (it commits the host's provisional grant).
   | { stream: number };
@@ -139,8 +158,9 @@ export type DirectJoinerState = 'ready' | 'hello' | 'joining' | 'exchanging' | '
   'awaiting_allow' | 'away' | `ended:${string}`;
 
 export type DirectStart =
-  | { result: 'ok'; flow: DirectJoiner }
-  | { result: 'bad_address' | 'bad_code' | 'attempts_exhausted' | 'no_pending' | 'internal_error' };
+  | { result: 'ok'; flow: DirectJoiner; effects: DirectJoinerEffect[] }
+  | { result: 'bad_address' | 'bad_code' | 'busy' | 'attempts_exhausted' | 'no_pending' | 'internal_error';
+      effects: DirectJoinerEffect[] };
 
 interface Connection {
   id: number;
@@ -151,12 +171,24 @@ interface Connection {
   recovery: boolean;
   // A recovery whose JOIN_DIRECT carried the cancel flag.
   cancelling?: boolean;
+  // The deadline for the answer to JOIN_DIRECT, while it is awaited.
+  answerBy?: number;
   // The attempt this connection ran: its id stays for a cancel after the code passed.
   attempt?: { id: Uint8Array; initiator?: ReturnType<typeof initiate> };
 }
 
 // Host closes that settle a pending record.
 const settling: readonly ErrorName[] = ['pairing_declined', 'cancelled', 'invitation_invalid', 'attempts_exhausted'];
+
+// The records under a lookup's hold, loaded and decoded.
+function loadRecords(store: DirectJoinerStore, lookup: string, address: string) {
+  const ledgerBytes = store.load('ledger', lookup, address);
+  const pendingBytes = store.load('pending', lookup, address);
+  const ledger = ledgerBytes && decodeLedger(ledgerBytes, lookup);
+  const pending = pendingBytes && decodePending(pendingBytes, lookup);
+  if (pending) requireThat(pending.address === address, 'invalid_pending');
+  return { ledgerBytes, pendingBytes, ledger, pending };
+}
 
 /** One Pair with IP flow: one Connect, at most one attempt, then recovery while a pending record exists. */
 export class DirectJoiner {
@@ -171,62 +203,73 @@ export class DirectJoiner {
   private pending?: DirectPending;
   private invitation?: Uint8Array;
   private connection?: Connection;
+  // Whether this flow has the lookup's hold.
+  private holding = true;
   // The connection the flow ended paired on, live, until the app opens its first stream there.
   private paired_?: Connection;
 
   private constructor(context: DirectJoinerContext, lookup: string, address: string, code: DirectCode | undefined,
-    ledgerBytes: Uint8Array | undefined, pendingBytes: Uint8Array | undefined, pending: DirectPending | undefined) {
+    records: ReturnType<typeof loadRecords>) {
     this.context = context;
     this.lookup = lookup;
     this.address = address;
     this.code = code;
-    this.ledgerBytes = ledgerBytes;
-    this.pendingBytes = pendingBytes;
-    this.pending = pending;
+    this.ledgerBytes = records.ledgerBytes;
+    this.pendingBytes = records.pendingBytes;
+    this.pending = records.pending;
+  }
+
+  // Take the lookup's hold and load the records under it; `undefined` when another flow has it.
+  private static hold(context: DirectJoinerContext, lookup: string, address: string, effects: DirectJoinerEffect[]) {
+    if (!context.store.acquire(lookup)) {
+      effects.push({ hold_refused: lookup });
+      return undefined;
+    }
+    effects.push({ hold: lookup });
+    try { return loadRecords(context.store, lookup, address); } catch {
+      context.store.release(lookup);
+      effects.push({ joiner: { ended: 'failed:internal_error' } }, { release: lookup });
+      return null;
+    }
   }
 
   /** What the person typed. Nothing is dialled and no attempt is spent unless the result is `ok`. */
   static start(context: DirectJoinerContext, typed: { address: string; code: string }, now: number): DirectStart {
     let address: string;
     let code: DirectCode;
-    try { address = parseDirectAddress(typed.address); } catch { return { result: 'bad_address' }; }
-    try { code = parseDirectCode(typed.code); } catch { return { result: 'bad_code' }; }
-    const { store } = context;
-    const ledgerBytes = store.load('ledger', code.lookup);
-    const pendingBytes = store.load('pending', code.lookup);
-    let ledger: DirectLedger | undefined;
-    let pending: DirectPending | undefined;
-    try {
-      ledger = ledgerBytes && decodeLedger(ledgerBytes, code.lookup);
-      pending = pendingBytes && decodePending(pendingBytes, code.lookup);
-    } catch { return { result: 'internal_error' }; }
+    try { address = parseDirectAddress(typed.address); } catch { return { result: 'bad_address', effects: [] }; }
+    try { code = parseDirectCode(typed.code); } catch { return { result: 'bad_code', effects: [] }; }
+    const effects: DirectJoinerEffect[] = [];
+    const records = DirectJoiner.hold(context, code.lookup, address, effects);
+    if (records === undefined) return { result: 'busy', effects: [...effects, { joiner: { ended: 'busy' } }] };
+    if (records === null) return { result: 'internal_error', effects };
     // The same typed address and lookup as a stored pending record: its recovery.
-    if (pending && pending.address === address) {
-      return { result: 'ok', flow: new DirectJoiner(context, code.lookup, address, undefined, ledgerBytes, pendingBytes,
-        pending) };
+    if (records.pending) {
+      return { result: 'ok', flow: new DirectJoiner(context, code.lookup, address, undefined, records), effects };
     }
-    if (DirectJoiner.left(ledger, now) === 0) return { result: 'attempts_exhausted' };
-    return { result: 'ok', flow: new DirectJoiner(context, code.lookup, address, code, ledgerBytes, pendingBytes,
-      undefined) };
+    if (DirectJoiner.left(records.ledger, now) === 0) {
+      context.store.release(code.lookup);
+      return { result: 'attempts_exhausted',
+        effects: [...effects, { joiner: { ended: 'attempts_exhausted' } }, { release: code.lookup }] };
+    }
+    return { result: 'ok', flow: new DirectJoiner(context, code.lookup, address, code, records), effects };
   }
 
-  /** A new flow from the pending record stored under `lookup` (no code). */
-  static resume(context: DirectJoinerContext, lookup: string): DirectStart {
-    const { store } = context;
-    const pendingBytes = store.load('pending', lookup);
-    if (!pendingBytes) return { result: 'no_pending' };
-    const ledgerBytes = store.load('ledger', lookup);
-    let pending: DirectPending;
-    try {
-      pending = decodePending(pendingBytes, lookup);
-      if (ledgerBytes) decodeLedger(ledgerBytes, lookup);
-    } catch { return { result: 'internal_error' }; }
-    return { result: 'ok', flow: new DirectJoiner(context, lookup, pending.address, undefined, ledgerBytes, pendingBytes,
-      pending) };
+  /** A new flow from the pending record stored under `lookup` at `address` (no code). */
+  static resume(context: DirectJoinerContext, lookup: string, address: string): DirectStart {
+    const effects: DirectJoinerEffect[] = [];
+    const records = DirectJoiner.hold(context, lookup, address, effects);
+    if (records === undefined) return { result: 'busy', effects: [...effects, { joiner: { ended: 'busy' } }] };
+    if (records === null) return { result: 'internal_error', effects };
+    if (!records.pending) {
+      context.store.release(lookup);
+      return { result: 'no_pending', effects: [...effects, { release: lookup }] };
+    }
+    return { result: 'ok', flow: new DirectJoiner(context, lookup, address, undefined, records), effects };
   }
 
   private static left(ledger: DirectLedger | undefined, now: number) {
-    return ledger && now < ledger.firstDebit + ledgerWindowSecs ? ledger.left : directJoinerAttempts;
+    return ledger && BigInt(now) < ledger.firstDebit + BigInt(ledgerWindowSecs) ? ledger.left : directJoinerAttempts;
   }
 
   private ledger() { return this.ledgerBytes && decodeLedger(this.ledgerBytes, this.lookup); }
@@ -236,11 +279,20 @@ export class DirectJoiner {
 
   private get ended() { return this.state.startsWith('ended:'); }
 
+  /** Whether this flow has the lookup's hold. */
+  get held() { return this.holding; }
+
   private write(kind: DirectRecordKind, next: Uint8Array | null, effects: DirectJoinerEffect[]): boolean {
     const previous = kind === 'ledger' ? this.ledgerBytes : this.pendingBytes;
     let saved = false;
-    try { saved = this.context.store.save(kind, this.lookup, next, previous); } catch { saved = false; }
-    if (!saved) return false;
+    // Every write needs the hold.
+    if (this.holding) {
+      try { saved = this.context.store.save(kind, this.lookup, this.address, next, previous); } catch { saved = false; }
+    }
+    if (!saved) {
+      effects.push({ write_failed: true });
+      return false;
+    }
     const stored = next === null ? undefined : Uint8Array.from(next);
     if (kind === 'ledger') this.ledgerBytes = stored;
     else this.pendingBytes = stored;
@@ -249,9 +301,36 @@ export class DirectJoiner {
     return true;
   }
 
+  // The hold goes back after the flow's last write, when it ends or goes away.
+  private release(): DirectJoinerEffect[] {
+    if (!this.holding) return [];
+    this.holding = false;
+    this.context.store.release(this.lookup);
+    return [{ release: this.lookup }];
+  }
+
+  // Going on from away: take the hold again and reload the records. A refused hold leaves the flow away;
+  // a recovery whose own record is gone ends as settled.
+  private retake(): DirectJoinerEffect[] | undefined {
+    if (this.holding) return undefined;
+    const effects: DirectJoinerEffect[] = [];
+    const records = DirectJoiner.hold(this.context, this.lookup, this.address, effects);
+    if (records === undefined) return [...effects, { joiner: 'away' }];
+    if (records === null) {
+      this.state = 'ended:failed:internal_error';
+      return effects;
+    }
+    this.holding = true;
+    this.ledgerBytes = records.ledgerBytes;
+    this.pendingBytes = records.pendingBytes;
+    this.pending = records.pending;
+    if (!this.pending) return [...effects, ...this.end('settled')];
+    return effects.length ? effects : undefined;
+  }
+
   private end(outcome: string): DirectJoinerEffect[] {
     this.state = `ended:${outcome}`;
-    return [{ joiner: { ended: outcome } }];
+    return [{ joiner: { ended: outcome } }, ...this.release()];
   }
 
   // The connection ends here. A kept pending record leaves the flow away, to recover later.
@@ -259,6 +338,7 @@ export class DirectJoiner {
     const connection = this.connection;
     if (connection) {
       connection.open = false;
+      connection.answerBy = undefined;
       connection.attempt?.initiator?.dispose();
       if (connection.attempt) connection.attempt.initiator = undefined;
     }
@@ -267,7 +347,7 @@ export class DirectJoiner {
 
   private away(): DirectJoinerEffect[] {
     this.state = 'away';
-    return [{ joiner: 'away' }];
+    return [{ joiner: 'away' }, ...this.release()];
   }
 
   // The joiner closes the connection; the flow ends, or waits away while a pending record is kept.
@@ -282,26 +362,29 @@ export class DirectJoiner {
     return [...effects, ...(this.pending && keepFlow ? this.away() : this.end(outcome))];
   }
 
-  // A write failed or found the record changed: nothing that waited for it goes out.
+  // A write failed or found the record changed: nothing that waited for it goes out; the joiner closes
+  // with INTERNAL_ERROR (a connection that was to close after the write is still up) and the flow ends.
   private failedWrite(effects: DirectJoinerEffect[] = []) {
-    return [...effects, ...this.fail('internal_error', 'failed:internal_error', false)];
+    return [...effects, ...this.fail('internal_error', 'closed:internal_error', false)];
   }
 
   /** TLS is up and the joiner sees the far end's identity key. */
   connect(id: number, peer: Uint8Array, exporters: { pair: Uint8Array }): DirectJoinerEffect[] {
     requireThat(this.state === 'ready' || this.state === 'away', 'wrong_state');
+    const held = this.retake();
+    if (held && (!this.holding || this.ended)) return held;
+    const effects = held ?? [];
     const recovery = this.pending !== undefined;
     // A recovery is dialled pinned to the record's host key: another key never connects.
-    if (recovery && !equalBytes(peer, this.pending!.host)) return this.away();
+    if (recovery && !equalBytes(peer, this.pending!.host)) return [...effects, ...this.away()];
     if (!recovery && equalBytes(peer, this.context.identity)) {
-      this.state = 'ended:own_device';
-      return [{ conn: id, close: 'pairing_failed' }, { joiner: { ended: 'own_device' } }];
+      return [...effects, { conn: id, close: 'pairing_failed' }, ...this.end('own_device')];
     }
     const gate = recovery ? new Gate('caller') : Gate.pairingOnly();
     this.connection = { id, gate, peer: Uint8Array.from(peer), exporter: Uint8Array.from(exporters.pair), open: true,
       recovery };
     this.state = 'hello';
-    return [{ conn: id, send: directHello }];
+    return [...effects, { conn: id, send: directHello }];
   }
 
   /** A control message from the host on connection `id`. */
@@ -314,18 +397,29 @@ export class DirectJoiner {
     if (verdict === 'ignore') return [];
     if (verdict !== 'allow') return this.fail(verdict.slice(6) as ErrorName);
     switch (msg.type) {
-      case 'HELLO': return this.hello(connection, msg);
+      case 'HELLO': return this.hello(connection, msg, now);
       case 'AUTHORIZED':
         if (msg.state === 'live') return [];
+        connection.answerBy = undefined;
         return connection.recovery ? this.recoveryAnswer(msg, now) : this.answer(connection, msg, now);
       case 'CODE_EXCHANGE': return this.confirm(connection, msg, now);
       case 'CODE_ABORT': return this.hostAbort(connection, msg, now);
-      case 'PAIRED': return this.paired(connection, msg);
+      case 'PAIRED':
+        connection.answerBy = undefined;
+        return this.paired(connection, msg);
       default: return this.fail('protocol_error');
     }
   }
 
-  private hello(connection: Connection, msg: Extract<Control, { type: 'HELLO' }>): DirectJoinerEffect[] {
+  /** The joiner's timer: no answer to JOIN_DIRECT within 10 s closes with NOT_AUTHORIZED (8.2). */
+  timeout(id: number, now: number): DirectJoinerEffect[] {
+    const connection = this.connection;
+    if (!connection || connection.id !== id || !connection.open || this.ended) return [];
+    if (connection.answerBy === undefined || now < connection.answerBy) return [];
+    return this.fail('not_authorized', 'closed:not_authorized');
+  }
+
+  private hello(connection: Connection, msg: Extract<Control, { type: 'HELLO' }>, now: number): DirectJoinerEffect[] {
     const result = connection.gate.receiveHello(msg, directHello);
     if (result === 'ignored') return [];
     // The host needs an update; a recovery keeps its record.
@@ -333,12 +427,15 @@ export class DirectJoiner {
       return this.fail('unsupported_version', 'needs_update');
     }
     const { name } = this.context;
+    // Either form of JOIN_DIRECT arms the wait for its answer.
+    connection.answerBy = now + answerWaitSecs;
     if (!connection.recovery) {
       this.state = 'joining';
       return [{ conn: connection.id, send: { type: 'JOIN_DIRECT', lookup: this.lookup, name } }];
     }
     const pending = this.pending!;
-    connection.gate.sentJoinProof(0);
+    // On a pinned recovery, JOIN_DIRECT counts as the proof (8.2).
+    connection.gate.sentJoinProof(now * 1000);
     connection.cancelling = pending.cancelled;
     this.state = 'recovering';
     return [{ conn: connection.id, send: { type: 'JOIN_DIRECT', lookup: this.lookup, name,
@@ -349,12 +446,13 @@ export class DirectJoiner {
   private answer(connection: Connection, msg: Extract<Control, { type: 'AUTHORIZED' }>, now: number): DirectJoinerEffect[] {
     if (this.state !== 'joining' || !msg.invitation || msg.notReceived) return this.fail('protocol_error');
     this.invitation = Uint8Array.from(msg.invitation);
+    // The ledger as loaded, read again now: when its 24 hours ended after the start, the debit begins a new record.
     const ledger = this.ledger();
-    const counts = ledger !== undefined && now < ledger.firstDebit + ledgerWindowSecs;
+    const counts = ledger !== undefined && BigInt(now) < ledger.firstDebit + BigInt(ledgerWindowSecs);
     const left = counts ? ledger.left : directJoinerAttempts;
     if (left === 0) return this.fail('attempts_exhausted', 'attempts_exhausted');
     const effects: DirectJoinerEffect[] = [];
-    const next = encodeLedger({ lookup: this.lookup, left: left - 1, firstDebit: counts ? ledger.firstDebit : now });
+    const next = encodeLedger({ lookup: this.lookup, left: left - 1, firstDebit: counts ? ledger.firstDebit : BigInt(now) });
     if (!this.write('ledger', next, effects)) return this.failedWrite(effects);
     const { random } = this.context;
     const attempt = random.bytes(16, 'attempt_id');
@@ -382,7 +480,7 @@ export class DirectJoiner {
     attempt.initiator = undefined;
     confirmation.isk.fill(0);
     const pending: DirectPending = { lookup: this.lookup, host: connection.peer, invitation: this.invitation!,
-      address: this.address, verifiedAt: now, cancelled: false };
+      address: this.address, verifiedAt: BigInt(now), cancelled: false };
     const effects: DirectJoinerEffect[] = [];
     if (!this.write('pending', encodePending(pending), effects)) {
       confirmation.message.fill(0);
@@ -436,7 +534,7 @@ export class DirectJoiner {
     if (!pending || !expected) return this.fail('protocol_error');
     const pairing = { host: pending.host, address: pending.address, invitation: pending.invitation, name: msg.name,
       role: msg.role };
-    try { this.context.store.savePairing(pairing); } catch { return this.failedWrite(); }
+    try { this.context.store.savePairing(pairing); } catch { return this.failedWrite([{ write_failed: true }]); }
     const effects: DirectJoinerEffect[] = [{ joiner: { paired: { address: pairing.address, host: hex(pairing.host),
       invitation: hex(pairing.invitation), name: pairing.name, role: pairing.role } } }];
     const { gate } = connection;
@@ -450,7 +548,7 @@ export class DirectJoiner {
     return [...effects, ...this.end('paired')];
   }
 
-  /** Once paired, the app opens its first stream on that connection if it is still up; none before. */
+  /** Once paired, the app may open its first stream on that connection, only when its gate is live. */
   openStream(): DirectJoinerEffect[] {
     const connection = this.paired_;
     if (!connection?.open || !connection.gate.canOpenStream('caller')) return [];
@@ -476,7 +574,7 @@ export class DirectJoiner {
     if (!this.pending) return this.end(`closed:${code}`);
     if (!settling.includes(code)) return this.away();
     const effects: DirectJoinerEffect[] = [];
-    if (!this.write('pending', null, effects)) return [...effects, ...this.end('failed:internal_error')];
+    if (!this.write('pending', null, effects)) return [...effects, ...this.end('closed:internal_error')];
     this.pending = undefined;
     return [...effects, ...this.end(`closed:${code}`)];
   }
@@ -494,8 +592,11 @@ export class DirectJoiner {
   /** The person cancels. */
   cancel(): DirectJoinerEffect[] {
     if (this.ended) return [];
+    // From away, the cancel takes the hold again and reloads; refused, the flow stays away.
+    const held = this.retake();
+    if (held && (!this.holding || this.ended)) return held;
     const connection = this.connection?.open ? this.connection : undefined;
-    const effects: DirectJoinerEffect[] = [];
+    const effects: DirectJoinerEffect[] = held ?? [];
     const abort = (attempt: Uint8Array) => effects.push({ conn: connection!.id,
       send: { type: 'CODE_ABORT', attempt, code: errorNumber('cancelled') } });
     if (!this.pending) {
@@ -521,5 +622,10 @@ export class DirectJoiner {
     }
     this.closed();
     return [...effects, ...this.away()];
+  }
+
+  /** The app stopped: the operating system releases the hold. */
+  crashed() {
+    this.holding = false;
   }
 }

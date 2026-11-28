@@ -2,9 +2,9 @@ import assert from 'node:assert/strict';
 import { bytes, decode, hex } from './cbor.ts';
 import { equalBytes, publicKey, sha256 } from './certificate.ts';
 import { initiate } from './cpace.ts';
-import { directCode, directCodeFromDraw, directCpaceInputs, displayDirectCode } from './direct-code.ts';
+import { directCode, directCodeFromDraw, directCpaceInputs, displayDirectCode, parseDirectCode } from './direct-code.ts';
 import { DirectHost, directHello } from './direct-host.ts';
-import { DirectJoiner } from './direct-joiner.ts';
+import { DirectJoiner, encodeLedger } from './direct-joiner.ts';
 import { PairingHost, PairingJoiner } from './pairing.ts';
 import { decodeControl, decodeFrame, decodeTicket, directMinor, encodeControl, encodeFragment, encodeFrame, errorNumber,
   hello, joinProof, readError } from './wire.ts';
@@ -815,23 +815,50 @@ export function replayBeforeMsgA(section, conventions) {
 export function directJoinerStore() {
   const records = new Map();
   const pins = new Set();
+  // The lookups this device's flows hold, and those another flow holds (`held_elsewhere`).
+  const holds = new Set();
+  const elsewhere = new Set();
+  const key = (kind, lookup, address) => kind === 'ledger' ? `ledger:${lookup}` : `pending:${lookup}:${address}`;
   return {
-    load(kind, lookup) { return records.get(`${kind}:${lookup}`); },
-    save(kind, lookup, next, previous) {
-      const key = `${kind}:${lookup}`;
-      const current = records.get(key);
+    failNext: false,
+    acquire(lookup) {
+      if (holds.has(lookup) || elsewhere.has(lookup)) return false;
+      holds.add(lookup);
+      return true;
+    },
+    release(lookup) { holds.delete(lookup); },
+    load(kind, lookup, address) { return records.get(key(kind, lookup, address)); },
+    save(kind, lookup, address, next, previous) {
+      // Every write needs the hold.
+      if (!holds.has(lookup)) return false;
+      if (this.failNext) {
+        this.failNext = false;
+        return false;
+      }
+      const at = key(kind, lookup, address);
+      const current = records.get(at);
       if (current === undefined ? previous !== undefined : !previous || !equalBytes(current, previous)) return false;
-      if (next === null) records.delete(key);
-      else records.set(key, Uint8Array.from(next));
+      if (next === null) records.delete(at);
+      else records.set(at, Uint8Array.from(next));
       return true;
     },
     savePairing(pairing) { pins.add(hex(pairing.host)); },
+    // Every pending record stored under `lookup`: address and state, by address.
+    pendings(lookup) {
+      const prefix = `pending:${lookup}:`;
+      return [...records].filter(([at]) => at.startsWith(prefix))
+        .map(([at, data]) => [at.slice(prefix.length), decode(data).get(7n) === 1n ? 'cancelled' : 'pending'])
+        .sort(([x], [y]) => (x < y ? -1 : x > y ? 1 : 0));
+    },
     pins,
+    holds,
+    elsewhere,
+    records,
   };
 }
 
 export function replayDirectJoinerSequence(sequence, conventions) {
-  const now = conventions.time;
+  let now = conventions.time;
   const draws = new Map(Object.entries(sequence.draws).map(([label, list]) => [label, new ScriptedDraws(list)]));
   const drawsOf = label => {
     if (!draws.has(label)) draws.set(label, new ScriptedDraws([]));
@@ -846,7 +873,7 @@ export function replayDirectJoinerSequence(sequence, conventions) {
       assert.ok(index >= 0, `unknown host ${label}`);
       const identity = publicKey(Buffer.alloc(32, label === 'host' ? 0x11 : 0x30 + index));
       const host = new DirectHost({ identity, name: 'Desk' }, policy, drawsOf(label));
-      const created = host.invite(now);
+      const created = host.invite(conventions.time);
       hosts.set(label, { label, host, identity, invitation: created.invitation, code: directCode(created.code) });
     }
     return hosts.get(label);
@@ -866,11 +893,16 @@ export function replayDirectJoinerSequence(sequence, conventions) {
   const conns = new Map();
   let flow;
   let lookup;
+  let address;
   let lastConn;
   let transit = [];
 
   for (const [index, step] of sequence.steps.entries()) {
     const name = `step ${index + 1} ${step.op}`;
+    if (step.at !== undefined) {
+      assert.ok(conventions.time + step.at >= now, `${name}: time goes back`);
+      now = conventions.time + step.at;
+    }
     const out = [];
     const queue = [];
     let crashed = false;
@@ -896,6 +928,9 @@ export function replayDirectJoinerSequence(sequence, conventions) {
           out.push({ close: { code: 'invitation_invalid', conn, from: party.label } });
           party.host.lost(conn, now);
           queue.push({ conn, close: 'invitation_invalid' });
+        } else if ('gate' in effect || 'stream' in effect) {
+          // The host gate's verdict on a message it dropped, or on the first stream frame.
+          out.push(effect);
         } else if ('committed' in effect) {
           const { conn, grant } = effect.committed;
           out.push({ committed: { conn, grant } });
@@ -909,7 +944,7 @@ export function replayDirectJoinerSequence(sequence, conventions) {
       fromHost(party, party.host.drop(conn, now));
     }
 
-    // The joiner's effects in order; each message reaches its host at once.
+    // The joiner's effects in order; each message reaches its host (and its gate) at once.
     function fromJoiner(effects) {
       for (const effect of effects) {
         if (crashed) return;
@@ -927,11 +962,16 @@ export function replayDirectJoinerSequence(sequence, conventions) {
             continue;
           }
           out.push({ send: { conn: effect.conn, control: control(effect.send), from: 'joiner' } });
+          // A silent host never answers JOIN_DIRECT.
+          if (entry.silent && message.type === 'JOIN_DIRECT') continue;
           fromHost(entry.party, entry.party.host.receive(effect.conn, message, now));
           if (msgC && entry.crash === 'after_msg_c') {
             out.push({ crash: true });
             breakConnection(effect.conn);
             crashed = true;
+            // The app stops: the operating system releases its hold.
+            flow.crashed();
+            store.release(flow.lookup);
             flow = undefined;
           }
         } else if ('close' in effect) {
@@ -939,13 +979,12 @@ export function replayDirectJoinerSequence(sequence, conventions) {
           const party = conns.get(effect.conn)?.party;
           if (party) fromHost(party, party.host.lost(effect.conn, now, effect.close));
         } else if ('stream' in effect) {
-          // The app's first stream frame reaches the host's gate.
-          out.push(effect);
+          // The app's first stream frame meets the host's gate, which answers commit while the grant is provisional.
           const { party } = conns.get(effect.stream);
           fromHost(party, party.host.stream(effect.stream, now));
         } else {
           out.push(effect);
-          // Paired with the connection still up: the app opens its first stream on it.
+          // Paired with its connection up: the app opens its first stream there once its gate is live.
           if (effect.joiner?.ended === 'paired') fromJoiner(flow.openStream());
         }
       }
@@ -978,44 +1017,59 @@ export function replayDirectJoinerSequence(sequence, conventions) {
       return false;
     };
 
+    const begin = started => {
+      result = started.result;
+      if (started.flow) {
+        flow = started.flow;
+        lookup = flow.lookup;
+        address = flow.address;
+      }
+      run(started.effects);
+    };
+
+    // `held_elsewhere`: another flow on the device holds the lookup during this step.
+    const otherLookup = step.held_elsewhere
+      ? (step.op === 'start' ? parseDirectCode(typedCode[step.code]).lookup : flow.lookup) : undefined;
+    if (otherLookup !== undefined) store.elsewhere.add(otherLookup);
+
     switch (step.op) {
       case 'start': {
         assert.ok(step.code in typedCode, `unknown code ${step.code}`);
-        const started = DirectJoiner.start(context, { address: conventions.address, code: typedCode[step.code] }, now);
-        result = started.result;
-        if (started.flow) {
-          flow = started.flow;
-          lookup = flow.lookup;
-        }
+        begin(DirectJoiner.start(context, { address: step.address ?? conventions.address, code: typedCode[step.code] },
+          now));
         break;
       }
-      case 'resume': {
-        const started = DirectJoiner.resume(context, right.lookup);
-        result = started.result;
-        if (started.flow) {
-          flow = started.flow;
-          lookup = flow.lookup;
-        }
+      case 'resume':
+        begin(DirectJoiner.resume(context, right.lookup, step.address ?? conventions.address));
         break;
-      }
       case 'connect': {
         assert.ok(!conns.has(step.conn), `connection ${step.conn} reused`);
         assert.ok(step.lose === undefined || step.lose === 'msg_c');
         assert.ok(step.crash === undefined || step.crash === 'after_msg_c');
         const party = step.host === 'own' ? undefined : hostOf(step.host);
-        conns.set(step.conn, { party, lose: step.lose, crash: step.crash, exchanges: 0 });
+        conns.set(step.conn, { party, lose: step.lose, crash: step.crash, silent: step.silent, exchanges: 0 });
         lastConn = step.conn;
         const exporters = { pair: Buffer.alloc(32, step.conn + 100) };
         const effects = flow.connect(step.conn, party ? party.identity : joinerIdentity, exporters);
-        if (party && effects.every(effect => !('close' in effect))) {
-          // Step 2, then the host's HELLO, which agrees on min(minor, 4).
-          fromHost(party, party.host.connect(step.conn, joinerIdentity, exporters, now), (conn, message) => {
-            if (message.type !== 'HELLO' || step.minor === undefined) return false;
-            queue.push({ conn, message: { ...message, minor: Math.min(step.minor, directMinor) } });
-            return true;
-          });
+        // From away the flow first takes the hold and reloads; then TLS, the host's step 2 and HELLOs.
+        const hello = effects.findIndex(effect => 'send' in effect);
+        run(hello < 0 ? effects : effects.slice(0, hello));
+        if (hello >= 0) {
+          if (party) {
+            // Step 2 with the host's gate, then the host's HELLO, which agrees on min(minor, 4).
+            fromHost(party, party.host.connect(step.conn, joinerIdentity, exporters, now), (conn, message) => {
+              if (message.type !== 'HELLO' || step.minor === undefined) return false;
+              queue.push({ conn, message: { ...message, minor: Math.min(step.minor, directMinor) } });
+              return true;
+            });
+          }
+          run(effects.slice(hello));
         }
-        run(effects);
+        if (step.silent && flow) {
+          // No answer: the joiner's 10 s timer runs.
+          out.push({ answer_timeout: step.conn });
+          run(flow.timeout(step.conn, now + 10));
+        }
         break;
       }
       case 'allow':
@@ -1037,16 +1091,25 @@ export function replayDirectJoinerSequence(sequence, conventions) {
         transit = [];
         run([]);
         break;
+      case 'stored_ledger':
+        // A ledger stored before the sequence, under the code's lookup.
+        store.records.set(`ledger:${right.lookup}`, encodeLedger({ lookup: right.lookup, left: step.attempts_left,
+          firstDebit: BigInt(conventions.time - step.first_debit_ago) }));
+        break;
+      case 'fail_next_write':
+        store.failNext = true;
+        break;
       default:
         assert.fail(`unknown operation ${step.op}`);
     }
+    if (otherLookup !== undefined) store.elsewhere.delete(otherLookup);
     assert.deepEqual(out, step.out, `${name} out`);
-    const stored = kind => {
-      const data = lookup === undefined ? undefined : store.load(kind, lookup);
+    const stored = (kind, at) => {
+      const data = lookup === undefined ? undefined : store.load(kind, lookup, at);
       return data === undefined ? null : decode(data);
     };
     const ledger = stored('ledger');
-    const pending = stored('pending');
+    const pending = stored('pending', address);
     // A grant this direct invitation made for the joiner: committed, provisional, or none.
     const made = grant => grant?.direct && grant.enrolled_by === hex(real.invitation);
     const granted = made(real.host.grants.get(hex(joinerIdentity))) ? 'committed'
@@ -1055,6 +1118,8 @@ export function replayDirectJoinerSequence(sequence, conventions) {
       state: flow?.state,
       ledger: ledger === null ? null : Number(ledger.get(3n)),
       pending: pending === null ? null : pending.get(7n) === 1n ? 'cancelled' : 'pending',
+      pendings: lookup === undefined ? [] : store.pendings(lookup),
+      held: lookup !== undefined && store.holds.has(lookup),
       pinned: store.pins.size > 0,
       granted,
       result,

@@ -9,8 +9,10 @@ runs the host side of Pair with IP (`direct-host.ts`: invitations, lookup,
 attempts, approval requests, provisional grants that commit on the first
 stream frame, the host gate's "commit first" and cancel exception of
 wire.md 8.1, and recovery), runs the joiner side
-(`direct-joiner.ts`: the typed address and code, the attempt ledger and
-the pending record with their compare-and-swap writes, first contact,
+(`direct-joiner.ts`: the typed address and code, the lookup's hold, the
+attempt ledger per typed lookup and the pending records per typed lookup
+and address, with their compare-and-swap writes under the hold and their
+times kept whole up to 2^64 - 1, first contact, the 10 s answer wait,
 recovery and cancel, and the first stream once paired, which commits the
 host's provisional grant), and runs the caller's
 pairing-only gate (wire.md 8.2). A TLS transport supplies the peer identity and the two TLS
@@ -49,10 +51,12 @@ The tests print case counts by vector file and end with `PASS second-impl` or
 twelve attempt sequences and the fifty-three Pair with IP host sequences
 of `direct-host.json` (with its `before_msg_a` section) with the supplied
 random draws, and compare the resulting messages and host events byte for
-byte. The fourteen Pair with IP end-to-end sequences of `direct-joiner.json`
-run the joiner against that host (or a fake host) from their draws and
-compare every message, close and record write in order, then the joiner's
-state, ledger, pending record and pin and the host's grant. The two kind-3 CPace runs (`pairing_runs`) are rebuilt from their
+byte. The nineteen Pair with IP end-to-end sequences of `direct-joiner.json`
+run the joiner against that host (or a fake host) from their draws, every
+message through the receiving side's gate, and compare every message, close,
+record write and hold in order, then the joiner's state, ledger, pending
+records, hold and pin and the host's grant; its two `records` decode and
+encode back byte for byte. The two kind-3 CPace runs (`pairing_runs`) are rebuilt from their
 inputs, from `D`, `CI` and `sid` to `ISK` and both confirmations. The relay tests rebuild every relay
 derivation and the relay certificate, decode and re-encode every relay message,
 and replay the twenty-five self-mode relay scenarios with their draws,
