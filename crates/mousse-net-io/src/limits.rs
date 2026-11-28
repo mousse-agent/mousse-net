@@ -52,6 +52,10 @@ mousse_net_core::define_limits! {
         streams_per_endpoint = "STREAMS_PER_ENDPOINT": 128, [1, 1_024];
         /// Engine streams (labels starting `mousse-`) per connection, counted apart from the two caps above so they never take the app's places (tighten only).
         engine_streams_per_connection = "OWN_STREAMS_PER_CONNECTION": 4, [1, 4];
+        /// Bot streams (labels `mousse.botsub`, `mousse.botrpc`, `mousse.botview`) per connection, counted apart from the app's caps so thread streams never take their places, and never taking the app's; a peer's open beyond it is refused with REFUSED_STREAM. At most STREAMS_PER_CONNECTION's default, so a connection queues at most twice its app streams' initial credit.
+        bot_streams_per_connection = "BOT_STREAMS_PER_CONNECTION": 16, [1, 32];
+        /// Bot streams all connections of one endpoint may have open together, apart from STREAMS_PER_ENDPOINT; a peer's open beyond it is refused with REFUSED_STREAM. At most STREAMS_PER_ENDPOINT's default.
+        bot_streams_per_endpoint = "BOT_STREAMS_PER_ENDPOINT": 64, [1, 128];
         /// Caller: candidate addresses for one host dialled at once (Phase 1a §6).
         dial_parallel = "DIAL_PARALLEL": 4, [1, 64];
         /// Caller: how long one candidate address may take to connect and pass step 1 before the next is tried (Phase 1a §6).
@@ -288,6 +292,46 @@ mod tests {
             ])
             .unwrap();
         assert_eq!(l.io().outcome_retry_first_ms(), 5_000);
+    }
+
+    #[test]
+    fn bot_stream_caps_stay_within_the_app_caps_defaults() {
+        let d = IoLimits::DEFAULT;
+        assert_eq!(d.bot_streams_per_connection(), 16);
+        assert_eq!(d.bot_streams_per_endpoint(), 64);
+        let l = Limits::DEFAULT
+            .with_overrides(&[
+                ("BOT_STREAMS_PER_CONNECTION", 32),
+                ("BOT_STREAMS_PER_ENDPOINT", 1),
+            ])
+            .unwrap();
+        assert_eq!(l.io().bot_streams_per_connection(), 32);
+        assert_eq!(l.io().bot_streams_per_endpoint(), 1);
+        // Bounded: bot places can at most double what the app's default
+        // caps let a peer queue unread, and never switch the room off.
+        for (name, bad) in [
+            ("BOT_STREAMS_PER_CONNECTION", 33),
+            ("BOT_STREAMS_PER_CONNECTION", 0),
+            ("BOT_STREAMS_PER_ENDPOINT", 129),
+            ("BOT_STREAMS_PER_ENDPOINT", 0),
+        ] {
+            assert!(
+                matches!(
+                    Limits::DEFAULT.with_overrides(&[(name, bad)]),
+                    Err(LimitError::OutOfRange { .. })
+                ),
+                "{name}={bad}"
+            );
+        }
+        let spec = |name: &str| IoLimits::SPECS.iter().find(|s| s.name == name).unwrap();
+        assert_eq!(
+            spec("BOT_STREAMS_PER_CONNECTION").max,
+            spec("STREAMS_PER_CONNECTION").default
+        );
+        assert_eq!(
+            spec("BOT_STREAMS_PER_ENDPOINT").max,
+            spec("STREAMS_PER_ENDPOINT").default
+        );
     }
 
     #[test]

@@ -279,6 +279,15 @@ import `NetSyncSession` or `link/mux`.
 | `mousse.sub` | interactive | caller, one per subscription | `subscribe {stream, cursor}`, then `head`, `records`, `delta`, `snapshot*`, `end` |
 | `mousse.blob` | bulk | caller, one per fetch | `get {stream, blob}`, then raw bytes, then `FIN` |
 | `mousse.put` | bulk | caller, for staging | `append {stream, event, envelope}` or `blob.put {stream, blob}` followed by the bytes; only into the caller's own `node.artifact` input streams (§4.4) |
+| `mousse.botsub` | interactive | caller, one per bot subscription | as `mousse.sub`, for a bot's feed and chat |
+| `mousse.botrpc` | interactive | caller, one per bot call | as `mousse.rpc`, for bot methods |
+| `mousse.botview` | bulk | caller, one per watched bot browser | a bot's live browser pictures, newest only: the sender skips stale pictures when credit runs short; nothing is stored or retried |
+
+The three bot labels take places of their own in the receiver's stream
+admission (`BOT_STREAMS_PER_CONNECTION`, `BOT_STREAMS_PER_ENDPOINT`), apart
+from the caps of §2.2, so thread traffic never refuses a bot's chat, call or
+browser view. The helper passes them like the others; which methods and
+kinds each may carry is the app's to check.
 
 Each message is `u32 BE length | JSON header | binary parts`.
 

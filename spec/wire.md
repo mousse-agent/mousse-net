@@ -760,7 +760,9 @@ An unknown error code in `RESET` or `GOAWAY` is not a frame error; treat it as
   `OPEN` is answered with `RESET REFUSED_STREAM`; the connection stays up.
 - A side may keep fewer, counting its own streams too (the reference
   implementation keeps 32 per connection and 128 per endpoint, to bound
-  the initial credit it has granted). It answers an `OPEN` past its own
+  the initial credit it has granted, with separate places for engine
+  streams and for its application's bot streams so those never wait
+  behind the rest). It answers an `OPEN` past its own
   limit the same way: `RESET REFUSED_STREAM`, connection up. A sender that
   gets `REFUSED_STREAM` may open the stream again once one of its streams
   on that connection has ended.

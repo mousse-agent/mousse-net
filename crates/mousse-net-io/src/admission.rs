@@ -14,6 +14,13 @@
 //! reader is gone, so bytes still waiting in a finished stream's queue keep
 //! counting.
 //!
+//! Two kinds of stream have places of their own, apart from those caps, so
+//! app streams filling theirs never refuse them ([`Room`]): engine streams
+//! (labels starting `mousse-`, `OWN_STREAMS_PER_CONNECTION`) and bot
+//! streams ([`BOT_LABELS`], `BOT_STREAMS_PER_CONNECTION` and
+//! `BOT_STREAMS_PER_ENDPOINT`). Bot streams can't take the app's places
+//! either: a bot label past its own caps is refused, never moved over.
+//!
 //! Shared by every connection of the endpoint, it also carries each
 //! connection's version decision ([`HelloSeen`]) to whoever watches them.
 
@@ -24,7 +31,48 @@ use mousse_net_core::identity::IdentityPublicKey;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
+use crate::conn::ENGINE_LABEL_PREFIX;
 use crate::limits::Limits;
+
+/// Labels of bot streams: a bot's feed and chat subscriptions
+/// (`mousse.botsub`), its calls (`mousse.botrpc`) and its live browser view
+/// (`mousse.botview`). They take places of their own
+/// (`BOT_STREAMS_PER_CONNECTION`, `BOT_STREAMS_PER_ENDPOINT`), so thread
+/// traffic filling the app's caps never refuses a bot's chat, call or view.
+pub const BOT_LABELS: [&str; 3] = ["mousse.botsub", "mousse.botrpc", "mousse.botview"];
+
+/// Which places a stream takes, from its label.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Room {
+    /// The app's: `STREAMS_PER_CONNECTION` and `STREAMS_PER_ENDPOINT`.
+    App,
+    /// Bot streams' ([`BOT_LABELS`]): `BOT_STREAMS_PER_CONNECTION` and
+    /// `BOT_STREAMS_PER_ENDPOINT`.
+    Bot,
+    /// Engine streams' (labels starting `mousse-`):
+    /// `OWN_STREAMS_PER_CONNECTION`.
+    Engine,
+}
+
+impl Room {
+    /// The room of a stream labelled `label`.
+    pub fn of(label: &str) -> Self {
+        if label.starts_with(ENGINE_LABEL_PREFIX) {
+            Self::Engine
+        } else if BOT_LABELS.contains(&label) {
+            Self::Bot
+        } else {
+            Self::App
+        }
+    }
+}
+
+/// Places taken on all connections of one endpoint.
+#[derive(Debug, Default)]
+struct Places {
+    app: usize,
+    bot: usize,
+}
 
 /// What one connection decided on its peer's first `HELLO`, whatever came
 /// after it (authorization, publication).
@@ -53,7 +101,10 @@ pub struct StreamAdmission {
     per_endpoint: usize,
     /// Engine streams per connection, apart from the two caps.
     engine_per_connection: usize,
-    open: Mutex<usize>,
+    /// Bot streams per connection and per endpoint, apart from the app's.
+    bot_per_connection: usize,
+    bot_per_endpoint: usize,
+    open: Mutex<Places>,
     queued: AtomicU64,
     peak_queued: AtomicU64,
     held: AtomicU64,
@@ -65,15 +116,18 @@ pub struct StreamAdmission {
 
 impl StreamAdmission {
     /// Places from `limits` (`STREAMS_PER_CONNECTION`,
-    /// `STREAMS_PER_ENDPOINT`).
+    /// `STREAMS_PER_ENDPOINT`, `OWN_STREAMS_PER_CONNECTION`,
+    /// `BOT_STREAMS_PER_CONNECTION`, `BOT_STREAMS_PER_ENDPOINT`).
     pub fn new(limits: &Limits) -> Arc<Self> {
         let io = limits.io();
+        let n = |v: u64| usize::try_from(v).unwrap_or(usize::MAX);
         Arc::new(Self {
-            per_connection: usize::try_from(io.streams_per_connection()).unwrap_or(usize::MAX),
-            per_endpoint: usize::try_from(io.streams_per_endpoint()).unwrap_or(usize::MAX),
-            engine_per_connection: usize::try_from(io.engine_streams_per_connection())
-                .unwrap_or(usize::MAX),
-            open: Mutex::new(0),
+            per_connection: n(io.streams_per_connection()),
+            per_endpoint: n(io.streams_per_endpoint()),
+            engine_per_connection: n(io.engine_streams_per_connection()),
+            bot_per_connection: n(io.bot_streams_per_connection()),
+            bot_per_endpoint: n(io.bot_streams_per_endpoint()),
+            open: Mutex::new(Places::default()),
             queued: AtomicU64::new(0),
             peak_queued: AtomicU64::new(0),
             held: AtomicU64::new(0),
@@ -97,9 +151,14 @@ impl StreamAdmission {
         }
     }
 
-    /// Streams open now on all connections.
+    /// App streams open now on all connections (not bot or engine streams).
     pub fn open_streams(&self) -> usize {
-        *self.open.lock().unwrap_or_else(|e| e.into_inner())
+        self.open.lock().unwrap_or_else(|e| e.into_inner()).app
+    }
+
+    /// Bot streams ([`BOT_LABELS`]) open now on all connections.
+    pub fn bot_streams(&self) -> usize {
+        self.open.lock().unwrap_or_else(|e| e.into_inner()).bot
     }
 
     /// Received stream bytes waiting in the engine's receive queues: arrived
@@ -137,6 +196,7 @@ impl StreamAdmission {
             admission: self.clone(),
             open: Arc::new(AtomicUsize::new(0)),
             engine_open: Arc::new(AtomicUsize::new(0)),
+            bot_open: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -174,24 +234,56 @@ pub(crate) struct ConnStreams {
     open: Arc<AtomicUsize>,
     /// Engine streams open on this connection.
     engine_open: Arc<AtomicUsize>,
+    /// Bot streams open on this connection.
+    bot_open: Arc<AtomicUsize>,
 }
 
 impl ConnStreams {
-    /// A place for one more stream, if both caps allow it.
+    /// A place in `room`, if its caps allow it.
+    pub(crate) fn try_admit_in(&self, room: Room) -> Option<Arc<StreamPermit>> {
+        match room {
+            Room::App => self.try_admit(),
+            Room::Bot => self.try_admit_bot(),
+            Room::Engine => self.try_admit_engine(),
+        }
+    }
+
+    /// A place for one more app stream, if both caps allow it.
     pub(crate) fn try_admit(&self) -> Option<Arc<StreamPermit>> {
         let mut open = self
             .admission
             .open
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if *open >= self.admission.per_endpoint
+        if open.app >= self.admission.per_endpoint
             || self.open.load(Ordering::Relaxed) >= self.admission.per_connection
         {
             return None;
         }
-        *open += 1;
+        open.app += 1;
         self.open.fetch_add(1, Ordering::Relaxed);
         Some(self.permit())
+    }
+
+    /// A place for a bot stream ([`BOT_LABELS`]), from the bot caps only.
+    pub(crate) fn try_admit_bot(&self) -> Option<Arc<StreamPermit>> {
+        let mut open = self
+            .admission
+            .open
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if open.bot >= self.admission.bot_per_endpoint
+            || self.bot_open.load(Ordering::Relaxed) >= self.admission.bot_per_connection
+        {
+            return None;
+        }
+        open.bot += 1;
+        self.bot_open.fetch_add(1, Ordering::Relaxed);
+        Some(Arc::new(StreamPermit {
+            admission: self.admission.clone(),
+            conn: self.bot_open.clone(),
+            room: Room::Bot,
+        }))
     }
 
     /// A place for an engine stream (label `mousse-`), counted apart from
@@ -209,7 +301,7 @@ impl ConnStreams {
         Some(Arc::new(StreamPermit {
             admission: self.admission.clone(),
             conn: self.engine_open.clone(),
-            engine: true,
+            room: Room::Engine,
         }))
     }
 
@@ -221,7 +313,7 @@ impl ConnStreams {
             .open
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        *open += 1;
+        open.app += 1;
         self.open.fetch_add(1, Ordering::Relaxed);
         self.permit()
     }
@@ -230,7 +322,7 @@ impl ConnStreams {
         Arc::new(StreamPermit {
             admission: self.admission.clone(),
             conn: self.open.clone(),
-            engine: false,
+            room: Room::App,
         })
     }
 
@@ -249,8 +341,8 @@ impl ConnStreams {
 pub(crate) struct StreamPermit {
     admission: Arc<StreamAdmission>,
     conn: Arc<AtomicUsize>,
-    /// An engine stream's place: not counted in the endpoint's total.
-    engine: bool,
+    /// Which places it holds; an engine stream's has no endpoint total.
+    room: Room,
 }
 
 impl Drop for StreamPermit {
@@ -260,8 +352,10 @@ impl Drop for StreamPermit {
             .open
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if !self.engine {
-            *open = open.saturating_sub(1);
+        match self.room {
+            Room::App => open.app = open.app.saturating_sub(1),
+            Room::Bot => open.bot = open.bot.saturating_sub(1),
+            Room::Engine => {}
         }
         let _ = self
             .conn
@@ -317,6 +411,53 @@ mod tests {
         );
         drop(engine);
         assert!(a.try_admit_engine().is_some());
+    }
+
+    #[test]
+    fn bot_labels_take_their_own_room() {
+        assert_eq!(Room::of("mousse.botview"), Room::Bot);
+        assert_eq!(Room::of("mousse.botsub"), Room::Bot);
+        assert_eq!(Room::of("mousse.botrpc"), Room::Bot);
+        assert_eq!(Room::of("mousse.sub"), Room::App);
+        assert_eq!(Room::of("mousse.botviewer"), Room::App);
+        assert_eq!(Room::of("mousse-grants"), Room::Engine);
+    }
+
+    #[test]
+    fn app_streams_filling_their_room_never_refuse_a_bot_stream() {
+        let admission = StreamAdmission::new(
+            &Limits::DEFAULT
+                .with_overrides(&[
+                    ("STREAMS_PER_CONNECTION", 2),
+                    ("STREAMS_PER_ENDPOINT", 3),
+                    ("BOT_STREAMS_PER_CONNECTION", 2),
+                    ("BOT_STREAMS_PER_ENDPOINT", 3),
+                ])
+                .unwrap(),
+        );
+        let a = admission.connection();
+        let b = admission.connection();
+        // Threads fill both app caps.
+        let _app: Vec<_> = (0..2).map(|_| a.try_admit_in(Room::App).unwrap()).collect();
+        let _b_app = b.try_admit_in(Room::App).unwrap();
+        assert!(a.try_admit_in(Room::App).is_none(), "connection cap");
+        assert!(b.try_admit_in(Room::App).is_none(), "endpoint cap");
+        // Bots still open, up to their own caps.
+        let a1 = a
+            .try_admit_in(Room::Bot)
+            .expect("bot room on a full connection");
+        let _a2 = a.try_admit_in(Room::Bot).unwrap();
+        assert!(a.try_admit_in(Room::Bot).is_none(), "bot connection cap");
+        let _b1 = b.try_admit_in(Room::Bot).unwrap();
+        assert!(b.try_admit_in(Room::Bot).is_none(), "bot endpoint cap");
+        assert_eq!(admission.open_streams(), 3);
+        assert_eq!(admission.bot_streams(), 3);
+        // Bots filling theirs never take the app's places either.
+        assert!(a.try_admit_in(Room::App).is_none());
+        drop(a1);
+        assert_eq!(admission.bot_streams(), 2);
+        assert!(b.try_admit_in(Room::Bot).is_some(), "the place came back");
+        assert!(b.try_admit_in(Room::App).is_none(), "app count unchanged");
     }
 
     #[test]

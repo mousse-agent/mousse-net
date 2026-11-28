@@ -54,7 +54,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 use tokio_rustls::TlsStream;
 
-use crate::admission::{ConnStreams, HelloSeen, StreamAdmission, StreamPermit};
+use crate::admission::{ConnStreams, HelloSeen, Room, StreamAdmission, StreamPermit};
 use crate::clock::Clock;
 use crate::error::NetError;
 use crate::limits::{ms, Limits};
@@ -1333,11 +1333,7 @@ impl Driver {
                     ))
                 } else if !self.role.may_open() {
                     Err(NetError::Refused("the connection is not authorized".into()))
-                } else if let Some(permit) = if label.starts_with(ENGINE_LABEL_PREFIX) {
-                    self.admit.try_admit_engine()
-                } else {
-                    self.admit.try_admit()
-                } {
+                } else if let Some(permit) = self.admit.try_admit_in(Room::of(&label)) {
                     self.mux
                         .open_stream(class, &label)
                         .map(|id| self.new_stream(id, class, label, permit))
@@ -1621,12 +1617,11 @@ impl Driver {
                 class,
                 label,
             } => {
-                // Admission: a stream past either cap is refused before
-                // anything is queued for it (Phase 1a §2.2).
-                let permit = if label.starts_with(ENGINE_LABEL_PREFIX) {
-                    self.admit.try_admit_engine()
-                } else {
-                    self.admit_peer_stream()
+                // Admission: a stream past either cap of its room is
+                // refused before anything is queued for it (Phase 1a §2.2).
+                let permit = match Room::of(&label) {
+                    Room::App => self.admit_peer_stream(),
+                    room => self.admit.try_admit_in(room),
                 };
                 let Some(permit) = permit else {
                     self.admit.refused();

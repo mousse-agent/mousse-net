@@ -111,7 +111,7 @@ const GRANT_ROLES: &str = "grant-roles";
 const GRANT_ADD_CONNECTED: &str = "grant-add-connected";
 
 /// The stream labels an inbound connection passes on to the app (§3.2).
-pub const LABELS: [&str; 6] = [
+pub const LABELS: [&str; 9] = [
     "mousse.hello",
     "mousse.rpc",
     "mousse.sub",
@@ -119,6 +119,14 @@ pub const LABELS: [&str; 6] = [
     "mousse.put",
     // One editor tunnel (Phase 1b §9.2).
     "mousse.tunnel",
+    // Bot streams, with places of their own apart from the app's caps
+    // (`BOT_STREAMS_PER_CONNECTION`): a bot's feed and chat subscriptions,
+    // its calls, and its live browser view (a latest-wins picture stream:
+    // the sender skips stale pictures when credit runs short, nothing is
+    // stored or retried).
+    mousse_net_io::BOT_LABELS[0],
+    mousse_net_io::BOT_LABELS[1],
+    mousse_net_io::BOT_LABELS[2],
 ];
 
 /// What the app learns in the `hello` reply.
@@ -981,6 +989,7 @@ impl Shared {
                     "preauth_refused": per_kind(mousse_net_io::PreAuthStats::refused),
                     "re": id,
                     "open_streams": a.open_streams(),
+                    "bot_streams": a.bot_streams(),
                     "queued_bytes": a.queued_bytes(),
                     "peak_queued_bytes": a.peak_queued_bytes(),
                     "held_bytes": a.held_bytes(),

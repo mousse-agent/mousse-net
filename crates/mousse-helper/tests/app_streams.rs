@@ -71,6 +71,47 @@ fn a_peer_opening_past_the_connection_cap_is_refused() {
     p.b.assert_clean();
 }
 
+/// Thread streams filling a connection's app places never refuse a bot's
+/// feed, chat, call or browser view: bot labels have places of their own,
+/// and past those a bot stream is refused rather than taking an app place.
+#[test]
+fn thread_streams_filling_their_places_never_block_a_bot_stream() {
+    let mut p = pair_up("botroom", &[("BOT_STREAMS_PER_CONNECTION", "3")], &ROOMY);
+    let threads: Vec<u32> = (0..33)
+        .map(|_| p.b.open(p.b_conn, "mousse.sub", "interactive"))
+        .collect();
+    p.a.incoming(p.a_conn, 31);
+    let r = p.b.event("stream.reset", |_| true);
+    assert_eq!(
+        (u(&r["handle"]) as u32, r["code"].as_str().unwrap()),
+        (threads[32], "refused_stream")
+    );
+    for (n, label) in ["mousse.botsub", "mousse.botrpc", "mousse.botview"]
+        .into_iter()
+        .enumerate()
+    {
+        p.b.open(p.b_conn, label, "interactive");
+        let h = p.a.incoming(p.a_conn, 32 + n);
+        let incoming = p.a.event("stream.incoming", |m| m["handle"] == h);
+        assert_eq!(incoming["label"], label);
+    }
+    // A's three bot places are full: a fourth bot stream is refused, and
+    // so is a thread stream, which can't use a bot place either.
+    let bot = p.b.open(p.b_conn, "mousse.botsub", "interactive");
+    let r = p.b.event("stream.reset", |m| m["handle"] == bot);
+    assert_eq!(r["code"], "refused_stream");
+    let thread = p.b.open(p.b_conn, "mousse.sub", "interactive");
+    let r = p.b.event("stream.reset", |m| m["handle"] == thread);
+    assert_eq!(r["code"], "refused_stream");
+    let stats = p.a.stats();
+    assert_eq!(stats["open_streams"], 32, "{stats}");
+    assert_eq!(stats["bot_streams"], 3, "{stats}");
+    assert_eq!(stats["refused_streams"], 3, "{stats}");
+    assert_eq!(p.a.events("stream.incoming").len(), 35);
+    p.a.assert_clean();
+    p.b.assert_clean();
+}
+
 /// With A's app reading nothing, everything waits in A's engine: at most
 /// the initial credit of each admitted stream, and in memory little more,
 /// also when B splits its data into the smallest DATA frames it may send
