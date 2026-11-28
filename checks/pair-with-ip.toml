@@ -12,10 +12,10 @@ plan = "docs/pair-with-ip-design.md"
 
 [[check]]
 id = "pair-with-ip.host-io"
-title = "The host side in mousse-net-io over loopback TLS at minor 4: Allow before any grant, a provisional grant committed and saved on the first stream, every attempt debited, the full miss hold with its place kept, lookups only on the TCP listener (never relay circuits or ws), a granted device's lookup counted against its source, Allow while away enrolled on recovery, a cancel crossing Allow, a provisional grant across a restart"
+title = "The host side in mousse-net-io over loopback TLS at minor 4: Allow before any grant, a provisional grant committed and saved on the first stream, every attempt debited, the full miss hold with its place kept, lookups only on the TCP listener (never relay circuits or ws), a granted device's lookup counted against its source, Allow while away enrolled on recovery, a cancel crossing Allow (stored before it is answered, ahead of a later first stream, still possible after a failed commit), a provisional grant across a restart, an Allow whose enrollment cannot be stored, ticket re-pair and receipts over relay"
 plan = "docs/pair-with-ip-design.md §1.4, §1.6 and §7 (phase 2, host side)"
 targets = ["windows-x64", "macos-arm64", "linux-x64"]
-min_tests = 8
+min_tests = 17
 local = [
   { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-net-io", "--test", "direct_host", "--no-fail-fast"] },
   { target = "macos-arm64", host = "macos-aarch64", command = ["cargo", "test", "-p", "mousse-net-io", "--test", "direct_host", "--no-fail-fast"] },

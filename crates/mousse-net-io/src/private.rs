@@ -57,7 +57,7 @@ pub fn make_private_dir_durably(dir: &Path) -> io::Result<()> {
 
 /// Make the entries of `dir` durable (Unix; nothing to do on Windows).
 pub fn sync_dir(dir: &Path) -> io::Result<()> {
-    #[cfg(test)]
+    #[cfg(debug_assertions)]
     if faults::take_sync(dir) {
         return Err(io::Error::other("injected: the folder sync failed"));
     }
@@ -109,14 +109,14 @@ pub fn is_owner_only(path: &Path) -> io::Result<bool> {
 /// new content at `to`, not known to be durable: callers tell the two
 /// cases apart by whether `from` still exists.
 pub fn replace_durably(from: &Path, to: &Path) -> io::Result<()> {
-    #[cfg(test)]
+    #[cfg(debug_assertions)]
     let fault = faults::take(to);
-    #[cfg(test)]
+    #[cfg(debug_assertions)]
     if fault == Some(faults::Fault::BeforeRename) {
         return Err(io::Error::other("injected: the write failed"));
     }
     imp::replace_durably(from, to)?;
-    #[cfg(test)]
+    #[cfg(debug_assertions)]
     if fault == Some(faults::Fault::AfterRename) {
         return Err(io::Error::other("injected: the folder sync failed"));
     }
@@ -125,9 +125,10 @@ pub fn replace_durably(from: &Path, to: &Path) -> io::Result<()> {
 
 /// Test faults: make the next durable replaces of a path fail before or
 /// after the rename (a failed write, a failed folder sync), and folder
-/// syncs fail.
-#[cfg(test)]
-pub(crate) mod faults {
+/// syncs fail. Debug builds only, for tests: release builds have none.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub mod faults {
     use std::collections::{HashMap, VecDeque};
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;

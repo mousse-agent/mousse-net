@@ -254,6 +254,9 @@ pub(crate) trait Role: Send + 'static {
     fn may_open(&self) -> bool;
     /// The connection ended.
     fn on_closed(&mut self, reason: &CloseReason);
+    /// The peer's `GOAWAY` arrived, with this code; [`Role::on_closed`]
+    /// follows once the connection is torn down.
+    fn on_goaway(&mut self, _code: ErrorCode) {}
     /// The owner typed a pairing code (send link, joiner only).
     fn on_code(&mut self, _code: PairingCode, out: &mut Outbox) {
         out.close = Some(ErrorCode::ProtocolError);
@@ -1691,6 +1694,7 @@ impl Driver {
             }
             MuxEvent::GoAway { code } => {
                 self.reason.get_or_insert(CloseReason::Peer(code));
+                self.role.on_goaway(code);
             }
         }
     }

@@ -1486,7 +1486,10 @@ with `INTERNAL_ERROR`. Then, in this order:
   join-only for it and the host answers `AUTHORIZED {1: join_only, 2: I}`;
 - anything else: the host holds the connection, and with it its
   pre-authorization place, for `DIRECT_MISS_HOLD_MS` (1000 ms), then closes
-  it with `INVITATION_INVALID`. The 10 s wait for a `JOIN_PROOF` (section 8,
+  it with `INVITATION_INVALID`. The place stays taken for the full hold
+  even when the joiner closes sooner. Until the hold ends, the connection
+  lets only `PING`, `PONG`, `HELLO` and `GOAWAY` through (8.1), also when it
+  was live. The 10 s wait for a `JOIN_PROOF` (section 8,
   step 2) stops for a held connection: the hold's close, after the full
   hold, is the only one. A device that holds a grant here gets the same
   answer. Every "no open invitation" (another endpoint's code, a typo
@@ -1559,6 +1562,12 @@ the role the owner picks with the answer goes to that enrollment only.
   (it passes the live gate, 8.1), or a `GOAWAY` with `CANCELLED`, on the
   connection the host enrolled, or a cancel by recovery, removes the
   provisional grant and nothing else, and the host closes with `CANCELLED`.
+  The cancel counts where it arrives: once the host has let the
+  `CODE_ABORT` or the `GOAWAY` in, a first stream on another connection
+  after it commits nothing. The host stores the removal before it answers
+  `CANCELLED`; when it cannot, the grant stays and the host closes with
+  `INTERNAL_ERROR`, so the joiner keeps its record and its next cancel
+  removes the grant.
   A committed grant is never cancelled: the `CODE_ABORT` is ignored, the
   `GOAWAY` is an ordinary close, and a recovery's cancel is answered as a
   recovery without one (`PAIRED`).

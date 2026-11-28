@@ -1028,7 +1028,11 @@ impl<F: CodeExchangeFactory> DirectHostPairing<F> {
             .map(|g| g.identity);
         match grants.commit(grant, now) {
             Ok(events) => {
-                self.enrolled.retain(|_, e| e.grant != grant);
+                // The enrolled connections keep their records: every use
+                // checks that the grant is still provisional, so after the
+                // commit they do nothing, and an I/O layer that cannot store
+                // the commit puts the grant table back and the cancel works
+                // again. They go when their connections close.
                 let mut actions: Vec<DirectHostAction> =
                     events.into_iter().map(DirectHostAction::Grant).collect();
                 if let Some(identity) = identity {
@@ -1118,6 +1122,21 @@ impl<F: CodeExchangeFactory> DirectHostPairing<F> {
         let mut actions = self.dismiss_others(&id, Some(&request.identity));
         actions.extend(self.approval_action(&id, &request.identity));
         Ok(actions)
+    }
+
+    /// The I/O layer could not store the enrollment this invitation made,
+    /// and put the grant table back as it was: no grant was made. The
+    /// invitation ends with `INTERNAL_ERROR` instead of being consumed, as
+    /// a restart would find it; the I/O layer reports the end and closes
+    /// the device's connection.
+    pub fn enrollment_not_stored(&mut self, invitation: &InvitationId) {
+        let Some(inv) = self.invitations.get_mut(invitation) else {
+            return;
+        };
+        if let DirectInvitationStatus::Consumed { grant } = inv.status {
+            inv.status = DirectInvitationStatus::Ended(ErrorCode::InternalError);
+            self.enrolled.retain(|_, e| e.grant != grant);
+        }
     }
 
     /// The owner declined `request`. Its device's connection closes with
