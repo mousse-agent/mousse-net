@@ -96,12 +96,13 @@ use crate::revoke::Removed;
 mod availability;
 mod check;
 mod connected;
+mod direct;
 mod probe;
 mod revoke_local;
 mod roles;
 
 /// The requests this module answers.
-pub const OPS: [&str; 25] = [
+pub const OPS: [&str; 27] = [
     "config.set",
     "invite.create",
     "routes.available",
@@ -113,6 +114,8 @@ pub const OPS: [&str; 25] = [
     "join",
     "join.code",
     "join.cancel",
+    "join.direct",
+    "join.direct.cancel",
     "join.status",
     "join.ack",
     "grants.list",
@@ -141,6 +144,8 @@ pub struct State {
     joins: HashMap<String, Join>,
     /// Probes running (see [`probe`]).
     probes: Vec<probe::Probe>,
+    /// Pair with IP, both sides (see [`direct`]).
+    direct: direct::State,
 }
 
 /// A join running.
@@ -160,6 +165,7 @@ impl State {
             approvals: HashMap::new(),
             joins: HashMap::new(),
             probes: Vec::new(),
+            direct: direct::State::default(),
         }
     }
 }
@@ -274,6 +280,10 @@ pub fn on_request(shared: &Arc<Shared>, id: Value, op: &str, map: &Map<String, V
             None => return,
         },
         "invite.cancel" => match parse_invitation(str_field(map, "invitation")) {
+            Some(invitation) if direct::owns_invitation(shared, &invitation) => {
+                direct::cancel_invitation(shared, &invitation);
+                json!({"re": id})
+            }
             Some(invitation) => {
                 shared.host.cancel(&invitation);
                 json!({"re": id})
@@ -290,7 +300,21 @@ pub fn on_request(shared: &Arc<Shared>, id: Value, op: &str, map: &Map<String, V
             Some(reply) => reply,
             None => return,
         },
+        "join.direct" => match direct::join(shared, &id, map) {
+            Some(reply) => reply,
+            None => return,
+        },
+        "join.direct.cancel" => match direct::cancel(shared, &id, map) {
+            Some(reply) => reply,
+            None => return,
+        },
+        // Without a ticket hash: the Pair with IP completions (1.2,
+        // `docs/pair-with-ip-design.md` §4).
+        "join.status" if !map.contains_key("ticket_hash") => direct::status(shared, &id, map),
         "join.status" => join_status(shared, &id, map),
+        "join.ack" if map.contains_key("invitation") && !map.contains_key("ticket_hash") => {
+            direct::ack(shared, &id, map)
+        }
         "join.ack" => join_ack(shared, &id, map),
         "grants.list" => {
             let grants: Vec<Value> = shared
@@ -346,6 +370,10 @@ pub(super) fn paused(shared: &Shared, id: &Value) -> Value {
 }
 
 fn invite(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
+    // Pair with IP: no ticket (see [`direct`]).
+    if map.get("kind").and_then(Value::as_str) == Some("direct") {
+        return direct::invite(shared, id, map);
+    }
     // A selector asks for the 1.2 path; without one, 1.1 unchanged.
     if map.contains_key("way") || map.contains_key("route") {
         return invite_way(shared, id, map);
@@ -531,6 +559,10 @@ fn answer(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
         Ok(role) => role,
         Err(e) => return error(id, "bad_request", e),
     };
+    // A Pair with IP request keeps its prompt until the host ends it.
+    if let Some(reply) = direct::answer(shared, id, request, yes, role.clone()) {
+        return reply;
+    }
     let Some(req) = state(shared).approvals.remove(request) else {
         return error(id, "no_request", "no such approval request is waiting");
     };
@@ -1015,6 +1047,12 @@ fn join_ack(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
     }
 }
 
+/// Recover the kept Pair with IP records, at start, before the first
+/// request is read.
+pub fn resume_direct_now(shared: &Arc<Shared>) {
+    direct::resume(shared);
+}
+
 /// Drop the completion records whose ticket expired more than
 /// `JOIN_DONE_KEEP_SECS` ago. Runs once at start, after the channel is up.
 pub async fn prune_completions(shared: Arc<Shared>) {
@@ -1067,7 +1105,7 @@ fn forget_completions(shared: &Shared, identity: &str) -> Result<(), NetError> {
     let peers = peers(shared);
     let held = peers.lock()?;
     if let Ok(pin) = identity_from_hex(identity) {
-        *super::lock(&shared.core).join_gen.entry(pin).or_default() += 1;
+        super::lock(&shared.core).void_joins(pin);
     }
     let ended = super::relay::end_pairings(shared, &held, identity);
     let removed = crate::peer::drop_completions(&shared.info.state_dir, &held, identity);
@@ -1130,12 +1168,24 @@ fn remove_grant(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value 
     let Some(grant) = map.get("grant").and_then(Value::as_u64) else {
         return error(id, "bad_request", "grant.remove needs grant");
     };
-    let identity = shared
-        .host
-        .grants()
+    let committed = shared.host.grants();
+    // A provisional (Pair with IP) grant names its device too, unless the
+    // device keeps an older committed grant, which stays with its records.
+    let provisional = || {
+        shared
+            .host
+            .provisional_grants()
+            .into_iter()
+            .find(|g| g.id == GrantId(grant))
+            .filter(|p| !committed.iter().any(|g| g.identity == p.identity))
+            .map(|g| g.identity)
+    };
+    let identity = committed
         .iter()
         .find(|g| g.id == GrantId(grant))
-        .map(|g| hex(g.identity.as_bytes()));
+        .map(|g| g.identity)
+        .or_else(provisional)
+        .map(|identity| hex(identity.as_bytes()));
     let removed = shared.removal.remove(GrantId(grant));
     if matches!(removed, Ok(Removed::Saved | Removed::Paused)) {
         super::reset_unserved(shared);
@@ -1242,7 +1292,7 @@ fn forget_peer(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
         {
             let mut core = super::lock(&shared.core);
             *core.peer_gen.entry(identity).or_default() += 1;
-            *core.join_gen.entry(identity).or_default() += 1;
+            core.void_joins(identity);
         }
         crate::peer::drop_completions(&shared.info.state_dir, &held, &key)
     });
@@ -1355,8 +1405,10 @@ pub fn host_event(shared: &Shared, event: HostEvent) {
             applog::line(format!("saving grants failed: {reason}"));
             json!({"ev": "store.failed", "reason": reason})
         }
-        // The app channel makes no Pair with IP invitations yet.
-        HostEvent::Direct(_) => return,
+        HostEvent::Direct(event) => match direct::host_event(shared, event) {
+            Some(value) => value,
+            None => return,
+        },
     };
     shared.event(value);
 }
@@ -1365,6 +1417,12 @@ pub fn host_event(shared: &Shared, event: HostEvent) {
 /// connections this channel opened (the host closes its own).
 pub async fn watch_pause(shared: Arc<Shared>) {
     let mut changes = shared.removal.watch();
+    // Paused before this watch began (a removal replay that failed at
+    // startup): a Pair with IP flow that started stops at once. Must-fail
+    // control (tests only): the pause at startup is not seen.
+    if shared.removal.is_paused() && !cfg!(mousse_control = "direct-resume-while-paused") {
+        direct::pause(&shared);
+    }
     while changes.changed().await.is_ok() {
         let now = changes.borrow_and_update().clone();
         match now {
@@ -1381,11 +1439,16 @@ pub async fn watch_pause(shared: Arc<Shared>) {
                     join.task.abort();
                     shared.event(paused(&shared, &join.id));
                 }
+                direct::pause(&shared);
                 shared.event(json!({"ev": "net.paused", "reason": reason}));
             }
             None => {
                 shared.event(json!({"ev": "net.resumed"}));
                 shared.keep.kick(super::paths::Kick::Reset(None));
+                // The Pair with IP flows a pause stopped go on.
+                if direct::idle(&shared) {
+                    direct::resume(&shared);
+                }
             }
         }
     }

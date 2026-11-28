@@ -101,7 +101,20 @@
         mousse_control = "completion-omits-relay-admission",
         mousse_control = "completion-replays-retired-tag",
         mousse_control = "completion-stores-clear-tag",
-        mousse_control = "relay-replay-after-forget"
+        mousse_control = "relay-replay-after-forget",
+        mousse_control = "direct-ops-ungated",
+        mousse_control = "direct-done-pin-only",
+        mousse_control = "direct-approval-per-connection",
+        mousse_control = "direct-cli-denied-unread",
+        mousse_control = "direct-cli-echoes-args",
+        mousse_control = "direct-cli-ungated",
+        mousse_control = "direct-pending-outlives-removal",
+        mousse_control = "direct-pin-after-removal",
+        mousse_control = "direct-no-startup-recovery",
+        mousse_control = "direct-resume-while-paused",
+        mousse_control = "direct-unreadable-names-only",
+        mousse_control = "direct-cli-any-route",
+        mousse_control = "direct-cli-stale-answer"
     )
 ))]
 compile_error!("a mousse_control build has a deliberate defect and is for tests only; build it without --release");
@@ -210,6 +223,19 @@ compile_error!("test-in-person lets a typed ticket count as scanned from the hos
     mousse_control = "completion-replays-retired-tag",
     mousse_control = "completion-stores-clear-tag",
     mousse_control = "relay-replay-after-forget",
+    mousse_control = "direct-ops-ungated",
+    mousse_control = "direct-done-pin-only",
+    mousse_control = "direct-approval-per-connection",
+    mousse_control = "direct-cli-denied-unread",
+    mousse_control = "direct-cli-echoes-args",
+    mousse_control = "direct-cli-ungated",
+    mousse_control = "direct-pending-outlives-removal",
+    mousse_control = "direct-pin-after-removal",
+    mousse_control = "direct-no-startup-recovery",
+    mousse_control = "direct-resume-while-paused",
+    mousse_control = "direct-unreadable-names-only",
+    mousse_control = "direct-cli-any-route",
+    mousse_control = "direct-cli-stale-answer",
     feature = "test-in-person"
 ))]
 const _: () = {
@@ -229,6 +255,7 @@ const _: () = {
 
 mod app;
 mod applog;
+mod direct;
 mod engine;
 mod ipc;
 mod limits;
@@ -348,6 +375,14 @@ enum Command {
         /// Print only the ticket line, no QR code.
         #[arg(long)]
         no_qr: bool,
+        /// Pair with IP: show this computer's address and a 12-character
+        /// code for the joining device to type (`join-direct`), no ticket.
+        #[arg(long, conflicts_with_all = ["link", "qr", "no_qr"])]
+        direct: bool,
+        /// With --direct, show this computer's tailnet address instead of
+        /// its local network address.
+        #[arg(long, requires = "direct")]
+        tailnet: bool,
     },
     /// Pair with a host using its ticket.
     Join {
@@ -362,6 +397,12 @@ enum Command {
         /// Address to use instead of the ticket's, as tcp://host:port.
         #[arg(long = "route")]
         routes: Vec<String>,
+    },
+    /// Pair with IP: pair with the host showing `address` and a code; the
+    /// code is asked for at a prompt, never taken from an argument.
+    JoinDirect {
+        /// The address the host shows, as IPv4:port or [IPv6]:port.
+        address: String,
     },
     /// List the hosts this endpoint paired with.
     Peers,
@@ -795,6 +836,152 @@ async fn invite(dir: &Path, link: bool, no_qr: bool) -> Result<(), String> {
     }
 }
 
+/// `invite --direct`: a Pair with IP invitation on the running host. Prints
+/// the address and the code, asks about each device that passed the code,
+/// and ends when one is enrolled or the invitation ends.
+async fn invite_direct(dir: &Path, tailnet: bool) -> Result<(), String> {
+    let way = if tailnet { "tailnet" } else { "lan" };
+    let mut ch = ipc::request(dir, json!({"cmd": "invite", "direct": true, "way": way}))
+        .await?
+        .ok_or("no host is running for this endpoint (start `serve` first)")?;
+    let mut first = ch
+        .recv()
+        .await?
+        .ok_or("the host closed the control channel")?;
+    if let Some(e) = first.get("error").and_then(Value::as_str) {
+        return Err(e.to_owned());
+    }
+    println!("ADDRESS {}", first["address"].as_str().unwrap_or(""));
+    println!(
+        "CODE {} (type it on the joining device)",
+        first["code"].as_str().unwrap_or("")
+    );
+    direct::wipe_code(&mut first);
+    println!("waiting for the device to connect");
+    let _ = std::io::stdout().flush();
+    // One question per request, in the order asked; a request seen again
+    // (its device left or came back) is not asked twice.
+    let mut asked: Vec<String> = Vec::new();
+    let mut queued: VecDeque<(String, String)> = VecDeque::new();
+    let mut asking: Option<(String, tokio::task::JoinHandle<bool>)> = None;
+    // Requests that ended while their question was on screen: its answer
+    // is dropped, never sent under an id a new request may reuse.
+    let mut retired: Vec<String> = Vec::new();
+    loop {
+        if asking.is_none() {
+            if let Some((request, question)) = queued.pop_front() {
+                let ask = tokio::task::spawn_blocking(move || ask_yes_no(&question));
+                asking = Some((request, ask));
+            }
+        }
+        let answered = async {
+            match asking.as_mut() {
+                Some((_, ask)) => ask.await.unwrap_or(false),
+                None => std::future::pending().await,
+            }
+        };
+        let event = tokio::select! {
+            yes = answered => {
+                if let Some((request, _)) = asking.take() {
+                    if let Some(at) = retired.iter().position(|r| *r == request) {
+                        retired.remove(at);
+                        println!("that request ended before the answer; nothing was sent");
+                    } else {
+                        ch.send(&json!({"answer": yes, "request": request})).await?;
+                    }
+                }
+                continue;
+            }
+            event = ch.recv() => event?,
+        };
+        let Some(event) = event else {
+            return Err("the host closed the control channel".into());
+        };
+        match event.get("event").and_then(Value::as_str) {
+            Some("attempt") => {
+                println!(
+                    "a code attempt was made ({} left)",
+                    event["attempts_left"].as_u64().unwrap_or(0)
+                );
+            }
+            Some("approval") => {
+                let request = event["request"].as_str().unwrap_or("").to_owned();
+                let name = printable(event["name"].as_str().unwrap_or(""));
+                let device = event["device"].as_str().unwrap_or("").to_owned();
+                if event["decision"] == "allowed" && event["state"] == "away" {
+                    println!("waiting for \"{name}\" ({device}) to reconnect");
+                } else if !asked.contains(&request) {
+                    asked.push(request.clone());
+                    let question = format!(
+                        "\"{name}\" ({device}) typed the code. Does that device show {device}? Allow it?"
+                    );
+                    queued.push_back((request, question));
+                }
+            }
+            Some("approval_ended") => {
+                let request = event["request"].as_str().unwrap_or("").to_owned();
+                queued.retain(|(r, _)| *r != request);
+                // The device may pass the code again: a new prompt then.
+                asked.retain(|r| *r != request);
+                // Must-fail control (tests only): the question on screen
+                // stays live.
+                let on_screen = asking.as_ref().is_some_and(|(r, _)| *r == request);
+                if on_screen && !cfg!(mousse_control = "direct-cli-stale-answer") {
+                    println!("that request ended; the question on screen no longer counts");
+                    retired.push(request);
+                }
+            }
+            Some("stale") => {
+                println!(
+                    "that request is no longer waiting: {}",
+                    event["error"].as_str().unwrap_or("")
+                );
+            }
+            Some("enrolled") => {
+                println!(
+                    "paired: grant {} for {}",
+                    event["grant"],
+                    event["device"].as_str().unwrap_or("")
+                );
+                return Ok(());
+            }
+            Some("ended") => {
+                return Err(format!(
+                    "the invitation ended: {}",
+                    event["reason"].as_str().unwrap_or("")
+                ))
+            }
+            _ => {
+                if let Some(e) = event.get("error").and_then(Value::as_str) {
+                    return Err(e.to_owned());
+                }
+            }
+        }
+        let _ = std::io::stdout().flush();
+    }
+}
+
+/// The command line. An error in a `join-direct` command line is reported
+/// in fixed words: clap would print the argument it did not expect, and a
+/// code typed after the address must never be echoed.
+fn parse_cli() -> Cli {
+    use clap::error::ErrorKind;
+    match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e)
+            if !matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion)
+                && std::env::args().any(|a| a == "join-direct")
+                && !cfg!(mousse_control = "direct-cli-echoes-args") =>
+        {
+            eprintln!(
+                "error: join-direct takes only the host's address; type the code at the prompt it shows"
+            );
+            std::process::exit(2);
+        }
+        Err(e) => e.exit(),
+    }
+}
+
 /// How long a ticket stays valid, for people: whole minutes from a minute
 /// up, else seconds.
 fn validity(secs: u64) -> String {
@@ -896,7 +1083,34 @@ async fn run(cli: Cli) -> Result<i32, String> {
             };
             serve::run(&dir, insecure, opts, created).await?;
         }
-        Command::Invite { link, qr: _, no_qr } => invite(&dir, link, no_qr).await?,
+        Command::Invite {
+            direct: true,
+            tailnet,
+            ..
+        } => {
+            // Refused here, before the running host is asked: this
+            // command's own build must speak minor 4 too. Must-fail
+            // control (tests only): not checked.
+            if !direct::enabled() && !cfg!(mousse_control = "direct-cli-ungated") {
+                return Err(direct::UNSUPPORTED.into());
+            }
+            invite_direct(&dir, tailnet).await?
+        }
+        Command::Invite {
+            link, qr: _, no_qr, ..
+        } => invite(&dir, link, no_qr).await?,
+        Command::JoinDirect { address } => {
+            // Refused before the endpoint opens, the code is asked for or
+            // anything is dialled. Must-fail control (tests only): not
+            // checked here.
+            if !direct::enabled() && !cfg!(mousse_control = "direct-cli-ungated") {
+                return Err(direct::UNSUPPORTED.into());
+            }
+            let side = peer::CallerSide::open(&dir, insecure)?;
+            // Before the code passes, a device sends its computer name only.
+            let line = direct::join_cli(&side, &address, &computer_name()).await?;
+            println!("{line}");
+        }
         Command::Join {
             ticket,
             arrival,
@@ -975,7 +1189,7 @@ async fn run(cli: Cli) -> Result<i32, String> {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    let cli = parse_cli();
     // Limits come from MOUSSE_NET_* once, before anything runs.
     if let Err(e) = limits::init_from_env() {
         eprintln!("error: {e}");

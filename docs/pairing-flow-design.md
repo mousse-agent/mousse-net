@@ -77,6 +77,7 @@ Additions only. A 1.2 helper serves a 1.1 app unchanged.
   | `grant-add-connected` | `grant.add_connected` |
   | `managed-tunnel` | `routes.managed_tunnel`; `managed_tunnel` in `hello`; the managed tunnel as a `tunnel` candidate (§3.1) |
   | `version-refusals` | `unsupported_version {peer_minor}` on `dial`, `peer_minor` on `dial.failed`, the `peer.incompatible` event, `version_refusal` on `peers.list` and `grants.list` rows (below) |
+  | `pair-with-ip` | `invite.create {kind: "direct"}`, `join.direct`, `join.direct.cancel`, `join.progress`, `join.direct.ended`, kind 3 `approval` fields, `join.status {}` and `join.ack {invitation}` (`docs/pair-with-ip-design.md` §4). Not listed yet: until minor 4 ships, these answer `unsupported` unless the helper speaks wire minor 4 |
 
 - **Refusals for version** (`docs/pair-with-ip-design.md` §5). When a
   connection with a paired device closes with `UNSUPPORTED_VERSION`, the

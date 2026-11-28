@@ -22,17 +22,22 @@ use std::sync::{Arc, Mutex};
 
 use mousse_net_core::grants::{GrantId, Role};
 use mousse_net_core::identity::{IdentityPublicKey, SoftwareKey};
-use mousse_net_core::pairing::{CpaceExchangeFactory, InvitationId, InvitationKind};
+use mousse_net_core::pairing::{
+    ApprovalEnd, CpaceExchangeFactory, DirectRequestId, InvitationId, InvitationKind,
+    RequestDecision, RequestPresence,
+};
 use mousse_net_core::ErrorCode;
 use mousse_net_io::discovery::{Advertiser, CachedBrowse};
 use mousse_net_io::pipe::ws::{self, WsTarget};
-use mousse_net_io::pipe::{accept_tcp, route_from_addr, route_uri, Pipe, RouteKind};
+use mousse_net_io::pipe::{
+    accept_tcp, route_from_addr, route_uri, AddrClass, AddrPolicy, LocalRoute, Pipe, RouteKind,
+};
 use mousse_net_io::rng::{os_rng, random_bytes};
-use mousse_net_io::routes::{RoutesConfig, RoutesStore};
+use mousse_net_io::routes::{RoutesConfig, RoutesStore, Way};
 use mousse_net_io::store::{hex, short_id};
 use mousse_net_io::{
-    ApprovalRequest, Caller, Host, HostConfig, HostEvent, ListenerKind, PortChoice, PreAuthSlot,
-    SharedSigner,
+    ApprovalRequest, Caller, DirectEvent, Host, HostConfig, HostEvent, ListenerKind, PortChoice,
+    PreAuthSlot, SharedSigner,
 };
 use serde_json::{json, Value};
 use tokio::net::{TcpListener, TcpStream};
@@ -112,7 +117,81 @@ pub struct ListenState {
     pub managed_tunnel: Option<String>,
 }
 
+/// The way of an address the listener serves without `routes.json`:
+/// IPv4 literals of class `lan` or `tailnet` under `policy`.
+pub fn served_way(policy: &AddrPolicy, route: &LocalRoute) -> Option<Way> {
+    let (Some(ip), Some(port)) = (route.ip(), route.port()) else {
+        return None;
+    };
+    if !ip.is_ipv4() || !matches!(route, LocalRoute::Tcp { .. }) {
+        return None;
+    }
+    match policy.class_of(SocketAddr::new(ip, port)) {
+        AddrClass::Lan => Some(Way::Lan),
+        AddrClass::Tailnet => Some(Way::Tailnet),
+        _ => None,
+    }
+}
+
+/// The `lan` and `tailnet` candidates of a listener on `ip`:`port` without
+/// `routes.json`: every address it serves (for `0.0.0.0`, each usable one
+/// of `addrs`), uncapped, with the way of its class. The 1.1 advertisement
+/// ([`crate::serve::route_hints`]) is the same list cut to eight before it
+/// is classed; selection must not inherit that cut.
+pub fn listener_candidates(
+    policy: &AddrPolicy,
+    ip: IpAddr,
+    port: u16,
+    addrs: &[IpAddr],
+) -> Vec<(Way, String)> {
+    served_hints(ip, port, addrs)
+        .iter()
+        .filter_map(|hint| {
+            let route = LocalRoute::parse(hint).ok()?;
+            Some((served_way(policy, &route)?, route.uri()))
+        })
+        .collect()
+}
+
+/// The addresses a Pair with IP invitation can show from `candidates`
+/// (routes of one way): their IPv4 TCP literals, in order.
+pub fn direct_addresses<'a>(candidates: impl IntoIterator<Item = &'a str>) -> Vec<SocketAddr> {
+    candidates
+        .into_iter()
+        .filter_map(|r| {
+            let parsed = LocalRoute::parse(r).ok()?;
+            if !matches!(parsed, LocalRoute::Tcp { .. }) {
+                return None;
+            }
+            let addr = SocketAddr::new(parsed.ip()?, parsed.port()?);
+            addr.is_ipv4().then_some(addr)
+        })
+        .collect()
+}
+
 impl ListenState {
+    /// The `lan` and `tailnet` candidates this listener serves now,
+    /// uncapped, each with its way (`docs/pairing-flow-design.md` §2):
+    /// without `routes.json` what `--listen-ip` serves, classed by
+    /// `policy`; with it, what the config selects for the sockets bound.
+    /// The app's inventory and `invite --direct` both choose from it.
+    pub fn private_candidates(
+        &self,
+        policy: &AddrPolicy,
+        interfaces: &[IpAddr],
+    ) -> Vec<(Way, String)> {
+        match self.listen_ip {
+            Some(ip) => listener_candidates(policy, ip, self.port, interfaces),
+            None => self
+                .config
+                .candidates(interfaces, &self.bound, self.port)
+                .into_iter()
+                .filter(|c| matches!(c.way, Way::Lan | Way::Tailnet))
+                .map(|c| (c.way, c.route))
+                .collect(),
+        }
+    }
+
     /// Advertise what `config` selects for the sockets bound now, plus the
     /// command line's tunnels.
     pub fn readvertise(&mut self, interfaces: &[IpAddr]) {
@@ -225,6 +304,8 @@ struct State {
     waiters: Mutex<HashMap<InvitationId, mpsc::UnboundedSender<Value>>>,
     /// Approval questions waiting for an answer, by request id.
     pending: Mutex<HashMap<String, ApprovalRequest>>,
+    /// Pair with IP approval questions, by request id.
+    direct: Mutex<HashMap<String, DirectRequestId>>,
     stop: Notify,
 }
 
@@ -487,6 +568,7 @@ pub async fn run(
         ticket_identity: real_identity,
         waiters: Mutex::new(HashMap::new()),
         pending: Mutex::new(HashMap::new()),
+        direct: Mutex::new(HashMap::new()),
         stop: Notify::new(),
     });
     print_line(format!(
@@ -948,8 +1030,123 @@ fn on_event(state: &State, event: HostEvent) {
             role.as_str()
         )),
         HostEvent::StoreFailed(e) => print_line(format!("saving grants failed: {e}")),
-        // This command makes no Pair with IP invitations.
-        HostEvent::Direct(_) => {}
+        HostEvent::Direct(event) => on_direct_event(state, event),
+    }
+}
+
+/// The id of one Pair with IP approval question: the invitation and the
+/// full fingerprint of the device, the same while it comes and goes.
+fn direct_request_id(req: &DirectRequestId) -> String {
+    format!(
+        "direct-{}-{}",
+        hex(&req.invitation.0),
+        hex(&req.identity.fingerprint())
+    )
+}
+
+/// A Pair with IP host event, for the inviting command (`invite --direct`).
+fn on_direct_event(state: &State, event: DirectEvent) {
+    let waiter = |id: &InvitationId| state.waiters.lock().ok().and_then(|w| w.get(id).cloned());
+    let (invitation, message) = match event {
+        DirectEvent::Code {
+            invitation,
+            attempts_left,
+        } => (
+            invitation,
+            json!({"event": "attempt", "attempts_left": attempts_left}),
+        ),
+        DirectEvent::Approval(a) => {
+            let id = direct_request_id(&a.request);
+            print_line(format!(
+                "approval requested for {} ({}) request {id}",
+                crate::printable(&a.name),
+                short_id(&a.request.identity)
+            ));
+            if let Ok(mut p) = state.direct.lock() {
+                p.insert(id.clone(), a.request);
+            }
+            let presence = match a.presence {
+                RequestPresence::Connected => "connected",
+                RequestPresence::Away => "away",
+            };
+            let decision = match a.decision {
+                RequestDecision::Pending => "pending",
+                RequestDecision::Allowed => "allowed",
+            };
+            (
+                a.request.invitation,
+                json!({
+                    "event": "approval",
+                    "request": id,
+                    "name": a.name,
+                    "device": short_id(&a.request.identity),
+                    "state": presence,
+                    "decision": decision,
+                }),
+            )
+        }
+        DirectEvent::ApprovalEnded { request, reason } => {
+            let id = direct_request_id(&request);
+            if let Ok(mut p) = state.direct.lock() {
+                p.remove(&id);
+            }
+            let reason = match reason {
+                ApprovalEnd::Enrolled => "enrolled",
+                ApprovalEnd::Cancelled => "cancelled",
+                ApprovalEnd::Declined => "declined",
+                ApprovalEnd::Dismissed => "dismissed",
+                ApprovalEnd::WindowEnded => "window_ended",
+            };
+            (
+                request.invitation,
+                json!({"event": "approval_ended", "request": id, "reason": reason}),
+            )
+        }
+        DirectEvent::Enrolled {
+            invitation,
+            grant,
+            identity,
+            role,
+        } => {
+            print_line(format!(
+                "enrolled grant {} {} as {} (provisional until its first stream)",
+                grant.0,
+                short_id(&identity),
+                role.as_str()
+            ));
+            (
+                invitation,
+                json!({"event": "enrolled", "grant": grant.0, "device": short_id(&identity)}),
+            )
+        }
+        DirectEvent::Committed { grant, identity } => {
+            print_line(format!(
+                "grant {} {} committed",
+                grant.0,
+                short_id(&identity)
+            ));
+            return;
+        }
+        DirectEvent::EnrollmentUndone {
+            grant, identity, ..
+        } => {
+            print_line(format!(
+                "provisional grant {} {} removed",
+                grant.0,
+                short_id(&identity)
+            ));
+            return;
+        }
+        DirectEvent::Ended { invitation, reason } => {
+            print_line(format!("invitation ended: {}", reason.name()));
+            (
+                invitation,
+                json!({"event": "ended", "reason": reason.name()}),
+            )
+        }
+    };
+    if let Some(tx) = waiter(&invitation) {
+        let _ = tx.send(message);
     }
 }
 
@@ -1025,6 +1222,11 @@ async fn control_session(state: Arc<State>, mut ch: Channel) {
         "stop" => {
             let _ = ch.send(&json!({"stopping": true})).await;
             state.stop.notify_one();
+            return;
+        }
+        "invite" if request.get("direct").and_then(Value::as_bool) == Some(true) => {
+            let tailnet = request.get("way").and_then(Value::as_str) == Some("tailnet");
+            invite_direct_session(&state, &mut ch, tailnet).await;
             return;
         }
         "invite" => {
@@ -1182,6 +1384,132 @@ async fn invite_session(state: &State, ch: &mut Channel, link: bool) {
         w.remove(&invitation);
     }
     if let Ok(mut p) = state.pending.lock() {
+        p.retain(|_, r| r.invitation != invitation);
+    }
+}
+
+/// The address a Pair with IP invitation shows: the way's first IPv4
+/// candidate, chosen as the app's `invite.create` chooses (never a public
+/// forward, never loopback outside tests). `None` when the way has none.
+fn direct_address(state: &State, tailnet: bool) -> Option<SocketAddr> {
+    let listen = state
+        .listen
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let policy = AddrPolicy::for_build().ok()?;
+    let interfaces = crate::app::listed_interface_ips().unwrap_or_default();
+    let way = if tailnet { Way::Tailnet } else { Way::Lan };
+    // Must-fail control (tests only): any IPv4 listener route that is not
+    // tailnet counts as the local network.
+    if cfg!(mousse_control = "direct-cli-any-route") {
+        return listen.routes.iter().find_map(|r| {
+            let addr = *direct_addresses([r.as_str()]).first()?;
+            let is_tailnet = mousse_net_io::pipe::classify(addr.ip()) == AddrClass::Tailnet;
+            (is_tailnet == tailnet).then_some(addr)
+        });
+    }
+    let routes: Vec<String> = listen
+        .private_candidates(&policy, &interfaces)
+        .into_iter()
+        .filter(|(w, _)| *w == way)
+        .map(|(_, r)| r)
+        .collect();
+    direct_addresses(routes.iter().map(String::as_str))
+        .first()
+        .copied()
+}
+
+/// One Pair with IP invitation (`invite --direct`), from its code to
+/// enrolment: the address and code go to the inviting command to show,
+/// each approval question is answered there, and the command going away
+/// cancels the invitation.
+async fn invite_direct_session(state: &State, ch: &mut Channel, tailnet: bool) {
+    if !crate::direct::enabled() {
+        let _ = ch.send(&reply_error(crate::direct::UNSUPPORTED)).await;
+        return;
+    }
+    let Some(address) = direct_address(state, tailnet) else {
+        let way = if tailnet { "tailnet" } else { "local network" };
+        let _ = ch
+            .send(&reply_error(format!(
+                "the listener serves no {way} IPv4 address"
+            )))
+            .await;
+        return;
+    };
+    let role = mousse_net_core::grants::Role::owner();
+    let created = match state.host.invite_direct(address, role) {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = ch.send(&reply_error(e.to_string())).await;
+            return;
+        }
+    };
+    let invitation = created.invitation;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    if let Ok(mut w) = state.waiters.lock() {
+        w.insert(invitation, tx);
+    }
+    // Shown only by the inviting command, never logged.
+    let mut first = {
+        let code = created.code.to_display();
+        json!({
+            "address": created.address.to_string(),
+            "code": code.as_str(),
+            "attempts_left": created.attempts_left,
+            "expires_at": created.expires_at.secs(),
+        })
+    };
+    let sent = ch.send(&first).await;
+    crate::direct::wipe_code(&mut first);
+    let mut finished = sent.is_err();
+    while !finished {
+        tokio::select! {
+            event = rx.recv() => match event {
+                Some(event) => {
+                    let last = matches!(
+                        event.get("event").and_then(Value::as_str),
+                        Some("enrolled" | "ended")
+                    );
+                    if ch.send(&event).await.is_err() || last {
+                        finished = true;
+                    }
+                }
+                None => finished = true,
+            },
+            answer = ch.recv() => match answer {
+                Ok(Some(msg)) => {
+                    let yes = msg.get("answer").and_then(Value::as_bool).unwrap_or(false);
+                    let id = msg.get("request").and_then(Value::as_str).unwrap_or("");
+                    let req = state.direct.lock().ok().and_then(|p| {
+                        p.get(id).filter(|r| r.invitation == invitation).cloned()
+                    });
+                    let done = match req {
+                        Some(req) if yes => state.host.allow_direct(&req, None),
+                        Some(req) => state.host.decline_direct(&req),
+                        None => Err(mousse_net_io::NetError::Refused(
+                            "no such approval request is waiting".into(),
+                        )),
+                    };
+                    if let Err(e) = done {
+                        let _ = ch
+                            .send(&json!({"event": "stale", "request": id, "error": e.to_string()}))
+                            .await;
+                    }
+                }
+                // The inviting command went away: the invitation ends.
+                _ => {
+                    state.host.cancel_direct(&invitation);
+                    finished = true;
+                }
+            },
+        }
+    }
+    if let Ok(mut w) = state.waiters.lock() {
+        w.remove(&invitation);
+    }
+    if let Ok(mut p) = state.direct.lock() {
         p.retain(|_, r| r.invitation != invitation);
     }
 }

@@ -49,9 +49,10 @@ pub mod watch;
 
 pub use admission::{HelloSeen, Room, StreamAdmission, BOT_LABELS};
 pub use caller::{
-    is_lan_route, route_rank, Caller, CandidateSource, CodeEntry, DirectJoin, DirectJoinEvent,
-    DirectJoined, DirectPins, DirectResumed, DirectSetup, JoinOutcome, LaterCandidates, NoCode,
-    PathEvent, Reached, RouteClass, Search, Step1Failures,
+    is_lan_route, route_rank, Caller, CandidateSource, CodeEntry, DirectCancel, DirectCancelFailed,
+    DirectDialFailure, DirectJoin, DirectJoinEvent, DirectJoined, DirectPins, DirectResumed,
+    DirectSetup, JoinOutcome, LaterCandidates, NoCode, PathEvent, Reached, RouteClass, Search,
+    Step1Failures,
 };
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use conn::{
@@ -137,7 +138,11 @@ pub type SharedSigner = Arc<dyn IdentitySigner + Send + Sync>;
         mousse_control = "direct-on-any-transport",
         mousse_control = "direct-miss-closes-at-once",
         mousse_control = "direct-live-place-without-source",
-        mousse_control = "direct-commit-unsaved"
+        mousse_control = "direct-commit-unsaved",
+        mousse_control = "direct-cancel-dropped-on-busy-hold",
+        mousse_control = "direct-cancel-unrecorded",
+        mousse_control = "direct-dial-unchecked",
+        mousse_control = "direct-remove-committed-only"
     )
 ))]
 compile_error!("a mousse_control build has a deliberate defect and is for tests only; build it without --release");
@@ -202,7 +207,11 @@ compile_error!("a mousse_control build has a deliberate defect and is for tests 
     mousse_control = "direct-on-any-transport",
     mousse_control = "direct-miss-closes-at-once",
     mousse_control = "direct-live-place-without-source",
-    mousse_control = "direct-commit-unsaved"
+    mousse_control = "direct-commit-unsaved",
+    mousse_control = "direct-cancel-dropped-on-busy-hold",
+    mousse_control = "direct-cancel-unrecorded",
+    mousse_control = "direct-dial-unchecked",
+    mousse_control = "direct-remove-committed-only"
 ))]
 const _: () = {
     let profile = env!("MOUSSE_BUILD_PROFILE").as_bytes();

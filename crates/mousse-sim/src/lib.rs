@@ -7,9 +7,9 @@
 //! produces the same event log, byte for byte.
 //!
 //! Simulated devices drive the real core state machines: [`HostPairing`],
-//! [`JoinerPairing`], [`ConnectionGate`], [`GrantTable`], [`Mux`] and
-//! [`PeerSession`], over a virtual network of reliable byte pipes with
-//! injected faults. TLS is abstracted as an authenticated pipe; see
+//! [`JoinerPairing`], [`DirectHostPairing`], [`DirectJoinerPairing`],
+//! [`ConnectionGate`], [`GrantTable`], [`Mux`] and [`PeerSession`], over a
+//! virtual network of reliable byte pipes with injected faults. TLS is abstracted as an authenticated pipe; see
 //! [`certs`] for exactly what is and is not modelled.
 //!
 //! After every step the run checks the invariants in [`Invariant`]. The first
@@ -17,6 +17,8 @@
 //!
 //! [`HostPairing`]: mousse_net_core::pairing::HostPairing
 //! [`JoinerPairing`]: mousse_net_core::pairing::JoinerPairing
+//! [`DirectHostPairing`]: mousse_net_core::pairing::DirectHostPairing
+//! [`DirectJoinerPairing`]: mousse_net_core::pairing::DirectJoinerPairing
 //! [`ConnectionGate`]: mousse_net_core::authz::ConnectionGate
 //! [`GrantTable`]: mousse_net_core::grants::GrantTable
 //! [`Mux`]: mousse_net_core::mux::Mux
@@ -26,6 +28,7 @@
 mod caller;
 pub mod certs;
 mod check;
+mod direct;
 mod drills;
 mod exchange;
 mod host;
@@ -57,15 +60,20 @@ pub enum Drill {
     /// listed, unlisted and bad-proof calls, joins and promotion, accept
     /// legs, revocation, reboots and key rotation.
     RelayAdmission,
+    /// Pair with IP: wrong codes and exhaustion, Allow while the joiner is
+    /// connected or away, a cancel crossing Allow, decline, invitation and
+    /// Allow-window expiry, broken connections, host restarts, two joiners.
+    PairingDirect,
 }
 
 impl Drill {
     /// Every drill.
-    pub const ALL: [Drill; 4] = [
+    pub const ALL: [Drill; 5] = [
         Drill::Handshake,
         Drill::PairingLimits,
         Drill::SharedEndpoints,
         Drill::RelayAdmission,
+        Drill::PairingDirect,
     ];
 
     /// The CLI name.
@@ -75,6 +83,7 @@ impl Drill {
             Drill::PairingLimits => "pairing-limits",
             Drill::SharedEndpoints => "shared-endpoints",
             Drill::RelayAdmission => "relay-admission",
+            Drill::PairingDirect => "pairing-direct",
         }
     }
 
@@ -85,6 +94,7 @@ impl Drill {
             Drill::PairingLimits => drills::PAIRING_VARIANTS,
             Drill::SharedEndpoints => drills::SHARED_VARIANTS,
             Drill::RelayAdmission => relay::RELAY_VARIANTS,
+            Drill::PairingDirect => direct::DIRECT_VARIANTS,
         }
     }
 }
@@ -145,11 +155,31 @@ pub enum Bug {
     /// After a reboot the relay reapplies a target's old allow-set when it
     /// registers again, before the target pushes a fresh one.
     RelayStaleAllowSet,
+    /// The Pair with IP host's I/O layer answers each new approval prompt
+    /// with Allow itself, without the owner.
+    DirectAutoAllow,
+    /// The Pair with IP host's I/O layer never tells the pairing machine
+    /// that a pairing connection broke, so an Allow enrolls on a connection
+    /// that is gone.
+    DirectLostClose,
+    /// The Pair with IP host's I/O layer drops the joiner's cancel on an
+    /// enrolled connection: the gate's `CODE_ABORT` exception is not asked
+    /// and the peer's `GOAWAY` code is lost.
+    DirectDropCancel,
+    /// The Pair with IP joiner's I/O layer pins the host as soon as the
+    /// code passes, before the owner allowed.
+    DirectPinOnCodePassed,
+    /// The Pair with IP joiner's I/O layer loads its records without the
+    /// attempt ledger, and stores each debit over the old one.
+    DirectLedgerIgnored,
+    /// The Pair with IP joiner's I/O layer acknowledges a debit at once and
+    /// stores it only after the attempt's first share went out.
+    DirectDebitAfterSend,
 }
 
 impl Bug {
     /// Every planted bug.
-    pub const ALL: [Bug; 11] = [
+    pub const ALL: [Bug; 17] = [
         Bug::KeepChannelAfterRemoval,
         Bug::HostWorkBeforeDebit,
         Bug::JoinerWorkBeforeDebit,
@@ -161,6 +191,12 @@ impl Bug {
         Bug::AcceptExpiredCert,
         Bug::RelayEarlyAnswer,
         Bug::RelayStaleAllowSet,
+        Bug::DirectAutoAllow,
+        Bug::DirectLostClose,
+        Bug::DirectDropCancel,
+        Bug::DirectPinOnCodePassed,
+        Bug::DirectLedgerIgnored,
+        Bug::DirectDebitAfterSend,
     ];
 
     /// The CLI name.
@@ -177,6 +213,12 @@ impl Bug {
             Bug::AcceptExpiredCert => "accept-expired-cert",
             Bug::RelayEarlyAnswer => "relay-early-answer",
             Bug::RelayStaleAllowSet => "relay-stale-allow-set",
+            Bug::DirectAutoAllow => "direct-auto-allow",
+            Bug::DirectLostClose => "direct-lost-close",
+            Bug::DirectDropCancel => "direct-drop-cancel",
+            Bug::DirectPinOnCodePassed => "direct-pin-on-code-passed",
+            Bug::DirectLedgerIgnored => "direct-ledger-ignored",
+            Bug::DirectDebitAfterSend => "direct-debit-after-send",
         }
     }
 
@@ -193,6 +235,12 @@ impl Bug {
             | Bug::JoinerNewFlowOnReconnect => Drill::PairingLimits,
             Bug::SharedGrantTable => Drill::SharedEndpoints,
             Bug::RelayEarlyAnswer | Bug::RelayStaleAllowSet => Drill::RelayAdmission,
+            Bug::DirectAutoAllow
+            | Bug::DirectLostClose
+            | Bug::DirectDropCancel
+            | Bug::DirectPinOnCodePassed
+            | Bug::DirectLedgerIgnored
+            | Bug::DirectDebitAfterSend => Drill::PairingDirect,
         }
     }
 
@@ -209,6 +257,12 @@ impl Bug {
             Bug::AcceptExpiredCert => Invariant::Step1Spec,
             Bug::RelayEarlyAnswer => Invariant::RelayOneAnswer,
             Bug::RelayStaleAllowSet => Invariant::RelayAllowSetOnly,
+            Bug::DirectAutoAllow => Invariant::NoGrantWithoutAllow,
+            Bug::DirectLostClose => Invariant::EnrollOnLiveConnection,
+            Bug::DirectDropCancel => Invariant::CancelWins,
+            Bug::DirectPinOnCodePassed => Invariant::PairingAgreement,
+            Bug::DirectLedgerIgnored => Invariant::AttemptCap,
+            Bug::DirectDebitAfterSend => Invariant::DebitBeforeWork,
         }
     }
 }

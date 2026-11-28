@@ -139,12 +139,14 @@ fn with_header(kind: u8, body_len: usize) -> Vec<u8> {
 /// A JSON frame. A value that does not fit in a frame is replaced by an
 /// error the other end can read.
 pub fn json(value: &Value) -> Vec<u8> {
-    let body = serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec());
+    let mut body = serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec());
     if body.len() + 1 > MAX_FRAME {
         return json(&serde_json::json!({"ev": "error", "reason": "message too large"}));
     }
     let mut out = with_header(JSON, body.len());
     out.extend_from_slice(&body);
+    // The frame is the only copy left of a code it carries.
+    zeroize::Zeroize::zeroize(&mut body);
     out
 }
 

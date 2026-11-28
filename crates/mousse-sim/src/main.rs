@@ -4,7 +4,7 @@
 //! mousse-sim run pairing-limits --seeds 5000 [--bug NAME] [--full-verify] [--jobs N]
 //! mousse-sim run --drill all --seeds 1000..2000
 //! mousse-sim replay --drill handshake --seed 42 [--bug NAME] [--full-verify]
-//! mousse-sim must-fail [--seeds 0..500]
+//! mousse-sim must-fail [--drill pairing-direct] [--seeds 0..500]
 //! mousse-sim list
 //! ```
 //!
@@ -13,7 +13,9 @@
 //! seeds side by side.
 //!
 //! `--seeds N` means seeds `0..N`; `--seeds A..B` a range; `--seed N` one
-//! seed. The drill is the first plain argument or `--drill`.
+//! seed; `must-fail` without seeds runs `0..500`. The drill is the first
+//! plain argument or `--drill`; `must-fail` with a drill plants only that
+//! drill's bugs.
 //!
 //! `run` ends each drill with `PASS sim <drill>` or `FAIL sim <drill>`. With
 //! `--bug`, the verdict counts only the invariant that bug must break, so a
@@ -33,11 +35,14 @@ use mousse_sim::{run, Bug, Drill, Invariant, RunConfig, RunOutcome};
 const USAGE: &str = "usage:
   mousse-sim run <drill|all> --seeds <N|A..B> [--bug <name>] [--full-verify] [--jobs <N>]
   mousse-sim replay --drill <name> --seed <N> [--bug <name>] [--full-verify]
-  mousse-sim must-fail [--seeds <A..B>] [--jobs <N>]
+  mousse-sim must-fail [--drill <name>] [--seeds <A..B>] [--jobs <N>]
   mousse-sim list";
 
 /// How many failures `run` prints in full.
 const SHOWN_FAILURES: usize = 20;
+
+/// The seeds `must-fail` uses when none are given.
+const MUST_FAIL_SEEDS: Range<u64> = 0..500;
 
 struct Args {
     drills: Vec<Drill>,
@@ -296,11 +301,15 @@ fn cmd_replay(args: &Args) -> ExitCode {
     }
 }
 
-/// Plant each bug and confirm its drill reports the expected invariant.
+/// Plant each bug (of the named drills, or every bug) and confirm its drill
+/// reports the expected invariant.
 fn cmd_must_fail(args: &Args) -> ExitCode {
-    let seeds = args.seeds.clone().unwrap_or(0..500);
+    let seeds = args.seeds.clone().unwrap_or(MUST_FAIL_SEEDS);
     let mut missed = false;
-    for bug in Bug::ALL {
+    let bugs = Bug::ALL
+        .into_iter()
+        .filter(|b| args.drills.is_empty() || args.drills.contains(&b.drill()));
+    for bug in bugs {
         let started = Instant::now();
         let configs: Vec<RunConfig> = seeds
             .clone()

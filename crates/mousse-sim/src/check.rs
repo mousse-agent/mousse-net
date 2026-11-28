@@ -10,10 +10,13 @@ pub enum Invariant {
     /// At most one enrollment per invitation, across all routes.
     SingleEnrollment,
     /// Every code-exchange start (code work) is preceded by an attempt debit,
-    /// on the host (per invitation) and on the joiner (per state machine).
+    /// on the host (per invitation) and on the joiner (per state machine;
+    /// for Pair with IP, per typed lookup, stored before the attempt's first
+    /// share goes out).
     DebitBeforeWork,
-    /// At most 3 attempts per invitation on the host and per code-entry flow
-    /// on the joiner; a debit is never returned.
+    /// At most the attempt limit per invitation on the host, and per
+    /// code-entry flow (for Pair with IP, per typed lookup) on the joiner; a
+    /// debit is never returned.
     AttemptCap,
     /// The host's application only accepts stream traffic (RPC, terminal) on
     /// a connection bound to a live grant.
@@ -26,7 +29,9 @@ pub enum Invariant {
     /// device's own clock.
     NoFlowPastDeadline,
     /// A joiner that completes pairing has a matching enrollment on the host,
-    /// and a joiner the host enrolled does not end its flow as failed.
+    /// and a joiner the host enrolled does not end its flow as failed. For
+    /// Pair with IP: a joiner whose flow ended holds the host's pin exactly
+    /// when the host holds a grant for it.
     PairingAgreement,
     /// A caller only ever authenticates the identity it pinned.
     PinMatch,
@@ -55,11 +60,21 @@ pub enum Invariant {
     RelayPreacceptBudget,
     /// The relay registers only keys on the operator's list.
     RelayRegisterAuthorized,
+    /// Pair with IP: a grant made by a direct invitation exists only for an
+    /// identity the host owner allowed on that invitation.
+    NoGrantWithoutAllow,
+    /// Pair with IP: enrollment happens only on a connection the host still
+    /// has open, whose step 1 identity is the one that asked.
+    EnrollOnLiveConnection,
+    /// Pair with IP: a joiner's cancel that crossed Allow leaves no grant,
+    /// once the host has handled it on the enrolled connection or by
+    /// recovery, and once the joiner's flow has ended.
+    CancelWins,
 }
 
 impl Invariant {
     /// Every invariant.
-    pub const ALL: [Invariant; 17] = [
+    pub const ALL: [Invariant; 20] = [
         Invariant::SingleEnrollment,
         Invariant::DebitBeforeWork,
         Invariant::AttemptCap,
@@ -77,6 +92,9 @@ impl Invariant {
         Invariant::RelayRemovalCloses,
         Invariant::RelayPreacceptBudget,
         Invariant::RelayRegisterAuthorized,
+        Invariant::NoGrantWithoutAllow,
+        Invariant::EnrollOnLiveConnection,
+        Invariant::CancelWins,
     ];
 
     /// Short kebab-case name.
@@ -99,6 +117,9 @@ impl Invariant {
             Invariant::RelayRemovalCloses => "relay-removal-closes",
             Invariant::RelayPreacceptBudget => "relay-preaccept-budget",
             Invariant::RelayRegisterAuthorized => "relay-register-authorized",
+            Invariant::NoGrantWithoutAllow => "no-grant-without-allow",
+            Invariant::EnrollOnLiveConnection => "enroll-on-live-connection",
+            Invariant::CancelWins => "cancel-wins",
         }
     }
 }
