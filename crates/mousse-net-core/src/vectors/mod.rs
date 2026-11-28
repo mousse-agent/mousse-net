@@ -10,6 +10,7 @@
 use wasm_bindgen_test::wasm_bindgen_test as test;
 
 mod direct;
+mod direct_joiner;
 mod relay;
 
 use std::collections::VecDeque;
@@ -110,6 +111,7 @@ fn checked_in(name: &str) -> Option<String> {
         "der-raw.json",
         "direct-code.json",
         "direct-host.json",
+        "direct-joiner.json",
         "hello.json",
         "join-proof.json",
         "mux.json",
@@ -2987,6 +2989,7 @@ fn all_vectors() -> Vec<(&'static str, J)> {
         ("hello.json", hello_vectors()),
         ("pairing-attempts.json", pairing_attempt_vectors()),
         ("direct-host.json", direct::direct_host_vectors()),
+        ("direct-joiner.json", direct_joiner::direct_joiner_vectors()),
         ("relay-admission.json", relay::relay_admission_vectors()),
     ]
 }

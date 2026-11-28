@@ -1393,9 +1393,6 @@ bound to the old one closes with `GRANT_REVOKED`.
 
 ### 10.9 Direct flow
 
-*The joiner's side (its attempt ledger and pending record) follows; this
-section gives the code, the binding and the host's side.*
-
 The direct flow pairs two endpoints with no ticket: the host shows its
 address and a **direct code**, and the joiner's owner types both. The host
 owner then allows the device, as in person (10.4).
@@ -1678,6 +1675,115 @@ grant enrollment made, provisional or committed, with receipt `I` and the
 mark that a direct invitation made it (section 7, 10.8), stored with the
 grant table; recovery reads it, also after a restart. Vectors:
 `direct-host.json`.
+
+#### Joiner
+
+**Before dialing.** The joiner reads the typed address with the route
+grammar (10.2.1): `<IPv4>:<port>` or `[<IPv6>]:<port>`, leading and
+trailing spaces dropped, no DNS names; anything else is `bad_address`. It
+reads the code as "Code" above; a text that is not a code is `bad_code`.
+The address is read first. Neither error dials or spends an attempt. A
+start with no attempts left for the typed lookup ends with
+`ATTEMPTS_EXHAUSTED` before dialing.
+
+**Ledger.** The joiner counts its attempts per **typed lookup**, not per key
+the far end shows, in a durable record stored under `L`:
+
+```
+{1: "mousse-direct-joiner-v1", 2: L (text, 4), 3: attempts left (0 to 5),
+ 4: time of the first debit (uint)}
+```
+
+A start has `DIRECT_JOINER_ATTEMPTS` (5) attempts when no record counts. A
+record counts until 24 hours (86 400 s, fixed) after its first debit; after
+that a start begins with every attempt again, and its first debit sets a
+new first-debit time. A record for another lookup is refused. A far end
+that shows a new identity key on every connection therefore still draws
+from the same count.
+
+**Pending record.** Once the host's confirmation verified, the host key
+and `I` are authenticated. The joiner stores, under `L`:
+
+```
+{1: "mousse-direct-pending-v1", 2: L (text, 4), 3: host identity key (65 bytes),
+ 4: I (16 bytes), 5: address (text, canonical: the IPv4 dotted form or the
+ bracketed lowercase RFC 5952 IPv6 form, then ":" and the port),
+ 6: time the host's confirmation verified (uint), 7: cancelled (0 or 1)}
+```
+
+A record whose address text is not in that canonical form is refused.
+Every write of either record is durable **before** what depends on it goes
+out, and is a compare and swap on the stored record as this flow last read
+or wrote it, as in 10.7. A write that fails or finds the record changed
+sends nothing that waited for it; the joiner closes with `INTERNAL_ERROR`
+and the flow ends.
+
+**First contact.** One flow is one Connect; it runs at most one attempt.
+
+1. The joiner dials the typed address with no pin (5.4). A far end that
+   shows the joiner's own identity key ends the flow (own device); the
+   joiner closes with `PAIRING_FAILED` and sends nothing else.
+2. It waits for the host's `HELLO`. With `agreed < 4` it closes with
+   `UNSUPPORTED_VERSION`: the host needs an update. Otherwise it sends
+   `JOIN_DIRECT {1: L, 2: name}`.
+3. A first `AUTHORIZED {live}` is step 2's notice, not the answer. The
+   answer is `AUTHORIZED {join_only, I}` (with key 3 it is a protocol error
+   here) or a close: a host close with `INVITATION_INVALID` means no open
+   invitation, with nothing debited.
+4. On the answer it debits: it writes the ledger with one attempt fewer
+   (the first debit also sets the first-debit time), then sends
+   `CODE_EXCHANGE {A, msg_a}` with a fresh attempt id `A`. With no attempts
+   left it closes with `ATTEMPTS_EXHAUSTED` instead.
+5. It checks `Tb` in `msg_b`. If it fails, it sends `CODE_ABORT {A,
+   PAIRING_FAILED}` and closes with `PAIRING_FAILED` (`ATTEMPTS_EXHAUSTED`
+   when none are left); the next try is a new Connect. A `CODE_ABORT` from
+   the host for `A` ends the flow the same way, without the joiner's
+   `CODE_ABORT`.
+6. If `Tb` verifies, it writes the pending record, then shows "Waiting for
+   Allow" and sends `CODE_EXCHANGE {A, msg_c}`.
+7. It accepts `PAIRED` only now (or on a recovery, below), and never once
+   it has cancelled. It then stores the pin, the typed address as an owner
+   route and a completion record keyed by `I`, makes the connection live
+   (8.2, pairing only), and only then deletes the pending record.
+
+**Ends that settle a pending record.** A close by the host with
+`PAIRING_DECLINED`, `CANCELLED`, `INVITATION_INVALID` or
+`ATTEMPTS_EXHAUSTED` deletes the pending record and ends the flow; so do
+`PAIRED` (after the pin) and `not_received` (below). Every other end keeps
+it: a broken connection, `INTERNAL_ERROR` (a paused or busy host),
+`NOT_AUTHORIZED` after the 10 s wait for an answer (8.2), a protocol error,
+a host that now agrees a minor below 4. No timer drops a kept record: the
+joiner recovers it later, with backoff, and when it starts.
+
+**Recovery.** While a pending record exists, every connection of the flow
+is a recovery, dialled **pinned** to its host key at its address. After the
+host's `HELLO` (minor 4 or more, as above) the joiner sends `JOIN_DIRECT
+{1: L, 2: name, 3: I}`, with key 4 when the record is marked cancelled; no
+code is needed. A Connect whose typed address and lookup match a stored
+pending record resumes it as a recovery instead of starting a new attempt;
+any other Connect starts a new flow. The answers:
+
+- `PAIRED` after step 2's `AUTHORIZED {live}`: enrolled (from the grant's
+  receipt); as step 7;
+- `AUTHORIZED {join_only, I}`: the request waits for Allow ("Waiting for
+  Allow"), or it was allowed while away and `PAIRED` follows; an `I` other
+  than the record's is a protocol error;
+- `AUTHORIZED {join_only, I, not_received}`: the host never had this
+  device's confirmation. The joiner deletes the pending record, closes with
+  `NO_ERROR` and tells the person to connect again with the code (the code
+  is never stored), with the attempts left;
+- a close: as "Ends that settle a pending record".
+
+**Cancel.** Before the code passed, a cancel ends the flow: a running
+attempt is aborted with `CODE_ABORT {A, CANCELLED}` (its debit stays) and
+the connection closes with `CANCELLED`. After it passed, the joiner first
+marks the pending record cancelled (durably); connected, it then sends
+`CODE_ABORT {A, CANCELLED}` on the connection that ran the attempt and
+closes with `CANCELLED`. Either way the record stays until a recovery,
+which carries the cancel flag, hears the host's settling answer, so a
+cancel that crossed the host's Allow still reaches the host. A joiner that
+cancelled ignores a `PAIRED` that crosses its cancel and pins nothing.
+Vectors: `direct-joiner.json`.
 
 ## 11. Control messages
 

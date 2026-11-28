@@ -1,0 +1,2182 @@
+{
+  "conventions": {
+    "address": "192.168.1.20:47100",
+    "draws": "Each party's random values in the order it takes them. Hosts: the invitation id (16), the code (12), then each attempt's yb (32), as in direct-host.json. Joiner: for each attempt the attempt id (16) and ya (32).",
+    "exporters": "On connection n both ends see the pair exporter n + 100 repeated 32 times.",
+    "hosts": "`host`: identity secret 0x11 repeated, name Desk, role owner, authorizing owner 0x51 repeated, the default limits. Fake host n (`fake1`, ...): identity secret 0x30 + its index (1 for the first fake) repeated; its invitation has the typed lookup and another secret.",
+    "joiner": {
+      "identity_secret": "5050505050505050505050505050505050505050505050505050505050505050",
+      "name": "Laptop"
+    },
+    "time": 1790000000,
+    "typed": "K7QM-2XPA-9RTE"
+  },
+  "description": "Pair with IP end to end (wire.md 10.9): the joiner machine against the host machine of direct-host.json, with the real code exchange, replayed byte for byte from the listed draws. Each sequence starts with the real host (`host`) holding one invitation created at `conventions.time` (`code`). Ops: start (the person types `conventions.address` and a code: right, wrong (the right lookup, secret 00000000 or 00000001), other_lookup (lookup 0000 or 0001, the right secret), typed (`conventions.typed`); `result` ok or the refusal, before any dial), resume (a new flow from the stored pending record, no code), connect (TLS with `host` on `conn`: the joiner sees the far end's key, then the host's step 2 runs, then the host's HELLO agrees on min(`minor`, 4) (default 4); `own` shows the joiner's own key; `lose` msg_c breaks the connection instead of delivering the joiner's confirmation; `crash` after_msg_c stops the joiner's app right after its confirmation reached the host and breaks the connection), allow and decline (the real host's owner answers the joiner's request; `lose` paired breaks the connection instead of delivering PAIRED; with `in_transit` the host's messages stay on their way until the next cancel), drop (the connection breaks), cancel (the person cancels; host messages in transit then arrive). Every write the joiner asks for lands at once (compare-and-swap checked), and every pin is stored at once. A host's miss hold is shown with the close the I/O layer makes after it. Expectations: `state` (the joiner flow's), `ledger` (attempts left in the stored ledger, or null), `pending` (the stored pending record: pending, cancelled or null), `pinned` (the joiner stored a pin), `granted` (the real host holds a grant for the joiner with the invitation's receipt). `out`: in order, control messages (`send`), closes (`close`, with who closed), miss holds, broken connections, the joiner's writes (`persist_ledger`, `persist_pending`: expected and new record bytes, null for none), what the joiner tells its UI (`code_passed`, `paired`, `away`, `ended`), a crash, and host messages that arrive after a cancel. HELLOs are not listed.",
+  "sequences": [
+    {
+      "code": "DMMG-CYFD-DT44",
+      "description": "The code passes, the joiner stores its pending record before its confirmation, the owner allows, and the joiner pins the host only on PAIRED, then clears the record.",
+      "draws": {
+        "host": [
+          {
+            "bytes": "b2125f5befebfd95faac46bc9e0e7433"
+          },
+          {
+            "bytes": "0df474300c3eef4ded9ae4c4"
+          },
+          {
+            "bytes": "e4794ee2bcc061439387ca193531e1f4d3a5a8ccd9140d3317abc21765feb579"
+          }
+        ],
+        "joiner": [
+          {
+            "bytes": "9a9ec1a2a6c152e5b938b4dd05f045ad"
+          },
+          {
+            "bytes": "e11a1b1776dff6485acc5921c49dcdd2b0a8148d9aa75b949e0af167af1766f4"
+          }
+        ]
+      },
+      "name": "success",
+      "steps": [
+        {
+          "code": "right",
+          "op": "start",
+          "out": [],
+          "result": "ok"
+        },
+        {
+          "conn": 1,
+          "host": "host",
+          "ledger": 4,
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300070164444d4d4702664c6170746f70",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000201020250b2125f5befebfd95faac46bc9e0e7433",
+                "from": "host"
+              }
+            },
+            {
+              "persist_ledger": {
+                "expected": null,
+                "record": "a401776d6f757373652d6469726563742d6a6f696e65722d76310264444d4d470304041a6ab13b80"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02582220feaf9e313a8f6fbbd224fc0a9852d5e49f88b9b0d0b92b2cc12e352c2a971f7d00",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02586220169bdf6c0fd103749ebf2ffe4e0b840dcc04348d15fbb972cca9e36b1b277d5d003581ea7114c3f912695c1f757557fe6a540c83385b85a24a20e7a14ccf96c5fa4fe331cc3947be5a2763357ec811b5d6d7f022f777a01d57a2ff4a0adc23ab98",
+                "from": "host"
+              }
+            },
+            {
+              "persist_pending": {
+                "expected": null,
+                "record": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700"
+              }
+            },
+            {
+              "joiner": "code_passed"
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad025840dab46c1345bd4dc78dc1f917ce72cfdba650327dda68aecec8cf7de010395c5d635a13511d21e1f47188ca3701696b6b25f428d22e91cd0d4d92d99d20c08a05",
+                "from": "joiner"
+              }
+            }
+          ],
+          "pending": "pending",
+          "pinned": false,
+          "state": "awaiting_allow"
+        },
+        {
+          "granted": true,
+          "op": "allow",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000601644465736b02656f776e6572",
+                "from": "host"
+              }
+            },
+            {
+              "joiner": {
+                "paired": {
+                  "address": "192.168.1.20:47100",
+                  "host": "040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794",
+                  "invitation": "b2125f5befebfd95faac46bc9e0e7433",
+                  "name": "Desk",
+                  "role": "owner"
+                }
+              }
+            },
+            {
+              "persist_pending": {
+                "expected": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700",
+                "record": null
+              }
+            },
+            {
+              "joiner": {
+                "ended": "paired"
+              }
+            }
+          ],
+          "pending": null,
+          "pinned": true,
+          "state": "ended:paired"
+        }
+      ]
+    },
+    {
+      "code": "DMMG-CYFD-DT44",
+      "description": "A wrong secret fails at the joiner's check of the host's confirmation: it aborts, closes, and the flow ends with the attempts left. The next Connect is a new flow.",
+      "draws": {
+        "host": [
+          {
+            "bytes": "b2125f5befebfd95faac46bc9e0e7433"
+          },
+          {
+            "bytes": "0df474300c3eef4ded9ae4c4"
+          },
+          {
+            "bytes": "e4794ee2bcc061439387ca193531e1f4d3a5a8ccd9140d3317abc21765feb579"
+          },
+          {
+            "bytes": "dfa2044170de3500199bbee88cee29164487708ac703d172edc113570b6bf288"
+          }
+        ],
+        "joiner": [
+          {
+            "bytes": "9a9ec1a2a6c152e5b938b4dd05f045ad"
+          },
+          {
+            "bytes": "e11a1b1776dff6485acc5921c49dcdd2b0a8148d9aa75b949e0af167af1766f4"
+          },
+          {
+            "bytes": "84627a34f6c10de28b77f93ea341ef97"
+          },
+          {
+            "bytes": "57826e19f83dc783b05426a652e9730a9b89c79caa62e007a8c5813556064b15"
+          }
+        ]
+      },
+      "name": "wrong_secret",
+      "steps": [
+        {
+          "code": "wrong",
+          "op": "start",
+          "out": [],
+          "result": "ok"
+        },
+        {
+          "conn": 1,
+          "host": "host",
+          "ledger": 4,
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300070164444d4d4702664c6170746f70",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000201020250b2125f5befebfd95faac46bc9e0e7433",
+                "from": "host"
+              }
+            },
+            {
+              "persist_ledger": {
+                "expected": null,
+                "record": "a401776d6f757373652d6469726563742d6a6f696e65722d76310264444d4d470304041a6ab13b80"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad0258222046556a03be7ebfa2d843e1c035f01e234122fe1123477c324ebfc5301d36a30600",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02586220169bdf6c0fd103749ebf2ffe4e0b840dcc04348d15fbb972cca9e36b1b277d5d0032ffc8ab3ebb02eb738e48aa427150f88f55726c9d61e39d9e7a44131776d6fa03cbf7fd55eaac27e489c5070911477ee19adeb5e77d33fd3fe3f1699cdd184d",
+                "from": "host"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000501509a9ec1a2a6c152e5b938b4dd05f045ad020a",
+                "from": "joiner"
+              }
+            },
+            {
+              "close": {
+                "code": "pairing_failed",
+                "conn": 1,
+                "from": "joiner"
+              }
+            },
+            {
+              "joiner": {
+                "ended": "code_failed:4"
+              }
+            }
+          ],
+          "pending": null,
+          "state": "ended:code_failed:4"
+        },
+        {
+          "code": "right",
+          "op": "start",
+          "out": [],
+          "result": "ok"
+        },
+        {
+          "conn": 2,
+          "host": "host",
+          "ledger": 3,
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a300070164444d4d4702664c6170746f70",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a3000201020250b2125f5befebfd95faac46bc9e0e7433",
+                "from": "host"
+              }
+            },
+            {
+              "persist_ledger": {
+                "expected": "a401776d6f757373652d6469726563742d6a6f696e65722d76310264444d4d470304041a6ab13b80",
+                "record": "a401776d6f757373652d6469726563742d6a6f696e65722d76310264444d4d470303041a6ab13b80"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a30004015084627a34f6c10de28b77f93ea341ef970258222068e01e33dc4b1a56f8a740f32a60d107c2773a35ec1fb917a095b5b0707ece1400",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a30004015084627a34f6c10de28b77f93ea341ef9702586220dc5ae589514569e1235d8acaf332e2ebe30506336fd84686c39fb531cfbfba4a009d11d13bdb0f0c3d2f8e2d1cd221d8106aa203cbab0e7b98ea33f1b1d4ae95832db10e98a8a904e4e1c09a57a0d5bc15bbc1eedc87a03c9a27a66e3b1f30b86e",
+                "from": "host"
+              }
+            },
+            {
+              "persist_pending": {
+                "expected": null,
+                "record": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700"
+              }
+            },
+            {
+              "joiner": "code_passed"
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a30004015084627a34f6c10de28b77f93ea341ef97025840c23b24f6c0f5f5e760b69677eef46809a860ec26dc2ebac49f1ad444748494ae20cc154474342b2d287b4453682770686d309a0c11a6a07232b7df9742089945",
+                "from": "joiner"
+              }
+            }
+          ],
+          "state": "awaiting_allow"
+        }
+      ]
+    },
+    {
+      "code": "DMMG-CYFD-DT44",
+      "description": "A typo in the first four characters: the host holds the connection, then closes it with invitation_invalid. Nothing is debited.",
+      "draws": {
+        "host": [
+          {
+            "bytes": "b2125f5befebfd95faac46bc9e0e7433"
+          },
+          {
+            "bytes": "0df474300c3eef4ded9ae4c4"
+          }
+        ],
+        "joiner": []
+      },
+      "name": "wrong_lookup",
+      "steps": [
+        {
+          "code": "other_lookup",
+          "op": "start",
+          "out": [],
+          "result": "ok"
+        },
+        {
+          "conn": 1,
+          "host": "host",
+          "ledger": null,
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000701643030303002664c6170746f70",
+                "from": "joiner"
+              }
+            },
+            {
+              "miss_hold": {
+                "conn": 1,
+                "hold_ms": 1000
+              }
+            },
+            {
+              "close": {
+                "code": "invitation_invalid",
+                "conn": 1,
+                "from": "host"
+              }
+            },
+            {
+              "joiner": {
+                "ended": "closed:invitation_invalid"
+              }
+            }
+          ],
+          "pending": null,
+          "state": "ended:closed:invitation_invalid"
+        }
+      ]
+    },
+    {
+      "code": "DMMG-CYFD-DT44",
+      "description": "Whatever answers at the typed address shows a new identity key on every Connect and does not know the secret. The ledger is kept by the typed lookup, so the five attempts run out all the same, and a sixth Connect is refused before dialing.",
+      "draws": {
+        "fake1": [
+          {
+            "bytes": "41414141414141414141414141414141"
+          },
+          {
+            "bytes": "130717141e1e1e1e1e1e1e1e"
+          },
+          {
+            "bytes": "f9076833dfbbbe285630061e62849bc485c1f1c6d298ae58f5e42452a8e0aa73"
+          }
+        ],
+        "fake2": [
+          {
+            "bytes": "42424242424242424242424242424242"
+          },
+          {
+            "bytes": "130717141d1d1d1d1d1d1d1d"
+          },
+          {
+            "bytes": "b41df80b2362f8d1635a009392eca00850e02dbd45372349ce7261cb5f4c30da"
+          }
+        ],
+        "fake3": [
+          {
+            "bytes": "43434343434343434343434343434343"
+          },
+          {
+            "bytes": "130717141c1c1c1c1c1c1c1c"
+          },
+          {
+            "bytes": "0cd2ed8a9b09cba48814b1dee8614012f1489c84f0bbed962f8092ddec94f384"
+          }
+        ],
+        "fake4": [
+          {
+            "bytes": "44444444444444444444444444444444"
+          },
+          {
+            "bytes": "130717141b1b1b1b1b1b1b1b"
+          },
+          {
+            "bytes": "9c7780c8dd779d18d70504a7f82fb2e6693b1bd5041f3cf53ee337e9d25355bd"
+          }
+        ],
+        "fake5": [
+          {
+            "bytes": "45454545454545454545454545454545"
+          },
+          {
+            "bytes": "130717141a1a1a1a1a1a1a1a"
+          },
+          {
+            "bytes": "56a76fe7ade96138af6c2188ead14ab70b950f65ce0679b0cf559f5edaf359a5"
+          }
+        ],
+        "host": [
+          {
+            "bytes": "b2125f5befebfd95faac46bc9e0e7433"
+          },
+          {
+            "bytes": "0df474300c3eef4ded9ae4c4"
+          }
+        ],
+        "joiner": [
+          {
+            "bytes": "9a9ec1a2a6c152e5b938b4dd05f045ad"
+          },
+          {
+            "bytes": "e11a1b1776dff6485acc5921c49dcdd2b0a8148d9aa75b949e0af167af1766f4"
+          },
+          {
+            "bytes": "84627a34f6c10de28b77f93ea341ef97"
+          },
+          {
+            "bytes": "57826e19f83dc783b05426a652e9730a9b89c79caa62e007a8c5813556064b15"
+          },
+          {
+            "bytes": "014919d49270c47d113de49f6a42639a"
+          },
+          {
+            "bytes": "ef4b9bcb3e22a5d65d52ce1562afd06b94addb084f1a750beafdfdc18546e402"
+          },
+          {
+            "bytes": "a00e3131f2a077390d88f54457c18fdb"
+          },
+          {
+            "bytes": "8ea13a9bdf057cb69da4b473dc1defdd08ffe788c31edc809ac4c1dbbb704c55"
+          },
+          {
+            "bytes": "2b82d7cbd565165894c121ce5bd08733"
+          },
+          {
+            "bytes": "bedba4d1dd229ed4803fbd764dd67f47c4101a54e43b135739862cfde58e77cc"
+          }
+        ]
+      },
+      "name": "far_end_changes_keys",
+      "steps": [
+        {
+          "code": "typed",
+          "op": "start",
+          "out": [],
+          "result": "ok"
+        },
+        {
+          "conn": 1,
+          "host": "fake1",
+          "ledger": 4,
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000701644b37514d02664c6170746f70",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300020102025041414141414141414141414141414141",
+                "from": "fake1"
+              }
+            },
+            {
+              "persist_ledger": {
+                "expected": null,
+                "record": "a401776d6f757373652d6469726563742d6a6f696e65722d763102644b37514d0304041a6ab13b80"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02582220548bf65be713db5e75d73008de5e71277f43d6d66ec1581fecbb74fce9f71e1f00",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad025862202a486c156162e9af60d16cc20b2f1e53fde9ddb28a4b0baf63adcbb9be9fca1d003bc64794f59d14532b24068b292170b3b2ae66306d70b773723702073a4b1cf7a9d7251704b6389e99c821cba1266b7844af72515d10f2cc3af88c58e2c20853",
+                "from": "fake1"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000501509a9ec1a2a6c152e5b938b4dd05f045ad020a",
+                "from": "joiner"
+              }
+            },
+            {
+              "close": {
+                "code": "pairing_failed",
+                "conn": 1,
+                "from": "joiner"
+              }
+            },
+            {
+              "joiner": {
+                "ended": "code_failed:4"
+              }
+            }
+          ],
+          "state": "ended:code_failed:4"
+        },
+        {
+          "code": "typed",
+          "op": "start",
+          "out": [],
+          "result": "ok"
+        },
+        {
+          "conn": 2,
+          "host": "fake2",
+          "ledger": 3,
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a3000701644b37514d02664c6170746f70",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a300020102025042424242424242424242424242424242",
+                "from": "fake2"
+              }
+            },
+            {
+              "persist_ledger": {
+                "expected": "a401776d6f757373652d6469726563742d6a6f696e65722d763102644b37514d0304041a6ab13b80",
+                "record": "a401776d6f757373652d6469726563742d6a6f696e65722d763102644b37514d0303041a6ab13b80"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a30004015084627a34f6c10de28b77f93ea341ef9702582220d04c0c8630eea291d9c1bfa5a160761af8de419827a23b0e6b7dc334540e260200",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a30004015084627a34f6c10de28b77f93ea341ef97025862202673e2e70fbd663ad52ac61e797bfa7b6e618d8692a6b5cefa0ae02530966b530038c7e6939158482eaadb24ae82a2f9dcc58c76194033b0ab7a2dfeabbfae0101b5ff7b768e5adcc8c712ddf70602ef592979240c5cd6023aa5d4e251c8874932",
+                "from": "fake2"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a30005015084627a34f6c10de28b77f93ea341ef97020a",
+                "from": "joiner"
+              }
+            },
+            {
+              "close": {
+                "code": "pairing_failed",
+                "conn": 2,
+                "from": "joiner"
+              }
+            },
+            {
+              "joiner": {
+                "ended": "code_failed:3"
+              }
+            }
+          ],
+          "state": "ended:code_failed:3"
+        },
+        {
+          "code": "typed",
+          "op": "start",
+          "out": [],
+          "result": "ok"
+        },
+        {
+          "conn": 3,
+          "host": "fake3",
+          "ledger": 2,
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 3,
+                "control": "a3000701644b37514d02664c6170746f70",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 3,
+                "control": "a300020102025043434343434343434343434343434343",
+                "from": "fake3"
+              }
+            },
+            {
+              "persist_ledger": {
+                "expected": "a401776d6f757373652d6469726563742d6a6f696e65722d763102644b37514d0303041a6ab13b80",
+                "record": "a401776d6f757373652d6469726563742d6a6f696e65722d763102644b37514d0302041a6ab13b80"
+              }
+            },
+            {
+              "send": {
+                "conn": 3,
+                "control": "a300040150014919d49270c47d113de49f6a42639a025822203ae5ae86c9d9366ca3f11156be7678adc56aeb76226b3ce647e20e2087aedb0400",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 3,
+                "control": "a300040150014919d49270c47d113de49f6a42639a02586220e0d8d9ddaa72ce2ea7066b2e8f213b9d737b7f2e27205075d5627ec16faf443f0073eed1e7e69df444418fd94816872cbea77a9090c4219e4e3190fdc5726a7db9c4954040bd332d76d16811fe2371df092299b89758a10099014381f730eff1b9",
+                "from": "fake3"
+              }
+            },
+            {
+              "send": {
+                "conn": 3,
+                "control": "a300050150014919d49270c47d113de49f6a42639a020a",
+                "from": "joiner"
+              }
+            },
+            {
+              "close": {
+                "code": "pairing_failed",
+                "conn": 3,
+                "from": "joiner"
+              }
+            },
+            {
+              "joiner": {
+                "ended": "code_failed:2"
+              }
+            }
+          ],
+          "state": "ended:code_failed:2"
+        },
+        {
+          "code": "typed",
+          "op": "start",
+          "out": [],
+          "result": "ok"
+        },
+        {
+          "conn": 4,
+          "host": "fake4",
+          "ledger": 1,
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 4,
+                "control": "a3000701644b37514d02664c6170746f70",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 4,
+                "control": "a300020102025044444444444444444444444444444444",
+                "from": "fake4"
+              }
+            },
+            {
+              "persist_ledger": {
+                "expected": "a401776d6f757373652d6469726563742d6a6f696e65722d763102644b37514d0302041a6ab13b80",
+                "record": "a401776d6f757373652d6469726563742d6a6f696e65722d763102644b37514d0301041a6ab13b80"
+              }
+            },
+            {
+              "send": {
+                "conn": 4,
+                "control": "a300040150a00e3131f2a077390d88f54457c18fdb02582220c8238b351cbe5194c69ca5d05ce1a5eebd40e41d9ef9f2526364a46cf182bd3400",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 4,
+                "control": "a300040150a00e3131f2a077390d88f54457c18fdb02586220e0dba03bfec1b501794e255c401cb79448bb3e2ea37e2e876a834b838c12bb74009245f8c97faa95e401911b44a999f863ff5e7d7306d412f38eeb61afeabc7c88892765a4da302c52ea8dd9a6d0e31aadd015f20a66b7086e3044a3f28f87ed8a",
+                "from": "fake4"
+              }
+            },
+            {
+              "send": {
+                "conn": 4,
+                "control": "a300050150a00e3131f2a077390d88f54457c18fdb020a",
+                "from": "joiner"
+              }
+            },
+            {
+              "close": {
+                "code": "pairing_failed",
+                "conn": 4,
+                "from": "joiner"
+              }
+            },
+            {
+              "joiner": {
+                "ended": "code_failed:1"
+              }
+            }
+          ],
+          "state": "ended:code_failed:1"
+        },
+        {
+          "code": "typed",
+          "op": "start",
+          "out": [],
+          "result": "ok"
+        },
+        {
+          "conn": 5,
+          "host": "fake5",
+          "ledger": 0,
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 5,
+                "control": "a3000701644b37514d02664c6170746f70",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 5,
+                "control": "a300020102025045454545454545454545454545454545",
+                "from": "fake5"
+              }
+            },
+            {
+              "persist_ledger": {
+                "expected": "a401776d6f757373652d6469726563742d6a6f696e65722d763102644b37514d0301041a6ab13b80",
+                "record": "a401776d6f757373652d6469726563742d6a6f696e65722d763102644b37514d0300041a6ab13b80"
+              }
+            },
+            {
+              "send": {
+                "conn": 5,
+                "control": "a3000401502b82d7cbd565165894c121ce5bd08733025822209e930b4654aa69f3e601b19712fba35febd0d785f0ee95e0d6dbe7509ef12d5900",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 5,
+                "control": "a3000401502b82d7cbd565165894c121ce5bd0873302586220b83ddfd95b8d00e67d7de8bd3953e1e6999fb2cd4e34acd8e8543257778cab52007a95ea5945703655a95ac54e31255deea20b4671661bd6be5ecd23e23ba8f5d05f58794bfa8570484109aef53ee1a210aa7b1a3c06775d53cd3c470803a8fbba",
+                "from": "fake5"
+              }
+            },
+            {
+              "send": {
+                "conn": 5,
+                "control": "a3000501502b82d7cbd565165894c121ce5bd08733020a",
+                "from": "joiner"
+              }
+            },
+            {
+              "close": {
+                "code": "attempts_exhausted",
+                "conn": 5,
+                "from": "joiner"
+              }
+            },
+            {
+              "joiner": {
+                "ended": "attempts_exhausted"
+              }
+            }
+          ],
+          "pending": null,
+          "pinned": false,
+          "state": "ended:attempts_exhausted"
+        },
+        {
+          "code": "typed",
+          "op": "start",
+          "out": [],
+          "result": "attempts_exhausted"
+        }
+      ]
+    },
+    {
+      "code": "DMMG-CYFD-DT44",
+      "description": "The far end shows this device's own identity key: the joiner closes with pairing_failed and sends nothing else (the I/O layer refuses that key even before its own certificate goes out).",
+      "draws": {
+        "host": [
+          {
+            "bytes": "b2125f5befebfd95faac46bc9e0e7433"
+          },
+          {
+            "bytes": "0df474300c3eef4ded9ae4c4"
+          }
+        ],
+        "joiner": []
+      },
+      "name": "own_device",
+      "steps": [
+        {
+          "code": "right",
+          "op": "start",
+          "out": [],
+          "result": "ok"
+        },
+        {
+          "conn": 1,
+          "host": "own",
+          "ledger": null,
+          "op": "connect",
+          "out": [
+            {
+              "close": {
+                "code": "pairing_failed",
+                "conn": 1,
+                "from": "joiner"
+              }
+            },
+            {
+              "joiner": {
+                "ended": "own_device"
+              }
+            }
+          ],
+          "state": "ended:own_device"
+        }
+      ]
+    },
+    {
+      "code": "DMMG-CYFD-DT44",
+      "description": "The host's HELLO agrees on minor 3: the joiner closes with unsupported_version before JOIN_DIRECT and reports that the host needs an update.",
+      "draws": {
+        "host": [
+          {
+            "bytes": "b2125f5befebfd95faac46bc9e0e7433"
+          },
+          {
+            "bytes": "0df474300c3eef4ded9ae4c4"
+          }
+        ],
+        "joiner": []
+      },
+      "name": "minor_3_host",
+      "steps": [
+        {
+          "code": "right",
+          "op": "start",
+          "out": [],
+          "result": "ok"
+        },
+        {
+          "conn": 1,
+          "host": "host",
+          "ledger": null,
+          "minor": 3,
+          "op": "connect",
+          "out": [
+            {
+              "close": {
+                "code": "unsupported_version",
+                "conn": 1,
+                "from": "joiner"
+              }
+            },
+            {
+              "joiner": {
+                "ended": "needs_update"
+              }
+            }
+          ],
+          "state": "ended:needs_update"
+        }
+      ]
+    },
+    {
+      "code": "DMMG-CYFD-DT44",
+      "description": "The owner declines: the host closes with pairing_declined, which settles and clears the pending record.",
+      "draws": {
+        "host": [
+          {
+            "bytes": "b2125f5befebfd95faac46bc9e0e7433"
+          },
+          {
+            "bytes": "0df474300c3eef4ded9ae4c4"
+          },
+          {
+            "bytes": "e4794ee2bcc061439387ca193531e1f4d3a5a8ccd9140d3317abc21765feb579"
+          }
+        ],
+        "joiner": [
+          {
+            "bytes": "9a9ec1a2a6c152e5b938b4dd05f045ad"
+          },
+          {
+            "bytes": "e11a1b1776dff6485acc5921c49dcdd2b0a8148d9aa75b949e0af167af1766f4"
+          }
+        ]
+      },
+      "name": "declined",
+      "steps": [
+        {
+          "code": "right",
+          "op": "start",
+          "out": [],
+          "result": "ok"
+        },
+        {
+          "conn": 1,
+          "host": "host",
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300070164444d4d4702664c6170746f70",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000201020250b2125f5befebfd95faac46bc9e0e7433",
+                "from": "host"
+              }
+            },
+            {
+              "persist_ledger": {
+                "expected": null,
+                "record": "a401776d6f757373652d6469726563742d6a6f696e65722d76310264444d4d470304041a6ab13b80"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02582220feaf9e313a8f6fbbd224fc0a9852d5e49f88b9b0d0b92b2cc12e352c2a971f7d00",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02586220169bdf6c0fd103749ebf2ffe4e0b840dcc04348d15fbb972cca9e36b1b277d5d003581ea7114c3f912695c1f757557fe6a540c83385b85a24a20e7a14ccf96c5fa4fe331cc3947be5a2763357ec811b5d6d7f022f777a01d57a2ff4a0adc23ab98",
+                "from": "host"
+              }
+            },
+            {
+              "persist_pending": {
+                "expected": null,
+                "record": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700"
+              }
+            },
+            {
+              "joiner": "code_passed"
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad025840dab46c1345bd4dc78dc1f917ce72cfdba650327dda68aecec8cf7de010395c5d635a13511d21e1f47188ca3701696b6b25f428d22e91cd0d4d92d99d20c08a05",
+                "from": "joiner"
+              }
+            }
+          ]
+        },
+        {
+          "granted": false,
+          "op": "decline",
+          "out": [
+            {
+              "close": {
+                "code": "pairing_declined",
+                "conn": 1,
+                "from": "host"
+              }
+            },
+            {
+              "persist_pending": {
+                "expected": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700",
+                "record": null
+              }
+            },
+            {
+              "joiner": {
+                "ended": "closed:pairing_declined"
+              }
+            }
+          ],
+          "pending": null,
+          "pinned": false,
+          "state": "ended:closed:pairing_declined"
+        }
+      ]
+    },
+    {
+      "code": "DMMG-CYFD-DT44",
+      "description": "The owner allows, but the connection breaks before PAIRED arrives: the pending record stays. The recovery dials pinned, gets step 2's AUTHORIZED {live} and then PAIRED from the grant's receipt.",
+      "draws": {
+        "host": [
+          {
+            "bytes": "b2125f5befebfd95faac46bc9e0e7433"
+          },
+          {
+            "bytes": "0df474300c3eef4ded9ae4c4"
+          },
+          {
+            "bytes": "e4794ee2bcc061439387ca193531e1f4d3a5a8ccd9140d3317abc21765feb579"
+          }
+        ],
+        "joiner": [
+          {
+            "bytes": "9a9ec1a2a6c152e5b938b4dd05f045ad"
+          },
+          {
+            "bytes": "e11a1b1776dff6485acc5921c49dcdd2b0a8148d9aa75b949e0af167af1766f4"
+          }
+        ]
+      },
+      "name": "lost_paired_then_recovery",
+      "steps": [
+        {
+          "code": "right",
+          "op": "start",
+          "out": [],
+          "result": "ok"
+        },
+        {
+          "conn": 1,
+          "host": "host",
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300070164444d4d4702664c6170746f70",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000201020250b2125f5befebfd95faac46bc9e0e7433",
+                "from": "host"
+              }
+            },
+            {
+              "persist_ledger": {
+                "expected": null,
+                "record": "a401776d6f757373652d6469726563742d6a6f696e65722d76310264444d4d470304041a6ab13b80"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02582220feaf9e313a8f6fbbd224fc0a9852d5e49f88b9b0d0b92b2cc12e352c2a971f7d00",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02586220169bdf6c0fd103749ebf2ffe4e0b840dcc04348d15fbb972cca9e36b1b277d5d003581ea7114c3f912695c1f757557fe6a540c83385b85a24a20e7a14ccf96c5fa4fe331cc3947be5a2763357ec811b5d6d7f022f777a01d57a2ff4a0adc23ab98",
+                "from": "host"
+              }
+            },
+            {
+              "persist_pending": {
+                "expected": null,
+                "record": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700"
+              }
+            },
+            {
+              "joiner": "code_passed"
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad025840dab46c1345bd4dc78dc1f917ce72cfdba650327dda68aecec8cf7de010395c5d635a13511d21e1f47188ca3701696b6b25f428d22e91cd0d4d92d99d20c08a05",
+                "from": "joiner"
+              }
+            }
+          ]
+        },
+        {
+          "granted": true,
+          "lose": "paired",
+          "op": "allow",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000601644465736b02656f776e6572",
+                "from": "host"
+              }
+            },
+            {
+              "broken": 1
+            },
+            {
+              "joiner": "away"
+            }
+          ],
+          "pending": "pending",
+          "pinned": false,
+          "state": "away"
+        },
+        {
+          "conn": 2,
+          "host": "host",
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a200020101",
+                "from": "host"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a400070164444d4d4702664c6170746f700350b2125f5befebfd95faac46bc9e0e7433",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a3000601644465736b02656f776e6572",
+                "from": "host"
+              }
+            },
+            {
+              "joiner": {
+                "paired": {
+                  "address": "192.168.1.20:47100",
+                  "host": "040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794",
+                  "invitation": "b2125f5befebfd95faac46bc9e0e7433",
+                  "name": "Desk",
+                  "role": "owner"
+                }
+              }
+            },
+            {
+              "persist_pending": {
+                "expected": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700",
+                "record": null
+              }
+            },
+            {
+              "joiner": {
+                "ended": "paired"
+              }
+            }
+          ],
+          "pending": null,
+          "pinned": true,
+          "state": "ended:paired"
+        }
+      ]
+    },
+    {
+      "code": "DMMG-CYFD-DT44",
+      "description": "The connection drops while the device waits; the owner allows it while it is away. Its recovery is answered AUTHORIZED {join_only, I}, enrolled and sent PAIRED.",
+      "draws": {
+        "host": [
+          {
+            "bytes": "b2125f5befebfd95faac46bc9e0e7433"
+          },
+          {
+            "bytes": "0df474300c3eef4ded9ae4c4"
+          },
+          {
+            "bytes": "e4794ee2bcc061439387ca193531e1f4d3a5a8ccd9140d3317abc21765feb579"
+          }
+        ],
+        "joiner": [
+          {
+            "bytes": "9a9ec1a2a6c152e5b938b4dd05f045ad"
+          },
+          {
+            "bytes": "e11a1b1776dff6485acc5921c49dcdd2b0a8148d9aa75b949e0af167af1766f4"
+          }
+        ]
+      },
+      "name": "allow_while_away",
+      "steps": [
+        {
+          "code": "right",
+          "op": "start",
+          "out": [],
+          "result": "ok"
+        },
+        {
+          "conn": 1,
+          "host": "host",
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300070164444d4d4702664c6170746f70",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000201020250b2125f5befebfd95faac46bc9e0e7433",
+                "from": "host"
+              }
+            },
+            {
+              "persist_ledger": {
+                "expected": null,
+                "record": "a401776d6f757373652d6469726563742d6a6f696e65722d76310264444d4d470304041a6ab13b80"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02582220feaf9e313a8f6fbbd224fc0a9852d5e49f88b9b0d0b92b2cc12e352c2a971f7d00",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02586220169bdf6c0fd103749ebf2ffe4e0b840dcc04348d15fbb972cca9e36b1b277d5d003581ea7114c3f912695c1f757557fe6a540c83385b85a24a20e7a14ccf96c5fa4fe331cc3947be5a2763357ec811b5d6d7f022f777a01d57a2ff4a0adc23ab98",
+                "from": "host"
+              }
+            },
+            {
+              "persist_pending": {
+                "expected": null,
+                "record": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700"
+              }
+            },
+            {
+              "joiner": "code_passed"
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad025840dab46c1345bd4dc78dc1f917ce72cfdba650327dda68aecec8cf7de010395c5d635a13511d21e1f47188ca3701696b6b25f428d22e91cd0d4d92d99d20c08a05",
+                "from": "joiner"
+              }
+            }
+          ]
+        },
+        {
+          "op": "drop",
+          "out": [
+            {
+              "broken": 1
+            },
+            {
+              "joiner": "away"
+            }
+          ],
+          "pending": "pending",
+          "state": "away"
+        },
+        {
+          "granted": false,
+          "op": "allow",
+          "out": []
+        },
+        {
+          "conn": 2,
+          "granted": true,
+          "host": "host",
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a400070164444d4d4702664c6170746f700350b2125f5befebfd95faac46bc9e0e7433",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a3000201020250b2125f5befebfd95faac46bc9e0e7433",
+                "from": "host"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a3000601644465736b02656f776e6572",
+                "from": "host"
+              }
+            },
+            {
+              "joiner": "code_passed"
+            },
+            {
+              "joiner": {
+                "paired": {
+                  "address": "192.168.1.20:47100",
+                  "host": "040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794",
+                  "invitation": "b2125f5befebfd95faac46bc9e0e7433",
+                  "name": "Desk",
+                  "role": "owner"
+                }
+              }
+            },
+            {
+              "persist_pending": {
+                "expected": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700",
+                "record": null
+              }
+            },
+            {
+              "joiner": {
+                "ended": "paired"
+              }
+            }
+          ],
+          "pending": null,
+          "pinned": true,
+          "state": "ended:paired"
+        }
+      ]
+    },
+    {
+      "code": "DMMG-CYFD-DT44",
+      "description": "The device cancels while connected: the pending record is marked cancelled first, then CODE_ABORT {A, cancelled} and a close with cancelled. Its next connection delivers the cancel and hears cancelled, which clears the record.",
+      "draws": {
+        "host": [
+          {
+            "bytes": "b2125f5befebfd95faac46bc9e0e7433"
+          },
+          {
+            "bytes": "0df474300c3eef4ded9ae4c4"
+          },
+          {
+            "bytes": "e4794ee2bcc061439387ca193531e1f4d3a5a8ccd9140d3317abc21765feb579"
+          }
+        ],
+        "joiner": [
+          {
+            "bytes": "9a9ec1a2a6c152e5b938b4dd05f045ad"
+          },
+          {
+            "bytes": "e11a1b1776dff6485acc5921c49dcdd2b0a8148d9aa75b949e0af167af1766f4"
+          }
+        ]
+      },
+      "name": "cancel_connected",
+      "steps": [
+        {
+          "code": "right",
+          "op": "start",
+          "out": [],
+          "result": "ok"
+        },
+        {
+          "conn": 1,
+          "host": "host",
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300070164444d4d4702664c6170746f70",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000201020250b2125f5befebfd95faac46bc9e0e7433",
+                "from": "host"
+              }
+            },
+            {
+              "persist_ledger": {
+                "expected": null,
+                "record": "a401776d6f757373652d6469726563742d6a6f696e65722d76310264444d4d470304041a6ab13b80"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02582220feaf9e313a8f6fbbd224fc0a9852d5e49f88b9b0d0b92b2cc12e352c2a971f7d00",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02586220169bdf6c0fd103749ebf2ffe4e0b840dcc04348d15fbb972cca9e36b1b277d5d003581ea7114c3f912695c1f757557fe6a540c83385b85a24a20e7a14ccf96c5fa4fe331cc3947be5a2763357ec811b5d6d7f022f777a01d57a2ff4a0adc23ab98",
+                "from": "host"
+              }
+            },
+            {
+              "persist_pending": {
+                "expected": null,
+                "record": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700"
+              }
+            },
+            {
+              "joiner": "code_passed"
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad025840dab46c1345bd4dc78dc1f917ce72cfdba650327dda68aecec8cf7de010395c5d635a13511d21e1f47188ca3701696b6b25f428d22e91cd0d4d92d99d20c08a05",
+                "from": "joiner"
+              }
+            }
+          ]
+        },
+        {
+          "op": "cancel",
+          "out": [
+            {
+              "persist_pending": {
+                "expected": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700",
+                "record": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800701"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000501509a9ec1a2a6c152e5b938b4dd05f045ad0210",
+                "from": "joiner"
+              }
+            },
+            {
+              "close": {
+                "code": "cancelled",
+                "conn": 1,
+                "from": "host"
+              }
+            },
+            {
+              "close": {
+                "code": "cancelled",
+                "conn": 1,
+                "from": "joiner"
+              }
+            },
+            {
+              "joiner": "away"
+            }
+          ],
+          "pending": "cancelled",
+          "state": "away"
+        },
+        {
+          "conn": 2,
+          "granted": false,
+          "host": "host",
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a500070164444d4d4702664c6170746f700350b2125f5befebfd95faac46bc9e0e74330401",
+                "from": "joiner"
+              }
+            },
+            {
+              "close": {
+                "code": "cancelled",
+                "conn": 2,
+                "from": "host"
+              }
+            },
+            {
+              "persist_pending": {
+                "expected": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800701",
+                "record": null
+              }
+            },
+            {
+              "joiner": {
+                "ended": "closed:cancelled"
+              }
+            }
+          ],
+          "pending": null,
+          "pinned": false,
+          "state": "ended:closed:cancelled"
+        }
+      ]
+    },
+    {
+      "code": "DMMG-CYFD-DT44",
+      "description": "The device cancels while away: the record is marked cancelled and the cancel goes with the next connection.",
+      "draws": {
+        "host": [
+          {
+            "bytes": "b2125f5befebfd95faac46bc9e0e7433"
+          },
+          {
+            "bytes": "0df474300c3eef4ded9ae4c4"
+          },
+          {
+            "bytes": "e4794ee2bcc061439387ca193531e1f4d3a5a8ccd9140d3317abc21765feb579"
+          }
+        ],
+        "joiner": [
+          {
+            "bytes": "9a9ec1a2a6c152e5b938b4dd05f045ad"
+          },
+          {
+            "bytes": "e11a1b1776dff6485acc5921c49dcdd2b0a8148d9aa75b949e0af167af1766f4"
+          }
+        ]
+      },
+      "name": "cancel_away",
+      "steps": [
+        {
+          "code": "right",
+          "op": "start",
+          "out": [],
+          "result": "ok"
+        },
+        {
+          "conn": 1,
+          "host": "host",
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300070164444d4d4702664c6170746f70",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000201020250b2125f5befebfd95faac46bc9e0e7433",
+                "from": "host"
+              }
+            },
+            {
+              "persist_ledger": {
+                "expected": null,
+                "record": "a401776d6f757373652d6469726563742d6a6f696e65722d76310264444d4d470304041a6ab13b80"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02582220feaf9e313a8f6fbbd224fc0a9852d5e49f88b9b0d0b92b2cc12e352c2a971f7d00",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02586220169bdf6c0fd103749ebf2ffe4e0b840dcc04348d15fbb972cca9e36b1b277d5d003581ea7114c3f912695c1f757557fe6a540c83385b85a24a20e7a14ccf96c5fa4fe331cc3947be5a2763357ec811b5d6d7f022f777a01d57a2ff4a0adc23ab98",
+                "from": "host"
+              }
+            },
+            {
+              "persist_pending": {
+                "expected": null,
+                "record": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700"
+              }
+            },
+            {
+              "joiner": "code_passed"
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad025840dab46c1345bd4dc78dc1f917ce72cfdba650327dda68aecec8cf7de010395c5d635a13511d21e1f47188ca3701696b6b25f428d22e91cd0d4d92d99d20c08a05",
+                "from": "joiner"
+              }
+            }
+          ]
+        },
+        {
+          "op": "drop",
+          "out": [
+            {
+              "broken": 1
+            },
+            {
+              "joiner": "away"
+            }
+          ]
+        },
+        {
+          "op": "cancel",
+          "out": [
+            {
+              "persist_pending": {
+                "expected": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700",
+                "record": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800701"
+              }
+            },
+            {
+              "joiner": "away"
+            }
+          ],
+          "pending": "cancelled",
+          "state": "away"
+        },
+        {
+          "conn": 2,
+          "granted": false,
+          "host": "host",
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a500070164444d4d4702664c6170746f700350b2125f5befebfd95faac46bc9e0e74330401",
+                "from": "joiner"
+              }
+            },
+            {
+              "close": {
+                "code": "cancelled",
+                "conn": 2,
+                "from": "host"
+              }
+            },
+            {
+              "persist_pending": {
+                "expected": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800701",
+                "record": null
+              }
+            },
+            {
+              "joiner": {
+                "ended": "closed:cancelled"
+              }
+            }
+          ],
+          "pending": null,
+          "state": "ended:closed:cancelled"
+        }
+      ]
+    },
+    {
+      "code": "DMMG-CYFD-DT44",
+      "description": "The owner allows while the device cancels. The host's PAIRED is on its way when the cancel leaves; the cancel reaches the host on the enrolled connection and the grant is removed. The joiner ignores the PAIRED that crossed its cancel and pins nothing; its recovery finds no invitation, which clears the record.",
+      "draws": {
+        "host": [
+          {
+            "bytes": "b2125f5befebfd95faac46bc9e0e7433"
+          },
+          {
+            "bytes": "0df474300c3eef4ded9ae4c4"
+          },
+          {
+            "bytes": "e4794ee2bcc061439387ca193531e1f4d3a5a8ccd9140d3317abc21765feb579"
+          }
+        ],
+        "joiner": [
+          {
+            "bytes": "9a9ec1a2a6c152e5b938b4dd05f045ad"
+          },
+          {
+            "bytes": "e11a1b1776dff6485acc5921c49dcdd2b0a8148d9aa75b949e0af167af1766f4"
+          }
+        ]
+      },
+      "name": "cancel_crossing_allow",
+      "steps": [
+        {
+          "code": "right",
+          "op": "start",
+          "out": [],
+          "result": "ok"
+        },
+        {
+          "conn": 1,
+          "host": "host",
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300070164444d4d4702664c6170746f70",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000201020250b2125f5befebfd95faac46bc9e0e7433",
+                "from": "host"
+              }
+            },
+            {
+              "persist_ledger": {
+                "expected": null,
+                "record": "a401776d6f757373652d6469726563742d6a6f696e65722d76310264444d4d470304041a6ab13b80"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02582220feaf9e313a8f6fbbd224fc0a9852d5e49f88b9b0d0b92b2cc12e352c2a971f7d00",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02586220169bdf6c0fd103749ebf2ffe4e0b840dcc04348d15fbb972cca9e36b1b277d5d003581ea7114c3f912695c1f757557fe6a540c83385b85a24a20e7a14ccf96c5fa4fe331cc3947be5a2763357ec811b5d6d7f022f777a01d57a2ff4a0adc23ab98",
+                "from": "host"
+              }
+            },
+            {
+              "persist_pending": {
+                "expected": null,
+                "record": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700"
+              }
+            },
+            {
+              "joiner": "code_passed"
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad025840dab46c1345bd4dc78dc1f917ce72cfdba650327dda68aecec8cf7de010395c5d635a13511d21e1f47188ca3701696b6b25f428d22e91cd0d4d92d99d20c08a05",
+                "from": "joiner"
+              }
+            }
+          ]
+        },
+        {
+          "granted": true,
+          "in_transit": true,
+          "op": "allow",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000601644465736b02656f776e6572",
+                "from": "host"
+              }
+            }
+          ]
+        },
+        {
+          "granted": false,
+          "op": "cancel",
+          "out": [
+            {
+              "persist_pending": {
+                "expected": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700",
+                "record": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800701"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000501509a9ec1a2a6c152e5b938b4dd05f045ad0210",
+                "from": "joiner"
+              }
+            },
+            {
+              "close": {
+                "code": "cancelled",
+                "conn": 1,
+                "from": "host"
+              }
+            },
+            {
+              "close": {
+                "code": "cancelled",
+                "conn": 1,
+                "from": "joiner"
+              }
+            },
+            {
+              "joiner": "away"
+            },
+            {
+              "arrives_after_cancel": "a3000601644465736b02656f776e6572"
+            }
+          ],
+          "pending": "cancelled",
+          "pinned": false,
+          "state": "away"
+        },
+        {
+          "conn": 2,
+          "granted": false,
+          "host": "host",
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a500070164444d4d4702664c6170746f700350b2125f5befebfd95faac46bc9e0e74330401",
+                "from": "joiner"
+              }
+            },
+            {
+              "miss_hold": {
+                "conn": 2,
+                "hold_ms": 1000
+              }
+            },
+            {
+              "close": {
+                "code": "invitation_invalid",
+                "conn": 2,
+                "from": "host"
+              }
+            },
+            {
+              "persist_pending": {
+                "expected": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800701",
+                "record": null
+              }
+            },
+            {
+              "joiner": {
+                "ended": "closed:invitation_invalid"
+              }
+            }
+          ],
+          "pending": null,
+          "pinned": false,
+          "state": "ended:closed:invitation_invalid"
+        }
+      ]
+    },
+    {
+      "code": "DMMG-CYFD-DT44",
+      "description": "The connection breaks after the joiner stored its pending record but before its confirmation reached the host. The recovery hears AUTHORIZED {join_only, I, not_received}: the record is cleared and the person connects again with the code.",
+      "draws": {
+        "host": [
+          {
+            "bytes": "b2125f5befebfd95faac46bc9e0e7433"
+          },
+          {
+            "bytes": "0df474300c3eef4ded9ae4c4"
+          },
+          {
+            "bytes": "e4794ee2bcc061439387ca193531e1f4d3a5a8ccd9140d3317abc21765feb579"
+          }
+        ],
+        "joiner": [
+          {
+            "bytes": "9a9ec1a2a6c152e5b938b4dd05f045ad"
+          },
+          {
+            "bytes": "e11a1b1776dff6485acc5921c49dcdd2b0a8148d9aa75b949e0af167af1766f4"
+          }
+        ]
+      },
+      "name": "not_received",
+      "steps": [
+        {
+          "code": "right",
+          "op": "start",
+          "out": [],
+          "result": "ok"
+        },
+        {
+          "conn": 1,
+          "host": "host",
+          "lose": "msg_c",
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300070164444d4d4702664c6170746f70",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000201020250b2125f5befebfd95faac46bc9e0e7433",
+                "from": "host"
+              }
+            },
+            {
+              "persist_ledger": {
+                "expected": null,
+                "record": "a401776d6f757373652d6469726563742d6a6f696e65722d76310264444d4d470304041a6ab13b80"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02582220feaf9e313a8f6fbbd224fc0a9852d5e49f88b9b0d0b92b2cc12e352c2a971f7d00",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02586220169bdf6c0fd103749ebf2ffe4e0b840dcc04348d15fbb972cca9e36b1b277d5d003581ea7114c3f912695c1f757557fe6a540c83385b85a24a20e7a14ccf96c5fa4fe331cc3947be5a2763357ec811b5d6d7f022f777a01d57a2ff4a0adc23ab98",
+                "from": "host"
+              }
+            },
+            {
+              "persist_pending": {
+                "expected": null,
+                "record": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700"
+              }
+            },
+            {
+              "joiner": "code_passed"
+            },
+            {
+              "broken": 1
+            },
+            {
+              "joiner": "away"
+            }
+          ],
+          "pending": "pending",
+          "state": "away"
+        },
+        {
+          "conn": 2,
+          "host": "host",
+          "ledger": 4,
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a400070164444d4d4702664c6170746f700350b2125f5befebfd95faac46bc9e0e7433",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a4000201020250b2125f5befebfd95faac46bc9e0e74330301",
+                "from": "host"
+              }
+            },
+            {
+              "persist_pending": {
+                "expected": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700",
+                "record": null
+              }
+            },
+            {
+              "close": {
+                "code": "no_error",
+                "conn": 2,
+                "from": "joiner"
+              }
+            },
+            {
+              "joiner": {
+                "ended": "not_received:4"
+              }
+            }
+          ],
+          "pending": null,
+          "state": "ended:not_received:4"
+        }
+      ]
+    },
+    {
+      "code": "DMMG-CYFD-DT44",
+      "description": "The app stops right after its confirmation went out. A new flow resumes from the stored pending record with no code, recovers, waits for Allow and pairs.",
+      "draws": {
+        "host": [
+          {
+            "bytes": "b2125f5befebfd95faac46bc9e0e7433"
+          },
+          {
+            "bytes": "0df474300c3eef4ded9ae4c4"
+          },
+          {
+            "bytes": "e4794ee2bcc061439387ca193531e1f4d3a5a8ccd9140d3317abc21765feb579"
+          }
+        ],
+        "joiner": [
+          {
+            "bytes": "9a9ec1a2a6c152e5b938b4dd05f045ad"
+          },
+          {
+            "bytes": "e11a1b1776dff6485acc5921c49dcdd2b0a8148d9aa75b949e0af167af1766f4"
+          }
+        ]
+      },
+      "name": "crash_after_pending_mark",
+      "steps": [
+        {
+          "code": "right",
+          "op": "start",
+          "out": [],
+          "result": "ok"
+        },
+        {
+          "conn": 1,
+          "crash": "after_msg_c",
+          "host": "host",
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300070164444d4d4702664c6170746f70",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000201020250b2125f5befebfd95faac46bc9e0e7433",
+                "from": "host"
+              }
+            },
+            {
+              "persist_ledger": {
+                "expected": null,
+                "record": "a401776d6f757373652d6469726563742d6a6f696e65722d76310264444d4d470304041a6ab13b80"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02582220feaf9e313a8f6fbbd224fc0a9852d5e49f88b9b0d0b92b2cc12e352c2a971f7d00",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad02586220169bdf6c0fd103749ebf2ffe4e0b840dcc04348d15fbb972cca9e36b1b277d5d003581ea7114c3f912695c1f757557fe6a540c83385b85a24a20e7a14ccf96c5fa4fe331cc3947be5a2763357ec811b5d6d7f022f777a01d57a2ff4a0adc23ab98",
+                "from": "host"
+              }
+            },
+            {
+              "persist_pending": {
+                "expected": null,
+                "record": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700"
+              }
+            },
+            {
+              "joiner": "code_passed"
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000401509a9ec1a2a6c152e5b938b4dd05f045ad025840dab46c1345bd4dc78dc1f917ce72cfdba650327dda68aecec8cf7de010395c5d635a13511d21e1f47188ca3701696b6b25f428d22e91cd0d4d92d99d20c08a05",
+                "from": "joiner"
+              }
+            },
+            {
+              "crash": true
+            },
+            {
+              "broken": 1
+            }
+          ],
+          "pending": "pending"
+        },
+        {
+          "op": "resume",
+          "out": [],
+          "result": "ok"
+        },
+        {
+          "conn": 2,
+          "host": "host",
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a400070164444d4d4702664c6170746f700350b2125f5befebfd95faac46bc9e0e7433",
+                "from": "joiner"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a3000201020250b2125f5befebfd95faac46bc9e0e7433",
+                "from": "host"
+              }
+            },
+            {
+              "joiner": "code_passed"
+            }
+          ],
+          "state": "awaiting_allow"
+        },
+        {
+          "granted": true,
+          "op": "allow",
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a3000601644465736b02656f776e6572",
+                "from": "host"
+              }
+            },
+            {
+              "joiner": {
+                "paired": {
+                  "address": "192.168.1.20:47100",
+                  "host": "040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e5794",
+                  "invitation": "b2125f5befebfd95faac46bc9e0e7433",
+                  "name": "Desk",
+                  "role": "owner"
+                }
+              }
+            },
+            {
+              "persist_pending": {
+                "expected": "a70178186d6f757373652d6469726563742d70656e64696e672d76310264444d4d47035841040217e617f0b6443928278f96999e69a23a4f2c152bdf6d6cdf66e5b80282d4ed194a7debcb97712d2dda3ca85aa8765a56f45fc758599652f2897c65306e57940450b2125f5befebfd95faac46bc9e0e743305723139322e3136382e312e32303a3437313030061a6ab13b800700",
+                "record": null
+              }
+            },
+            {
+              "joiner": {
+                "ended": "paired"
+              }
+            }
+          ],
+          "pending": null,
+          "pinned": true,
+          "state": "ended:paired"
+        }
+      ]
+    }
+  ]
+}
