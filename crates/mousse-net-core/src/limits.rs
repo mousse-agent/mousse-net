@@ -238,6 +238,18 @@ define_limits! {
         host_attempts_per_invitation = "HOST_ATTEMPTS_PER_INVITATION": 3, [1, 3];
         /// Code attempts the joiner allows per ticket; a stored flow record holds at most 3 (wire.md 10.7; tighten only).
         joiner_attempts_per_flow = "JOINER_ATTEMPTS_PER_FLOW": 3, [1, 3];
+        /// How long a new Pair with IP invitation takes new attempts (wire.md 10.9; tighten only).
+        direct_invite_lifetime_secs = "DIRECT_INVITE_LIFETIME_SECS": 600, [60, 600];
+        /// Code attempts the host allows per Pair with IP invitation (wire.md 10.9; tighten only).
+        direct_host_attempts = "DIRECT_HOST_ATTEMPTS": 5, [1, 5];
+        /// Code attempts the joiner allows per typed lookup in 24 h (wire.md 10.9; tighten only).
+        direct_joiner_attempts = "DIRECT_JOINER_ATTEMPTS": 5, [1, 5];
+        /// How long after a device passed the code its request may be allowed and claimed, even past the invitation's expiry (wire.md 10.9; tighten only).
+        direct_allow_window_secs = "DIRECT_ALLOW_WINDOW_SECS": 300, [60, 300];
+        /// Pair with IP invitations open at once on one endpoint (wire.md 10.9; tighten only).
+        direct_max_open = "DIRECT_MAX_OPEN": 4, [1, 4];
+        /// How long the host holds a JOIN_DIRECT that found no invitation, with its pre-authorization place, before it closes (wire.md 10.9; lengthen only).
+        direct_miss_hold_ms = "DIRECT_MISS_HOLD_MS": 1_000, [1_000, 5_000];
     }
     agree(l) {
         if l.renew_retry_max_secs < l.renew_retry_first_secs {
@@ -277,6 +289,13 @@ mod tests {
         assert_eq!(d.ticket_lifetime_secs(), 600);
         assert_eq!(d.host_attempts_per_invitation(), 3);
         assert_eq!(d.joiner_attempts_per_flow(), 3);
+        // wire.md 10.9.
+        assert_eq!(d.direct_invite_lifetime_secs(), 600);
+        assert_eq!(d.direct_host_attempts(), 5);
+        assert_eq!(d.direct_joiner_attempts(), 5);
+        assert_eq!(d.direct_allow_window_secs(), 300);
+        assert_eq!(d.direct_max_open(), 4);
+        assert_eq!(d.direct_miss_hold_ms(), 1_000);
         assert_eq!(d.with_overrides(&[]), Ok(d));
         assert_eq!(Limits::default(), d);
     }
@@ -296,12 +315,23 @@ mod tests {
             "TICKET_LIFETIME_SECS",
             "HOST_ATTEMPTS_PER_INVITATION",
             "JOINER_ATTEMPTS_PER_FLOW",
+            "DIRECT_INVITE_LIFETIME_SECS",
+            "DIRECT_HOST_ATTEMPTS",
+            "DIRECT_JOINER_ATTEMPTS",
+            "DIRECT_ALLOW_WINDOW_SECS",
+            "DIRECT_MAX_OPEN",
         ];
         for spec in Limits::SPECS {
             if wire_bound.contains(&spec.name) {
                 assert_eq!(spec.max, spec.default, "{}", spec.name);
             }
         }
+        // The miss hold may only be lengthened.
+        let hold = Limits::SPECS
+            .iter()
+            .find(|s| s.name == "DIRECT_MISS_HOLD_MS")
+            .unwrap();
+        assert_eq!(hold.min, hold.default);
         // Renewal may only start earlier.
         let lead = Limits::SPECS
             .iter()

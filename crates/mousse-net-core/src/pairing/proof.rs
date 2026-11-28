@@ -14,7 +14,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use super::{AttemptId, InvitationId, InvitationKind, TicketSecret};
+use super::{AttemptId, DirectLookup, InvitationId, InvitationKind, TicketSecret};
 use crate::cbor::{self, Value};
 use crate::identity::IdentityPublicKey;
 
@@ -166,21 +166,74 @@ pub fn binding_transcript(
         (2, Value::Bytes(ticket_hash.to_vec())),
         (3, Value::Uint(kind.as_u64())),
         (4, Value::Uint(ticket_version)),
-        (
-            5,
-            Value::Array(vec![
-                Value::Array(vec![
-                    Value::Uint(ROLE_INITIATOR),
-                    Value::Bytes(joiner.as_bytes().to_vec()),
-                ]),
-                Value::Array(vec![
-                    Value::Uint(ROLE_RESPONDER),
-                    Value::Bytes(host.as_bytes().to_vec()),
-                ]),
-            ]),
-        ),
+        (5, role_keys(joiner, host)),
         (6, Value::Bytes(pair_exporter.to_vec())),
     ])))
+}
+
+/// Domain string of a direct invitation's digest `D`.
+pub const DIRECT_INVITE_DOMAIN: &str = "mousse-direct-invite-v1";
+
+/// Domain string of the direct binding transcript.
+pub const DIRECT_PAIR_DOMAIN: &str = "mousse-direct-pair-v1";
+
+/// The kind number of a direct invitation (Pair with IP) inside its binding
+/// transcript. Kind 3 never appears in a ticket.
+pub const DIRECT_KIND: u64 = 3;
+
+/// The direct ceremony version in the binding transcript. It never appears
+/// on the wire and stays 1 for the life of kind 3; a new ceremony is a new
+/// kind.
+pub const DIRECT_CEREMONY_VERSION: u64 = 1;
+
+/// A direct invitation's digest of public values:
+/// `D = SHA-256(CBOR {1: "mousse-direct-invite-v1", 2: lookup, 3: invitation id})`.
+/// It holds nothing derived from the code's secret.
+pub fn direct_invite_digest(lookup: &DirectLookup, invitation: &InvitationId) -> [u8; 32] {
+    let record = cbor::encode(&Value::Map(vec![
+        (1, Value::Text(DIRECT_INVITE_DOMAIN.to_owned())),
+        (2, Value::Text(lookup.as_str().to_owned())),
+        (3, Value::Bytes(invitation.0.to_vec())),
+    ]));
+    Sha256::digest(record).into()
+}
+
+/// The direct flow's binding transcript, the code exchange's `CI`
+/// (wire.md 10.9):
+/// `{1: "mousse-direct-pair-v1", 2: D, 3: 3, 4: 1,
+///   5: [[1, joiner identity], [2, host identity]], 6: pair exporter}`.
+pub fn direct_binding_transcript(
+    lookup: &DirectLookup,
+    invitation: &InvitationId,
+    host: &IdentityPublicKey,
+    joiner: &IdentityPublicKey,
+    pair_exporter: &[u8; EXPORTER_LEN],
+) -> BindingTranscript {
+    BindingTranscript(cbor::encode(&Value::Map(vec![
+        (1, Value::Text(DIRECT_PAIR_DOMAIN.to_owned())),
+        (
+            2,
+            Value::Bytes(direct_invite_digest(lookup, invitation).to_vec()),
+        ),
+        (3, Value::Uint(DIRECT_KIND)),
+        (4, Value::Uint(DIRECT_CEREMONY_VERSION)),
+        (5, role_keys(joiner, host)),
+        (6, Value::Bytes(pair_exporter.to_vec())),
+    ])))
+}
+
+/// `[[1, initiator (joiner) key], [2, responder (host) key]]`.
+fn role_keys(joiner: &IdentityPublicKey, host: &IdentityPublicKey) -> Value {
+    Value::Array(vec![
+        Value::Array(vec![
+            Value::Uint(ROLE_INITIATOR),
+            Value::Bytes(joiner.as_bytes().to_vec()),
+        ]),
+        Value::Array(vec![
+            Value::Uint(ROLE_RESPONDER),
+            Value::Bytes(host.as_bytes().to_vec()),
+        ]),
+    ])
 }
 
 /// Length of a code-exchange session id.
@@ -267,6 +320,24 @@ mod tests {
             binding_transcript(&[0; 32], InvitationKind::SendLink, 2, &h, &j, &[5; 32]),
             binding_transcript(&[0; 32], InvitationKind::SendLink, 1, &j, &h, &[5; 32]),
             binding_transcript(&[0; 32], InvitationKind::SendLink, 1, &h, &j, &[6; 32]),
+        ];
+        for v in variants {
+            assert_ne!(v, base);
+        }
+    }
+
+    #[test]
+    fn direct_transcript_changes_with_every_bound_input() {
+        let (h, j) = (key(1), key(2));
+        let l = |s| DirectLookup::from_canonical(s).unwrap();
+        let inv = InvitationId([1; 16]);
+        let base = direct_binding_transcript(&l("K7QM"), &inv, &h, &j, &[5; 32]);
+        let variants = [
+            direct_binding_transcript(&l("K7QN"), &inv, &h, &j, &[5; 32]),
+            direct_binding_transcript(&l("K7QM"), &InvitationId([2; 16]), &h, &j, &[5; 32]),
+            direct_binding_transcript(&l("K7QM"), &inv, &j, &h, &[5; 32]),
+            direct_binding_transcript(&l("K7QM"), &inv, &h, &key(3), &[5; 32]),
+            direct_binding_transcript(&l("K7QM"), &inv, &h, &j, &[6; 32]),
         ];
         for v in variants {
             assert_ne!(v, base);

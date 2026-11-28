@@ -13,7 +13,7 @@ use mousse_net_core::mux::{Mux, MuxEvent, MuxRole, PriorityClass};
 use mousse_net_core::pairing::{
     Arrival, BindingTranscript, CodeExchange, CodeExchangeFactory, CpaceExchangeFactory,
     ExchangeError, ExchangeRole, ExchangeStep, InvitationKind, InvitationStatus, JoinerError,
-    PairingCode, Ticket, SID_LEN,
+    Ticket, SID_LEN,
 };
 use mousse_net_core::{
     ErrorCode, Limits as CoreLimits, Millis, UnixTime, PROTOCOL_MINOR_VERSION, PROTOCOL_VERSION,
@@ -678,13 +678,13 @@ impl CodeExchangeFactory for FlagConfirm {
     fn start<R: rand_core::CryptoRng + ?Sized>(
         &self,
         role: ExchangeRole,
-        code: &PairingCode,
+        password: &[u8],
         binding: &BindingTranscript,
         sid: &[u8; SID_LEN],
         rng: &mut R,
     ) -> FlaggedExchange {
         FlaggedExchange {
-            inner: CpaceExchangeFactory.start(role, code, binding, sid, rng),
+            inner: CpaceExchangeFactory.start(role, password, binding, sid, rng),
             flag: self.0.clone(),
         }
     }

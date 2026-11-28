@@ -5,12 +5,14 @@ import { bytes, decode, encode, hex } from './cbor.ts';
 import { authenticateNativePeer, checkRaw, DerReader, derToRaw, issueCertificate, lanCandidate, nativeTlsPolicy, publicKey,
   rawToDer, SessionLifetime, sha256, signCertificateVerify, verify, verifyCertificate } from './certificate.ts';
 import * as cpace from './cpace.ts';
-import { DIRECT_CODE_ALPHABET, directCodeFromDraw, displayDirectCode, parseDirectCode } from './direct-code.ts';
+import { DIRECT_CODE_ALPHABET, directCode, directCodeFromDraw, directCpaceInputs, directInviteDigest, directTranscript,
+  displayDirectCode, parseDirectCode } from './direct-code.ts';
 import { PairingJoiner, trafficOf } from './pairing.ts';
 import { Gate, step2, Streams } from './session.ts';
 import * as relay from './relay.ts';
 import * as wire from './wire.ts';
-import { memoryFlowStore, replayAttemptSequence, replayEndToEnd } from './pairing-replay.mjs';
+import { memoryFlowStore, replayAttemptSequence, replayBeforeMsgA, replayDirectSequence,
+  replayEndToEnd } from './pairing-replay.mjs';
 
 const directory = new URL('../../spec/vectors/', import.meta.url);
 const fixtures = new Map(readdirSync(directory).filter(file => file.endsWith('.json'))
@@ -448,6 +450,47 @@ function outcome(expected, fn) {
       default: assert.fail(`unknown rejection stage ${r.stage}`);
     }
   });
+  // Kind 3, Pair with IP (wire.md 10.9 "Binding"): every value rebuilt from the inputs.
+  for (const r of v.pairing_runs) add(`pairing run ${r.name}`, () => {
+    const prs = bytes(r.PRS);
+    const code = directCode(r.lookup + prs.toString('latin1'));
+    const binding = { host: bytes(r.host_identity), joiner: bytes(r.joiner_identity), exporter: bytes(r.pair_exporter) };
+    const inputs = directCpaceInputs(code, bytes(r.invitation), binding, bytes(r.attempt));
+    matches(directInviteDigest(r.lookup, bytes(r.invitation)), r.D);
+    matches(inputs.digest, r.D);
+    matches(inputs.ci, r.CI);
+    matches(directTranscript(bytes(r.D), binding), r.CI);
+    matches(inputs.sid, r.sid);
+    matches(inputs.prs, r.PRS);
+    const generator = cpace.generator(inputs.prs, inputs.ci, inputs.sid);
+    assert.equal(generator.zpad, r.zpad_len);
+    // The generator string: lv(DSI), lv(PRS), then the zero padding's length byte and the zeros.
+    const at = cpace.prependLen(cpace.DSI).length + cpace.prependLen(inputs.prs).length;
+    assert.equal(generator.input[at], r.zpad_len);
+    assert.ok(generator.input.subarray(at + 1, at + 1 + r.zpad_len).every(x => x === 0));
+    matches(cpace.prependLen(inputs.ci), hex(generator.input.subarray(at + 1 + r.zpad_len, at + 1 + r.zpad_len +
+      cpace.prependLen(inputs.ci).length)));
+    const g = generator.point.toBytes();
+    matches(g, r.g);
+    const [ya, yb] = [r.ya, r.yb].map(x => cpace.sampleScalar(() => bytes(x)));
+    matches(cpace.scalarMult(ya, g), r.Ya);
+    matches(cpace.scalarMult(yb, g), r.Yb);
+    const a = cpace.initiate(inputs, () => bytes(r.ya));
+    matches(a.message, r.msg_a);
+    matches(a.message.subarray(1, 33), r.Ya);
+    const b = cpace.respond(inputs, a.message, () => bytes(r.yb));
+    matches(b.message, r.msg_b);
+    matches(b.message.subarray(1, 33), r.Yb);
+    matches(b.message.subarray(-64), r.Tb);
+    matches(cpace.scalarMultVerified(ya, bytes(r.Yb)), r.K);
+    matches(cpace.scalarMultVerified(yb, bytes(r.Ya)), r.K);
+    const outA = a.finish(b.message);
+    matches(outA.isk, r.ISK);
+    matches(outA.message, r.Ta);
+    matches(outA.message, r.msg_c);
+    matches(cpace.confirmationKey(inputs.sid, outA.isk), r.mac_key);
+    matches(b.finish(outA.message).isk, r.ISK);
+  });
 }
 
 {
@@ -458,6 +501,12 @@ function outcome(expected, fn) {
 {
   const [v, add] = file('pairing-attempts.json');
   for (const sequence of v.sequences) add(sequence.name, () => replayAttemptSequence(sequence, v.conventions));
+}
+
+{
+  const [v, add] = file('direct-host.json');
+  for (const sequence of v.sequences) add(sequence.name, () => replayDirectSequence(sequence, v.conventions));
+  add('before_msg_a', () => replayBeforeMsgA(v.before_msg_a, v.conventions));
 }
 
 {

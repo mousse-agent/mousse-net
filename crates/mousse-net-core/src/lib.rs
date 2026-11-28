@@ -70,7 +70,11 @@
         mousse_control = "approval-uses-invitation-role",
         mousse_control = "role-edit-ignores-revision",
         mousse_control = "demoted-signer-removes",
-        mousse_control = "answer-role-sticks-to-invitation"
+        mousse_control = "answer-role-sticks-to-invitation",
+        mousse_control = "direct-skip-allow",
+        mousse_control = "direct-enroll-without-connection",
+        mousse_control = "direct-allow-beats-cancel",
+        mousse_control = "direct-attempt-not-debited"
     ),
     not(debug_assertions)
 ))]
@@ -111,7 +115,11 @@ compile_error!("mousse_control plants a bug for tests; it is not allowed in rele
     mousse_control = "approval-uses-invitation-role",
     mousse_control = "role-edit-ignores-revision",
     mousse_control = "demoted-signer-removes",
-    mousse_control = "answer-role-sticks-to-invitation"
+    mousse_control = "answer-role-sticks-to-invitation",
+    mousse_control = "direct-skip-allow",
+    mousse_control = "direct-enroll-without-connection",
+    mousse_control = "direct-allow-beats-cancel",
+    mousse_control = "direct-attempt-not-debited"
 ))]
 const _: () = {
     let profile = env!("MOUSSE_BUILD_PROFILE").as_bytes();

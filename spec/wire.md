@@ -572,6 +572,10 @@ the TLS client and the **host** is the TLS server.
    the connection starts and before it reads any control message from the
    caller. It sends nothing to say that it awaits a proof:
    - identity denied: close with `NOT_AUTHORIZED`;
+   - a provisional grant (Pair with IP, 10.9), whether or not the identity
+     also holds a grant: bind the connection to the provisional grant and
+     send `AUTHORIZED {state: live}`. Its first stream frame commits that
+     grant (8.1);
    - a live grant: bind the connection to it and send
      `AUTHORIZED {state: live}`;
    - otherwise: wait for a `JOIN_PROOF`. If none arrives within **10 s**,
@@ -639,6 +643,26 @@ connection's state:
 
 After a close, everything else is ignored. A valid identity with no grant can
 therefore never reach RPC or any other channel.
+
+A live connection bound to a **provisional** grant (Pair with IP, 10.9)
+follows the live column with two differences, until the grant commits:
+
+- **First stream frame.** The gate does not let it through on its own: it
+  answers "commit first". The I/O layer has the host commit the grant
+  (10.9, "Provisional grant") before it releases that frame or anything
+  after it; when the commit fails, the connection closes with
+  `GRANT_REVOKED`. After the commit every connection bound to that grant,
+  not only the one whose frame committed it, is live as any other.
+- **Cancel.** On the connection the host enrolled after a code exchange, a
+  `CODE_ABORT` whose attempt id is the attempt that passed on that
+  connection is allowed. Every other `CODE_EXCHANGE` and `CODE_ABORT` is
+  ignored, as on any live connection, and so is that one once the grant
+  has committed, whichever connection committed it.
+
+A connection the host holds after a lookup that found nothing (10.9,
+"Lookup") lets only `PING`, `PONG`, `HELLO` and `GOAWAY` through until the
+host closes it; everything else, a stream frame included, is ignored and
+commits nothing.
 
 ### 8.2 What the caller accepts
 
@@ -880,8 +904,10 @@ host's record and in the ticket.
 |---|---|---|
 | In person | 1 | Join proof, then the host owner approves with one tap. No code. |
 | Send link | 2 | Join proof, then the code exchange with a 6-digit code shown on the host. |
+| Direct | 3 | Lookup, code exchange with the 12-character code, then the host owner approves (10.9). |
 
-Browsers always use "Send link".
+Browsers always use "Send link". Kind 3 has no ticket and never appears in
+one: a ticket with kind 3 is `unknown_kind` (10.2).
 
 **The kind is believed only as far as the ticket's arrival supports it.**
 "In person" skips the code, so it is safe only when the ticket came straight
@@ -1367,11 +1393,12 @@ bound to the old one closes with `GRANT_REVOKED`.
 
 ### 10.9 Direct flow
 
-*Draft: this section so far gives only the code. The flow, its messages and
-its limits follow.*
+*The joiner's side (its attempt ledger and pending record) follows; this
+section gives the code, the binding and the host's side.*
 
 The direct flow pairs two endpoints with no ticket: the host shows its
-address and a **direct code**, and the joiner's owner types both.
+address and a **direct code**, and the joiner's owner types both. The host
+owner then allows the device, as in person (10.4).
 
 #### Code
 
@@ -1397,6 +1424,260 @@ address and a **direct code**, and the joiner's owner types both.
   is dialled and no attempt is spent.
 
 The code, `L` and `S` are never logged. Vectors: `direct-code.json`.
+
+#### Invitation
+
+The host keeps each direct invitation **in memory only**: the invitation id
+`I` (16 random bytes), the code, `expires_at`, the attempts left, the role
+it offers and the authorizing owner, the approval requests, and the
+outcomes it keeps for recovery (below). A restart ends every direct
+invitation; grants they made stay. Creating one draws `I` (16 bytes), then
+the code (12 bytes, drawn again while its lookup is the lookup of another
+open direct invitation of this endpoint). At most `DIRECT_MAX_OPEN` (4)
+direct invitations are open at once on an endpoint; another is refused
+until one ends. An invitation **takes attempts** while it is open and
+before `expires_at` = creation time + `DIRECT_INVITE_LIFETIME_SECS` (600).
+It ends on enrollment, decline, the owner's cancel, exhaustion, and at
+expiry unless a request is still inside its Allow window. The host's own
+timer ends it at expiry; an attempt refused at `expires_at` closes only its
+connection.
+
+#### Binding
+
+```
+D   = H(CBOR {1: "mousse-direct-invite-v1", 2: L (text, 4), 3: I (bytes, 16)})
+CI  = CBOR {1: "mousse-direct-pair-v1",
+            2: D,
+            3: 3,                                 (kind)
+            4: 1,                                 (direct ceremony version)
+            5: [[1, joiner identity key], [2, host identity key]],
+            6: pair exporter (EXPORTER-mousse-pair-v1)}
+sid = the attempt's session id (10.5)
+PRS = S, its 8 ASCII bytes
+```
+
+`H` is SHA-256 and the maps are canonical CBOR (section 3). The code
+exchange is CPace profile 1 as in 10.5: empty AD, the joiner the initiator,
+the host the responder, both confirmations, `ISK` unused. `D` holds only
+public values, and nothing on the wire before `msg_a` depends on `S`;
+`msg_a` does, through the generator ([`cpace.md`](cpace.md) 5.1). Key 4 is
+1 for the life of kind 3 and never appears on the wire; a new ceremony is a
+new kind. Vectors: `cpace-ristretto255-sha512-mousse.json` `pairing_runs`
+(every value from the inputs), `direct-host.json` `before_msg_a`.
+
+#### Lookup
+
+The joiner dials the typed address, sends `HELLO` and waits for the host's
+(it needs `agreed`; with `agreed < 4` it closes with `UNSUPPORTED_VERSION`),
+then sends `JOIN_DIRECT {1: L, 2: name}`. The name is the computer name, as
+for a sent link (10.3). `JOIN_DIRECT` passes the host's gate as
+`JOIN_PROOF` does (8.1); step 2 runs first as for any connection, and its
+`AUTHORIZED {live}` notice is not the answer. The host answers it only on a
+connection its TCP listener accepted; on any other (WebSocket, pipe, relay
+circuit) it closes with `INVITATION_INVALID`. From a live connection,
+`JOIN_DIRECT` first takes a new pre-authorization place counted against the
+connection's source address; with none free the host closes with
+`INTERNAL_ERROR`. Then, in this order:
+
+- the joiner's identity is the host's own, or denied here: close with
+  `NOT_AUTHORIZED`, whatever the lookup;
+- an invitation that takes attempts with this `L`: the connection becomes
+  join-only for it and the host answers `AUTHORIZED {1: join_only, 2: I}`;
+- anything else: the host holds the connection, and with it its
+  pre-authorization place, for `DIRECT_MISS_HOLD_MS` (1000 ms), then closes
+  it with `INVITATION_INVALID`. The 10 s wait for a `JOIN_PROOF` (section 8,
+  step 2) stops for a held connection: the hold's close, after the full
+  hold, is the only one. A device that holds a grant here gets the same
+  answer. Every "no open invitation" (another endpoint's code, a typo
+  in `L`, expired, used up, cancelled, a restart) looks the same.
+
+#### Attempt
+
+**One attempt per connection.** The joiner debits its own count, then sends
+`CODE_EXCHANGE {A, msg_a}` with a fresh attempt id `A`. The host, for the
+first message of a new attempt:
+
+1. refuses it at or after `expires_at`, or once the invitation stopped
+   taking attempts, by closing with `INVITATION_INVALID` (a running attempt
+   ends the same way: a code passes only before `expires_at`);
+2. refuses a second attempt on the connection by closing with
+   `PROTOCOL_ERROR`, with no debit;
+3. closes with `ATTEMPTS_EXHAUSTED` when none are left;
+4. otherwise **debits first** (`DIRECT_HOST_ATTEMPTS`, 5 per invitation,
+   across all connections), tells its owner the attempts left (the code
+   stays the same) and draws the attempt's CPace scalar, then answers
+   `CODE_EXCHANGE {A, msg_b}`.
+
+A repeat on an attempt follows 10.7 ("No resends"). A wrong code fails at
+the joiner when it checks `Tb`: it sends `CODE_ABORT {A, PAIRING_FAILED}`
+and closes; the next try is a new connection. When no attempts are left, no
+attempt runs and no request is inside its Allow window, the invitation ends
+and its join-only connections close with `ATTEMPTS_EXHAUSTED`.
+
+#### Requests
+
+When the host verifies `Ta`, the device **passed the code**. The host opens
+an **approval request keyed by (invitation, joiner identity)**, not by
+connection, and asks its owner, showing the name from `JOIN_DIRECT`, the
+short device id and the role. The role and the name belong to the request;
+the role the owner picks with the answer goes to that enrollment only.
+
+- **One request per identity.** The same identity passing again (on a new
+  connection) keeps its request: the same id, now pointing at the new
+  connection. Another identity that passes gets its own request.
+- A request is **connected** while its connection is up and **away** once it
+  closed without `CANCELLED`; it is kept either way.
+- **The Allow window.** A request may be allowed, and claimed by recovery,
+  until `DIRECT_ALLOW_WINDOW_SECS` (300) after its identity first passed the
+  code, also past `expires_at`. Then it ends, and its connection, if up,
+  closes with `INVITATION_INVALID`. While any request is inside its window
+  the invitation neither ends at expiry nor for lack of attempts; at
+  `expires_at` it stops taking lookups and attempts, and its join-only
+  connections without a request close with `INVITATION_INVALID`.
+- **Allow, connected:** enrollment (10.8) on that connection with receipt
+  `I`, except that the grant it adds is provisional (below); the host sends
+  `PAIRED {host name, role}`. Every other request ends and its connection
+  closes with `INVITATION_INVALID`.
+- **Allow, away:** the request is marked allowed, every other request ends
+  as above, and the invitation takes no lookups or attempts. The device's
+  recovery (below) is enrolled at once. Enrollment always happens on a
+  connection of the device that passed the code.
+- **Decline:** the request's connection closes with `PAIRING_DECLINED` and
+  the invitation ends; every other connection closes with
+  `INVITATION_INVALID`.
+- **The joiner cancels.** Connected: `CODE_ABORT {A, CANCELLED}`, then a
+  close with `CANCELLED`; the host ends the request and closes the
+  connection with `CANCELLED`. Only the attempt that passed
+  counts, the one the request remembers (a recovery that moves the request
+  to another connection keeps it): a `CODE_ABORT` naming another attempt,
+  one merely running on the request's connection included, ends no
+  request (that running attempt still counts as failed). Away: the cancel comes with its recovery.
+  Only a close without `CANCELLED` keeps a request.
+- **Cancel crossing Allow.** The cancel wins while the grant is
+  provisional. A `CODE_ABORT {A, CANCELLED}` for the attempt that passed
+  (it passes the live gate, 8.1), or a `GOAWAY` with `CANCELLED`, on the
+  connection the host enrolled, or a cancel by recovery, removes the
+  provisional grant and nothing else, and the host closes with `CANCELLED`.
+  A committed grant is never cancelled: the `CODE_ABORT` is ignored, the
+  `GOAWAY` is an ordinary close, and a recovery's cancel is answered as a
+  recovery without one (`PAIRED`).
+- A declined or cancelled request's outcome is kept with the invitation
+  until its Allow window ends, for its recovery. Which identities passed
+  the code is kept until the host forgets the invitation.
+
+#### Provisional grant
+
+Direct enrollment adds a **provisional grant**: the identity, the request's
+name, the role the owner allowed, the invitation's authorizing owner and
+grant expiry, receipt `I`, and a mark that a direct invitation made it. It is
+stored with the grant table and survives a restart. It is not the
+identity's grant yet: step 2 binds a new connection of that identity to it
+(section 8), but a grant the identity already holds stays, and so do the
+connections bound to that grant.
+
+- **Before it is made,** at Allow or when a recovery claims an Allow, the
+  host checks everything that can fail: the identity is not denied, and
+  the grant expiry, if any, is still ahead. A failed check changes nothing
+  in the grant table, and a claim that fails it sends nothing before its
+  close (no `AUTHORIZED`). Making it never closes the connection it is
+  made on: that connection is detached from any grant first, even when it
+  was bound to the provisional grant this one replaces. Allow is refused (`denied`, checked first, or
+  `grant_expired`); at a claim the invitation ends with
+  `INVITATION_INVALID` (its requests, the allowed one too, end as
+  dismissed) and the connection closes with it.
+- **It commits** on the first stream frame of any connection bound to it:
+  the connection the host enrolled, a recovery connection, or the joiner's
+  first ordinary connection after `PAIRED`. The I/O layer reports that
+  frame and has the commit done before it releases the stream (8.1).
+  Committing first checks that the identity is not denied and the grant has
+  not expired, then, in one step, replaces the identity's grant, if any
+  (its connections close with `GRANT_REVOKED`), and makes the provisional
+  grant the identity's grant, with the same id and receipt `I`. The
+  connections bound to it stay bound. When a check fails, the provisional
+  grant is removed, its connections close with `GRANT_REVOKED`, and the old
+  grant and its connections stay.
+- **It is removed** by a cancel (above), by a denial of the identity, at its
+  expiry, and when another direct invitation makes a new provisional grant
+  for the identity. Its connections close with `GRANT_REVOKED` (the
+  cancelling connection with `CANCELLED`), before the host reports the
+  removal; the removal is reported also when no connection was bound.
+- On the enrolled connection, a `CODE_ABORT` for the attempt that passed
+  with any code other than `CANCELLED` passes the gate and is ignored.
+
+A recovery opens no stream before the host's answer (section 8, step 4), so
+a joiner that cancelled never commits the grant it is cancelling. A device
+that already held a grant may commit through another of its connections
+before its cancel arrives; that cancel then comes too late.
+
+#### Recovery
+
+A joiner whose connection closed after the host's confirmation verified
+reconnects **pinned** to the host key it verified and sends `JOIN_DIRECT
+{1: L, 2: name, 3: I, 4?: 1}` (key 4: it cancels). No code is needed. The
+host answers, in this order:
+
+1. an unexpired provisional or committed grant for this identity, made by
+   a direct invitation, with receipt `I` (also after a restart; a receipt
+   from a ticket never matches): with the cancel flag, a provisional grant is
+   removed and the host closes with `CANCELLED`. Otherwise, and for a
+   committed grant whatever the flag, the host answers `PAIRED {host name,
+   role}` with the grant's role. When step 2 did not bind the connection to
+   that grant (it appeared later, for example by an Allow on the original
+   connection, or step 2 bound the identity's older grant), the host binds
+   it first, and sends `AUTHORIZED {live}` first when step 2 sent none;
+2. no direct invitation `I` with this `L`: the miss hold, as for a lookup;
+   from here on, with the cancel flag the host first retires every
+   attempt and pairing connection of this identity on the invitation (they
+   close with `CANCELLED`), whatever the answer below;
+3. a kept outcome for this identity: close with `PAIRING_DECLINED` or
+   `CANCELLED`; with the cancel flag, an invitation its retirements leave
+   with nothing to take then ends, as in 4;
+4. with the cancel flag (its attempts and connections retired, so a
+   confirmation still on its way opens no request after the cancel): the
+   request, if any, ends; then the host closes with
+   `CANCELLED` (an invitation that no longer takes anything gets the miss
+   hold instead: one neither allowed nor open with its own deadline ahead or
+   a request inside its Allow window, whether or not the host's timer has
+   run). An allowed request that is cancelled ends the invitation;
+   so does any cancel that leaves it with no attempts, no running attempt
+   and no request inside its Allow window (`ATTEMPTS_EXHAUSTED`);
+5. this identity's request is allowed: `AUTHORIZED {join_only, I}`,
+   enrollment on this connection, `PAIRED`;
+6. its request waits for Allow: `AUTHORIZED {join_only, I}`; the request
+   (same id, same prompt) now points at this connection and an older
+   connection of it closes with `PATH_REPLACED`;
+7. the invitation takes attempts and this identity never passed the code
+   on it (the host never had its `msg_c`): `AUTHORIZED {join_only, I,
+   not_received}`;
+8. anything else (expired, consumed by another device, another identity,
+   an identity that passed the code whose outcome is forgotten): the miss
+   hold.
+
+Only the identity that passed the code learns that it was declined.
+
+#### Limits
+
+| Limit | Default | Allowed |
+|---|---|---|
+| `DIRECT_INVITE_LIFETIME_SECS` | 600 | 60 to 600 |
+| `DIRECT_HOST_ATTEMPTS` | 5 | 1 to 5 |
+| `DIRECT_JOINER_ATTEMPTS` | 5 | 1 to 5 |
+| `DIRECT_ALLOW_WINDOW_SECS` | 300 | 60 to 300 |
+| `DIRECT_MAX_OPEN` | 4 | 1 to 4 |
+| `DIRECT_MISS_HOLD_MS` | 1000 | 1000 to 5000 |
+
+Each is set by `MOUSSE_NET_<name>` and can only move toward safety: fewer
+attempts and invitations, shorter lives and windows, longer holds
+([`../docs/limits.md`](../docs/limits.md)). The code's alphabet, length and
+4 + 8 split are fixed.
+
+#### Records
+
+The host stores nothing for a direct invitation. What outlives it is the
+grant enrollment made, provisional or committed, with receipt `I` and the
+mark that a direct invitation made it (section 7, 10.8), stored with the
+grant table; recovery reads it, also after a restart. Vectors:
+`direct-host.json`.
 
 ## 11. Control messages
 

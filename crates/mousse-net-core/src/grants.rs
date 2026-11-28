@@ -156,6 +156,10 @@ pub struct Grant {
     /// with `PAIRED` again, so a joiner whose `PAIRED` was lost learns that
     /// this invitation's role took effect. Stored with the grant.
     pub enrolled_by: Option<InvitationId>,
+    /// `enrolled_by` names a Pair with IP invitation (kind 3, wire.md 10.9),
+    /// not a ticket. Only such a receipt answers a direct recovery, and only
+    /// such a grant is ever provisional. Stored with the grant.
+    pub direct: bool,
 }
 
 impl Grant {
@@ -237,6 +241,8 @@ pub enum GrantError {
     InvalidName,
     /// Restored data has duplicate ids or identities, or a revision of 0.
     Inconsistent,
+    /// The grant's expiry is not ahead of now.
+    Expired,
     /// A role edit named a revision that is not the grant's current one.
     RevisionConflict,
     /// The grant's revision cannot grow any more.
@@ -252,6 +258,7 @@ impl fmt::Display for GrantError {
             GrantError::InvalidRole => "invalid role name",
             GrantError::InvalidName => "invalid device name",
             GrantError::Inconsistent => "inconsistent stored grants",
+            GrantError::Expired => "the grant's expiry has passed",
             GrantError::RevisionConflict => "the grant changed since that revision",
             GrantError::RevisionOverflow => "the grant's revision cannot grow any more",
         })
@@ -273,10 +280,19 @@ pub fn validate_name(name: &str) -> Result<(), GrantError> {
 }
 
 /// An endpoint's grant table.
+///
+/// Besides each identity's grant it keeps **provisional** grants (Pair with
+/// IP, wire.md 10.9): made by a direct enrollment, stored, but not the
+/// identity's grant until they commit. [`GrantTable::live_grant`] never
+/// returns one. A connection may be bound to a provisional grant; the first
+/// stream frame there commits it ([`GrantTable::commit`]) before anything
+/// runs under it.
 #[derive(Clone, Debug, Default)]
 pub struct GrantTable {
     grants: BTreeMap<GrantId, Grant>,
     by_identity: BTreeMap<IdentityPublicKey, GrantId>,
+    provisional: BTreeMap<GrantId, Grant>,
+    provisional_by_identity: BTreeMap<IdentityPublicKey, GrantId>,
     denials: BTreeMap<IdentityPublicKey, UnixTime>,
     bindings: BTreeMap<ConnectionId, GrantId>,
     next_id: u64,
@@ -351,10 +367,151 @@ impl GrantTable {
             granted_at: now,
             expires_at: new.expires_at,
             enrolled_by: new.enrolled_by,
+            direct: false,
         };
         self.by_identity.insert(grant.identity, id);
         self.grants.insert(id, grant);
         Ok((id, events))
+    }
+
+    /// Pair with IP enrollment (wire.md 10.9): add a provisional grant made
+    /// by the direct invitation `new.enrolled_by`, and bind `conn` to it.
+    ///
+    /// Everything that can fail is checked first, and a failure changes
+    /// nothing: a denial ([`GrantError::Denied`]), the name, a missing
+    /// receipt ([`GrantError::Inconsistent`]) and an expiry that is not
+    /// ahead of `now` ([`GrantError::Expired`]). The identity's grant, if
+    /// any, and the connections bound to it stay; an older provisional grant
+    /// of the identity is replaced (its connections close). `conn` is
+    /// unbound from whatever it was bound to.
+    pub fn add_provisional(
+        &mut self,
+        new: NewGrant,
+        conn: ConnectionId,
+        now: UnixTime,
+    ) -> Result<(GrantId, Vec<GrantEvent>), GrantError> {
+        if self.denials.contains_key(&new.identity) {
+            return Err(GrantError::Denied);
+        }
+        validate_name(&new.name)?;
+        if new.enrolled_by.is_none() {
+            return Err(GrantError::Inconsistent);
+        }
+        if new.expires_at.is_some_and(|t| now >= t) {
+            return Err(GrantError::Expired);
+        }
+        // Detach the enrolling connection first: removing an older
+        // provisional grant must not close the connection being enrolled.
+        self.bindings.remove(&conn);
+        let mut events = Vec::new();
+        if let Some(old) = self.provisional_by_identity.get(&new.identity).copied() {
+            events.extend(self.remove(old));
+        }
+        let id = GrantId(self.next_id);
+        self.next_id += 1;
+        let grant = Grant {
+            id,
+            identity: new.identity,
+            name: new.name,
+            role: new.role,
+            revision: 1,
+            source: GrantSource::Local,
+            authorizing_owner: new.authorizing_owner,
+            adopted_into: None,
+            granted_at: now,
+            expires_at: new.expires_at,
+            enrolled_by: new.enrolled_by,
+            direct: true,
+        };
+        self.provisional_by_identity.insert(grant.identity, id);
+        self.provisional.insert(id, grant);
+        self.bindings.insert(conn, id);
+        Ok((id, events))
+    }
+
+    /// Commit a provisional grant (wire.md 10.9): it becomes the identity's
+    /// grant, with the same id and receipt, and replaces the identity's
+    /// older grant (whose connections close with `GRANT_REVOKED`).
+    /// Connections bound to it stay bound.
+    ///
+    /// A denial ([`GrantError::Denied`]) or a passed expiry
+    /// ([`GrantError::Expired`]) is checked first and changes nothing: the
+    /// caller removes the provisional grant. A grant that already committed
+    /// commits again with nothing to do.
+    pub fn commit(&mut self, id: GrantId, now: UnixTime) -> Result<Vec<GrantEvent>, GrantError> {
+        if self.grants.contains_key(&id) {
+            return Ok(Vec::new());
+        }
+        let grant = self.provisional.get(&id).ok_or(GrantError::UnknownGrant)?;
+        if self.denials.contains_key(&grant.identity) {
+            return Err(GrantError::Denied);
+        }
+        if !grant.is_live(now) {
+            return Err(GrantError::Expired);
+        }
+        let identity = grant.identity;
+        let mut events = Vec::new();
+        if let Some(old) = self.by_identity.get(&identity).copied() {
+            events.extend(self.remove(old));
+        }
+        let Some(grant) = self.provisional.remove(&id) else {
+            return Err(GrantError::UnknownGrant);
+        };
+        self.provisional_by_identity.remove(&identity);
+        self.by_identity.insert(identity, id);
+        self.grants.insert(id, grant);
+        Ok(events)
+    }
+
+    /// The identity's provisional grant at `now`: present, not expired, not
+    /// denied.
+    pub fn provisional_grant(&self, identity: &IdentityPublicKey, now: UnixTime) -> Option<&Grant> {
+        if self.is_denied(identity) {
+            return None;
+        }
+        let id = self.provisional_by_identity.get(identity)?;
+        self.provisional.get(id).filter(|g| g.is_live(now))
+    }
+
+    /// A provisional grant by id, live or not.
+    pub fn provisional(&self, id: GrantId) -> Option<&Grant> {
+        self.provisional.get(&id)
+    }
+
+    /// Whether `id` is a provisional grant.
+    pub fn is_provisional(&self, id: GrantId) -> bool {
+        self.provisional.contains_key(&id)
+    }
+
+    /// All provisional grants, for persistence.
+    pub fn provisional_grants(&self) -> impl Iterator<Item = &Grant> {
+        self.provisional.values()
+    }
+
+    /// Put back stored provisional grants after [`GrantTable::restore`].
+    /// Each must be a direct grant with a receipt and an id below
+    /// [`GrantTable::next_grant_id`], with no other grant of that id and no
+    /// other provisional grant of that identity; one of a denied identity is
+    /// dropped.
+    pub fn restore_provisional(&mut self, grants: Vec<Grant>) -> Result<(), GrantError> {
+        for g in grants {
+            if g.id.0 >= self.next_id
+                || g.revision == 0
+                || !g.direct
+                || g.enrolled_by.is_none()
+                || self.grants.contains_key(&g.id)
+                || self.provisional.contains_key(&g.id)
+                || self.provisional_by_identity.contains_key(&g.identity)
+            {
+                return Err(GrantError::Inconsistent);
+            }
+            if self.denials.contains_key(&g.identity) {
+                continue;
+            }
+            self.provisional_by_identity.insert(g.identity, g.id);
+            self.provisional.insert(g.id, g);
+        }
+        Ok(())
     }
 
     /// Edit a live grant's role in place, if its revision is still
@@ -428,12 +585,16 @@ impl GrantTable {
         })
     }
 
-    /// Remove a grant and close every channel bound to it.
+    /// Remove a grant, provisional or not, and close every channel bound to
+    /// it.
     pub fn remove(&mut self, id: GrantId) -> Vec<GrantEvent> {
-        let Some(grant) = self.grants.remove(&id) else {
+        if let Some(grant) = self.grants.remove(&id) {
+            self.by_identity.remove(&grant.identity);
+        } else if let Some(grant) = self.provisional.remove(&id) {
+            self.provisional_by_identity.remove(&grant.identity);
+        } else {
             return Vec::new();
-        };
-        self.by_identity.remove(&grant.identity);
+        }
         let channels: Vec<ConnectionId> = self
             .bindings
             .iter()
@@ -458,10 +619,14 @@ impl GrantTable {
     /// blocks future grants.
     pub fn deny(&mut self, identity: IdentityPublicKey, now: UnixTime) -> Vec<GrantEvent> {
         self.denials.entry(identity).or_insert(now);
-        match self.by_identity.get(&identity).copied() {
-            Some(id) => self.remove(id),
-            None => Vec::new(),
+        let mut events = Vec::new();
+        if let Some(id) = self.provisional_by_identity.get(&identity).copied() {
+            events.extend(self.remove(id));
         }
+        if let Some(id) = self.by_identity.get(&identity).copied() {
+            events.extend(self.remove(id));
+        }
+        events
     }
 
     /// Lift a local denial. Grants nothing by itself.
@@ -488,7 +653,8 @@ impl GrantTable {
         self.grants.get(&id)
     }
 
-    /// Bind a channel to the grant that authorized it. The grant must be live.
+    /// Bind a channel to the grant that authorized it, or to a provisional
+    /// grant. The grant must be live.
     pub fn bind(
         &mut self,
         channel: ConnectionId,
@@ -501,6 +667,7 @@ impl GrantTable {
         let grant = self
             .grants
             .get(&id)
+            .or_else(|| self.provisional.get(&id))
             .filter(|g| g.is_live(now))
             .ok_or(GrantError::UnknownGrant)?;
         if self.denials.contains_key(&grant.identity) {
@@ -520,11 +687,22 @@ impl GrantTable {
         self.bindings.get(&channel).copied()
     }
 
-    /// Remove grants that expired at or before `now`, closing their channels.
+    /// The channels bound to a grant.
+    pub fn channels(&self, id: GrantId) -> Vec<ConnectionId> {
+        self.bindings
+            .iter()
+            .filter(|(_, g)| **g == id)
+            .map(|(c, _)| *c)
+            .collect()
+    }
+
+    /// Remove grants, provisional ones too, that expired at or before
+    /// `now`, closing their channels.
     pub fn tick(&mut self, now: UnixTime) -> Vec<GrantEvent> {
         let expired: Vec<GrantId> = self
             .grants
             .values()
+            .chain(self.provisional.values())
             .filter(|g| !g.is_live(now))
             .map(|g| g.id)
             .collect();
@@ -533,7 +711,11 @@ impl GrantTable {
 
     /// The earliest grant expiry, so the caller knows when to call `tick`.
     pub fn next_expiry(&self) -> Option<UnixTime> {
-        self.grants.values().filter_map(|g| g.expires_at).min()
+        self.grants
+            .values()
+            .chain(self.provisional.values())
+            .filter_map(|g| g.expires_at)
+            .min()
     }
 
     /// The id the next grant will get: one above every id ever issued,
@@ -802,6 +984,129 @@ mod tests {
         assert_eq!(
             GrantTable::restore(zero, Vec::new(), t.next_grant_id()).err(),
             Some(GrantError::Inconsistent)
+        );
+    }
+
+    fn direct_grant(seed: u8, expires_at: Option<UnixTime>) -> NewGrant {
+        NewGrant {
+            role: role("viewer"),
+            enrolled_by: Some(InvitationId([3; 16])),
+            ..new_grant(seed, expires_at)
+        }
+    }
+
+    /// Pair with IP (wire.md 10.9): a provisional grant leaves the
+    /// identity's grant and its connections alone until it commits; then it
+    /// replaces that grant in one step, with the same id and receipt.
+    #[test]
+    fn a_provisional_grant_replaces_the_old_one_only_when_it_commits() {
+        let mut t = GrantTable::new();
+        let (old, _) = t.add(new_grant(1, None), NOW).unwrap();
+        t.bind(ConnectionId(1), old, NOW).unwrap();
+        t.bind(ConnectionId(2), old, NOW).unwrap();
+        let (p, events) = t
+            .add_provisional(direct_grant(1, None), ConnectionId(2), NOW)
+            .unwrap();
+        assert!(events.is_empty());
+        assert_eq!(t.live_grant(&id(1), NOW).map(|g| g.id), Some(old));
+        assert_eq!(t.provisional_grant(&id(1), NOW).map(|g| g.id), Some(p));
+        assert_eq!(t.binding(ConnectionId(1)), Some(old));
+        assert_eq!(t.binding(ConnectionId(2)), Some(p));
+        assert!(t.get(p).is_none());
+
+        let events = t.commit(p, NOW).unwrap();
+        assert_eq!(
+            events,
+            vec![GrantEvent::CloseChannels {
+                grant: old,
+                channels: vec![ConnectionId(1)],
+                code: ErrorCode::GrantRevoked
+            }]
+        );
+        let now = t.live_grant(&id(1), NOW).cloned().unwrap();
+        assert_eq!(now.id, p);
+        assert_eq!(now.role, role("viewer"));
+        assert_eq!(now.enrolled_by, Some(InvitationId([3; 16])));
+        assert!(now.direct);
+        assert_eq!(t.binding(ConnectionId(2)), Some(p));
+        assert!(t.provisional_grant(&id(1), NOW).is_none());
+        // Committing again does nothing.
+        assert_eq!(t.commit(p, NOW), Ok(Vec::new()));
+    }
+
+    /// Everything that can fail is checked before the table changes: an
+    /// expired provisional grant neither commits nor touches the old grant
+    /// and its connections, and one that would be born expired is refused.
+    #[test]
+    fn a_failed_commit_keeps_the_old_grant_and_its_connections() {
+        let mut t = GrantTable::new();
+        let (old, _) = t.add(new_grant(1, None), NOW).unwrap();
+        t.bind(ConnectionId(1), old, NOW).unwrap();
+        assert_eq!(
+            t.add_provisional(direct_grant(1, Some(NOW)), ConnectionId(1), NOW)
+                .err(),
+            Some(GrantError::Expired)
+        );
+        assert_eq!(t.binding(ConnectionId(1)), Some(old));
+        let (p, _) = t
+            .add_provisional(direct_grant(1, Some(UnixTime(2_000))), ConnectionId(2), NOW)
+            .unwrap();
+        assert_eq!(t.commit(p, UnixTime(2_000)), Err(GrantError::Expired));
+        assert_eq!(
+            t.live_grant(&id(1), UnixTime(2_000)).map(|g| g.id),
+            Some(old)
+        );
+        assert_eq!(t.binding(ConnectionId(1)), Some(old));
+        assert!(t.is_provisional(p));
+        t.deny(id(1), NOW);
+        assert!(!t.is_provisional(p));
+        assert_eq!(t.binding(ConnectionId(2)), None);
+    }
+
+    /// A second provisional grant for the identity, enrolled on a
+    /// connection step 2 had bound to the first one, replaces the first
+    /// without closing that connection.
+    #[test]
+    fn a_new_provisional_grant_keeps_its_own_connection() {
+        let mut t = GrantTable::new();
+        let (first, _) = t
+            .add_provisional(direct_grant(1, None), ConnectionId(1), NOW)
+            .unwrap();
+        t.bind(ConnectionId(2), first, NOW).unwrap();
+        let (second, events) = t
+            .add_provisional(direct_grant(1, None), ConnectionId(2), NOW)
+            .unwrap();
+        assert_eq!(
+            events,
+            vec![GrantEvent::CloseChannels {
+                grant: first,
+                channels: vec![ConnectionId(1)],
+                code: ErrorCode::GrantRevoked
+            }]
+        );
+        assert_eq!(t.binding(ConnectionId(2)), Some(second));
+        assert_eq!(t.channels(second), vec![ConnectionId(2)]);
+    }
+
+    #[test]
+    fn provisional_grants_are_restored_beside_the_grants() {
+        let mut t = GrantTable::new();
+        t.add(new_grant(1, None), NOW).unwrap();
+        let (p, _) = t
+            .add_provisional(direct_grant(1, None), ConnectionId(1), NOW)
+            .unwrap();
+        let grants: Vec<Grant> = t.grants().cloned().collect();
+        let provisional: Vec<Grant> = t.provisional_grants().cloned().collect();
+        let mut back = GrantTable::restore(grants.clone(), Vec::new(), t.next_grant_id()).unwrap();
+        back.restore_provisional(provisional.clone()).unwrap();
+        assert_eq!(back.provisional(p), t.provisional(p));
+        assert!(back.commit(p, NOW).is_ok());
+        let mut twice = GrantTable::restore(grants, Vec::new(), t.next_grant_id()).unwrap();
+        let mut doubled = provisional.clone();
+        doubled.extend(provisional);
+        assert_eq!(
+            twice.restore_provisional(doubled),
+            Err(GrantError::Inconsistent)
         );
     }
 

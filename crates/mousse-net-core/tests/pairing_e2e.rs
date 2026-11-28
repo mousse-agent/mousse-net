@@ -328,6 +328,7 @@ impl World {
                     Verdict::Ignore => return vec![json!({ "ignored": true })],
                     Verdict::Close(code) => return vec![close("host", conn, code)],
                     Verdict::Allow => {}
+                    Verdict::Commit(_) => unreachable!("a control message commits nothing"),
                 }
                 let peer = *gate.peer();
                 let actions = match message {
@@ -544,6 +545,7 @@ impl World {
                     Verdict::Ignore => return vec![json!({ "ignored": true })],
                     Verdict::Close(code) => return vec![close(name, conn, code)],
                     Verdict::Allow => {}
+                    Verdict::Commit(_) => unreachable!("the caller gate commits nothing"),
                 }
                 let pairing = j.pairing.as_mut().expect("started");
                 let actions = match message {
