@@ -1414,7 +1414,9 @@ direct invitations are open at once on an endpoint; another is refused
 until one ends. An invitation **takes attempts** while it is open and
 before `expires_at` = creation time + `DIRECT_INVITE_LIFETIME_SECS` (600).
 It ends on enrollment, decline, the owner's cancel, exhaustion, and at
-expiry unless a request is still inside its Allow window.
+expiry unless a request is still inside its Allow window. The host's own
+timer ends it at expiry; an attempt refused at `expires_at` closes only its
+connection.
 
 #### Binding
 
@@ -1451,12 +1453,12 @@ connection its TCP listener accepted; on any other (WebSocket, pipe, relay
 circuit) it closes with `INVITATION_INVALID`. From a live connection,
 `JOIN_DIRECT` first takes a new pre-authorization place counted against the
 connection's source address; with none free the host closes with
-`INTERNAL_ERROR`. Then:
+`INTERNAL_ERROR`. Then, in this order:
 
+- the joiner's identity is the host's own, or denied here: close with
+  `NOT_AUTHORIZED`, whatever the lookup;
 - an invitation that takes attempts with this `L`: the connection becomes
   join-only for it and the host answers `AUTHORIZED {1: join_only, 2: I}`;
-- the joiner's identity is the host's own, or denied here: close with
-  `NOT_AUTHORIZED`;
 - anything else: the host holds the connection, and with it its
   pre-authorization place, for `DIRECT_MISS_HOLD_MS` (1000 ms), then closes
   it with `INVITATION_INVALID`. A device that holds a grant here gets the

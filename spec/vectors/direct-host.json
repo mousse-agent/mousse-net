@@ -1,8 +1,8 @@
 {
   "before_msg_a": {
     "codes": [
-      "4b37514d3258504139525445",
-      "4b37514d5a5a5a5a30303030"
+      "13071714021d160a09181a0e",
+      "130717141f1f1f1f00000000"
     ],
     "description": "Two invitations with the same invitation id (0x49 repeated) and lookup and different secrets (codes K7QM-2XPA-9RTE and K7QM-ZZZZ-0000), host draws listed in `codes`. Joiner a connects on connection 1 with the same draws. Everything on the wire up to and including AUTHORIZED {join_only, I} (`out`) is the same for both; the first msg_a differs.",
     "invitation": "49494949494949494949494949494949",
@@ -15,14 +15,14 @@
       }
     ],
     "msg_a": [
-      "20ecfe79b7f0c30cfad15fdfdf8171a98ee2e3c1d1023d6c10c4779ca9d3841e5800",
-      "20c29341b4e64e7e5fcda453cb60317ab5f7036f358504ed79956907870c4a573e00"
+      "20ce330d77955dbdee621cd5e3ebf0b3dc30d017ee759cc112b793976a582ee27700",
+      "2088905ccad6b0e9476b60035ea310cf38da686f88d844034b3dc470b16999793600"
     ],
     "out": [
       {
         "send": {
           "conn": 1,
-          "control": "a30007016442514844026161",
+          "control": "a3000701644b37514d026161",
           "from": "a"
         }
       },
@@ -56,7 +56,7 @@
     "limits": "The defaults: 600 s lifetime, 5 attempts, a 300 s Allow window, a 1000 ms miss hold.",
     "time": 1790000000
   },
-  "description": "The host side of Pair with IP (wire.md 10.9) with the real code exchange. Each sequence starts with one invitation created at `conventions.time`; each step runs one operation, then its expectations hold. Ops: connect (step 2, then the joiner sends JOIN_DIRECT {lookup, name} on conn; `lookup` wrong means another lookup), recover (step 2, then JOIN_DIRECT with receipt I and, with `cancel`, the cancel flag), submit (the joiner runs one attempt with the right or a wrong secret: it draws an attempt id and its scalar, sends msg_a, checks msg_b; on a failed check it sends CODE_ABORT {A, pairing_failed} and closes with pairing_failed; otherwise it sends msg_c, unless `lose` is msg_c: then the connection breaks first), inject (the joiner sends CODE_EXCHANGE with `attempt` and `payload`), cancel (the joiner sends CODE_ABORT {its last attempt, cancelled} and closes with cancelled), drop (conn breaks with no GOAWAY), allow and decline (the owner answers the joiner's request; `result` ok or the refusal), owner_cancel, tick (the host's timer). `at` sets the time, in seconds after `conventions.time`, before the op. Step 2: a connection from an identity with a live grant is bound to it and the host sends AUTHORIZED {live} first. Expectations: `host_status`, `host_attempts_left`, `closed` (connections the host closed during the step, with the code), `held` (JOIN_DIRECTs answered by a miss hold: the I/O layer holds the connection for hold_ms, then closes it with invitation_invalid; that close is not listed), `requests` (answerable requests: joiner, presence, decision), `granted` (devices holding a grant whose receipt is the invitation). `out` lists in order every control message each side sent (except the two HELLOs), host closes, and what the host told its I/O layer and UI: admitted (join-only gate), miss_hold, attempts_left (after each debit; the code stays the same), approval (the prompt, sent again with the same id when its presence or decision changes), approval_ended, enrolled, enrollment_undone, invitation_ended and grant_closes (grant-table events).",
+  "description": "The host side of Pair with IP (wire.md 10.9) with the real code exchange. Each sequence starts with one invitation created at `conventions.time`; each step runs one operation, then its expectations hold. Ops: connect (step 2, then the joiner sends JOIN_DIRECT {lookup, name} on conn; `lookup` wrong means another lookup), recover (step 2, then JOIN_DIRECT with receipt I and, with `cancel`, the cancel flag), submit (the joiner runs one attempt with the right or a wrong secret: it draws an attempt id and its scalar, sends msg_a, checks msg_b; on a failed check it sends CODE_ABORT {A, pairing_failed} and closes with pairing_failed; otherwise it sends msg_c, unless `lose` is msg_c: then the connection breaks first), inject (the joiner sends CODE_EXCHANGE with `attempt` and `payload`), cancel (the joiner sends CODE_ABORT {its last attempt, cancelled} and closes with cancelled), drop (conn breaks with no GOAWAY), allow and decline (the owner answers the joiner's request; `result` ok or the refusal), owner_cancel, tick (the host's timer). A joiner's close is listed, and reaches the host, only when the host has not closed the connection during the step. A wrong lookup is `0000` (`0001` if that is the invitation's), a wrong secret `00000000` (`00000001` if that is the code's). `at` sets the time, in seconds after `conventions.time`, before the op. Step 2: a connection from an identity with a live grant is bound to it and the host sends AUTHORIZED {live} first. Expectations: `host_status` (`gone` once the host has forgotten the invitation), `host_attempts_left`, `closed` (connections the host closed during the step, with the code), `held` (JOIN_DIRECTs answered by a miss hold: the I/O layer holds the connection for hold_ms, then closes it with invitation_invalid; that close is not listed), `requests` (answerable requests: joiner, presence, decision), `granted` (devices holding a grant whose receipt is the invitation). `out` lists in order every control message each side sent (except the two HELLOs), host closes, and what the host told its I/O layer and UI: admitted (join-only gate), miss_hold, attempts_left (after each debit; the code stays the same), approval (the prompt, sent again with the same id when its presence or decision changes), approval_ended, enrolled and enrollment_undone (with the grant table's id, counting from 0), invitation_ended and grant_closes (grant-table events).",
   "sequences": [
     {
       "code": "RV83-ADZ8-S423",
@@ -2458,13 +2458,6 @@
                 "conn": 1,
                 "from": "host"
               }
-            },
-            {
-              "close": {
-                "code": "cancelled",
-                "conn": 1,
-                "from": "a"
-              }
             }
           ],
           "requests": []
@@ -2978,13 +2971,6 @@
                 "code": "cancelled",
                 "conn": 1,
                 "from": "host"
-              }
-            },
-            {
-              "close": {
-                "code": "cancelled",
-                "conn": 1,
-                "from": "a"
               }
             }
           ]
@@ -3536,19 +3522,6 @@
               }
             },
             {
-              "approval_ended": {
-                "joiner": "a",
-                "reason": "dismissed"
-              }
-            },
-            {
-              "close": {
-                "code": "invitation_invalid",
-                "conn": 1,
-                "from": "host"
-              }
-            },
-            {
               "enrolled": {
                 "conn": 2,
                 "grant": 0,
@@ -3560,6 +3533,19 @@
               "send": {
                 "conn": 2,
                 "control": "a3000601644465736b02656f776e6572",
+                "from": "host"
+              }
+            },
+            {
+              "approval_ended": {
+                "joiner": "a",
+                "reason": "dismissed"
+              }
+            },
+            {
+              "close": {
+                "code": "invitation_invalid",
+                "conn": 1,
                 "from": "host"
               }
             }

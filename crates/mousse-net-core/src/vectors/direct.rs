@@ -757,7 +757,9 @@ impl Replay {
                         code: ErrorCode::Cancelled,
                     },
                 );
-                self.joiner_closes(&who, conn, Some(ErrorCode::Cancelled));
+                if !self.closed.iter().any(|(c, _)| *c == conn) {
+                    self.joiner_closes(&who, conn, Some(ErrorCode::Cancelled));
+                }
             }
             "drop" => {
                 let joiner = self
@@ -916,7 +918,18 @@ fn run_sequence(seq: &J, listed: Option<&J>) -> J {
 /// byte up to and including `AUTHORIZED {join_only, I}` is the same, and the
 /// first `msg_a` is not.
 fn before_msg_a(listed: Option<&J>) -> J {
-    let codes: [[u8; 12]; 2] = [*b"K7QM2XPA9RTE", *b"K7QMZZZZ0000"];
+    // The drawn bytes are alphabet positions, so these are the codes.
+    let draw = |code: &str| -> Vec<u8> {
+        code.bytes()
+            .map(|c| {
+                crate::pairing::DIRECT_CODE_ALPHABET
+                    .iter()
+                    .position(|a| *a == c)
+                    .expect("alphabet") as u8
+            })
+            .collect()
+    };
+    let codes = [draw("K7QM2XPA9RTE"), draw("K7QMZZZZ0000")];
     let mut runs = Vec::new();
     for (n, code) in codes.iter().enumerate() {
         // Host draws: the invitation id, then the 12 code bytes; joiner
@@ -973,7 +986,7 @@ fn before_msg_a(listed: Option<&J>) -> J {
 pub(super) fn direct_host_vectors() -> J {
     let sequences: Vec<J> = sequences().iter().map(|s| run_sequence(s, None)).collect();
     json!({
-        "description": "The host side of Pair with IP (wire.md 10.9) with the real code exchange. Each sequence starts with one invitation created at `conventions.time`; each step runs one operation, then its expectations hold. Ops: connect (step 2, then the joiner sends JOIN_DIRECT {lookup, name} on conn; `lookup` wrong means another lookup), recover (step 2, then JOIN_DIRECT with receipt I and, with `cancel`, the cancel flag), submit (the joiner runs one attempt with the right or a wrong secret: it draws an attempt id and its scalar, sends msg_a, checks msg_b; on a failed check it sends CODE_ABORT {A, pairing_failed} and closes with pairing_failed; otherwise it sends msg_c, unless `lose` is msg_c: then the connection breaks first), inject (the joiner sends CODE_EXCHANGE with `attempt` and `payload`), cancel (the joiner sends CODE_ABORT {its last attempt, cancelled} and closes with cancelled), drop (conn breaks with no GOAWAY), allow and decline (the owner answers the joiner's request; `result` ok or the refusal), owner_cancel, tick (the host's timer). `at` sets the time, in seconds after `conventions.time`, before the op. Step 2: a connection from an identity with a live grant is bound to it and the host sends AUTHORIZED {live} first. Expectations: `host_status`, `host_attempts_left`, `closed` (connections the host closed during the step, with the code), `held` (JOIN_DIRECTs answered by a miss hold: the I/O layer holds the connection for hold_ms, then closes it with invitation_invalid; that close is not listed), `requests` (answerable requests: joiner, presence, decision), `granted` (devices holding a grant whose receipt is the invitation). `out` lists in order every control message each side sent (except the two HELLOs), host closes, and what the host told its I/O layer and UI: admitted (join-only gate), miss_hold, attempts_left (after each debit; the code stays the same), approval (the prompt, sent again with the same id when its presence or decision changes), approval_ended, enrolled, enrollment_undone, invitation_ended and grant_closes (grant-table events).",
+        "description": "The host side of Pair with IP (wire.md 10.9) with the real code exchange. Each sequence starts with one invitation created at `conventions.time`; each step runs one operation, then its expectations hold. Ops: connect (step 2, then the joiner sends JOIN_DIRECT {lookup, name} on conn; `lookup` wrong means another lookup), recover (step 2, then JOIN_DIRECT with receipt I and, with `cancel`, the cancel flag), submit (the joiner runs one attempt with the right or a wrong secret: it draws an attempt id and its scalar, sends msg_a, checks msg_b; on a failed check it sends CODE_ABORT {A, pairing_failed} and closes with pairing_failed; otherwise it sends msg_c, unless `lose` is msg_c: then the connection breaks first), inject (the joiner sends CODE_EXCHANGE with `attempt` and `payload`), cancel (the joiner sends CODE_ABORT {its last attempt, cancelled} and closes with cancelled), drop (conn breaks with no GOAWAY), allow and decline (the owner answers the joiner's request; `result` ok or the refusal), owner_cancel, tick (the host's timer). A joiner's close is listed, and reaches the host, only when the host has not closed the connection during the step. A wrong lookup is `0000` (`0001` if that is the invitation's), a wrong secret `00000000` (`00000001` if that is the code's). `at` sets the time, in seconds after `conventions.time`, before the op. Step 2: a connection from an identity with a live grant is bound to it and the host sends AUTHORIZED {live} first. Expectations: `host_status` (`gone` once the host has forgotten the invitation), `host_attempts_left`, `closed` (connections the host closed during the step, with the code), `held` (JOIN_DIRECTs answered by a miss hold: the I/O layer holds the connection for hold_ms, then closes it with invitation_invalid; that close is not listed), `requests` (answerable requests: joiner, presence, decision), `granted` (devices holding a grant whose receipt is the invitation). `out` lists in order every control message each side sent (except the two HELLOs), host closes, and what the host told its I/O layer and UI: admitted (join-only gate), miss_hold, attempts_left (after each debit; the code stays the same), approval (the prompt, sent again with the same id when its presence or decision changes), approval_ended, enrolled and enrollment_undone (with the grant table's id, counting from 0), invitation_ended and grant_closes (grant-table events).",
         "conventions": {
             "time": T,
             "host": { "identity_secret": hex(&IDENTITY_A), "name": HOST_NAME },

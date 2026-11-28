@@ -1412,7 +1412,6 @@ impl<F: CodeExchangeFactory> DirectHostPairing<F> {
             },
             reason: ApprovalEnd::Enrolled,
         });
-        actions.extend(self.dismiss_others(id, None));
         actions.push(DirectHostAction::Enrolled {
             invitation: *id,
             conn,
@@ -1427,6 +1426,8 @@ impl<F: CodeExchangeFactory> DirectHostPairing<F> {
                 role,
             },
         });
+        // wire.md 10.8 step 5: then every other request and connection.
+        actions.extend(self.dismiss_others(id, None));
         actions
     }
 
