@@ -36,6 +36,7 @@ use crate::pairing::{
     RouteHost, SessionExporters, Ticket, TicketSecret, JOIN_PROOF_KEY_INFO, SID_DOMAIN,
     TICKET_VERSION,
 };
+use crate::pairing::{DirectCode, DIRECT_CODE_ALPHABET, DIRECT_CODE_LEN};
 use crate::session_cert::{
     self, build_certificate, PendingCertificate, SessionKey, ValidityWindow,
 };
@@ -104,6 +105,7 @@ fn checked_in(name: &str) -> Option<String> {
         "cbor.json",
         "control.json",
         "der-raw.json",
+        "direct-code.json",
         "hello.json",
         "join-proof.json",
         "mux.json",
@@ -1283,6 +1285,99 @@ fn der_raw_vectors() -> J {
             { "name": "63_bytes", "input": raw_plain[..126], "result": "not_raw" },
             { "name": "r_zero", "input": format!("{}{s}", "00".repeat(32)), "result": "out_of_range" },
         ],
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Direct code
+// ---------------------------------------------------------------------------
+
+fn direct_code_json(code: &DirectCode) -> J {
+    json!({
+        "code": code.as_str(),
+        "lookup": code.lookup().as_str(),
+        "secret": hex(code.secret().as_bytes()),
+    })
+}
+
+fn direct_code_vectors() -> J {
+    let mut seeded = [0u8; DIRECT_CODE_LEN];
+    ChaCha20Rng::from_seed([0x5a; 32]).fill_bytes(&mut seeded);
+    let ascending: [u8; DIRECT_CODE_LEN] = std::array::from_fn(|i| i as u8);
+    let draws: [(&str, [u8; DIRECT_CODE_LEN]); 7] = [
+        ("all_zero", [0x00; DIRECT_CODE_LEN]),
+        ("all_ones", [0xff; DIRECT_CODE_LEN]),
+        ("digits", ascending),
+        ("high_bits_ignored", ascending.map(|b| b | 0xe0)),
+        ("first_letters", ascending.map(|b| b + 0x0a)),
+        ("last_letters", ascending.map(|b| b + 0x14)),
+        ("seeded", seeded),
+    ];
+    let draws: Vec<J> = draws
+        .iter()
+        .map(|(name, draw)| {
+            let code = DirectCode::from_draw(draw);
+            let mut case = direct_code_json(&code);
+            case["name"] = json!(name);
+            case["draw"] = json!(hex(draw));
+            case["display"] = json!(code.to_display().as_str());
+            case
+        })
+        .collect();
+    let accepted: Vec<J> = [
+        ("canonical", "K7QM2XPA9RTE"),
+        ("display_form", "K7QM-2XPA-9RTE"),
+        ("lowercase", "k7qm-2xpa-9rte"),
+        ("mixed_case", "k7Qm2xPa9rTe"),
+        ("spaces", "K7QM 2XPA 9RTE"),
+        ("leading_and_trailing_spaces", "  K7QM2XPA9RTE  "),
+        ("extra_dashes", "--K7QM--2XPA--9RTE--"),
+        ("spaces_and_dashes_anywhere", "K 7-Q M2X-P A9R-T E"),
+        ("o_reads_as_zero", "OoOo-0000-0000"),
+        ("i_and_l_read_as_one", "IiLl-1111-1111"),
+        ("all_folding_lowercase", "oil0-ilo1-loil"),
+    ]
+    .iter()
+    .map(|(name, input)| {
+        let code = DirectCode::parse(input).expect("accepted input");
+        let mut case = direct_code_json(&code);
+        case["name"] = json!(name);
+        case["input"] = json!(input);
+        case
+    })
+    .collect();
+    let rejected: Vec<J> = [
+        ("empty", ""),
+        ("only_separators", " - - "),
+        ("eleven_characters", "K7QM-2XPA-9RT"),
+        ("thirteen_characters", "K7QM-2XPA-9RTEX"),
+        ("u_is_not_in_the_alphabet", "K7QM-2XPA-9RTU"),
+        ("lowercase_u", "k7qm-2xpa-9rtu"),
+        ("dot_separator", "K7QM.2XPA.9RTE"),
+        ("underscore_separator", "K7QM_2XPA_9RTE"),
+        ("tab", "K7QM\t2XPA9RTE"),
+        ("newline", "K7QM2XPA9RTE\n"),
+        ("non_ascii_letter", "K7QM-2XPA-9RTÉ"),
+        ("fullwidth_digits", "１２３４５６７８９０１２"),
+        ("cyrillic_o", "K7QМ-2XPA-9RTО"),
+        ("no_break_space", "K7QM\u{a0}2XPA9RTE"),
+        ("bad_character_before_length", "K7QM!"),
+        ("bad_character_after_twelve", "K7QM2XPA9RTE!"),
+        ("bad_character_after_thirteen", "K7QM2XPA9RTEX!"),
+        ("long_s_is_not_ascii", "K7QM2XPA9RT\u{17f}"),
+    ]
+    .iter()
+    .map(|(name, input)| {
+        let error = DirectCode::parse(input).expect_err("rejected input");
+        json!({ "name": name, "input": input, "error": error.code() })
+    })
+    .collect();
+    json!({
+        "description": "The direct code (spec wire.md 10.9). `draws`: 12 drawn bytes to the code, its display form, the lookup (characters 1 to 4) and the secret (characters 5 to 12, as hex of their ASCII bytes). `accepted`: typed text to the canonical code. `rejected`: typed text that is not a code, with the error; a bad character is reported before a wrong length.",
+        "alphabet": std::str::from_utf8(DIRECT_CODE_ALPHABET).expect("ascii"),
+        "draws": draws,
+        "accepted": accepted,
+        "rejected": rejected,
     })
 }
 
@@ -2473,6 +2568,7 @@ fn all_vectors() -> Vec<(&'static str, J)> {
         ("join-proof.json", proof_vectors()),
         ("cbor.json", cbor_vectors()),
         ("der-raw.json", der_raw_vectors()),
+        ("direct-code.json", direct_code_vectors()),
         ("mux.json", mux_vectors()),
         ("control.json", control_vectors()),
         ("hello.json", hello_vectors()),

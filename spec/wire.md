@@ -1312,6 +1312,39 @@ lost `PAIRED` (10.6, rule 8). When a pairing replaces a grant, the
 connection it ran on is bound to the new grant and every other connection
 bound to the old one closes with `GRANT_REVOKED`.
 
+### 10.9 Direct flow
+
+*Draft: this section so far gives only the code. The flow, its messages and
+its limits follow.*
+
+The direct flow pairs two endpoints with no ticket: the host shows its
+address and a **direct code**, and the joiner's owner types both.
+
+#### Code
+
+- **Alphabet:** Crockford base32, `0123456789ABCDEFGHJKMNPQRSTVWXYZ` (no
+  `I`, `L`, `O`, `U`).
+- **Length:** 12 characters. The host shows them as three groups of four
+  joined by `-`: `K7QM-2XPA-9RTE`.
+- **Generation:** draw 12 bytes; byte `b` becomes `ALPHABET[b & 0x1f]`.
+  Every character is uniform and independent; nothing is redrawn except as
+  the host's lookup rule below says.
+- **Lookup `L`:** characters 1 to 4 (20 bits). It finds the invitation on
+  the host and is sent inside TLS; it is not secret once used. When a new
+  code's lookup equals the lookup of another open direct invitation of the
+  same endpoint, the host draws a whole new code.
+- **Secret `S`:** characters 5 to 12 (40 bits), as their 8 ASCII bytes. It
+  is the code exchange's password and is never sent. It is independent of
+  `L`.
+- **Entry:** the joiner reads typed text as follows. ASCII spaces (0x20) and
+  `-` are dropped; ASCII letters are uppercased; `O` reads as `0`, and `I`
+  and `L` as `1`. Any other character is `bad_character`. If what remains is
+  not 12 characters long, it is `wrong_length`. A bad character is reported
+  before a wrong length. Either error means the text is not a code: nothing
+  is dialled and no attempt is spent.
+
+The code, `L` and `S` are never logged. Vectors: `direct-code.json`.
+
 ## 11. Control messages
 
 Each `CONTROL` frame carries exactly one message: a canonical CBOR map whose

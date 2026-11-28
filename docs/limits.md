@@ -337,6 +337,9 @@ These are protocol constants, not limits, so they are not settings:
 - The verifier's 24 h certificate maximum (`MAX_LIFETIME_SECS`); a device
   can only issue shorter certificates (`CERT_LIFETIME_SECS`).
 - The joiner record's bound of 3 attempts: the stored format rejects more.
+- The direct code (wire.md 10.9): the Crockford base32 alphabet, 12
+  characters, and the split into a 4-character lookup and an 8-character
+  secret. Both ends read the code the same way.
 - Engine-stream messages: at most 262 144 bytes (wire.md 9.5). Plus's fixed
   maxima (`REQUEST_MAX` 16 384, `DIR_ENTRY_MAX` 4096, `MAIL_ENVELOPE_MAX`
   8192, `DEPOSIT_TOKENS_MAX` 256, `BLOCK_MAX_LIFETIME` 172 800 s, the

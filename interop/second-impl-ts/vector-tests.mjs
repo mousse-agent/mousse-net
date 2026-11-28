@@ -5,6 +5,7 @@ import { bytes, decode, encode, hex } from './cbor.ts';
 import { authenticateNativePeer, checkRaw, DerReader, derToRaw, issueCertificate, lanCandidate, nativeTlsPolicy, publicKey,
   rawToDer, SessionLifetime, sha256, signCertificateVerify, verify, verifyCertificate } from './certificate.ts';
 import * as cpace from './cpace.ts';
+import { DIRECT_CODE_ALPHABET, directCodeFromDraw, displayDirectCode, parseDirectCode } from './direct-code.ts';
 import { PairingJoiner } from './pairing.ts';
 import { Gate, step2, Streams } from './session.ts';
 import * as relay from './relay.ts';
@@ -42,6 +43,24 @@ function outcome(expected, fn) {
     }
   });
   for (const item of v.raw_only) add(item.name, () => outcome(item.result, () => checkRaw(bytes(item.input))));
+}
+
+{
+  const [v, add] = file('direct-code.json');
+  const same = (code, item) => {
+    assert.equal(code.code, item.code);
+    assert.equal(code.lookup, item.lookup);
+    matches(code.secret, item.secret);
+  };
+  add('alphabet', () => assert.equal(v.alphabet, DIRECT_CODE_ALPHABET));
+  for (const item of v.draws) add(`draw ${item.name}`, () => {
+    const code = directCodeFromDraw(bytes(item.draw));
+    same(code, item);
+    assert.equal(displayDirectCode(code.code), item.display);
+    same(parseDirectCode(item.display), item);
+  });
+  for (const item of v.accepted) add(`accepted ${item.name}`, () => same(parseDirectCode(item.input), item));
+  for (const item of v.rejected) add(`rejected ${item.name}`, () => outcome(item.error, () => parseDirectCode(item.input)));
 }
 
 {
