@@ -74,7 +74,7 @@ use serde_json::{json, Map, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, watch, Notify};
 
-use self::budget::Budget;
+use self::budget::{Budget, Credit};
 use self::frame::Frame;
 use self::out::{Meta, Out};
 use crate::applog;
@@ -111,7 +111,7 @@ const GRANT_ROLES: &str = "grant-roles";
 const GRANT_ADD_CONNECTED: &str = "grant-add-connected";
 
 /// The stream labels an inbound connection passes on to the app (§3.2).
-pub const LABELS: [&str; 6] = [
+pub const LABELS: [&str; 9] = [
     "mousse.hello",
     "mousse.rpc",
     "mousse.sub",
@@ -119,6 +119,14 @@ pub const LABELS: [&str; 6] = [
     "mousse.put",
     // One editor tunnel (Phase 1b §9.2).
     "mousse.tunnel",
+    // Bot streams, with places of their own apart from the app's caps
+    // (`BOT_STREAMS_PER_CONNECTION`): a bot's feed and chat subscriptions,
+    // its calls, and its live browser view (a latest-wins picture stream:
+    // the sender skips stale pictures when credit runs short, nothing is
+    // stored or retried).
+    mousse_net_io::BOT_LABELS[0],
+    mousse_net_io::BOT_LABELS[1],
+    mousse_net_io::BOT_LABELS[2],
 ];
 
 /// What the app learns in the `hello` reply.
@@ -246,6 +254,8 @@ struct ConnEntry {
 struct StreamEntry {
     conn: u64,
     class: PriorityClass,
+    /// The part of the credit budget it draws on (from its label and class).
+    credit: Credit,
     writer: StreamWriter,
     /// The app accepted it (always, for a stream it opened).
     accepted: bool,
@@ -282,8 +292,9 @@ struct Core {
     streams: BTreeMap<u32, StreamEntry>,
     next_conn: u64,
     next_handle: u32,
-    /// The last stream granted credit, per class (streams take turns).
-    turn: [u32; 2],
+    /// The last stream granted credit, per credit kind (streams take
+    /// turns).
+    turn: [u32; 3],
     dropped: u64,
     buffered: u64,
     peak_buffered: u64,
@@ -378,12 +389,13 @@ impl App {
                 budget: Budget::new(
                     limits.app_credit_budget_bytes(),
                     limits.app_credit_interactive_reserve_bytes(),
+                    limits.app_credit_bot_reserve_bytes(),
                 ),
                 conns: HashMap::new(),
                 streams: BTreeMap::new(),
                 next_conn: 1,
                 next_handle: 1,
-                turn: [0, 0],
+                turn: [0, 0, 0],
                 dropped: 0,
                 buffered: 0,
                 peak_buffered: 0,
@@ -849,6 +861,7 @@ impl Shared {
         let handle = core.next_handle;
         core.next_handle += 1;
         let class = stream.class();
+        let credit = Credit::of(stream.label(), class);
         let (reader, writer) = stream.split();
         let (tx, rx) = mpsc::unbounded_channel();
         let wake = Arc::new(Notify::new());
@@ -857,6 +870,7 @@ impl Shared {
             StreamEntry {
                 conn: no,
                 class,
+                credit,
                 writer: writer.clone(),
                 accepted,
                 rx: Rx::Open,
@@ -934,9 +948,9 @@ impl Shared {
         let unused = s.tx_credit;
         s.tx_credit = 0;
         s.tx_window -= unused;
-        let class = s.class;
+        let credit = s.credit;
         core.out.take_credit(handle);
-        core.budget.give_back(class, unused);
+        core.budget.give_back(credit, unused);
         core.regrant(&self.limits);
         self.wake_writer.notify_one();
         Ok(())
@@ -981,6 +995,7 @@ impl Shared {
                     "preauth_refused": per_kind(mousse_net_io::PreAuthStats::refused),
                     "re": id,
                     "open_streams": a.open_streams(),
+                    "bot_streams": a.bot_streams(),
                     "queued_bytes": a.queued_bytes(),
                     "peak_queued_bytes": a.peak_queued_bytes(),
                     "held_bytes": a.held_bytes(),
@@ -1281,8 +1296,8 @@ impl Shared {
         };
         let n = n.min(s.tx_window);
         s.tx_window -= n;
-        let class = s.class;
-        core.budget.give_back(class, n);
+        let credit = s.credit;
+        core.budget.give_back(credit, n);
         core.regrant(&self.limits);
         self.wake_writer.notify_one();
     }
@@ -1301,9 +1316,9 @@ impl Shared {
         let left = s.tx_window;
         s.tx_window = 0;
         s.tx_credit = 0;
-        let class = s.class;
+        let credit = s.credit;
         core.out.take_credit(handle);
-        core.budget.give_back(class, left);
+        core.budget.give_back(credit, left);
         core.maybe_remove(handle);
         core.regrant(&self.limits);
         self.wake_writer.notify_one();
@@ -1369,7 +1384,7 @@ fn drop_stream(core: &mut Core, handle: u32) -> bool {
     core.out.discard(handle);
     let unheard = core.out.unannounce(handle);
     core.buffered = core.buffered.saturating_sub(s.rx_buffered);
-    core.budget.give_back(s.class, s.tx_window);
+    core.budget.give_back(s.credit, s.tx_window);
     s.wake.notify_one();
     !unheard
 }
@@ -1383,19 +1398,23 @@ impl Core {
         }
     }
 
-    /// Grant credit to streams that can take more, interactive first,
-    /// streams taking turns within a class.
+    /// Grant credit to streams that can take more: bot chat and calls,
+    /// then interactive, then bulk, streams taking turns within a kind.
     fn regrant(&mut self, limits: &HelperLimits) {
-        let max = limits.app_stream_credit_bytes();
-        for (slot, class) in [PriorityClass::Interactive, PriorityClass::Bulk]
+        for (slot, credit) in [Credit::Bot, Credit::Interactive, Credit::Bulk]
             .into_iter()
             .enumerate()
         {
+            // A bot stream holds at most a share of the bot pool, so one
+            // whose reader stalls can't pin all of it.
+            let max = self
+                .budget
+                .stream_max(credit, limits.app_stream_credit_bytes());
             let wanting: Vec<u32> = self
                 .streams
                 .iter()
                 .filter(|(_, s)| {
-                    s.class == class && s.accepted && s.tx.is_some() && s.tx_window < max
+                    s.credit == credit && s.accepted && s.tx.is_some() && s.tx_window < max
                 })
                 .map(|(h, _)| *h)
                 .collect();
@@ -1407,7 +1426,7 @@ impl Core {
                 let Some(s) = self.streams.get_mut(&handle) else {
                     continue;
                 };
-                let got = self.budget.take(class, max - s.tx_window);
+                let got = self.budget.take(credit, max - s.tx_window);
                 if got == 0 {
                     break;
                 }

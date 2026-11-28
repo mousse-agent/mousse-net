@@ -54,10 +54,10 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 use tokio_rustls::TlsStream;
 
-use crate::admission::{ConnStreams, HelloSeen, StreamAdmission, StreamPermit};
+use crate::admission::{ConnStreams, HelloSeen, Room, StreamAdmission, StreamPermit};
 use crate::clock::Clock;
 use crate::error::NetError;
-use crate::limits::{ms, Limits};
+use crate::limits::{ms, CoreLimits, Limits};
 use crate::pipe::Pipe;
 
 /// The driver's limits, from [`Limits`], as the types it uses.
@@ -920,6 +920,32 @@ pub(crate) fn channel() -> (mpsc::UnboundedSender<Cmd>, mpsc::UnboundedReceiver<
 /// places, apart from the app's stream caps.
 pub const ENGINE_LABEL_PREFIX: &str = "mousse-";
 
+/// The mux limits of a connection admitted by `streams`: `MAX_PEER_STREAMS`
+/// raised, where it is lower, to every place `streams` gives a connection
+/// (app, bot and engine), so the mux never refuses a peer's open before its
+/// room's cap is looked at. A caller or host may take its admission from
+/// another configuration ([`Caller::use_stream_admission`],
+/// [`HostConfig::streams`]); this is where the two meet. Memory stays
+/// bounded: those places are, and the mux holds no stream they refuse.
+///
+/// [`Caller::use_stream_admission`]: crate::Caller::use_stream_admission
+/// [`HostConfig::streams`]: crate::HostConfig::streams
+fn mux_limits(limits: &Limits, streams: &StreamAdmission) -> CoreLimits {
+    let core = *limits.core();
+    let spec_max = CoreLimits::SPECS
+        .iter()
+        .find(|s| s.name == "MAX_PEER_STREAMS")
+        .map_or(u64::MAX, |s| s.max);
+    let places = u64::try_from(streams.places_per_connection())
+        .unwrap_or(u64::MAX)
+        .min(spec_max);
+    if core.max_peer_streams() >= places {
+        return core;
+    }
+    core.with_overrides(&[("MAX_PEER_STREAMS", places)])
+        .unwrap_or(core)
+}
+
 /// Start the driver task for one connection.
 pub(crate) fn spawn<P: Pipe>(
     start: Start<P>,
@@ -946,7 +972,11 @@ pub(crate) fn spawn<P: Pipe>(
         shutting: shutting.clone(),
     };
     let driver = Driver {
-        mux: Mux::with_limits(start.side, start.clock.mono(), start.limits.core()),
+        mux: Mux::with_limits(
+            start.side,
+            start.clock.mono(),
+            &mux_limits(&start.limits, &start.streams),
+        ),
         limits: DriverLimits::new(&start.limits),
         admit: start.streams.connection(),
         permits: HashMap::new(),
@@ -1340,11 +1370,7 @@ impl Driver {
                     ))
                 } else if !self.role.may_open() {
                     Err(NetError::Refused("the connection is not authorized".into()))
-                } else if let Some(permit) = if label.starts_with(ENGINE_LABEL_PREFIX) {
-                    self.admit.try_admit_engine()
-                } else {
-                    self.admit.try_admit()
-                } {
+                } else if let Some(permit) = self.admit.try_admit_in(Room::of(&label)) {
                     self.mux
                         .open_stream(class, &label)
                         .map(|id| self.new_stream(id, class, label, permit))
@@ -1632,12 +1658,11 @@ impl Driver {
                 class,
                 label,
             } => {
-                // Admission: a stream past either cap is refused before
-                // anything is queued for it (Phase 1a §2.2).
-                let permit = if label.starts_with(ENGINE_LABEL_PREFIX) {
-                    self.admit.try_admit_engine()
-                } else {
-                    self.admit_peer_stream()
+                // Admission: a stream past either cap of its room is
+                // refused before anything is queued for it (Phase 1a §2.2).
+                let permit = match Room::of(&label) {
+                    Room::App => self.admit_peer_stream(),
+                    room => self.admit.try_admit_in(room),
                 };
                 let Some(permit) = permit else {
                     self.admit.refused();
@@ -2021,6 +2046,15 @@ mod tests {
         deadline_in: u64,
         streams: Arc<StreamAdmission>,
     ) -> (Connection, Peer, Valve, Arc<ManualClock>) {
+        connected_limits(deadline_in, Limits::DEFAULT, streams).await
+    }
+
+    /// [`connected_with`], with the connection's own `limits`.
+    async fn connected_limits(
+        deadline_in: u64,
+        limits: Limits,
+        streams: Arc<StreamAdmission>,
+    ) -> (Connection, Peer, Valve, Arc<ManualClock>) {
         let clock = Arc::new(ManualClock::new());
         let cert = |clock: Arc<ManualClock>| {
             CertManager::new(Arc::new(SoftwareKey::generate(&mut os_rng())), clock)
@@ -2056,7 +2090,7 @@ mod tests {
                 kx_group: handshake.kx_group,
                 deadline: UnixTime(clock.now().0 + deadline_in),
                 clock: clock.clone(),
-                limits: Limits::DEFAULT,
+                limits,
                 streams,
             },
             Box::new(OpenRole),
@@ -2510,6 +2544,75 @@ mod tests {
                 "late DATA changed the reset's code"
             );
         }
+    }
+
+    /// A connection whose stream admission comes from another configuration
+    /// than its own limits (as `Caller::use_stream_admission` and
+    /// `HostConfig::streams` allow): its mux keeps room for every place the
+    /// admission gives, so a peer filling the app's places still opens bot
+    /// streams, and the admission's caps still refuse the rest.
+    #[tokio::test]
+    async fn the_mux_keeps_room_for_every_place_of_a_shared_admission() {
+        let own = |pairs: &[(&str, u64)]| Limits::DEFAULT.with_overrides(pairs).unwrap();
+        // The connection's own limits: 1 app + 1 bot + 1 engine place, and
+        // a mux that keeps 3 peer streams.
+        let limits = own(&[
+            ("STREAMS_PER_CONNECTION", 1),
+            ("BOT_STREAMS_PER_CONNECTION", 1),
+            ("OWN_STREAMS_PER_CONNECTION", 1),
+            ("MAX_PEER_STREAMS", 3),
+        ]);
+        // The admission it is given: 2 app + 2 bot + 1 engine place.
+        let admission = StreamAdmission::new(&own(&[
+            ("STREAMS_PER_CONNECTION", 2),
+            ("BOT_STREAMS_PER_CONNECTION", 2),
+            ("OWN_STREAMS_PER_CONNECTION", 1),
+        ]));
+        let (conn, mut peer, _valve, _clock) =
+            connected_limits(3_600, limits, admission.clone()).await;
+        for label in [
+            "mousse.sub",
+            "mousse.sub",
+            "mousse.botsub",
+            "mousse.botview",
+        ] {
+            peer.mux
+                .open_stream(PriorityClass::Interactive, label)
+                .unwrap();
+        }
+        peer.flush().await;
+        for n in 0..4 {
+            let s = within(&format!("stream {n}"), conn.accept_stream())
+                .await
+                .unwrap();
+            assert_eq!(
+                s.label(),
+                [
+                    "mousse.sub",
+                    "mousse.sub",
+                    "mousse.botsub",
+                    "mousse.botview"
+                ][n]
+            );
+        }
+        assert_eq!(admission.open_streams(), 2);
+        assert_eq!(admission.bot_streams(), 2);
+        // Past the admission's own caps, opens are still refused.
+        let extra = peer
+            .mux
+            .open_stream(PriorityClass::Interactive, "mousse.botrpc")
+            .unwrap();
+        peer.flush().await;
+        assert!(
+            within(
+                "the refusal",
+                peer.read_until(|f| matches!(
+                    f,
+                    Frame::Reset { stream, code: ErrorCode::RefusedStream } if *stream == extra
+                ))
+            )
+            .await
+        );
     }
 
     /// A peer splitting its data into one-byte DATA frames while nobody

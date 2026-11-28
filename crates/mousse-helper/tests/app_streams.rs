@@ -71,6 +71,57 @@ fn a_peer_opening_past_the_connection_cap_is_refused() {
     p.b.assert_clean();
 }
 
+/// Thread streams filling a connection's app places never refuse a bot's
+/// feed, chat, call or browser view: bot labels have places of their own,
+/// and past those a bot stream is refused rather than taking an app place.
+/// A's own cap on peer streams is set to one: the connection raises it to
+/// every place A's admission gives (32 app + 3 bot + 4 engine), so all 35
+/// app and bot streams open.
+#[test]
+fn thread_streams_filling_their_places_never_block_a_bot_stream() {
+    let mut p = pair_up(
+        "botroom",
+        &[
+            ("BOT_STREAMS_PER_CONNECTION", "3"),
+            ("MAX_PEER_STREAMS", "1"),
+        ],
+        &ROOMY,
+    );
+    let threads: Vec<u32> = (0..33)
+        .map(|_| p.b.open(p.b_conn, "mousse.sub", "interactive"))
+        .collect();
+    p.a.incoming(p.a_conn, 31);
+    let r = p.b.event("stream.reset", |_| true);
+    assert_eq!(
+        (u(&r["handle"]) as u32, r["code"].as_str().unwrap()),
+        (threads[32], "refused_stream")
+    );
+    for (n, label) in ["mousse.botsub", "mousse.botrpc", "mousse.botview"]
+        .into_iter()
+        .enumerate()
+    {
+        p.b.open(p.b_conn, label, "interactive");
+        let h = p.a.incoming(p.a_conn, 32 + n);
+        let incoming = p.a.event("stream.incoming", |m| m["handle"] == h);
+        assert_eq!(incoming["label"], label);
+    }
+    // A's three bot places are full: a fourth bot stream is refused, and
+    // so is a thread stream, which can't use a bot place either.
+    let bot = p.b.open(p.b_conn, "mousse.botsub", "interactive");
+    let r = p.b.event("stream.reset", |m| m["handle"] == bot);
+    assert_eq!(r["code"], "refused_stream");
+    let thread = p.b.open(p.b_conn, "mousse.sub", "interactive");
+    let r = p.b.event("stream.reset", |m| m["handle"] == thread);
+    assert_eq!(r["code"], "refused_stream");
+    let stats = p.a.stats();
+    assert_eq!(stats["open_streams"], 32, "{stats}");
+    assert_eq!(stats["bot_streams"], 3, "{stats}");
+    assert_eq!(stats["refused_streams"], 3, "{stats}");
+    assert_eq!(p.a.events("stream.incoming").len(), 35);
+    p.a.assert_clean();
+    p.b.assert_clean();
+}
+
 /// With A's app reading nothing, everything waits in A's engine: at most
 /// the initial credit of each admitted stream, and in memory little more,
 /// also when B splits its data into the smallest DATA frames it may send
@@ -289,6 +340,164 @@ fn credit_comes_from_one_budget_with_a_reserve_for_interactive() {
     }
     assert_eq!(total(&p.b, i1) + total(&p.b, i2), 256 * KIB);
     assert_eq!(u(&p.b.stats()["app_credit_out_bytes"]), 512 * KIB);
+    p.b.assert_clean();
+}
+
+/// Thread streams filling the credit budget never stall a bot's chat: it
+/// draws on a pool of its own, which a bot's browser view can't take,
+/// whatever class it was opened with.
+#[test]
+fn threads_filling_the_credit_budget_never_stall_bot_chat() {
+    // 512 KiB shared, 128 KiB of it interactive only, 1 MiB for bot chat
+    // and calls, 128 KiB a stream.
+    let budget = [
+        ("APP_CREDIT_BUDGET_BYTES", "524288"),
+        ("APP_CREDIT_INTERACTIVE_RESERVE_BYTES", "131072"),
+        ("APP_CREDIT_BOT_RESERVE_BYTES", "1048576"),
+        ("APP_STREAM_CREDIT_BYTES", "131072"),
+    ];
+    let mut p = pair_up("botcredit", &[], &budget);
+    let total = |app: &App, h: u32| app.st().tx.get(&h).map(|t| t.credit_total).unwrap_or(0);
+    let full = |app: &App, hs: &[u32]| {
+        app.wait("full credit", WAIT, |st| {
+            hs.iter()
+                .all(|h| st.tx.get(h).is_some_and(|t| t.credit_total == 128 * KIB))
+                .then_some(())
+        })
+    };
+    // Bulk threads take all the budget but the interactive reserve.
+    let bulk = open_bulk(&mut p.b, p.b_conn, 3);
+    full(&p.b, &bulk);
+    // A browser view opened interactive while that reserve is still free
+    // gets none of it: pictures count as bulk.
+    let early_view = p.b.open(p.b_conn, "mousse.botview", "interactive");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        total(&p.b, early_view),
+        0,
+        "the view took interactive credit"
+    );
+    let sub = p.b.open(p.b_conn, "mousse.sub", "interactive");
+    full(&p.b, &[sub]);
+    let extra = p.b.open(p.b_conn, "mousse.sub", "interactive");
+    // Nor bot credit, opened bulk or interactive.
+    let views = [
+        early_view,
+        p.b.open(p.b_conn, "mousse.botview", "bulk"),
+        p.b.open(p.b_conn, "mousse.botview", "interactive"),
+    ];
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(u(&p.b.stats()["app_credit_out_bytes"]), 512 * KIB);
+    assert_eq!(total(&p.b, extra), 0);
+    for v in views {
+        assert_eq!(total(&p.b, v), 0, "the view took reserved credit");
+    }
+    // A bot's chat gets credit at once, and its data moves: once the
+    // engine takes the bytes, the credit comes back to it.
+    let chat = p.b.open(p.b_conn, "mousse.botsub", "interactive");
+    full(&p.b, &[chat]);
+    p.b.send(chat, &pattern(128 * KIB as usize, 3), false);
+    p.b.wait("bot chat credit back", WAIT, |st| {
+        st.tx
+            .get(&chat)
+            .is_some_and(|t| t.credit_total == 256 * KIB)
+            .then_some(())
+    });
+    assert_eq!(total(&p.b, extra), 0, "a thread got bot credit");
+    for v in views {
+        assert_eq!(total(&p.b, v), 0, "the view got bot credit");
+    }
+    assert_eq!(u(&p.b.stats()["app_credit_out_bytes"]), 640 * KIB);
+    p.b.assert_clean();
+}
+
+/// Bot streams at their cap leave threads their share: more bot streams
+/// than the bot pool holds never take a thread call's credit.
+#[test]
+fn bot_streams_at_their_cap_leave_a_thread_call_credit() {
+    // 512 KiB shared, 256 KiB of it interactive only, 1 MiB for bots,
+    // 256 KiB a stream: four bot streams fill the bot pool.
+    let budget = [
+        ("APP_CREDIT_BUDGET_BYTES", "524288"),
+        ("APP_CREDIT_INTERACTIVE_RESERVE_BYTES", "262144"),
+        ("APP_CREDIT_BOT_RESERVE_BYTES", "1048576"),
+        ("APP_STREAM_CREDIT_BYTES", "262144"),
+    ];
+    let mut p = pair_up("botcap", &[], &budget);
+    let total = |app: &App, h: u32| app.st().tx.get(&h).map(|t| t.credit_total).unwrap_or(0);
+    let bots: Vec<u32> = (0..8)
+        .map(|n| {
+            let class = if n % 2 == 0 { "interactive" } else { "bulk" };
+            p.b.open(p.b_conn, "mousse.botsub", class)
+        })
+        .collect();
+    p.b.wait("the bot pool given out", WAIT, |st| {
+        let out: u64 = bots
+            .iter()
+            .filter_map(|h| st.tx.get(h).map(|t| t.credit_total))
+            .sum();
+        (out == 1024 * KIB).then_some(())
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    let held: u64 = bots.iter().map(|h| total(&p.b, *h)).sum();
+    assert_eq!(held, 1024 * KIB, "bots took more than their pool");
+    let call = p.b.open(p.b_conn, "mousse.rpc", "interactive");
+    p.b.wait("a thread call's credit", WAIT, |st| {
+        st.tx
+            .get(&call)
+            .is_some_and(|t| t.credit_total == 256 * KIB)
+            .then_some(())
+    });
+    p.b.assert_clean();
+}
+
+/// A bot stream whose reader stalls holds at most a share of the bot pool:
+/// another bot stream still gets credit and moves.
+#[test]
+fn one_stalled_bot_reader_leaves_other_bot_streams_moving() {
+    // The bot pool at its 1 MiB floor; a stream could hold all of it but
+    // for its share (a quarter). 2 MiB shared, 1 MiB of it interactive.
+    let budget = [
+        ("APP_CREDIT_BUDGET_BYTES", "2097152"),
+        ("APP_CREDIT_BOT_RESERVE_BYTES", "1048576"),
+        ("APP_STREAM_CREDIT_BYTES", "1048576"),
+    ];
+    let mut p = pair_up("botstall", &[], &budget);
+    let full = |app: &App, h: u32| {
+        app.wait("full credit", WAIT, |st| {
+            st.tx
+                .get(&h)
+                .is_some_and(|t| t.credit_total == 1024 * KIB)
+                .then_some(())
+        })
+    };
+    // Idle threads hold the whole shared budget, so no bot stream can lean
+    // on it.
+    let blob = p.b.open(p.b_conn, "mousse.blob", "bulk");
+    full(&p.b, blob);
+    let sub = p.b.open(p.b_conn, "mousse.sub", "interactive");
+    full(&p.b, sub);
+    let stalled = p.b.open(p.b_conn, "mousse.botsub", "interactive");
+    let ha = p.a.incoming(p.a_conn, 2);
+    p.a.accept(ha);
+    // A's app reads nothing: B's writes stall on wire credit.
+    p.b.send(stalled, &pattern(4 << 20, 1), false);
+    let sent = p.b.settle(Duration::from_millis(700), |b| b.sent(stalled));
+    assert!(sent < 4 << 20, "B never stalled: {sent}");
+    let moving = p.b.open(p.b_conn, "mousse.botsub", "interactive");
+    p.b.wait("credit for the other bot stream", WAIT, |st| {
+        st.tx
+            .get(&moving)
+            .is_some_and(|t| t.credit_total == 256 * KIB)
+            .then_some(())
+    });
+    p.b.send(moving, &pattern(128 * KIB as usize, 2), false);
+    p.b.wait("its credit back", WAIT, |st| {
+        st.tx
+            .get(&moving)
+            .is_some_and(|t| t.credit_total >= 384 * KIB)
+            .then_some(())
+    });
     p.b.assert_clean();
 }
 
