@@ -67,8 +67,8 @@ use mousse_net_core::{ErrorCode, BOTH_WAYS_MIN_MINOR};
 use mousse_net_io::pipe::RouteKind;
 use mousse_net_io::store::{hex, short_id};
 use mousse_net_io::{
-    Caller, CloseReason, ConnStatus, Connection, Host, HostEvent, ListenerKind, MuxStream,
-    NetError, RouteClass, StreamAdmission, StreamReader, StreamWriter,
+    Caller, CloseReason, Connection, HelloSeen, Host, HostEvent, ListenerKind, MuxStream, NetError,
+    RouteClass, StreamAdmission, StreamReader, StreamWriter,
 };
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -342,6 +342,21 @@ fn error(id: &Value, error: &str, reason: impl Into<String>) -> Value {
     json!({"re": id, "error": error, "reason": reason.into()})
 }
 
+/// Every connection's version decision, as its driver made it
+/// (`refusals.rs`): an agreement clears the device's refusal, a refusal is
+/// kept, whether or not the connection was then authorized or announced.
+async fn watch_hellos(shared: Arc<Shared>, mut hellos: mpsc::UnboundedReceiver<HelloSeen>) {
+    while let Some(seen) = hellos.recv().await {
+        let paired = || shared.paired(&seen.peer);
+        if shared
+            .refusals
+            .record(&seen, paired, crate::peer::now_secs())
+        {
+            shared.version_refused(&seen);
+        }
+    }
+}
+
 impl App {
     /// Start the channel on stdin and stdout.
     pub fn start(
@@ -391,9 +406,10 @@ impl App {
             limits,
             engine,
         });
-        // Read the refusals file off the path every new connection takes.
-        let warm = shared.clone();
-        tokio::spawn(async move { warm.refusals.get("") });
+        tokio::spawn(watch_hellos(
+            shared.clone(),
+            shared.admission.watch_hellos(),
+        ));
         tokio::spawn(read_stdin(shared.clone()));
         tokio::spawn(write_stdout(shared.clone()));
         tokio::spawn(pairing::watch_pause(shared.clone()));
@@ -457,12 +473,6 @@ impl App {
         // Must-fail control: announce the connection before step 2 settles.
         let wait_for_live = !cfg!(mousse_control = "inbound-before-live");
         if wait_for_live && !self.caller_hello(&conn, &peer).await {
-            if let ConnStatus::Closed(reason) = conn.status() {
-                if let NetError::Version { peer_minor, .. } = conn.closed_error(reason) {
-                    self.shared
-                        .inbound_version_refused(*conn.peer(), peer_minor);
-                }
-            }
             return None;
         }
         let grant = self.shared.host.grant_of(conn.id());
@@ -571,24 +581,6 @@ impl Shared {
         self.queued(&core);
     }
 
-    /// A connection with the paired device `identity` closed with
-    /// `UNSUPPORTED_VERSION` after its `HELLO` named `peer_minor`: kept as
-    /// its last refusal, as seen now. On a dial, the dial's own error tells
-    /// the app.
-    fn note_version_refusal(&self, identity: IdentityPublicKey, peer_minor: u64) {
-        self.refusals.note(
-            &identity,
-            peer_minor,
-            mousse_net_io::conn::local_minor(),
-            crate::peer::now_secs(),
-            tokio::time::Instant::now(),
-        );
-        applog::line(format!(
-            "{} speaks minor versions up to {peer_minor}: no common version",
-            short_id(&identity)
-        ));
-    }
-
     /// A connection with `identity` agreed a version, seen at `seen`: its
     /// refusal for version goes, unless one seen later was kept.
     fn clear_refusal(&self, identity: &IdentityPublicKey, seen: tokio::time::Instant) {
@@ -600,32 +592,37 @@ impl Shared {
         }
     }
 
-    /// An incoming connection from `identity` closed with
-    /// `UNSUPPORTED_VERSION` after its `HELLO` named `peer_minor`. From a
-    /// device that holds a grant here or that this computer pins, it is kept
-    /// as its last refusal and `peer.incompatible` tells the app, at most
-    /// once per `PEER_INCOMPATIBLE_GAP_MS`; unknown identities raise
-    /// nothing.
-    fn inbound_version_refused(&self, identity: IdentityPublicKey, peer_minor: u64) {
-        let pinned = || {
-            let key = hex(identity.as_bytes());
-            mousse_net_io::store::PeerStore::in_dir(&self.info.state_dir)
-                .load()
-                .is_ok_and(|list| list.iter().any(|p| p.identity == key))
-        };
-        if self.host.live_grant(&identity).is_none() && !pinned() {
-            return;
+    /// Whether `identity` holds a grant here or this computer pins it.
+    fn paired(&self, identity: &IdentityPublicKey) -> bool {
+        if self.host.live_grant(identity).is_some() {
+            return true;
         }
-        self.note_version_refusal(identity, peer_minor);
+        let key = hex(identity.as_bytes());
+        mousse_net_io::store::PeerStore::in_dir(&self.info.state_dir)
+            .load()
+            .is_ok_and(|list| list.iter().any(|p| p.identity == key))
+    }
+
+    /// A paired device's refusal for version was kept: an incoming one
+    /// also raises `peer.incompatible`, at most once per
+    /// `PEER_INCOMPATIBLE_GAP_MS`.
+    fn version_refused(&self, seen: &HelloSeen) {
+        let identity = seen.peer;
+        applog::line(format!(
+            "{} speaks minor versions up to {}: no common version",
+            short_id(&identity),
+            seen.peer_minor
+        ));
         let gap = crate::limits::ms(self.limits.peer_incompatible_gap_ms());
-        if self
-            .refusals
-            .take_turn(&identity, crate::peer::now_secs(), gap)
+        if seen.inbound
+            && self
+                .refusals
+                .take_turn(&identity, crate::peer::now_secs(), gap)
         {
             self.event(json!({
                 "ev": "peer.incompatible",
                 "identity": hex(identity.as_bytes()),
-                "peer_minor": peer_minor,
+                "peer_minor": seen.peer_minor,
             }));
         }
     }

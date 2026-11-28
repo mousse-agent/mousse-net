@@ -757,9 +757,6 @@ pub async fn dial(
     shared
         .keep
         .note_end(pin, reached.as_ref().err().map(Failure::of));
-    if let Some(peer_minor) = reached.as_ref().err().and_then(peer_minor_of) {
-        shared.note_version_refusal(pin, peer_minor);
-    }
     let (conn, used) = reached.map_err(DialError::Failed)?;
     let role = super::pairing::role_text(&record.role);
     let (route, via) = match used {

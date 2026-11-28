@@ -5,7 +5,8 @@
 //!   `path.reopen {identity, from, conn}`: the app reopens its channels on
 //!   `conn` and sends `path.reopened {conn}`, and only then does the old
 //!   path close with `PATH_REPLACED`. A renewal try that fails is
-//!   `path.renew_failed {identity, why, reason}`; the caller tries again
+//!   `path.renew_failed {identity, why, reason}` (with `peer_minor` when
+//!   the host shares no version with this computer); the caller tries again
 //!   later, until the old path's deadline.
 //! - **Network changes.** The watcher reports interface changes and wakes
 //!   (a jump of the monotonic clock). Either way every connection must
@@ -97,12 +98,18 @@ pub async fn forward_renewals(shared: Arc<Shared>) {
             }
             PathEvent::RenewFailed { pin, error } => {
                 applog::line(format!("renewing {} failed: {error}", short_id(&pin)));
-                shared.event(json!({
+                let mut event = json!({
                     "ev": "path.renew_failed",
                     "identity": hex(pin.as_bytes()),
                     "why": crate::peer::reason_of(&error),
                     "reason": crate::peer::describe(&error),
-                }));
+                });
+                // Refused for version: the refusal itself is kept from the
+                // connection's own report (`super::watch_hellos`).
+                if let mousse_net_io::NetError::Version { peer_minor, .. } = error {
+                    event["peer_minor"] = json!(peer_minor);
+                }
+                shared.event(event);
             }
         }
     }

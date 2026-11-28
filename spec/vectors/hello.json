@@ -1,6 +1,7 @@
 {
   "cases": [
     {
+      "connection": 3,
       "local": {
         "major": 1,
         "minor": 3,
@@ -14,6 +15,7 @@
       "result": 3
     },
     {
+      "connection": "close:unsupported_version",
       "local": {
         "major": 1,
         "minor": 3,
@@ -27,6 +29,7 @@
       "result": 3
     },
     {
+      "connection": "close:unsupported_version",
       "local": {
         "major": 1,
         "minor": 3,
@@ -40,6 +43,7 @@
       "result": "close:unsupported_version"
     },
     {
+      "connection": "close:unsupported_version",
       "local": {
         "major": 1,
         "minor": 3,
@@ -53,6 +57,7 @@
       "result": "close:unsupported_version"
     },
     {
+      "connection": "close:unsupported_version",
       "local": {
         "major": 1,
         "minor": 4,
@@ -66,6 +71,7 @@
       "result": 4
     },
     {
+      "connection": 3,
       "local": {
         "major": 1,
         "minor": 4,
@@ -79,6 +85,7 @@
       "result": 3
     },
     {
+      "connection": "close:unsupported_version",
       "local": {
         "major": 1,
         "minor": 4,
@@ -92,6 +99,7 @@
       "result": "close:unsupported_version"
     },
     {
+      "connection": "close:unsupported_version",
       "local": {
         "major": 1,
         "minor": 4,
@@ -105,6 +113,7 @@
       "result": "close:unsupported_version"
     },
     {
+      "connection": "close:unsupported_version",
       "local": {
         "major": 1,
         "minor": 4,
@@ -118,7 +127,7 @@
       "result": "close:unsupported_version"
     }
   ],
-  "description": "HELLO version negotiation (spec wire.md, \"Versions\"). `local` is what the receiving side speaks (its newest and oldest minor version), `peer` is the HELLO it received. `result` is the minor version both sides use, or the close code. `this_build` is what this mousse-net-core build speaks; `hello` is its HELLO. `repeated`: several HELLOs arrive on one connection, as control-message bytes, in order. Only the first counts; each later one is `ignored`, whatever it holds. `agreed` is the connection's minor version at the end (null if the first HELLO closed it).",
+  "description": "HELLO version negotiation (spec wire.md, \"Versions\"). `local` is what the receiving side speaks (its newest and oldest minor version), `peer` is the HELLO it received. `result` is the minor version from the receiving side's own range (steps 1 to 4), or the close code. `connection` is what the connection does: the same, except that it also closes with `UNSUPPORTED_VERSION` when the peer would refuse `result` (below the peer's minor - 1, which a peer never speaks). `this_build` is what this mousse-net-core build speaks; `hello` is its HELLO. `repeated`: several HELLOs arrive on one connection, as control-message bytes, in order. Only the first counts; each later one is `ignored`, whatever it holds. `agreed` is the connection's minor version at the end (null if the first HELLO closed it).",
   "hello": "a3000101010203",
   "repeated": [
     {

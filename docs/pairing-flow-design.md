@@ -82,22 +82,24 @@ Additions only. A 1.2 helper serves a 1.1 app unchanged.
   connection with a paired device closes with `UNSUPPORTED_VERSION`, the
   helper knows the device's newest minor version from its `HELLO`:
   - `dial` answers `{error: "unsupported_version", peer_minor, why,
-    reason}` in place of `unreachable`; the keeper's `dial.failed` adds
-    `peer_minor`.
+    reason}` in place of `unreachable`; the keeper's `dial.failed` and a
+    renewal's `path.renew_failed` add `peer_minor`.
   - An incoming connection refused this way, from a device that holds a
     grant here or that this computer pins, raises `peer.incompatible
     {identity, peer_minor}`, at most once per `PEER_INCOMPATIBLE_GAP_MS`
-    (an hour) per device. Unknown identities raise nothing.
+    (an hour at least) per device. Unknown identities raise nothing.
   - Each `peers.list` and `grants.list` row adds `version_refusal`: null,
     or the device's last refusal `{peer_minor, local_minor, since}`
     (`since` in unix seconds; `local_minor` is this computer's newest minor
     then, so the lower of the two names the computer that has to update).
     It is kept in `version-refusals.json` next to `peers.json`, so it
-    outlives a restart, and goes once a connection with the device agrees a
-    version, before that connection's `conn.up` (unless a refusal was seen
-    after the agreement). The time of the last `peer.incompatible` is kept
-    in the same file, so a restart or a clear does not raise it again
-    within the gap.
+    outlives a restart. Every connection with the device counts, dials,
+    renewals and incoming ones alike: one that agrees a version on its
+    `HELLO` clears it, whether or not it is then authorized, and an
+    announced one has cleared it by its `conn.up`. Outcomes apply in the
+    order their `HELLO`s were read. The time of the last
+    `peer.incompatible` is kept in the same file, so a restart, a clear or
+    a clock set back does not raise it again within the gap.
   - The keeper never parks a host refused for version: it tries it again
     at `KEEP_RETRY_MAX_MS`. `dial` tries it at once ("Check again").
 

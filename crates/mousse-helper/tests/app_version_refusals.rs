@@ -140,3 +140,43 @@ fn a_host_refused_for_version_is_reported_kept_retried_and_cleared_once_it_updat
     let on_a = grant_of(&mut a, &b_id)["version_refusal"].clone();
     assert!(on_a.is_null(), "{on_a}");
 }
+
+/// Poll `get` until it holds, within `WAIT`.
+fn until(what: &str, mut get: impl FnMut() -> bool) {
+    let start = Instant::now();
+    while !get() {
+        assert!(start.elapsed() < WAIT, "never: {what}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// A host this computer only pins (it holds no grant here, and this
+/// computer none there) updates: the first connection that agrees a
+/// version clears its refusal, though the host then refuses this device
+/// and no connection is ever announced.
+#[test]
+fn an_agreed_hello_clears_the_refusal_without_authorization() {
+    let (ae, be) = (Endpoint::init("vpa"), Endpoint::init("vpb"));
+    let old = [("MOUSSE_NET_TEST_HELLO_MINOR", Path::new(OLD))];
+    let mut b = be.app_raw("hostB", &[], 0, &old);
+    let port = b.hello()["port"].as_u64().unwrap() as u16;
+    let route = route_of(&mut b);
+    let b_id = b.identity.clone();
+    let mut a = ae.app("peerA", &[("KEEP_RETRY_MAX_MS", "1500")]);
+    a.hello();
+    a.call(
+        "peer.add",
+        json!({"identity": b_id, "name": "hostB", "routes": [route]}),
+    );
+    until("A keeps B's refusal", || {
+        !peer_of(&mut a, &b_id)["version_refusal"].is_null()
+    });
+
+    b.kill();
+    let mut b = be.app_with("hostB", &[], port, None);
+    b.hello();
+    until("an agreed HELLO clears it", || {
+        peer_of(&mut a, &b_id)["version_refusal"].is_null()
+    });
+    assert!(a.events("conn.up").is_empty(), "{:?}", a.events("conn.up"));
+}

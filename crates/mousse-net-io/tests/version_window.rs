@@ -2,7 +2,12 @@
 //! `AUTHORIZED` before it has read the caller's `HELLO` (wire.md 2 and 8).
 //! The caller must not go live on that connection: the host refuses it as
 //! soon as it reads the caller's `HELLO`. The dial ends with the host's
-//! version instead.
+//! version instead, and the host sees the caller's `HELLO` once, then
+//! `GOAWAY(UNSUPPORTED_VERSION)`.
+//!
+//! On this single-threaded runtime the host's frames are waiting when the
+//! caller's driver first runs, so it reads them before its writer takes
+//! its own queued `HELLO`: the close must not drop that `HELLO`.
 
 mod common;
 
@@ -10,7 +15,7 @@ use std::sync::Arc;
 
 use common::*;
 use mousse_net_core::control::{AuthorizedState, ControlMessage, VersionSupport};
-use mousse_net_core::mux::{Mux, MuxRole};
+use mousse_net_core::mux::{Mux, MuxEvent, MuxRole};
 use mousse_net_core::ErrorCode;
 use mousse_net_io::certs::CertManager;
 use mousse_net_io::{tls, Clock, CloseReason, ManualClock, NetError, TlsPolicy};
@@ -46,14 +51,33 @@ async fn a_caller_below_the_hosts_oldest_minor_never_goes_live() {
             wr.write_all(&frame).await.unwrap();
         }
         wr.flush().await.unwrap();
-        // Never reads the caller's HELLO: only drains until it hangs up.
+        // Never answers: only records what the caller sends until it
+        // hangs up.
+        let mut seen = Vec::new();
         let mut buf = vec![0u8; 16 * 1024];
-        while matches!(rd.read(&mut buf).await, Ok(n) if n > 0) {}
+        while let Ok(n @ 1..) = rd.read(&mut buf).await {
+            let Ok(events) = mux.receive(&buf[..n], host_clock.mono()) else {
+                break;
+            };
+            for event in events {
+                match event {
+                    MuxEvent::Control(bytes) => seen.push(match ControlMessage::decode(&bytes) {
+                        Ok(ControlMessage::Hello { minor_version, .. }) => {
+                            format!("hello {minor_version}")
+                        }
+                        Ok(_) => "another control message".to_string(),
+                        Err(_) => "undecodable control".to_string(),
+                    }),
+                    MuxEvent::GoAway { code } => seen.push(format!("goaway {}", code.name())),
+                    _ => {}
+                }
+            }
+        }
+        seen
     });
 
     let caller = new_caller_with_clock(new_signer(), clock);
     let dialled = within("the dial", caller.dial(callers, identity)).await;
-    host.abort();
     match dialled {
         Err(NetError::Version { reason, peer_minor }) => {
             assert_eq!(peer_minor, newer);
@@ -66,4 +90,12 @@ async fn a_caller_below_the_hosts_oldest_minor_never_goes_live() {
         Err(e) => panic!("expected a refusal for version, got {e}"),
         Ok(_) => panic!("the caller went live on a connection the host refuses"),
     }
+    let seen = within("the host's record", host).await.unwrap();
+    assert_eq!(
+        seen,
+        [
+            format!("hello {}", VersionSupport::LOCAL.minor),
+            "goaway unsupported_version".to_string(),
+        ]
+    );
 }

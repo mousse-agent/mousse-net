@@ -13,11 +13,35 @@
 //! A stream holds its place until the mux is done with it **and** its
 //! reader is gone, so bytes still waiting in a finished stream's queue keep
 //! counting.
+//!
+//! Shared by every connection of the endpoint, it also carries each
+//! connection's version decision ([`HelloSeen`]) to whoever watches them.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use mousse_net_core::identity::IdentityPublicKey;
+use tokio::sync::mpsc;
+use tokio::time::Instant;
+
 use crate::limits::Limits;
+
+/// What one connection decided on its peer's first `HELLO`, whatever came
+/// after it (authorization, publication).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HelloSeen {
+    /// The peer's identity, proven in step 1.
+    pub peer: IdentityPublicKey,
+    /// The newest minor version its `HELLO` named.
+    pub peer_minor: u64,
+    /// The minor version the connection uses; `None`: it closed with
+    /// `UNSUPPORTED_VERSION`.
+    pub agreed: Option<u64>,
+    /// When the `HELLO` was read.
+    pub at: Instant,
+    /// The peer dialled this endpoint.
+    pub inbound: bool,
+}
 
 /// One endpoint's stream places and receive-queue gauge. A host and a
 /// caller of the same endpoint share one (see
@@ -35,6 +59,8 @@ pub struct StreamAdmission {
     held: AtomicU64,
     peak_held: AtomicU64,
     refused: AtomicU64,
+    /// Where version decisions go, once someone watches.
+    hellos: Mutex<Option<mpsc::UnboundedSender<HelloSeen>>>,
 }
 
 impl StreamAdmission {
@@ -53,7 +79,22 @@ impl StreamAdmission {
             held: AtomicU64::new(0),
             peak_held: AtomicU64::new(0),
             refused: AtomicU64::new(0),
+            hellos: Mutex::new(None),
         })
+    }
+
+    /// Every connection's version decision from now on, in the order they
+    /// were made. A second watcher replaces the first.
+    pub fn watch_hellos(&self) -> mpsc::UnboundedReceiver<HelloSeen> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        *self.hellos.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+        rx
+    }
+
+    pub(crate) fn hello_seen(&self, seen: HelloSeen) {
+        if let Some(tx) = &*self.hellos.lock().unwrap_or_else(|e| e.into_inner()) {
+            let _ = tx.send(seen);
+        }
     }
 
     /// Streams open now on all connections.

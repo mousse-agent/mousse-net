@@ -39,9 +39,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 use mousse_net_core::authz::{Traffic, Verdict};
-use mousse_net_core::control::{
-    peer_accepts, ControlMessage, HelloOutcome, HelloState, VersionSupport,
-};
+use mousse_net_core::control::{ControlMessage, HelloOutcome, HelloState, VersionSupport};
 use mousse_net_core::identity::IdentityPublicKey;
 use mousse_net_core::mux::{
     decode_frame, frame_type, Frame, Mux, MuxEvent, MuxRole, PriorityClass, StreamError, StreamId,
@@ -54,7 +52,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 use tokio_rustls::TlsStream;
 
-use crate::admission::{ConnStreams, StreamAdmission, StreamPermit};
+use crate::admission::{ConnStreams, HelloSeen, StreamAdmission, StreamPermit};
 use crate::clock::Clock;
 use crate::error::NetError;
 use crate::limits::{ms, Limits};
@@ -952,6 +950,8 @@ pub(crate) fn spawn<P: Pipe>(
         minor,
         peer_hello,
         own_hello_out: false,
+        peer: start.peer,
+        inbound: start.side == MuxRole::Host,
         reason: None,
         before_close: VecDeque::new(),
         fences: Vec::new(),
@@ -994,6 +994,10 @@ struct Driver {
     /// This side's own `HELLO`, the mux's first frame, has gone to the
     /// writer. Closing drops what the mux still holds.
     own_hello_out: bool,
+    /// The peer's identity, proven in step 1.
+    peer: IdentityPublicKey,
+    /// The peer dialled this endpoint.
+    inbound: bool,
     reason: Option<CloseReason>,
     /// Encoded frames a closing step produced, sent before the GOAWAY.
     before_close: VecDeque<Vec<u8>>,
@@ -1565,14 +1569,20 @@ impl Driver {
                 };
                 // Kept before the verdict, so whoever sees the close can
                 // tell how new the peer is. Only the first `HELLO` sets it.
-                let _ = self.peer_hello.set((*minor_version, Instant::now()));
-                match self.hello.on_hello(*major_version, *minor_version) {
-                    // The peer refuses a minor below its own oldest
-                    // (wire.md 2), maybe only after this side went live:
-                    // refused here, before any step-2 answer counts.
-                    HelloOutcome::Agreed(minor) if !peer_accepts(minor, *minor_version) => {
-                        return self.refuse_version();
-                    }
+                let at = Instant::now();
+                let _ = self.peer_hello.set((*minor_version, at));
+                let outcome = self.hello.on_hello(*major_version, *minor_version);
+                if outcome != HelloOutcome::Ignored {
+                    // Reported whatever follows: authorization, publication.
+                    self.admit.admission().hello_seen(HelloSeen {
+                        peer: self.peer,
+                        peer_minor: *minor_version,
+                        agreed: self.hello.agreed(),
+                        at,
+                        inbound: self.inbound,
+                    });
+                }
+                match outcome {
                     HelloOutcome::Agreed(minor) => {
                         self.minor.send_if_modified(|m| {
                             let first = m.is_none();
@@ -1583,6 +1593,8 @@ impl Driver {
                         });
                     }
                     HelloOutcome::Ignored => return Verdict::Ignore,
+                    // No common version, or one the peer refuses (wire.md
+                    // 2): refused here, before any step-2 answer counts.
                     HelloOutcome::Close(_) => return self.refuse_version(),
                 }
             }
