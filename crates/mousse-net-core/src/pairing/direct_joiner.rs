@@ -72,6 +72,8 @@ impl DirectAddress {
         let port = parse_port(port)?;
         let ip = match parse_host(host)? {
             RouteHost::Ipv4(v4) => IpAddr::V4(v4),
+            // An IPv4-mapped address is an IPv4 address: type that.
+            RouteHost::Ipv6(v6) if v6.to_ipv4_mapped().is_some() => return None,
             RouteHost::Ipv6(v6) => IpAddr::V6(v6),
             RouteHost::Dns(_) => return None,
         };
@@ -869,8 +871,9 @@ impl<F: CodeExchangeFactory> DirectJoinerPairing<F> {
         }
     }
 
-    /// The host sent `CODE_ABORT` for this connection's attempt: it did not
-    /// accept the attempt, so nothing is pending. The debit stays.
+    /// The host sent `CODE_ABORT` for this connection's attempt. Before the
+    /// code passed the flow ends as for a wrong code (the debit stays);
+    /// after, the connection closes and the pending record stays.
     pub fn on_code_abort(&mut self, attempt: AttemptId) -> Vec<DirectJoinerAction> {
         if self.attempt.as_ref().map(|a| a.id) != Some(attempt)
             || !matches!(
@@ -880,13 +883,14 @@ impl<F: CodeExchangeFactory> DirectJoinerPairing<F> {
         {
             return Vec::new();
         }
-        let had_pending = self.pending.take().is_some();
-        let actions = self.code_failed(None);
-        if had_pending {
-            self.commit_pending(actions)
-        } else {
-            actions
+        if self.pending.is_some() {
+            // After the code passed only a settling answer clears the
+            // record; a recovery learns how it ended.
+            let mut actions = vec![DirectJoinerAction::Close(ErrorCode::PairingFailed)];
+            actions.extend(self.broken(Some(ErrorCode::PairingFailed), false));
+            return actions;
         }
+        self.code_failed(None)
     }
 
     /// The host sent `PAIRED`. Accepted only after this flow verified the

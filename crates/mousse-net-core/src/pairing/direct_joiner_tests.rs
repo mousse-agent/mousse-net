@@ -57,6 +57,7 @@ fn typed_addresses() {
         ("192.168.1.020:47100", None),
         ("192.168.1.20:047100", None),
         ("fe80::1:47100", None),
+        ("[::ffff:192.168.1.20]:47100", None),
         ("", None),
     ] {
         assert_eq!(
@@ -214,4 +215,127 @@ fn a_debit_that_fails_to_store_sends_no_share() {
         flow.state(),
         DirectJoinerState::Ended(DirectEnd::Closed(Some(ErrorCode::InternalError)))
     );
+}
+
+/// After the code passed, only a settling answer clears the pending
+/// record: a host's `CODE_ABORT` there closes the connection and the record
+/// stays for a recovery.
+#[test]
+fn a_host_abort_after_the_code_passed_keeps_the_pending_record() {
+    use crate::grants::{GrantTable, OwnerRef, Role};
+    use crate::pairing::{DirectHostAction, DirectHostPairing, DirectInvitationParams};
+
+    let host_key = key(1);
+    let mut host = DirectHostPairing::new(host_key, "Desk".into(), CpaceExchangeFactory);
+    let mut host_rng = ChaCha20Rng::from_seed([5; 32]);
+    let created = host
+        .create(
+            DirectInvitationParams {
+                role: Role::owner(),
+                authorizing_owner: OwnerRef::from_bytes([0x51; 16]),
+                grant_expires_at: None,
+            },
+            T,
+            &mut host_rng,
+        )
+        .unwrap();
+    let mut grants = GrantTable::new();
+    let code = created.code.to_display();
+    let mut flow = start("10.0.0.2:47100", &code, None, None, T).unwrap();
+    let conn = crate::ConnectionId(1);
+    let exporter = [9u8; 32];
+    flow.on_connected(host_key, exporter);
+    let Some(DirectJoinerAction::Send(ControlMessage::JoinDirect { lookup, name, .. })) =
+        flow.on_hello(4).into_iter().next()
+    else {
+        panic!("JOIN_DIRECT")
+    };
+    host.on_join_direct(
+        conn,
+        &key(2),
+        &exporter,
+        &lookup,
+        &name,
+        None,
+        &mut grants,
+        T,
+    );
+    // Settle every write at once; return the messages for the host.
+    fn settle(
+        flow: &mut DirectJoinerPairing<CpaceExchangeFactory>,
+        actions: Vec<DirectJoinerAction>,
+    ) -> Vec<DirectJoinerAction> {
+        let mut out = Vec::new();
+        let mut queue: std::collections::VecDeque<_> = actions.into();
+        while let Some(a) = queue.pop_front() {
+            if matches!(
+                a,
+                DirectJoinerAction::PersistLedger { .. }
+                    | DirectJoinerAction::PersistPending { .. }
+            ) {
+                out.push(a);
+                for m in flow.on_persisted().into_iter().rev() {
+                    queue.push_front(m);
+                }
+            } else {
+                out.push(a);
+            }
+        }
+        out
+    }
+    let sends = |actions: &[DirectJoinerAction]| -> Vec<ControlMessage> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                DirectJoinerAction::Send(m) => Some(m.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let mut rng = ChaCha20Rng::from_seed([6; 32]);
+    let first = flow_on_authorized(&mut flow, created.invitation, &mut rng);
+    let a = settle(&mut flow, first);
+    let msgs = sends(&a);
+    let [ControlMessage::CodeExchange { attempt, payload }] = msgs.as_slice() else {
+        panic!("msg_a")
+    };
+    let attempt = *attempt;
+    let reply = host.on_code_exchange(conn, attempt, payload, T, &mut host_rng);
+    let msg_b = reply
+        .iter()
+        .find_map(|a| match a {
+            DirectHostAction::Send {
+                message: ControlMessage::CodeExchange { payload, .. },
+                ..
+            } => Some(payload.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let step = flow.on_code_exchange(attempt, &msg_b, T);
+    let passed = settle(&mut flow, step);
+    assert!(passed.iter().any(|a| matches!(
+        a,
+        DirectJoinerAction::PersistPending {
+            record: Some(_),
+            ..
+        }
+    )));
+    assert_eq!(flow.state(), DirectJoinerState::AwaitingAllow);
+
+    let after = flow.on_code_abort(attempt);
+    assert!(after.contains(&DirectJoinerAction::Close(ErrorCode::PairingFailed)));
+    assert!(after.contains(&DirectJoinerAction::Away));
+    assert!(!after
+        .iter()
+        .any(|a| matches!(a, DirectJoinerAction::PersistPending { .. })));
+    assert_eq!(flow.state(), DirectJoinerState::Away);
+    assert!(flow.pending().is_some());
+}
+
+fn flow_on_authorized(
+    flow: &mut DirectJoinerPairing<CpaceExchangeFactory>,
+    invitation: InvitationId,
+    rng: &mut ChaCha20Rng,
+) -> Vec<DirectJoinerAction> {
+    flow.on_authorized_direct(invitation, false, T, rng)
 }

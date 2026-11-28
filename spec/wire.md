@@ -1680,7 +1680,9 @@ grant table; recovery reads it, also after a restart. Vectors:
 
 **Before dialing.** The joiner reads the typed address with the route
 grammar (10.2.1): `<IPv4>:<port>` or `[<IPv6>]:<port>`, leading and
-trailing spaces dropped, no DNS names; anything else is `bad_address`. It
+trailing spaces dropped, no DNS names, and no IPv4-mapped IPv6 address
+(`::ffff:0:0/96`; the IPv4 form is typed instead); anything else is
+`bad_address`. It
 reads the code as "Code" above; a text that is not a code is `bad_code`.
 The address is read first. Neither error dials or spends an attempt. A
 start with no attempts left for the typed lookup ends with
@@ -1706,8 +1708,9 @@ and `I` are authenticated. The joiner stores, under `L`:
 
 ```
 {1: "mousse-direct-pending-v1", 2: L (text, 4), 3: host identity key (65 bytes),
- 4: I (16 bytes), 5: address (text, canonical: the IPv4 dotted form or the
- bracketed lowercase RFC 5952 IPv6 form, then ":" and the port),
+ 4: I (16 bytes), 5: address (text, canonical: the IPv4 dotted form, or
+ the IPv6 form of RFC 5952 in hex groups, lowercase, in brackets; then ":"
+ and the port),
  6: time the host's confirmation verified (uint), 7: cancelled (0 or 1)}
 ```
 
@@ -1738,7 +1741,8 @@ and the flow ends.
    PAIRING_FAILED}` and closes with `PAIRING_FAILED` (`ATTEMPTS_EXHAUSTED`
    when none are left); the next try is a new Connect. A `CODE_ABORT` from
    the host for `A` ends the flow the same way, without the joiner's
-   `CODE_ABORT`.
+   `CODE_ABORT`; after the code passed (step 6) it only closes the
+   connection with `PAIRING_FAILED`, and the pending record stays.
 6. If `Tb` verifies, it writes the pending record, then shows "Waiting for
    Allow" and sends `CODE_EXCHANGE {A, msg_c}`.
 7. It accepts `PAIRED` only now (or on a recovery, below), and never once
@@ -1759,9 +1763,12 @@ joiner recovers it later, with backoff, and when it starts.
 is a recovery, dialled **pinned** to its host key at its address. After the
 host's `HELLO` (minor 4 or more, as above) the joiner sends `JOIN_DIRECT
 {1: L, 2: name, 3: I}`, with key 4 when the record is marked cancelled; no
-code is needed. A Connect whose typed address and lookup match a stored
-pending record resumes it as a recovery instead of starting a new attempt;
-any other Connect starts a new flow. The answers:
+code is needed, and none of the ledger's attempts: a recovery runs with
+none left. A Connect whose typed address and lookup match a stored pending
+record resumes it as a recovery instead of starting a new attempt. Any
+other Connect starts a new flow; if a pending record for the same lookup at
+another address is stored, that flow's own pending record replaces it (the
+write is compared against the record read at the start). The answers:
 
 - `PAIRED` after step 2's `AUTHORIZED {live}`: enrolled (from the grant's
   receipt); as step 7;
@@ -1779,7 +1786,8 @@ attempt is aborted with `CODE_ABORT {A, CANCELLED}` (its debit stays) and
 the connection closes with `CANCELLED`. After it passed, the joiner first
 marks the pending record cancelled (durably); connected, it then sends
 `CODE_ABORT {A, CANCELLED}` on the connection that ran the attempt and
-closes with `CANCELLED`. Either way the record stays until a recovery,
+closes with `CANCELLED` (on a recovery connection, which ran no attempt, it
+only closes with `CANCELLED`). Either way the record stays until a recovery,
 which carries the cancel flag, hears the host's settling answer, so a
 cancel that crossed the host's Allow still reaches the host. A joiner that
 cancelled ignores a `PAIRED` that crosses its cancel and pins nothing.
