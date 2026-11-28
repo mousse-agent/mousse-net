@@ -106,6 +106,11 @@ profiles under the same OS user (see "Other people on the same computer").
   the link may have been swapped and asks for a new one by another way
   ([`wire.md`](wire.md) 10.6 rule 6), so the user does not keep feeding a
   fake host guesses with fresh links from the same channel.
+- Pair with IP (kind 3): the code's secret has 40 bits and stays the same
+  for the invitation. At most 5 guesses at the real host per invitation and
+  5 at the joiner per typed lookup in 24 h: at most 10 / 2^40 ≈ 9.1 × 10^-12
+  for one invitation and one joiner profile ("Pairing by typed address"
+  below).
 
 ### Fake host
 
@@ -123,6 +128,63 @@ profiles under the same OS user (see "Other people on the same computer").
   joiner already pinned that host before ([`wire.md`](wire.md) 10.6 rule 8).
 - A fake host learns the joiner's identity key and computer name before the
   code fails ([`privacy.md`](privacy.md)).
+- Pair with IP has no ticket and so no pin on first contact. Whatever answers
+  at the typed address gets one online guess of the code per Connect, at
+  most 5 per typed lookup in 24 h on one joiner profile, whatever keys it
+  shows; nothing from it is trusted before its code-exchange confirmation
+  verifies ("Pairing by typed address" below).
+
+### Pairing by typed address
+
+Pair with IP ([`wire.md`](wire.md) 10.9): the joiner types the host's
+address and a 12-character code, a public 4-character lookup `L` and an
+8-character secret `S` (40 bits). The host owner then allows the device.
+
+- **Guessing at the real host:** at most `DIRECT_HOST_ATTEMPTS` (5) per
+  invitation, debited before any exchange work, across all connections: at
+  most 5 / 2^40.
+- **A fake endpoint at the typed address** gets one online guess per
+  Connect: `msg_a` depends on the code only through the CPace generator,
+  which gives it a single online test (as [`cpace.md`](cpace.md) 8 note 2
+  says for kind 2). The joiner's count is kept by the typed lookup, not by
+  the key the far end shows: at most 5 per lookup in 24 h on one joiner
+  profile.
+- **Together:** at most 10 / 2^40 ≈ 9.1 × 10^-12 for one invitation and one
+  joiner profile, about 1 in 110 billion. Each further profile the same code
+  is typed into adds up to 5 / 2^40. A sent link is 6 in 1 000 000.
+- **Offline:** CPace gives no offline test from a failed or a successful
+  transcript; `L`, `I` and `D` do not depend on `S`, and nothing on the wire
+  before `msg_a` does.
+- **In the middle:** a TLS-terminating attacker has a different exporter
+  and different identity keys on each side, so the confirmations cannot be
+  relayed. It can block pairing.
+- **Burning attempts:** an attacker must first hit a 20-bit lookup. Each
+  miss holds a pre-authorization place for `DIRECT_MISS_HOLD_MS` (1 s), and
+  kind 3 is answered only on the TCP listener, so the 48 TCP places allow at
+  most 48 tries a second for the whole endpoint, 8 per source address: at
+  most 28 800 in 10 minutes, a 2.7 % chance of hitting one open invitation's
+  lookup, and at most 11 % of hitting any of `DIRECT_MAX_OPEN` (4). A hit can
+  use up that invitation's attempts; the owner makes a new one with a new
+  lookup. Other invitations and grants are untouched. No per-source block is
+  kept after the hold, so a neighbour on the same IPv6 /64 cannot lock an
+  honest joiner out.
+- **One answer for every miss:** a wrong lookup, another endpoint's code, an
+  expired, used, cancelled or forgotten invitation and a device that
+  already holds a grant all get the same held `INVITATION_INVALID`, so the
+  host is no oracle for open invitations.
+- **Someone overhears the whole code:** they reach the Allow prompt. The
+  owner sees a name and a short device id to compare with the joiner's
+  screen; Allow is the presence check. Decline ends the invitation.
+- **Requests outlive connections, enrollment does not:** a request is keyed
+  by invitation and identity and survives a dropped connection for its
+  Allow window (300 s), but the grant is made only on a connection of the
+  identity that passed the code. The joiner's cancel wins over a crossing
+  Allow: a cancel on the just-enrolled connection, or by recovery, removes
+  the grant, which never carried a stream. Recovery needs a pinned
+  connection, the receipt `I` (128 random bits) and the lookup; only the
+  identity that passed the code learns that it was declined.
+- **Restart:** direct invitations live in memory only, so a restart ends
+  them; grants they made, with their receipt, stay.
 
 ### Other people on the same computer
 

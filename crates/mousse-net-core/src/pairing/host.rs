@@ -612,9 +612,13 @@ impl<F: CodeExchangeFactory> HostPairing<F> {
                 &joiner.pair_exporter,
             );
             let sid = attempt_sid(&attempt, &joiner.pair_exporter);
-            let exchange = self
-                .factory
-                .start(ExchangeRole::Responder, &code, &binding, &sid, rng);
+            let exchange = self.factory.start(
+                ExchangeRole::Responder,
+                code.as_bytes(),
+                &binding,
+                &sid,
+                rng,
+            );
             inv.attempts.insert(
                 key,
                 HostAttempt {

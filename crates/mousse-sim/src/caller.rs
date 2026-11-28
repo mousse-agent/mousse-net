@@ -822,7 +822,13 @@ impl CallerDev {
                     &hc.ep.auth.exporters.pair,
                 );
                 let sid = [0; mousse_net_core::pairing::SID_LEN];
-                let _ = factory.start(ExchangeRole::Initiator, &code, &binding, &sid, &mut sim.rng);
+                let _ = factory.start(
+                    ExchangeRole::Initiator,
+                    code.as_bytes(),
+                    &binding,
+                    &sid,
+                    &mut sim.rng,
+                );
             }
         }
         match flow.submit_code(&code, &mut sim.rng) {

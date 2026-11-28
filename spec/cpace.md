@@ -55,8 +55,8 @@ Each party gets the following. A party MUST reject its own inputs if they break 
 
 | Input | Mousse meaning | Rules |
 |---|---|---|
-| `PRS` | The pairing code: the 6 digits shown by the host, as ASCII bytes `0x30`–`0x39`. No spaces or separators; leading zeros are kept. | Not empty (`EmptyPassword`). CPace accepts any bytes here; the pairing layer MUST pass exactly the 6 digits. |
-| `CI` | The binding transcript ([`wire.md`](wire.md) 10.5): ticket hash, mode, version, the identities with their roles (initiator first), and the peer session's TLS exporter. | Opaque. Never sent. Both sides MUST build identical bytes. Any length. |
+| `PRS` | The pairing code, per invitation kind. Kind 2 (send link): the 6 digits shown by the host, as ASCII bytes `0x30`–`0x39`, leading zeros kept. Kind 3 (Pair with IP, [`wire.md`](wire.md) 10.9): the direct code's 8 secret characters (characters 5 to 12, canonical, uppercase, from its alphabet) as ASCII bytes; never the lookup. No spaces or separators in either. | Not empty (`EmptyPassword`). CPace accepts any bytes here; the pairing layer MUST pass exactly the bytes its kind names. |
+| `CI` | The binding transcript: for kinds 1 and 2 ([`wire.md`](wire.md) 10.5) the ticket hash, mode, version, the identities with their roles (initiator first), and the peer session's TLS exporter; for kind 3 ([`wire.md`](wire.md) 10.9) a digest of the lookup and invitation id in place of the ticket hash, the kind, the ceremony version, the identities and the exporter. | Opaque. Never sent. Both sides MUST build identical bytes. Any length. |
 | `sid` | The attempt's session id ([`wire.md`](wire.md) 10.5, "Session id"): 32 bytes, a hash of the attempt id and the peer session's TLS exporter. | At least 16 bytes (`SidTooShort`). Public. Identical on both sides. MUST NOT be reused across attempts (§10.9). |
 | `ADa`, `ADb` | Each party's associated data. Sent in clear inside its message. Mousse pairing MUST send both empty and refuses a share that carries AD (`Malformed`). AD support exists only so the draft's test vectors and Mousse's own framing vectors run; pairing never uses it. | At most 4096 bytes (`AdTooLong`). |
 
@@ -78,7 +78,7 @@ gen_hash  = SHA-512(gen_str)                  # 64 bytes
 g         = one_way_map(gen_hash)
 ```
 
-For a 6-digit code, `len_zpad` = 128 − 1 − 7 − 18 = 102.
+For a 6-digit code, `len_zpad` = 128 − 1 − 7 − 18 = 102; for the 8 characters of a direct code, 128 − 1 − 9 − 18 = 100.
 
 ### 5.2 Scalars (§8.3)
 
@@ -157,8 +157,8 @@ Any error ends the attempt, and the state is discarded. The pairing layer counts
 ## 7. Test vectors
 
 - `vectors/cpace-ristretto255-sha512.json`: every value in the draft that applies to this suite. That covers Appendix A.1 and A.3 (`prepend_len`, `lv_cat`, ordering, `o_cat`, `transcript_ir`, `transcript_oc`) and Appendix B.3: generator string, hash and `g`; `ya`, `Ya`, `yb`, `Yb`; `K`; the ISK inputs and `ISK` for both transcript kinds; sid outputs; one valid `scalar_mult` case; and two invalid points. The values were copied from the draft's embedded JSON and checked against the hex printed in its text.
-- `vectors/cpace-ristretto255-sha512-mousse.json`: Mousse's own vectors, because the draft has none for key confirmation or framing. It holds two full runs and 24 rejection cases. The first run uses the B.3 inputs, so its `ISK` equals the draft's `ISK_IR`. The second has a 200-byte `ADa`, which needs a two-byte length, and an empty `ADb`. Each run lists `mac_key`, `Ta`, `Tb`, `msg_a`, `msg_b` and `msg_c`. Each rejection names the receiving step, the message and the required error.
-- `vectors/cpace-mousse-vectors.py` builds the Mousse file from the draft file using only Python's `hashlib` and `hmac`. It doesn't depend on the Rust code: `python -I cpace-mousse-vectors.py cpace-ristretto255-sha512.json cpace-ristretto255-sha512-mousse.json`.
+- `vectors/cpace-ristretto255-sha512-mousse.json`: Mousse's own vectors, because the draft has none for key confirmation or framing. It holds two full runs and 24 rejection cases. The first run uses the B.3 inputs, so its `ISK` equals the draft's `ISK_IR`. The second has a 200-byte `ADa`, which needs a two-byte length, and an empty `ADb`. Each run lists `mac_key`, `Ta`, `Tb`, `msg_a`, `msg_b` and `msg_c`. Each rejection names the receiving step, the message and the required error. `pairing_runs` holds two full runs with the inputs Pair with IP gives CPace ([`wire.md`](wire.md) 10.9): an 8-byte `PRS`, the kind-3 `CI` and `sid` built from the listed lookup, invitation id, keys, exporter and attempt id, and every value computed from them (`g`, `Ya`, `Yb`, `K` and the rest), not reused from the draft. The two runs share the lookup and differ in the secret.
+- `vectors/cpace-mousse-vectors.py` builds the Mousse file from the draft file using only the Python standard library: `hashlib`, `hmac`, and for the pairing runs a small ristretto255 (RFC 9496) that it first checks against the draft's `g`, `Ya`, `Yb` and `K`. It doesn't depend on the Rust code: `python -I cpace-mousse-vectors.py cpace-ristretto255-sha512.json cpace-ristretto255-sha512-mousse.json`.
 
 An implementation passes when it reproduces every value in both files bit for bit and fails every rejection with the listed error. The exceptions are the draft-only values of section 2 (`o_cat`, `transcript_oc`, the ISK built from it and the sid output): they are informative, and an implementation that does not compute them still passes.
 

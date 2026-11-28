@@ -24,7 +24,7 @@ use mousse_net_core::grants::OwnerRef;
 use mousse_net_core::identity::SoftwareKey;
 use mousse_net_core::pairing::{
     BindingTranscript, CodeExchange, CodeExchangeFactory, ExchangeError, ExchangeRole,
-    ExchangeStep, InvitationId, InvitationKind, PairingCode, Ticket, TicketSecret, SID_LEN,
+    ExchangeStep, InvitationId, InvitationKind, Ticket, TicketSecret, SID_LEN,
 };
 use mousse_net_core::UnixTime;
 use mousse_net_io::pipe::accept_tcp;
@@ -630,7 +630,7 @@ impl CodeExchangeFactory for NoConfirm {
     fn start<R: rand_core::CryptoRng + ?Sized>(
         &self,
         _role: ExchangeRole,
-        _code: &PairingCode,
+        _password: &[u8],
         _binding: &BindingTranscript,
         _sid: &[u8; SID_LEN],
         _rng: &mut R,

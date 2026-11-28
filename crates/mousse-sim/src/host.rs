@@ -633,7 +633,13 @@ impl HostDev {
         );
         let factory = CountingFactory::new(self.id, self.instance, sim.work.clone());
         let sid = [0; SID_LEN];
-        let _ = factory.start(ExchangeRole::Responder, code, &binding, &sid, &mut sim.rng);
+        let _ = factory.start(
+            ExchangeRole::Responder,
+            code.as_bytes(),
+            &binding,
+            &sid,
+            &mut sim.rng,
+        );
         sim.say(self.id, format_args!("precomputes its exchange share"));
     }
 

@@ -666,3 +666,77 @@ fn debug_output_hides_secrets() {
     assert!(shown.contains("redacted"));
     assert!(!shown.contains(&format!("{first}{:02x}", a.isk().as_bytes()[1])));
 }
+
+/// The pairing runs: CPace with the inputs Pair with IP gives it (wire.md
+/// 10.9). `D`, `CI` and `sid` are rebuilt from the listed lookup,
+/// invitation, keys, exporter and attempt id; then a full run with the
+/// listed scalars reproduces every value, with an 8-byte password and its
+/// zero padding of 100 bytes.
+#[test]
+fn pairing_runs_reproduce_bit_exact() {
+    use crate::identity::IdentityPublicKey;
+    use crate::pairing::{
+        attempt_sid, direct_binding_transcript, direct_invite_digest, AttemptId, DirectLookup,
+        InvitationId,
+    };
+    let v = json(MOUSSE);
+    let runs = v["pairing_runs"].as_array().expect("pairing runs");
+    assert!(!runs.is_empty());
+    for run in runs {
+        let lookup = DirectLookup::from_canonical(run["lookup"].as_str().unwrap()).unwrap();
+        let invitation = InvitationId(hex(&run["invitation"]).try_into().unwrap());
+        let key = |k: &str| IdentityPublicKey::from_sec1(&hex(&run[k])).unwrap();
+        let (host, joiner) = (key("host_identity"), key("joiner_identity"));
+        let exporter: [u8; 32] = arr32(&run["pair_exporter"]);
+        let attempt = AttemptId(hex(&run["attempt"]).try_into().unwrap());
+        assert_eq!(
+            &direct_invite_digest(&lookup, &invitation)[..],
+            &hex(&run["D"])[..]
+        );
+        let ci = direct_binding_transcript(&lookup, &invitation, &host, &joiner, &exporter);
+        assert_eq!(ci.as_bytes(), &hex(&run["CI"])[..]);
+        let sid = attempt_sid(&attempt, &exporter);
+        assert_eq!(&sid[..], &hex(&run["sid"])[..]);
+
+        let prs = hex(&run["PRS"]);
+        assert_eq!(prs.len(), 8);
+        let gen_str = generator_string(&prs, ci.as_bytes(), &sid);
+        assert_eq!(gen_str[18 + 9], run["zpad_len"].as_u64().unwrap() as u8);
+        let g = calculate_generator(&prs, ci.as_bytes(), &sid);
+        assert_eq!(g.compress().to_bytes(), arr32(&run["g"]));
+
+        let inputs = Inputs {
+            prs: &prs,
+            ci: ci.as_bytes(),
+            sid: &sid,
+            ad: &[],
+        };
+        let (a, msg_a) = Initiator::start_with_scalar(&inputs, scalar(&run["ya"]));
+        assert_eq!(msg_a, hex(&run["msg_a"]));
+        assert_eq!(&msg_a[1..33], &hex(&run["Ya"])[..]);
+        let (b, msg_b) =
+            Responder::respond_with_scalar(&inputs, &msg_a, scalar(&run["yb"])).unwrap();
+        assert_eq!(msg_b, hex(&run["msg_b"]));
+        assert_eq!(&msg_b[1..33], &hex(&run["Yb"])[..]);
+        assert_eq!(
+            *scalar_mult_vfy(&scalar(&run["ya"]), &arr32(&run["Yb"])),
+            arr32(&run["K"])
+        );
+        let (a_done, msg_c) = a.finish(&msg_b).unwrap();
+        assert_eq!(msg_c, hex(&run["msg_c"]));
+        let b_done = b.finish(&msg_c).unwrap();
+        let isk = hex(&run["ISK"]);
+        assert_eq!(&a_done.isk().as_bytes()[..], &isk[..]);
+        assert_eq!(&b_done.isk().as_bytes()[..], &isk[..]);
+        let mac_key = primitives::mac_key(&sid, a_done.isk().as_bytes());
+        assert_eq!(&mac_key[..], &hex(&run["mac_key"])[..]);
+        assert_eq!(&primitives::tag(&mac_key, &msg_a)[..], &hex(&run["Ta"])[..]);
+        assert_eq!(&msg_b[msg_b.len() - TAG_LEN..], &hex(&run["Tb"])[..]);
+    }
+    // Same lookup, other secret: the public inputs agree, the shares do not.
+    let (first, second) = (&runs[0], &runs[1]);
+    for field in ["D", "CI", "sid"] {
+        assert_eq!(first[field], second[field], "{field}");
+    }
+    assert_ne!(first["msg_a"], second["msg_a"]);
+}

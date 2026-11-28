@@ -880,8 +880,10 @@ host's record and in the ticket.
 |---|---|---|
 | In person | 1 | Join proof, then the host owner approves with one tap. No code. |
 | Send link | 2 | Join proof, then the code exchange with a 6-digit code shown on the host. |
+| Direct | 3 | Lookup, code exchange with the 12-character code, then the host owner approves (10.9). |
 
-Browsers always use "Send link".
+Browsers always use "Send link". Kind 3 has no ticket and never appears in
+one: a ticket with kind 3 is `unknown_kind` (10.2).
 
 **The kind is believed only as far as the ticket's arrival supports it.**
 "In person" skips the code, so it is safe only when the ticket came straight
@@ -1367,11 +1369,12 @@ bound to the old one closes with `GRANT_REVOKED`.
 
 ### 10.9 Direct flow
 
-*Draft: this section so far gives only the code. The flow, its messages and
-its limits follow.*
+*The joiner's side (its attempt ledger and pending record) follows; this
+section gives the code, the binding and the host's side.*
 
 The direct flow pairs two endpoints with no ticket: the host shows its
-address and a **direct code**, and the joiner's owner types both.
+address and a **direct code**, and the joiner's owner types both. The host
+owner then allows the device, as in person (10.4).
 
 #### Code
 
@@ -1397,6 +1400,185 @@ address and a **direct code**, and the joiner's owner types both.
   is dialled and no attempt is spent.
 
 The code, `L` and `S` are never logged. Vectors: `direct-code.json`.
+
+#### Invitation
+
+The host keeps each direct invitation **in memory only**: the invitation id
+`I` (16 random bytes), the code, `expires_at`, the attempts left, the role
+it offers and the authorizing owner, the approval requests, and the
+outcomes it keeps for recovery (below). A restart ends every direct
+invitation; grants they made stay. Creating one draws `I` (16 bytes), then
+the code (12 bytes, drawn again while its lookup is the lookup of another
+open direct invitation of this endpoint). At most `DIRECT_MAX_OPEN` (4)
+direct invitations are open at once on an endpoint; another is refused
+until one ends. An invitation **takes attempts** while it is open and
+before `expires_at` = creation time + `DIRECT_INVITE_LIFETIME_SECS` (600).
+It ends on enrollment, decline, the owner's cancel, exhaustion, and at
+expiry unless a request is still inside its Allow window.
+
+#### Binding
+
+```
+D   = H(CBOR {1: "mousse-direct-invite-v1", 2: L (text, 4), 3: I (bytes, 16)})
+CI  = CBOR {1: "mousse-direct-pair-v1",
+            2: D,
+            3: 3,                                 (kind)
+            4: 1,                                 (direct ceremony version)
+            5: [[1, joiner identity key], [2, host identity key]],
+            6: pair exporter (EXPORTER-mousse-pair-v1)}
+sid = the attempt's session id (10.5)
+PRS = S, its 8 ASCII bytes
+```
+
+`H` is SHA-256 and the maps are canonical CBOR (section 3). The code
+exchange is CPace profile 1 as in 10.5: empty AD, the joiner the initiator,
+the host the responder, both confirmations, `ISK` unused. `D` holds only
+public values, and nothing on the wire before `msg_a` depends on `S`;
+`msg_a` does, through the generator ([`cpace.md`](cpace.md) 5.1). Key 4 is
+1 for the life of kind 3 and never appears on the wire; a new ceremony is a
+new kind. Vectors: `cpace-ristretto255-sha512-mousse.json` `pairing_runs`
+(every value from the inputs), `direct-host.json` `before_msg_a`.
+
+#### Lookup
+
+The joiner dials the typed address, sends `HELLO` and waits for the host's
+(it needs `agreed`; with `agreed < 4` it closes with `UNSUPPORTED_VERSION`),
+then sends `JOIN_DIRECT {1: L, 2: name}`. The name is the computer name, as
+for a sent link (10.3). `JOIN_DIRECT` passes the host's gate as
+`JOIN_PROOF` does (8.1); step 2 runs first as for any connection, and its
+`AUTHORIZED {live}` notice is not the answer. The host answers it only on a
+connection its TCP listener accepted; on any other (WebSocket, pipe, relay
+circuit) it closes with `INVITATION_INVALID`. From a live connection,
+`JOIN_DIRECT` first takes a new pre-authorization place counted against the
+connection's source address; with none free the host closes with
+`INTERNAL_ERROR`. Then:
+
+- an invitation that takes attempts with this `L`: the connection becomes
+  join-only for it and the host answers `AUTHORIZED {1: join_only, 2: I}`;
+- the joiner's identity is the host's own, or denied here: close with
+  `NOT_AUTHORIZED`;
+- anything else: the host holds the connection, and with it its
+  pre-authorization place, for `DIRECT_MISS_HOLD_MS` (1000 ms), then closes
+  it with `INVITATION_INVALID`. A device that holds a grant here gets the
+  same answer. Every "no open invitation" (another endpoint's code, a typo
+  in `L`, expired, used up, cancelled, a restart) looks the same.
+
+#### Attempt
+
+**One attempt per connection.** The joiner debits its own count, then sends
+`CODE_EXCHANGE {A, msg_a}` with a fresh attempt id `A`. The host, for the
+first message of a new attempt:
+
+1. refuses it at or after `expires_at`, or once the invitation stopped
+   taking attempts, by closing with `INVITATION_INVALID` (a running attempt
+   ends the same way: a code passes only before `expires_at`);
+2. refuses a second attempt on the connection by closing with
+   `PROTOCOL_ERROR`, with no debit;
+3. closes with `ATTEMPTS_EXHAUSTED` when none are left;
+4. otherwise **debits first** (`DIRECT_HOST_ATTEMPTS`, 5 per invitation,
+   across all connections), tells its owner the attempts left (the code
+   stays the same) and draws the attempt's CPace scalar, then answers
+   `CODE_EXCHANGE {A, msg_b}`.
+
+A repeat on an attempt follows 10.7 ("No resends"). A wrong code fails at
+the joiner when it checks `Tb`: it sends `CODE_ABORT {A, PAIRING_FAILED}`
+and closes; the next try is a new connection. When no attempts are left, no
+attempt runs and no request is inside its Allow window, the invitation ends
+and its join-only connections close with `ATTEMPTS_EXHAUSTED`.
+
+#### Requests
+
+When the host verifies `Ta`, the device **passed the code**. The host opens
+an **approval request keyed by (invitation, joiner identity)**, not by
+connection, and asks its owner, showing the name from `JOIN_DIRECT`, the
+short device id and the role. The role and the name belong to the request;
+the role the owner picks with the answer goes to that enrollment only.
+
+- **One request per identity.** The same identity passing again (on a new
+  connection) keeps its request: the same id, now pointing at the new
+  connection. Another identity that passes gets its own request.
+- A request is **connected** while its connection is up and **away** once it
+  closed without `CANCELLED`; it is kept either way.
+- **The Allow window.** A request may be allowed, and claimed by recovery,
+  until `DIRECT_ALLOW_WINDOW_SECS` (300) after its identity first passed the
+  code, also past `expires_at`. Then it ends, and its connection, if up,
+  closes with `INVITATION_INVALID`. While any request is inside its window
+  the invitation neither ends at expiry nor for lack of attempts; at
+  `expires_at` it stops taking lookups and attempts, and its join-only
+  connections without a request close with `INVITATION_INVALID`.
+- **Allow, connected:** enrollment (10.8) on that connection with receipt
+  `I`; the host sends `PAIRED {host name, role}`. Every other request ends
+  and its connection closes with `INVITATION_INVALID`.
+- **Allow, away:** the request is marked allowed, every other request ends
+  as above, and the invitation takes no lookups or attempts. The device's
+  recovery (below) is enrolled at once. Enrollment always happens on a
+  connection of the device that passed the code.
+- **Decline:** the request's connection closes with `PAIRING_DECLINED` and
+  the invitation ends; every other connection closes with
+  `INVITATION_INVALID`.
+- **The joiner cancels.** Connected: `CODE_ABORT {A, CANCELLED}`, then a
+  close with `CANCELLED`; the host ends the request and closes the
+  connection with `CANCELLED`. Away: the cancel comes with its recovery.
+  Only a close without `CANCELLED` keeps a request.
+- **Cancel crossing Allow.** The cancel wins. A `CANCELLED` (`CODE_ABORT`
+  or `GOAWAY`) on the connection the host just enrolled, before it carried
+  any stream frame, removes the grant with receipt `I`, and the host closes
+  with `CANCELLED`. The joiner never pinned the host, so that grant never
+  carried a stream.
+- A declined or cancelled request's outcome is kept with the invitation
+  until its Allow window ends, for its recovery.
+
+#### Recovery
+
+A joiner whose connection closed after the host's confirmation verified
+reconnects **pinned** to the host key it verified and sends `JOIN_DIRECT
+{1: L, 2: name, 3: I, 4?: 1}` (key 4: it cancels). No code is needed. The
+host answers, in this order:
+
+1. a live grant for this identity with receipt `I` (also after a restart):
+   step 2 already sent `AUTHORIZED {live}`; with the cancel flag the grant
+   is removed and the host closes with `CANCELLED`; otherwise it sends
+   `PAIRED {host name, role}` with the grant's role;
+2. no direct invitation `I` with this `L`: the miss hold, as for a lookup;
+3. a kept outcome for this identity: close with `PAIRING_DECLINED` or
+   `CANCELLED`;
+4. with the cancel flag: the request, if any, ends; close with `CANCELLED`
+   (an invitation that no longer takes anything gets the miss hold
+   instead). An allowed request that is cancelled ends the invitation;
+5. this identity's request is allowed: `AUTHORIZED {join_only, I}`,
+   enrollment on this connection, `PAIRED`;
+6. its request waits for Allow: `AUTHORIZED {join_only, I}`; the request
+   (same id, same prompt) now points at this connection and an older
+   connection of it closes with `PATH_REPLACED`;
+7. the invitation takes attempts and this identity has no request (the host
+   never had its `msg_c`): `AUTHORIZED {join_only, I, not_received}`;
+8. anything else (expired, consumed by another device, another identity, a
+   forgotten outcome): the miss hold.
+
+Only the identity that passed the code learns that it was declined.
+
+#### Limits
+
+| Limit | Default | Allowed |
+|---|---|---|
+| `DIRECT_INVITE_LIFETIME_SECS` | 600 | 60 to 600 |
+| `DIRECT_HOST_ATTEMPTS` | 5 | 1 to 5 |
+| `DIRECT_JOINER_ATTEMPTS` | 5 | 1 to 5 |
+| `DIRECT_ALLOW_WINDOW_SECS` | 300 | 60 to 300 |
+| `DIRECT_MAX_OPEN` | 4 | 1 to 4 |
+| `DIRECT_MISS_HOLD_MS` | 1000 | 1000 to 5000 |
+
+Each is set by `MOUSSE_NET_<name>` and can only move toward safety: fewer
+attempts and invitations, shorter lives and windows, longer holds
+([`../docs/limits.md`](../docs/limits.md)). The code's alphabet, length and
+4 + 8 split are fixed.
+
+#### Records
+
+The host stores nothing for a direct invitation. What outlives it is the
+grant enrollment made, with receipt `I` (section 7, 10.8), stored as any
+grant is; recovery reads it, also after a restart. Vectors:
+`direct-host.json`.
 
 ## 11. Control messages
 
