@@ -8,12 +8,23 @@
 //! invitation id `I` are authenticated, and the joiner waits for the host
 //! owner's Allow (`PAIRED`).
 //!
-//! Two durable records, kept by the I/O layer under the typed lookup:
-//! - the **ledger** ([`DirectLedger`]) counts this profile's attempts per
-//!   typed lookup for 24 h, whatever key the far end shows;
-//! - the **pending record** ([`DirectPending`]) remembers a code that passed
-//!   until the host has said how it ended, so a dropped connection, a
-//!   cancel while away or a crash never loses the outcome.
+//! Durable records, kept by the I/O layer under the typed lookup:
+//! - the **ledger** ([`DirectLedger`]), one per typed lookup, counts this
+//!   profile's attempts for 24 h, whatever key the far end shows;
+//! - **pending records** ([`DirectPending`]), one per typed lookup and
+//!   typed address, each remember a code that passed until the host has
+//!   said how it ended, so a dropped connection, a cancel while away or a
+//!   crash never loses the outcome. A flow at another address never
+//!   touches another address's record.
+//!
+//! **The hold.** One flow at a time works on a typed lookup. A flow starts
+//! by asking for the lookup's hold ([`DirectJoinerAction::AcquireHold`]);
+//! the I/O layer takes it (or refuses at once when another flow, in this
+//! process or another, has it), loads the records under it and passes them
+//! to [`DirectJoinerPairing::on_records`]. The flow gives the hold back
+//! ([`DirectJoinerAction::ReleaseHold`]) when it ends or goes away, after
+//! its last write; going on from away (a recovery, a cancel) asks for it
+//! again and reloads the records. Dropping a flow drops its hold.
 //!
 //! Writes come out as [`DirectJoinerAction::PersistLedger`] and
 //! [`DirectJoinerAction::PersistPending`], compare-and-swap writes the I/O
@@ -288,6 +299,14 @@ pub enum DirectEnd {
     },
     /// This device cancelled before its code passed.
     Cancelled,
+    /// Another flow on this device holds the typed lookup. Nothing was
+    /// loaded or dialled.
+    Busy,
+    /// A stored record is for another lookup.
+    BadRecord,
+    /// The pending record this flow was recovering is gone: another flow on
+    /// this device settled it.
+    Settled,
     /// The host closed with this code (`INVITATION_INVALID`,
     /// `PAIRING_DECLINED`, `CANCELLED`, `ATTEMPTS_EXHAUSTED`, a busy host's
     /// `INTERNAL_ERROR`, ...), or the connection broke (`None`). Any pending
@@ -298,6 +317,8 @@ pub enum DirectEnd {
 /// Where the flow stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DirectJoinerState {
+    /// Waiting for the lookup's hold and the records loaded under it.
+    Holding,
     /// Not connected (yet).
     Connecting,
     /// Connected; waiting for the host's `HELLO`.
@@ -335,6 +356,12 @@ pub struct DirectPaired {
 /// Something the I/O layer or UI must do, in order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DirectJoinerAction {
+    /// Take the hold on this typed lookup, load its ledger and pending
+    /// records under it, then call [`DirectJoinerPairing::on_records`]; if
+    /// another flow has it, call [`DirectJoinerPairing::on_hold_refused`].
+    AcquireHold(DirectLookup),
+    /// Give the hold on this typed lookup back.
+    ReleaseHold(DirectLookup),
     /// Send this control message on the connection.
     Send(ControlMessage),
     /// Send `GOAWAY(code)` and close the connection.
@@ -350,8 +377,9 @@ pub enum DirectJoinerAction {
         /// The ledger to store.
         record: DirectLedger,
     },
-    /// Store (`Some`) or delete (`None`) the pending record under its
-    /// lookup, the same way.
+    /// Store (`Some`) or delete (`None`) the pending record kept under its
+    /// lookup and address, the same way: only the record at that address
+    /// is compared and replaced, never another address's.
     PersistPending {
         /// The pending record this flow loaded or last wrote.
         expected: Option<DirectPending>,
@@ -397,10 +425,10 @@ pub struct DirectJoinerPairing<F: CodeExchangeFactory> {
     factory: F,
     state: DirectJoinerState,
     attempts_left: u8,
+    /// This profile's attempts per typed lookup.
+    attempts_per_lookup: u8,
     /// The ledger as stored, as far as this flow knows.
     ledger_saved: Option<DirectLedger>,
-    /// The first debit time of the ledger entry that still counts.
-    first_debit: Option<UnixTime>,
     /// The pending record in memory, and as stored.
     pending: Option<DirectPending>,
     pending_saved: Option<DirectPending>,
@@ -420,131 +448,74 @@ pub struct DirectJoinerPairing<F: CodeExchangeFactory> {
     cancel_sent: bool,
     in_flight: Option<Write>,
     held: Vec<DirectJoinerAction>,
+    /// This flow has the lookup's hold.
+    holding: bool,
+    /// Asking for the hold to go on from away: a refusal leaves the flow
+    /// away.
+    from_away: bool,
+    /// A cancel asked for while away, applied once the records are loaded.
+    cancel_wanted: bool,
+    /// A connection is up (a close it is waiting to send counts as up).
+    connected: bool,
 }
 
 impl<F: CodeExchangeFactory> DirectJoinerPairing<F> {
-    /// Start a Connect from what the person typed. `ledger` and `pending`
-    /// are the records stored under the typed lookup, if any. A pending
-    /// record for the same lookup and address resumes that flow (a
-    /// recovery, no attempt); otherwise a new flow starts. Every refusal
-    /// here happens before dialing. Uses the default limits.
-    #[allow(clippy::too_many_arguments)]
+    /// Start a Connect from what the person typed. Every refusal here
+    /// happens before anything is loaded or dialled. Then
+    /// [`Self::start`]: the records come with the hold. Uses the default
+    /// limits.
     pub fn new(
         address: &str,
         code: &str,
         joiner: IdentityPublicKey,
         name: &str,
         factory: F,
-        ledger: Option<&DirectLedger>,
-        pending: Option<&DirectPending>,
-        now: UnixTime,
     ) -> Result<Self, DirectJoinError> {
-        Self::with_limits(
-            address,
-            code,
-            joiner,
-            name,
-            factory,
-            ledger,
-            pending,
-            now,
-            &Limits::DEFAULT,
-        )
+        Self::with_limits(address, code, joiner, name, factory, &Limits::DEFAULT)
     }
 
     /// [`DirectJoinerPairing::new`] with other limits
     /// ([`Limits::direct_joiner_attempts`], cut to the record's bound).
-    #[allow(clippy::too_many_arguments)]
     pub fn with_limits(
         address: &str,
         code: &str,
         joiner: IdentityPublicKey,
         name: &str,
         factory: F,
-        ledger: Option<&DirectLedger>,
-        pending: Option<&DirectPending>,
-        now: UnixTime,
         limits: &Limits,
     ) -> Result<Self, DirectJoinError> {
         let address = DirectAddress::parse(address).ok_or(DirectJoinError::BadAddress)?;
         let code = DirectCode::parse(code).map_err(DirectJoinError::BadCode)?;
-        let lookup = code.lookup();
-        let resumes = pending.is_some_and(|p| p.lookup == lookup && p.address == address);
-        let mut flow = Self::build(
-            address, lookup, joiner, name, factory, ledger, pending, now, limits,
-        )?;
-        if !resumes {
-            if flow.attempts_left == 0 {
-                return Err(DirectJoinError::AttemptsExhausted);
-            }
-            flow.code = Some(code);
-            // A pending record for this lookup at another address belongs
-            // to another flow; this one starts afresh.
-            flow.pending = None;
-        }
+        let mut flow = Self::build(address, code.lookup(), joiner, name, factory, limits)?;
+        flow.code = Some(code);
         Ok(flow)
     }
 
-    /// Resume the flow of a stored pending record, with no code: a start-up
-    /// or background recovery. `ledger` is the ledger stored under the same
-    /// lookup, if any.
+    /// Recover the pending record kept for `lookup` at `address`, with no
+    /// code: a start-up or background recovery. Then [`Self::start`].
     pub fn resume(
-        pending: &DirectPending,
+        address: DirectAddress,
+        lookup: DirectLookup,
         joiner: IdentityPublicKey,
         name: &str,
         factory: F,
-        ledger: Option<&DirectLedger>,
-        now: UnixTime,
         limits: &Limits,
     ) -> Result<Self, DirectJoinError> {
-        let mut flow = Self::build(
-            pending.address,
-            pending.lookup.clone(),
-            joiner,
-            name,
-            factory,
-            ledger,
-            Some(pending),
-            now,
-            limits,
-        )?;
-        flow.recovering = true;
-        Ok(flow)
+        Self::build(address, lookup, joiner, name, factory, limits)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn build(
         address: DirectAddress,
         lookup: DirectLookup,
         joiner: IdentityPublicKey,
         name: &str,
         factory: F,
-        ledger: Option<&DirectLedger>,
-        pending: Option<&DirectPending>,
-        now: UnixTime,
         limits: &Limits,
     ) -> Result<Self, DirectJoinError> {
         validate_name(name).map_err(|_| DirectJoinError::InvalidName)?;
-        if ledger.is_some_and(|l| l.lookup != lookup) || pending.is_some_and(|p| p.lookup != lookup)
-        {
-            return Err(DirectJoinError::BadRecord);
-        }
         let attempts_per_lookup = u8::try_from(limits.direct_joiner_attempts())
             .unwrap_or(u8::MAX)
             .min(DIRECT_JOINER_ATTEMPTS);
-        // Must-fail control (tests only): the stored count is not read, as
-        // with a ledger keyed by the far end's key when the far end shows a
-        // new key on every Connect.
-        let counted = ledger
-            .filter(|l| l.is_live(now))
-            .filter(|_| !cfg!(mousse_control = "direct-ledger-by-key"));
-        let (attempts_left, first_debit) = match counted {
-            Some(l) => (
-                l.attempts_left.min(attempts_per_lookup),
-                Some(l.first_debit),
-            ),
-            None => (attempts_per_lookup, None),
-        };
         Ok(Self {
             address,
             lookup,
@@ -552,12 +523,12 @@ impl<F: CodeExchangeFactory> DirectJoinerPairing<F> {
             joiner,
             name: name.to_owned(),
             factory,
-            state: DirectJoinerState::Connecting,
-            attempts_left,
-            ledger_saved: ledger.cloned(),
-            first_debit,
-            pending: pending.cloned(),
-            pending_saved: pending.cloned(),
+            state: DirectJoinerState::Holding,
+            attempts_left: attempts_per_lookup,
+            attempts_per_lookup,
+            ledger_saved: None,
+            pending: None,
+            pending_saved: None,
             recovering: false,
             host: None,
             pair_exporter: None,
@@ -567,7 +538,117 @@ impl<F: CodeExchangeFactory> DirectJoinerPairing<F> {
             cancel_sent: false,
             in_flight: None,
             held: Vec::new(),
+            holding: false,
+            from_away: false,
+            cancel_wanted: false,
+            connected: false,
         })
+    }
+
+    /// Ask for the lookup's hold: at the start, and to go on from away (a
+    /// recovery connection, or a cancel). Nothing else happens before
+    /// [`Self::on_records`].
+    pub fn start(&mut self) -> Vec<DirectJoinerAction> {
+        match self.state {
+            DirectJoinerState::Holding if !self.holding => {}
+            DirectJoinerState::Away if !self.holding => {
+                self.from_away = true;
+                self.state = DirectJoinerState::Holding;
+            }
+            _ => return Vec::new(),
+        }
+        vec![DirectJoinerAction::AcquireHold(self.lookup.clone())]
+    }
+
+    /// Another flow holds the lookup. A new flow ends ([`DirectEnd::Busy`]);
+    /// one going on from away stays away.
+    pub fn on_hold_refused(&mut self) -> Vec<DirectJoinerAction> {
+        if self.state != DirectJoinerState::Holding || self.holding {
+            return Vec::new();
+        }
+        if std::mem::take(&mut self.from_away) {
+            self.cancel_wanted = false;
+            self.state = DirectJoinerState::Away;
+            return vec![DirectJoinerAction::Away];
+        }
+        self.state = DirectJoinerState::Ended(DirectEnd::Busy);
+        vec![DirectJoinerAction::Ended(DirectEnd::Busy)]
+    }
+
+    /// The hold is taken; `ledger` and `pending` are the records stored
+    /// under the typed lookup (pending ones at any address). A Connect at
+    /// the address of a pending record resumes it as a recovery (no
+    /// attempt); any other Connect starts a new flow and leaves every
+    /// stored record alone. A recovery takes its own record again, as
+    /// stored now (another flow may have marked it cancelled). Every
+    /// refusal here happens before dialing.
+    pub fn on_records(
+        &mut self,
+        ledger: Option<&DirectLedger>,
+        pending: &[DirectPending],
+        now: UnixTime,
+    ) -> Vec<DirectJoinerAction> {
+        if self.state != DirectJoinerState::Holding || self.holding {
+            return Vec::new();
+        }
+        self.holding = true;
+        let from_away = std::mem::take(&mut self.from_away);
+        if ledger.is_some_and(|l| l.lookup != self.lookup)
+            || pending.iter().any(|p| p.lookup != self.lookup)
+        {
+            return self.end_unconnected(DirectEnd::BadRecord);
+        }
+        self.ledger_saved = ledger.cloned();
+        // Must-fail control (tests only): the stored count is not read, as
+        // with a ledger keyed by the far end's key when the far end shows a
+        // new key on every Connect.
+        self.attempts_left = ledger
+            .filter(|l| l.is_live(now))
+            .filter(|_| !cfg!(mousse_control = "direct-ledger-by-key"))
+            .map_or(self.attempts_per_lookup, |l| {
+                l.attempts_left.min(self.attempts_per_lookup)
+            });
+        let own = pending.iter().find(|p| p.address == self.address).cloned();
+        self.pending_saved = own.clone();
+        self.pending = own.clone();
+        if own.is_none() {
+            if self.code.is_none() || from_away {
+                // Nothing left to recover: another flow settled it.
+                return self.end_unconnected(DirectEnd::Settled);
+            }
+            if self.attempts_left == 0 {
+                return self.end_unconnected(DirectEnd::AttemptsExhausted);
+            }
+        }
+        if std::mem::take(&mut self.cancel_wanted) {
+            if let Some(p) = self.pending.as_mut() {
+                p.cancelled = true;
+            }
+            self.state = DirectJoinerState::Away;
+            return self.commit_pending(vec![DirectJoinerAction::Away]);
+        }
+        self.state = DirectJoinerState::Connecting;
+        Vec::new()
+    }
+
+    /// End before any connection, giving the hold back.
+    fn end_unconnected(&mut self, end: DirectEnd) -> Vec<DirectJoinerAction> {
+        self.state = DirectJoinerState::Ended(end);
+        self.finish(vec![DirectJoinerAction::Ended(end)])
+    }
+
+    /// Give the hold back once the flow has ended or gone away and no write
+    /// is in flight.
+    fn finish(&mut self, mut actions: Vec<DirectJoinerAction>) -> Vec<DirectJoinerAction> {
+        let done = matches!(
+            self.state,
+            DirectJoinerState::Ended(_) | DirectJoinerState::Away
+        );
+        if done && self.holding && self.in_flight.is_none() {
+            self.holding = false;
+            actions.push(DirectJoinerAction::ReleaseHold(self.lookup.clone()));
+        }
+        actions
     }
 
     /// Current state.
@@ -608,7 +689,14 @@ impl<F: CodeExchangeFactory> DirectJoinerPairing<F> {
             Some(Write::Pending(p)) => self.pending_saved = p,
             None => return Vec::new(),
         }
-        std::mem::take(&mut self.held)
+        let released = std::mem::take(&mut self.held);
+        if released
+            .iter()
+            .any(|a| matches!(a, DirectJoinerAction::Close(_)))
+        {
+            self.connected = false;
+        }
+        self.finish(released)
     }
 
     /// The last persist action did not happen (the write failed, or another
@@ -621,19 +709,17 @@ impl<F: CodeExchangeFactory> DirectJoinerPairing<F> {
         }
         self.held.clear();
         self.attempt = None;
-        let connected = !matches!(
-            self.state,
-            DirectJoinerState::Away | DirectJoinerState::Connecting
-        );
         self.state = DirectJoinerState::Ended(DirectEnd::Closed(Some(ErrorCode::InternalError)));
         let mut actions = Vec::new();
-        if connected {
+        // A close that waited for the write was never sent: the
+        // connection is still up.
+        if std::mem::take(&mut self.connected) {
             actions.push(DirectJoinerAction::Close(ErrorCode::InternalError));
         }
         actions.push(DirectJoinerAction::Ended(DirectEnd::Closed(Some(
             ErrorCode::InternalError,
         ))));
-        actions
+        self.finish(actions)
     }
 
     /// TLS is up with `host`, the key the far end showed (pinned on a
@@ -644,12 +730,10 @@ impl<F: CodeExchangeFactory> DirectJoinerPairing<F> {
         host: IdentityPublicKey,
         pair_exporter: [u8; EXPORTER_LEN],
     ) -> Vec<DirectJoinerAction> {
-        if !matches!(
-            self.state,
-            DirectJoinerState::Connecting | DirectJoinerState::Away
-        ) {
+        if self.state != DirectJoinerState::Connecting {
             return Vec::new();
         }
+        self.connected = true;
         // A device never pairs with itself (the I/O layer's verifier
         // refuses this key first, before its own certificate goes out).
         if host == self.joiner {
@@ -769,12 +853,24 @@ impl<F: CodeExchangeFactory> DirectJoinerPairing<F> {
         ) else {
             return self.protocol_error();
         };
+        // The ledger is read again at the debit: an entry whose 24 h ended
+        // since the Connect started gives way to a new one that starts with
+        // this debit. The write is still compared against the stored one.
+        let counted = self
+            .ledger_saved
+            .as_ref()
+            .filter(|l| l.is_live(now))
+            .filter(|_| !cfg!(mousse_control = "direct-ledger-by-key"));
+        let (left, first_debit) = match counted {
+            Some(l) => (l.attempts_left.min(self.attempts_per_lookup), l.first_debit),
+            None => (self.attempts_per_lookup, now),
+        };
+        self.attempts_left = left;
         if self.attempts_left == 0 {
             return self.end_connected(ErrorCode::AttemptsExhausted, DirectEnd::AttemptsExhausted);
         }
         // Debit first. Nothing below runs on an undebited attempt.
         self.attempts_left -= 1;
-        let first_debit = *self.first_debit.get_or_insert(now);
         let ledger = DirectLedger {
             lookup: self.lookup.clone(),
             attempts_left: self.attempts_left,
@@ -950,6 +1046,15 @@ impl<F: CodeExchangeFactory> DirectJoinerPairing<F> {
     /// recovery hears the host's answer (the cancel wins over a crossing
     /// Allow).
     pub fn cancel(&mut self) -> Result<Vec<DirectJoinerAction>, DirectJoinError> {
+        // Away, the flow has given its hold back: it asks for it again, and
+        // marks the record (as stored then) once the records are loaded.
+        if self.state == DirectJoinerState::Away && !self.holding {
+            self.cancel_wanted = true;
+            return Ok(self.start());
+        }
+        if self.state == DirectJoinerState::Holding {
+            return Err(DirectJoinError::WrongState);
+        }
         let connected = matches!(
             self.state,
             DirectJoinerState::AwaitingHello
@@ -978,7 +1083,8 @@ impl<F: CodeExchangeFactory> DirectJoinerPairing<F> {
                     cancelled: true,
                     ..pending
                 });
-                Ok(self.commit_pending(then))
+                let actions = self.commit_pending(then);
+                Ok(self.finish(actions))
             }
             (_, None) => {
                 let mut actions = Vec::new();
@@ -992,8 +1098,9 @@ impl<F: CodeExchangeFactory> DirectJoinerPairing<F> {
                     actions.push(DirectJoinerAction::Close(ErrorCode::Cancelled));
                 }
                 self.state = DirectJoinerState::Ended(DirectEnd::Cancelled);
+                self.connected = false;
                 actions.push(DirectJoinerAction::Ended(DirectEnd::Cancelled));
-                Ok(actions)
+                Ok(self.finish(actions))
             }
         }
     }
@@ -1016,7 +1123,10 @@ impl<F: CodeExchangeFactory> DirectJoinerPairing<F> {
     pub fn on_closed(&mut self, code: Option<ErrorCode>) -> Vec<DirectJoinerAction> {
         if matches!(
             self.state,
-            DirectJoinerState::Ended(_) | DirectJoinerState::Away | DirectJoinerState::Connecting
+            DirectJoinerState::Ended(_)
+                | DirectJoinerState::Away
+                | DirectJoinerState::Connecting
+                | DirectJoinerState::Holding
         ) {
             return Vec::new();
         }
@@ -1030,8 +1140,14 @@ impl<F: CodeExchangeFactory> DirectJoinerPairing<F> {
     /// The connection ended with `code`. With a pending record: a settling
     /// answer clears it, anything else keeps it. Without: the flow ends.
     fn broken(&mut self, code: Option<ErrorCode>, close: bool) -> Vec<DirectJoinerAction> {
+        let actions = self.broken_inner(code, close);
+        self.finish(actions)
+    }
+
+    fn broken_inner(&mut self, code: Option<ErrorCode>, close: bool) -> Vec<DirectJoinerAction> {
         self.attempt = None;
         self.held.clear();
+        self.connected = false;
         let mut actions = Vec::new();
         if close {
             if let Some(code) = code {
@@ -1077,11 +1193,12 @@ impl<F: CodeExchangeFactory> DirectJoinerPairing<F> {
     /// record stays stored.
     fn end_connected(&mut self, code: ErrorCode, end: DirectEnd) -> Vec<DirectJoinerAction> {
         self.attempt = None;
+        self.connected = false;
         self.state = DirectJoinerState::Ended(end);
-        vec![
+        self.finish(vec![
             DirectJoinerAction::Close(code),
             DirectJoinerAction::Ended(end),
-        ]
+        ])
     }
 
     /// The attempt failed at this side (`attempt`: tell the host) or at the
@@ -1106,15 +1223,16 @@ impl<F: CodeExchangeFactory> DirectJoinerPairing<F> {
             )
         };
         self.state = DirectJoinerState::Ended(end);
+        self.connected = false;
         actions.push(DirectJoinerAction::Close(code));
         actions.push(DirectJoinerAction::Ended(end));
-        actions
+        self.finish(actions)
     }
 
     /// Ask for the pending record's write if it changed; `then` waits.
     fn commit_pending(&mut self, then: Vec<DirectJoinerAction>) -> Vec<DirectJoinerAction> {
         if self.pending == self.pending_saved {
-            return then;
+            return self.finish(then);
         }
         let record = self.pending.clone();
         self.persist(Write::Pending(record), then)

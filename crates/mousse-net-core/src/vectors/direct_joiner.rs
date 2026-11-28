@@ -8,16 +8,18 @@ use std::convert::Infallible;
 use rand_core::{TryCryptoRng, TryRng};
 use serde_json::{json, Value as J};
 
-use super::{checked_in, hex, identity, Draws, IDENTITY_A, T};
+use super::{checked_in, hex, identity, unhex, Draws, IDENTITY_A, T};
+use crate::authz::{CallerGate, CallerTraffic, ConnectionGate, GateState, Traffic, Verdict};
 use crate::control::{AuthorizedState, ControlMessage, DIRECT_MINOR_VERSION};
 use crate::grants::{GrantTable, OwnerRef, Role};
 use crate::identity::IdentityPublicKey;
 use crate::pairing::{
-    CpaceExchangeFactory, DirectCode, DirectEnd, DirectHostAction, DirectHostPairing,
-    DirectInvitationParams, DirectJoinerAction, DirectJoinerPairing, DirectJoinerState,
-    DirectLedger, DirectPending, DirectRequestId, InvitationId, DIRECT_CODE_ALPHABET,
+    CpaceExchangeFactory, DirectAddress, DirectCode, DirectEnd, DirectHostAction,
+    DirectHostPairing, DirectInvitationParams, DirectJoinerAction, DirectJoinerPairing,
+    DirectJoinerState, DirectLedger, DirectLookup, DirectPending, DirectRequestId, InvitationId,
+    DIRECT_CODE_ALPHABET,
 };
-use crate::time::UnixTime;
+use crate::time::{Millis, UnixTime};
 use crate::{ConnectionId, ErrorCode};
 
 const ADDRESS: &str = "192.168.1.20:47100";
@@ -170,12 +172,76 @@ fn sequences() -> Vec<J> {
                 { "op": "allow", "state": "ended:paired", "pending": null, "pinned": true, "granted": "committed" },
             ],
         }),
+        json!({
+            "name": "a_second_address_keeps_the_first_pending_record",
+            "description": "A code passes at the typed address, the device goes away and cancels. The same code then passes at another address of the same host: its pending record is kept beside the first one, which still holds its cancel. Each is recovered on its own: the first delivers the cancel, the second hears it.",
+            "steps": [
+                { "op": "start", "code": "right", "result": "ok" },
+                { "op": "connect", "conn": 1, "host": "host" },
+                { "op": "drop", "state": "away", "held": false },
+                { "op": "cancel", "state": "away", "pending": "cancelled", "held": false },
+                { "op": "start", "code": "right", "address": "192.168.1.21:47100", "result": "ok" },
+                { "op": "connect", "conn": 2, "host": "host", "state": "awaiting_allow", "pendings": [["192.168.1.20:47100", "cancelled"], ["192.168.1.21:47100", "pending"]] },
+                { "op": "drop", "state": "away" },
+                { "op": "resume", "result": "ok" },
+                { "op": "connect", "conn": 3, "host": "host", "state": "ended:closed:cancelled", "pendings": [["192.168.1.21:47100", "pending"]], "granted": null },
+                { "op": "resume", "address": "192.168.1.21:47100", "result": "ok" },
+                { "op": "connect", "conn": 4, "host": "host", "state": "ended:closed:cancelled", "pendings": [], "held": false },
+            ],
+        }),
+        json!({
+            "name": "a_held_lookup_is_busy",
+            "description": "Another flow on this device holds the typed lookup: a Connect is refused before anything is loaded or dialled. A cancel while away that cannot get the hold leaves the flow away and its record as it was.",
+            "steps": [
+                { "op": "start", "code": "right", "held_elsewhere": true, "result": "busy", "ledger": null },
+                { "op": "start", "code": "right", "result": "ok" },
+                { "op": "connect", "conn": 1, "host": "host" },
+                { "op": "drop", "state": "away" },
+                { "op": "cancel", "held_elsewhere": true, "state": "away", "pending": "pending" },
+            ],
+        }),
+        json!({
+            "name": "the_ledger_window_ends_before_the_debit",
+            "description": "The stored ledger has one attempt left and its 24 h end 10 s after the Connect starts. The debit comes at 20 s: the entry has ended, so the debit starts a new one with this attempt counted (4 left), written in place of the stored one.",
+            "steps": [
+                { "op": "stored_ledger", "attempts_left": 1, "first_debit_ago": 86390 },
+                { "op": "start", "code": "right", "result": "ok" },
+                { "op": "connect", "conn": 1, "host": "host", "at": 20, "state": "awaiting_allow", "ledger": 4 },
+            ],
+        }),
+        json!({
+            "name": "a_failed_cancel_write",
+            "description": "The write that marks the pending record cancelled fails. Connected, the flow closes the connection with internal_error and ends; away, it ends with no connection to close. The record stays as it was.",
+            "steps": [
+                { "op": "start", "code": "right", "result": "ok" },
+                { "op": "connect", "conn": 1, "host": "host" },
+                { "op": "fail_next_write" },
+                { "op": "cancel", "state": "ended:closed:internal_error", "pending": "pending", "held": false },
+                { "op": "resume", "result": "ok" },
+                { "op": "connect", "conn": 2, "host": "host", "state": "awaiting_allow" },
+                { "op": "drop", "state": "away" },
+                { "op": "fail_next_write" },
+                { "op": "cancel", "state": "ended:closed:internal_error", "pending": "pending", "held": false },
+            ],
+        }),
+        json!({
+            "name": "a_silent_host",
+            "description": "The host never answers JOIN_DIRECT. After the 10 s wait the joiner closes with not_authorized: a first contact ends; a recovery goes away and keeps its pending record.",
+            "steps": [
+                { "op": "start", "code": "right", "result": "ok" },
+                { "op": "connect", "conn": 1, "host": "host", "silent": true, "state": "ended:closed:not_authorized", "ledger": null },
+                { "op": "start", "code": "right", "result": "ok" },
+                { "op": "connect", "conn": 2, "host": "host", "lose": "msg_c", "state": "away", "pending": "pending" },
+                { "op": "connect", "conn": 3, "host": "host", "silent": true, "state": "away", "pending": "pending", "held": false },
+            ],
+        }),
     ]
 }
 
 fn state_name(s: Option<DirectJoinerState>) -> String {
     match s {
         None => "none".into(),
+        Some(DirectJoinerState::Holding) => "holding".into(),
         Some(DirectJoinerState::Connecting) => "connecting".into(),
         Some(DirectJoinerState::AwaitingHello) => "awaiting_hello".into(),
         Some(DirectJoinerState::AwaitingAnswer) => "awaiting_answer".into(),
@@ -196,6 +262,9 @@ fn end_name(end: DirectEnd) -> String {
         DirectEnd::AttemptsExhausted => "attempts_exhausted".into(),
         DirectEnd::NotReceived { attempts_left } => format!("not_received:{attempts_left}"),
         DirectEnd::Cancelled => "cancelled".into(),
+        DirectEnd::Busy => "busy".into(),
+        DirectEnd::BadRecord => "bad_record".into(),
+        DirectEnd::Settled => "settled".into(),
         DirectEnd::Closed(Some(code)) => format!("closed:{}", code.name()),
         DirectEnd::Closed(None) => "closed".into(),
     }
@@ -308,13 +377,25 @@ impl VHost {
     }
 }
 
-/// The joiner's durable store: the two records under the typed lookup, and
-/// its pins.
+/// The joiner's durable store: under the typed lookup, the ledger, the
+/// pending records (one per typed address) and the lookup's hold; and its
+/// pins.
 #[derive(Default)]
 struct Store {
     ledger: Option<DirectLedger>,
-    pending: Option<DirectPending>,
+    pending: Vec<DirectPending>,
+    held: bool,
+    /// Another flow (not replayed here) has the hold.
+    held_elsewhere: bool,
+    /// The next write fails.
+    fail_next: bool,
     pins: Vec<(IdentityPublicKey, InvitationId)>,
+}
+
+impl Store {
+    fn pending_at(&self, address: &DirectAddress) -> Option<&DirectPending> {
+        self.pending.iter().find(|p| p.address == *address)
+    }
 }
 
 struct World {
@@ -334,6 +415,13 @@ struct World {
     /// Host messages on their way to the joiner, not yet delivered.
     in_transit: Vec<ControlMessage>,
     hold_host_sends: bool,
+    /// The host's gate and the joiner's gate of the current connection.
+    host_gate: Option<ConnectionGate>,
+    caller_gate: Option<CallerGate>,
+    /// The host never answers `JOIN_DIRECT` on the current connection.
+    silent: bool,
+    /// The typed address of the current flow.
+    address: String,
     now: UnixTime,
     out: Vec<J>,
 }
@@ -359,6 +447,10 @@ impl World {
             exchanges_sent: 0,
             in_transit: Vec::new(),
             hold_host_sends: false,
+            host_gate: None,
+            caller_gate: None,
+            silent: false,
+            address: ADDRESS.to_owned(),
             now: UnixTime(T),
             out: Vec::new(),
         };
@@ -421,6 +513,36 @@ impl World {
         let name = self.hosts[i].name.clone();
         let mut to_joiner = Vec::new();
         for a in actions {
+            if let Some(gate) = self.host_gate.as_mut().filter(|g| g.conn().0 == self.conn) {
+                match &a {
+                    DirectHostAction::AdmittedJoinOnly { conn, invitation }
+                        if conn.0 == self.conn =>
+                    {
+                        gate.admit_join_only(*invitation)
+                    }
+                    DirectHostAction::Enrolled {
+                        conn,
+                        grant,
+                        attempt,
+                        ..
+                    } if conn.0 == self.conn => gate.bind_direct(*grant, true, *attempt),
+                    DirectHostAction::Bound {
+                        conn,
+                        grant,
+                        provisional,
+                    } if conn.0 == self.conn => gate.bind_direct(*grant, *provisional, None),
+                    DirectHostAction::Committed { bound, .. }
+                        if bound.iter().any(|c| c.0 == self.conn) =>
+                    {
+                        gate.committed()
+                    }
+                    DirectHostAction::MissHold { conn, .. } if conn.0 == self.conn => gate.hold(),
+                    DirectHostAction::Close { conn, code } if conn.0 == self.conn => {
+                        gate.close(*code)
+                    }
+                    _ => {}
+                }
+            }
             match a {
                 DirectHostAction::Send { conn, message } if conn.0 == self.conn => {
                     if !self.open {
@@ -455,27 +577,49 @@ impl World {
     }
 
     /// Paired, the joiner's app opens its first stream on the connection,
-    /// if it is still up: the host's gate holds it until the host commits
-    /// the provisional grant (wire.md 8.1).
+    /// if it is still up and its own gate is live: the host's gate holds it
+    /// until the host commits the provisional grant (wire.md 8.1).
     fn first_stream(&mut self) {
         let Some(i) = self.host else {
             return;
         };
-        if !self.open {
+        if !self.open || !self.caller_gate.as_ref().is_some_and(|g| g.is_live()) {
             return;
         }
         let (conn, now) = (ConnectionId(self.conn), self.now);
-        let h = &mut self.hosts[i];
-        let Some(grant) = h
-            .grants
-            .binding(conn)
-            .filter(|g| h.grants.is_provisional(*g))
-        else {
-            return;
+        let verdict = self
+            .host_gate
+            .as_mut()
+            .expect("the host's gate")
+            .check(Traffic::Stream);
+        let name = match verdict {
+            Verdict::Allow => "allow",
+            Verdict::Commit(_) => "commit",
+            Verdict::Ignore => "ignore",
+            Verdict::Close(_) => "close",
         };
-        self.out.push(json!({ "stream": self.conn }));
-        let actions = h.machine.on_first_stream(conn, grant, &mut h.grants, now);
-        let _ = self.host_did(actions);
+        self.out
+            .push(json!({ "stream": { "conn": self.conn, "verdict": name } }));
+        match verdict {
+            Verdict::Commit(grant) => {
+                let h = &mut self.hosts[i];
+                let actions = h.machine.on_first_stream(conn, grant, &mut h.grants, now);
+                let _ = self.host_did(actions);
+                if self.open {
+                    let again = self
+                        .host_gate
+                        .as_mut()
+                        .expect("the host's gate")
+                        .check(Traffic::Stream);
+                    assert_eq!(again, Verdict::Allow, "the frame passes after the commit");
+                }
+            }
+            Verdict::Close(code) => {
+                let to_joiner = self.host_did(vec![DirectHostAction::Close { conn, code }]);
+                let _ = to_joiner;
+            }
+            Verdict::Allow | Verdict::Ignore => {}
+        }
     }
 
     /// The joiner's message reaches the host.
@@ -483,7 +627,27 @@ impl World {
         let Some(i) = self.host else {
             return Vec::new();
         };
+        if self.silent && matches!(m, ControlMessage::JoinDirect { .. }) {
+            // A silent host: the message is never answered.
+            return Vec::new();
+        }
         let (conn, now, joiner) = (ConnectionId(self.conn), self.now, self.joiner_key);
+        let verdict = self
+            .host_gate
+            .as_mut()
+            .expect("the host's gate")
+            .check_message(m);
+        match verdict {
+            Verdict::Allow => {}
+            Verdict::Close(code) => {
+                return self.host_did(vec![DirectHostAction::Close { conn, code }]);
+            }
+            _ => {
+                self.out
+                    .push(json!({ "gate": { "conn": self.conn, "verdict": "ignore" } }));
+                return Vec::new();
+            }
+        }
         let h = &mut self.hosts[i];
         let exporter = pair_exporter(self.conn);
         let actions = match m {
@@ -559,6 +723,11 @@ impl World {
                     }
                 }
                 self.sent("joiner", &m);
+                if matches!(m, ControlMessage::JoinDirect { .. }) {
+                    if let Some(gate) = self.caller_gate.as_mut() {
+                        gate.sent_join_proof();
+                    }
+                }
                 let replies = self.deliver_to_host(&m);
                 if self.exchanges_sent == 2
                     && matches!(m, ControlMessage::CodeExchange { .. })
@@ -566,6 +735,8 @@ impl World {
                 {
                     // The app stops: the flow is gone, the connection breaks.
                     self.flow = None;
+                    // The OS gives the dead app's hold back.
+                    self.store.held = false;
                     self.out.push(json!({ "crash": true }));
                     let _ = self.break_connection();
                     return Vec::new();
@@ -585,7 +756,45 @@ impl World {
                 self.host_sees_close(Some(code));
                 Vec::new()
             }
+            DirectJoinerAction::AcquireHold(lookup) => {
+                if self.store.held || self.store.held_elsewhere {
+                    self.out.push(json!({ "hold_refused": lookup.as_str() }));
+                    return self
+                        .flow
+                        .as_mut()
+                        .map(|f| f.on_hold_refused())
+                        .unwrap_or_default();
+                }
+                self.store.held = true;
+                self.out.push(json!({ "hold": lookup.as_str() }));
+                let (ledger, pending, now) = (
+                    self.store.ledger.clone(),
+                    self.store.pending.clone(),
+                    self.now,
+                );
+                self.flow
+                    .as_mut()
+                    .map(|f| f.on_records(ledger.as_ref(), &pending, now))
+                    .unwrap_or_default()
+            }
+            DirectJoinerAction::ReleaseHold(lookup) => {
+                assert!(self.store.held, "a release without the hold");
+                self.store.held = false;
+                self.out.push(json!({ "release": lookup.as_str() }));
+                Vec::new()
+            }
+            DirectJoinerAction::PersistLedger { .. }
+            | DirectJoinerAction::PersistPending { .. }
+                if std::mem::take(&mut self.store.fail_next) =>
+            {
+                self.out.push(json!({ "write_failed": true }));
+                self.flow
+                    .as_mut()
+                    .map(|f| f.on_persist_failed())
+                    .unwrap_or_default()
+            }
             DirectJoinerAction::PersistLedger { expected, record } => {
+                assert!(self.store.held, "a write without the hold");
                 assert_eq!(self.store.ledger, expected, "ledger compare-and-swap");
                 self.out.push(json!({ "persist_ledger": {
                     "expected": expected.as_ref().map(|l| hex(&l.to_bytes())),
@@ -598,12 +807,27 @@ impl World {
                     .unwrap_or_default()
             }
             DirectJoinerAction::PersistPending { expected, record } => {
-                assert_eq!(self.store.pending, expected, "pending compare-and-swap");
+                assert!(self.store.held, "a write without the hold");
+                let address = expected
+                    .as_ref()
+                    .or(record.as_ref())
+                    .map(|p| p.address)
+                    .expect("a record");
+                assert!(
+                    record.as_ref().is_none_or(|r| r.address == address),
+                    "one address per write"
+                );
+                assert_eq!(
+                    self.store.pending_at(&address),
+                    expected.as_ref(),
+                    "pending compare-and-swap"
+                );
                 self.out.push(json!({ "persist_pending": {
                     "expected": expected.as_ref().map(|p| hex(&p.to_bytes())),
                     "record": record.as_ref().map(|p| hex(&p.to_bytes())),
                 } }));
-                self.store.pending = record;
+                self.store.pending.retain(|p| p.address != address);
+                self.store.pending.extend(record);
                 self.flow
                     .as_mut()
                     .map(|f| f.on_persisted())
@@ -622,6 +846,10 @@ impl World {
                     "address": p.address.to_text(),
                 } } }));
                 self.store.pins.push((p.identity, p.invitation));
+                if let Some(gate) = self.caller_gate.as_mut() {
+                    gate.promote_direct();
+                    gate.promote();
+                }
                 self.flow
                     .as_mut()
                     .map(|f| f.on_pin_stored())
@@ -659,6 +887,25 @@ impl World {
         }
         if self.lose.as_deref() == Some("paired") && matches!(m, ControlMessage::Paired { .. }) {
             return self.break_connection();
+        }
+        if let Some(gate) = self.caller_gate.as_mut() {
+            match gate.check(CallerTraffic::of(&m)) {
+                Verdict::Allow => {}
+                Verdict::Close(code) => {
+                    let conn = self.conn;
+                    self.out.push(
+                        json!({ "close": { "from": "joiner", "conn": conn, "code": code.name() } }),
+                    );
+                    self.open = false;
+                    self.host_sees_close(Some(code));
+                    return self
+                        .flow
+                        .as_mut()
+                        .map(|f| f.on_closed(Some(code)))
+                        .unwrap_or_default();
+                }
+                _ => return Vec::new(),
+            }
         }
         let rng = &mut self.joiner_rng;
         let Some(flow) = self.flow.as_mut() else {
@@ -705,19 +952,30 @@ impl World {
             "typed" => TYPED.to_owned(),
             other => panic!("code {other}"),
         };
+        self.address = step["address"].as_str().unwrap_or(ADDRESS).to_owned();
+        self.store.held_elsewhere = step["held_elsewhere"].as_bool().unwrap_or(false);
         let flow = DirectJoinerPairing::new(
-            ADDRESS,
+            &self.address,
             &code,
             self.joiner_key,
             JOINER_NAME,
             CpaceExchangeFactory,
-            self.store.ledger.as_ref(),
-            self.store.pending.as_ref(),
-            self.now,
         )
         .map_err(|e| e.name().to_owned())?;
+        self.begin(flow)
+    }
+
+    /// A new flow asks for the hold and gets its records; it ends there if
+    /// they refuse it.
+    fn begin(&mut self, mut flow: DirectJoinerPairing<CpaceExchangeFactory>) -> Result<(), String> {
+        let actions = flow.start();
         self.flow = Some(flow);
-        Ok(())
+        self.pump(actions);
+        self.store.held_elsewhere = false;
+        match self.flow.as_ref().map(|f| f.state()) {
+            Some(DirectJoinerState::Ended(end)) => Err(end_name(end)),
+            _ => Ok(()),
+        }
     }
 
     fn connect(&mut self, step: &J) {
@@ -726,7 +984,23 @@ impl World {
         self.exchanges_sent = 0;
         self.lose = step["lose"].as_str().map(str::to_owned);
         self.crash = step["crash"].as_str().map(str::to_owned);
+        self.silent = step["silent"].as_bool().unwrap_or(false);
         let exporter = pair_exporter(self.conn);
+        if self.flow.as_ref().map(|f| f.state()) == Some(DirectJoinerState::Away) {
+            // Going on from away: the hold and the records first.
+            let actions = self.flow.as_mut().expect("a flow").start();
+            self.pump(actions);
+            if self.flow.as_ref().map(|f| f.state()) != Some(DirectJoinerState::Connecting) {
+                self.open = false;
+                return;
+            }
+        }
+        let pinned = self.flow.as_ref().and_then(|f| f.pinned_host()).is_some();
+        self.caller_gate = Some(if pinned {
+            CallerGate::new()
+        } else {
+            CallerGate::pairing_only()
+        });
         let who = step["host"].as_str().expect("host");
         let key = if who == "own" {
             self.host = None;
@@ -745,18 +1019,15 @@ impl World {
         if !self.open || self.host.is_none() {
             return;
         }
-        // Step 2 on the host: a provisional or live grant binds the
-        // connection and the host says AUTHORIZED {live} first.
+        // Step 2 on the host, with its gate: a provisional or live grant
+        // binds the connection and the host says AUTHORIZED {live} first.
         let i = self.host.expect("host");
         let (conn, now, joiner) = (ConnectionId(self.conn), self.now, self.joiner_key);
-        let bound = match crate::authz::decide(&self.hosts[i].grants, &joiner, now) {
-            crate::authz::Step2::Live { grant, .. }
-            | crate::authz::Step2::Provisional { grant, .. } => Some(grant),
-            _ => None,
-        };
+        let gate = ConnectionGate::open(conn, joiner, &mut self.hosts[i].grants, now, Millis(0));
+        let live = matches!(gate.state(), GateState::Live { .. });
+        self.host_gate = Some(gate);
         let mut inbox = Vec::new();
-        if let Some(grant) = bound {
-            self.hosts[i].grants.bind(conn, grant, now).expect("bind");
+        if live {
             let m = ControlMessage::Authorized {
                 state: AuthorizedState::Live,
             };
@@ -772,6 +1043,14 @@ impl World {
             actions.extend(self.joiner_receives(m));
         }
         self.pump(actions);
+        if self.silent
+            && self.flow.as_ref().map(|f| f.state()) == Some(DirectJoinerState::AwaitingAnswer)
+        {
+            // 10 s pass with no answer (wire.md 8.2).
+            self.out.push(json!({ "answer_timeout": self.conn }));
+            let actions = self.flow.as_mut().expect("a flow").on_answer_timeout();
+            self.pump(actions);
+        }
     }
 
     fn owner(&mut self, step: &J, allow: bool) {
@@ -819,24 +1098,37 @@ impl World {
                 })
             }
             "resume" => {
-                let pending = self.store.pending.clone().expect("a pending record");
+                self.address = step["address"].as_str().unwrap_or(ADDRESS).to_owned();
+                let address = DirectAddress::parse(&self.address).expect("address");
+                let lookup = self.hosts[0].code.lookup();
                 let flow = DirectJoinerPairing::resume(
-                    &pending,
+                    address,
+                    lookup,
                     self.joiner_key,
                     JOINER_NAME,
                     CpaceExchangeFactory,
-                    self.store.ledger.as_ref(),
-                    self.now,
                     &crate::limits::Limits::DEFAULT,
                 );
                 return Some(match flow {
-                    Ok(flow) => {
-                        self.flow = Some(flow);
-                        "ok".into()
-                    }
+                    Ok(flow) => match self.begin(flow) {
+                        Ok(()) => "ok".into(),
+                        Err(e) => e,
+                    },
                     Err(e) => e.name().into(),
                 });
             }
+            "stored_ledger" => {
+                // A ledger written earlier: `first_debit` is seconds before
+                // the conventions' time.
+                let ago = step["first_debit_ago"].as_u64().expect("first_debit_ago");
+                self.store.ledger = Some(DirectLedger {
+                    lookup: self.hosts[0].code.lookup(),
+                    attempts_left: u8::try_from(step["attempts_left"].as_u64().expect("left"))
+                        .expect("u8"),
+                    first_debit: UnixTime(T - ago),
+                });
+            }
+            "fail_next_write" => self.store.fail_next = true,
             "connect" => self.connect(step),
             "allow" => self.owner(step, true),
             "decline" => self.owner(step, false),
@@ -851,6 +1143,9 @@ impl World {
                     .expect("a flow")
                     .cancel()
                     .expect("cancel");
+                if step["held_elsewhere"].as_bool().unwrap_or(false) {
+                    self.store.held_elsewhere = true;
+                }
                 self.pump(actions);
                 // What the host sent before the cancel reached it arrives
                 // now, after the joiner's cancel.
@@ -868,6 +1163,7 @@ impl World {
                     self.pump(actions);
                     self.open = was_open;
                 }
+                self.store.held_elsewhere = false;
             }
             other => panic!("op {other}"),
         }
@@ -918,12 +1214,30 @@ fn run_sequence(seq: &J, listed: Option<&J>) -> J {
             assert_eq!(got, l.as_u64(), "{ctx}: ledger");
         }
         if let Some(p) = step.get("pending") {
+            let address = DirectAddress::parse(&w.address).expect("address");
             let got =
                 w.store
-                    .pending
-                    .as_ref()
+                    .pending_at(&address)
                     .map(|p| if p.cancelled { "cancelled" } else { "pending" });
             assert_eq!(got, p.as_str(), "{ctx}: pending");
+        }
+        if let Some(list) = step["pendings"].as_array() {
+            let mut got: Vec<J> = w
+                .store
+                .pending
+                .iter()
+                .map(|p| {
+                    json!([
+                        p.address.to_text(),
+                        if p.cancelled { "cancelled" } else { "pending" }
+                    ])
+                })
+                .collect();
+            got.sort_by_key(|v| v.to_string());
+            assert_eq!(&got, list, "{ctx}: pendings");
+        }
+        if let Some(h) = step["held"].as_bool() {
+            assert_eq!(w.store.held, h, "{ctx}: held");
         }
         if let Some(p) = step["pinned"].as_bool() {
             assert_eq!(!w.store.pins.is_empty(), p, "{ctx}: pinned");
@@ -967,10 +1281,34 @@ fn run_sequence(seq: &J, listed: Option<&J>) -> J {
     out
 }
 
+/// Both record formats with times above 2^53 - 1: a reader keeps every
+/// bit of the uint.
+fn records() -> J {
+    let lookup = DirectLookup::from_canonical("K7QM").expect("lookup");
+    let big = UnixTime((1u64 << 53) + 1);
+    let ledger = DirectLedger {
+        lookup: lookup.clone(),
+        attempts_left: 3,
+        first_debit: big,
+    };
+    let pending = DirectPending {
+        lookup,
+        host: identity(&IDENTITY_A).public_key(),
+        invitation: InvitationId([0x49; 16]),
+        address: DirectAddress::parse("[fe80::1]:47100").expect("address"),
+        verified_at: UnixTime(u64::MAX),
+        cancelled: true,
+    };
+    json!([
+        { "kind": "ledger", "lookup": "K7QM", "attempts_left": 3, "first_debit": big.0.to_string(), "bytes": hex(&ledger.to_bytes()) },
+        { "kind": "pending", "lookup": "K7QM", "host": hex(pending.host.as_bytes()), "invitation": hex(&[0x49; 16]), "address": "[fe80::1]:47100", "verified_at": u64::MAX.to_string(), "cancelled": true, "bytes": hex(&pending.to_bytes()) },
+    ])
+}
+
 pub(super) fn direct_joiner_vectors() -> J {
     let sequences: Vec<J> = sequences().iter().map(|s| run_sequence(s, None)).collect();
     json!({
-        "description": "Pair with IP end to end (wire.md 10.9): the joiner machine against the host machine of direct-host.json, with the real code exchange, replayed byte for byte from the listed draws. Each sequence starts with the real host (`host`) holding one invitation created at `conventions.time` (`code`). Ops: start (the person types `conventions.address` and a code: right, wrong (the right lookup, secret 00000000 or 00000001), other_lookup (lookup 0000 or 0001, the right secret), typed (`conventions.typed`); `result` ok or the refusal, before any dial), resume (a new flow from the stored pending record, no code), connect (TLS with `host` on `conn`: the joiner sees the far end's key, then the host's step 2 runs, then the host's HELLO agrees on min(`minor`, 4) (default 4); `own` shows the joiner's own key; `lose` msg_c breaks the connection instead of delivering the joiner's confirmation; `crash` after_msg_c stops the joiner's app right after its confirmation reached the host and breaks the connection), allow and decline (the real host's owner answers the joiner's request; `lose` paired breaks the connection instead of delivering PAIRED; with `in_transit` the host's messages stay on their way until the next cancel), drop (the connection breaks), cancel (the person cancels; host messages in transit then arrive). Every write the joiner asks for lands at once (compare-and-swap checked), and every pin is stored at once. A host's miss hold is shown with the close the I/O layer makes after it. Expectations: `state` (the joiner flow's), `ledger` (attempts left in the stored ledger, or null), `pending` (the stored pending record: pending, cancelled or null), `pinned` (the joiner stored a pin), `granted` (a grant the real host's direct invitation made for the joiner: committed, provisional or null). Once the joiner ends paired and its connection is still up, its app opens the first stream there, and the host commits the provisional grant before the stream goes on. `out`: in order, control messages (`send`), closes (`close`, with who closed), miss holds, broken connections, the joiner's writes (`persist_ledger`, `persist_pending`: expected and new record bytes, null for none), what the joiner tells its UI (`code_passed`, `paired`, `away`, `ended`), the app's first stream (`stream`) and the host's commit (`committed`), a crash, and host messages that arrive after a cancel. HELLOs are not listed.",
+        "description": "Pair with IP end to end (wire.md 10.9): the joiner machine against the host machine of direct-host.json, with the real code exchange, replayed byte for byte from the listed draws. Each sequence starts with the real host (`host`) holding one invitation created at `conventions.time` (`code`). Ops: start (the person types `conventions.address` and a code: right, wrong (the right lookup, secret 00000000 or 00000001), other_lookup (lookup 0000 or 0001, the right secret), typed (`conventions.typed`); `result` ok or the refusal, before any dial), `address` (default `conventions.address`) is the typed address, and with `held_elsewhere` another flow holds the lookup for that step only), resume (a new flow for the pending record stored at `address`, no code), connect (from away, the flow first takes the hold and reloads its records; then TLS with `host` on `conn`: the joiner sees the far end's key, then the host's step 2 runs with its gate, then the host's HELLO agrees on min(`minor`, 4) (default 4); `own` shows the joiner's own key; `lose` msg_c breaks the connection instead of delivering the joiner's confirmation; `crash` after_msg_c stops the joiner's app right after its confirmation reached the host and breaks the connection, and its hold goes; `silent`: the host never answers JOIN_DIRECT and the joiner's answer timeout runs within the step, as if its 10 s had passed; the step's clock does not move), allow and decline (the real host's owner answers the joiner's request; `lose` paired breaks the connection instead of delivering PAIRED; with `in_transit` the host's messages stay on their way until the next cancel), drop (the connection breaks), cancel (the person cancels, with `held_elsewhere` while another flow holds the lookup for that step; host messages in transit then arrive), stored_ledger (a ledger stored before the sequence: `attempts_left`, first debit `first_debit_ago` seconds before `conventions.time`), fail_next_write (the next write the joiner asks for fails). The store keeps one ledger per typed lookup, one pending record per typed lookup and address, and the lookup's hold: a flow asks for it (`hold`, or `hold_refused` when another flow has it) and gets the records loaded under it, and gives it back (`release`); every write needs it. Every write the joiner asks for otherwise lands at once (compare-and-swap checked against the record at its address), and every pin is stored at once. Every message passes the receiving side's gate: the host's (wire.md 8.1; `gate` ignore when it drops one) and the joiner's (8.2, pairing-only on a first contact, pinned on a recovery); the joiner's app opens its first stream only when its gate is live. A host's miss hold is shown with the close the I/O layer makes after it. Expectations: `state` (the joiner flow's), `ledger` (attempts left in the stored ledger, or null), `pending` (the pending record stored at the flow's typed address: pending, cancelled or null), `pendings` (every stored pending record: address and state, sorted by address text), `held` (the lookup's hold is taken), `pinned` (the joiner stored a pin), `granted` (a grant the real host's direct invitation made for the joiner: committed, provisional or null). Once the joiner ends paired and its connection is still up, its app opens the first stream there, and the host commits the provisional grant before the stream goes on. `out`: in order, control messages (`send`), closes (`close`, with who closed), miss holds, broken connections, the joiner's writes (`persist_ledger`, `persist_pending`: expected and new record bytes, null for none), what the joiner tells its UI (`code_passed`, `paired`, `away`, `ended`), the app's first stream (`stream`, with the host gate's verdict) and the host's commit (`committed`), the hold (`hold`, `hold_refused`, `release`), a failed write (`write_failed`), an answer timeout, a crash, and host messages that arrive after a cancel. HELLOs are not listed. `records`: both record formats with times above 2^53 - 1 (as decimal strings), each with its canonical bytes; a reader keeps the whole uint and writes the same bytes back.",
         "conventions": {
             "time": T,
             "address": ADDRESS,
@@ -981,14 +1319,30 @@ pub(super) fn direct_joiner_vectors() -> J {
             "draws": "Each party's random values in the order it takes them. Hosts: the invitation id (16), the code (12), then each attempt's yb (32), as in direct-host.json. Joiner: for each attempt the attempt id (16) and ya (32).",
         },
         "sequences": sequences,
+        "records": records(),
     })
 }
 
 #[test]
 fn direct_joiner_sequences_hold() {
-    let text = checked_in("direct-joiner.json")
-        .unwrap_or_else(|| serde_json::to_string(&direct_joiner_vectors()).expect("json"));
+    let text = checked_in("direct-joiner.json").expect("spec/vectors/direct-joiner.json");
     let doc: J = serde_json::from_str(&text).expect("json");
+    for r in doc["records"].as_array().expect("records") {
+        let bytes = unhex(r["bytes"].as_str().expect("bytes"));
+        match r["kind"].as_str() {
+            Some("ledger") => {
+                let l = DirectLedger::from_bytes(&bytes).expect("ledger");
+                assert_eq!(l.first_debit.0.to_string(), r["first_debit"]);
+                assert_eq!(l.to_bytes(), bytes);
+            }
+            Some("pending") => {
+                let p = DirectPending::from_bytes(&bytes).expect("pending");
+                assert_eq!(p.verified_at.0.to_string(), r["verified_at"]);
+                assert_eq!(p.to_bytes(), bytes);
+            }
+            other => panic!("record kind {other:?}"),
+        }
+    }
     for seq in doc["sequences"].as_array().expect("sequences") {
         let replayed = run_sequence(seq, Some(&seq["draws"]));
         assert_eq!(&replayed, seq, "{}", seq["name"]);

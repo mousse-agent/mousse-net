@@ -23,23 +23,41 @@ fn lookup() -> DirectLookup {
     DirectLookup::from_canonical("K7QM").unwrap()
 }
 
+/// A Connect: the flow takes the lookup's hold and gets `ledger` and
+/// `pending` loaded under it. Err: the refusal's name.
 fn start(
     address: &str,
     code: &str,
     ledger: Option<&DirectLedger>,
     pending: Option<&DirectPending>,
     now: UnixTime,
-) -> Result<DirectJoinerPairing<CpaceExchangeFactory>, DirectJoinError> {
-    DirectJoinerPairing::new(
-        address,
-        code,
-        key(2),
-        "Laptop",
-        CpaceExchangeFactory,
-        ledger,
-        pending,
-        now,
-    )
+) -> Result<DirectJoinerPairing<CpaceExchangeFactory>, &'static str> {
+    let mut flow = DirectJoinerPairing::new(address, code, key(2), "Laptop", CpaceExchangeFactory)
+        .map_err(|e| e.name())?;
+    assert!(matches!(
+        flow.start().as_slice(),
+        [DirectJoinerAction::AcquireHold(_)]
+    ));
+    let pending: Vec<DirectPending> = pending.into_iter().cloned().collect();
+    let actions = flow.on_records(ledger, &pending, now);
+    match flow.state() {
+        DirectJoinerState::Ended(end) => {
+            // Refused before dialing: the hold goes back at once.
+            assert!(matches!(
+                actions.as_slice(),
+                [
+                    DirectJoinerAction::Ended(_),
+                    DirectJoinerAction::ReleaseHold(_)
+                ]
+            ));
+            Err(match end {
+                DirectEnd::AttemptsExhausted => "attempts_exhausted",
+                DirectEnd::BadRecord => "bad_record",
+                _ => "ended",
+            })
+        }
+        _ => Ok(flow),
+    }
 }
 
 /// Inputs: the address forms the route grammar reads, and what it does not
@@ -72,7 +90,7 @@ fn typed_addresses() {
 /// address is read first.
 #[test]
 fn bad_input_is_refused_before_dialing() {
-    let name = |r: Result<_, DirectJoinError>| r.err().map(|e| e.name());
+    let name = |r: Result<_, &'static str>| r.err();
     assert_eq!(
         name(start("desk:1", "nope", None, None, T)),
         Some("bad_address")
@@ -148,9 +166,7 @@ fn the_ledger_counts_for_a_day_from_its_first_debit() {
     };
     let last_second = T.plus(DIRECT_LEDGER_LIFE_SECS - 1);
     assert_eq!(
-        start("10.0.0.2:47100", CODE, Some(&empty), None, last_second)
-            .err()
-            .map(|e| e.name()),
+        start("10.0.0.2:47100", CODE, Some(&empty), None, last_second).err(),
         Some("attempts_exhausted")
     );
     let next_day = start(
@@ -168,9 +184,7 @@ fn the_ledger_counts_for_a_day_from_its_first_debit() {
         ..empty
     };
     assert_eq!(
-        start("10.0.0.2:47100", CODE, Some(&other), None, T)
-            .err()
-            .map(|e| e.name()),
+        start("10.0.0.2:47100", CODE, Some(&other), None, T).err(),
         Some("bad_record")
     );
 }
@@ -355,15 +369,18 @@ fn paired_in_answer_to_a_cancelling_recovery_is_taken() {
         cancelled: true,
     };
     let mut flow = DirectJoinerPairing::resume(
-        &pending,
+        pending.address,
+        lookup(),
         key(2),
         "Laptop",
         CpaceExchangeFactory,
-        None,
-        T,
         &Limits::DEFAULT,
     )
     .unwrap();
+    flow.start();
+    assert!(flow
+        .on_records(None, std::slice::from_ref(&pending), T)
+        .is_empty());
     flow.on_connected(key(1), [9; 32]);
     let sent = flow.on_hello(4);
     assert!(matches!(
@@ -378,5 +395,79 @@ fn paired_in_answer_to_a_cancelling_recovery_is_taken() {
     let paired = flow.on_paired("Desk".into(), Role::owner());
     assert!(
         matches!(paired.as_slice(), [DirectJoinerAction::Paired(p)] if p.invitation == pending.invitation)
+    );
+}
+
+/// The hold (wire.md 10.9 "Joiner records"): nothing is loaded or dialled
+/// without it, a refusal ends a new flow as busy, and the flow gives it
+/// back when it goes away.
+#[test]
+fn the_lookup_hold_comes_before_the_records_and_goes_back_away() {
+    let mut busy = DirectJoinerPairing::new(
+        "10.0.0.2:47100",
+        CODE,
+        key(2),
+        "Laptop",
+        CpaceExchangeFactory,
+    )
+    .unwrap();
+    assert!(busy.on_connected(key(1), [3; 32]).is_empty());
+    assert_eq!(busy.state(), DirectJoinerState::Holding);
+    busy.start();
+    assert_eq!(
+        busy.on_hold_refused(),
+        vec![DirectJoinerAction::Ended(DirectEnd::Busy)]
+    );
+
+    let mut flow = start("10.0.0.2:47100", CODE, None, None, T).unwrap();
+    flow.on_connected(key(1), [3; 32]);
+    flow.on_hello(4);
+    let mut rng = ChaCha20Rng::from_seed([4; 32]);
+    flow.on_authorized_direct(InvitationId([7; 16]), false, T, &mut rng);
+    flow.on_persisted();
+    // The connection breaks before the code passed: the flow ends and the
+    // hold goes back.
+    let ended = flow.on_closed(None);
+    assert_eq!(
+        ended.last(),
+        Some(&DirectJoinerAction::ReleaseHold(lookup()))
+    );
+}
+
+/// A cancel whose write fails while connected closes that connection with
+/// `INTERNAL_ERROR`; the close that waited for the write is never sent.
+#[test]
+fn a_failed_cancel_write_closes_the_live_connection() {
+    let pending = DirectPending {
+        lookup: lookup(),
+        host: key(1),
+        invitation: InvitationId([7; 16]),
+        address: DirectAddress::parse("10.0.0.2:47100").unwrap(),
+        verified_at: T,
+        cancelled: false,
+    };
+    let mut flow = start("10.0.0.2:47100", CODE, None, Some(&pending), T).unwrap();
+    flow.on_connected(key(1), [3; 32]);
+    flow.on_hello(4);
+    flow.on_authorized_direct(
+        InvitationId([7; 16]),
+        false,
+        T,
+        &mut ChaCha20Rng::from_seed([4; 32]),
+    );
+    assert_eq!(flow.state(), DirectJoinerState::AwaitingAllow);
+    let asked = flow.cancel().unwrap();
+    assert!(matches!(
+        asked.as_slice(),
+        [DirectJoinerAction::PersistPending { record: Some(r), .. }] if r.cancelled
+    ));
+    let failed = flow.on_persist_failed();
+    assert_eq!(
+        failed,
+        vec![
+            DirectJoinerAction::Close(ErrorCode::InternalError),
+            DirectJoinerAction::Ended(DirectEnd::Closed(Some(ErrorCode::InternalError))),
+            DirectJoinerAction::ReleaseHold(lookup()),
+        ]
     );
 }

@@ -1684,9 +1684,19 @@ trailing spaces dropped, no DNS names, and no IPv4-mapped IPv6 address
 (`::ffff:0:0/96`; the IPv4 form is typed instead); anything else is
 `bad_address`. It
 reads the code as "Code" above; a text that is not a code is `bad_code`.
-The address is read first. Neither error dials or spends an attempt. A
-start with no attempts left for the typed lookup ends with
-`ATTEMPTS_EXHAUSTED` before dialing.
+The address is read first. Neither error dials or spends an attempt.
+
+**Hold.** One flow at a time works on a typed lookup. A flow first takes the
+lookup's **hold** (a lock the operating system releases if the app dies),
+then loads the ledger and the pending records under it; when another flow
+on the device has it, a new flow ends at once (busy) and nothing is loaded
+or dialled. The flow keeps the hold until it ends, or until its
+connection ends with its pending record kept (it is away), after its last
+write; going on from away, for a recovery connection or a cancel, takes it
+again and reloads the records, so a flow never acts on a record another
+flow changed since. A cancel that cannot take the hold leaves the flow
+away and the record as it was. A start with no attempts left for the
+typed lookup ends with `ATTEMPTS_EXHAUSTED` before dialing.
 
 **Ledger.** The joiner counts its attempts per **typed lookup**, not per key
 the far end shows, in a durable record stored under `L`:
@@ -1699,12 +1709,17 @@ the far end shows, in a durable record stored under `L`:
 A start has `DIRECT_JOINER_ATTEMPTS` (5) attempts when no record counts. A
 record counts until 24 hours (86 400 s, fixed) after its first debit; after
 that a start begins with every attempt again, and its first debit sets a
-new first-debit time. A record for another lookup is refused. A far end
+new first-debit time. The record is read again at the debit: when its 24
+hours ended after the start, the debit begins a new record (every attempt
+but this one, first debit now), still written against the record as
+loaded. A record for another lookup is refused. A far end
 that shows a new identity key on every connection therefore still draws
 from the same count.
 
 **Pending record.** Once the host's confirmation verified, the host key
-and `I` are authenticated. The joiner stores, under `L`:
+and `I` are authenticated. The joiner stores, under `L` and the typed
+address (one record per lookup and address; a flow at another address
+never replaces it):
 
 ```
 {1: "mousse-direct-pending-v1", 2: L (text, 4), 3: host identity key (65 bytes),
@@ -1719,7 +1734,9 @@ Every write of either record is durable **before** what depends on it goes
 out, and is a compare and swap on the stored record as this flow last read
 or wrote it, as in 10.7. A write that fails or finds the record changed
 sends nothing that waited for it; the joiner closes with `INTERNAL_ERROR`
-and the flow ends.
+(a connection that was to close after the write, as on a cancel, is still
+up and closes so) and the flow ends. Times in both records are uints up to
+2^64 - 1; a reader keeps every bit.
 
 **First contact.** One flow is one Connect; it runs at most one attempt.
 
@@ -1771,9 +1788,10 @@ host's `HELLO` (minor 4 or more, as above) the joiner sends `JOIN_DIRECT
 code is needed, and none of the ledger's attempts: a recovery runs with
 none left. A Connect whose typed address and lookup match a stored pending
 record resumes it as a recovery instead of starting a new attempt. Any
-other Connect starts a new flow; if a pending record for the same lookup at
-another address is stored, that flow's own pending record replaces it (the
-write is compared against the record read at the start). The answers:
+other Connect starts a new flow; pending records at other addresses stay as
+they are, each recovered on its own. A recovery sends `JOIN_DIRECT` and
+waits for the answer for 10 s, as a first contact does (8.2); an
+`AUTHORIZED {live}` alone does not end that wait. The answers:
 
 - `AUTHORIZED {live}` (step 2's, or the host's own when it binds the
   connection to a grant that appeared after step 2), then `PAIRED`:
