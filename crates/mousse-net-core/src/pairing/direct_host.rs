@@ -393,6 +393,17 @@ struct EnrolledConn {
     attempt: Option<AttemptId>,
 }
 
+/// The per-connection records of [`DirectHostPairing`] that a grant-table
+/// change goes with: which invitation each pairing connection belongs to,
+/// and which connections were enrolled (and may still cancel). An I/O layer
+/// that cannot store a change takes these with the grant table before the
+/// change and puts both back together.
+#[derive(Clone)]
+pub struct DirectRecords {
+    by_conn: BTreeMap<ConnectionId, InvitationId>,
+    enrolled: BTreeMap<ConnectionId, EnrolledConn>,
+}
+
 /// The host side of Pair with IP.
 pub struct DirectHostPairing<F: CodeExchangeFactory> {
     host_identity: IdentityPublicKey,
@@ -1028,6 +1039,9 @@ impl<F: CodeExchangeFactory> DirectHostPairing<F> {
             .map(|g| g.identity);
         match grants.commit(grant, now) {
             Ok(events) => {
+                // Committed: nothing cancels it now. An I/O layer that
+                // cannot store the commit puts these records back with the
+                // grant table ([`DirectHostPairing::records`]).
                 self.enrolled.retain(|_, e| e.grant != grant);
                 let mut actions: Vec<DirectHostAction> =
                     events.into_iter().map(DirectHostAction::Grant).collect();
@@ -1118,6 +1132,36 @@ impl<F: CodeExchangeFactory> DirectHostPairing<F> {
         let mut actions = self.dismiss_others(&id, Some(&request.identity));
         actions.extend(self.approval_action(&id, &request.identity));
         Ok(actions)
+    }
+
+    /// The I/O layer could not store the enrollment this invitation made,
+    /// and put the grant table back as it was: no grant was made. The
+    /// invitation ends with `INTERNAL_ERROR` instead of being consumed, as
+    /// a restart would find it; the I/O layer reports the end and closes
+    /// the device's connection.
+    pub fn enrollment_not_stored(&mut self, invitation: &InvitationId) {
+        let Some(inv) = self.invitations.get_mut(invitation) else {
+            return;
+        };
+        if let DirectInvitationStatus::Consumed { .. } = inv.status {
+            inv.status = DirectInvitationStatus::Ended(ErrorCode::InternalError);
+        }
+    }
+
+    /// The connection records a grant-table change goes with
+    /// ([`DirectRecords`]).
+    pub fn records(&self) -> DirectRecords {
+        DirectRecords {
+            by_conn: self.by_conn.clone(),
+            enrolled: self.enrolled.clone(),
+        }
+    }
+
+    /// Put back the records taken by [`DirectHostPairing::records`], when
+    /// the grant table goes back to what it was then.
+    pub fn restore_records(&mut self, records: DirectRecords) {
+        self.by_conn = records.by_conn;
+        self.enrolled = records.enrolled;
     }
 
     /// The owner declined `request`. Its device's connection closes with

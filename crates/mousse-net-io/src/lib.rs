@@ -55,8 +55,8 @@ pub use conn::{
 pub use endpoint::{Endpoint, PortChoice};
 pub use error::NetError;
 pub use host::{
-    AppliedRemoval, ApprovalRequest, ConnectedGrantError, Host, HostConfig, HostEvent, Refusal,
-    RoleEditError, RoleEditing,
+    AppliedRemoval, ApprovalRequest, ConnectedGrantError, DirectEvent, DirectInvite, Host,
+    HostConfig, HostEvent, Refusal, RoleEditError, RoleEditing,
 };
 pub use limits::Limits;
 pub use preauth::{ListenerKind, PreAuthSlot, PreAuthStats};
@@ -125,7 +125,11 @@ pub type SharedSigner = Arc<dyn IdentitySigner + Send + Sync>;
         mousse_control = "grant-from-stale-connection",
         mousse_control = "live-permit-ignored",
         mousse_control = "connected-grant-while-paused",
-        mousse_control = "connected-grant-answers-unsaved"
+        mousse_control = "connected-grant-answers-unsaved",
+        mousse_control = "direct-on-any-transport",
+        mousse_control = "direct-miss-closes-at-once",
+        mousse_control = "direct-live-place-without-source",
+        mousse_control = "direct-commit-unsaved"
     )
 ))]
 compile_error!("a mousse_control build has a deliberate defect and is for tests only; build it without --release");
@@ -186,7 +190,11 @@ compile_error!("a mousse_control build has a deliberate defect and is for tests 
     mousse_control = "grant-from-stale-connection",
     mousse_control = "live-permit-ignored",
     mousse_control = "connected-grant-while-paused",
-    mousse_control = "connected-grant-answers-unsaved"
+    mousse_control = "connected-grant-answers-unsaved",
+    mousse_control = "direct-on-any-transport",
+    mousse_control = "direct-miss-closes-at-once",
+    mousse_control = "direct-live-place-without-source",
+    mousse_control = "direct-commit-unsaved"
 ))]
 const _: () = {
     let profile = env!("MOUSSE_BUILD_PROFILE").as_bytes();

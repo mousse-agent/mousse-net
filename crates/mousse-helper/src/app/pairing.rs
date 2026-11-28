@@ -1355,6 +1355,8 @@ pub fn host_event(shared: &Shared, event: HostEvent) {
             applog::line(format!("saving grants failed: {reason}"));
             json!({"ev": "store.failed", "reason": reason})
         }
+        // The app channel makes no Pair with IP invitations yet.
+        HostEvent::Direct(_) => return,
     };
     shared.event(value);
 }

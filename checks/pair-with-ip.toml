@@ -1,0 +1,33 @@
+# Pair with IP: the host address and a 12-character code
+# (docs/pair-with-ip-design.md). Format: checks/README.md.
+#
+# Each check runs one test file. Every control plants one bug and must fail
+# its own assertion while the normal build passes. The `direct-*` controls
+# of the core state machine (spec/vectors/README.md) run here too, against
+# the host over real sockets.
+
+phase = "pair-with-ip"
+title = "Pair with IP"
+plan = "docs/pair-with-ip-design.md"
+
+[[check]]
+id = "pair-with-ip.host-io"
+title = "The host side in mousse-net-io over loopback TLS at minor 4: Allow before any grant, a provisional grant committed and saved on the first stream, every attempt debited, the full miss hold with its place kept, lookups only on the TCP listener (never relay circuits or ws), a granted device's lookup counted against its source, Allow while away enrolled on recovery, a cancel crossing Allow (by abort or GOAWAY, stored before it is answered, ahead of a later first stream, still possible after a failed save, and a grant whose cancel was not stored commits nothing), failed saves that put the grant table and enrollment records back together without dropping earlier unsaved changes, a provisional grant across a restart, an Allow whose enrollment cannot be stored, ticket re-pair and receipts over relay within the TCP pool"
+plan = "docs/pair-with-ip-design.md §1.4, §1.6 and §7 (phase 2, host side)"
+targets = ["windows-x64", "macos-arm64", "linux-x64"]
+min_tests = 25
+local = [
+  { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-net-io", "--test", "direct_host", "--no-fail-fast"] },
+  { target = "macos-arm64", host = "macos-aarch64", command = ["cargo", "test", "-p", "mousse-net-io", "--test", "direct_host", "--no-fail-fast"] },
+  { target = "linux-x64", host = "linux-x86_64", command = ["cargo", "test", "-p", "mousse-net-io", "--test", "direct_host", "--no-fail-fast"] },
+]
+control = [
+  { name = "direct-skip-allow", breaks = "the code alone pairs, with no Allow", env = { RUSTFLAGS = '--cfg mousse_control="direct-skip-allow"' } },
+  { name = "direct-attempt-not-debited", breaks = "a code attempt is not debited", env = { RUSTFLAGS = '--cfg mousse_control="direct-attempt-not-debited"' } },
+  { name = "direct-enroll-without-connection", breaks = "Allow while the device is away grants at once, with no connection of it", env = { RUSTFLAGS = '--cfg mousse_control="direct-enroll-without-connection"' } },
+  { name = "direct-allow-beats-cancel", breaks = "a cancel crossing Allow leaves the provisional grant", env = { RUSTFLAGS = '--cfg mousse_control="direct-allow-beats-cancel"' } },
+  { name = "direct-on-any-transport", breaks = "a lookup is answered on a relay circuit or a ws tunnel", env = { RUSTFLAGS = '--cfg mousse_control="direct-on-any-transport"' } },
+  { name = "direct-miss-closes-at-once", breaks = "a lookup that finds nothing closes at once, freeing its place", env = { RUSTFLAGS = '--cfg mousse_control="direct-miss-closes-at-once"' } },
+  { name = "direct-live-place-without-source", breaks = "a granted device's lookup takes a place counted against no source", env = { RUSTFLAGS = '--cfg mousse_control="direct-live-place-without-source"' } },
+  { name = "direct-commit-unsaved", breaks = "the first stream runs before the commit is saved", env = { RUSTFLAGS = '--cfg mousse_control="direct-commit-unsaved"' } },
+]
