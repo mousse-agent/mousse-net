@@ -166,20 +166,22 @@ impl Limits {
                 out.io.cert_lifetime_secs()
             )));
         }
-        // The mux refuses a peer's open past MAX_PEER_STREAMS before the
-        // places below are looked at, so it must hold all of them: a peer
-        // filling the app's places then still reaches the bot and engine
-        // places. Each room keeps its own cap, so memory stays bounded by
-        // their sum.
+        // Each connection's mux keeps at least every place its admission
+        // gives (app + bot + engine; the driver raises MAX_PEER_STREAMS to
+        // that), so the places together must fit the spec's ceiling on
+        // peer streams, or the app's could take the mux's last ones.
         let places = out.io.streams_per_connection()
             + out.io.bot_streams_per_connection()
             + out.io.engine_streams_per_connection();
-        if out.core.max_peer_streams() < places {
+        let ceiling = CoreLimits::SPECS
+            .iter()
+            .find(|s| s.name == "MAX_PEER_STREAMS")
+            .map_or(u64::MAX, |s| s.max);
+        if places > ceiling {
             return Err(LimitError::Conflict(format!(
-                "MAX_PEER_STREAMS ({}) is below the places a connection has: \
-                 STREAMS_PER_CONNECTION ({}) + BOT_STREAMS_PER_CONNECTION ({}) + \
-                 OWN_STREAMS_PER_CONNECTION ({})",
-                out.core.max_peer_streams(),
+                "STREAMS_PER_CONNECTION ({}) + BOT_STREAMS_PER_CONNECTION ({}) + \
+                 OWN_STREAMS_PER_CONNECTION ({}) is more than the {ceiling} streams a \
+                 peer may have open on one connection",
                 out.io.streams_per_connection(),
                 out.io.bot_streams_per_connection(),
                 out.io.engine_streams_per_connection()
@@ -289,15 +291,12 @@ mod tests {
     }
 
     #[test]
-    fn the_mux_holds_every_place_a_connection_has() {
-        // 32 app + 16 bot + 4 engine places.
-        assert!(matches!(
-            Limits::DEFAULT.with_overrides(&[("MAX_PEER_STREAMS", 51)]),
-            Err(LimitError::Conflict(_))
-        ));
+    fn a_connections_places_fit_the_spec_ceiling_on_peer_streams() {
+        // A lower MAX_PEER_STREAMS is raised per connection, not refused.
         assert!(Limits::DEFAULT
-            .with_overrides(&[("MAX_PEER_STREAMS", 52)])
+            .with_overrides(&[("MAX_PEER_STREAMS", 1)])
             .is_ok());
+        // 1 024 app + 16 bot + 4 engine places can't fit 1 024.
         assert!(matches!(
             Limits::DEFAULT.with_overrides(&[("STREAMS_PER_CONNECTION", 1_024)]),
             Err(LimitError::Conflict(_))

@@ -137,6 +137,16 @@ impl StreamAdmission {
         })
     }
 
+    /// Places one connection has in every room together: the app's, the
+    /// bots' and the engine's. A connection's mux must keep at least this
+    /// many peer streams, or it would refuse an open before its room is
+    /// looked at.
+    pub fn places_per_connection(&self) -> usize {
+        self.per_connection
+            .saturating_add(self.bot_per_connection)
+            .saturating_add(self.engine_per_connection)
+    }
+
     /// Every connection's version decision from now on, in the order they
     /// were made. A second watcher replaces the first.
     pub fn watch_hellos(&self) -> mpsc::UnboundedReceiver<HelloSeen> {

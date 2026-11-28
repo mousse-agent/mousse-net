@@ -74,15 +74,16 @@ fn a_peer_opening_past_the_connection_cap_is_refused() {
 /// Thread streams filling a connection's app places never refuse a bot's
 /// feed, chat, call or browser view: bot labels have places of their own,
 /// and past those a bot stream is refused rather than taking an app place.
-/// The mux's own cap on peer streams is as tight as allowed (32 app + 3 bot
-/// + 4 engine places), so 32 thread streams leave it room for the bots.
+/// A's own cap on peer streams is set to one: the connection raises it to
+/// every place A's admission gives (32 app + 3 bot + 4 engine), so all 35
+/// app and bot streams open.
 #[test]
 fn thread_streams_filling_their_places_never_block_a_bot_stream() {
     let mut p = pair_up(
         "botroom",
         &[
             ("BOT_STREAMS_PER_CONNECTION", "3"),
-            ("MAX_PEER_STREAMS", "39"),
+            ("MAX_PEER_STREAMS", "1"),
         ],
         &ROOMY,
     );
@@ -455,14 +456,29 @@ fn bot_streams_at_their_cap_leave_a_thread_call_credit() {
 #[test]
 fn one_stalled_bot_reader_leaves_other_bot_streams_moving() {
     // The bot pool at its 1 MiB floor; a stream could hold all of it but
-    // for its share (a quarter).
+    // for its share (a quarter). 2 MiB shared, 1 MiB of it interactive.
     let budget = [
+        ("APP_CREDIT_BUDGET_BYTES", "2097152"),
         ("APP_CREDIT_BOT_RESERVE_BYTES", "1048576"),
         ("APP_STREAM_CREDIT_BYTES", "1048576"),
     ];
     let mut p = pair_up("botstall", &[], &budget);
+    let full = |app: &App, h: u32| {
+        app.wait("full credit", WAIT, |st| {
+            st.tx
+                .get(&h)
+                .is_some_and(|t| t.credit_total == 1024 * KIB)
+                .then_some(())
+        })
+    };
+    // Idle threads hold the whole shared budget, so no bot stream can lean
+    // on it.
+    let blob = p.b.open(p.b_conn, "mousse.blob", "bulk");
+    full(&p.b, blob);
+    let sub = p.b.open(p.b_conn, "mousse.sub", "interactive");
+    full(&p.b, sub);
     let stalled = p.b.open(p.b_conn, "mousse.botsub", "interactive");
-    let ha = p.a.incoming(p.a_conn, 0);
+    let ha = p.a.incoming(p.a_conn, 2);
     p.a.accept(ha);
     // A's app reads nothing: B's writes stall on wire credit.
     p.b.send(stalled, &pattern(4 << 20, 1), false);

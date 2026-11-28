@@ -185,9 +185,10 @@ and a final write stalled on credit with FIN queued behind it.
     connection and 64 per helper, and engine streams 4 per connection.
     That keeps initial credit at or below 13 MiB per connection (52
     streams) and 48 MiB per helper for app and bot streams (192 streams),
-    plus 1 MiB per connection for engine streams. `MAX_PEER_STREAMS`
-    must hold all of a connection's places (52 by default), so the mux
-    never refuses an open before its room's cap is looked at.
+    plus 1 MiB per connection for engine streams. Each connection raises
+    its mux's `MAX_PEER_STREAMS`, where lower, to all of the places its
+    admission gives (52 by default), so the mux never refuses an open
+    before its room's cap is looked at.
   - A peer's open beyond a cap is reset; E2 names the reset code in
     `spec/wire.md`. The app session queues its own opens past the cap.
   - Credit beyond the initial grant returns only as the app reads (see

@@ -28,7 +28,7 @@ spec's value: it can only be tightened.
 | `MOUSSE_NET_JOIN_PROOF_WAIT_MS` | 10000 | 1000 to 10000 | Host: time a connection with no grant has to send its `JOIN_PROOF` (wire.md 8). |
 | `MOUSSE_NET_KEEPALIVE_MS` | 15000 | 1000 to 15000 | `PING` after this long without sending (wire.md 9.4). |
 | `MOUSSE_NET_IDLE_TIMEOUT_MS` | 45000 | 30000 to 45000 | Close after this long without receiving; at least two of the peer's keepalives (wire.md 9.4). |
-| `MOUSSE_NET_MAX_PEER_STREAMS` | 1024 | 1 to 1024 | Streams the peer may have open; more are refused (wire.md 9.2). Checked before the I/O layer's places, so it may not be below `STREAMS_PER_CONNECTION` + `BOT_STREAMS_PER_CONNECTION` + `OWN_STREAMS_PER_CONNECTION` (52 by default); a lower value stops startup. |
+| `MOUSSE_NET_MAX_PEER_STREAMS` | 1024 | 1 to 1024 | Streams the peer may have open; more are refused (wire.md 9.2). Checked before the I/O layer's places, so on each connection it is raised, where lower, to every place that connection's stream admission gives: `STREAMS_PER_CONNECTION` + `BOT_STREAMS_PER_CONNECTION` + `OWN_STREAMS_PER_CONNECTION` (52 by default). That sum may not pass 1024; a larger one stops startup. |
 | `MOUSSE_NET_SEND_CHUNK_BYTES` | 16384 | 1024 to 16384 | Largest `DATA` payload sent (wire.md 9.4). |
 | `MOUSSE_NET_CREDIT_RETURN_BYTES` | 65536 | 1024 to 65536 | Consumed bytes that trigger a `CREDIT` (wire.md 9.3). |
 | `MOUSSE_NET_CLOCK_SKEW_SECS` | 600 | 0 to 600 | Clock difference allowed on peer-signed times: certificates, session deadlines, ticket expiry (wire.md 1). |
