@@ -62,6 +62,14 @@ pub fn bin() -> &'static Path {
     })
 }
 
+/// Keep `cmd`'s helper listening on loopback only, also with LAN on or an
+/// address of this computer chosen: the debug-build test hook
+/// `MOUSSE_HELPER_TEST_LOOPBACK`. Nothing a test starts listens beyond this
+/// computer, so no firewall asks about it.
+pub fn loopback_only(cmd: &mut Command) -> &mut Command {
+    cmd.env("MOUSSE_HELPER_TEST_LOOPBACK", "1")
+}
+
 pub fn temp_dir(tag: &str) -> PathBuf {
     let n = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -95,8 +103,10 @@ impl Endpoint {
     }
 
     /// The helper with this state directory; stdin closed, output piped.
+    /// It listens on loopback only, whatever it is told (see [`loopback_only`]).
     pub fn command(&self, args: &[&str]) -> Command {
         let mut cmd = Command::new(bin());
+        loopback_only(&mut cmd);
         cmd.arg("--state")
             .arg(&self.dir)
             .arg("--insecure-file-key")

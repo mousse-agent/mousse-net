@@ -65,6 +65,28 @@ fn break_mode() -> Option<String> {
     std::env::var("MOUSSE_HELPER_BREAK").ok()
 }
 
+/// The address the socket serving `ip` binds: `ip`. Test hook, debug
+/// builds only: with `MOUSSE_HELPER_TEST_LOOPBACK=1` nothing listens
+/// beyond this computer. Every interface (`0.0.0.0`, `::`) binds loopback
+/// instead, and any other address that is not loopback does not bind, as
+/// if it were not there. The socket still stands for `ip`, so what is
+/// served and advertised is unchanged.
+fn socket_ip(ip: IpAddr) -> std::io::Result<IpAddr> {
+    #[cfg(debug_assertions)]
+    if std::env::var("MOUSSE_HELPER_TEST_LOOPBACK").as_deref() == Ok("1") {
+        return match ip {
+            IpAddr::V4(v4) if v4.is_unspecified() => Ok(std::net::Ipv4Addr::LOCALHOST.into()),
+            IpAddr::V6(v6) if v6.is_unspecified() => Ok(std::net::Ipv6Addr::LOCALHOST.into()),
+            ip if ip.is_loopback() => Ok(ip),
+            ip => Err(std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                format!("{ip} is not loopback, and tests listen on loopback only"),
+            )),
+        };
+    }
+    Ok(ip)
+}
+
 /// What the listener serves now, for `hello`, tickets and `routes.config`.
 #[derive(Clone, Debug, Default)]
 pub struct ListenState {
@@ -175,7 +197,11 @@ async fn reconcile(
         if sockets.contains_key(&ip) {
             continue;
         }
-        match TcpListener::bind(SocketAddr::new(ip, port)).await {
+        let opened = match socket_ip(ip) {
+            Ok(at) => TcpListener::bind(SocketAddr::new(at, port)).await,
+            Err(e) => Err(e),
+        };
+        match opened {
             Ok(listener) => {
                 print_line(format!("listening on {ip}:{port}"));
                 sockets.insert(ip, Socket::open(listener, accepted.clone()));
@@ -350,10 +376,19 @@ pub async fn run(
     let mut sockets: HashMap<IpAddr, Socket> = HashMap::new();
     let mut unbound: Vec<IpAddr> = Vec::new();
     let mut bound_port = None;
+    // The fixed port asked for on an address the test hook kept from
+    // binding (see [`socket_ip`]): the port that bind would have kept.
+    let mut refused_fixed = None;
     for ip in &plan {
-        let listener = match bound_port {
-            None => endpoint.bind(*ip, choice).await,
-            Some(port) => TcpListener::bind(SocketAddr::new(*ip, port))
+        let listener = match (socket_ip(*ip), bound_port) {
+            (Err(e), _) => {
+                if let PortChoice::Fixed(port) = choice {
+                    refused_fixed = refused_fixed.or(Some(port).filter(|p| *p != 0));
+                }
+                Err(mousse_net_io::NetError::from(e))
+            }
+            (Ok(at), None) => endpoint.bind(at, choice).await,
+            (Ok(at), Some(port)) => TcpListener::bind(SocketAddr::new(at, port))
                 .await
                 .map_err(mousse_net_io::NetError::from),
         };
@@ -372,6 +407,7 @@ pub async fn run(
         }
     }
     let port = bound_port
+        .or(refused_fixed)
         .or(endpoint.fixed_port())
         .or(endpoint.kept_port())
         .ok_or("listen: no selected address could be bound and no port is kept yet")?;
