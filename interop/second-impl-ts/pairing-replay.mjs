@@ -4,6 +4,7 @@ import { equalBytes, publicKey, sha256 } from './certificate.ts';
 import { initiate } from './cpace.ts';
 import { directCode, directCodeFromDraw, directCpaceInputs, displayDirectCode } from './direct-code.ts';
 import { DirectHost, directHello } from './direct-host.ts';
+import { DirectJoiner } from './direct-joiner.ts';
 import { PairingHost, PairingJoiner } from './pairing.ts';
 import { decodeControl, decodeFrame, decodeTicket, directMinor, encodeControl, encodeFragment, encodeFrame, errorNumber,
   hello, joinProof, readError } from './wire.ts';
@@ -807,4 +808,248 @@ export function replayBeforeMsgA(section, conventions) {
   }
   assert.equal(first.length, 2);
   assert.notEqual(first[0], first[1]);
+}
+
+// Pair with IP end to end (wire.md 10.9), direct-joiner.json: DirectJoiner
+// against DirectHost. Every write lands at once and every pin is stored at once.
+export function directJoinerStore() {
+  const records = new Map();
+  const pins = new Set();
+  return {
+    load(kind, lookup) { return records.get(`${kind}:${lookup}`); },
+    save(kind, lookup, next, previous) {
+      const key = `${kind}:${lookup}`;
+      const current = records.get(key);
+      if (current === undefined ? previous !== undefined : !previous || !equalBytes(current, previous)) return false;
+      if (next === null) records.delete(key);
+      else records.set(key, Uint8Array.from(next));
+      return true;
+    },
+    savePairing(pairing) { pins.add(hex(pairing.host)); },
+    pins,
+  };
+}
+
+export function replayDirectJoinerSequence(sequence, conventions) {
+  const now = conventions.time;
+  const draws = new Map(Object.entries(sequence.draws).map(([label, list]) => [label, new ScriptedDraws(list)]));
+  const drawsOf = label => {
+    if (!draws.has(label)) draws.set(label, new ScriptedDraws([]));
+    return draws.get(label);
+  };
+  const policy = { authorizingOwner: '51'.repeat(16), grantExpiresAt: null, role: 'owner' };
+  const hosts = new Map();
+  // `host` (identity 0x11 repeated) and fake host n (0x30 + n repeated), each holding one invitation.
+  const hostOf = label => {
+    if (!hosts.has(label)) {
+      const index = label === 'host' ? 0 : Number(/^fake([1-9][0-9]*)$/.exec(label)?.[1]);
+      assert.ok(index >= 0, `unknown host ${label}`);
+      const identity = publicKey(Buffer.alloc(32, label === 'host' ? 0x11 : 0x30 + index));
+      const host = new DirectHost({ identity, name: 'Desk' }, policy, drawsOf(label));
+      const created = host.invite(now);
+      hosts.set(label, { label, host, identity, invitation: created.invitation, code: directCode(created.code) });
+    }
+    return hosts.get(label);
+  };
+  const real = hostOf('host');
+  assert.equal(displayDirectCode(real.code.code), sequence.code);
+  const joinerIdentity = publicKey(bytes(conventions.joiner.identity_secret));
+  const store = directJoinerStore();
+  const context = { identity: joinerIdentity, name: conventions.joiner.name, store, random: drawsOf('joiner') };
+  const right = real.code;
+  const typedCode = {
+    right: sequence.code,
+    wrong: displayDirectCode(right.lookup + wrongSecret(right.code.slice(4))),
+    other_lookup: displayDirectCode(wrongLookup(right.lookup) + right.code.slice(4)),
+    typed: conventions.typed,
+  };
+  const conns = new Map();
+  let flow;
+  let lookup;
+  let lastConn;
+  let transit = [];
+
+  for (const [index, step] of sequence.steps.entries()) {
+    const name = `step ${index + 1} ${step.op}`;
+    const out = [];
+    const queue = [];
+    let crashed = false;
+    let result;
+    const control = message => hex(encodeControl(message));
+
+    // A host's effects: its messages and closes are listed and travel to the joiner.
+    function fromHost(party, effects, divert) {
+      for (const effect of effects) {
+        if ('send' in effect) {
+          const message = onWireDirect(effect.send);
+          if (effect.send.type !== 'HELLO') {
+            out.push({ send: { conn: effect.conn, control: control(effect.send), from: party.label } });
+          }
+          if (!divert?.(effect.conn, message)) queue.push({ conn: effect.conn, message });
+        } else if ('close' in effect) {
+          out.push({ close: { code: effect.close, conn: effect.conn, from: party.label } });
+          queue.push({ conn: effect.conn, close: effect.close });
+        } else if ('miss_hold' in effect) {
+          // The I/O layer closes a held connection once its hold ends.
+          const { conn } = effect.miss_hold;
+          out.push(effect);
+          out.push({ close: { code: 'invitation_invalid', conn, from: party.label } });
+          party.host.lost(conn, now);
+          queue.push({ conn, close: 'invitation_invalid' });
+        }
+      }
+    }
+
+    function breakConnection(conn) {
+      out.push({ broken: conn });
+      const { party } = conns.get(conn);
+      fromHost(party, party.host.drop(conn, now));
+    }
+
+    // The joiner's effects in order; each message reaches its host at once.
+    function fromJoiner(effects) {
+      for (const effect of effects) {
+        if (crashed) return;
+        if ('send' in effect) {
+          const entry = conns.get(effect.conn);
+          const message = onWireDirect(effect.send);
+          const msgC = message.type === 'CODE_EXCHANGE' && ++entry.exchanges === 2;
+          if (message.type === 'HELLO') {
+            fromHost(entry.party, entry.party.host.receive(effect.conn, message, now));
+            continue;
+          }
+          if (msgC && entry.lose === 'msg_c') {
+            breakConnection(effect.conn);
+            queue.push({ conn: effect.conn, broken: true });
+            continue;
+          }
+          out.push({ send: { conn: effect.conn, control: control(effect.send), from: 'joiner' } });
+          fromHost(entry.party, entry.party.host.receive(effect.conn, message, now));
+          if (msgC && entry.crash === 'after_msg_c') {
+            out.push({ crash: true });
+            breakConnection(effect.conn);
+            crashed = true;
+            flow = undefined;
+          }
+        } else if ('close' in effect) {
+          out.push({ close: { code: effect.close, conn: effect.conn, from: 'joiner' } });
+          const party = conns.get(effect.conn)?.party;
+          if (party) fromHost(party, party.host.lost(effect.conn, now, effect.close));
+        } else out.push(effect);
+      }
+    }
+
+    // What the hosts sent reaches the joiner in order.
+    function run(effects) {
+      fromJoiner(effects);
+      while (queue.length && !crashed) {
+        const item = queue.shift();
+        if (!flow) continue;
+        if (item.arrives) out.push({ arrives_after_cancel: control(item.message) });
+        if ('message' in item) fromJoiner(flow.receive(item.conn, item.message, now));
+        else if ('close' in item) fromJoiner(flow.hostClosed(item.conn, item.close));
+        else fromJoiner(flow.broken(item.conn));
+      }
+    }
+
+    // `lose` paired breaks the connection instead; `in_transit` holds the host's messages until the next cancel.
+    const hostAnswer = (conn, message) => {
+      if (step.lose === 'paired' && message.type === 'PAIRED') {
+        breakConnection(conn);
+        queue.push({ conn, broken: true });
+        return true;
+      }
+      if (step.in_transit) {
+        transit.push({ conn, message });
+        return true;
+      }
+      return false;
+    };
+
+    switch (step.op) {
+      case 'start': {
+        assert.ok(step.code in typedCode, `unknown code ${step.code}`);
+        const started = DirectJoiner.start(context, { address: conventions.address, code: typedCode[step.code] }, now);
+        result = started.result;
+        if (started.flow) {
+          flow = started.flow;
+          lookup = flow.lookup;
+        }
+        break;
+      }
+      case 'resume': {
+        const started = DirectJoiner.resume(context, right.lookup);
+        result = started.result;
+        if (started.flow) {
+          flow = started.flow;
+          lookup = flow.lookup;
+        }
+        break;
+      }
+      case 'connect': {
+        assert.ok(!conns.has(step.conn), `connection ${step.conn} reused`);
+        assert.ok(step.lose === undefined || step.lose === 'msg_c');
+        assert.ok(step.crash === undefined || step.crash === 'after_msg_c');
+        const party = step.host === 'own' ? undefined : hostOf(step.host);
+        conns.set(step.conn, { party, lose: step.lose, crash: step.crash, exchanges: 0 });
+        lastConn = step.conn;
+        const exporters = { pair: Buffer.alloc(32, step.conn + 100) };
+        const effects = flow.connect(step.conn, party ? party.identity : joinerIdentity, exporters);
+        if (party && effects.every(effect => !('close' in effect))) {
+          // Step 2, then the host's HELLO, which agrees on min(minor, 4).
+          fromHost(party, party.host.connect(step.conn, joinerIdentity, exporters, now), (conn, message) => {
+            if (message.type !== 'HELLO' || step.minor === undefined) return false;
+            queue.push({ conn, message: { ...message, minor: Math.min(step.minor, directMinor) } });
+            return true;
+          });
+        }
+        run(effects);
+        break;
+      }
+      case 'allow':
+      case 'decline': {
+        const answer = real.host[step.op](real.invitation, joinerIdentity, now);
+        assert.equal(answer.result, 'ok', `${name} result`);
+        fromHost(real, answer.effects, hostAnswer);
+        run([]);
+        break;
+      }
+      case 'drop':
+        breakConnection(lastConn);
+        queue.push({ conn: lastConn, broken: true });
+        run([]);
+        break;
+      case 'cancel':
+        fromJoiner(flow.cancel());
+        queue.unshift(...transit.map(item => ({ ...item, arrives: true })));
+        transit = [];
+        run([]);
+        break;
+      default:
+        assert.fail(`unknown operation ${step.op}`);
+    }
+    assert.deepEqual(out, step.out, `${name} out`);
+    const stored = kind => {
+      const data = lookup === undefined ? undefined : store.load(kind, lookup);
+      return data === undefined ? null : decode(data);
+    };
+    const ledger = stored('ledger');
+    const pending = stored('pending');
+    const grant = real.host.grants.get(hex(joinerIdentity));
+    const actual = {
+      state: flow?.state,
+      ledger: ledger === null ? null : Number(ledger.get(3n)),
+      pending: pending === null ? null : pending.get(7n) === 1n ? 'cancelled' : 'pending',
+      pinned: store.pins.size > 0,
+      granted: grant?.enrolled_by === hex(real.invitation),
+      result,
+    };
+    for (const key of Object.keys(actual)) {
+      if (key in step) assert.deepEqual(actual[key], step[key], `${name} ${key}`);
+    }
+  }
+  for (const [label, script] of draws) {
+    if (label !== 'host' && !hosts.has(label) && label !== 'joiner') assert.fail(`unused host ${label}`);
+    script.done();
+  }
 }

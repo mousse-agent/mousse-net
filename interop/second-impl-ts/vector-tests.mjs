@@ -11,7 +11,7 @@ import { PairingJoiner, trafficOf } from './pairing.ts';
 import { Gate, step2, Streams } from './session.ts';
 import * as relay from './relay.ts';
 import * as wire from './wire.ts';
-import { memoryFlowStore, replayAttemptSequence, replayBeforeMsgA, replayDirectSequence,
+import { memoryFlowStore, replayAttemptSequence, replayBeforeMsgA, replayDirectJoinerSequence, replayDirectSequence,
   replayEndToEnd } from './pairing-replay.mjs';
 
 const directory = new URL('../../spec/vectors/', import.meta.url);
@@ -507,6 +507,11 @@ function outcome(expected, fn) {
   const [v, add] = file('direct-host.json');
   for (const sequence of v.sequences) add(sequence.name, () => replayDirectSequence(sequence, v.conventions));
   add('before_msg_a', () => replayBeforeMsgA(v.before_msg_a, v.conventions));
+}
+
+{
+  const [v, add] = file('direct-joiner.json');
+  for (const sequence of v.sequences) add(sequence.name, () => replayDirectJoinerSequence(sequence, v.conventions));
 }
 
 {
