@@ -400,11 +400,13 @@ impl GrantTable {
         if new.expires_at.is_some_and(|t| now >= t) {
             return Err(GrantError::Expired);
         }
+        // Detach the enrolling connection first: removing an older
+        // provisional grant must not close the connection being enrolled.
+        self.bindings.remove(&conn);
         let mut events = Vec::new();
         if let Some(old) = self.provisional_by_identity.get(&new.identity).copied() {
             events.extend(self.remove(old));
         }
-        self.bindings.remove(&conn);
         let id = GrantId(self.next_id);
         self.next_id += 1;
         let grant = Grant {
@@ -683,6 +685,15 @@ impl GrantTable {
     /// The grant a channel is bound to.
     pub fn binding(&self, channel: ConnectionId) -> Option<GrantId> {
         self.bindings.get(&channel).copied()
+    }
+
+    /// The channels bound to a grant.
+    pub fn channels(&self, id: GrantId) -> Vec<ConnectionId> {
+        self.bindings
+            .iter()
+            .filter(|(_, g)| **g == id)
+            .map(|(c, _)| *c)
+            .collect()
     }
 
     /// Remove grants, provisional ones too, that expired at or before
@@ -1050,6 +1061,31 @@ mod tests {
         t.deny(id(1), NOW);
         assert!(!t.is_provisional(p));
         assert_eq!(t.binding(ConnectionId(2)), None);
+    }
+
+    /// A second provisional grant for the identity, enrolled on a
+    /// connection step 2 had bound to the first one, replaces the first
+    /// without closing that connection.
+    #[test]
+    fn a_new_provisional_grant_keeps_its_own_connection() {
+        let mut t = GrantTable::new();
+        let (first, _) = t
+            .add_provisional(direct_grant(1, None), ConnectionId(1), NOW)
+            .unwrap();
+        t.bind(ConnectionId(2), first, NOW).unwrap();
+        let (second, events) = t
+            .add_provisional(direct_grant(1, None), ConnectionId(2), NOW)
+            .unwrap();
+        assert_eq!(
+            events,
+            vec![GrantEvent::CloseChannels {
+                grant: first,
+                channels: vec![ConnectionId(1)],
+                code: ErrorCode::GrantRevoked
+            }]
+        );
+        assert_eq!(t.binding(ConnectionId(2)), Some(second));
+        assert_eq!(t.channels(second), vec![ConnectionId(2)]);
     }
 
     #[test]

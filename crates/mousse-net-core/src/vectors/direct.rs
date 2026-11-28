@@ -441,6 +441,128 @@ fn sequences() -> Vec<J> {
             ],
         }),
         json!({
+            "name": "a_commit_elsewhere_ends_the_cancel_exception",
+            "description": "The device's next connection commits the grant while the enrolled connection is still up. Every connection bound to the grant learns of the commit, so the enrolled connection's gate now ignores the late CODE_ABORT of the attempt that passed, and the grant stays.",
+            "steps": [
+                { "op": "connect", "joiner": "a", "conn": 1 },
+                { "op": "submit", "joiner": "a", "conn": 1, "code": "right" },
+                { "op": "allow", "joiner": "a", "result": "ok" },
+                { "op": "dial", "joiner": "a", "conn": 2 },
+                { "op": "stream", "conn": 2, "grants": [["a", "a", "owner", "direct"]] },
+                { "op": "cancel", "joiner": "a", "conn": 1, "goaway": "lost", "grants": [["a", "a", "owner", "direct"]] },
+            ],
+        }),
+        json!({
+            "name": "a_recovery_cancel_with_a_kept_outcome_still_retires",
+            "description": "The device cancelled once and its outcome is kept; it types the code again and its confirmation is still on its way when its recovery cancels. The host retires that connection before it answers with the kept outcome, so the confirmation opens no request.",
+            "steps": [
+                { "op": "connect", "joiner": "a", "conn": 1 },
+                { "op": "submit", "joiner": "a", "conn": 1, "code": "right" },
+                { "op": "cancel", "joiner": "a", "conn": 1, "closed": [[1, "cancelled"]] },
+                { "op": "connect", "joiner": "a", "conn": 2 },
+                { "op": "submit", "joiner": "a", "conn": 2, "code": "right", "hold": "msg_c" },
+                { "op": "recover", "joiner": "a", "conn": 3, "cancel": true, "closed": [[2, "cancelled"], [3, "cancelled"]] },
+                { "op": "deliver", "joiner": "a", "conn": 2, "requests": [] },
+            ],
+        }),
+        json!({
+            "name": "an_abort_for_another_attempt_keeps_the_request",
+            "description": "A CODE_ABORT with cancelled that names an attempt other than the one that passed on the connection ends nothing: the request stays.",
+            "steps": [
+                { "op": "connect", "joiner": "a", "conn": 1 },
+                { "op": "submit", "joiner": "a", "conn": 1, "code": "right" },
+                { "op": "abort", "joiner": "a", "conn": 1, "attempt": first, "code": "cancelled", "requests": [["a", "connected", "pending"]], "closed": [] },
+            ],
+        }),
+        json!({
+            "name": "a_held_connection_commits_nothing",
+            "description": "The device holds a provisional grant; its next connection is bound to it by step 2, then sends a lookup that finds nothing. While the host holds that connection, its stream frame is ignored and commits nothing.",
+            "steps": [
+                { "op": "connect", "joiner": "a", "conn": 1 },
+                { "op": "submit", "joiner": "a", "conn": 1, "code": "right" },
+                { "op": "allow", "joiner": "a", "result": "ok" },
+                { "op": "drop", "conn": 1 },
+                { "op": "connect", "joiner": "a", "conn": 2, "lookup": "wrong", "held": [2] },
+                { "op": "stream", "conn": 2, "grants": [["a", "a", "owner", "provisional"]] },
+            ],
+        }),
+        json!({
+            "name": "an_expired_request_does_not_keep_an_exhausted_invitation",
+            "description": "a passes at 0 and b at 100; c uses up the last attempts. At 310 a's request is past its window but the timer has not run. b's recovery cancels: no request inside its window is left, so the invitation ends as exhausted and the next lookup gets the miss hold.",
+            "steps": [
+                { "op": "connect", "joiner": "a", "conn": 1 },
+                { "op": "submit", "joiner": "a", "conn": 1, "code": "right", "host_attempts_left": 4 },
+                { "op": "connect", "joiner": "b", "conn": 2, "at": 100 },
+                { "op": "submit", "joiner": "b", "conn": 2, "code": "right", "host_attempts_left": 3 },
+                { "op": "connect", "joiner": "c", "conn": 3 },
+                { "op": "submit", "joiner": "c", "conn": 3, "code": "wrong" },
+                { "op": "connect", "joiner": "c", "conn": 4 },
+                { "op": "submit", "joiner": "c", "conn": 4, "code": "wrong" },
+                { "op": "connect", "joiner": "c", "conn": 5 },
+                { "op": "submit", "joiner": "c", "conn": 5, "code": "wrong", "host_attempts_left": 0, "host_status": "open" },
+                { "op": "recover", "joiner": "b", "conn": 6, "at": 310, "cancel": true, "closed": [[1, "attempts_exhausted"], [2, "cancelled"], [6, "cancelled"]], "host_status": "ended:attempts_exhausted" },
+                { "op": "connect", "joiner": "d", "conn": 7, "held": [7] },
+            ],
+        }),
+        json!({
+            "name": "a_claim_after_the_grant_expiry_sends_nothing",
+            "grant_expires_at": 100,
+            "description": "The invitation's grants expire at 100. Allowed while away at 50, the device recovers at 100: the grant would be born expired, so nothing is sent but the close, the invitation ends as invalid, and nothing is granted.",
+            "steps": [
+                { "op": "connect", "joiner": "a", "conn": 1 },
+                { "op": "submit", "joiner": "a", "conn": 1, "code": "right" },
+                { "op": "drop", "conn": 1 },
+                { "op": "allow", "joiner": "a", "at": 50, "result": "ok" },
+                { "op": "recover", "joiner": "a", "conn": 2, "at": 100, "closed": [[2, "invitation_invalid"]], "host_status": "ended:invitation_invalid", "grants": [] },
+            ],
+        }),
+        json!({
+            "name": "allow_after_the_grant_expiry_is_refused",
+            "grant_expires_at": 100,
+            "description": "An Allow at the grant expiry is refused and changes nothing.",
+            "steps": [
+                { "op": "connect", "joiner": "a", "conn": 1 },
+                { "op": "submit", "joiner": "a", "conn": 1, "code": "right" },
+                { "op": "allow", "joiner": "a", "at": 100, "result": "grant_expired", "requests": [["a", "connected", "pending"]], "grants": [], "host_status": "open" },
+            ],
+        }),
+        json!({
+            "name": "a_commit_after_the_grant_expiry_fails",
+            "grant_expires_at": 100,
+            "description": "Allowed at 50, the device opens its first stream at 100: the commit fails, the provisional grant is removed and the connection closes with grant_revoked.",
+            "steps": [
+                { "op": "connect", "joiner": "a", "conn": 1 },
+                { "op": "submit", "joiner": "a", "conn": 1, "code": "right" },
+                { "op": "allow", "joiner": "a", "at": 50, "result": "ok" },
+                { "op": "stream", "conn": 1, "at": 100, "closed": [[1, "grant_revoked"]], "grants": [] },
+            ],
+        }),
+        json!({
+            "name": "a_provisional_grant_expires",
+            "grant_expires_at": 100,
+            "description": "Allowed at 50, the device opens no stream; at 100 the timer removes the provisional grant and closes its connection with grant_revoked.",
+            "steps": [
+                { "op": "connect", "joiner": "a", "conn": 1 },
+                { "op": "submit", "joiner": "a", "conn": 1, "code": "right" },
+                { "op": "allow", "joiner": "a", "at": 50, "result": "ok" },
+                { "op": "tick", "at": 100, "grants": [] },
+                { "op": "stream", "conn": 1 },
+            ],
+        }),
+        json!({
+            "name": "a_committed_grant_expires",
+            "grant_expires_at": 100,
+            "description": "The grant committed at 10; at 100 the timer removes it and closes its connection with grant_revoked, after which nothing on that connection passes the gate.",
+            "steps": [
+                { "op": "connect", "joiner": "a", "conn": 1 },
+                { "op": "submit", "joiner": "a", "conn": 1, "code": "right" },
+                { "op": "allow", "joiner": "a", "result": "ok" },
+                { "op": "stream", "conn": 1, "at": 10, "grants": [["a", "a", "owner", "direct"]] },
+                { "op": "tick", "at": 100, "grants": [] },
+                { "op": "stream", "conn": 1 },
+            ],
+        }),
+        json!({
             "name": "one_attempt_per_connection",
             "description": "A second attempt on a connection closes it with protocol_error and is not debited.",
             "steps": [
@@ -542,7 +664,7 @@ struct Replay {
 }
 
 impl Replay {
-    fn new(listed: Option<&J>) -> Self {
+    fn new(listed: Option<&J>, grant_expires_at: Option<UnixTime>) -> Self {
         let mut host_rng = match listed {
             Some(draws) => Draws::scripted(&draws["host"]),
             None => Draws::recording(8),
@@ -554,7 +676,7 @@ impl Replay {
                 DirectInvitationParams {
                     role: Role::owner(),
                     authorizing_owner: OwnerRef::from_bytes([0x51; 16]),
-                    grant_expires_at: None,
+                    grant_expires_at,
                 },
                 UnixTime(T),
                 &mut host_rng,
@@ -649,6 +771,9 @@ impl Replay {
                 }
                 DirectHostAction::Close { conn: c, code } => self.host_closes(c.0, *code),
                 DirectHostAction::MissHold { conn: c, hold_ms } => {
+                    if let Some(gate) = self.gates.get_mut(&c.0) {
+                        gate.hold();
+                    }
                     self.out
                         .push(json!({ "miss_hold": { "conn": c.0, "hold_ms": hold_ms } }));
                     self.held.push(c.0);
@@ -714,11 +839,18 @@ impl Replay {
                     conn: c,
                     grant,
                     identity,
+                    bound,
                 } => {
                     let who = self.name_of(identity);
-                    self.out.push(
-                        json!({ "committed": { "joiner": who, "conn": c.0, "grant": grant.0 } }),
-                    );
+                    let list: Vec<u64> = bound.iter().map(|b| b.0).collect();
+                    self.out.push(json!({ "committed": {
+                        "joiner": who, "conn": c.0, "grant": grant.0, "bound": list,
+                    } }));
+                    for b in bound {
+                        if let Some(gate) = self.gates.get_mut(&b.0) {
+                            gate.committed();
+                        }
+                    }
                 }
                 DirectHostAction::EnrollmentUndone {
                     grant, identity, ..
@@ -1056,6 +1188,18 @@ impl Replay {
                     self.deliver(&who, conn, &m);
                 }
             }
+            "abort" => {
+                let attempt = AttemptId(
+                    unhex(step["attempt"].as_str().expect("attempt"))
+                        .try_into()
+                        .expect("16"),
+                );
+                let code = match step["code"].as_str() {
+                    Some("cancelled") => ErrorCode::Cancelled,
+                    other => panic!("abort code {other:?}"),
+                };
+                self.deliver(&who, conn, &ControlMessage::CodeAbort { attempt, code });
+            }
             "inject" => {
                 let attempt = AttemptId(
                     unhex(step["attempt"].as_str().expect("attempt"))
@@ -1113,7 +1257,13 @@ impl Replay {
                         );
                         self.host_did(&actions, conn);
                         if !self.gone.contains(&conn) {
-                            self.gates.get_mut(&conn).expect("gate").committed();
+                            // Committed: the frame passes the gate now.
+                            let again = self
+                                .gates
+                                .get_mut(&conn)
+                                .expect("gate")
+                                .check(Traffic::Stream);
+                            assert_eq!(again, Verdict::Allow);
                         }
                     }
                     Verdict::Close(code) => self.host_closes(conn, code),
@@ -1176,7 +1326,15 @@ impl Replay {
                 self.host_did(&actions, 0);
             }
             "tick" => {
-                let actions = self.host.tick(self.now);
+                // The host's timer runs both the direct invitations and the
+                // grant table's expiry.
+                let mut actions = self.host.tick(self.now);
+                actions.extend(
+                    self.grants
+                        .tick(self.now)
+                        .into_iter()
+                        .map(DirectHostAction::Grant),
+                );
                 self.host_did(&actions, 0);
             }
             other => panic!("unknown op {other}"),
@@ -1217,7 +1375,8 @@ fn pairs(list: &J) -> Vec<(u64, String)> {
 /// `listed`, the random values come from that list.
 fn run_sequence(seq: &J, listed: Option<&J>) -> J {
     let name = seq["name"].as_str().expect("name");
-    let mut r = Replay::new(listed);
+    let expires = seq["grant_expires_at"].as_u64().map(|at| UnixTime(T + at));
+    let mut r = Replay::new(listed, expires);
     let mut steps = Vec::new();
     for (i, step) in seq["steps"].as_array().expect("steps").iter().enumerate() {
         let ctx = format!("{name} step {i}");
@@ -1323,7 +1482,10 @@ fn before_msg_a(listed: Option<&J>) -> J {
                 { "bytes": hex(&[0x0f; 32]) },
             ]),
         };
-        let mut r = Replay::new(Some(&json!({ "host": host_draws, "a": joiner_draws })));
+        let mut r = Replay::new(
+            Some(&json!({ "host": host_draws, "a": joiner_draws })),
+            None,
+        );
         r.joiner("a");
         let lookup = r.code.lookup();
         r.join_direct("a", 1, lookup, None);
@@ -1368,7 +1530,7 @@ fn before_msg_a(listed: Option<&J>) -> J {
 pub(super) fn direct_host_vectors() -> J {
     let sequences: Vec<J> = sequences().iter().map(|s| run_sequence(s, None)).collect();
     json!({
-        "description": "The host side of Pair with IP (wire.md 10.9) with the real code exchange, behind the host's gate (wire.md 8.1). Each sequence starts with one invitation created at `conventions.time`; each step runs one operation, then its expectations hold. Every message from a joiner passes the host's gate first: let through, it reaches the host machine; otherwise `out` lists the gate's verdict (`gate`: ignore) or the host's close. Ops: dial (a new connection from the joiner: step 2 runs with the gate; a provisional or live grant binds it and the host sends AUTHORIZED {live}), connect (dial unless the connection exists, then the joiner sends JOIN_DIRECT {lookup, name}; `lookup` wrong means another lookup), recover (the same with receipt I and, with `cancel`, the cancel flag), submit (the joiner runs one attempt with the right or a wrong secret: it draws an attempt id and its scalar, sends msg_a, checks msg_b; on a failed check it sends CODE_ABORT {A, pairing_failed} and closes with pairing_failed; otherwise it sends msg_c, unless `lose` is msg_c, when the connection breaks first, or `hold` is msg_c, when msg_c stays on its way), deliver (the held msg_c arrives, unless its connection has closed: then `undelivered`), inject (the joiner sends CODE_EXCHANGE with `attempt` and `payload`), cancel (the joiner sends CODE_ABORT {its last attempt, cancelled}, `lost` with `abort` lost, and closes with cancelled, or breaks the connection with `goaway` lost), drop (conn breaks with no GOAWAY), stream (the joiner opens a stream on conn: the gate's verdict, and on commit the host commits the provisional grant before the frame goes on), allow and decline (the owner answers the joiner's request, allow with `role` when given; `result` ok or the refusal), owner_cancel, tick (the host's timer), old_grant (the joiner already holds an owner grant named \"<joiner> (old)\" made by a ticket pairing whose invitation id has the bytes of I), restart (the host restarts: invitations are gone, the grant table, provisional grants included, is restored, and every connection is gone). A joiner's close is listed, and reaches the host, only when the connection is still up. A wrong lookup is `0000` (`0001` if that is the invitation's), a wrong secret `00000000` (`00000001` if that is the code's). `at` sets the time, in seconds after `conventions.time`, before the op. Expectations: `host_status` (`gone` once the host has forgotten the invitation), `host_attempts_left`, `closed` (connections the host closed during the step with a close of its own, with the code; connections a grant-table change closes are in `grant_closes` instead, listed only when there are any), `held` (JOIN_DIRECTs answered by a miss hold: the I/O layer holds the connection for hold_ms, then closes it with invitation_invalid; that close is not listed), `requests` (answerable requests: joiner, presence, decision), `grants` (every grant in the table: joiner, name, role, and provisional, direct for a committed grant a direct invitation made, or ticket), `paired` (the PAIRED messages the host sent during the step: connection, role). `out` lists in order every control message each side sent (except the two HELLOs), closes, and what the host told its I/O layer and UI: admitted (join-only gate), miss_hold, attempts_left (after each debit; the code stays the same), approval (the prompt, sent again with the same id when its presence or decision changes), approval_ended, enrolled (a provisional grant, with the grant table's id, counting from 0), bound (a recovery connection bound to a direct grant), committed, enrollment_undone, invitation_ended and grant_closes (grant-table events).",
+        "description": "The host side of Pair with IP (wire.md 10.9) with the real code exchange, behind the host's gate (wire.md 8.1). Each sequence starts with one invitation created at `conventions.time`; each step runs one operation, then its expectations hold. Every message from a joiner passes the host's gate first: let through, it reaches the host machine; otherwise `out` lists the gate's verdict (`gate`: ignore) or the host's close. Ops: dial (a new connection from the joiner: step 2 runs with the gate; a provisional or live grant binds it and the host sends AUTHORIZED {live}), connect (dial unless the connection exists, then the joiner sends JOIN_DIRECT {lookup, name}; `lookup` wrong means another lookup), recover (the same with receipt I and, with `cancel`, the cancel flag), submit (the joiner runs one attempt with the right or a wrong secret: it draws an attempt id and its scalar, sends msg_a, checks msg_b; on a failed check it sends CODE_ABORT {A, pairing_failed} and closes with pairing_failed; otherwise it sends msg_c, unless `lose` is msg_c, when the connection breaks first, or `hold` is msg_c, when msg_c stays on its way), deliver (the held msg_c arrives, unless its connection has closed: then `undelivered`), inject (the joiner sends CODE_EXCHANGE with `attempt` and `payload`), cancel (the joiner sends CODE_ABORT {its last attempt, cancelled}, `lost` with `abort` lost, and closes with cancelled, or breaks the connection with `goaway` lost), drop (conn breaks with no GOAWAY), stream (the joiner opens a stream on conn: the gate's verdict, and on commit the host commits the provisional grant before the frame goes on), allow and decline (the owner answers the joiner's request, allow with `role` when given; `result` ok or the refusal), owner_cancel, tick (the host's timer), old_grant (the joiner already holds an owner grant named \"<joiner> (old)\" made by a ticket pairing whose invitation id has the bytes of I), restart (the host restarts: invitations are gone, the grant table, provisional grants included, is restored, and every connection is gone), abort (the joiner sends CODE_ABORT with `attempt` and `code`). A sequence with `grant_expires_at` (seconds after `conventions.time`) creates its invitation with that grant expiry. tick runs the host's timer for the invitations and then the grant table's expiry. A miss hold holds the connection's gate: until the I/O layer closes it, only keepalive, HELLO and GOAWAY pass. On committed, every gate in `bound` drops its provisional state and the cancel exception; the frame that asked for the commit then passes the gate. A joiner's close is listed, and reaches the host, only when the connection is still up. A wrong lookup is `0000` (`0001` if that is the invitation's), a wrong secret `00000000` (`00000001` if that is the code's). `at` sets the time, in seconds after `conventions.time`, before the op. Expectations: `host_status` (`gone` once the host has forgotten the invitation), `host_attempts_left`, `closed` (connections the host closed during the step with a close of its own, with the code; connections a grant-table change closes are in `grant_closes` instead, listed only when there are any), `held` (JOIN_DIRECTs answered by a miss hold: the I/O layer holds the connection for hold_ms, then closes it with invitation_invalid; that close is not listed), `requests` (answerable requests: joiner, presence, decision), `grants` (every grant in the table: joiner, name, role, and provisional, direct for a committed grant a direct invitation made, or ticket), `paired` (the PAIRED messages the host sent during the step: connection, role). `out` lists in order every control message each side sent (except the two HELLOs), closes, and what the host told its I/O layer and UI: admitted (join-only gate), miss_hold, attempts_left (after each debit; the code stays the same), approval (the prompt, sent again with the same id when its presence or decision changes), approval_ended, enrolled (a provisional grant, with the grant table's id, counting from 0), bound (a recovery connection bound to a direct grant), committed, enrollment_undone, invitation_ended and grant_closes (grant-table events).",
         "conventions": {
             "time": T,
             "host": { "identity_secret": hex(&IDENTITY_A), "name": HOST_NAME },

@@ -139,9 +139,10 @@ pub enum Verdict {
     Close(ErrorCode),
     /// The first stream frame on a connection bound to a provisional grant
     /// (wire.md 8.1): have the grant committed
-    /// ([`crate::pairing::DirectHostPairing::on_first_stream`]), then call
-    /// [`ConnectionGate::committed`] and process the frame; if the commit
-    /// closed the connection, drop it. Nothing on the stream runs before.
+    /// ([`crate::pairing::DirectHostPairing::on_first_stream`]), call
+    /// [`ConnectionGate::committed`] on every connection the host lists,
+    /// then check the frame again; if the commit closed the connection,
+    /// drop it. Nothing on the stream runs before.
     Commit(GrantId),
 }
 
@@ -182,6 +183,9 @@ pub struct ConnectionGate {
     /// On the connection a direct enrollment ran on, the attempt whose
     /// `CODE_ABORT` may still cancel the provisional grant.
     cancel_attempt: Option<AttemptId>,
+    /// The host holds this connection after a lookup that found nothing
+    /// (wire.md 10.9), until it closes it.
+    held: bool,
 }
 
 impl ConnectionGate {
@@ -233,6 +237,7 @@ impl ConnectionGate {
             stream_seen: false,
             provisional,
             cancel_attempt: None,
+            held: false,
         }
     }
 
@@ -253,7 +258,7 @@ impl ConnectionGate {
 
     /// Live under a provisional grant that has not committed yet.
     pub fn is_provisional(&self) -> bool {
-        self.provisional && matches!(self.state, GateState::Live { .. })
+        self.provisional && !self.held && matches!(self.state, GateState::Live { .. })
     }
 
     /// Check an inbound control message: [`ConnectionGate::check`] for its
@@ -275,6 +280,8 @@ impl ConnectionGate {
         let verdict = match (&self.state, traffic) {
             (GateState::Closed(_), _) => Verdict::Ignore,
             (_, Keepalive | Hello | GoAway) => Verdict::Allow,
+            // Held after a miss: nothing else counts until the close.
+            _ if self.held => Verdict::Ignore,
             (_, HostOnly) => Verdict::Close(ErrorCode::ProtocolError),
             // One proof per connection (wire.md 8): `JOIN_PROOF` and
             // `JOIN_DIRECT` share it, even before the host admits either.
@@ -366,14 +373,21 @@ impl ConnectionGate {
         self.cancel_attempt = cancel_attempt.filter(|_| provisional);
     }
 
-    /// The provisional grant committed on this connection's first stream
-    /// frame ([`Verdict::Commit`]); that frame is let through.
+    /// The provisional grant this connection is bound to committed, on
+    /// this connection's first stream frame or another's
+    /// ([`crate::pairing::DirectHostAction::Committed`] lists every bound
+    /// connection): it is live as any other, and the cancel exception ends.
     pub fn committed(&mut self) {
         self.provisional = false;
         self.cancel_attempt = None;
-        if matches!(self.state, GateState::Live { .. }) {
-            self.stream_seen = true;
-        }
+    }
+
+    /// The host holds this connection after a lookup that found nothing
+    /// ([`crate::pairing::DirectHostAction::MissHold`]): until the I/O
+    /// layer closes it, only keepalive, `HELLO` and `GOAWAY` pass; nothing
+    /// else, a stream frame included, is let through or commits anything.
+    pub fn hold(&mut self) {
+        self.held = true;
     }
 
     /// The bound grant ended ([`crate::grants::GrantEvent::CloseChannels`]),
@@ -730,6 +744,12 @@ mod tests {
         enrolled.committed();
         assert_eq!(enrolled.check(Traffic::Stream), Verdict::Allow);
         assert_eq!(enrolled.check_message(&abort(7)), Verdict::Ignore);
+        // Held after a miss, a gate bound to a provisional grant lets
+        // nothing through and commits nothing.
+        let mut held = ConnectionGate::open(ConnectionId(3), id(1), &mut grants, NOW, Millis(0));
+        held.hold();
+        assert_eq!(held.check(Traffic::Stream), Verdict::Ignore);
+        assert_eq!(held.check(Traffic::Keepalive), Verdict::Allow);
 
         let mut other = ConnectionGate::open(ConnectionId(2), id(1), &mut grants, NOW, Millis(0));
         assert_eq!(other.state(), &GateState::Live { grant: p });

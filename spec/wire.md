@@ -651,12 +651,18 @@ follows the live column with two differences, until the grant commits:
   answers "commit first". The I/O layer has the host commit the grant
   (10.9, "Provisional grant") before it releases that frame or anything
   after it; when the commit fails, the connection closes with
-  `GRANT_REVOKED`. After the commit the connection is live as any other.
+  `GRANT_REVOKED`. After the commit every connection bound to that grant,
+  not only the one whose frame committed it, is live as any other.
 - **Cancel.** On the connection the host enrolled after a code exchange, a
   `CODE_ABORT` whose attempt id is the attempt that passed on that
   connection is allowed. Every other `CODE_EXCHANGE` and `CODE_ABORT` is
   ignored, as on any live connection, and so is that one once the grant
-  has committed.
+  has committed, whichever connection committed it.
+
+A connection the host holds after a lookup that found nothing (10.9,
+"Lookup") lets only `PING`, `PONG`, `HELLO` and `GOAWAY` through until the
+host closes it; everything else, a stream frame included, is ignored and
+commits nothing.
 
 ### 8.2 What the caller accepts
 
@@ -1539,7 +1545,8 @@ the role the owner picks with the answer goes to that enrollment only.
   `INVITATION_INVALID`.
 - **The joiner cancels.** Connected: `CODE_ABORT {A, CANCELLED}`, then a
   close with `CANCELLED`; the host ends the request and closes the
-  connection with `CANCELLED`. Away: the cancel comes with its recovery.
+  connection with `CANCELLED`. Only the attempt that passed on that
+  connection counts: a `CODE_ABORT` naming another attempt ends nothing. Away: the cancel comes with its recovery.
   Only a close without `CANCELLED` keeps a request.
 - **Cancel crossing Allow.** The cancel wins while the grant is
   provisional. A `CODE_ABORT {A, CANCELLED}` for the attempt that passed
@@ -1566,7 +1573,10 @@ connections bound to that grant.
 - **Before it is made,** at Allow or when a recovery claims an Allow, the
   host checks everything that can fail: the identity is not denied, and
   the grant expiry, if any, is still ahead. A failed check changes nothing
-  in the grant table. Allow is refused (`denied`, checked first, or
+  in the grant table, and a claim that fails it sends nothing before its
+  close (no `AUTHORIZED`). Making it never closes the connection it is
+  made on: that connection is detached from any grant first, even when it
+  was bound to the provisional grant this one replaces. Allow is refused (`denied`, checked first, or
   `grant_expired`); at a claim the invitation ends with
   `INVITATION_INVALID` (its requests, the allowed one too, end as
   dismissed) and the connection closes with it.
@@ -1611,12 +1621,14 @@ host answers, in this order:
    connection, or step 2 bound the identity's older grant), the host binds
    it first, and sends `AUTHORIZED {live}` first when step 2 sent none;
 2. no direct invitation `I` with this `L`: the miss hold, as for a lookup;
+   from here on, with the cancel flag the host first retires every
+   attempt and pairing connection of this identity on the invitation (they
+   close with `CANCELLED`), whatever the answer below;
 3. a kept outcome for this identity: close with `PAIRING_DECLINED` or
    `CANCELLED`;
-4. with the cancel flag: the host retires every attempt and pairing
-   connection of this identity on the invitation (they close with
-   `CANCELLED`), so a confirmation still on its way opens no request after
-   the cancel; the request, if any, ends; then the host closes with
+4. with the cancel flag (its attempts and connections retired, so a
+   confirmation still on its way opens no request after the cancel): the
+   request, if any, ends; then the host closes with
    `CANCELLED` (an invitation that no longer takes anything gets the miss
    hold instead). An allowed request that is cancelled ends the invitation;
    so does any cancel that leaves it with no attempts, no running attempt
