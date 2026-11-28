@@ -178,13 +178,30 @@ address and a 12-character code, a public 4-character lookup `L` and an
 - **Requests outlive connections, enrollment does not:** a request is keyed
   by invitation and identity and survives a dropped connection for its
   Allow window (300 s), but the grant is made only on a connection of the
-  identity that passed the code. The joiner's cancel wins over a crossing
-  Allow: a cancel on the just-enrolled connection, or by recovery, removes
-  the grant, which never carried a stream. Recovery needs a pinned
-  connection, the receipt `I` (128 random bits) and the lookup; only the
-  identity that passed the code learns that it was declined.
+  identity that passed the code.
+- **Nothing runs under a grant that can still be cancelled:** Allow makes a
+  provisional grant; the device's earlier grant, if any, stays in force
+  with its connections. The first stream frame on any connection bound to
+  the provisional grant commits it, and the gate holds that frame until the
+  commit is done; the commit checks expiry and denial before it changes
+  anything, so a failed one leaves the earlier grant. The joiner's cancel
+  wins over a crossing Allow while the grant is provisional (its
+  `CODE_ABORT` passes the live gate only for the attempt that passed on
+  that connection) and removes only the provisional grant. A recovery
+  opens no stream before the host's answer, so a joiner that cancelled
+  never commits the grant it cancels.
+- **Receipts:** recovery needs a pinned connection, the receipt `I` (128
+  random bits) and the lookup, and only a grant marked as made by a direct
+  invitation answers it: a ticket's receipt with the same bytes neither
+  answers nor is removed. A recovery's cancel first closes the identity's
+  other pairing connections, so a confirmation still on its way opens no
+  request after the cancel was answered. Only the identity that passed the
+  code learns that it was declined, and the host remembers which
+  identities passed until the invitation ends, so a forgotten outcome never
+  reads as "not received".
 - **Restart:** direct invitations live in memory only, so a restart ends
-  them; grants they made, with their receipt, stay.
+  them; grants they made, provisional or committed, with their receipt,
+  stay.
 
 ### Other people on the same computer
 

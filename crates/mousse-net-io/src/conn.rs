@@ -1550,6 +1550,10 @@ impl Driver {
                     }
                 },
                 Verdict::Ignore => {}
+                // Only Pair with IP binds a connection to a provisional
+                // grant, and io does not run it yet: nothing commits here,
+                // so the frame is refused.
+                Verdict::Commit(_) => self.close(ErrorCode::GrantRevoked),
                 Verdict::Close(code) => self.close(code),
             }
             inbuf.drain(..used);

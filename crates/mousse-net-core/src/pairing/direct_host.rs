@@ -9,9 +9,11 @@
 //! connection: a device that passed the code keeps its request when its
 //! connection drops, and the owner can still allow it until the request's
 //! Allow window ends. Enrollment always happens on a connection of that
-//! identity. The joiner's cancel wins over a crossing Allow.
+//! identity, and makes a provisional grant that commits on the first stream
+//! frame under it; until then the joiner's cancel wins over a crossing
+//! Allow, and removes only that provisional grant.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use rand_core::CryptoRng;
@@ -20,8 +22,8 @@ use super::direct_code::{DirectCode, DirectLookup};
 use super::exchange::{CodeExchange, CodeExchangeFactory, ExchangeRole};
 use super::proof::{attempt_sid, direct_binding_transcript, EXPORTER_LEN};
 use super::{AttemptId, InvitationId};
-use crate::control::{ControlMessage, DirectRecovery};
-use crate::grants::{GrantError, GrantEvent, GrantId, GrantTable, NewGrant, OwnerRef, Role};
+use crate::control::{AuthorizedState, ControlMessage, DirectRecovery};
+use crate::grants::{Grant, GrantError, GrantEvent, GrantId, GrantTable, NewGrant, OwnerRef, Role};
 use crate::identity::IdentityPublicKey;
 use crate::limits::Limits;
 use crate::time::UnixTime;
@@ -65,7 +67,8 @@ pub enum DirectInvitationStatus {
         /// The allowed device.
         identity: IdentityPublicKey,
     },
-    /// One device was enrolled; the invitation is spent.
+    /// One device was enrolled; the invitation is spent. Its grant may
+    /// still be provisional ([`GrantTable::is_provisional`]).
     Consumed {
         /// The grant it created.
         grant: GrantId,
@@ -188,22 +191,49 @@ pub enum DirectHostAction {
         /// Why.
         reason: ApprovalEnd,
     },
-    /// A device was enrolled. Its connection is bound to `grant`; set its
-    /// gate to live.
+    /// A device was enrolled: `grant` is a provisional grant and its
+    /// connection is bound to it. Set its gate live with
+    /// [`crate::authz::ConnectionGate::bind_direct`]`(grant, true,
+    /// attempt)`.
     Enrolled {
         /// Invitation.
         invitation: InvitationId,
         /// Connection.
         conn: ConnectionId,
-        /// New grant.
+        /// The new provisional grant.
         grant: GrantId,
         /// The device.
         identity: IdentityPublicKey,
         /// The new grant's role, as `PAIRED` carries it.
         role: Role,
+        /// The attempt that passed on this connection; `None` on a recovery
+        /// connection, which ran none.
+        attempt: Option<AttemptId>,
     },
-    /// The device cancelled across the Allow: the grant this invitation
-    /// made for it was removed. It never carried a stream.
+    /// A recovery connection is now bound to the direct grant it asked
+    /// about. Set its gate live with
+    /// [`crate::authz::ConnectionGate::bind_direct`]`(grant, provisional,
+    /// None)`.
+    Bound {
+        /// Connection.
+        conn: ConnectionId,
+        /// The grant.
+        grant: GrantId,
+        /// The grant has not committed yet.
+        provisional: bool,
+    },
+    /// A provisional grant committed on the first stream frame of `conn`:
+    /// it is the device's grant now. Release the frame.
+    Committed {
+        /// The connection whose stream committed it.
+        conn: ConnectionId,
+        /// The grant.
+        grant: GrantId,
+        /// The device.
+        identity: IdentityPublicKey,
+    },
+    /// The device cancelled across the Allow: the provisional grant this
+    /// invitation made for it was removed. Its earlier grant, if any, stays.
     EnrollmentUndone {
         /// Invitation.
         invitation: InvitationId,
@@ -219,8 +249,9 @@ pub enum DirectHostAction {
         /// Why.
         reason: ErrorCode,
     },
-    /// A grant-table event (enrolling replaced an older grant, or a
-    /// cancel removed one).
+    /// A grant-table event: a commit replaced an older grant, a cancel or a
+    /// failed commit removed a provisional one, or a new provisional grant
+    /// replaced an older one.
     Grant(GrantEvent),
 }
 
@@ -235,6 +266,11 @@ pub enum DirectHostError {
     NotOpen,
     /// No such request, or its Allow window has ended.
     UnknownRequest,
+    /// The invitation's grant expiry is not ahead: the grant would be born
+    /// expired. Nothing changed.
+    GrantExpired,
+    /// The device is denied on this endpoint. Nothing changed.
+    Denied,
 }
 
 impl fmt::Display for DirectHostError {
@@ -244,6 +280,8 @@ impl fmt::Display for DirectHostError {
             DirectHostError::UnknownInvitation => "no such invitation",
             DirectHostError::NotOpen => "invitation is not open",
             DirectHostError::UnknownRequest => "no such approval request",
+            DirectHostError::GrantExpired => "the grant would already be expired",
+            DirectHostError::Denied => "the device is denied here",
         })
     }
 }
@@ -299,6 +337,10 @@ struct DirectInvitation<E> {
     attempts: BTreeMap<(ConnectionId, AttemptId), DirectAttempt<E>>,
     requests: BTreeMap<IdentityPublicKey, Request>,
     outcomes: BTreeMap<IdentityPublicKey, Outcome>,
+    /// Every identity that passed the code, until the invitation is
+    /// forgotten: a recovery of one whose outcome is gone is a miss, never
+    /// `not_received`.
+    passed: BTreeSet<IdentityPublicKey>,
 }
 
 impl<E> DirectInvitation<E> {
@@ -315,6 +357,15 @@ impl<E> DirectInvitation<E> {
     }
 }
 
+/// A connection this machine enrolled on.
+#[derive(Clone, Copy)]
+struct EnrolledConn {
+    invitation: InvitationId,
+    grant: GrantId,
+    /// The attempt that passed there (`None` on a recovery connection).
+    attempt: Option<AttemptId>,
+}
+
 /// The host side of Pair with IP.
 pub struct DirectHostPairing<F: CodeExchangeFactory> {
     host_identity: IdentityPublicKey,
@@ -322,9 +373,9 @@ pub struct DirectHostPairing<F: CodeExchangeFactory> {
     factory: F,
     invitations: BTreeMap<InvitationId, DirectInvitation<F::Exchange>>,
     by_conn: BTreeMap<ConnectionId, InvitationId>,
-    /// Connections a direct pairing enrolled that have carried no stream
-    /// yet. A `CANCELLED` from the joiner there undoes the enrollment.
-    fresh: BTreeMap<ConnectionId, (InvitationId, GrantId)>,
+    /// Connections this machine enrolled on. While their grant is
+    /// provisional, the joiner's cancel there removes it.
+    enrolled: BTreeMap<ConnectionId, EnrolledConn>,
     lifetime_secs: u64,
     attempts_per_invitation: u8,
     allow_window_secs: u64,
@@ -351,7 +402,7 @@ impl<F: CodeExchangeFactory> DirectHostPairing<F> {
             factory,
             invitations: BTreeMap::new(),
             by_conn: BTreeMap::new(),
-            fresh: BTreeMap::new(),
+            enrolled: BTreeMap::new(),
             lifetime_secs: limits.direct_invite_lifetime_secs(),
             attempts_per_invitation: u8::try_from(limits.direct_host_attempts()).unwrap_or(u8::MAX),
             allow_window_secs: limits.direct_allow_window_secs(),
@@ -403,6 +454,7 @@ impl<F: CodeExchangeFactory> DirectHostPairing<F> {
                 attempts: BTreeMap::new(),
                 requests: BTreeMap::new(),
                 outcomes: BTreeMap::new(),
+                passed: BTreeSet::new(),
             },
         );
         Ok(CreatedDirectInvitation {
@@ -477,7 +529,7 @@ impl<F: CodeExchangeFactory> DirectHostPairing<F> {
         now: UnixTime,
     ) -> Vec<DirectHostAction> {
         let close = |code| vec![DirectHostAction::Close { conn, code }];
-        if self.by_conn.contains_key(&conn) || self.fresh.contains_key(&conn) {
+        if self.by_conn.contains_key(&conn) || self.enrolled.contains_key(&conn) {
             return close(ErrorCode::ProtocolError);
         }
         // A device never pairs with itself, and a denied one never pairs.
@@ -520,39 +572,40 @@ impl<F: CodeExchangeFactory> DirectHostPairing<F> {
         now: UnixTime,
     ) -> Vec<DirectHostAction> {
         let id = recovery.receipt;
-        // A grant this invitation made for this identity: it was enrolled
-        // (also before a host restart). Step 2 already said `AUTHORIZED
-        // {live}` and bound the connection.
-        if let Some(grant) = grants
-            .live_grant(joiner, now)
-            .filter(|g| g.enrolled_by == Some(id))
-            .cloned()
-        {
-            if recovery.cancel {
-                let mut actions = self.undo(id, grant.id, conn, grants);
+        let close = |code| vec![DirectHostAction::Close { conn, code }];
+        // A grant the direct invitation `I` made for this identity,
+        // provisional or committed (also after a restart). A ticket's
+        // receipt never matches.
+        let made_here = |g: &&Grant| g.direct && g.enrolled_by == Some(id);
+        let found = grants
+            .provisional_grant(joiner, now)
+            .filter(made_here)
+            .map(|g| (g.id, g.role.clone(), true))
+            .or_else(|| {
+                grants
+                    .live_grant(joiner, now)
+                    .filter(made_here)
+                    .map(|g| (g.id, g.role.clone(), false))
+            });
+        if let Some((grant, role, provisional)) = found {
+            // A committed grant is never cancelled: the cancel came too
+            // late, and the answer is the one without it.
+            if recovery.cancel && provisional {
+                let mut actions = self.undo(id, grant, conn, grants);
                 actions.push(DirectHostAction::Close {
                     conn,
                     code: ErrorCode::Cancelled,
                 });
                 return actions;
             }
-            return vec![DirectHostAction::Send {
-                conn,
-                message: ControlMessage::Paired {
-                    host_name: self.host_name.clone(),
-                    role: grant.role,
-                },
-            }];
+            return self.answer_by_receipt(conn, grant, role, provisional, grants, now);
         }
         let window = self.allow_window_secs;
         let Some(inv) = self.invitations.get(&id).filter(|i| i.lookup == *lookup) else {
             return self.miss(conn);
         };
         if let Some(outcome) = inv.outcomes.get(joiner).filter(|o| now < o.until) {
-            return vec![DirectHostAction::Close {
-                conn,
-                code: outcome.code,
-            }];
+            return close(outcome.code);
         }
         // (allowed role, connection) of this identity's live request.
         let request = inv
@@ -562,23 +615,24 @@ impl<F: CodeExchangeFactory> DirectHostPairing<F> {
             .map(|r| (r.allowed_role.clone(), r.conn));
         let live = inv.is_live();
         let takes_attempts = inv.takes_attempts(now);
+        let passed_before = inv.passed.contains(joiner);
         if recovery.cancel {
-            if request.is_some() {
-                let mut actions = self.drop_request(&id, joiner, ApprovalEnd::Cancelled);
-                actions.push(DirectHostAction::Close {
-                    conn,
-                    code: ErrorCode::Cancelled,
-                });
-                return actions;
+            if !live {
+                return self.miss(conn);
             }
-            return if live {
-                vec![DirectHostAction::Close {
-                    conn,
-                    code: ErrorCode::Cancelled,
-                }]
-            } else {
-                self.miss(conn)
-            };
+            // Every attempt and connection of this identity goes first, so
+            // a confirmation still on its way opens no request after the
+            // cancel was answered.
+            let mut actions = self.retire(&id, joiner);
+            if request.is_some() {
+                actions.extend(self.drop_request(&id, joiner, ApprovalEnd::Cancelled));
+            }
+            actions.push(DirectHostAction::Close {
+                conn,
+                code: ErrorCode::Cancelled,
+            });
+            actions.extend(self.end_if_exhausted(&id, now));
+            return actions;
         }
         match request {
             Some((Some(role), _)) => {
@@ -592,7 +646,7 @@ impl<F: CodeExchangeFactory> DirectHostPairing<F> {
                 // prompt) now points at this connection.
                 let mut actions = Vec::new();
                 if let Some(old) = old {
-                    actions.extend(self.forget_conn(&id, old));
+                    self.forget_conn(&id, old);
                     actions.push(DirectHostAction::Close {
                         conn: old,
                         code: ErrorCode::PathReplaced,
@@ -609,12 +663,60 @@ impl<F: CodeExchangeFactory> DirectHostPairing<F> {
                 actions.extend(self.approval_action(&id, joiner));
                 actions
             }
-            None if takes_attempts => {
-                // The host never had this identity's confirmation.
+            // The host never had this identity's confirmation.
+            None if takes_attempts && !passed_before => {
                 self.admit(conn, id, joiner, name, pair_exporter, true)
             }
             None => self.miss(conn),
         }
+    }
+
+    /// Answer a recovery by its receipt: `PAIRED` with the grant's role,
+    /// after binding the connection to that grant when step 2 did not (and
+    /// `AUTHORIZED {live}` first when step 2 sent none).
+    fn answer_by_receipt(
+        &mut self,
+        conn: ConnectionId,
+        grant: GrantId,
+        role: Role,
+        provisional: bool,
+        grants: &mut GrantTable,
+        now: UnixTime,
+    ) -> Vec<DirectHostAction> {
+        let mut actions = Vec::new();
+        let bound = grants.binding(conn);
+        if bound != Some(grant) {
+            grants.unbind(conn);
+            if grants.bind(conn, grant, now).is_err() {
+                return vec![DirectHostAction::Close {
+                    conn,
+                    code: ErrorCode::InternalError,
+                }];
+            }
+            actions.push(DirectHostAction::Bound {
+                conn,
+                grant,
+                provisional,
+            });
+            if bound.is_none() {
+                // A pinned caller needs an `AUTHORIZED` before `PAIRED`
+                // (wire.md 8.2), and step 2 sent none.
+                actions.push(DirectHostAction::Send {
+                    conn,
+                    message: ControlMessage::Authorized {
+                        state: AuthorizedState::Live,
+                    },
+                });
+            }
+        }
+        actions.push(DirectHostAction::Send {
+            conn,
+            message: ControlMessage::Paired {
+                host_name: self.host_name.clone(),
+                role,
+            },
+        });
+        actions
     }
 
     /// A `CODE_EXCHANGE` arrived on a connection this machine admitted.
@@ -642,12 +744,8 @@ impl<F: CodeExchangeFactory> DirectHostPairing<F> {
                 a.state = AttemptState::Failed;
                 a.exchange = None;
             }
-            let mut actions = self.forget_conn(&id, conn);
-            actions.push(DirectHostAction::Close {
-                conn,
-                code: ErrorCode::InvitationInvalid,
-            });
-            return actions;
+            self.forget_conn(&id, conn);
+            return close(ErrorCode::InvitationInvalid);
         }
         let mut actions = Vec::new();
         if let Some(existing) = inv.attempts.get(&key) {
@@ -666,20 +764,12 @@ impl<F: CodeExchangeFactory> DirectHostPairing<F> {
             };
             // One attempt per connection: the next try is a new Connect.
             if joiner.attempt.is_some() {
-                let mut actions = self.forget_conn(&id, conn);
-                actions.push(DirectHostAction::Close {
-                    conn,
-                    code: ErrorCode::ProtocolError,
-                });
-                return actions;
+                self.forget_conn(&id, conn);
+                return close(ErrorCode::ProtocolError);
             }
             if inv.attempts_left == 0 {
-                let mut actions = self.forget_conn(&id, conn);
-                actions.push(DirectHostAction::Close {
-                    conn,
-                    code: ErrorCode::AttemptsExhausted,
-                });
-                return actions;
+                self.forget_conn(&id, conn);
+                return close(ErrorCode::AttemptsExhausted);
             }
             // Debit first. Nothing below runs on an undebited attempt.
             // Must-fail control: the attempt is not debited.
@@ -753,8 +843,11 @@ impl<F: CodeExchangeFactory> DirectHostPairing<F> {
 
     /// A `CODE_ABORT` arrived. It ends a running attempt (its debit stays).
     /// With `CANCELLED` from a device waiting for Allow on this connection,
-    /// its request goes; on a connection this machine just enrolled, the
-    /// grant goes too and the connection closes with `CANCELLED`.
+    /// its request goes. On a connection this machine enrolled, only the
+    /// joiner's `CANCELLED` for the attempt that passed there counts (the
+    /// gate lets that one through, wire.md 8.1): it removes the provisional
+    /// grant, and the connection closes with `CANCELLED`. Once the grant
+    /// committed it is ignored.
     pub fn on_code_abort(
         &mut self,
         conn: ConnectionId,
@@ -763,12 +856,15 @@ impl<F: CodeExchangeFactory> DirectHostPairing<F> {
         grants: &mut GrantTable,
         now: UnixTime,
     ) -> Vec<DirectHostAction> {
-        if let Some(&(id, grant)) = self.fresh.get(&conn) {
-            if code != ErrorCode::Cancelled {
+        if let Some(enrolled) = self.enrolled.get(&conn).copied() {
+            if code != ErrorCode::Cancelled
+                || enrolled.attempt != Some(attempt)
+                || !grants.is_provisional(enrolled.grant)
+            {
                 return Vec::new();
             }
-            self.fresh.remove(&conn);
-            let mut actions = self.undo(id, grant, conn, grants);
+            self.enrolled.remove(&conn);
+            let mut actions = self.undo(enrolled.invitation, enrolled.grant, conn, grants);
             actions.push(DirectHostAction::Close {
                 conn,
                 code: ErrorCode::Cancelled,
@@ -799,8 +895,8 @@ impl<F: CodeExchangeFactory> DirectHostPairing<F> {
     /// A connection closed, with the code of the peer's `GOAWAY` if it sent
     /// one. Its running attempt counts as failed. A device waiting for Allow
     /// keeps its request (now away) unless it closed with `CANCELLED`; on a
-    /// connection this machine just enrolled, `CANCELLED` removes the
-    /// grant.
+    /// connection this machine enrolled, `CANCELLED` removes the grant while
+    /// it is provisional.
     pub fn on_connection_closed(
         &mut self,
         conn: ConnectionId,
@@ -808,9 +904,9 @@ impl<F: CodeExchangeFactory> DirectHostPairing<F> {
         grants: &mut GrantTable,
         now: UnixTime,
     ) -> Vec<DirectHostAction> {
-        if let Some((id, grant)) = self.fresh.remove(&conn) {
-            return if code == Some(ErrorCode::Cancelled) {
-                self.undo(id, grant, conn, grants)
+        if let Some(enrolled) = self.enrolled.remove(&conn) {
+            return if code == Some(ErrorCode::Cancelled) && grants.is_provisional(enrolled.grant) {
+                self.undo(enrolled.invitation, enrolled.grant, conn, grants)
             } else {
                 Vec::new()
             };
@@ -822,7 +918,8 @@ impl<F: CodeExchangeFactory> DirectHostPairing<F> {
             .invitations
             .get(&id)
             .and_then(|inv| waiting_on(inv, conn));
-        let mut actions = self.forget_conn(&id, conn);
+        self.forget_conn(&id, conn);
+        let mut actions = Vec::new();
         if let Some(identity) = waiting {
             if code == Some(ErrorCode::Cancelled) {
                 actions.extend(self.drop_request(&id, &identity, ApprovalEnd::Cancelled));
@@ -841,10 +938,52 @@ impl<F: CodeExchangeFactory> DirectHostPairing<F> {
         actions
     }
 
-    /// The connection carried its first stream frame: from now on a close
-    /// with `CANCELLED` there is an ordinary close, not a cancelled pairing.
-    pub fn on_stream_opened(&mut self, conn: ConnectionId) {
-        self.fresh.remove(&conn);
+    /// The gate held the first stream frame of `conn`, bound to the
+    /// provisional `grant` ([`crate::authz::Verdict::Commit`]): commit it
+    /// (wire.md 10.9) before the frame is released. On success the device
+    /// holds `grant` now, its older grant's connections close, and the
+    /// frame goes on ([`crate::authz::ConnectionGate::committed`]). When
+    /// the commit fails (the grant expired, or the device was denied), the
+    /// provisional grant is removed, `conn` closes with `GRANT_REVOKED`, and
+    /// the older grant and its connections stay. A grant that already
+    /// committed has nothing more to do.
+    pub fn on_first_stream(
+        &mut self,
+        conn: ConnectionId,
+        grant: GrantId,
+        grants: &mut GrantTable,
+        now: UnixTime,
+    ) -> Vec<DirectHostAction> {
+        let identity = grants.provisional(grant).map(|g| g.identity);
+        match grants.commit(grant, now) {
+            Ok(events) => {
+                self.enrolled.retain(|_, e| e.grant != grant);
+                let mut actions: Vec<DirectHostAction> =
+                    events.into_iter().map(DirectHostAction::Grant).collect();
+                if let Some(identity) = identity {
+                    actions.push(DirectHostAction::Committed {
+                        conn,
+                        grant,
+                        identity,
+                    });
+                }
+                actions
+            }
+            Err(_) => {
+                self.enrolled.retain(|_, e| e.grant != grant);
+                grants.unbind(conn);
+                let mut actions: Vec<DirectHostAction> = grants
+                    .remove(grant)
+                    .into_iter()
+                    .map(DirectHostAction::Grant)
+                    .collect();
+                actions.push(DirectHostAction::Close {
+                    conn,
+                    code: ErrorCode::GrantRevoked,
+                });
+                actions
+            }
+        }
     }
 
     /// The owner allowed `request`, with the role chosen with the answer
@@ -872,6 +1011,13 @@ impl<F: CodeExchangeFactory> DirectHostPairing<F> {
             .get_mut(&request.identity)
             .filter(|r| now < r.passed_at.plus(window))
             .ok_or(DirectHostError::UnknownRequest)?;
+        // What can fail is checked before anything changes.
+        if grants.is_denied(&request.identity) {
+            return Err(DirectHostError::Denied);
+        }
+        if inv.params.grant_expires_at.is_some_and(|t| now >= t) {
+            return Err(DirectHostError::GrantExpired);
+        }
         let role = role.unwrap_or_else(|| inv.params.role.clone());
         if let Some(conn) = r.conn {
             return Ok(self.enroll(&id, conn, role, grants, now));
@@ -972,7 +1118,7 @@ impl<F: CodeExchangeFactory> DirectHostPairing<F> {
                         .map(|(c, _)| *c)
                         .collect();
                     for conn in idle {
-                        actions.extend(self.forget_conn(&id, conn));
+                        self.forget_conn(&id, conn);
                         actions.push(DirectHostAction::Close {
                             conn,
                             code: ErrorCode::InvitationInvalid,
@@ -1068,6 +1214,7 @@ impl<F: CodeExchangeFactory> DirectHostPairing<F> {
         };
         let identity = joiner.identity;
         let name = joiner.name.clone();
+        inv.passed.insert(identity);
         let mut actions = Vec::new();
         match inv
             .requests
@@ -1077,7 +1224,7 @@ impl<F: CodeExchangeFactory> DirectHostPairing<F> {
             Some(r) => {
                 // One request per identity: same id, no second prompt.
                 if let Some(old) = r.conn.replace(conn).filter(|old| *old != conn) {
-                    actions.extend(self.forget_conn(id, old));
+                    self.forget_conn(id, old);
                     actions.push(DirectHostAction::Close {
                         conn: old,
                         code: ErrorCode::PathReplaced,
@@ -1151,9 +1298,35 @@ impl<F: CodeExchangeFactory> DirectHostPairing<F> {
             .then(|| DirectHostAction::Approval(self.approval(id, inv, identity)))
     }
 
+    /// Every pairing connection of `identity` on the invitation closes with
+    /// `CANCELLED`, and its running attempt fails.
+    fn retire(&mut self, id: &InvitationId, identity: &IdentityPublicKey) -> Vec<DirectHostAction> {
+        let conns: Vec<ConnectionId> = self
+            .invitations
+            .get(id)
+            .map(|inv| {
+                inv.joiners
+                    .iter()
+                    .filter(|(_, j)| j.identity == *identity)
+                    .map(|(c, _)| *c)
+                    .collect()
+            })
+            .unwrap_or_default();
+        conns
+            .into_iter()
+            .map(|conn| {
+                self.forget_conn(id, conn);
+                DirectHostAction::Close {
+                    conn,
+                    code: ErrorCode::Cancelled,
+                }
+            })
+            .collect()
+    }
+
     /// Forget `conn` as a pairing connection: its running attempt fails.
-    /// Returns no close; the caller decides.
-    fn forget_conn(&mut self, id: &InvitationId, conn: ConnectionId) -> Vec<DirectHostAction> {
+    /// The caller closes it.
+    fn forget_conn(&mut self, id: &InvitationId, conn: ConnectionId) {
         self.by_conn.remove(&conn);
         if let Some(inv) = self.invitations.get_mut(id) {
             inv.joiners.remove(&conn);
@@ -1169,7 +1342,6 @@ impl<F: CodeExchangeFactory> DirectHostPairing<F> {
                 }
             }
         }
-        Vec::new()
     }
 
     /// End `identity`'s request. A declined or cancelled one keeps its
@@ -1352,9 +1524,13 @@ impl<F: CodeExchangeFactory> DirectHostPairing<F> {
         }
     }
 
-    /// Enrollment (wire.md 10.8) with receipt `I`, on `conn`, a connection
-    /// of the requesting identity: grant, bind, mark consumed, end every
-    /// other request and pairing connection, send `PAIRED`.
+    /// Enrollment (wire.md 10.8, 10.9) with receipt `I`, on `conn`, a
+    /// connection of the requesting identity: a provisional grant bound to
+    /// `conn`, the invitation consumed, `PAIRED`, then every other request
+    /// and pairing connection ends. The identity's older grant stays until
+    /// the new one commits. When the grant cannot be made (it would be born
+    /// expired, or the device is denied) nothing in the table changes; the
+    /// connection closes, and the invitation ends as invalid.
     fn enroll(
         &mut self,
         id: &InvitationId,
@@ -1366,15 +1542,13 @@ impl<F: CodeExchangeFactory> DirectHostPairing<F> {
         let Some(inv) = self.invitations.get_mut(id) else {
             return Vec::new();
         };
-        let Some(identity) = inv.joiners.get(&conn).map(|j| j.identity) else {
+        let Some((identity, attempt)) = inv.joiners.get(&conn).map(|j| (j.identity, j.attempt))
+        else {
             return Vec::new();
         };
         let Some(request) = inv.requests.get(&identity) else {
             return Vec::new();
         };
-        // A pairing on a connection that was live under the device's old
-        // grant: the new grant replaces it.
-        grants.unbind(conn);
         let new_grant = NewGrant {
             identity,
             name: request.name.clone(),
@@ -1383,26 +1557,34 @@ impl<F: CodeExchangeFactory> DirectHostPairing<F> {
             expires_at: inv.params.grant_expires_at,
             enrolled_by: Some(*id),
         };
-        let failed = |this: &mut Self, code| {
-            let mut actions = this.forget_conn(id, conn);
-            actions.push(DirectHostAction::Close { conn, code });
-            actions
-        };
-        let (grant, events) = match grants.add(new_grant, now) {
+        let (grant, events) = match grants.add_provisional(new_grant, conn, now) {
             Ok(added) => added,
-            Err(GrantError::Denied) => return failed(self, ErrorCode::NotAuthorized),
-            Err(_) => return failed(self, ErrorCode::InternalError),
+            Err(e) => {
+                let code = if e == GrantError::Denied {
+                    ErrorCode::NotAuthorized
+                } else {
+                    ErrorCode::InvitationInvalid
+                };
+                self.forget_conn(id, conn);
+                let mut actions = vec![DirectHostAction::Close { conn, code }];
+                actions.extend(self.end(id, ErrorCode::InvitationInvalid, None));
+                return actions;
+            }
         };
-        if grants.bind(conn, grant, now).is_err() {
-            return failed(self, ErrorCode::InternalError);
-        }
         if let Some(inv) = self.invitations.get_mut(id) {
             inv.status = DirectInvitationStatus::Consumed { grant };
             inv.requests.remove(&identity);
             inv.joiners.remove(&conn);
         }
         self.by_conn.remove(&conn);
-        self.fresh.insert(conn, (*id, grant));
+        self.enrolled.insert(
+            conn,
+            EnrolledConn {
+                invitation: *id,
+                grant,
+                attempt,
+            },
+        );
         let mut actions: Vec<DirectHostAction> =
             events.into_iter().map(DirectHostAction::Grant).collect();
         actions.push(DirectHostAction::ApprovalEnded {
@@ -1418,6 +1600,7 @@ impl<F: CodeExchangeFactory> DirectHostPairing<F> {
             grant,
             identity,
             role: role.clone(),
+            attempt,
         });
         actions.push(DirectHostAction::Send {
             conn,
@@ -1431,8 +1614,8 @@ impl<F: CodeExchangeFactory> DirectHostPairing<F> {
         actions
     }
 
-    /// The device cancelled across the Allow: remove the grant this
-    /// invitation made for it, if it is still that grant.
+    /// The device cancelled across the Allow: remove the provisional grant
+    /// this invitation made for it, if it is still that grant.
     fn undo(
         &mut self,
         id: InvitationId,
@@ -1445,13 +1628,13 @@ impl<F: CodeExchangeFactory> DirectHostPairing<F> {
             return Vec::new();
         }
         let Some(identity) = grants
-            .get(grant)
-            .filter(|g| g.enrolled_by == Some(id))
+            .provisional(grant)
+            .filter(|g| g.direct && g.enrolled_by == Some(id))
             .map(|g| g.identity)
         else {
             return Vec::new();
         };
-        self.fresh.retain(|_, (_, g)| *g != grant);
+        self.enrolled.retain(|_, e| e.grant != grant);
         grants.unbind(conn);
         let mut actions: Vec<DirectHostAction> = grants
             .remove(grant)

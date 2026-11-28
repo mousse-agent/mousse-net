@@ -1,6 +1,6 @@
 //! Rules of [`DirectHostPairing`] that `direct-host.json` does not reach:
-//! creation, the stream that ends a fresh enrollment's cancel, a receipt
-//! after a restart, denied identities and the timer.
+//! creation, a grant expiry that passes before Allow or before the commit,
+//! a committed grant after a restart, denied identities and the timer.
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen_test::wasm_bindgen_test as test;
@@ -153,62 +153,148 @@ fn pass(
     h.on_code_exchange(c, attempt, &msg_c, now, &mut rng)
 }
 
-/// A `CANCELLED` close on a connection the host just enrolled undoes the
-/// grant; once a stream has run on it, it is an ordinary close.
+/// Enrollment with an owner grant `old` already bound on connection 5:
+/// the device passes on connection 7 and the owner allows it at `allow_at`.
+fn re_pair(
+    expires: Option<UnixTime>,
+    allow_at: UnixTime,
+) -> (
+    DirectHostPairing<CpaceExchangeFactory>,
+    GrantTable,
+    GrantId,
+    Result<Vec<DirectHostAction>, DirectHostError>,
+) {
+    let mut h = host(&Limits::DEFAULT);
+    let mut grants = GrantTable::new();
+    let joiner = key(2);
+    let (old, _) = grants
+        .add(
+            NewGrant {
+                identity: joiner,
+                name: "old".into(),
+                role: Role::owner(),
+                authorizing_owner: OwnerRef::from_bytes([0x51; 16]),
+                expires_at: None,
+                enrolled_by: None,
+            },
+            T,
+        )
+        .unwrap();
+    grants.bind(ConnectionId(5), old, T).unwrap();
+    let created = h
+        .create(
+            DirectInvitationParams {
+                grant_expires_at: expires,
+                ..params()
+            },
+            T,
+            &mut ChaCha20Rng::from_seed([9; 32]),
+        )
+        .unwrap();
+    pass(&mut h, &created, &joiner, 7, &mut grants, T);
+    let request = DirectRequestId {
+        invitation: created.invitation,
+        identity: joiner,
+    };
+    let allowed = h.allow(&request, None, &mut grants, allow_at);
+    (h, grants, old, allowed)
+}
+
+/// The grant expiry is checked before anything changes: an Allow at or
+/// after it is refused and the device keeps its grant; a provisional grant
+/// that expires before its first stream does not commit, and the old grant
+/// and its connection stay.
 #[test]
-fn a_cancelled_close_undoes_only_an_enrollment_that_carried_no_stream() {
-    for (stream_first, kept) in [(false, false), (true, true)] {
-        let mut h = host(&Limits::DEFAULT);
-        let mut grants = GrantTable::new();
-        let created = create(&mut h);
+fn an_expired_grant_never_replaces_the_old_one() {
+    let joiner = key(2);
+    let (_, grants, old, allowed) = re_pair(Some(T.plus(100)), T.plus(100));
+    assert_eq!(allowed.unwrap_err(), DirectHostError::GrantExpired);
+    assert_eq!(
+        grants.live_grant(&joiner, T.plus(100)).map(|g| g.id),
+        Some(old)
+    );
+    assert_eq!(grants.binding(ConnectionId(5)), Some(old));
+
+    let (mut h, mut grants, old, allowed) = re_pair(Some(T.plus(100)), T.plus(50));
+    let allowed = allowed.unwrap();
+    let grant = allowed
+        .iter()
+        .find_map(|a| match a {
+            DirectHostAction::Enrolled { grant, .. } => Some(*grant),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        grants.live_grant(&joiner, T.plus(50)).map(|g| g.id),
+        Some(old)
+    );
+    let actions = h.on_first_stream(ConnectionId(7), grant, &mut grants, T.plus(100));
+    assert!(actions.contains(&DirectHostAction::Close {
+        conn: ConnectionId(7),
+        code: ErrorCode::GrantRevoked
+    }));
+    assert!(!grants.is_provisional(grant));
+    assert_eq!(
+        grants.live_grant(&joiner, T.plus(100)).map(|g| g.id),
+        Some(old)
+    );
+    assert_eq!(grants.binding(ConnectionId(5)), Some(old));
+}
+
+/// A `CANCELLED` close on the connection the host enrolled removes the
+/// provisional grant; once the grant committed it is an ordinary close.
+#[test]
+fn a_cancelled_close_removes_only_a_provisional_grant() {
+    for committed in [false, true] {
         let joiner = key(2);
-        pass(&mut h, &created, &joiner, 7, &mut grants, T);
-        let request = DirectRequestId {
-            invitation: created.invitation,
-            identity: joiner,
-        };
-        h.allow(&request, None, &mut grants, T).unwrap();
-        assert!(grants.live_grant(&joiner, T).is_some());
-        if stream_first {
-            h.on_stream_opened(ConnectionId(7));
+        let (mut h, mut grants, old, allowed) = re_pair(None, T);
+        let grant = allowed
+            .unwrap()
+            .iter()
+            .find_map(|a| match a {
+                DirectHostAction::Enrolled { grant, .. } => Some(*grant),
+                _ => None,
+            })
+            .unwrap();
+        if committed {
+            h.on_first_stream(ConnectionId(7), grant, &mut grants, T);
         }
         let actions =
             h.on_connection_closed(ConnectionId(7), Some(ErrorCode::Cancelled), &mut grants, T);
-        assert_eq!(
-            grants.live_grant(&joiner, T).is_some(),
-            kept,
-            "stream first: {stream_first}"
-        );
+        let now = grants.live_grant(&joiner, T).map(|g| g.id);
+        assert_eq!(now, Some(if committed { grant } else { old }));
         assert_eq!(
             actions
                 .iter()
                 .any(|a| matches!(a, DirectHostAction::EnrollmentUndone { .. })),
-            !kept
+            !committed
         );
     }
 }
 
 /// Invitations live in memory only; the grant and its receipt are durable.
-/// After a restart the receipt still answers, and a cancel still removes it.
+/// After a restart a committed grant's receipt still answers `PAIRED`, with
+/// or without the cancel flag: a committed grant is never cancelled.
 #[test]
-fn a_receipt_grant_answers_recovery_after_a_restart() {
-    let mut grants = GrantTable::new();
+fn a_committed_receipt_answers_recovery_after_a_restart() {
     let joiner = key(2);
-    let (lookup, invitation) = {
-        let mut before = host(&Limits::DEFAULT);
-        let created = create(&mut before);
-        pass(&mut before, &created, &joiner, 7, &mut grants, T);
-        let request = DirectRequestId {
-            invitation: created.invitation,
-            identity: joiner,
-        };
-        before.allow(&request, None, &mut grants, T).unwrap();
-        (created.code.lookup(), created.invitation)
-    };
+    let (mut before, mut grants, _, allowed) = re_pair(None, T);
+    let allowed = allowed.unwrap();
+    let (grant, invitation) = allowed
+        .iter()
+        .find_map(|a| match a {
+            DirectHostAction::Enrolled {
+                grant, invitation, ..
+            } => Some((*grant, *invitation)),
+            _ => None,
+        })
+        .unwrap();
+    before.on_first_stream(ConnectionId(7), grant, &mut grants, T);
     grants.unbind(ConnectionId(7));
     let mut after = host(&Limits::DEFAULT);
+    let lookup = DirectLookup::from_canonical("K7QM").unwrap();
     for (cancel, conn) in [(false, 8u64), (true, 9)] {
-        let grant = grants.live_grant(&joiner, T).map(|g| g.id).unwrap();
+        // Step 2 bound the connection to the grant.
         grants.bind(ConnectionId(conn), grant, T).unwrap();
         let actions = after.on_join_direct(
             ConnectionId(conn),
@@ -223,22 +309,17 @@ fn a_receipt_grant_answers_recovery_after_a_restart() {
             &mut grants,
             T,
         );
-        if cancel {
-            assert!(grants.live_grant(&joiner, T).is_none());
-            assert!(actions.contains(&DirectHostAction::Close {
-                conn: ConnectionId(conn),
-                code: ErrorCode::Cancelled
-            }));
-        } else {
-            assert!(matches!(
+        assert!(
+            matches!(
                 actions.as_slice(),
                 [DirectHostAction::Send {
                     message: ControlMessage::Paired { .. },
                     ..
                 }]
-            ));
-            grants.unbind(ConnectionId(conn));
-        }
+            ),
+            "cancel: {cancel}"
+        );
+        assert_eq!(grants.live_grant(&joiner, T).map(|g| g.id), Some(grant));
     }
 }
 

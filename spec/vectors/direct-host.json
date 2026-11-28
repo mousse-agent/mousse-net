@@ -56,11 +56,11 @@
     "limits": "The defaults: 600 s lifetime, 5 attempts, a 300 s Allow window, a 1000 ms miss hold.",
     "time": 1790000000
   },
-  "description": "The host side of Pair with IP (wire.md 10.9) with the real code exchange. Each sequence starts with one invitation created at `conventions.time`; each step runs one operation, then its expectations hold. Ops: connect (step 2, then the joiner sends JOIN_DIRECT {lookup, name} on conn; `lookup` wrong means another lookup), recover (step 2, then JOIN_DIRECT with receipt I and, with `cancel`, the cancel flag), submit (the joiner runs one attempt with the right or a wrong secret: it draws an attempt id and its scalar, sends msg_a, checks msg_b; on a failed check it sends CODE_ABORT {A, pairing_failed} and closes with pairing_failed; otherwise it sends msg_c, unless `lose` is msg_c: then the connection breaks first), inject (the joiner sends CODE_EXCHANGE with `attempt` and `payload`), cancel (the joiner sends CODE_ABORT {its last attempt, cancelled} and closes with cancelled), drop (conn breaks with no GOAWAY), allow and decline (the owner answers the joiner's request; `result` ok or the refusal), owner_cancel, tick (the host's timer). A joiner's close is listed, and reaches the host, only when the host has not closed the connection during the step. A wrong lookup is `0000` (`0001` if that is the invitation's), a wrong secret `00000000` (`00000001` if that is the code's). `at` sets the time, in seconds after `conventions.time`, before the op. Step 2: a connection from an identity with a live grant is bound to it and the host sends AUTHORIZED {live} first. Expectations: `host_status` (`gone` once the host has forgotten the invitation), `host_attempts_left`, `closed` (connections the host closed during the step, with the code), `held` (JOIN_DIRECTs answered by a miss hold: the I/O layer holds the connection for hold_ms, then closes it with invitation_invalid; that close is not listed), `requests` (answerable requests: joiner, presence, decision), `granted` (devices holding a grant whose receipt is the invitation). `out` lists in order every control message each side sent (except the two HELLOs), host closes, and what the host told its I/O layer and UI: admitted (join-only gate), miss_hold, attempts_left (after each debit; the code stays the same), approval (the prompt, sent again with the same id when its presence or decision changes), approval_ended, enrolled and enrollment_undone (with the grant table's id, counting from 0), invitation_ended and grant_closes (grant-table events).",
+  "description": "The host side of Pair with IP (wire.md 10.9) with the real code exchange, behind the host's gate (wire.md 8.1). Each sequence starts with one invitation created at `conventions.time`; each step runs one operation, then its expectations hold. Every message from a joiner passes the host's gate first: let through, it reaches the host machine; otherwise `out` lists the gate's verdict (`gate`: ignore) or the host's close. Ops: dial (a new connection from the joiner: step 2 runs with the gate; a provisional or live grant binds it and the host sends AUTHORIZED {live}), connect (dial unless the connection exists, then the joiner sends JOIN_DIRECT {lookup, name}; `lookup` wrong means another lookup), recover (the same with receipt I and, with `cancel`, the cancel flag), submit (the joiner runs one attempt with the right or a wrong secret: it draws an attempt id and its scalar, sends msg_a, checks msg_b; on a failed check it sends CODE_ABORT {A, pairing_failed} and closes with pairing_failed; otherwise it sends msg_c, unless `lose` is msg_c, when the connection breaks first, or `hold` is msg_c, when msg_c stays on its way), deliver (the held msg_c arrives, unless its connection has closed: then `undelivered`), inject (the joiner sends CODE_EXCHANGE with `attempt` and `payload`), cancel (the joiner sends CODE_ABORT {its last attempt, cancelled}, `lost` with `abort` lost, and closes with cancelled, or breaks the connection with `goaway` lost), drop (conn breaks with no GOAWAY), stream (the joiner opens a stream on conn: the gate's verdict, and on commit the host commits the provisional grant before the frame goes on), allow and decline (the owner answers the joiner's request, allow with `role` when given; `result` ok or the refusal), owner_cancel, tick (the host's timer), old_grant (the joiner already holds an owner grant named \"<joiner> (old)\" made by a ticket pairing whose invitation id has the bytes of I), restart (the host restarts: invitations are gone, the grant table, provisional grants included, is restored, and every connection is gone). A joiner's close is listed, and reaches the host, only when the connection is still up. A wrong lookup is `0000` (`0001` if that is the invitation's), a wrong secret `00000000` (`00000001` if that is the code's). `at` sets the time, in seconds after `conventions.time`, before the op. Expectations: `host_status` (`gone` once the host has forgotten the invitation), `host_attempts_left`, `closed` (connections the host closed during the step, with the code), `held` (JOIN_DIRECTs answered by a miss hold: the I/O layer holds the connection for hold_ms, then closes it with invitation_invalid; that close is not listed), `requests` (answerable requests: joiner, presence, decision), `grants` (every grant in the table: joiner, name, role, and provisional, direct for a committed grant a direct invitation made, or ticket), `paired` (the PAIRED messages the host sent during the step: connection, role). `out` lists in order every control message each side sent (except the two HELLOs), closes, and what the host told its I/O layer and UI: admitted (join-only gate), miss_hold, attempts_left (after each debit; the code stays the same), approval (the prompt, sent again with the same id when its presence or decision changes), approval_ended, enrolled (a provisional grant, with the grant table's id, counting from 0), bound (a recovery connection bound to a direct grant), committed, enrollment_undone, invitation_ended and grant_closes (grant-table events).",
   "sequences": [
     {
       "code": "RV83-ADZ8-S423",
-      "description": "The lookup finds the invitation, the code passes and the owner is asked. Allow enrolls on the connection with receipt I and sends PAIRED.",
+      "description": "The lookup finds the invitation, the code passes and the owner is asked. Allow makes a provisional grant with receipt I bound to the connection and sends PAIRED. The first stream frame there commits it.",
       "draws": {
         "a": [
           {
@@ -116,7 +116,7 @@
         {
           "code": "right",
           "conn": 1,
-          "granted": [],
+          "grants": [],
           "host_attempts_left": 4,
           "joiner": "a",
           "op": "submit",
@@ -165,8 +165,13 @@
           ]
         },
         {
-          "granted": [
-            "a"
+          "grants": [
+            [
+              "a",
+              "a",
+              "owner",
+              "provisional"
+            ]
           ],
           "host_status": "consumed",
           "joiner": "a",
@@ -194,8 +199,41 @@
               }
             }
           ],
+          "paired": [
+            [
+              1,
+              "owner"
+            ]
+          ],
           "requests": [],
           "result": "ok"
+        },
+        {
+          "conn": 1,
+          "grants": [
+            [
+              "a",
+              "a",
+              "owner",
+              "direct"
+            ]
+          ],
+          "op": "stream",
+          "out": [
+            {
+              "stream": {
+                "conn": 1,
+                "verdict": "commit"
+              }
+            },
+            {
+              "committed": {
+                "conn": 1,
+                "grant": 0,
+                "joiner": "a"
+              }
+            }
+          ]
         }
       ]
     },
@@ -509,9 +547,6 @@
           ]
         },
         {
-          "granted": [
-            "a"
-          ],
           "joiner": "a",
           "op": "allow",
           "out": [
@@ -538,6 +573,33 @@
             }
           ],
           "result": "ok"
+        },
+        {
+          "conn": 2,
+          "grants": [
+            [
+              "a",
+              "a",
+              "owner",
+              "direct"
+            ]
+          ],
+          "op": "stream",
+          "out": [
+            {
+              "stream": {
+                "conn": 2,
+                "verdict": "commit"
+              }
+            },
+            {
+              "committed": {
+                "conn": 2,
+                "grant": 0,
+                "joiner": "a"
+              }
+            }
+          ]
         },
         {
           "conn": 3,
@@ -1690,8 +1752,13 @@
           ]
         },
         {
-          "granted": [
-            "a"
+          "grants": [
+            [
+              "a",
+              "a",
+              "owner",
+              "provisional"
+            ]
           ],
           "host_status": "consumed",
           "joiner": "a",
@@ -1725,7 +1792,7 @@
     },
     {
       "code": "RV83-ADZ8-S423",
-      "description": "The device's connection drops after the code passed; its request stays, away. Allow marks it allowed and ends every other request. Its recovery connection is answered AUTHORIZED {join_only, I}, enrolled and sent PAIRED.",
+      "description": "The device's connection drops after the code passed; its request stays, away. Allow, with the role viewer, marks it allowed and ends every other request. Its recovery connection is answered AUTHORIZED {join_only, I}, enrolled with that role and sent PAIRED; its first stream frame commits the grant.",
       "draws": {
         "a": [
           {
@@ -1843,7 +1910,7 @@
           ]
         },
         {
-          "granted": [],
+          "grants": [],
           "host_status": "allowed",
           "joiner": "a",
           "op": "allow",
@@ -1855,7 +1922,7 @@
                 "joiner": "a",
                 "name": "a",
                 "presence": "away",
-                "role": "owner"
+                "role": "viewer"
               }
             }
           ],
@@ -1866,7 +1933,8 @@
               "allowed"
             ]
           ],
-          "result": "ok"
+          "result": "ok",
+          "role": "viewer"
         },
         {
           "conn": 2,
@@ -1893,8 +1961,13 @@
         },
         {
           "conn": 3,
-          "granted": [
-            "a"
+          "grants": [
+            [
+              "a",
+              "a",
+              "viewer",
+              "provisional"
+            ]
           ],
           "host_status": "consumed",
           "joiner": "a",
@@ -1930,18 +2003,51 @@
                 "conn": 3,
                 "grant": 0,
                 "joiner": "a",
-                "role": "owner"
+                "role": "viewer"
               }
             },
             {
               "send": {
                 "conn": 3,
-                "control": "a3000601644465736b02656f776e6572",
+                "control": "a3000601644465736b0266766965776572",
                 "from": "host"
               }
             }
           ],
+          "paired": [
+            [
+              3,
+              "viewer"
+            ]
+          ],
           "requests": []
+        },
+        {
+          "conn": 3,
+          "grants": [
+            [
+              "a",
+              "a",
+              "viewer",
+              "direct"
+            ]
+          ],
+          "op": "stream",
+          "out": [
+            {
+              "stream": {
+                "conn": 3,
+                "verdict": "commit"
+              }
+            },
+            {
+              "committed": {
+                "conn": 3,
+                "grant": 0,
+                "joiner": "a"
+              }
+            }
+          ]
         }
       ]
     },
@@ -2100,8 +2206,13 @@
           ]
         },
         {
-          "granted": [
-            "a"
+          "grants": [
+            [
+              "a",
+              "a",
+              "owner",
+              "provisional"
+            ]
           ],
           "joiner": "a",
           "op": "allow",
@@ -2127,6 +2238,12 @@
                 "from": "host"
               }
             }
+          ],
+          "paired": [
+            [
+              2,
+              "owner"
+            ]
           ],
           "result": "ok"
         }
@@ -2783,7 +2900,7 @@
             ]
           ],
           "conn": 2,
-          "granted": [],
+          "grants": [],
           "host_status": "ended:cancelled",
           "joiner": "a",
           "op": "recover",
@@ -2817,7 +2934,7 @@
     },
     {
       "code": "RV83-ADZ8-S423",
-      "description": "The owner allows while the device's cancel is on its way. The cancel arrives on the connection the host just enrolled: the grant with receipt I is removed and the connection closes with cancelled.",
+      "description": "The owner allows while the device's cancel is on its way. Its CODE_ABORT {A, cancelled} for the attempt that passed goes through the live gate of the connection the host just enrolled; the provisional grant is removed and the host closes with cancelled. The device's own GOAWAY is lost.",
       "draws": {
         "a": [
           {
@@ -2840,7 +2957,7 @@
         ]
       },
       "invitation": "c2206fc0bd318594f8cc73bc35106fba",
-      "name": "cancel_crossing_allow",
+      "name": "cancel_crossing_allow_goaway_lost",
       "steps": [
         {
           "conn": 1,
@@ -2911,8 +3028,13 @@
           ]
         },
         {
-          "granted": [
-            "a"
+          "grants": [
+            [
+              "a",
+              "a",
+              "owner",
+              "provisional"
+            ]
           ],
           "joiner": "a",
           "op": "allow",
@@ -2949,7 +3071,8 @@
             ]
           ],
           "conn": 1,
-          "granted": [],
+          "goaway": "lost",
+          "grants": [],
           "joiner": "a",
           "op": "cancel",
           "out": [
@@ -2979,7 +3102,399 @@
     },
     {
       "code": "RV83-ADZ8-S423",
-      "description": "The owner allowed; the connection broke before the device saw PAIRED, and the device cancelled meanwhile. Its recovery (step 2 says AUTHORIZED {live} for the new grant) carries the cancel: the grant with receipt I is removed.",
+      "description": "As before, but the CODE_ABORT is lost and only the device's close with cancelled reaches the host: that removes the provisional grant too.",
+      "draws": {
+        "a": [
+          {
+            "bytes": "d27f726c6ef791779daad69bcb84964d"
+          },
+          {
+            "bytes": "4d5ed512ad8f4857f0ee25a7bf5cd302af275cf01825f3ce8d1c906f67ea8de8"
+          }
+        ],
+        "host": [
+          {
+            "bytes": "c2206fc0bd318594f8cc73bc35106fba"
+          },
+          {
+            "bytes": "f87b28c38a8dbfc8d9848243"
+          },
+          {
+            "bytes": "038f9c1c84034870a9b65832a5f2bad9063feebe9de6c9e88643afe9ecdd3c83"
+          }
+        ]
+      },
+      "invitation": "c2206fc0bd318594f8cc73bc35106fba",
+      "name": "cancel_crossing_allow_abort_lost",
+      "steps": [
+        {
+          "conn": 1,
+          "joiner": "a",
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a30007016452563833026161",
+                "from": "a"
+              }
+            },
+            {
+              "admitted": {
+                "conn": 1
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000201020250c2206fc0bd318594f8cc73bc35106fba",
+                "from": "host"
+              }
+            }
+          ]
+        },
+        {
+          "code": "right",
+          "conn": 1,
+          "joiner": "a",
+          "op": "submit",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150d27f726c6ef791779daad69bcb84964d025822207a8cc438a806d5e2772d178eeada2d216df9f19cf18b1b3beb6952efcc61206700",
+                "from": "a"
+              }
+            },
+            {
+              "attempts_left": 4
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150d27f726c6ef791779daad69bcb84964d025862202439397e9e36a9ef3992176a948ed89acff1575219fc93aeaf4179e9e9c97f000006e0c544385ce6a03b95845f8b2bf75e909876cfddc8d3618ac0c090cd3bb28f55283996531c3e3d2f62470108833cf80c6b686b80bb95628a8dad403fb08644",
+                "from": "host"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150d27f726c6ef791779daad69bcb84964d0258406153c6342535f56c3ebd859927cf33fa44dc27558ec72c0871c4c363770a1f3d5ec54cb79ab89f125b8fe32906ffa1374b05e9b9dc797e227a5fb09d9c715f1d",
+                "from": "a"
+              }
+            },
+            {
+              "approval": {
+                "answer_by": 1790000300,
+                "decision": "pending",
+                "joiner": "a",
+                "name": "a",
+                "presence": "connected",
+                "role": "owner"
+              }
+            }
+          ]
+        },
+        {
+          "grants": [
+            [
+              "a",
+              "a",
+              "owner",
+              "provisional"
+            ]
+          ],
+          "joiner": "a",
+          "op": "allow",
+          "out": [
+            {
+              "approval_ended": {
+                "joiner": "a",
+                "reason": "enrolled"
+              }
+            },
+            {
+              "enrolled": {
+                "conn": 1,
+                "grant": 0,
+                "joiner": "a",
+                "role": "owner"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000601644465736b02656f776e6572",
+                "from": "host"
+              }
+            }
+          ],
+          "result": "ok"
+        },
+        {
+          "abort": "lost",
+          "conn": 1,
+          "grants": [],
+          "joiner": "a",
+          "op": "cancel",
+          "out": [
+            {
+              "lost": {
+                "conn": 1,
+                "control": "a300050150d27f726c6ef791779daad69bcb84964d0210",
+                "from": "a"
+              }
+            },
+            {
+              "close": {
+                "code": "cancelled",
+                "conn": 1,
+                "from": "a"
+              }
+            },
+            {
+              "enrollment_undone": {
+                "grant": 0,
+                "joiner": "a"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "code": "RV83-ADZ8-S423",
+      "description": "Once a stream frame committed the grant, the device's CODE_ABORT is ignored by the live gate and its close with cancelled is an ordinary close. A recovery that cancels is answered PAIRED: the grant stays.",
+      "draws": {
+        "a": [
+          {
+            "bytes": "d27f726c6ef791779daad69bcb84964d"
+          },
+          {
+            "bytes": "4d5ed512ad8f4857f0ee25a7bf5cd302af275cf01825f3ce8d1c906f67ea8de8"
+          }
+        ],
+        "host": [
+          {
+            "bytes": "c2206fc0bd318594f8cc73bc35106fba"
+          },
+          {
+            "bytes": "f87b28c38a8dbfc8d9848243"
+          },
+          {
+            "bytes": "038f9c1c84034870a9b65832a5f2bad9063feebe9de6c9e88643afe9ecdd3c83"
+          }
+        ]
+      },
+      "invitation": "c2206fc0bd318594f8cc73bc35106fba",
+      "name": "a_cancel_after_the_commit_is_too_late",
+      "steps": [
+        {
+          "conn": 1,
+          "joiner": "a",
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a30007016452563833026161",
+                "from": "a"
+              }
+            },
+            {
+              "admitted": {
+                "conn": 1
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000201020250c2206fc0bd318594f8cc73bc35106fba",
+                "from": "host"
+              }
+            }
+          ]
+        },
+        {
+          "code": "right",
+          "conn": 1,
+          "joiner": "a",
+          "op": "submit",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150d27f726c6ef791779daad69bcb84964d025822207a8cc438a806d5e2772d178eeada2d216df9f19cf18b1b3beb6952efcc61206700",
+                "from": "a"
+              }
+            },
+            {
+              "attempts_left": 4
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150d27f726c6ef791779daad69bcb84964d025862202439397e9e36a9ef3992176a948ed89acff1575219fc93aeaf4179e9e9c97f000006e0c544385ce6a03b95845f8b2bf75e909876cfddc8d3618ac0c090cd3bb28f55283996531c3e3d2f62470108833cf80c6b686b80bb95628a8dad403fb08644",
+                "from": "host"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150d27f726c6ef791779daad69bcb84964d0258406153c6342535f56c3ebd859927cf33fa44dc27558ec72c0871c4c363770a1f3d5ec54cb79ab89f125b8fe32906ffa1374b05e9b9dc797e227a5fb09d9c715f1d",
+                "from": "a"
+              }
+            },
+            {
+              "approval": {
+                "answer_by": 1790000300,
+                "decision": "pending",
+                "joiner": "a",
+                "name": "a",
+                "presence": "connected",
+                "role": "owner"
+              }
+            }
+          ]
+        },
+        {
+          "joiner": "a",
+          "op": "allow",
+          "out": [
+            {
+              "approval_ended": {
+                "joiner": "a",
+                "reason": "enrolled"
+              }
+            },
+            {
+              "enrolled": {
+                "conn": 1,
+                "grant": 0,
+                "joiner": "a",
+                "role": "owner"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000601644465736b02656f776e6572",
+                "from": "host"
+              }
+            }
+          ],
+          "result": "ok"
+        },
+        {
+          "conn": 1,
+          "grants": [
+            [
+              "a",
+              "a",
+              "owner",
+              "direct"
+            ]
+          ],
+          "op": "stream",
+          "out": [
+            {
+              "stream": {
+                "conn": 1,
+                "verdict": "commit"
+              }
+            },
+            {
+              "committed": {
+                "conn": 1,
+                "grant": 0,
+                "joiner": "a"
+              }
+            }
+          ]
+        },
+        {
+          "conn": 1,
+          "grants": [
+            [
+              "a",
+              "a",
+              "owner",
+              "direct"
+            ]
+          ],
+          "joiner": "a",
+          "op": "cancel",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300050150d27f726c6ef791779daad69bcb84964d0210",
+                "from": "a"
+              }
+            },
+            {
+              "gate": {
+                "conn": 1,
+                "verdict": "ignore"
+              }
+            },
+            {
+              "close": {
+                "code": "cancelled",
+                "conn": 1,
+                "from": "a"
+              }
+            }
+          ]
+        },
+        {
+          "cancel": true,
+          "conn": 2,
+          "grants": [
+            [
+              "a",
+              "a",
+              "owner",
+              "direct"
+            ]
+          ],
+          "joiner": "a",
+          "op": "recover",
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a200020101",
+                "from": "host"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a500070164525638330261610350c2206fc0bd318594f8cc73bc35106fba0401",
+                "from": "a"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a3000601644465736b02656f776e6572",
+                "from": "host"
+              }
+            }
+          ],
+          "paired": [
+            [
+              2,
+              "owner"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "code": "RV83-ADZ8-S423",
+      "description": "The owner allowed; the connection broke before the device saw PAIRED, and the device cancelled meanwhile. Step 2 binds its recovery to the provisional grant (AUTHORIZED {live}); the recovery carries the cancel, which removes that grant.",
       "draws": {
         "a": [
           {
@@ -3073,9 +3588,6 @@
           ]
         },
         {
-          "granted": [
-            "a"
-          ],
           "joiner": "a",
           "op": "allow",
           "out": [
@@ -3105,8 +3617,13 @@
         },
         {
           "conn": 1,
-          "granted": [
-            "a"
+          "grants": [
+            [
+              "a",
+              "a",
+              "owner",
+              "provisional"
+            ]
           ],
           "op": "drop",
           "out": []
@@ -3120,7 +3637,7 @@
             ]
           ],
           "conn": 2,
-          "granted": [],
+          "grants": [],
           "joiner": "a",
           "op": "recover",
           "out": [
@@ -3157,7 +3674,7 @@
     },
     {
       "code": "RV83-ADZ8-S423",
-      "description": "The owner allowed; PAIRED was lost with the connection. The recovery gets step 2's AUTHORIZED {live} and then PAIRED from the grant's receipt.",
+      "description": "The owner allowed; PAIRED was lost with the connection. Step 2 binds the recovery to the provisional grant (AUTHORIZED {live}), and the host answers PAIRED from its receipt. The first stream frame commits it.",
       "draws": {
         "a": [
           {
@@ -3285,8 +3802,13 @@
         },
         {
           "conn": 2,
-          "granted": [
-            "a"
+          "grants": [
+            [
+              "a",
+              "a",
+              "owner",
+              "provisional"
+            ]
           ],
           "joiner": "a",
           "op": "recover",
@@ -3312,13 +3834,995 @@
                 "from": "host"
               }
             }
+          ],
+          "paired": [
+            [
+              2,
+              "owner"
+            ]
+          ]
+        },
+        {
+          "conn": 2,
+          "grants": [
+            [
+              "a",
+              "a",
+              "owner",
+              "direct"
+            ]
+          ],
+          "op": "stream",
+          "out": [
+            {
+              "stream": {
+                "conn": 2,
+                "verdict": "commit"
+              }
+            },
+            {
+              "committed": {
+                "conn": 2,
+                "grant": 0,
+                "joiner": "a"
+              }
+            }
           ]
         }
       ]
     },
     {
       "code": "RV83-ADZ8-S423",
-      "description": "Two devices pass the code, each with its own request. Allowing one enrolls it, ends the other request and closes its connection with invitation_invalid.",
+      "description": "The pairing connection closes before any stream. The device's next ordinary connection is bound to the provisional grant by step 2 (AUTHORIZED {live}); its first stream frame commits it.",
+      "draws": {
+        "a": [
+          {
+            "bytes": "d27f726c6ef791779daad69bcb84964d"
+          },
+          {
+            "bytes": "4d5ed512ad8f4857f0ee25a7bf5cd302af275cf01825f3ce8d1c906f67ea8de8"
+          }
+        ],
+        "host": [
+          {
+            "bytes": "c2206fc0bd318594f8cc73bc35106fba"
+          },
+          {
+            "bytes": "f87b28c38a8dbfc8d9848243"
+          },
+          {
+            "bytes": "038f9c1c84034870a9b65832a5f2bad9063feebe9de6c9e88643afe9ecdd3c83"
+          }
+        ]
+      },
+      "invitation": "c2206fc0bd318594f8cc73bc35106fba",
+      "name": "the_first_ordinary_connection_commits",
+      "steps": [
+        {
+          "conn": 1,
+          "joiner": "a",
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a30007016452563833026161",
+                "from": "a"
+              }
+            },
+            {
+              "admitted": {
+                "conn": 1
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000201020250c2206fc0bd318594f8cc73bc35106fba",
+                "from": "host"
+              }
+            }
+          ]
+        },
+        {
+          "code": "right",
+          "conn": 1,
+          "joiner": "a",
+          "op": "submit",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150d27f726c6ef791779daad69bcb84964d025822207a8cc438a806d5e2772d178eeada2d216df9f19cf18b1b3beb6952efcc61206700",
+                "from": "a"
+              }
+            },
+            {
+              "attempts_left": 4
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150d27f726c6ef791779daad69bcb84964d025862202439397e9e36a9ef3992176a948ed89acff1575219fc93aeaf4179e9e9c97f000006e0c544385ce6a03b95845f8b2bf75e909876cfddc8d3618ac0c090cd3bb28f55283996531c3e3d2f62470108833cf80c6b686b80bb95628a8dad403fb08644",
+                "from": "host"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150d27f726c6ef791779daad69bcb84964d0258406153c6342535f56c3ebd859927cf33fa44dc27558ec72c0871c4c363770a1f3d5ec54cb79ab89f125b8fe32906ffa1374b05e9b9dc797e227a5fb09d9c715f1d",
+                "from": "a"
+              }
+            },
+            {
+              "approval": {
+                "answer_by": 1790000300,
+                "decision": "pending",
+                "joiner": "a",
+                "name": "a",
+                "presence": "connected",
+                "role": "owner"
+              }
+            }
+          ]
+        },
+        {
+          "joiner": "a",
+          "op": "allow",
+          "out": [
+            {
+              "approval_ended": {
+                "joiner": "a",
+                "reason": "enrolled"
+              }
+            },
+            {
+              "enrolled": {
+                "conn": 1,
+                "grant": 0,
+                "joiner": "a",
+                "role": "owner"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000601644465736b02656f776e6572",
+                "from": "host"
+              }
+            }
+          ],
+          "result": "ok"
+        },
+        {
+          "conn": 1,
+          "op": "drop",
+          "out": []
+        },
+        {
+          "conn": 2,
+          "grants": [
+            [
+              "a",
+              "a",
+              "owner",
+              "provisional"
+            ]
+          ],
+          "joiner": "a",
+          "op": "dial",
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a200020101",
+                "from": "host"
+              }
+            }
+          ]
+        },
+        {
+          "conn": 2,
+          "grants": [
+            [
+              "a",
+              "a",
+              "owner",
+              "direct"
+            ]
+          ],
+          "op": "stream",
+          "out": [
+            {
+              "stream": {
+                "conn": 2,
+                "verdict": "commit"
+              }
+            },
+            {
+              "committed": {
+                "conn": 2,
+                "grant": 0,
+                "joiner": "a"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "code": "RV83-ADZ8-S423",
+      "description": "The device's recovery connection ran step 2 before the owner allowed on the original connection, so step 2 bound nothing and sent nothing. When its JOIN_DIRECT arrives, the host binds it to the provisional grant and sends AUTHORIZED {live} before PAIRED.",
+      "draws": {
+        "a": [
+          {
+            "bytes": "d27f726c6ef791779daad69bcb84964d"
+          },
+          {
+            "bytes": "4d5ed512ad8f4857f0ee25a7bf5cd302af275cf01825f3ce8d1c906f67ea8de8"
+          }
+        ],
+        "host": [
+          {
+            "bytes": "c2206fc0bd318594f8cc73bc35106fba"
+          },
+          {
+            "bytes": "f87b28c38a8dbfc8d9848243"
+          },
+          {
+            "bytes": "038f9c1c84034870a9b65832a5f2bad9063feebe9de6c9e88643afe9ecdd3c83"
+          }
+        ]
+      },
+      "invitation": "c2206fc0bd318594f8cc73bc35106fba",
+      "name": "a_recovery_bound_after_a_late_allow",
+      "steps": [
+        {
+          "conn": 1,
+          "joiner": "a",
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a30007016452563833026161",
+                "from": "a"
+              }
+            },
+            {
+              "admitted": {
+                "conn": 1
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000201020250c2206fc0bd318594f8cc73bc35106fba",
+                "from": "host"
+              }
+            }
+          ]
+        },
+        {
+          "code": "right",
+          "conn": 1,
+          "joiner": "a",
+          "op": "submit",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150d27f726c6ef791779daad69bcb84964d025822207a8cc438a806d5e2772d178eeada2d216df9f19cf18b1b3beb6952efcc61206700",
+                "from": "a"
+              }
+            },
+            {
+              "attempts_left": 4
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150d27f726c6ef791779daad69bcb84964d025862202439397e9e36a9ef3992176a948ed89acff1575219fc93aeaf4179e9e9c97f000006e0c544385ce6a03b95845f8b2bf75e909876cfddc8d3618ac0c090cd3bb28f55283996531c3e3d2f62470108833cf80c6b686b80bb95628a8dad403fb08644",
+                "from": "host"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150d27f726c6ef791779daad69bcb84964d0258406153c6342535f56c3ebd859927cf33fa44dc27558ec72c0871c4c363770a1f3d5ec54cb79ab89f125b8fe32906ffa1374b05e9b9dc797e227a5fb09d9c715f1d",
+                "from": "a"
+              }
+            },
+            {
+              "approval": {
+                "answer_by": 1790000300,
+                "decision": "pending",
+                "joiner": "a",
+                "name": "a",
+                "presence": "connected",
+                "role": "owner"
+              }
+            }
+          ]
+        },
+        {
+          "conn": 2,
+          "joiner": "a",
+          "op": "dial",
+          "out": []
+        },
+        {
+          "joiner": "a",
+          "op": "allow",
+          "out": [
+            {
+              "approval_ended": {
+                "joiner": "a",
+                "reason": "enrolled"
+              }
+            },
+            {
+              "enrolled": {
+                "conn": 1,
+                "grant": 0,
+                "joiner": "a",
+                "role": "owner"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000601644465736b02656f776e6572",
+                "from": "host"
+              }
+            }
+          ],
+          "paired": [
+            [
+              1,
+              "owner"
+            ]
+          ],
+          "result": "ok"
+        },
+        {
+          "conn": 2,
+          "grants": [
+            [
+              "a",
+              "a",
+              "owner",
+              "provisional"
+            ]
+          ],
+          "joiner": "a",
+          "op": "recover",
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a400070164525638330261610350c2206fc0bd318594f8cc73bc35106fba",
+                "from": "a"
+              }
+            },
+            {
+              "bound": {
+                "conn": 2,
+                "grant": 0,
+                "provisional": true
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a200020101",
+                "from": "host"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a3000601644465736b02656f776e6572",
+                "from": "host"
+              }
+            }
+          ],
+          "paired": [
+            [
+              2,
+              "owner"
+            ]
+          ]
+        },
+        {
+          "conn": 2,
+          "grants": [
+            [
+              "a",
+              "a",
+              "owner",
+              "direct"
+            ]
+          ],
+          "op": "stream",
+          "out": [
+            {
+              "stream": {
+                "conn": 2,
+                "verdict": "commit"
+              }
+            },
+            {
+              "committed": {
+                "conn": 2,
+                "grant": 0,
+                "joiner": "a"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "code": "RV83-ADZ8-S423",
+      "description": "a already holds a grant (from a ticket whose invitation id has the same bytes as I) and pairs again on connection 2. Allow, with the role viewer, makes a provisional grant: the old grant stays, and connection 1, live under it, opens a stream without committing anything. The cancel crossing Allow removes only the provisional grant; the old one and connection 1 stay.",
+      "draws": {
+        "a": [
+          {
+            "bytes": "d27f726c6ef791779daad69bcb84964d"
+          },
+          {
+            "bytes": "4d5ed512ad8f4857f0ee25a7bf5cd302af275cf01825f3ce8d1c906f67ea8de8"
+          }
+        ],
+        "host": [
+          {
+            "bytes": "c2206fc0bd318594f8cc73bc35106fba"
+          },
+          {
+            "bytes": "f87b28c38a8dbfc8d9848243"
+          },
+          {
+            "bytes": "038f9c1c84034870a9b65832a5f2bad9063feebe9de6c9e88643afe9ecdd3c83"
+          }
+        ]
+      },
+      "invitation": "c2206fc0bd318594f8cc73bc35106fba",
+      "name": "a_re_pair_cancelled_across_allow_keeps_the_old_grant",
+      "steps": [
+        {
+          "grants": [
+            [
+              "a",
+              "a (old)",
+              "owner",
+              "ticket"
+            ]
+          ],
+          "joiner": "a",
+          "op": "old_grant",
+          "out": []
+        },
+        {
+          "conn": 1,
+          "joiner": "a",
+          "op": "dial",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a200020101",
+                "from": "host"
+              }
+            }
+          ]
+        },
+        {
+          "conn": 2,
+          "joiner": "a",
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a200020101",
+                "from": "host"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a30007016452563833026161",
+                "from": "a"
+              }
+            },
+            {
+              "admitted": {
+                "conn": 2
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a3000201020250c2206fc0bd318594f8cc73bc35106fba",
+                "from": "host"
+              }
+            }
+          ]
+        },
+        {
+          "code": "right",
+          "conn": 2,
+          "joiner": "a",
+          "op": "submit",
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a300040150d27f726c6ef791779daad69bcb84964d02582220fc79af690a455d87a4595a006a94ee5902b90a67b602e3e57f40db8dfce3fe6f00",
+                "from": "a"
+              }
+            },
+            {
+              "attempts_left": 4
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a300040150d27f726c6ef791779daad69bcb84964d02586220ca70118552ce631be00d142422e2a42420fb05481deb1c58e2e48f4273c27c17007b60ff6c4c108779b0f247326bba52e1f161d53897202a776332e7955c7a8c1fa8ab0b48a494ae2919cadfc609e9c34ca1b3e918aa27b80cd7ee93b60d7eed42",
+                "from": "host"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a300040150d27f726c6ef791779daad69bcb84964d025840f51323f5370ad77a029b0e971d49119d62af3e3692b9bc13716d96a7ecbe519ad046ab4b7648f3bce3727be8b828589fa2545af09bd12fa8f4664ff09a3ac55b",
+                "from": "a"
+              }
+            },
+            {
+              "approval": {
+                "answer_by": 1790000300,
+                "decision": "pending",
+                "joiner": "a",
+                "name": "a",
+                "presence": "connected",
+                "role": "owner"
+              }
+            }
+          ]
+        },
+        {
+          "grants": [
+            [
+              "a",
+              "a",
+              "viewer",
+              "provisional"
+            ],
+            [
+              "a",
+              "a (old)",
+              "owner",
+              "ticket"
+            ]
+          ],
+          "joiner": "a",
+          "op": "allow",
+          "out": [
+            {
+              "approval_ended": {
+                "joiner": "a",
+                "reason": "enrolled"
+              }
+            },
+            {
+              "enrolled": {
+                "conn": 2,
+                "grant": 1,
+                "joiner": "a",
+                "role": "viewer"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a3000601644465736b0266766965776572",
+                "from": "host"
+              }
+            }
+          ],
+          "paired": [
+            [
+              2,
+              "viewer"
+            ]
+          ],
+          "result": "ok",
+          "role": "viewer"
+        },
+        {
+          "conn": 1,
+          "grants": [
+            [
+              "a",
+              "a",
+              "viewer",
+              "provisional"
+            ],
+            [
+              "a",
+              "a (old)",
+              "owner",
+              "ticket"
+            ]
+          ],
+          "op": "stream",
+          "out": [
+            {
+              "stream": {
+                "conn": 1,
+                "verdict": "allow"
+              }
+            }
+          ]
+        },
+        {
+          "closed": [
+            [
+              2,
+              "cancelled"
+            ]
+          ],
+          "conn": 2,
+          "goaway": "lost",
+          "grants": [
+            [
+              "a",
+              "a (old)",
+              "owner",
+              "ticket"
+            ]
+          ],
+          "joiner": "a",
+          "op": "cancel",
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a300050150d27f726c6ef791779daad69bcb84964d0210",
+                "from": "a"
+              }
+            },
+            {
+              "enrollment_undone": {
+                "grant": 1,
+                "joiner": "a"
+              }
+            },
+            {
+              "close": {
+                "code": "cancelled",
+                "conn": 2,
+                "from": "host"
+              }
+            }
+          ]
+        },
+        {
+          "conn": 1,
+          "op": "stream",
+          "out": [
+            {
+              "stream": {
+                "conn": 1,
+                "verdict": "allow"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "code": "RV83-ADZ8-S423",
+      "description": "As before, but the device takes PAIRED and opens a stream on connection 2: the provisional grant commits, replaces the old grant, and connection 1, bound to the old one, closes with grant_revoked.",
+      "draws": {
+        "a": [
+          {
+            "bytes": "d27f726c6ef791779daad69bcb84964d"
+          },
+          {
+            "bytes": "4d5ed512ad8f4857f0ee25a7bf5cd302af275cf01825f3ce8d1c906f67ea8de8"
+          }
+        ],
+        "host": [
+          {
+            "bytes": "c2206fc0bd318594f8cc73bc35106fba"
+          },
+          {
+            "bytes": "f87b28c38a8dbfc8d9848243"
+          },
+          {
+            "bytes": "038f9c1c84034870a9b65832a5f2bad9063feebe9de6c9e88643afe9ecdd3c83"
+          }
+        ]
+      },
+      "invitation": "c2206fc0bd318594f8cc73bc35106fba",
+      "name": "a_re_pair_commit_replaces_the_old_grant",
+      "steps": [
+        {
+          "joiner": "a",
+          "op": "old_grant",
+          "out": []
+        },
+        {
+          "conn": 1,
+          "joiner": "a",
+          "op": "dial",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a200020101",
+                "from": "host"
+              }
+            }
+          ]
+        },
+        {
+          "conn": 2,
+          "joiner": "a",
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a200020101",
+                "from": "host"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a30007016452563833026161",
+                "from": "a"
+              }
+            },
+            {
+              "admitted": {
+                "conn": 2
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a3000201020250c2206fc0bd318594f8cc73bc35106fba",
+                "from": "host"
+              }
+            }
+          ]
+        },
+        {
+          "code": "right",
+          "conn": 2,
+          "joiner": "a",
+          "op": "submit",
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a300040150d27f726c6ef791779daad69bcb84964d02582220fc79af690a455d87a4595a006a94ee5902b90a67b602e3e57f40db8dfce3fe6f00",
+                "from": "a"
+              }
+            },
+            {
+              "attempts_left": 4
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a300040150d27f726c6ef791779daad69bcb84964d02586220ca70118552ce631be00d142422e2a42420fb05481deb1c58e2e48f4273c27c17007b60ff6c4c108779b0f247326bba52e1f161d53897202a776332e7955c7a8c1fa8ab0b48a494ae2919cadfc609e9c34ca1b3e918aa27b80cd7ee93b60d7eed42",
+                "from": "host"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a300040150d27f726c6ef791779daad69bcb84964d025840f51323f5370ad77a029b0e971d49119d62af3e3692b9bc13716d96a7ecbe519ad046ab4b7648f3bce3727be8b828589fa2545af09bd12fa8f4664ff09a3ac55b",
+                "from": "a"
+              }
+            },
+            {
+              "approval": {
+                "answer_by": 1790000300,
+                "decision": "pending",
+                "joiner": "a",
+                "name": "a",
+                "presence": "connected",
+                "role": "owner"
+              }
+            }
+          ]
+        },
+        {
+          "joiner": "a",
+          "op": "allow",
+          "out": [
+            {
+              "approval_ended": {
+                "joiner": "a",
+                "reason": "enrolled"
+              }
+            },
+            {
+              "enrolled": {
+                "conn": 2,
+                "grant": 1,
+                "joiner": "a",
+                "role": "viewer"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a3000601644465736b0266766965776572",
+                "from": "host"
+              }
+            }
+          ],
+          "result": "ok",
+          "role": "viewer"
+        },
+        {
+          "conn": 2,
+          "grants": [
+            [
+              "a",
+              "a",
+              "viewer",
+              "direct"
+            ]
+          ],
+          "op": "stream",
+          "out": [
+            {
+              "stream": {
+                "conn": 2,
+                "verdict": "commit"
+              }
+            },
+            {
+              "grant_closes": {
+                "code": "grant_revoked",
+                "conns": [
+                  1
+                ],
+                "grant": 0
+              }
+            },
+            {
+              "committed": {
+                "conn": 2,
+                "grant": 1,
+                "joiner": "a"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "code": "RV83-ADZ8-S423",
+      "description": "a holds a grant from a ticket whose invitation id has the same bytes as I. A direct recovery with that receipt neither removes it (with the cancel flag) nor is answered PAIRED (without): a never passed this invitation's code, so the second recovery hears not_received.",
+      "draws": {
+        "a": [],
+        "host": [
+          {
+            "bytes": "c2206fc0bd318594f8cc73bc35106fba"
+          },
+          {
+            "bytes": "f87b28c38a8dbfc8d9848243"
+          }
+        ]
+      },
+      "invitation": "c2206fc0bd318594f8cc73bc35106fba",
+      "name": "a_ticket_receipt_never_answers_a_direct_recovery",
+      "steps": [
+        {
+          "joiner": "a",
+          "op": "old_grant",
+          "out": []
+        },
+        {
+          "cancel": true,
+          "closed": [
+            [
+              1,
+              "cancelled"
+            ]
+          ],
+          "conn": 1,
+          "grants": [
+            [
+              "a",
+              "a (old)",
+              "owner",
+              "ticket"
+            ]
+          ],
+          "joiner": "a",
+          "op": "recover",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a200020101",
+                "from": "host"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a500070164525638330261610350c2206fc0bd318594f8cc73bc35106fba0401",
+                "from": "a"
+              }
+            },
+            {
+              "close": {
+                "code": "cancelled",
+                "conn": 1,
+                "from": "host"
+              }
+            }
+          ]
+        },
+        {
+          "conn": 2,
+          "grants": [
+            [
+              "a",
+              "a (old)",
+              "owner",
+              "ticket"
+            ]
+          ],
+          "joiner": "a",
+          "op": "recover",
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a200020101",
+                "from": "host"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a400070164525638330261610350c2206fc0bd318594f8cc73bc35106fba",
+                "from": "a"
+              }
+            },
+            {
+              "admitted": {
+                "conn": 2
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a4000201020250c2206fc0bd318594f8cc73bc35106fba0301",
+                "from": "host"
+              }
+            }
+          ],
+          "paired": []
+        }
+      ]
+    },
+    {
+      "code": "RV83-ADZ8-S423",
+      "description": "Two devices pass the code, each with its own request. Allowing b with the role viewer enrolls b with its own name and that role, ends a's request and closes its connection with invitation_invalid.",
       "draws": {
         "a": [
           {
@@ -3509,8 +5013,13 @@
               "invitation_invalid"
             ]
           ],
-          "granted": [
-            "b"
+          "grants": [
+            [
+              "b",
+              "b",
+              "viewer",
+              "provisional"
+            ]
           ],
           "joiner": "b",
           "op": "allow",
@@ -3526,13 +5035,13 @@
                 "conn": 2,
                 "grant": 0,
                 "joiner": "b",
-                "role": "owner"
+                "role": "viewer"
               }
             },
             {
               "send": {
                 "conn": 2,
-                "control": "a3000601644465736b02656f776e6572",
+                "control": "a3000601644465736b0266766965776572",
                 "from": "host"
               }
             },
@@ -3550,8 +5059,15 @@
               }
             }
           ],
+          "paired": [
+            [
+              2,
+              "viewer"
+            ]
+          ],
           "requests": [],
-          "result": "ok"
+          "result": "ok",
+          "role": "viewer"
         },
         {
           "joiner": "a",
@@ -3720,8 +5236,13 @@
         },
         {
           "at": 898,
-          "granted": [
-            "a"
+          "grants": [
+            [
+              "a",
+              "a",
+              "owner",
+              "provisional"
+            ]
           ],
           "joiner": "a",
           "op": "allow",
@@ -3989,6 +5510,316 @@
     },
     {
       "code": "RV83-ADZ8-S423",
+      "description": "At the end of the Allow window, before the host's timer has run, the request can no longer be allowed or declined.",
+      "draws": {
+        "a": [
+          {
+            "bytes": "d27f726c6ef791779daad69bcb84964d"
+          },
+          {
+            "bytes": "4d5ed512ad8f4857f0ee25a7bf5cd302af275cf01825f3ce8d1c906f67ea8de8"
+          }
+        ],
+        "host": [
+          {
+            "bytes": "c2206fc0bd318594f8cc73bc35106fba"
+          },
+          {
+            "bytes": "f87b28c38a8dbfc8d9848243"
+          },
+          {
+            "bytes": "038f9c1c84034870a9b65832a5f2bad9063feebe9de6c9e88643afe9ecdd3c83"
+          }
+        ]
+      },
+      "invitation": "c2206fc0bd318594f8cc73bc35106fba",
+      "name": "answers_at_the_window_end_before_the_timer",
+      "steps": [
+        {
+          "conn": 1,
+          "joiner": "a",
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a30007016452563833026161",
+                "from": "a"
+              }
+            },
+            {
+              "admitted": {
+                "conn": 1
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000201020250c2206fc0bd318594f8cc73bc35106fba",
+                "from": "host"
+              }
+            }
+          ]
+        },
+        {
+          "at": 10,
+          "code": "right",
+          "conn": 1,
+          "joiner": "a",
+          "op": "submit",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150d27f726c6ef791779daad69bcb84964d025822207a8cc438a806d5e2772d178eeada2d216df9f19cf18b1b3beb6952efcc61206700",
+                "from": "a"
+              }
+            },
+            {
+              "attempts_left": 4
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150d27f726c6ef791779daad69bcb84964d025862202439397e9e36a9ef3992176a948ed89acff1575219fc93aeaf4179e9e9c97f000006e0c544385ce6a03b95845f8b2bf75e909876cfddc8d3618ac0c090cd3bb28f55283996531c3e3d2f62470108833cf80c6b686b80bb95628a8dad403fb08644",
+                "from": "host"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150d27f726c6ef791779daad69bcb84964d0258406153c6342535f56c3ebd859927cf33fa44dc27558ec72c0871c4c363770a1f3d5ec54cb79ab89f125b8fe32906ffa1374b05e9b9dc797e227a5fb09d9c715f1d",
+                "from": "a"
+              }
+            },
+            {
+              "approval": {
+                "answer_by": 1790000310,
+                "decision": "pending",
+                "joiner": "a",
+                "name": "a",
+                "presence": "connected",
+                "role": "owner"
+              }
+            }
+          ]
+        },
+        {
+          "at": 310,
+          "grants": [],
+          "joiner": "a",
+          "op": "allow",
+          "out": [],
+          "result": "unknown_request"
+        },
+        {
+          "host_status": "open",
+          "joiner": "a",
+          "op": "decline",
+          "out": [],
+          "result": "unknown_request"
+        },
+        {
+          "closed": [
+            [
+              1,
+              "invitation_invalid"
+            ]
+          ],
+          "op": "tick",
+          "out": [
+            {
+              "approval_ended": {
+                "joiner": "a",
+                "reason": "window_ended"
+              }
+            },
+            {
+              "close": {
+                "code": "invitation_invalid",
+                "conn": 1,
+                "from": "host"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "code": "RV83-ADZ8-S423",
+      "description": "Allowed while away, the device recovers at the end of the Allow window, before the host's timer has run: nothing is enrolled and the recovery gets the miss hold.",
+      "draws": {
+        "a": [
+          {
+            "bytes": "d27f726c6ef791779daad69bcb84964d"
+          },
+          {
+            "bytes": "4d5ed512ad8f4857f0ee25a7bf5cd302af275cf01825f3ce8d1c906f67ea8de8"
+          }
+        ],
+        "host": [
+          {
+            "bytes": "c2206fc0bd318594f8cc73bc35106fba"
+          },
+          {
+            "bytes": "f87b28c38a8dbfc8d9848243"
+          },
+          {
+            "bytes": "038f9c1c84034870a9b65832a5f2bad9063feebe9de6c9e88643afe9ecdd3c83"
+          }
+        ]
+      },
+      "invitation": "c2206fc0bd318594f8cc73bc35106fba",
+      "name": "a_claim_at_the_window_end_before_the_timer",
+      "steps": [
+        {
+          "conn": 1,
+          "joiner": "a",
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a30007016452563833026161",
+                "from": "a"
+              }
+            },
+            {
+              "admitted": {
+                "conn": 1
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000201020250c2206fc0bd318594f8cc73bc35106fba",
+                "from": "host"
+              }
+            }
+          ]
+        },
+        {
+          "at": 10,
+          "code": "right",
+          "conn": 1,
+          "joiner": "a",
+          "op": "submit",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150d27f726c6ef791779daad69bcb84964d025822207a8cc438a806d5e2772d178eeada2d216df9f19cf18b1b3beb6952efcc61206700",
+                "from": "a"
+              }
+            },
+            {
+              "attempts_left": 4
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150d27f726c6ef791779daad69bcb84964d025862202439397e9e36a9ef3992176a948ed89acff1575219fc93aeaf4179e9e9c97f000006e0c544385ce6a03b95845f8b2bf75e909876cfddc8d3618ac0c090cd3bb28f55283996531c3e3d2f62470108833cf80c6b686b80bb95628a8dad403fb08644",
+                "from": "host"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150d27f726c6ef791779daad69bcb84964d0258406153c6342535f56c3ebd859927cf33fa44dc27558ec72c0871c4c363770a1f3d5ec54cb79ab89f125b8fe32906ffa1374b05e9b9dc797e227a5fb09d9c715f1d",
+                "from": "a"
+              }
+            },
+            {
+              "approval": {
+                "answer_by": 1790000310,
+                "decision": "pending",
+                "joiner": "a",
+                "name": "a",
+                "presence": "connected",
+                "role": "owner"
+              }
+            }
+          ]
+        },
+        {
+          "conn": 1,
+          "op": "drop",
+          "out": [
+            {
+              "approval": {
+                "answer_by": 1790000310,
+                "decision": "pending",
+                "joiner": "a",
+                "name": "a",
+                "presence": "away",
+                "role": "owner"
+              }
+            }
+          ]
+        },
+        {
+          "at": 309,
+          "host_status": "allowed",
+          "joiner": "a",
+          "op": "allow",
+          "out": [
+            {
+              "approval": {
+                "answer_by": 1790000310,
+                "decision": "allowed",
+                "joiner": "a",
+                "name": "a",
+                "presence": "away",
+                "role": "owner"
+              }
+            }
+          ],
+          "result": "ok"
+        },
+        {
+          "at": 310,
+          "conn": 2,
+          "grants": [],
+          "held": [
+            2
+          ],
+          "joiner": "a",
+          "op": "recover",
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a400070164525638330261610350c2206fc0bd318594f8cc73bc35106fba",
+                "from": "a"
+              }
+            },
+            {
+              "miss_hold": {
+                "conn": 2,
+                "hold_ms": 1000
+              }
+            }
+          ]
+        },
+        {
+          "host_status": "gone",
+          "op": "tick",
+          "out": [
+            {
+              "approval_ended": {
+                "joiner": "a",
+                "reason": "window_ended"
+              }
+            },
+            {
+              "invitation_ended": "invitation_invalid"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "code": "RV83-ADZ8-S423",
       "description": "The connection drops after the device verified the host's confirmation but before its own reached the host. Its recovery hears AUTHORIZED {join_only, I, not_received}.",
       "draws": {
         "a": [
@@ -4094,6 +5925,1016 @@
             }
           ],
           "requests": []
+        }
+      ]
+    },
+    {
+      "code": "RV83-ADZ8-S423",
+      "description": "The device passed the code and cancelled; its outcome is kept until its Allow window ends. A recovery after that, while the invitation is still open, gets the miss hold, never not_received.",
+      "draws": {
+        "a": [
+          {
+            "bytes": "d27f726c6ef791779daad69bcb84964d"
+          },
+          {
+            "bytes": "4d5ed512ad8f4857f0ee25a7bf5cd302af275cf01825f3ce8d1c906f67ea8de8"
+          }
+        ],
+        "host": [
+          {
+            "bytes": "c2206fc0bd318594f8cc73bc35106fba"
+          },
+          {
+            "bytes": "f87b28c38a8dbfc8d9848243"
+          },
+          {
+            "bytes": "038f9c1c84034870a9b65832a5f2bad9063feebe9de6c9e88643afe9ecdd3c83"
+          }
+        ]
+      },
+      "invitation": "c2206fc0bd318594f8cc73bc35106fba",
+      "name": "a_forgotten_outcome_is_never_not_received",
+      "steps": [
+        {
+          "conn": 1,
+          "joiner": "a",
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a30007016452563833026161",
+                "from": "a"
+              }
+            },
+            {
+              "admitted": {
+                "conn": 1
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000201020250c2206fc0bd318594f8cc73bc35106fba",
+                "from": "host"
+              }
+            }
+          ]
+        },
+        {
+          "code": "right",
+          "conn": 1,
+          "joiner": "a",
+          "op": "submit",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150d27f726c6ef791779daad69bcb84964d025822207a8cc438a806d5e2772d178eeada2d216df9f19cf18b1b3beb6952efcc61206700",
+                "from": "a"
+              }
+            },
+            {
+              "attempts_left": 4
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150d27f726c6ef791779daad69bcb84964d025862202439397e9e36a9ef3992176a948ed89acff1575219fc93aeaf4179e9e9c97f000006e0c544385ce6a03b95845f8b2bf75e909876cfddc8d3618ac0c090cd3bb28f55283996531c3e3d2f62470108833cf80c6b686b80bb95628a8dad403fb08644",
+                "from": "host"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150d27f726c6ef791779daad69bcb84964d0258406153c6342535f56c3ebd859927cf33fa44dc27558ec72c0871c4c363770a1f3d5ec54cb79ab89f125b8fe32906ffa1374b05e9b9dc797e227a5fb09d9c715f1d",
+                "from": "a"
+              }
+            },
+            {
+              "approval": {
+                "answer_by": 1790000300,
+                "decision": "pending",
+                "joiner": "a",
+                "name": "a",
+                "presence": "connected",
+                "role": "owner"
+              }
+            }
+          ]
+        },
+        {
+          "closed": [
+            [
+              1,
+              "cancelled"
+            ]
+          ],
+          "conn": 1,
+          "joiner": "a",
+          "op": "cancel",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300050150d27f726c6ef791779daad69bcb84964d0210",
+                "from": "a"
+              }
+            },
+            {
+              "approval_ended": {
+                "joiner": "a",
+                "reason": "cancelled"
+              }
+            },
+            {
+              "close": {
+                "code": "cancelled",
+                "conn": 1,
+                "from": "host"
+              }
+            }
+          ]
+        },
+        {
+          "at": 300,
+          "host_status": "open",
+          "op": "tick",
+          "out": []
+        },
+        {
+          "conn": 2,
+          "held": [
+            2
+          ],
+          "joiner": "a",
+          "op": "recover",
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a400070164525638330261610350c2206fc0bd318594f8cc73bc35106fba",
+                "from": "a"
+              }
+            },
+            {
+              "miss_hold": {
+                "conn": 2,
+                "hold_ms": 1000
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "code": "RV83-ADZ8-S423",
+      "description": "The device's confirmation (msg_c) is still on its way on connection 1 when its recovery with the cancel flag arrives. The host retires connection 1 and its attempt before it answers cancelled, so the confirmation, which then never arrives, opens no request.",
+      "draws": {
+        "a": [
+          {
+            "bytes": "d27f726c6ef791779daad69bcb84964d"
+          },
+          {
+            "bytes": "4d5ed512ad8f4857f0ee25a7bf5cd302af275cf01825f3ce8d1c906f67ea8de8"
+          }
+        ],
+        "host": [
+          {
+            "bytes": "c2206fc0bd318594f8cc73bc35106fba"
+          },
+          {
+            "bytes": "f87b28c38a8dbfc8d9848243"
+          },
+          {
+            "bytes": "038f9c1c84034870a9b65832a5f2bad9063feebe9de6c9e88643afe9ecdd3c83"
+          }
+        ]
+      },
+      "invitation": "c2206fc0bd318594f8cc73bc35106fba",
+      "name": "a_recovery_cancel_before_the_confirmation_arrives",
+      "steps": [
+        {
+          "conn": 1,
+          "joiner": "a",
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a30007016452563833026161",
+                "from": "a"
+              }
+            },
+            {
+              "admitted": {
+                "conn": 1
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000201020250c2206fc0bd318594f8cc73bc35106fba",
+                "from": "host"
+              }
+            }
+          ]
+        },
+        {
+          "code": "right",
+          "conn": 1,
+          "hold": "msg_c",
+          "joiner": "a",
+          "op": "submit",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150d27f726c6ef791779daad69bcb84964d025822207a8cc438a806d5e2772d178eeada2d216df9f19cf18b1b3beb6952efcc61206700",
+                "from": "a"
+              }
+            },
+            {
+              "attempts_left": 4
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150d27f726c6ef791779daad69bcb84964d025862202439397e9e36a9ef3992176a948ed89acff1575219fc93aeaf4179e9e9c97f000006e0c544385ce6a03b95845f8b2bf75e909876cfddc8d3618ac0c090cd3bb28f55283996531c3e3d2f62470108833cf80c6b686b80bb95628a8dad403fb08644",
+                "from": "host"
+              }
+            }
+          ],
+          "requests": []
+        },
+        {
+          "cancel": true,
+          "closed": [
+            [
+              1,
+              "cancelled"
+            ],
+            [
+              2,
+              "cancelled"
+            ]
+          ],
+          "conn": 2,
+          "joiner": "a",
+          "op": "recover",
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a500070164525638330261610350c2206fc0bd318594f8cc73bc35106fba0401",
+                "from": "a"
+              }
+            },
+            {
+              "close": {
+                "code": "cancelled",
+                "conn": 1,
+                "from": "host"
+              }
+            },
+            {
+              "close": {
+                "code": "cancelled",
+                "conn": 2,
+                "from": "host"
+              }
+            }
+          ]
+        },
+        {
+          "conn": 1,
+          "joiner": "a",
+          "op": "deliver",
+          "out": [
+            {
+              "undelivered": {
+                "conn": 1
+              }
+            }
+          ],
+          "requests": []
+        },
+        {
+          "grants": [],
+          "joiner": "a",
+          "op": "allow",
+          "out": [],
+          "result": "unknown_request"
+        }
+      ]
+    },
+    {
+      "code": "RV83-ADZ8-S423",
+      "description": "a passes and goes away; b uses up the other four attempts, so only a's request keeps the invitation open. a's recovery cancels: the invitation ends at once, the next lookup gets the miss hold, and a's next recovery still hears cancelled.",
+      "draws": {
+        "a": [
+          {
+            "bytes": "d27f726c6ef791779daad69bcb84964d"
+          },
+          {
+            "bytes": "4d5ed512ad8f4857f0ee25a7bf5cd302af275cf01825f3ce8d1c906f67ea8de8"
+          }
+        ],
+        "b": [
+          {
+            "bytes": "1edbc53f7f9e2d49fc5df922aebbfd2d"
+          },
+          {
+            "bytes": "52c99ef6dd2f19a19a3715dc585e78919d214ad2078a05b843438d0a803b3c4f"
+          },
+          {
+            "bytes": "7da5b61122f5ff45037762f6225d2a5f"
+          },
+          {
+            "bytes": "e3e217508560201283b13afaa8428b4cdd4b30f8ca95f341964356dde006dfff"
+          },
+          {
+            "bytes": "2da73feb0d66832230c887e02ac7e8a0"
+          },
+          {
+            "bytes": "e34c41b6baa9a3aec5d87a9a8ccc01bcc84d975d27b5aec22c281ab28cfb3d14"
+          },
+          {
+            "bytes": "97e2c02e229f0fee21818638c00fe150"
+          },
+          {
+            "bytes": "c66f4e0700ed4fc949dde4fbcb28e7b73295d4fc74e2266889007e273fa085f0"
+          }
+        ],
+        "c": [],
+        "host": [
+          {
+            "bytes": "c2206fc0bd318594f8cc73bc35106fba"
+          },
+          {
+            "bytes": "f87b28c38a8dbfc8d9848243"
+          },
+          {
+            "bytes": "038f9c1c84034870a9b65832a5f2bad9063feebe9de6c9e88643afe9ecdd3c83"
+          },
+          {
+            "bytes": "06f410db06e7c08f77ac9dd17ac200efff80fd27c7f991e2fc53a551322e1101"
+          },
+          {
+            "bytes": "5e6ce08b338998b0e6cbb8ac4bb5ce97bc166471e097443fcaa4e1549b8da931"
+          },
+          {
+            "bytes": "ff4b015ffa225ccb9c815410149531563ff574245274d788c59a7e63637f4f1d"
+          },
+          {
+            "bytes": "174aac9514022b661d525966e15340e5f7e8c2cf0681b72e0434cd6df040430f"
+          }
+        ]
+      },
+      "invitation": "c2206fc0bd318594f8cc73bc35106fba",
+      "name": "a_recovery_cancel_ends_an_exhausted_invitation",
+      "steps": [
+        {
+          "conn": 1,
+          "joiner": "a",
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a30007016452563833026161",
+                "from": "a"
+              }
+            },
+            {
+              "admitted": {
+                "conn": 1
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000201020250c2206fc0bd318594f8cc73bc35106fba",
+                "from": "host"
+              }
+            }
+          ]
+        },
+        {
+          "code": "right",
+          "conn": 1,
+          "joiner": "a",
+          "op": "submit",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150d27f726c6ef791779daad69bcb84964d025822207a8cc438a806d5e2772d178eeada2d216df9f19cf18b1b3beb6952efcc61206700",
+                "from": "a"
+              }
+            },
+            {
+              "attempts_left": 4
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150d27f726c6ef791779daad69bcb84964d025862202439397e9e36a9ef3992176a948ed89acff1575219fc93aeaf4179e9e9c97f000006e0c544385ce6a03b95845f8b2bf75e909876cfddc8d3618ac0c090cd3bb28f55283996531c3e3d2f62470108833cf80c6b686b80bb95628a8dad403fb08644",
+                "from": "host"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150d27f726c6ef791779daad69bcb84964d0258406153c6342535f56c3ebd859927cf33fa44dc27558ec72c0871c4c363770a1f3d5ec54cb79ab89f125b8fe32906ffa1374b05e9b9dc797e227a5fb09d9c715f1d",
+                "from": "a"
+              }
+            },
+            {
+              "approval": {
+                "answer_by": 1790000300,
+                "decision": "pending",
+                "joiner": "a",
+                "name": "a",
+                "presence": "connected",
+                "role": "owner"
+              }
+            }
+          ]
+        },
+        {
+          "conn": 1,
+          "op": "drop",
+          "out": [
+            {
+              "approval": {
+                "answer_by": 1790000300,
+                "decision": "pending",
+                "joiner": "a",
+                "name": "a",
+                "presence": "away",
+                "role": "owner"
+              }
+            }
+          ]
+        },
+        {
+          "conn": 2,
+          "joiner": "b",
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a30007016452563833026162",
+                "from": "b"
+              }
+            },
+            {
+              "admitted": {
+                "conn": 2
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a3000201020250c2206fc0bd318594f8cc73bc35106fba",
+                "from": "host"
+              }
+            }
+          ]
+        },
+        {
+          "code": "wrong",
+          "conn": 2,
+          "joiner": "b",
+          "op": "submit",
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a3000401501edbc53f7f9e2d49fc5df922aebbfd2d0258222090697980f16f6e2619ba4f84dc1a7ff5c4f431f66331e4eaa77a018d0309545500",
+                "from": "b"
+              }
+            },
+            {
+              "attempts_left": 3
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a3000401501edbc53f7f9e2d49fc5df922aebbfd2d025862202eec977a9d84fcbbeb2f7957ae6b2f35368737a6ceb3ba773cdd27bdc45f7d59008826073963778c8f1a1db5fbe111a2d9de0908e1b33dc796d1fedea076a667e7ace57b32a24c21732dbfb60bec0833f5ae62b7491d6ab6247c8de04c1b1c0f3a",
+                "from": "host"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a3000501501edbc53f7f9e2d49fc5df922aebbfd2d020a",
+                "from": "b"
+              }
+            },
+            {
+              "close": {
+                "code": "pairing_failed",
+                "conn": 2,
+                "from": "b"
+              }
+            }
+          ]
+        },
+        {
+          "conn": 3,
+          "joiner": "b",
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 3,
+                "control": "a30007016452563833026162",
+                "from": "b"
+              }
+            },
+            {
+              "admitted": {
+                "conn": 3
+              }
+            },
+            {
+              "send": {
+                "conn": 3,
+                "control": "a3000201020250c2206fc0bd318594f8cc73bc35106fba",
+                "from": "host"
+              }
+            }
+          ]
+        },
+        {
+          "code": "wrong",
+          "conn": 3,
+          "joiner": "b",
+          "op": "submit",
+          "out": [
+            {
+              "send": {
+                "conn": 3,
+                "control": "a3000401507da5b61122f5ff45037762f6225d2a5f02582220107942f439d0bd8830e0fd6e69473cf732ad9e07e203884d8c7d43a3757ba34700",
+                "from": "b"
+              }
+            },
+            {
+              "attempts_left": 2
+            },
+            {
+              "send": {
+                "conn": 3,
+                "control": "a3000401507da5b61122f5ff45037762f6225d2a5f0258622052cf8f5252422e2bb64f677575a7afd66ad5885922cb8fd5543b692672213279002306a58ce22719989dacd1bb6de76d3fd865b68520b0014ac1bb750e0298cd2e026e0f3a1fad7de10041441364d1aacfac1ebf04c102385a8191ee00f1430780",
+                "from": "host"
+              }
+            },
+            {
+              "send": {
+                "conn": 3,
+                "control": "a3000501507da5b61122f5ff45037762f6225d2a5f020a",
+                "from": "b"
+              }
+            },
+            {
+              "close": {
+                "code": "pairing_failed",
+                "conn": 3,
+                "from": "b"
+              }
+            }
+          ]
+        },
+        {
+          "conn": 4,
+          "joiner": "b",
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 4,
+                "control": "a30007016452563833026162",
+                "from": "b"
+              }
+            },
+            {
+              "admitted": {
+                "conn": 4
+              }
+            },
+            {
+              "send": {
+                "conn": 4,
+                "control": "a3000201020250c2206fc0bd318594f8cc73bc35106fba",
+                "from": "host"
+              }
+            }
+          ]
+        },
+        {
+          "code": "wrong",
+          "conn": 4,
+          "joiner": "b",
+          "op": "submit",
+          "out": [
+            {
+              "send": {
+                "conn": 4,
+                "control": "a3000401502da73feb0d66832230c887e02ac7e8a002582220b00f02bba17de97f18f1e07452146a2909932dcffa5cf075263d3f27fac24d0700",
+                "from": "b"
+              }
+            },
+            {
+              "attempts_left": 1
+            },
+            {
+              "send": {
+                "conn": 4,
+                "control": "a3000401502da73feb0d66832230c887e02ac7e8a002586220e435a8ecfa4e21880922946b46c969895939480a97664e958d5dbc509433657f00e3c615973ba363e636bd6db78a871fc64d48232946885b2d16d878634a5ce9e1a92340348e8e82010f73f6dca932001068c046275da8c01f075d980550a66a3f",
+                "from": "host"
+              }
+            },
+            {
+              "send": {
+                "conn": 4,
+                "control": "a3000501502da73feb0d66832230c887e02ac7e8a0020a",
+                "from": "b"
+              }
+            },
+            {
+              "close": {
+                "code": "pairing_failed",
+                "conn": 4,
+                "from": "b"
+              }
+            }
+          ]
+        },
+        {
+          "conn": 5,
+          "joiner": "b",
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 5,
+                "control": "a30007016452563833026162",
+                "from": "b"
+              }
+            },
+            {
+              "admitted": {
+                "conn": 5
+              }
+            },
+            {
+              "send": {
+                "conn": 5,
+                "control": "a3000201020250c2206fc0bd318594f8cc73bc35106fba",
+                "from": "host"
+              }
+            }
+          ]
+        },
+        {
+          "code": "wrong",
+          "conn": 5,
+          "host_attempts_left": 0,
+          "host_status": "open",
+          "joiner": "b",
+          "op": "submit",
+          "out": [
+            {
+              "send": {
+                "conn": 5,
+                "control": "a30004015097e2c02e229f0fee21818638c00fe15002582220bef6a2a61823b1a4b847149a25ae4f7b66ac7f8fe1690587d631f71f86d08c2900",
+                "from": "b"
+              }
+            },
+            {
+              "attempts_left": 0
+            },
+            {
+              "send": {
+                "conn": 5,
+                "control": "a30004015097e2c02e229f0fee21818638c00fe1500258622022bb408497a3a1dfafc8156677b04c83989ea5a723de28dd19cdf155f9fb210900ce25dd55100da0d2bce5b434070bd07b315fe9d99d2a6cb0f580af05eac63f21aa769159229e30664ec08e5952720163c76e01e858ed9552fd179965275635ce",
+                "from": "host"
+              }
+            },
+            {
+              "send": {
+                "conn": 5,
+                "control": "a30005015097e2c02e229f0fee21818638c00fe150020a",
+                "from": "b"
+              }
+            },
+            {
+              "close": {
+                "code": "pairing_failed",
+                "conn": 5,
+                "from": "b"
+              }
+            }
+          ]
+        },
+        {
+          "cancel": true,
+          "closed": [
+            [
+              6,
+              "cancelled"
+            ]
+          ],
+          "conn": 6,
+          "host_status": "ended:attempts_exhausted",
+          "joiner": "a",
+          "op": "recover",
+          "out": [
+            {
+              "send": {
+                "conn": 6,
+                "control": "a500070164525638330261610350c2206fc0bd318594f8cc73bc35106fba0401",
+                "from": "a"
+              }
+            },
+            {
+              "approval_ended": {
+                "joiner": "a",
+                "reason": "cancelled"
+              }
+            },
+            {
+              "close": {
+                "code": "cancelled",
+                "conn": 6,
+                "from": "host"
+              }
+            },
+            {
+              "invitation_ended": "attempts_exhausted"
+            }
+          ]
+        },
+        {
+          "conn": 7,
+          "held": [
+            7
+          ],
+          "joiner": "c",
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 7,
+                "control": "a30007016452563833026163",
+                "from": "c"
+              }
+            },
+            {
+              "miss_hold": {
+                "conn": 7,
+                "hold_ms": 1000
+              }
+            }
+          ]
+        },
+        {
+          "closed": [
+            [
+              8,
+              "cancelled"
+            ]
+          ],
+          "conn": 8,
+          "joiner": "a",
+          "op": "recover",
+          "out": [
+            {
+              "send": {
+                "conn": 8,
+                "control": "a400070164525638330261610350c2206fc0bd318594f8cc73bc35106fba",
+                "from": "a"
+              }
+            },
+            {
+              "close": {
+                "code": "cancelled",
+                "conn": 8,
+                "from": "host"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "code": "RV83-ADZ8-S423",
+      "description": "The owner allowed and the connection broke before any stream; then the host restarted. The invitation is gone, but the provisional grant was stored: step 2 binds the recovery to it, the receipt answers PAIRED, and the first stream frame commits it.",
+      "draws": {
+        "a": [
+          {
+            "bytes": "d27f726c6ef791779daad69bcb84964d"
+          },
+          {
+            "bytes": "4d5ed512ad8f4857f0ee25a7bf5cd302af275cf01825f3ce8d1c906f67ea8de8"
+          }
+        ],
+        "host": [
+          {
+            "bytes": "c2206fc0bd318594f8cc73bc35106fba"
+          },
+          {
+            "bytes": "f87b28c38a8dbfc8d9848243"
+          },
+          {
+            "bytes": "038f9c1c84034870a9b65832a5f2bad9063feebe9de6c9e88643afe9ecdd3c83"
+          }
+        ]
+      },
+      "invitation": "c2206fc0bd318594f8cc73bc35106fba",
+      "name": "a_provisional_grant_survives_a_restart",
+      "steps": [
+        {
+          "conn": 1,
+          "joiner": "a",
+          "op": "connect",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a30007016452563833026161",
+                "from": "a"
+              }
+            },
+            {
+              "admitted": {
+                "conn": 1
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000201020250c2206fc0bd318594f8cc73bc35106fba",
+                "from": "host"
+              }
+            }
+          ]
+        },
+        {
+          "code": "right",
+          "conn": 1,
+          "joiner": "a",
+          "op": "submit",
+          "out": [
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150d27f726c6ef791779daad69bcb84964d025822207a8cc438a806d5e2772d178eeada2d216df9f19cf18b1b3beb6952efcc61206700",
+                "from": "a"
+              }
+            },
+            {
+              "attempts_left": 4
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150d27f726c6ef791779daad69bcb84964d025862202439397e9e36a9ef3992176a948ed89acff1575219fc93aeaf4179e9e9c97f000006e0c544385ce6a03b95845f8b2bf75e909876cfddc8d3618ac0c090cd3bb28f55283996531c3e3d2f62470108833cf80c6b686b80bb95628a8dad403fb08644",
+                "from": "host"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a300040150d27f726c6ef791779daad69bcb84964d0258406153c6342535f56c3ebd859927cf33fa44dc27558ec72c0871c4c363770a1f3d5ec54cb79ab89f125b8fe32906ffa1374b05e9b9dc797e227a5fb09d9c715f1d",
+                "from": "a"
+              }
+            },
+            {
+              "approval": {
+                "answer_by": 1790000300,
+                "decision": "pending",
+                "joiner": "a",
+                "name": "a",
+                "presence": "connected",
+                "role": "owner"
+              }
+            }
+          ]
+        },
+        {
+          "joiner": "a",
+          "op": "allow",
+          "out": [
+            {
+              "approval_ended": {
+                "joiner": "a",
+                "reason": "enrolled"
+              }
+            },
+            {
+              "enrolled": {
+                "conn": 1,
+                "grant": 0,
+                "joiner": "a",
+                "role": "owner"
+              }
+            },
+            {
+              "send": {
+                "conn": 1,
+                "control": "a3000601644465736b02656f776e6572",
+                "from": "host"
+              }
+            }
+          ],
+          "result": "ok"
+        },
+        {
+          "conn": 1,
+          "op": "drop",
+          "out": []
+        },
+        {
+          "grants": [
+            [
+              "a",
+              "a",
+              "owner",
+              "provisional"
+            ]
+          ],
+          "host_status": "gone",
+          "op": "restart",
+          "out": [
+            {
+              "restart": true
+            }
+          ]
+        },
+        {
+          "conn": 2,
+          "joiner": "a",
+          "op": "recover",
+          "out": [
+            {
+              "send": {
+                "conn": 2,
+                "control": "a200020101",
+                "from": "host"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a400070164525638330261610350c2206fc0bd318594f8cc73bc35106fba",
+                "from": "a"
+              }
+            },
+            {
+              "send": {
+                "conn": 2,
+                "control": "a3000601644465736b02656f776e6572",
+                "from": "host"
+              }
+            }
+          ],
+          "paired": [
+            [
+              2,
+              "owner"
+            ]
+          ]
+        },
+        {
+          "conn": 2,
+          "grants": [
+            [
+              "a",
+              "a",
+              "owner",
+              "direct"
+            ]
+          ],
+          "op": "stream",
+          "out": [
+            {
+              "stream": {
+                "conn": 2,
+                "verdict": "commit"
+              }
+            },
+            {
+              "committed": {
+                "conn": 2,
+                "grant": 0,
+                "joiner": "a"
+              }
+            }
+          ]
         }
       ]
     },

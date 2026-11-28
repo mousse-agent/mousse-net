@@ -556,6 +556,7 @@ impl CallerDev {
         match cc.gate.check(traffic) {
             Verdict::Allow => true,
             Verdict::Ignore => false,
+            Verdict::Commit(_) => unreachable!("the caller gate commits nothing"),
             Verdict::Close(code) => {
                 sim.say(
                     self.id,
