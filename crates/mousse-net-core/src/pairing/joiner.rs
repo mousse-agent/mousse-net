@@ -650,9 +650,13 @@ impl<F: CodeExchangeFactory> JoinerPairing<F> {
             &exporters.pair,
         );
         let sid = attempt_sid(&attempt, &exporters.pair);
-        let mut exchange = self
-            .factory
-            .start(ExchangeRole::Initiator, code, &binding, &sid, rng);
+        let mut exchange = self.factory.start(
+            ExchangeRole::Initiator,
+            code.as_bytes(),
+            &binding,
+            &sid,
+            rng,
+        );
         let actions = match exchange.step(None) {
             Ok(step) => match step.send {
                 Some(payload) => {

@@ -1248,7 +1248,7 @@ impl CodeExchangeFactory for FailingFactory {
     fn start<R: CryptoRng + ?Sized>(
         &self,
         _: ExchangeRole,
-        _: &PairingCode,
+        _: &[u8],
         _: &BindingTranscript,
         _: &[u8; SID_LEN],
         _: &mut R,

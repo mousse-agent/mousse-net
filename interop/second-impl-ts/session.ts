@@ -46,6 +46,9 @@ export class Gate {
 
   get version() { return this.agreed; }
 
+  /** Whether the connection has carried any stream frame. */
+  get carriedStream() { return this.streamSeen; }
+
   receiveHello(peer: Version, local: Version = hello): UInt | 'ignored' | 'close:unsupported_version' {
     if (this.agreed !== undefined || this.state.startsWith('closed:')) return 'ignored';
     try {

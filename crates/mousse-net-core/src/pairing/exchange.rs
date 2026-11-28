@@ -145,14 +145,15 @@ pub trait CodeExchangeFactory {
     /// The per-attempt exchange.
     type Exchange: CodeExchange;
 
-    /// Start an exchange for `role`: the code is the password, the binding
-    /// transcript the channel identifier (CI) and `sid` the attempt's session
-    /// id (see [`super::attempt_sid`]). All randomness the exchange needs is
-    /// drawn here, from `rng`.
+    /// Start an exchange for `role`: `password` is the CPace `PRS` (the 6
+    /// digits of a [`PairingCode`], or the 8 secret characters of a
+    /// [`super::DirectCode`]), the binding transcript the channel identifier
+    /// (CI) and `sid` the attempt's session id (see [`super::attempt_sid`]).
+    /// All randomness the exchange needs is drawn here, from `rng`.
     fn start<R: CryptoRng + ?Sized>(
         &self,
         role: ExchangeRole,
-        code: &PairingCode,
+        password: &[u8],
         binding: &BindingTranscript,
         sid: &[u8; SID_LEN],
         rng: &mut R,
@@ -178,7 +179,7 @@ enum CpaceState {
 /// One side of a CPace attempt.
 pub struct CpaceExchange {
     role: ExchangeRole,
-    code: PairingCode,
+    password: Zeroizing<Vec<u8>>,
     ci: Vec<u8>,
     sid: [u8; SID_LEN],
     state: CpaceState,
@@ -196,7 +197,7 @@ impl CodeExchangeFactory for CpaceExchangeFactory {
     fn start<R: CryptoRng + ?Sized>(
         &self,
         role: ExchangeRole,
-        code: &PairingCode,
+        password: &[u8],
         binding: &BindingTranscript,
         sid: &[u8; SID_LEN],
         rng: &mut R,
@@ -205,7 +206,7 @@ impl CodeExchangeFactory for CpaceExchangeFactory {
         // starts, in a fixed order.
         CpaceExchange {
             role,
-            code: code.clone(),
+            password: Zeroizing::new(password.to_vec()),
             ci: binding.as_bytes().to_vec(),
             sid: *sid,
             state: CpaceState::Fresh(sample_scalar(rng)),
@@ -224,7 +225,7 @@ impl CodeExchange for CpaceExchange {
     fn step(&mut self, incoming: Option<&[u8]>) -> Result<ExchangeStep, ExchangeError> {
         let state = std::mem::replace(&mut self.state, CpaceState::Done);
         let inputs = Inputs {
-            prs: self.code.as_bytes(),
+            prs: &self.password,
             ci: &self.ci,
             sid: &self.sid,
             ad: &[],
@@ -292,7 +293,7 @@ pub mod insecure {
     /// One side of the stand-in exchange.
     pub struct InsecureTestExchange {
         role: ExchangeRole,
-        code: PairingCode,
+        password: Zeroizing<Vec<u8>>,
         binding: Vec<u8>,
         own_nonce: [u8; 16],
         peer_nonce: Option<[u8; 16]>,
@@ -306,8 +307,8 @@ pub mod insecure {
             responder_nonce: &[u8; 16],
             label: u8,
         ) -> [u8; 32] {
-            let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(self.code.as_bytes())
-                .expect("any key length");
+            let mut mac =
+                <Hmac<Sha256> as KeyInit>::new_from_slice(&self.password).expect("any key length");
             mac.update(&self.binding);
             mac.update(initiator_nonce);
             mac.update(responder_nonce);
@@ -322,7 +323,7 @@ pub mod insecure {
         fn start<R: CryptoRng + ?Sized>(
             &self,
             role: ExchangeRole,
-            code: &PairingCode,
+            password: &[u8],
             binding: &BindingTranscript,
             sid: &[u8; SID_LEN],
             rng: &mut R,
@@ -333,7 +334,7 @@ pub mod insecure {
             bound.extend_from_slice(sid);
             InsecureTestExchange {
                 role,
-                code: code.clone(),
+                password: Zeroizing::new(password.to_vec()),
                 binding: bound,
                 own_nonce,
                 peer_nonce: None,
@@ -467,14 +468,14 @@ mod tests {
         let code = |c: &str| PairingCode::parse(c).unwrap();
         let mut i = f.start(
             ExchangeRole::Initiator,
-            &code(codes.0),
+            code(codes.0).as_bytes(),
             &binding(bindings.0),
             &sids.0,
             &mut rng,
         );
         let mut r = f.start(
             ExchangeRole::Responder,
-            &code(codes.1),
+            code(codes.1).as_bytes(),
             &binding(bindings.1),
             &sids.1,
             &mut rng,
@@ -515,17 +516,47 @@ mod tests {
         let mut rng = ChaCha20Rng::from_seed([3; 32]);
         let code = PairingCode::parse("123456").unwrap();
         let b = binding(0);
-        let mut r = f.start(ExchangeRole::Responder, &code, &b, &[1; 32], &mut rng);
+        let mut r = f.start(
+            ExchangeRole::Responder,
+            code.as_bytes(),
+            &b,
+            &[1; 32],
+            &mut rng,
+        );
         assert_eq!(r.step(None), Err(ExchangeError::OutOfOrder));
-        let mut r = f.start(ExchangeRole::Responder, &code, &b, &[1; 32], &mut rng);
+        let mut r = f.start(
+            ExchangeRole::Responder,
+            code.as_bytes(),
+            &b,
+            &[1; 32],
+            &mut rng,
+        );
         assert_eq!(r.step(Some(&[0x20; 10])), Err(ExchangeError::Malformed));
         // A failed step ends the exchange.
         assert_eq!(r.step(Some(&[0x20; 10])), Err(ExchangeError::OutOfOrder));
-        let mut i = f.start(ExchangeRole::Initiator, &code, &b, &[1; 32], &mut rng);
+        let mut i = f.start(
+            ExchangeRole::Initiator,
+            code.as_bytes(),
+            &b,
+            &[1; 32],
+            &mut rng,
+        );
         assert_eq!(i.step(Some(b"x")), Err(ExchangeError::OutOfOrder));
         // A forged confirmation from the initiator fails on the responder.
-        let mut i = f.start(ExchangeRole::Initiator, &code, &b, &[1; 32], &mut rng);
-        let mut r = f.start(ExchangeRole::Responder, &code, &b, &[1; 32], &mut rng);
+        let mut i = f.start(
+            ExchangeRole::Initiator,
+            code.as_bytes(),
+            &b,
+            &[1; 32],
+            &mut rng,
+        );
+        let mut r = f.start(
+            ExchangeRole::Responder,
+            code.as_bytes(),
+            &b,
+            &[1; 32],
+            &mut rng,
+        );
         let m1 = i.step(None).unwrap().send.unwrap();
         r.step(Some(&m1)).unwrap();
         assert_eq!(
@@ -551,10 +582,10 @@ mod tests {
         };
         // msg_a with AD, to our responder.
         let (_, msg_a) = Initiator::start(&inputs, &mut rng).unwrap();
-        let mut r = f.start(ExchangeRole::Responder, &code, &b, &sid, &mut rng);
+        let mut r = f.start(ExchangeRole::Responder, code.as_bytes(), &b, &sid, &mut rng);
         assert_eq!(r.step(Some(&msg_a)), Err(ExchangeError::Malformed));
         // msg_b with AD, to our initiator.
-        let mut i = f.start(ExchangeRole::Initiator, &code, &b, &sid, &mut rng);
+        let mut i = f.start(ExchangeRole::Initiator, code.as_bytes(), &b, &sid, &mut rng);
         let ours = i.step(None).unwrap().send.unwrap();
         let (_, msg_b) = Responder::respond(&inputs, &ours, &mut rng).unwrap();
         assert_eq!(i.step(Some(&msg_b)), Err(ExchangeError::Malformed));

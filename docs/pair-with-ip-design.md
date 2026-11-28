@@ -43,9 +43,10 @@ authenticate with nothing but an address and a short secret.
 7. **Lost connection after the code passed:** the joiner reconnects on its
    own and learns the outcome without the code (§1.6). If the owner tapped
    Allow while it was away, it is paired as soon as it is back.
-8. **Joiner cancels while waiting for Allow:** nothing stays granted. The
-   host's prompt goes away when the cancel reaches it, at once if the
-   joiner is connected, otherwise when it next reaches the host.
+8. **Joiner cancels while waiting for Allow:** nothing stays granted, and a
+   device pairing again keeps the access it had. The host's prompt goes
+   away when the cancel reaches it, at once if the joiner is connected,
+   otherwise when it next reaches the host.
 9. **Undo:** Remove works as for any grant.
 
 ### Rules
@@ -122,8 +123,8 @@ authenticate with nothing but an address and a short secret.
 | Code type (`DirectCode`, `DirectSecret`: zeroized, `Debug` hidden, constant-time compare) | `pairing/direct_code.rs` (new) | |
 | Joiner state machine | `DirectJoinerPairing`, `pairing/direct_joiner.rs` (new); no I/O | One flow |
 | **Joiner attempt ledger**, keyed by the typed `L` | core decides; io stores it through a new `DirectRecords` store keyed by `L`, with the compare-and-swap and hold of `wire.md` 10.7 (`FlowRecords`, `store.rs:1038-1056`, is keyed by ticket hash and stays as it is) | Per profile; an entry is dropped 24 h after its first debit (fixed) |
-| **Joiner pending record:** `L`, host key, `I`, address | same store | From a verified host confirmation until the outcome is settled (§1.6) |
-| Grant with receipt `I` | `GrantTable` / `GrantStore`, unchanged | Durable |
+| **Joiner pending records:** `L`, host key, `I`, address; one per typed `L` and typed address, so a Connect at another address never overwrites an unsettled one | same store, under the same per-`L` hold: a flow takes it before it loads the records and gives it back when it ends or goes away (going on from away takes it again and reloads); the core flow asks for it and gives it back as actions | From a verified host confirmation until the outcome is settled (§1.6) |
+| Grant with receipt `I`, marked as made by a direct invitation; provisional until it commits (§1.4 step 8) | `GrantTable` / `GrantStore`: provisional grants are kept beside the grants and stored with them | Durable |
 | Pin, the typed address as an owner route, tailnet approval, completion record | helper `peer.rs` and `app/pairing.rs`, after `PAIRED` only | Durable |
 | Last refusal for version, per paired identity (§5) | helper, in a small store of its own next to the peer store, so a device that only uses this computer gets no `PeerRecord` (a peer record is an outbound pin the keeper dials, io `store.rs:557`); cleared by the next connection that negotiates a version | Durable |
 | "Needs update notice shown" per device (§5) | app settings | Durable |
@@ -232,8 +233,33 @@ counted as the proof (`authz.rs:390-396`).
      invitation, dismisses the other prompts and closes their connections
      with `INVITATION_INVALID`.
    - **Allow while the joiner is connected** enrolls as `wire.md` 10.8 with
-     receipt `I` (pause fence included) and sends `PAIRED {host name,
-     role}`.
+     receipt `I` (pause fence included), but the grant it makes is
+     **provisional** (below), and sends `PAIRED {host name, role}`.
+   - **Provisional, then committed.** Enrollment adds a provisional grant:
+     receipt `I`, marked as made by a direct invitation (so a ticket's
+     receipt never matches a direct recovery), stored with the grant table
+     (it survives a restart), but not yet the identity's grant. A grant the
+     identity already holds, and the connections bound to it, stay as they
+     are. No stream ever runs under it: the grant **commits** on the first
+     stream frame of a connection bound to it, which is either the pairing
+     connection (bound at enrollment), a recovery connection (§1.6), or the
+     joiner's first ordinary connection after `PAIRED` (step 2 binds a new
+     connection of that identity to the provisional grant, says
+     `AUTHORIZED {live}`, and marks it so), whichever comes first. The gate
+     hands that frame back as "commit first", and io has the direct host
+     commit before it releases the stream. Step 2 binds but does not
+     commit: a joiner that cancelled reconnects only to deliver its cancel,
+     and a recovery opens no stream before the host's answer
+     (`wire.md` 8 step 4), so its connection must not commit the grant it
+     cancels. A first-time joiner opens a stream only after it accepted
+     `PAIRED` and pinned the host; a device that pairs again may commit
+     through another of its connections first, and then its cancel comes
+     too late (below). Committing is atomic: it first checks everything
+     that can fail (the grant's expiry, a denial), then replaces the old
+     grant (its connections close with `GRANT_REVOKED`) and keeps receipt
+     `I`. When a check fails, only the provisional grant goes away: the old
+     grant and its connections stay. Allow runs the same checks before it
+     makes the provisional grant.
    - **Allow while the joiner is away** (its connection dropped) marks the
      request allowed and the prompt reads "Waiting for <name> to reconnect".
      The joiner's recovery connection (§1.6) is enrolled at once and gets
@@ -247,12 +273,20 @@ counted as the proof (`authz.rs:390-396`).
      shows the request as away; an Allow there is never claimed, because a
      cancelled joiner reconnects only to cancel. Only a close without
      `CANCELLED` keeps the request.
-   - **Cancel crossing Allow.** The cancel wins. A `CANCELLED` that arrives
-     on the connection after the host enrolled it, or a cancel delivered by
-     recovery for a grant with receipt `I`, removes that grant (it has never
-     carried a stream: the joiner never pinned the host) and closes with
-     `CANCELLED`. A joiner that cancelled ignores a `PAIRED` that crosses its
-     cancel and pins nothing.
+   - **Cancel crossing Allow.** The cancel wins while the grant is
+     provisional. The joiner's `CODE_ABORT {A, CANCELLED}` for the attempt
+     that passed reaches the host through a narrow exception in its live
+     gate (`wire.md` 8.1): on a connection bound to a provisional grant by
+     enrollment, a `CODE_ABORT` naming that connection's attempt is let
+     through; every other pairing message there is still ignored. That
+     `CODE_ABORT`, a close with `CANCELLED` on the enrolled connection, or a
+     cancel delivered by recovery removes the provisional grant and nothing
+     else, and the host closes with `CANCELLED`; the identity's earlier
+     grant and its connections stay. A committed grant cannot be cancelled:
+     a cancel that arrives later is answered as a recovery without one
+     (`PAIRED`). A joiner that cancelled ignores a `PAIRED` that crosses its
+     cancel and pins nothing; a joiner's recovery that cancels and still
+     hears `PAIRED` learns that the grant committed first.
    - **Decline** closes with `PAIRING_DECLINED` and ends the invitation.
    - **The Allow window.** A request may be answered and claimed until
      `DIRECT_ALLOW_WINDOW_SECS` (300 s) after its identity passed the code,
@@ -302,12 +336,21 @@ verified, sends `HELLO`, then `JOIN_DIRECT {1: L, 2: name, 3: receipt I,
 before `PAIRED` (`authz.rs:417`, `wire.md` 8.2), so every answer that
 enrolls is preceded by one. The host answers:
 
-- with `cancel`: removes the request, or the grant with receipt `I` for this
-  identity (§1.4 step 8, "Cancel crossing Allow"), and closes with
-  `CANCELLED`;
-- a grant for this identity with receipt `I`: step 2 already sent
-  `AUTHORIZED {live}`; then `PAIRED {host name, role}` (also after a host
-  restart);
+- a grant made by a direct invitation for this identity with receipt `I`,
+  provisional or committed (also after a host restart): `PAIRED {host name,
+  role}`. When the connection is not bound to that grant (a provisional
+  grant, or one made after this connection's step 2, for example by an
+  Allow on the original connection), the host binds it first, and sends
+  `AUTHORIZED {live}` first when step 2 sent none. With `cancel`, a
+  provisional grant is removed instead and the host closes with
+  `CANCELLED` (§1.4 step 8, "Cancel crossing Allow"); a committed one is
+  answered as without `cancel`. A grant whose receipt came from a ticket
+  (kinds 1 and 2) never matches;
+- with `cancel` otherwise: the host first retires every attempt and
+  pairing connection of this identity on the invitation (they close with
+  `CANCELLED`), so a confirmation still on its way cannot open a request
+  after the cancel was acknowledged; then it removes the request, if any,
+  and closes with `CANCELLED`;
 - this identity's request was allowed while it was away: `AUTHORIZED
   {join_only, I}`, enrollment, then `PAIRED`;
 - this identity's request still waits for Allow: `AUTHORIZED {join_only,
@@ -322,7 +365,10 @@ enrolls is preceded by one. The host answers:
   invitation until its Allow window ends, then forgets it;
 - anything else (expired, consumed by another device, host restarted with
   no grant, another identity, a forgotten outcome): `INVITATION_INVALID`.
-  Only the identity that passed the code learns that it was declined.
+  Only the identity that passed the code learns that it was declined. The
+  host remembers which identities passed the code until the invitation
+  ends, so a recovery after an outcome was forgotten never reads as
+  `not_received`.
 
 `not_received` is `AUTHORIZED` key 3 (absent when false, uint `1` when
 true), sent only in answer to a

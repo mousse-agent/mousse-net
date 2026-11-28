@@ -334,6 +334,7 @@ impl HostDev {
                         format_args!("conn {}: gate ignores {msg:?}", conn.0),
                     ),
                     Verdict::Allow => self.on_control(sim, conn, msg),
+                    Verdict::Commit(_) => unreachable!("a control message commits nothing"),
                 }
             }
             MuxEvent::StreamOpened { stream, label, .. } => {
@@ -405,6 +406,12 @@ impl HostDev {
                 true
             }
             Verdict::Ignore => false,
+            // The simulation runs no Pair with IP, so no connection is ever
+            // bound to a provisional grant.
+            Verdict::Commit(_) => {
+                self.close(sim, conn, ErrorCode::GrantRevoked);
+                false
+            }
             Verdict::Close(code) => {
                 sim.say(
                     self.id,
@@ -633,7 +640,13 @@ impl HostDev {
         );
         let factory = CountingFactory::new(self.id, self.instance, sim.work.clone());
         let sid = [0; SID_LEN];
-        let _ = factory.start(ExchangeRole::Responder, code, &binding, &sid, &mut sim.rng);
+        let _ = factory.start(
+            ExchangeRole::Responder,
+            code.as_bytes(),
+            &binding,
+            &sid,
+            &mut sim.rng,
+        );
         sim.say(self.id, format_args!("precomputes its exchange share"));
     }
 

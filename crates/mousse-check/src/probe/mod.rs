@@ -327,6 +327,7 @@ fn parse(args: &[String]) -> Result<Plan, String> {
             command: {
                 let selector = ssh_command.ok_or("the ssh route needs --ssh-profile <selector>")?;
                 mousse_net_io::pipe::ssh::remote_command(
+                    mousse_net_io::pipe::ssh::RemoteShell::Sh,
                     "mousse-helper",
                     &["pipe", "--profile", &selector],
                 )

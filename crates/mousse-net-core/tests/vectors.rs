@@ -365,6 +365,7 @@ fn verdict_name(v: Verdict) -> String {
         Verdict::Allow => "allow".into(),
         Verdict::Ignore => "ignore".into(),
         Verdict::Close(code) => format!("close:{}", code.name()),
+        Verdict::Commit(grant) => format!("commit:{}", grant.0),
     }
 }
 

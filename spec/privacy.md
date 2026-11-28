@@ -66,6 +66,11 @@ add. Each later phase updates this document before it ships.
 - An in-person ticket is accepted only from the app's own scanner
   ([`wire.md`](wire.md) 10.1), so a swapped link cannot make the joiner send
   its full name to a fake host that way.
+- **Pair with IP has no pin on first contact.** A joiner shows its identity
+  key, its computer name and the code's lookup (the first 4 characters) to
+  whatever Mousse endpoint answers at the address it typed, before the code
+  exchange has shown that it is the real host ([`wire.md`](wire.md) 10.9).
+  The secret part of the code is never sent.
 
 ## Through a relay (Phase 3)
 

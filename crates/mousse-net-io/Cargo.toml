@@ -49,6 +49,11 @@ keyring = { version = "=3.6.3", features = ["sync-secret-service", "crypto-rust"
 default = ["os-keystore"]
 os-keystore = ["dep:keyring"]
 
+[[test]]
+# Its own main: the test's executable is also the echo program it runs.
+name = "windows_shells"
+harness = false
+
 [dev-dependencies]
 # The relay tests run the real relay in the test process.
 mousse-relay = { path = "../mousse-relay" }

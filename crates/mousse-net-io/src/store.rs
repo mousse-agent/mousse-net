@@ -203,6 +203,10 @@ struct GrantRecord {
     /// and in files written before receipts were kept.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     enrolled_by: Option<String>,
+    /// The receipt names a Pair with IP invitation (wire.md 10.9). Absent
+    /// when false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    direct: bool,
     /// The role's revision, one higher after each edit. Absent in files
     /// written before roles could be edited, and for revision 1.
     #[serde(default = "first_revision", skip_serializing_if = "is_first_revision")]
@@ -211,6 +215,10 @@ struct GrantRecord {
 
 fn first_revision() -> u64 {
     1
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 fn is_first_revision(revision: &u64) -> bool {
@@ -230,6 +238,11 @@ struct GrantFile {
     /// the grant that last used an id was removed.
     next_grant_id: u64,
     grants: Vec<GrantRecord>,
+    /// Pair with IP grants that have not committed (wire.md 10.9). Absent
+    /// when there are none; a helper that does not know them drops them,
+    /// which grants nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    provisional: Vec<GrantRecord>,
     denials: Vec<DenialRecord>,
 }
 
@@ -324,21 +337,8 @@ fn file_of(table: &GrantTable) -> GrantFile {
     GrantFile {
         version,
         next_grant_id: table.next_grant_id(),
-        grants: table
-            .grants()
-            .map(|g| GrantRecord {
-                id: g.id.0,
-                identity: hex(g.identity.as_bytes()),
-                name: g.name.clone(),
-                role: g.role.as_str().to_owned(),
-                source: "local".into(),
-                authorizing_owner: hex(g.authorizing_owner.as_bytes()),
-                granted_at: g.granted_at.secs(),
-                expires_at: g.expires_at.map(|t| t.secs()),
-                enrolled_by: g.enrolled_by.map(|i| hex(&i.0)),
-                revision: g.revision,
-            })
-            .collect(),
+        grants: table.grants().map(record_of).collect(),
+        provisional: table.provisional_grants().map(record_of).collect(),
         denials: table
             .denials()
             .map(|d| DenialRecord {
@@ -505,6 +505,22 @@ impl GrantStore {
     }
 }
 
+fn record_of(g: &Grant) -> GrantRecord {
+    GrantRecord {
+        id: g.id.0,
+        identity: hex(g.identity.as_bytes()),
+        name: g.name.clone(),
+        role: g.role.as_str().to_owned(),
+        source: "local".into(),
+        authorizing_owner: hex(g.authorizing_owner.as_bytes()),
+        granted_at: g.granted_at.secs(),
+        expires_at: g.expires_at.map(|t| t.secs()),
+        enrolled_by: g.enrolled_by.map(|i| hex(&i.0)),
+        direct: g.direct,
+        revision: g.revision,
+    }
+}
+
 /// The table in `file`, read from `origin`.
 fn table_of(file: GrantFile, origin: &Path) -> Result<GrantTable, NetError> {
     if file.version != GRANT_FILE_VERSION && file.version != RESTRICTED_GRANT_FILE_VERSION {
@@ -515,12 +531,11 @@ fn table_of(file: GrantFile, origin: &Path) -> Result<GrantTable, NetError> {
         )));
     }
     let bad = |what: &str| NetError::Store(format!("{}: bad {what}", origin.display()));
-    let mut grants = Vec::with_capacity(file.grants.len());
-    for g in file.grants {
+    let grant_of = |g: GrantRecord| -> Result<Grant, NetError> {
         if g.source != "local" {
             return Err(bad("grant source"));
         }
-        grants.push(Grant {
+        Ok(Grant {
             id: GrantId(g.id),
             identity: identity_from_hex(&g.identity)?,
             name: g.name,
@@ -541,8 +556,19 @@ fn table_of(file: GrantFile, origin: &Path) -> Result<GrantTable, NetError> {
                 )),
                 None => None,
             },
-        });
-    }
+            direct: g.direct,
+        })
+    };
+    let grants = file
+        .grants
+        .into_iter()
+        .map(grant_of)
+        .collect::<Result<Vec<_>, _>>()?;
+    let provisional = file
+        .provisional
+        .into_iter()
+        .map(grant_of)
+        .collect::<Result<Vec<_>, _>>()?;
     let mut denials = Vec::with_capacity(file.denials.len());
     for d in file.denials {
         denials.push(Denial {
@@ -550,8 +576,12 @@ fn table_of(file: GrantFile, origin: &Path) -> Result<GrantTable, NetError> {
             denied_at: UnixTime(d.denied_at),
         });
     }
-    GrantTable::restore(grants, denials, file.next_grant_id)
-        .map_err(|e| NetError::Store(format!("{}: {e}", origin.display())))
+    let mut table = GrantTable::restore(grants, denials, file.next_grant_id)
+        .map_err(|e| NetError::Store(format!("{}: {e}", origin.display())))?;
+    table
+        .restore_provisional(provisional)
+        .map_err(|e| NetError::Store(format!("{}: {e}", origin.display())))?;
+    Ok(table)
 }
 
 /// A host this device paired with.
@@ -1257,6 +1287,42 @@ mod tests {
         assert!(store.load(&[4; 32]).is_err());
         fs::write(store.path(&[5; 32]), b"junk").unwrap();
         assert!(store.load(&[5; 32]).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Pair with IP (wire.md 10.9): a provisional grant, and the mark that
+    /// a direct invitation made a grant, are stored with the table.
+    #[test]
+    fn provisional_and_direct_grants_survive_a_save_and_load() {
+        let dir = temp_dir("provisional");
+        let store = GrantStore::in_dir(&dir);
+        let mut table = GrantTable::new();
+        let a = SoftwareKey::generate(&mut os_rng()).public_key();
+        let b = SoftwareKey::generate(&mut os_rng()).public_key();
+        let direct = |identity| NewGrant {
+            identity,
+            name: "phone".into(),
+            role: Role::new("viewer").unwrap(),
+            authorizing_owner: OwnerRef::from_bytes([7; 16]),
+            expires_at: None,
+            enrolled_by: Some(InvitationId([9; 16])),
+        };
+        let (committed, _) = table
+            .add_provisional(direct(a), mousse_net_core::ConnectionId(1), UnixTime(100))
+            .unwrap();
+        table.commit(committed, UnixTime(100)).unwrap();
+        let (provisional, _) = table
+            .add_provisional(direct(b), mousse_net_core::ConnectionId(2), UnixTime(100))
+            .unwrap();
+        store.save(&table).unwrap();
+        let back = store.load().unwrap();
+        assert_eq!(back.get(committed), table.get(committed));
+        assert!(back.get(committed).unwrap().direct);
+        assert_eq!(
+            back.provisional(provisional),
+            table.provisional(provisional)
+        );
+        assert!(back.live_grant(&b, UnixTime(100)).is_none());
         fs::remove_dir_all(&dir).unwrap();
     }
 

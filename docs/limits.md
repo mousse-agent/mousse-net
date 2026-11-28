@@ -38,6 +38,12 @@ spec's value: it can only be tightened.
 | `MOUSSE_NET_TICKET_LIFETIME_SECS` | 600 | 60 to 600 | How long a new pairing ticket is valid (wire.md 10.2). |
 | `MOUSSE_NET_HOST_ATTEMPTS_PER_INVITATION` | 3 | 1 to 3 | Code attempts the host allows per invitation (wire.md 10.7). |
 | `MOUSSE_NET_JOINER_ATTEMPTS_PER_FLOW` | 3 | 1 to 3 | Code attempts the joiner allows per ticket; the stored record holds at most 3 (wire.md 10.7). |
+| `MOUSSE_NET_DIRECT_INVITE_LIFETIME_SECS` | 600 | 60 to 600 | Pair with IP: how long a new invitation takes lookups and attempts (wire.md 10.9). |
+| `MOUSSE_NET_DIRECT_HOST_ATTEMPTS` | 5 | 1 to 5 | Pair with IP: code attempts the host allows per invitation (wire.md 10.9). |
+| `MOUSSE_NET_DIRECT_JOINER_ATTEMPTS` | 5 | 1 to 5 | Pair with IP: code attempts the joiner allows per typed lookup in 24 h (wire.md 10.9). |
+| `MOUSSE_NET_DIRECT_ALLOW_WINDOW_SECS` | 300 | 60 to 300 | Pair with IP: how long after a device passed the code its request may be allowed and claimed, also past the invitation's expiry (wire.md 10.9). |
+| `MOUSSE_NET_DIRECT_MAX_OPEN` | 4 | 1 to 4 | Pair with IP: invitations open at once on one endpoint (wire.md 10.9). |
+| `MOUSSE_NET_DIRECT_MISS_HOLD_MS` | 1000 | 1000 to 5000 | Pair with IP: how long the host holds a `JOIN_DIRECT` that found no invitation, with its pre-authorization place, before it closes; lengthen only (wire.md 10.9). |
 
 ## I/O
 

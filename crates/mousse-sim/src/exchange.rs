@@ -13,9 +13,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use mousse_net_core::pairing::{
-    BindingTranscript, CodeExchangeFactory, ExchangeRole, PairingCode, SID_LEN,
-};
+use mousse_net_core::pairing::{BindingTranscript, CodeExchangeFactory, ExchangeRole, SID_LEN};
 use rand_core::CryptoRng;
 
 /// The code-exchange factory the simulated devices use: real CPace (the
@@ -75,7 +73,7 @@ impl CodeExchangeFactory for CountingFactory {
     fn start<R: CryptoRng + ?Sized>(
         &self,
         role: ExchangeRole,
-        code: &PairingCode,
+        password: &[u8],
         binding: &BindingTranscript,
         sid: &[u8; SID_LEN],
         rng: &mut R,
@@ -86,7 +84,7 @@ impl CodeExchangeFactory for CountingFactory {
             role,
             transcript: binding.as_bytes().to_vec(),
         });
-        self.inner.start(role, code, binding, sid, rng)
+        self.inner.start(role, password, binding, sid, rng)
     }
 }
 
