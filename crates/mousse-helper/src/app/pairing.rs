@@ -96,12 +96,13 @@ use crate::revoke::Removed;
 mod availability;
 mod check;
 mod connected;
+mod direct;
 mod probe;
 mod revoke_local;
 mod roles;
 
 /// The requests this module answers.
-pub const OPS: [&str; 25] = [
+pub const OPS: [&str; 27] = [
     "config.set",
     "invite.create",
     "routes.available",
@@ -113,6 +114,8 @@ pub const OPS: [&str; 25] = [
     "join",
     "join.code",
     "join.cancel",
+    "join.direct",
+    "join.direct.cancel",
     "join.status",
     "join.ack",
     "grants.list",
@@ -141,6 +144,8 @@ pub struct State {
     joins: HashMap<String, Join>,
     /// Probes running (see [`probe`]).
     probes: Vec<probe::Probe>,
+    /// Pair with IP, both sides (see [`direct`]).
+    direct: direct::State,
 }
 
 /// A join running.
@@ -160,6 +165,7 @@ impl State {
             approvals: HashMap::new(),
             joins: HashMap::new(),
             probes: Vec::new(),
+            direct: direct::State::default(),
         }
     }
 }
@@ -274,6 +280,10 @@ pub fn on_request(shared: &Arc<Shared>, id: Value, op: &str, map: &Map<String, V
             None => return,
         },
         "invite.cancel" => match parse_invitation(str_field(map, "invitation")) {
+            Some(invitation) if direct::owns_invitation(shared, &invitation) => {
+                direct::cancel_invitation(shared, &invitation);
+                json!({"re": id})
+            }
             Some(invitation) => {
                 shared.host.cancel(&invitation);
                 json!({"re": id})
@@ -290,7 +300,21 @@ pub fn on_request(shared: &Arc<Shared>, id: Value, op: &str, map: &Map<String, V
             Some(reply) => reply,
             None => return,
         },
+        "join.direct" => match direct::join(shared, &id, map) {
+            Some(reply) => reply,
+            None => return,
+        },
+        "join.direct.cancel" => match direct::cancel(shared, &id, map) {
+            Some(reply) => reply,
+            None => return,
+        },
+        // Without a ticket hash: the Pair with IP completions (1.2,
+        // `docs/pair-with-ip-design.md` §4).
+        "join.status" if !map.contains_key("ticket_hash") => direct::status(shared, &id, map),
         "join.status" => join_status(shared, &id, map),
+        "join.ack" if map.contains_key("invitation") && !map.contains_key("ticket_hash") => {
+            direct::ack(shared, &id, map)
+        }
         "join.ack" => join_ack(shared, &id, map),
         "grants.list" => {
             let grants: Vec<Value> = shared
@@ -346,6 +370,10 @@ pub(super) fn paused(shared: &Shared, id: &Value) -> Value {
 }
 
 fn invite(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
+    // Pair with IP: no ticket (see [`direct`]).
+    if map.get("kind").and_then(Value::as_str) == Some("direct") {
+        return direct::invite(shared, id, map);
+    }
     // A selector asks for the 1.2 path; without one, 1.1 unchanged.
     if map.contains_key("way") || map.contains_key("route") {
         return invite_way(shared, id, map);
@@ -531,6 +559,10 @@ fn answer(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
         Ok(role) => role,
         Err(e) => return error(id, "bad_request", e),
     };
+    // A Pair with IP request keeps its prompt until the host ends it.
+    if let Some(reply) = direct::answer(shared, id, request, yes, role.clone()) {
+        return reply;
+    }
     let Some(req) = state(shared).approvals.remove(request) else {
         return error(id, "no_request", "no such approval request is waiting");
     };
@@ -1015,6 +1047,12 @@ fn join_ack(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
     }
 }
 
+/// Recover the kept Pair with IP records. Runs once at start, after the
+/// channel is up.
+pub async fn resume_direct(shared: Arc<Shared>) {
+    direct::resume(&shared);
+}
+
 /// Drop the completion records whose ticket expired more than
 /// `JOIN_DONE_KEEP_SECS` ago. Runs once at start, after the channel is up.
 pub async fn prune_completions(shared: Arc<Shared>) {
@@ -1355,8 +1393,10 @@ pub fn host_event(shared: &Shared, event: HostEvent) {
             applog::line(format!("saving grants failed: {reason}"));
             json!({"ev": "store.failed", "reason": reason})
         }
-        // The app channel makes no Pair with IP invitations yet.
-        HostEvent::Direct(_) => return,
+        HostEvent::Direct(event) => match direct::host_event(shared, event) {
+            Some(value) => value,
+            None => return,
+        },
     };
     shared.event(value);
 }
@@ -1381,11 +1421,16 @@ pub async fn watch_pause(shared: Arc<Shared>) {
                     join.task.abort();
                     shared.event(paused(&shared, &join.id));
                 }
+                direct::pause(&shared);
                 shared.event(json!({"ev": "net.paused", "reason": reason}));
             }
             None => {
                 shared.event(json!({"ev": "net.resumed"}));
                 shared.keep.kick(super::paths::Kick::Reset(None));
+                // The Pair with IP flows a pause stopped go on.
+                if direct::idle(&shared) {
+                    direct::resume(&shared);
+                }
             }
         }
     }

@@ -209,6 +209,9 @@ struct Shared {
     relay: relay::State,
     /// SSH routes: `ssh.*` and the connection window (Phase 1b §3).
     ssh: Arc<crate::ssh::Ssh>,
+    /// What a Pair with IP join uses: its records, pins and the denied
+    /// identities.
+    direct: mousse_net_io::DirectSetup,
     info: AppInfo,
     limits: HelperLimits,
     engine: Arc<Engine>,
@@ -381,6 +384,12 @@ impl App {
         let limits = *crate::limits::helper();
         let (ended, _) = watch::channel(None);
         let (keep, kicks) = paths::Keep::new();
+        let denied_by = host.clone();
+        let direct = crate::direct::setup(
+            &info.state_dir,
+            caller.addr_policy().clone(),
+            Arc::new(move |identity| denied_by.is_denied(identity)),
+        );
         let shared = Arc::new(Shared {
             core: Mutex::new(Core {
                 hello: false,
@@ -414,6 +423,7 @@ impl App {
             refusals: refusals::Refusals::in_dir(&info.state_dir),
             relay: relay::State::new(&info),
             ssh: info.ssh.clone(),
+            direct,
             info,
             limits,
             engine,
@@ -426,6 +436,7 @@ impl App {
         tokio::spawn(write_stdout(shared.clone()));
         tokio::spawn(pairing::watch_pause(shared.clone()));
         tokio::spawn(pairing::prune_completions(shared.clone()));
+        tokio::spawn(pairing::resume_direct(shared.clone()));
         tokio::spawn(paths::keep_connected(shared.clone(), kicks));
         tokio::spawn(changes::forward_renewals(shared.clone()));
         tokio::spawn(watch_served(shared.clone()));

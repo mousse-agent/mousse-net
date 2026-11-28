@@ -111,7 +111,8 @@ use crate::SharedSigner;
 
 mod direct;
 pub use direct::{
-    DirectJoin, DirectJoinEvent, DirectJoined, DirectPins, DirectResumed, DirectSetup,
+    DirectDialFailure, DirectJoin, DirectJoinEvent, DirectJoined, DirectPins, DirectResumed,
+    DirectSetup,
 };
 
 /// How pairing ended.

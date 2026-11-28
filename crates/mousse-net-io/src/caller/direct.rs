@@ -26,7 +26,7 @@ use mousse_net_core::control::{AuthorizedState, ControlMessage};
 use mousse_net_core::identity::IdentityPublicKey;
 use mousse_net_core::mux::MuxRole;
 use mousse_net_core::pairing::{
-    AttemptId, CodeExchangeFactory, DirectEnd, DirectJoinError, DirectJoinerAction,
+    AttemptId, CodeExchangeFactory, DirectAddress, DirectEnd, DirectJoinError, DirectJoinerAction,
     DirectJoinerPairing, DirectJoinerState, DirectLookup, DirectPaired, EXPORTER_LEN,
 };
 use mousse_net_core::{ConnectionId, ErrorCode, Millis};
@@ -79,6 +79,17 @@ pub enum DirectJoinEvent {
     Ended(DirectEnd),
 }
 
+/// Why the last dial of a Pair with IP flow failed, so a UI can tell "Can't
+/// reach that address" from "Can't reach Mousse at that address".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectDialFailure {
+    /// No TCP connection to the address.
+    Unreachable,
+    /// A TCP connection, but no Mousse TLS handshake (or a far end this
+    /// profile denied).
+    NotMousse,
+}
+
 /// How a Pair with IP join ended.
 pub struct DirectJoined {
     /// The flow's end.
@@ -90,6 +101,9 @@ pub struct DirectJoined {
     /// the host's session was displaced), and the next ordinary pinned dial
     /// reaches the host.
     pub connection: Option<Connection>,
+    /// Why the flow's last dial failed, when it did (a first contact that
+    /// ends on a failed dial ends with no host code).
+    pub dial: Option<DirectDialFailure>,
 }
 
 /// The recoveries started at startup ([`Caller::resume_direct`]).
@@ -108,6 +122,7 @@ impl std::fmt::Debug for DirectJoined {
         f.debug_struct("DirectJoined")
             .field("end", &self.end)
             .field("connection", &self.connection.as_ref().map(|c| c.id()))
+            .field("dial", &self.dial)
             .finish()
     }
 }
@@ -115,6 +130,9 @@ impl std::fmt::Debug for DirectJoined {
 /// A running Pair with IP join.
 pub struct DirectJoin {
     events: mpsc::UnboundedReceiver<DirectJoinEvent>,
+    state: watch::Receiver<DirectJoinerState>,
+    lookup: DirectLookup,
+    address: DirectAddress,
     cancel: Box<dyn Fn() -> Result<(), DirectJoinError> + Send + Sync>,
     stop: Box<dyn Fn() + Send + Sync>,
     task: tokio::task::JoinHandle<Result<DirectJoined, NetError>>,
@@ -125,6 +143,23 @@ impl DirectJoin {
     /// stopped) and every event was read.
     pub async fn event(&mut self) -> Option<DirectJoinEvent> {
         self.events.recv().await
+    }
+
+    /// The typed lookup the flow is kept under. Part of the code: never log
+    /// it.
+    pub fn lookup(&self) -> &DirectLookup {
+        &self.lookup
+    }
+
+    /// The typed address the flow dials.
+    pub fn address(&self) -> DirectAddress {
+        self.address
+    }
+
+    /// Where the flow stands now, and each change after (only the latest
+    /// state is kept, so a quick step may be skipped). For a UI's progress.
+    pub fn state(&self) -> watch::Receiver<DirectJoinerState> {
+        self.state.clone()
     }
 
     /// The person cancelled (wire.md 10.9): before the code passed this
@@ -182,6 +217,9 @@ struct DirectFlow<F: CodeExchangeFactory> {
     waiting_hold: bool,
     /// The handle cancelled before the records were loaded.
     cancel_wanted: bool,
+    /// Why the last dial failed, if it did; cleared by a dial that
+    /// connects.
+    dial: Option<DirectDialFailure>,
     /// The order of what the flow handed out, for tests.
     #[cfg(test)]
     trace: Vec<&'static str>,
@@ -756,6 +794,7 @@ where
     ) -> DirectJoin {
         let (events_tx, events) = mpsc::unbounded_channel();
         let (state_tx, state) = watch::channel(pairing.state());
+        let (lookup, address) = (pairing.lookup().clone(), pairing.address());
         let flow: SharedDirect<F> = Arc::new(Mutex::new(DirectFlow {
             pairing,
             setup,
@@ -769,9 +808,11 @@ where
             startup,
             waiting_hold: false,
             cancel_wanted: false,
+            dial: None,
             #[cfg(test)]
             trace: Vec::new(),
         }));
+        let watching = state.clone();
         let cancelling = flow.clone();
         let cancel = Box::new(move || lock_flow(&cancelling).cancel());
         let stopping = flow.clone();
@@ -785,6 +826,9 @@ where
         });
         DirectJoin {
             events,
+            state: watching,
+            lookup,
+            address,
             cancel,
             stop,
             task,
@@ -824,6 +868,7 @@ where
                     return Ok(DirectJoined {
                         end,
                         connection: None,
+                        dial: lock_flow(flow).dial,
                     })
                 }
                 DirectJoinerState::Away => {
@@ -869,8 +914,10 @@ where
                 f.setup.denied.clone(),
             )
         };
-        let failed = |flow: &SharedDirect<F>| {
-            lock_flow(flow).step(|p| p.on_dial_failed());
+        let failed = |flow: &SharedDirect<F>, why: DirectDialFailure| {
+            let mut f = lock_flow(flow);
+            f.dial = Some(why);
+            f.step(|p| p.on_dial_failed());
             None
         };
         let own = match self.certs.current() {
@@ -882,7 +929,7 @@ where
         };
         let addr = SocketAddr::new(address.ip, address.port);
         let Ok(pipe) = connect_addr(addr, ms(self.limits.io().connect_timeout_ms())).await else {
-            return failed(flow);
+            return failed(flow, DirectDialFailure::Unreachable);
         };
         let shook = match pin {
             Some(pin) => tls::connect(pipe, &own, pin, self.clock.clone(), self.policy).await,
@@ -899,13 +946,14 @@ where
                 lock_flow(flow).step(|p| p.on_connected(own_key, [0u8; EXPORTER_LEN]));
                 return None;
             }
-            Err(_) => return failed(flow),
+            Err(_) => return failed(flow, DirectDialFailure::NotMousse),
         };
         let peer = handshake.peer.identity;
         let conn = self.next_conn_id();
         let (cmd_tx, cmd_rx) = conn::channel();
         {
             let mut f = lock_flow(flow);
+            f.dial = None;
             f.step(|p| p.on_connected(peer, handshake.exporters.pair));
             // Stopped, a cancel while the dial was outstanding, or a far
             // end the flow refuses: the connection goes unused.
@@ -1017,6 +1065,7 @@ where
                     return Some(DirectJoined {
                         end: DirectEnd::Paired,
                         connection,
+                        dial: None,
                     });
                 }
                 DirectJoinerState::Ended(_) | DirectJoinerState::Away => return None,
@@ -1155,6 +1204,7 @@ mod tests {
             startup,
             waiting_hold: false,
             cancel_wanted: false,
+            dial: None,
             trace: Vec::new(),
         }));
         Rig {

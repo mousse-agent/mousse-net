@@ -2130,6 +2130,12 @@ where
         Ok((grant, false))
     }
 
+    /// Whether this profile denied `identity`: a Pair with IP first contact
+    /// refuses such a far end before its own certificate goes out.
+    pub fn is_denied(&self, identity: &IdentityPublicKey) -> bool {
+        lock(&self.shared).grants.is_denied(identity)
+    }
+
     /// The live grant `identity` holds on this endpoint, if any and if it
     /// is served: the host serves grants (no enrollment waits for a save
     /// to settle) and this one is not waiting for a role edit to settle.

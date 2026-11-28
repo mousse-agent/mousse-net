@@ -523,6 +523,72 @@ invitation, at most 600 s, is gone.
 - The CLI reads the code from a prompt, never from an argument, so it does
   not land in shell history.
 
+### Helper protocol as built (phase 2)
+
+What the helper serves until phase 4 lists `pair-with-ip`:
+
+- **Gate.** Every Pair with IP operation, and the new forms of shared
+  ones (`invite.create {kind: "direct"}`, `join.status` without
+  `ticket_hash`, `join.ack {invitation}`), answers `{error:
+  "unsupported"}` unless the helper speaks wire minor 4: a release build
+  only once `PROTOCOL_MINOR_VERSION` is 4, a debug build with
+  `MOUSSE_NET_TEST_HELLO_MINOR=4`. Startup recovery runs only then too.
+  The CLI (`invite --direct`, `join-direct`) follows the same rule.
+- **Host.** `invite.create {kind: "direct", way, route?, role?}` takes the
+  way's IPv4 candidates in inventory order (`route` picks one; a `route`
+  the way does not offer is `way_unavailable` with `route_not_offered`).
+  `invite.code {invitation, code, attempts_left}` follows every attempt,
+  with the same code. `enrolled` adds `kind: "direct"` and `provisional:
+  true`; the grant commits on the device's first stream
+  (`grant.committed {grant, identity}`) or goes with a cancel
+  (`enrollment.undone {invitation, grant, identity}`). `approval` adds
+  `kind: "direct"`, `role`, `state`, `decision` and `answer_by` (unix
+  seconds, the end of its Allow window); its id is
+  `direct-<I hex>-<full fingerprint hex>`. `approval.answer` on a kind 3
+  request answers `stale` once the request is over, `paused` while
+  networking is paused, `store_failed` when the enrollment cannot be
+  stored. `approval.ended {request, invitation, reason}` gives `enrolled`,
+  `cancelled`, `declined`, `dismissed` or `window_ended`. `invite.ended`
+  gives the same reasons as for tickets (an expired invitation:
+  `invitation_invalid`).
+- **Joiner.** `join.direct {address, code}` answers later. Each flow has a
+  `flow` id, carried by every `join.progress` and by the reply. The reply
+  is `{flow, identity, name, role, invitation, already: false, conn}`
+  (`conn`: the pairing connection, published like a `dial`'s, or null).
+  Errors besides those listed above: `own_device` (the address is this
+  device), `not_received {attempts_left}` (the connection dropped before
+  the code's answer), `settled` (another flow on this device settled
+  it), `store_failed`, `bad_name`, `bad_request`. A flow already running
+  for the same typed lookup and address, such as a startup recovery,
+  takes the request; a second request for it is `busy`.
+  `join.direct.cancel {flow}` answers the flow's request `cancelled` at
+  once, then `{}`; a flow that is away keeps running only to deliver the
+  cancel. A flow with no request (a startup recovery, or one already
+  cancelled) ends with `join.direct.ended {flow, ...}`, the reply's fields
+  or its error. A pause stops every flow where it is (its records stay)
+  and answers each waiting request `paused`; resume starts the kept ones
+  again.
+- **Completions.** `join.status {}` answers `{direct: [{invitation,
+  identity, name, role, route}], direct_unreadable}`;
+  `direct_unreadable` counts kept pending records whose files did not
+  read at the last start (logged by number only). `join.ack {invitation}`
+  answers `{removed}`. Removing the host drops its completions too.
+- **The typed address and the address policy.** The typed address is read
+  with the route grammar and checked against the address policy as an
+  owner address is (`peer.addresses.set`): the person typed it, so it
+  counts as approved, and it is refused with `bad_address` only where the
+  policy never dials (unspecified, multicast, reserved and documentation
+  ranges, and loopback outside tests). After `PAIRED` it is stored as the host's owner address,
+  with an owner approval when the automatic rule does not cover it (a
+  tailnet address). The pin, the address and approval, then the
+  completion record are each written durably before the join is reported
+  paired; a crash part way leaves the pending record, and the next
+  recovery writes them again.
+- **No new limits.** The flows use the existing `DIRECT_*` limits.
+- **Not yet:** ranking physical interfaces before virtual adapters (waits
+  for the hand check on Windows); the `pair-with-ip` feature and minor 4
+  (phase 4).
+
 ### App
 
 The tabs come from mousse-agent/mousse#2039, which phase 3 builds on. Behind

@@ -49,9 +49,9 @@ pub mod watch;
 
 pub use admission::{HelloSeen, Room, StreamAdmission, BOT_LABELS};
 pub use caller::{
-    is_lan_route, route_rank, Caller, CandidateSource, CodeEntry, DirectJoin, DirectJoinEvent,
-    DirectJoined, DirectPins, DirectResumed, DirectSetup, JoinOutcome, LaterCandidates, NoCode,
-    PathEvent, Reached, RouteClass, Search, Step1Failures,
+    is_lan_route, route_rank, Caller, CandidateSource, CodeEntry, DirectDialFailure, DirectJoin,
+    DirectJoinEvent, DirectJoined, DirectPins, DirectResumed, DirectSetup, JoinOutcome,
+    LaterCandidates, NoCode, PathEvent, Reached, RouteClass, Search, Step1Failures,
 };
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use conn::{

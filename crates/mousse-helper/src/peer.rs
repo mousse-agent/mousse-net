@@ -24,7 +24,7 @@ use crate::term::{self, ClientEnd};
 /// An open endpoint and its caller.
 pub struct CallerSide {
     pub endpoint: Endpoint,
-    pub caller: Caller,
+    pub caller: Arc<Caller>,
 }
 
 impl CallerSide {
@@ -42,7 +42,10 @@ impl CallerSide {
             crate::limits::get().net,
         );
         caller.use_flow_records(Arc::new(endpoint.flow_records()));
-        Ok(Self { endpoint, caller })
+        Ok(Self {
+            endpoint,
+            caller: Arc::new(caller),
+        })
     }
 
     fn peers(&self) -> PeerStore {
@@ -890,6 +893,8 @@ pub(crate) fn drop_completions(
         return Ok(Vec::new());
     }
     ApprovalStore::in_dir(dir).remove_identity(held, identity)?;
+    // A Pair with IP completion naming the host goes too.
+    crate::direct::Completions::in_dir(dir).remove_naming(held, identity)?;
     CompletionStore::in_dir(dir).remove_naming(held, identity)
 }
 
@@ -1254,7 +1259,7 @@ async fn run_slice(side: &CallerSide, opts: &SliceCheck, steps: &mut Steps) {
 }
 
 /// Ask the host for its build over a `helper-info` stream.
-async fn host_build(conn: &Connection) -> Result<String, String> {
+pub(crate) async fn host_build(conn: &Connection) -> Result<String, String> {
     let stream = conn
         .open_stream(
             mousse_net_core::mux::PriorityClass::Interactive,
