@@ -35,7 +35,7 @@ use mousse_net_io::certs::CertManager;
 use mousse_net_io::conn::TEST_HELLO_MINOR_VAR;
 use mousse_net_io::tls::DeniedCheck;
 use mousse_net_io::{
-    tls, Caller, Clock, DirectEvent, DirectJoin, DirectPins, DirectRecordStore, DirectRecords,
+    tls, Caller, Clock, DirectJoin, DirectJoinEvent, DirectPins, DirectRecordStore, DirectRecords,
     DirectSetup, Limits, MemoryDirectRecords, NetError, SharedSigner, SystemClock, TlsPolicy,
 };
 use rand_core::{TryCryptoRng, TryRng};
@@ -615,14 +615,14 @@ impl Joiner {
     }
 }
 
-async fn next(join: &mut DirectJoin) -> DirectEvent {
+async fn next(join: &mut DirectJoin) -> DirectJoinEvent {
     within("joiner event", join.event())
         .await
         .expect("the flow ended without this event")
 }
 
 /// Wait for an event matching `want`, skipping others.
-async fn until(join: &mut DirectJoin, want: impl Fn(&DirectEvent) -> bool) -> DirectEvent {
+async fn until(join: &mut DirectJoin, want: impl Fn(&DirectJoinEvent) -> bool) -> DirectJoinEvent {
     loop {
         let e = next(join).await;
         if want(&e) {
@@ -632,7 +632,7 @@ async fn until(join: &mut DirectJoin, want: impl Fn(&DirectEvent) -> bool) -> Di
 }
 
 /// Every event until the stream ends.
-async fn drain(join: &mut DirectJoin) -> Vec<DirectEvent> {
+async fn drain(join: &mut DirectJoin) -> Vec<DirectJoinEvent> {
     within("the end of the events", async {
         let mut out = Vec::new();
         while let Some(e) = join.event().await {
@@ -701,19 +701,22 @@ async fn a_connect_pairs_and_its_first_stream_commits() {
     let (records, dir) = disk("direct-ok");
     let joiner = Joiner::new(records.clone());
     let mut join = joiner.join(&host, &host.code);
-    assert_eq!(next(&mut join).await, DirectEvent::CodePassed);
+    assert_eq!(next(&mut join).await, DirectJoinEvent::CodePassed);
     // Nothing is pinned before PAIRED.
     assert!(joiner.pins.stored.lock().unwrap().is_empty());
     assert_eq!(pending_count(&*records, &host.code), 1);
     host.allow(joiner.identity()).await;
-    let paired = until(&mut join, |e| matches!(e, DirectEvent::Paired(_))).await;
-    let DirectEvent::Paired(p) = paired else {
+    let paired = until(&mut join, |e| matches!(e, DirectJoinEvent::Paired(_))).await;
+    let DirectJoinEvent::Paired(p) = paired else {
         unreachable!()
     };
     assert_eq!(p.identity, host.identity);
     assert_eq!(p.name, HOST_NAME);
     assert_eq!(p.invitation, host.invitation);
-    assert_eq!(next(&mut join).await, DirectEvent::Ended(DirectEnd::Paired));
+    assert_eq!(
+        next(&mut join).await,
+        DirectJoinEvent::Ended(DirectEnd::Paired)
+    );
     let joined = within("join end", join.finish()).await.unwrap();
     assert_eq!(joined.end, DirectEnd::Paired);
     let conn = joined.connection.expect("a live connection");
@@ -746,7 +749,7 @@ async fn a_wrong_secret_spends_an_attempt_and_a_wrong_lookup_none() {
     // The events end once the flow has.
     assert_eq!(
         drain(&mut join).await.last(),
-        Some(&DirectEvent::Ended(DirectEnd::CodeFailed {
+        Some(&DirectJoinEvent::Ended(DirectEnd::CodeFailed {
             attempts_left: 4
         }))
     );
@@ -833,10 +836,10 @@ async fn a_lost_paired_is_learned_by_recovery_after_a_restart() {
     let (records, dir) = disk("direct-lost");
     let joiner = Joiner::new(records.clone());
     let mut join = joiner.join(&host, &host.code);
-    assert_eq!(next(&mut join).await, DirectEvent::CodePassed);
+    assert_eq!(next(&mut join).await, DirectJoinEvent::CodePassed);
     host.state.lock().unwrap().lose_paired = true;
     host.allow(joiner.identity()).await;
-    assert_eq!(next(&mut join).await, DirectEvent::Away);
+    assert_eq!(next(&mut join).await, DirectJoinEvent::Away);
     // The app quits while away: what it stored stays.
     join.stop();
     assert_eq!(pending_count(&*records, &host.code), 1);
@@ -850,8 +853,8 @@ async fn a_lost_paired_is_learned_by_recovery_after_a_restart() {
         .joins;
     assert_eq!(joins.len(), 1);
     let mut join = joins.remove(0);
-    let paired = until(&mut join, |e| matches!(e, DirectEvent::Paired(_))).await;
-    assert!(matches!(paired, DirectEvent::Paired(p) if p.identity == host.identity));
+    let paired = until(&mut join, |e| matches!(e, DirectJoinEvent::Paired(_))).await;
+    assert!(matches!(paired, DirectJoinEvent::Paired(p) if p.identity == host.identity));
     let joined = within("recovery", join.finish()).await.unwrap();
     assert_eq!(joined.end, DirectEnd::Paired);
     assert_eq!(pending_count(&*records, &host.code), 0);
@@ -875,10 +878,10 @@ async fn an_allow_while_away_is_claimed_by_the_recovery() {
     let records: Arc<dyn DirectRecords> = Arc::new(MemoryDirectRecords::default());
     let joiner = Joiner::new(records.clone());
     let mut join = joiner.join(&host, &host.code);
-    assert_eq!(next(&mut join).await, DirectEvent::CodePassed);
+    assert_eq!(next(&mut join).await, DirectJoinEvent::CodePassed);
     wait_for("the request", || host.logged("approval:")).await;
     host.break_all();
-    assert_eq!(next(&mut join).await, DirectEvent::Away);
+    assert_eq!(next(&mut join).await, DirectJoinEvent::Away);
     wait_for("the request away", || host.logged("approval:Away")).await;
     host.allow(joiner.identity()).await;
     let joined = within("claim", join.finish()).await.unwrap();
@@ -896,9 +899,9 @@ async fn a_cancel_while_connected_ends_the_request() {
     let records: Arc<dyn DirectRecords> = Arc::new(MemoryDirectRecords::default());
     let joiner = Joiner::new(records.clone());
     let mut join = joiner.join(&host, &host.code);
-    assert_eq!(next(&mut join).await, DirectEvent::CodePassed);
+    assert_eq!(next(&mut join).await, DirectJoinEvent::CodePassed);
     join.cancel().unwrap();
-    assert_eq!(next(&mut join).await, DirectEvent::Away);
+    assert_eq!(next(&mut join).await, DirectJoinEvent::Away);
     // The abort, then the close, on the connection the code passed on.
     let cancelled = ErrorCode::Cancelled.name();
     let goaway_end = format!(":{cancelled}");
@@ -936,10 +939,10 @@ async fn a_cancel_while_away_reaches_the_host_with_the_recovery() {
     let records: Arc<dyn DirectRecords> = Arc::new(MemoryDirectRecords::default());
     let joiner = Joiner::new(records.clone());
     let mut join = joiner.join(&host, &host.code);
-    assert_eq!(next(&mut join).await, DirectEvent::CodePassed);
+    assert_eq!(next(&mut join).await, DirectJoinEvent::CodePassed);
     wait_for("the request", || host.logged("approval:")).await;
     host.break_all();
-    assert_eq!(next(&mut join).await, DirectEvent::Away);
+    assert_eq!(next(&mut join).await, DirectJoinEvent::Away);
     join.cancel().unwrap();
     assert!(pending_at(&*records, &host).unwrap().cancelled);
     let joined = within("cancel away", join.finish()).await.unwrap();
@@ -957,7 +960,7 @@ async fn the_hold_refuses_a_second_flow() {
     let records: Arc<dyn DirectRecords> = Arc::new(MemoryDirectRecords::default());
     let joiner = Joiner::new(records.clone());
     let mut first = joiner.join(&host, &host.code);
-    assert_eq!(next(&mut first).await, DirectEvent::CodePassed);
+    assert_eq!(next(&mut first).await, DirectJoinEvent::CodePassed);
     let handshakes = host.state.lock().unwrap().handshakes;
     let second = within("second", joiner.join(&host, &host.code).finish())
         .await
@@ -1105,7 +1108,7 @@ async fn crash_points_leave_what_a_restart_needs() {
     let joiner = Joiner::new(store.clone());
     joiner.pins.fail.store(true, Ordering::SeqCst);
     let mut join = joiner.join(&host, &host.code);
-    assert_eq!(next(&mut join).await, DirectEvent::CodePassed);
+    assert_eq!(next(&mut join).await, DirectJoinEvent::CodePassed);
     host.allow(joiner.identity()).await;
     let joined = within("pin fails", join.finish()).await.unwrap();
     assert_eq!(
@@ -1163,10 +1166,10 @@ async fn startup_recovers_every_kept_record_one_flow_at_a_time() {
     let joiner = Joiner::new(records.clone());
     for host in [&a, &b] {
         let mut join = joiner.join(host, code);
-        assert_eq!(next(&mut join).await, DirectEvent::CodePassed);
+        assert_eq!(next(&mut join).await, DirectJoinEvent::CodePassed);
         wait_for("the request", || host.logged("approval:")).await;
         host.break_all();
-        assert_eq!(next(&mut join).await, DirectEvent::Away);
+        assert_eq!(next(&mut join).await, DirectJoinEvent::Away);
         join.stop();
         wait_for("the request away", || host.logged("approval:Away")).await;
         host.allow(joiner.identity()).await;
@@ -1199,10 +1202,10 @@ async fn a_damaged_record_stops_only_its_own_recovery() {
     let (records, dir) = disk("direct-damaged");
     let joiner = Joiner::new(records.clone());
     let mut join = joiner.join(&host, &host.code);
-    assert_eq!(next(&mut join).await, DirectEvent::CodePassed);
+    assert_eq!(next(&mut join).await, DirectJoinEvent::CodePassed);
     wait_for("the request", || host.logged("approval:")).await;
     host.break_all();
-    assert_eq!(next(&mut join).await, DirectEvent::Away);
+    assert_eq!(next(&mut join).await, DirectJoinEvent::Away);
     join.stop();
     wait_for("the request away", || host.logged("approval:Away")).await;
     host.allow(joiner.identity()).await;
@@ -1233,7 +1236,10 @@ async fn a_damaged_record_stops_only_its_own_recovery() {
             }
             Ok(joined) => {
                 assert_eq!(joined.end, DirectEnd::Paired);
-                assert_eq!(events.last(), Some(&DirectEvent::Ended(DirectEnd::Paired)));
+                assert_eq!(
+                    events.last(),
+                    Some(&DirectJoinEvent::Ended(DirectEnd::Paired))
+                );
                 paired += 1;
             }
         }
@@ -1255,7 +1261,7 @@ async fn a_recovery_never_shows_its_certificate_to_another_key_at_the_address() 
     let (records, dir) = disk("direct-moved");
     let joiner = Joiner::new(records.clone());
     let mut join = joiner.join(&host, &host.code);
-    assert_eq!(next(&mut join).await, DirectEvent::CodePassed);
+    assert_eq!(next(&mut join).await, DirectJoinEvent::CodePassed);
     wait_for("the request", || host.logged("approval:")).await;
     join.stop();
     let (addr, code) = (host.addr, host.code.clone());
@@ -1270,7 +1276,7 @@ async fn a_recovery_never_shows_its_certificate_to_another_key_at_the_address() 
         .joins;
     assert_eq!(joins.len(), 1);
     let mut join = joins.remove(0);
-    assert_eq!(next(&mut join).await, DirectEvent::Away);
+    assert_eq!(next(&mut join).await, DirectJoinEvent::Away);
     wait_for("the refused handshake", || {
         other.state.lock().unwrap().refused_handshakes > 0
     })

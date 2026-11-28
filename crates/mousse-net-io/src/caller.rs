@@ -110,7 +110,9 @@ use crate::tls::{self, Handshake, TlsPolicy};
 use crate::SharedSigner;
 
 mod direct;
-pub use direct::{DirectEvent, DirectJoin, DirectJoined, DirectPins, DirectResumed, DirectSetup};
+pub use direct::{
+    DirectJoin, DirectJoinEvent, DirectJoined, DirectPins, DirectResumed, DirectSetup,
+};
 
 /// How pairing ended.
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -67,7 +67,7 @@ pub struct DirectSetup {
 
 /// What a Pair with IP join tells its UI, in order.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DirectEvent {
+pub enum DirectJoinEvent {
     /// The code passed: show "Waiting for Allow".
     CodePassed,
     /// The host allowed this device; its pin is stored.
@@ -114,7 +114,7 @@ impl std::fmt::Debug for DirectJoined {
 
 /// A running Pair with IP join.
 pub struct DirectJoin {
-    events: mpsc::UnboundedReceiver<DirectEvent>,
+    events: mpsc::UnboundedReceiver<DirectJoinEvent>,
     cancel: Box<dyn Fn() -> Result<(), DirectJoinError> + Send + Sync>,
     stop: Box<dyn Fn() + Send + Sync>,
     task: tokio::task::JoinHandle<Result<DirectJoined, NetError>>,
@@ -123,7 +123,7 @@ pub struct DirectJoin {
 impl DirectJoin {
     /// The next event, or `None` once the flow has ended (or failed, or
     /// stopped) and every event was read.
-    pub async fn event(&mut self) -> Option<DirectEvent> {
+    pub async fn event(&mut self) -> Option<DirectJoinEvent> {
         self.events.recv().await
     }
 
@@ -163,7 +163,7 @@ struct DirectFlow<F: CodeExchangeFactory> {
     setup: DirectSetup,
     hold: Option<FlowHold>,
     /// The UI's events; gone once the flow is over.
-    events: Option<mpsc::UnboundedSender<DirectEvent>>,
+    events: Option<mpsc::UnboundedSender<DirectJoinEvent>>,
     state: watch::Sender<DirectJoinerState>,
     /// The connection the flow is on, and its commands. Only that
     /// connection's role reaches the pairing.
@@ -228,7 +228,7 @@ fn settles(code: ErrorCode) -> bool {
 }
 
 impl<F: CodeExchangeFactory> DirectFlow<F> {
-    fn emit(&self, event: DirectEvent) {
+    fn emit(&self, event: DirectJoinEvent) {
         if let Some(events) = &self.events {
             let _ = events.send(event);
         }
@@ -296,7 +296,7 @@ impl<F: CodeExchangeFactory> DirectFlow<F> {
                 // connection is live: `Wire::Live`.
                 DirectJoinerAction::Paired(paired) => match self.setup.pins.store(&paired) {
                     Ok(()) => {
-                        self.emit(DirectEvent::Paired(paired));
+                        self.emit(DirectJoinEvent::Paired(paired));
                         out.push(Wire::Live);
                         Vec::new()
                     }
@@ -311,15 +311,15 @@ impl<F: CodeExchangeFactory> DirectFlow<F> {
                     Vec::new()
                 }
                 DirectJoinerAction::CodePassed => {
-                    self.emit(DirectEvent::CodePassed);
+                    self.emit(DirectJoinEvent::CodePassed);
                     Vec::new()
                 }
                 DirectJoinerAction::Away => {
-                    self.emit(DirectEvent::Away);
+                    self.emit(DirectJoinEvent::Away);
                     Vec::new()
                 }
                 DirectJoinerAction::Ended(end) => {
-                    self.emit(DirectEvent::Ended(end));
+                    self.emit(DirectJoinEvent::Ended(end));
                     Vec::new()
                 }
             };
@@ -1079,7 +1079,7 @@ mod tests {
         flow: SharedDirect<CpaceExchangeFactory>,
         records: Arc<MemoryDirectRecords>,
         pins: Arc<Pins>,
-        events: mpsc::UnboundedReceiver<DirectEvent>,
+        events: mpsc::UnboundedReceiver<DirectJoinEvent>,
         host: IdentityPublicKey,
         clock: Arc<ManualClock>,
         paths: Arc<Mutex<Paths>>,
@@ -1183,7 +1183,7 @@ mod tests {
                 .collect()
         }
 
-        fn drained(&mut self) -> Vec<DirectEvent> {
+        fn drained(&mut self) -> Vec<DirectJoinEvent> {
             let mut out = Vec::new();
             while let Ok(e) = self.events.try_recv() {
                 out.push(e);
@@ -1347,7 +1347,7 @@ mod tests {
         assert!(rig.stored().is_empty());
         assert_eq!(
             rig.drained().last(),
-            Some(&DirectEvent::Ended(DirectEnd::Paired))
+            Some(&DirectJoinEvent::Ended(DirectEnd::Paired))
         );
     }
 
@@ -1363,7 +1363,10 @@ mod tests {
         lock_flow(&rig.flow).step(|p| p.start());
         assert_eq!(rig.state(), DirectJoinerState::Ended(DirectEnd::Settled));
         assert_eq!(rig.stored(), vec![newer]);
-        assert_eq!(rig.drained(), vec![DirectEvent::Ended(DirectEnd::Settled)]);
+        assert_eq!(
+            rig.drained(),
+            vec![DirectJoinEvent::Ended(DirectEnd::Settled)]
+        );
         assert!(lock_flow(&rig.flow).cancel().is_err());
     }
 
@@ -1391,7 +1394,7 @@ mod tests {
         assert_eq!(kept.len(), 1);
         assert!(kept[0].cancelled);
         assert_eq!(kept[0].attempt, stored.attempt);
-        assert_eq!(rig.drained(), vec![DirectEvent::Away]);
+        assert_eq!(rig.drained(), vec![DirectJoinEvent::Away]);
     }
 
     /// A cancel while an attempt runs goes to the connection as one step,
