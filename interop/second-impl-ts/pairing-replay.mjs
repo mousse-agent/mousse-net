@@ -1,8 +1,11 @@
 import assert from 'node:assert/strict';
 import { bytes, decode, hex } from './cbor.ts';
 import { equalBytes, publicKey, sha256 } from './certificate.ts';
+import { initiate } from './cpace.ts';
+import { directCode, directCodeFromDraw, directCpaceInputs, displayDirectCode } from './direct-code.ts';
+import { DirectHost, directHello } from './direct-host.ts';
 import { PairingHost, PairingJoiner } from './pairing.ts';
-import { decodeControl, decodeFrame, decodeTicket, encodeControl, encodeFragment, encodeFrame, errorNumber,
+import { decodeControl, decodeFrame, decodeTicket, directMinor, encodeControl, encodeFragment, encodeFrame, errorNumber,
   hello, joinProof, readError } from './wire.ts';
 
 export function memoryFlowStore(onPersist = () => {}, onPin = () => {}) {
@@ -459,4 +462,261 @@ export function replayAttemptSequence(sequence, input) {
     }
   }
   for (const script of draws.values()) script.done();
+}
+
+// Pair with IP (wire.md 10.9), direct-host.json. The joiners are scripted here;
+// the host is DirectHost.
+const onWireDirect = control => decodeControl(
+  incoming(encodeFrame({ type: 'control', payload: encodeControl(control) })).payload, directMinor);
+// The fixture's wrong inputs: lookup `0000` (`0001` if that is the invitation's),
+// secret `00000000` (`00000001` if that is the code's).
+const wrongLookup = lookup => lookup === '0000' ? '0001' : '0000';
+const wrongSecret = secret => secret === '00000000' ? '00000001' : '00000000';
+
+function directParties(conventions, draws) {
+  const hostKey = publicKey(bytes(conventions.host.identity_secret));
+  const { invitation } = conventions;
+  const policy = { authorizingOwner: invitation.authorizing_owner, grantExpiresAt: invitation.grant_expires_at,
+    role: invitation.role };
+  const hostDraws = new ScriptedDraws(draws.host);
+  const host = new DirectHost({ identity: hostKey, name: conventions.host.name }, policy, hostDraws);
+  const joiners = new Map();
+  const labels = new Map([[hex(hostKey), 'host']]);
+  const joinerOf = label => {
+    if (!joiners.has(label)) {
+      const count = [...joiners.keys()].filter(name => name !== 'host').length;
+      const identity = label === 'host' ? hostKey : publicKey(Buffer.alloc(32, 0x50 + count));
+      // A joiner with the host's own identity draws nothing; `draws.host` is the host's.
+      joiners.set(label, { identity, draws: new ScriptedDraws(label === 'host' ? [] : draws[label] ?? []) });
+      labels.set(hex(identity), label);
+    }
+    return joiners.get(label);
+  };
+  return { host, hostKey, hostDraws, joinerOf, joiners, labels };
+}
+
+// One step's I/O: every message each side sent (no HELLOs), host closes and host events.
+function directWire(host, labels, now, conns) {
+  const out = [];
+  const closed = [];
+  const held = [];
+  for (const connection of conns.values()) connection.inbox = [];
+  const label = identity => labels.get(identity) ?? identity;
+  const record = (from, conn, message) => out.push({ send: { conn, control: hex(encodeControl(message)), from } });
+
+  function fromHost(effects) {
+    for (const effect of effects) {
+      if ('send' in effect) {
+        if (effect.send.type === 'HELLO') continue;
+        record('host', effect.conn, effect.send);
+        conns.get(effect.conn)?.inbox.push(onWireDirect(effect.send));
+      } else if ('close' in effect) {
+        closed.push([effect.conn, effect.close]);
+        out.push({ close: { code: effect.close, conn: effect.conn, from: 'host' } });
+        const connection = conns.get(effect.conn);
+        if (connection) connection.closed = true;
+      } else if ('admitted' in effect) out.push({ admitted: { conn: effect.admitted } });
+      else if ('miss_hold' in effect) {
+        held.push(effect.miss_hold.conn);
+        out.push(effect);
+      } else if ('attempts_left' in effect) out.push({ attempts_left: effect.attempts_left.left });
+      else if ('approval' in effect) {
+        const { answer_by, decision, identity, name, presence, role } = effect.approval;
+        out.push({ approval: { answer_by, decision, joiner: label(identity), name, presence, role } });
+      } else if ('approval_ended' in effect) {
+        const { identity, reason } = effect.approval_ended;
+        out.push({ approval_ended: { joiner: label(identity), reason } });
+      } else if ('enrolled' in effect) {
+        const { conn, grant, identity, role } = effect.enrolled;
+        out.push({ enrolled: { conn, grant, joiner: label(identity), role } });
+      } else if ('enrollment_undone' in effect) {
+        const { grant, identity } = effect.enrollment_undone;
+        out.push({ enrollment_undone: { grant, joiner: label(identity) } });
+      } else if ('invitation_ended' in effect) out.push({ invitation_ended: effect.invitation_ended.code });
+      else if (!('version' in effect) && !('ignored' in effect)) out.push(effect);
+    }
+  }
+
+  function toHost(from, conn, message) {
+    record(from, conn, message);
+    fromHost(host.receive(conn, onWireDirect(message), now()));
+  }
+
+  // Step 2 and both HELLOs; then the caller sends JOIN_DIRECT.
+  function open(from, conn, joiner) {
+    assert.ok(!conns.has(conn), `connection ${conn} reused`);
+    const exporters = { pair: Buffer.alloc(32, conn + 100) };
+    const connection = { from, joiner, exporters, inbox: [], closed: false };
+    conns.set(conn, connection);
+    fromHost(host.connect(conn, joiner.identity, exporters, now()));
+    assert.ok(!connection.closed, 'closed at step 2');
+    assert.deepEqual(host.receive(conn, onWireDirect(directHello), now()), [{ version: directMinor }]);
+    return connection;
+  }
+
+  return { host, now, out, closed, held, conns, fromHost, toHost, open };
+}
+
+// The scripted joiner's attempt: msg_a, check msg_b, then msg_c (or CODE_ABORT and a close).
+function directAttempt(wire, conn, code, invitation, hostKey, lose) {
+  const connection = wire.conns.get(conn);
+  const { joiner, from, exporters } = connection;
+  const attempt = joiner.draws.bytes(16, 'attempt_id');
+  const inputs = directCpaceInputs(code, invitation, { host: hostKey, joiner: joiner.identity, exporter: exporters.pair },
+    attempt);
+  let initiator;
+  try { initiator = initiate(inputs, size => joiner.draws.bytes(size, 'cpace_scalar_ya')); }
+  finally { inputs.prs.fill(0); }
+  joiner.attempt = attempt;
+  wire.toHost(from, conn, { type: 'CODE_EXCHANGE', attempt, payload: initiator.message });
+  const reply = connection.inbox.find(m => m.type === 'CODE_EXCHANGE' && equalBytes(m.attempt, attempt));
+  if (connection.closed || !reply) {
+    initiator.dispose();
+    return;
+  }
+  let confirmation;
+  try {
+    confirmation = initiator.finish(reply.payload);
+  } catch {
+    wire.toHost(from, conn, { type: 'CODE_ABORT', attempt, code: errorNumber('pairing_failed') });
+    // Its close is listed, and reaches the host, only if the host has not closed the connection.
+    if (!connection.closed) {
+      connection.closed = true;
+      wire.out.push({ close: { code: 'pairing_failed', conn, from } });
+      wire.fromHost(wire.host.lost(conn, wire.now(), 'pairing_failed'));
+    }
+    return;
+  }
+  confirmation.isk.fill(0);
+  if (lose === 'msg_c') {
+    connection.closed = true;
+    wire.fromHost(wire.host.drop(conn, wire.now()));
+    return;
+  }
+  wire.toHost(from, conn, { type: 'CODE_EXCHANGE', attempt, payload: confirmation.message });
+}
+
+export function replayDirectSequence(sequence, conventions) {
+  const { host, hostKey, hostDraws, joinerOf, joiners, labels } = directParties(conventions, sequence.draws);
+  const created = host.invite(conventions.time);
+  assert.equal(hex(created.invitation), sequence.invitation);
+  assert.equal(displayDirectCode(created.code), sequence.code);
+  const code = directCode(created.code);
+  const invitation = created.invitation;
+  const conns = new Map();
+  let now = conventions.time;
+  const label = identity => labels.get(identity) ?? identity;
+
+  for (const [index, step] of sequence.steps.entries()) {
+    const name = `step ${index + 1} ${step.op}`;
+    if (step.at !== undefined) {
+      assert.ok(conventions.time + step.at >= now, `${name}: time goes back`);
+      now = conventions.time + step.at;
+    }
+    const wire = directWire(host, labels, () => now, conns);
+    const joiner = step.joiner === undefined ? undefined : joinerOf(step.joiner);
+    let result;
+    switch (step.op) {
+      case 'connect':
+      case 'recover': {
+        assert.ok(step.lookup === undefined || step.lookup === 'wrong');
+        wire.open(step.joiner, step.conn, joiner);
+        const message = step.op === 'connect'
+          ? { type: 'JOIN_DIRECT', lookup: step.lookup === 'wrong' ? wrongLookup(code.lookup) : code.lookup,
+            name: step.joiner }
+          : { type: 'JOIN_DIRECT', lookup: code.lookup, name: step.joiner, receipt: invitation,
+            ...(step.cancel ? { cancel: true } : {}) };
+        wire.toHost(step.joiner, step.conn, message);
+        break;
+      }
+      case 'submit': {
+        assert.ok(step.code === 'right' || step.code === 'wrong');
+        assert.ok(step.lose === undefined || step.lose === 'msg_c');
+        const secret = step.code === 'right' ? code : directCode(code.lookup + wrongSecret(code.code.slice(4)));
+        directAttempt(wire, step.conn, secret, invitation, hostKey, step.lose);
+        break;
+      }
+      case 'inject': {
+        const attempt = bytes(step.attempt);
+        joiner.attempt = attempt;
+        wire.toHost(step.joiner, step.conn, { type: 'CODE_EXCHANGE', attempt, payload: bytes(step.payload) });
+        break;
+      }
+      case 'cancel': {
+        wire.toHost(step.joiner, step.conn, { type: 'CODE_ABORT', attempt: joiner.attempt, code: errorNumber('cancelled') });
+        // Its close is listed, and reaches the host, only if the host has not closed the connection.
+        const connection = conns.get(step.conn);
+        if (!connection.closed) {
+          connection.closed = true;
+          wire.out.push({ close: { code: 'cancelled', conn: step.conn, from: step.joiner } });
+          wire.fromHost(host.lost(step.conn, now, 'cancelled'));
+        }
+        break;
+      }
+      case 'drop':
+        wire.fromHost(host.drop(step.conn, now));
+        break;
+      case 'allow':
+      case 'decline': {
+        const answer = host[step.op](invitation, joiner.identity, now);
+        result = answer.result;
+        wire.fromHost(answer.effects);
+        break;
+      }
+      case 'owner_cancel':
+        wire.fromHost(host.cancel(invitation, now));
+        break;
+      case 'tick':
+        wire.fromHost(host.tick(now));
+        break;
+      default:
+        assert.fail(`unknown operation ${step.op}`);
+    }
+    assert.deepEqual(wire.out, step.out, `${name} out`);
+    assert.deepEqual(wire.closed, step.closed ?? [], `${name} closed`);
+    assert.deepEqual(wire.held, step.held ?? [], `${name} held`);
+    const snapshot = host.snapshot(invitation);
+    const actual = {
+      host_status: snapshot.status,
+      host_attempts_left: snapshot.attempts_left,
+      requests: snapshot.requests.map(([identity, presence, decision]) => [label(identity), presence, decision]),
+      granted: snapshot.granted.map(label),
+      result,
+    };
+    for (const key of Object.keys(actual)) {
+      if (key in step) assert.deepEqual(actual[key], step[key], `${name} ${key}`);
+    }
+  }
+  for (const { draws } of joiners.values()) draws.done();
+  hostDraws.done();
+}
+
+// Two invitations with the same id and lookup and different secrets: the same
+// bytes up to AUTHORIZED {join_only, I}, then different msg_a.
+export function replayBeforeMsgA(section, conventions) {
+  const first = [];
+  for (const [index, codeDraw] of section.codes.entries()) {
+    const { host, hostKey, hostDraws, joinerOf, labels } = directParties(conventions,
+      { host: [{ bytes: section.invitation }, { bytes: codeDraw }], a: section.joiner_draws });
+    const created = host.invite(conventions.time);
+    assert.equal(hex(created.invitation), section.invitation);
+    assert.equal(created.code, directCodeFromDraw(bytes(codeDraw)).code);
+    const wire = directWire(host, labels, () => conventions.time, new Map());
+    const joiner = joinerOf('a');
+    wire.open('a', 1, joiner);
+    wire.toHost('a', 1, { type: 'JOIN_DIRECT', lookup: directCode(created.code).lookup, name: 'a' });
+    assert.deepEqual(wire.out, section.out, `invitation ${index + 1} out`);
+    // The joiner's first message, not delivered (the host would debit and draw).
+    const attempt = joiner.draws.bytes(16, 'attempt_id');
+    const inputs = directCpaceInputs(directCode(created.code), created.invitation,
+      { host: hostKey, joiner: joiner.identity, exporter: wire.conns.get(1).exporters.pair }, attempt);
+    const initiator = initiate(inputs, size => joiner.draws.bytes(size, 'cpace_scalar_ya'));
+    initiator.dispose();
+    assert.equal(hex(initiator.message), section.msg_a[index], `invitation ${index + 1} msg_a`);
+    first.push(hex(initiator.message));
+    joiner.draws.done();
+    hostDraws.done();
+  }
+  assert.equal(first.length, 2);
+  assert.notEqual(first[0], first[1]);
 }

@@ -1,6 +1,11 @@
 // The direct code of wire.md 10.9: 12 characters of Crockford base32, the
 // first 4 the lookup, the last 8 the secret (the exchange password).
 
+import { encode, record, requireThat } from './cbor.ts';
+import { sha256 } from './certificate.ts';
+import { attemptSession } from './wire.ts';
+import type { PeerBinding } from './wire.ts';
+
 export const DIRECT_CODE_ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
 const LENGTH = 12;
 const LOOKUP_LENGTH = 4;
@@ -45,5 +50,34 @@ export function parseDirectCode(text: string): DirectCode {
     length += 1;
   }
   if (length !== LENGTH) throw new Error('wrong_length');
+  return parts(code);
+}
+
+// The kind-3 binding (wire.md 10.9 "Binding").
+export const DIRECT_KIND = 3;
+export const DIRECT_CEREMONY_VERSION = 1;
+
+/** D = H(CBOR {1: "mousse-direct-invite-v1", 2: L, 3: I}). */
+export function directInviteDigest(lookup: string, invitation: Uint8Array): Uint8Array {
+  requireThat(/^[0-9A-HJKMNP-TV-Z]{4}$/.test(lookup) && invitation.length === 16, 'direct_binding');
+  return sha256(encode(record([1, 'mousse-direct-invite-v1'], [2, lookup], [3, invitation])));
+}
+
+/** CI: the direct binding transcript, with the joiner (initiator) first. */
+export const directTranscript = (digest: Uint8Array, binding: PeerBinding): Uint8Array =>
+  encode(record([1, 'mousse-direct-pair-v1'], [2, digest], [3, DIRECT_KIND], [4, DIRECT_CEREMONY_VERSION],
+    [5, [[1, binding.joiner], [2, binding.host]]], [6, binding.exporter]));
+
+/** The CPace inputs of one Pair with IP attempt: PRS is the secret's 8 ASCII bytes. */
+export function directCpaceInputs(code: DirectCode, invitation: Uint8Array, binding: PeerBinding, attempt: Uint8Array) {
+  const digest = directInviteDigest(code.lookup, invitation);
+  const ci = directTranscript(digest, binding);
+  const { sid } = attemptSession(attempt, binding.exporter);
+  return { digest, ci, sid, prs: Uint8Array.from(code.secret), ad: new Uint8Array(), requireEmptyPeerAd: true };
+}
+
+/** A code from its 12 characters (no folding: the host's own or a parsed one). */
+export function directCode(code: string): DirectCode {
+  requireThat(code.length === LENGTH && [...code].every(c => DIRECT_CODE_ALPHABET.includes(c)), 'bad_character');
   return parts(code);
 }
