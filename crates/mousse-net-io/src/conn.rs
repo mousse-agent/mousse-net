@@ -245,6 +245,10 @@ pub(crate) struct Outbox {
 pub(crate) trait Role: Send + 'static {
     /// The driver queued `HELLO`; queue whatever comes next.
     fn on_start(&mut self, out: &mut Outbox);
+    /// The peer's first `HELLO` agreed on `minor`. A role that must not
+    /// send before it knows the version (a Pair with IP joiner) starts
+    /// here.
+    fn on_hello(&mut self, _minor: u64, _out: &mut Outbox) {}
     /// Decide what to do with inbound traffic (`message` is the decoded
     /// control message, if it is one).
     fn check(&mut self, traffic: Traffic, message: Option<&ControlMessage>) -> Verdict;
@@ -285,6 +289,9 @@ pub(crate) enum Cmd {
     Release(StreamId, u64),
     Control(ControlMessage),
     Close(ErrorCode),
+    /// A role's step from outside the driver, applied as one: control
+    /// messages that come with a close go out before its `GOAWAY`.
+    Apply(Outbox),
     Status(ConnStatus),
     Code(PairingCode),
     /// Answered when the peer's next `PONG` arrives.
@@ -1406,6 +1413,11 @@ impl Driver {
                 }
             }
             Cmd::Close(code) => self.close(code),
+            Cmd::Apply(out) => {
+                if self.refuse_if_expired().is_none() {
+                    self.apply(out);
+                }
+            }
             Cmd::Status(status) => {
                 let _ = self.status.send(status);
             }
@@ -1712,6 +1724,13 @@ impl Driver {
                     return;
                 };
                 if matches!(message, ControlMessage::Hello { .. }) {
+                    // Only the peer's first HELLO gets here: the gate
+                    // ignores a repeat.
+                    if let Some(minor) = self.hello.agreed() {
+                        let mut out = Outbox::default();
+                        self.role.on_hello(minor, &mut out);
+                        self.apply(out);
+                    }
                     return;
                 }
                 let mut out = Outbox::default();

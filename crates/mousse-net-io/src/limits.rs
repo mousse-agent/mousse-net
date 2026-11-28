@@ -24,6 +24,10 @@ mousse_net_core::define_limits! {
         outcome_retry_first_ms = "OUTCOME_RETRY_FIRST_MS": 250, [10, 10_000];
         /// Longest wait between those reconnects; not below the first wait.
         outcome_retry_max_ms = "OUTCOME_RETRY_MAX_MS": 2_000, [10, 60_000];
+        /// Pair with IP joiner: wait before the first recovery of a kept pending record (wire.md 10.9); each next wait doubles.
+        direct_retry_first_ms = "DIRECT_RETRY_FIRST_MS": 1_000, [100, 60_000];
+        /// Pair with IP joiner: longest wait between recoveries of a kept pending record; not below the first wait.
+        direct_retry_max_ms = "DIRECT_RETRY_MAX_MS": 300_000, [1_000, 3_600_000];
         /// Longest time between readings of both clocks for connection deadlines, renewal and the host's step 2 timers (wire.md 6 closes in the second after the deadline; tighten only).
         clock_recheck_ms = "CLOCK_RECHECK_MS": 1_000, [10, 1_000];
         /// How often a write still pending checks the connection deadline.
@@ -106,6 +110,12 @@ mousse_net_core::define_limits! {
             return Err(LimitError::Conflict(format!(
                 "OUTCOME_RETRY_MAX_MS ({}) is below OUTCOME_RETRY_FIRST_MS ({})",
                 io.outcome_retry_max_ms, io.outcome_retry_first_ms
+            )));
+        }
+        if io.direct_retry_max_ms < io.direct_retry_first_ms {
+            return Err(LimitError::Conflict(format!(
+                "DIRECT_RETRY_MAX_MS ({}) is below DIRECT_RETRY_FIRST_MS ({})",
+                io.direct_retry_max_ms, io.direct_retry_first_ms
             )));
         }
     }

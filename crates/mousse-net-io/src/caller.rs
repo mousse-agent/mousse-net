@@ -109,6 +109,11 @@ use crate::store::{FlowHold, FlowRecords, MemoryFlowRecords};
 use crate::tls::{self, Handshake, TlsPolicy};
 use crate::SharedSigner;
 
+mod direct;
+pub use direct::{
+    DirectJoin, DirectJoinEvent, DirectJoined, DirectPins, DirectResumed, DirectSetup,
+};
+
 /// How pairing ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum JoinOutcome {
@@ -958,8 +963,24 @@ where
         pin: IdentityPublicKey,
         handshake: &Handshake,
     ) -> Result<ConnectionId, NetError> {
-        let conn = ConnectionId(self.next_conn.fetch_add(1, Ordering::Relaxed));
-        let mut paths = lock(&self.paths);
+        let conn = self.next_conn_id();
+        self.admit_in(&mut lock(&self.paths), conn, pin, handshake)?;
+        Ok(conn)
+    }
+
+    fn next_conn_id(&self) -> ConnectionId {
+        ConnectionId(self.next_conn.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Admit `conn`, already authenticated as `pin`, into that peer's
+    /// session as a new path, under the paths lock `paths`.
+    fn admit_in(
+        &self,
+        paths: &mut Paths,
+        conn: ConnectionId,
+        pin: IdentityPublicKey,
+        handshake: &Handshake,
+    ) -> Result<(), NetError> {
         let session = paths
             .sessions
             .entry(pin)
@@ -984,7 +1005,7 @@ where
         paths.run(events);
         match refused {
             Some(e) => Err(e),
-            None => Ok(conn),
+            None => Ok(()),
         }
     }
 
