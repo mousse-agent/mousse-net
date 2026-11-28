@@ -11,7 +11,10 @@
 //!   the step 2 gate over one TLS connection, and hands out streams.
 //! - [`host`]: the host side: accepts connections, runs step 2 and pairing,
 //!   owns the grant table.
-//! - [`caller`]: the caller side: dials known hosts and joins with a ticket.
+//! - [`caller`]: the caller side: dials known hosts and joins with a ticket
+//!   or, with Pair with IP, an address and a code.
+//! - [`direct_records`]: a Pair with IP joiner's ledger, pending records and
+//!   lookup holds.
 //! - [`endpoint`]: one profile's helper on a device: its state directory,
 //!   locks, kept port and profile id.
 //! - [`keystore`] and [`store`]: the identity key and the local state files.
@@ -27,6 +30,7 @@ pub mod caller;
 pub mod certs;
 pub mod clock;
 pub mod conn;
+pub mod direct_records;
 pub mod discovery;
 pub mod endpoint;
 mod error;
@@ -45,13 +49,15 @@ pub mod watch;
 
 pub use admission::{HelloSeen, StreamAdmission};
 pub use caller::{
-    is_lan_route, route_rank, Caller, CandidateSource, CodeEntry, JoinOutcome, LaterCandidates,
-    NoCode, PathEvent, Reached, RouteClass, Search, Step1Failures,
+    is_lan_route, route_rank, Caller, CandidateSource, CodeEntry, DirectEvent, DirectJoin,
+    DirectJoined, DirectPins, DirectSetup, JoinOutcome, LaterCandidates, NoCode, PathEvent,
+    Reached, RouteClass, Search, Step1Failures,
 };
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use conn::{
     CloseReason, ConnStatus, Connection, LivePermit, MuxStream, StreamReader, StreamWriter,
 };
+pub use direct_records::{DirectRecordStore, DirectRecords, MemoryDirectRecords};
 pub use endpoint::{Endpoint, PortChoice};
 pub use error::NetError;
 pub use host::{

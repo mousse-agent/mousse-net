@@ -5,6 +5,10 @@
 //! - Both verifiers call [`session_cert::verify`]. The caller passes the
 //!   stored pin (or, on first contact, the ticket's host identity) on every
 //!   connection. The host passes no pin; step 2 decides what the peer may do.
+//! - The one unpinned dial is a Pair with IP first contact
+//!   ([`connect_unpinned`], wire.md 5.4): every check but the pin, and the
+//!   far end may be neither this endpoint nor a denied identity. What it
+//!   shows is only a candidate until the code exchange confirms it.
 //! - No session resumption, no tickets, no PSK and no early data, so every
 //!   connection runs a full handshake and the verifier again.
 //! - Key exchange offers X25519MLKEM768 first and X25519 second (aws-lc-rs),
@@ -252,6 +256,109 @@ impl ServerCertVerifier for PinnedHostVerifier {
     }
 }
 
+/// Why an unpinned dial ([`connect_unpinned`]) refused the far end before
+/// this device's certificate went out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnpinnedRefusal {
+    /// The far end is this endpoint: a device never pairs with itself.
+    OwnEndpoint,
+    /// This profile denied the far end's identity.
+    Denied,
+}
+
+impl fmt::Display for UnpinnedRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            UnpinnedRefusal::OwnEndpoint => "the far end is this device",
+            UnpinnedRefusal::Denied => "the far end is denied here",
+        })
+    }
+}
+
+impl std::error::Error for UnpinnedRefusal {}
+
+/// Whether this profile denied an identity, for [`connect_unpinned`].
+pub type DeniedCheck = Arc<dyn Fn(&IdentityPublicKey) -> bool + Send + Sync>;
+
+/// Caller side of a Pair with IP first contact (wire.md 5.4): checks 1 to 8
+/// and 10, no pin. The far end's identity may be neither `own` nor one
+/// `denied` names; both are refused here, inside the server certificate
+/// check, so this side's certificate never goes out to them.
+struct UnpinnedPairVerifier {
+    own: IdentityPublicKey,
+    denied: DeniedCheck,
+    clock: Arc<dyn Clock>,
+    skew_secs: u64,
+}
+
+impl fmt::Debug for UnpinnedPairVerifier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("UnpinnedPairVerifier")
+    }
+}
+
+impl UnpinnedPairVerifier {
+    fn refusal(&self, identity: &IdentityPublicKey) -> Option<UnpinnedRefusal> {
+        if *identity == self.own {
+            Some(UnpinnedRefusal::OwnEndpoint)
+        } else if (self.denied)(identity) {
+            Some(UnpinnedRefusal::Denied)
+        } else {
+            None
+        }
+    }
+}
+
+impl ServerCertVerifier for UnpinnedPairVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: PkiTime,
+    ) -> Result<ServerCertVerified, Error> {
+        if !intermediates.is_empty() {
+            return Err(cert_error(CertError::Malformed));
+        }
+        let verified = session_cert::verify_with_skew(
+            end_entity.as_ref(),
+            self.clock.now(),
+            None,
+            self.skew_secs,
+        )
+        .map_err(cert_error)?;
+        if let Some(refusal) = self.refusal(&verified.identity) {
+            return Err(Error::InvalidCertificate(CertificateError::Other(
+                OtherError(Arc::new(refusal)),
+            )));
+        }
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        Err(Error::General("TLS 1.2 is not allowed".into()))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        verify_cert_verify(&*self.clock, self.skew_secs, message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![SCHEME]
+    }
+}
+
 /// Host side: any valid session certificate; step 2 decides afterwards.
 #[derive(Debug)]
 struct AnyDeviceVerifier {
@@ -326,17 +433,26 @@ fn client_config_on(
     clock: Arc<dyn Clock>,
     policy: TlsPolicy,
 ) -> Result<Arc<ClientConfig>, NetError> {
-    let mut config =
-        ClientConfig::builder_with_details(provider, Arc::new(ClockTime(clock.clone())))
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .map_err(|e| NetError::Tls(e.to_string()))?
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(PinnedHostVerifier {
-                pin,
-                clock,
-                skew_secs: policy.skew_secs,
-            }))
-            .with_client_cert_resolver(Arc::new(OwnCert(certified_key(own))));
+    let verifier = Arc::new(PinnedHostVerifier {
+        pin,
+        clock: clock.clone(),
+        skew_secs: policy.skew_secs,
+    });
+    client_config_with(provider, own, verifier, clock)
+}
+
+fn client_config_with(
+    provider: Arc<CryptoProvider>,
+    own: &SessionCertificate,
+    verifier: Arc<dyn ServerCertVerifier>,
+    clock: Arc<dyn Clock>,
+) -> Result<Arc<ClientConfig>, NetError> {
+    let mut config = ClientConfig::builder_with_details(provider, Arc::new(ClockTime(clock)))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|e| NetError::Tls(e.to_string()))?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_client_cert_resolver(Arc::new(OwnCert(certified_key(own))));
     config.alpn_protocols = vec![ALPN.to_vec()];
     config.resumption = Resumption::disabled();
     config.enable_early_data = false;
@@ -394,6 +510,9 @@ fn map_handshake_error(e: std::io::Error) -> NetError {
         if let Error::InvalidCertificate(CertificateError::Other(other)) = inner {
             if let Some(cert) = other.0.downcast_ref::<CertError>() {
                 return NetError::PeerCertificate(*cert);
+            }
+            if let Some(refusal) = other.0.downcast_ref::<UnpinnedRefusal>() {
+                return NetError::PairPeer(*refusal);
             }
         }
         return NetError::Tls(inner.to_string());
@@ -469,6 +588,43 @@ pub async fn connect<P: Pipe>(
     let exporters =
         exporters(|label| conn.export_keying_material([0u8; 32], label.as_bytes(), None))?;
     let handshake = finish(conn, exporters, &*clock, Some(&pin), own.window(), policy)?;
+    Ok((TlsStream::Client(stream), handshake))
+}
+
+/// Run the caller side of step 1 for a Pair with IP first contact (wire.md
+/// 5.4): no pin, every other check of step 1 and the full TLS policy. A far
+/// end showing `own` or an identity `denied` names is refused inside the
+/// server certificate check, before this device's certificate goes out
+/// ([`NetError::PairPeer`]). The identity in the returned handshake is only
+/// a candidate: the connection is pairing only (8.2) until the host's
+/// confirmation verifies. Every other dial, a Pair with IP recovery
+/// included, is pinned ([`connect`]).
+pub async fn connect_unpinned<P: Pipe>(
+    pipe: P,
+    own: &SessionCertificate,
+    denied: DeniedCheck,
+    clock: Arc<dyn Clock>,
+    policy: TlsPolicy,
+) -> Result<(TlsStream<P>, Handshake), NetError> {
+    let verifier = Arc::new(UnpinnedPairVerifier {
+        own: *own.identity(),
+        denied,
+        clock: clock.clone(),
+        skew_secs: policy.skew_secs,
+    });
+    let config = client_config_with(provider(), own, verifier, clock.clone())?;
+    let name = ServerName::try_from("mousse-session").map_err(|e| NetError::Tls(e.to_string()))?;
+    let stream = tokio::time::timeout(
+        policy.handshake_timeout,
+        TlsConnector::from(config).connect(name, pipe),
+    )
+    .await
+    .map_err(|_| NetError::Timeout("TLS handshake"))?
+    .map_err(map_handshake_error)?;
+    let conn = stream.get_ref().1;
+    let exporters =
+        exporters(|label| conn.export_keying_material([0u8; 32], label.as_bytes(), None))?;
+    let handshake = finish(conn, exporters, &*clock, None, own.window(), policy)?;
     Ok((TlsStream::Client(stream), handshake))
 }
 
@@ -552,5 +708,136 @@ mod tests {
             Err(NetError::Tls(e)) => assert!(e.contains("hybrid"), "{e}"),
             other => panic!("accepted a classical-only connection: {:?}", other.err()),
         }
+    }
+
+    /// A host config whose client check records whether it ran: whether
+    /// the caller's certificate ever reached the host.
+    #[derive(Debug)]
+    struct Recording {
+        inner: AnyDeviceVerifier,
+        called: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl ClientCertVerifier for Recording {
+        fn offer_client_auth(&self) -> bool {
+            true
+        }
+
+        fn client_auth_mandatory(&self) -> bool {
+            true
+        }
+
+        fn root_hint_subjects(&self) -> &[DistinguishedName] {
+            &[]
+        }
+
+        fn verify_client_cert(
+            &self,
+            end_entity: &CertificateDer<'_>,
+            intermediates: &[CertificateDer<'_>],
+            now: PkiTime,
+        ) -> Result<ClientCertVerified, Error> {
+            self.called.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.inner
+                .verify_client_cert(end_entity, intermediates, now)
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, Error> {
+            self.inner.verify_tls12_signature(message, cert, dss)
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, Error> {
+            self.inner.verify_tls13_signature(message, cert, dss)
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            vec![SCHEME]
+        }
+    }
+
+    /// An unpinned dial to `host`: the caller's result, and whether the
+    /// host ever saw the caller's certificate.
+    async fn unpinned(
+        caller: &SessionCertificate,
+        host: &SessionCertificate,
+        denied: DeniedCheck,
+        clock: Arc<ManualClock>,
+    ) -> (Result<IdentityPublicKey, NetError>, bool) {
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut config =
+            ServerConfig::builder_with_details(provider(), Arc::new(ClockTime(clock.clone())))
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_client_cert_verifier(Arc::new(Recording {
+                    inner: AnyDeviceVerifier {
+                        clock: clock.clone(),
+                        skew_secs: TlsPolicy::default().skew_secs,
+                    },
+                    called: called.clone(),
+                }))
+                .with_cert_resolver(Arc::new(OwnCert(certified_key(host))));
+        config.alpn_protocols = vec![ALPN.to_vec()];
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let (dialled, _accepted) = tokio::join!(
+            connect_unpinned(a, caller, denied, clock.clone(), TlsPolicy::default()),
+            TlsAcceptor::from(Arc::new(config)).accept(b),
+        );
+        let result = dialled.map(|(_, handshake)| handshake.peer.identity);
+        (result, called.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    fn nobody_denied() -> DeniedCheck {
+        Arc::new(|_| false)
+    }
+
+    /// wire.md 5.4: a Pair with IP first contact pins nothing; the host it
+    /// reaches is a candidate.
+    #[tokio::test]
+    async fn an_unpinned_dial_takes_any_host_as_a_candidate() {
+        let clock = Arc::new(ManualClock::new());
+        let (caller, host) = (cert(clock.clone()), cert(clock.clone()));
+        let (seen, sent) = unpinned(&caller, &host, nobody_denied(), clock).await;
+        assert_eq!(seen.unwrap(), *host.identity());
+        assert!(sent);
+    }
+
+    /// wire.md 5.4: the far end showing this endpoint's own key, or a key
+    /// this profile denied, is refused before the caller's certificate
+    /// goes out.
+    #[tokio::test]
+    async fn an_unpinned_dial_refuses_itself_and_denied_keys_before_its_certificate_goes_out() {
+        let clock = Arc::new(ManualClock::new());
+        let signer = Arc::new(SoftwareKey::generate(&mut os_rng()));
+        let caller = CertManager::new(signer.clone(), clock.clone())
+            .current()
+            .unwrap();
+        // Another session certificate of the same endpoint.
+        let same = CertManager::new(signer, clock.clone()).current().unwrap();
+        let (seen, sent) = unpinned(&caller, &same, nobody_denied(), clock.clone()).await;
+        assert!(
+            matches!(seen, Err(NetError::PairPeer(UnpinnedRefusal::OwnEndpoint))),
+            "{seen:?}"
+        );
+        assert!(!sent, "the certificate went out to this device itself");
+
+        let host = cert(clock.clone());
+        let denied_key = *host.identity();
+        let denied: DeniedCheck = Arc::new(move |k| *k == denied_key);
+        let (seen, sent) = unpinned(&caller, &host, denied, clock).await;
+        assert!(
+            matches!(seen, Err(NetError::PairPeer(UnpinnedRefusal::Denied))),
+            "{seen:?}"
+        );
+        assert!(!sent, "the certificate went out to a denied host");
     }
 }

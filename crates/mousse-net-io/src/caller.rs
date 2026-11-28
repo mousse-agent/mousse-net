@@ -109,6 +109,9 @@ use crate::store::{FlowHold, FlowRecords, MemoryFlowRecords};
 use crate::tls::{self, Handshake, TlsPolicy};
 use crate::SharedSigner;
 
+mod direct;
+pub use direct::{DirectEvent, DirectJoin, DirectJoined, DirectPins, DirectSetup};
+
 /// How pairing ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum JoinOutcome {

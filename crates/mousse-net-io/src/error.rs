@@ -12,6 +12,10 @@ pub enum NetError {
     Io(std::io::Error),
     /// Our step 1 check refused the peer's session certificate.
     PeerCertificate(CertError),
+    /// An unpinned Pair with IP dial (wire.md 5.4) refused the far end's
+    /// identity before this device's certificate went out: it is this
+    /// endpoint's own key, or one this profile denied.
+    PairPeer(crate::tls::UnpinnedRefusal),
     /// The TLS handshake failed for another reason (the peer refused our
     /// certificate, no common protocol, a wrong ALPN or key exchange group).
     Tls(String),
@@ -71,6 +75,7 @@ impl NetError {
                 | NetError::Tls(_)
                 | NetError::Timeout(_)
                 | NetError::PeerCertificate(_)
+                | NetError::PairPeer(_)
                 | NetError::Relay(_)
                 | NetError::Ssh { .. }
                 | NetError::Forbidden(_)
@@ -83,6 +88,7 @@ impl fmt::Display for NetError {
         match self {
             NetError::Io(e) => write!(f, "connection failed: {e}"),
             NetError::PeerCertificate(e) => write!(f, "peer certificate refused: {e}"),
+            NetError::PairPeer(e) => write!(f, "peer refused: {e}"),
             NetError::Tls(e) => write!(f, "TLS handshake failed: {e}"),
             NetError::Closed(reason) => write!(f, "connection closed: {reason}"),
             NetError::Version { reason, peer_minor } => write!(

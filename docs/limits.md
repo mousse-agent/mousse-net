@@ -53,6 +53,8 @@ spec's value: it can only be tightened.
 | `MOUSSE_NET_OUTCOME_RETRIES` | 4 | 0 to 20 | Reconnects a join makes to learn an outcome a dropped connection left pending. |
 | `MOUSSE_NET_OUTCOME_RETRY_FIRST_MS` | 250 | 10 to 10000 | Wait before the first of those reconnects; each next wait doubles. |
 | `MOUSSE_NET_OUTCOME_RETRY_MAX_MS` | 2000 | 10 to 60000 | Longest of those waits; not below the first. |
+| `MOUSSE_NET_DIRECT_RETRY_FIRST_MS` | 1000 | 100 to 60000 | Pair with IP joiner: wait before the first recovery of a kept pending record (wire.md 10.9); each next wait doubles. |
+| `MOUSSE_NET_DIRECT_RETRY_MAX_MS` | 300000 | 1000 to 3600000 | Longest wait between those recoveries; not below the first. |
 | `MOUSSE_NET_CLOCK_RECHECK_MS` | 1000 | 10 to 1000 | Longest time between readings of both clocks: connection deadlines, renewal, the host's step 2 timers (wire.md 6). |
 | `MOUSSE_NET_DEADLINE_POLL_MS` | 50 | 1 to 1000 | How often a pending write checks the connection deadline. |
 | `MOUSSE_NET_CLOSE_LINGER_MS` | 2000 | 100 to 30000 | Time a closing connection has to send its last frame and shut the pipe, while it reads and drops what the peer still sends. |

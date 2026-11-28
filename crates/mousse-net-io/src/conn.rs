@@ -245,6 +245,10 @@ pub(crate) struct Outbox {
 pub(crate) trait Role: Send + 'static {
     /// The driver queued `HELLO`; queue whatever comes next.
     fn on_start(&mut self, out: &mut Outbox);
+    /// The peer's first `HELLO` agreed on `minor`. A role that must not
+    /// send before it knows the version (a Pair with IP joiner) starts
+    /// here.
+    fn on_hello(&mut self, _minor: u64, _out: &mut Outbox) {}
     /// Decide what to do with inbound traffic (`message` is the decoded
     /// control message, if it is one).
     fn check(&mut self, traffic: Traffic, message: Option<&ControlMessage>) -> Verdict;
@@ -962,6 +966,7 @@ pub(crate) fn spawn<P: Pipe>(
         minor,
         peer_hello,
         own_hello_out: false,
+        role_heard_hello: false,
         peer: start.peer,
         inbound: start.side == MuxRole::Host,
         reason: None,
@@ -1006,6 +1011,8 @@ struct Driver {
     /// This side's own `HELLO`, the mux's first frame, has gone to the
     /// writer. Closing drops what the mux still holds.
     own_hello_out: bool,
+    /// [`Role::on_hello`] ran.
+    role_heard_hello: bool,
     /// The peer's identity, proven in step 1.
     peer: IdentityPublicKey,
     /// The peer dialled this endpoint.
@@ -1678,6 +1685,12 @@ impl Driver {
                     return;
                 };
                 if matches!(message, ControlMessage::Hello { .. }) {
+                    if let Some(minor) = self.hello.agreed().filter(|_| !self.role_heard_hello) {
+                        self.role_heard_hello = true;
+                        let mut out = Outbox::default();
+                        self.role.on_hello(minor, &mut out);
+                        self.apply(out);
+                    }
                     return;
                 }
                 let mut out = Outbox::default();
