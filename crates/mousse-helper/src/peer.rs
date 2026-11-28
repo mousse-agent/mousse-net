@@ -893,8 +893,10 @@ pub(crate) fn drop_completions(
         return Ok(Vec::new());
     }
     ApprovalStore::in_dir(dir).remove_identity(held, identity)?;
-    // A Pair with IP completion naming the host goes too.
+    // A Pair with IP completion naming the host goes too, and so does any
+    // kept pending record of a join to it: no recovery pairs with it again.
     crate::direct::Completions::in_dir(dir).remove_naming(held, identity)?;
+    crate::direct::forget_pending(dir, held, identity)?;
     CompletionStore::in_dir(dir).remove_naming(held, identity)
 }
 

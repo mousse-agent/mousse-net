@@ -29,9 +29,11 @@ use mousse_net_core::pairing::{
 use mousse_net_core::ErrorCode;
 use mousse_net_io::discovery::{Advertiser, CachedBrowse};
 use mousse_net_io::pipe::ws::{self, WsTarget};
-use mousse_net_io::pipe::{accept_tcp, route_from_addr, route_uri, Pipe, RouteKind};
+use mousse_net_io::pipe::{
+    accept_tcp, route_from_addr, route_uri, AddrClass, AddrPolicy, LocalRoute, Pipe, RouteKind,
+};
 use mousse_net_io::rng::{os_rng, random_bytes};
-use mousse_net_io::routes::{RoutesConfig, RoutesStore};
+use mousse_net_io::routes::{RoutesConfig, RoutesStore, Way};
 use mousse_net_io::store::{hex, short_id};
 use mousse_net_io::{
     ApprovalRequest, Caller, DirectEvent, Host, HostConfig, HostEvent, ListenerKind, PortChoice,
@@ -115,7 +117,81 @@ pub struct ListenState {
     pub managed_tunnel: Option<String>,
 }
 
+/// The way of an address the listener serves without `routes.json`:
+/// IPv4 literals of class `lan` or `tailnet` under `policy`.
+pub fn served_way(policy: &AddrPolicy, route: &LocalRoute) -> Option<Way> {
+    let (Some(ip), Some(port)) = (route.ip(), route.port()) else {
+        return None;
+    };
+    if !ip.is_ipv4() || !matches!(route, LocalRoute::Tcp { .. }) {
+        return None;
+    }
+    match policy.class_of(SocketAddr::new(ip, port)) {
+        AddrClass::Lan => Some(Way::Lan),
+        AddrClass::Tailnet => Some(Way::Tailnet),
+        _ => None,
+    }
+}
+
+/// The `lan` and `tailnet` candidates of a listener on `ip`:`port` without
+/// `routes.json`: every address it serves (for `0.0.0.0`, each usable one
+/// of `addrs`), uncapped, with the way of its class. The 1.1 advertisement
+/// ([`crate::serve::route_hints`]) is the same list cut to eight before it
+/// is classed; selection must not inherit that cut.
+pub fn listener_candidates(
+    policy: &AddrPolicy,
+    ip: IpAddr,
+    port: u16,
+    addrs: &[IpAddr],
+) -> Vec<(Way, String)> {
+    served_hints(ip, port, addrs)
+        .iter()
+        .filter_map(|hint| {
+            let route = LocalRoute::parse(hint).ok()?;
+            Some((served_way(policy, &route)?, route.uri()))
+        })
+        .collect()
+}
+
+/// The addresses a Pair with IP invitation can show from `candidates`
+/// (routes of one way): their IPv4 TCP literals, in order.
+pub fn direct_addresses<'a>(candidates: impl IntoIterator<Item = &'a str>) -> Vec<SocketAddr> {
+    candidates
+        .into_iter()
+        .filter_map(|r| {
+            let parsed = LocalRoute::parse(r).ok()?;
+            if !matches!(parsed, LocalRoute::Tcp { .. }) {
+                return None;
+            }
+            let addr = SocketAddr::new(parsed.ip()?, parsed.port()?);
+            addr.is_ipv4().then_some(addr)
+        })
+        .collect()
+}
+
 impl ListenState {
+    /// The `lan` and `tailnet` candidates this listener serves now,
+    /// uncapped, each with its way (`docs/pairing-flow-design.md` §2):
+    /// without `routes.json` what `--listen-ip` serves, classed by
+    /// `policy`; with it, what the config selects for the sockets bound.
+    /// The app's inventory and `invite --direct` both choose from it.
+    pub fn private_candidates(
+        &self,
+        policy: &AddrPolicy,
+        interfaces: &[IpAddr],
+    ) -> Vec<(Way, String)> {
+        match self.listen_ip {
+            Some(ip) => listener_candidates(policy, ip, self.port, interfaces),
+            None => self
+                .config
+                .candidates(interfaces, &self.bound, self.port)
+                .into_iter()
+                .filter(|c| matches!(c.way, Way::Lan | Way::Tailnet))
+                .map(|c| (c.way, c.route))
+                .collect(),
+        }
+    }
+
     /// Advertise what `config` selects for the sockets bound now, plus the
     /// command line's tunnels.
     pub fn readvertise(&mut self, interfaces: &[IpAddr]) {
@@ -1312,25 +1388,36 @@ async fn invite_session(state: &State, ch: &mut Channel, link: bool) {
     }
 }
 
-/// The address a Pair with IP invitation shows: the first IPv4 address the
-/// listener serves, of the tailnet range when `tailnet`, otherwise not.
+/// The address a Pair with IP invitation shows: the way's first IPv4
+/// candidate, chosen as the app's `invite.create` chooses (never a public
+/// forward, never loopback outside tests). `None` when the way has none.
 fn direct_address(state: &State, tailnet: bool) -> Option<SocketAddr> {
-    use mousse_net_io::pipe::{classify, AddrClass, LocalRoute};
-    let routes = state
+    let listen = state
         .listen
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .routes
         .clone();
-    routes.iter().find_map(|r| {
-        let route = LocalRoute::parse(r).ok()?;
-        if !matches!(route, LocalRoute::Tcp { .. }) {
-            return None;
-        }
-        let addr = SocketAddr::new(route.ip()?, route.port()?);
-        let is_tailnet = classify(addr.ip()) == AddrClass::Tailnet;
-        (addr.is_ipv4() && is_tailnet == tailnet).then_some(addr)
-    })
+    let policy = AddrPolicy::for_build().ok()?;
+    let interfaces = crate::app::listed_interface_ips().unwrap_or_default();
+    let way = if tailnet { Way::Tailnet } else { Way::Lan };
+    // Must-fail control (tests only): any IPv4 listener route that is not
+    // tailnet counts as the local network.
+    if cfg!(mousse_control = "direct-cli-any-route") {
+        return listen.routes.iter().find_map(|r| {
+            let addr = *direct_addresses([r.as_str()]).first()?;
+            let is_tailnet = mousse_net_io::pipe::classify(addr.ip()) == AddrClass::Tailnet;
+            (is_tailnet == tailnet).then_some(addr)
+        });
+    }
+    let routes: Vec<String> = listen
+        .private_candidates(&policy, &interfaces)
+        .into_iter()
+        .filter(|(w, _)| *w == way)
+        .map(|(_, r)| r)
+        .collect();
+    direct_addresses(routes.iter().map(String::as_str))
+        .first()
+        .copied()
 }
 
 /// One Pair with IP invitation (`invite --direct`), from its code to
@@ -1365,7 +1452,7 @@ async fn invite_direct_session(state: &State, ch: &mut Channel, tailnet: bool) {
         w.insert(invitation, tx);
     }
     // Shown only by the inviting command, never logged.
-    let first = {
+    let mut first = {
         let code = created.code.to_display();
         json!({
             "address": created.address.to_string(),
@@ -1375,7 +1462,7 @@ async fn invite_direct_session(state: &State, ch: &mut Channel, tailnet: bool) {
         })
     };
     let sent = ch.send(&first).await;
-    drop(first);
+    crate::direct::wipe_code(&mut first);
     let mut finished = sent.is_err();
     while !finished {
         tokio::select! {

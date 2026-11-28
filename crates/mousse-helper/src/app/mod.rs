@@ -32,6 +32,7 @@
 
 mod budget;
 mod changes;
+pub use changes::listed_interface_ips;
 mod engine_ops;
 mod frame;
 mod lan;
@@ -59,6 +60,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
+use zeroize::Zeroize;
 
 use mousse_net_core::grants::GrantId;
 use mousse_net_core::identity::IdentityPublicKey;
@@ -209,9 +211,12 @@ struct Shared {
     relay: relay::State,
     /// SSH routes: `ssh.*` and the connection window (Phase 1b §3).
     ssh: Arc<crate::ssh::Ssh>,
-    /// What a Pair with IP join uses: its records, pins and the denied
-    /// identities.
-    direct: mousse_net_io::DirectSetup,
+    /// The identities a Pair with IP first contact refuses before its own
+    /// certificate goes out: those this profile denied.
+    direct_denied: mousse_net_io::tls::DeniedCheck,
+    /// Taken while Pair with IP flows start, stop for a pause, or resume,
+    /// so a pause never misses a flow starting with it.
+    direct_gate: Mutex<()>,
     info: AppInfo,
     limits: HelperLimits,
     engine: Arc<Engine>,
@@ -312,6 +317,22 @@ struct Core {
     /// paths. A join reads it before it starts and stores the peer only if
     /// it has not changed, checked under the peers lock.
     join_gen: HashMap<IdentityPublicKey, u64>,
+    /// Counts every join made void ([`Core::void_joins`]); a Pair with IP
+    /// join notes it when it starts, before its host is known.
+    join_seq: u64,
+    /// Per peer, the `join_seq` its joins were last made void at: a Pair
+    /// with IP join that started before stores nothing for it.
+    join_voided: HashMap<IdentityPublicKey, u64>,
+}
+
+impl Core {
+    /// Make every join to `pin` running now void (see `join_gen`). Call
+    /// under the peers lock.
+    fn void_joins(&mut self, pin: IdentityPublicKey) {
+        *self.join_gen.entry(pin).or_default() += 1;
+        self.join_seq += 1;
+        self.join_voided.insert(pin, self.join_seq);
+    }
 }
 
 /// Why a connection that finished opening was closed instead of published.
@@ -385,11 +406,8 @@ impl App {
         let (ended, _) = watch::channel(None);
         let (keep, kicks) = paths::Keep::new();
         let denied_by = host.clone();
-        let direct = crate::direct::setup(
-            &info.state_dir,
-            caller.addr_policy().clone(),
-            Arc::new(move |identity| denied_by.is_denied(identity)),
-        );
+        let direct_denied: mousse_net_io::tls::DeniedCheck =
+            Arc::new(move |identity| denied_by.is_denied(identity));
         let shared = Arc::new(Shared {
             core: Mutex::new(Core {
                 hello: false,
@@ -411,6 +429,8 @@ impl App {
                 ending: None,
                 peer_gen: HashMap::new(),
                 join_gen: HashMap::new(),
+                join_seq: 0,
+                join_voided: HashMap::new(),
             }),
             wake_writer: Notify::new(),
             ended,
@@ -423,7 +443,8 @@ impl App {
             refusals: refusals::Refusals::in_dir(&info.state_dir),
             relay: relay::State::new(&info),
             ssh: info.ssh.clone(),
-            direct,
+            direct_denied,
+            direct_gate: Mutex::new(()),
             info,
             limits,
             engine,
@@ -432,11 +453,17 @@ impl App {
             shared.clone(),
             shared.admission.watch_hellos(),
         ));
+        // The kept Pair with IP records are recovered, and their flows
+        // registered, before the first request is read: a `join.direct`
+        // for one of them always finds its flow. Must-fail control (tests
+        // only): nothing is recovered at startup.
+        if !cfg!(mousse_control = "direct-no-startup-recovery") {
+            pairing::resume_direct_now(&shared);
+        }
         tokio::spawn(read_stdin(shared.clone()));
         tokio::spawn(write_stdout(shared.clone()));
         tokio::spawn(pairing::watch_pause(shared.clone()));
         tokio::spawn(pairing::prune_completions(shared.clone()));
-        tokio::spawn(pairing::resume_direct(shared.clone()));
         tokio::spawn(paths::keep_connected(shared.clone(), kicks));
         tokio::spawn(changes::forward_renewals(shared.clone()));
         tokio::spawn(watch_served(shared.clone()));
@@ -592,15 +619,19 @@ impl Shared {
         }
     }
 
-    fn reply(&self, core: &mut Core, value: Value) {
+    fn reply(&self, core: &mut Core, mut value: Value) {
         core.out.json(&value);
+        // A code shown to the owner leaves no copy here but the frame,
+        // which is wiped once written.
+        crate::direct::wipe_code(&mut value);
         self.queued(core);
     }
 
     /// Queue an event for the app.
-    fn event(&self, value: Value) {
+    fn event(&self, mut value: Value) {
         let mut core = lock(&self.core);
         core.out.json(&value);
+        crate::direct::wipe_code(&mut value);
         self.queued(&core);
     }
 
@@ -673,6 +704,23 @@ impl Shared {
     /// The generation of `pin` (see `Core::peer_gen`).
     fn peer_gen(&self, pin: &IdentityPublicKey) -> u64 {
         lock(&self.core).peer_gen.get(pin).copied().unwrap_or(0)
+    }
+
+    /// The fence of a Pair with IP join starting now: it may store a host
+    /// only if no removal of that host made joins void since, and then
+    /// learns the host's peer generation, which the path it publishes must
+    /// still match. Read under the peers lock by the store.
+    fn direct_fence(self: &Arc<Self>) -> crate::direct::JoinFence {
+        let started = lock(&self.core).join_seq;
+        let shared = Arc::downgrade(self);
+        Arc::new(move |identity| {
+            let shared = shared.upgrade()?;
+            let core = lock(&shared.core);
+            if core.join_voided.get(identity).is_some_and(|v| *v > started) {
+                return None;
+            }
+            Some(core.peer_gen.get(identity).copied().unwrap_or(0))
+        })
     }
 
     /// The join generation of `pin` (see `Core::join_gen`).
@@ -968,6 +1016,9 @@ impl Shared {
     }
 
     fn on_request(self: &Arc<Self>, map: Map<String, Value>) {
+        // A typed code (`join.direct`, `join.code`) is wiped once the
+        // request is answered.
+        let map = crate::direct::WipeCode(map);
         let id = map.get("id").cloned().unwrap_or(Value::Null);
         let op = map.get("op").and_then(Value::as_str).unwrap_or("");
         let mut core = lock(&self.core);
@@ -1146,11 +1197,11 @@ impl Shared {
             #[cfg(debug_assertions)]
             "test.ssh_dial" => {
                 drop(core);
-                tokio::spawn(ssh_dial_op(self.clone(), id, map));
+                tokio::spawn(ssh_dial_op(self.clone(), id, map.take()));
             }
             op if crate::ssh::OPS.contains(&op) => {
                 drop(core);
-                tokio::spawn(ssh_op(self.clone(), id, op.to_owned(), map));
+                tokio::spawn(ssh_op(self.clone(), id, op.to_owned(), map.take()));
             }
             op if pairing::OPS.contains(&op) => {
                 drop(core);
@@ -1454,7 +1505,10 @@ async fn read_stdin(shared: Arc<Shared>) {
     let mut stdin = tokio::io::stdin();
     let size = usize::try_from(crate::limits::get().net.io().read_buffer_bytes()).unwrap_or(32_768);
     let mut buf = vec![0u8; size];
-    let mut inbuf: Vec<u8> = Vec::new();
+    // Room for one whole frame and one read, so it never moves: the bytes
+    // read are wiped once used (a typed code among them), and a move
+    // would leave a copy behind.
+    let mut inbuf: Vec<u8> = Vec::with_capacity(frame::MAX_FRAME + 4 + size);
     loop {
         let n = match stdin.read(&mut buf).await {
             Ok(0) | Err(_) => {
@@ -1464,6 +1518,7 @@ async fn read_stdin(shared: Arc<Shared>) {
             Ok(n) => n,
         };
         inbuf.extend_from_slice(&buf[..n]);
+        buf[..n].zeroize();
         let mut at = 0;
         loop {
             match frame::decode(&inbuf[at..]) {
@@ -1481,6 +1536,7 @@ async fn read_stdin(shared: Arc<Shared>) {
                 }
             }
         }
+        inbuf[..at].zeroize();
         inbuf.drain(..at);
     }
 }
@@ -1508,7 +1564,13 @@ async fn write_stdout(shared: Arc<Shared>) {
         };
         // One frame at a time, flushed: an interactive frame waits behind
         // at most the frame being written and the pipe's buffer.
-        if stdout.write_all(&bytes).await.is_err() || stdout.flush().await.is_err() {
+        let mut bytes = bytes;
+        let written = stdout.write_all(&bytes).await.is_ok() && stdout.flush().await.is_ok();
+        // A control frame may carry a code: wiped once written.
+        if matches!(meta, out::Meta::Json) {
+            bytes.zeroize();
+        }
+        if !written {
             shared.end(End::Eof);
             return;
         }

@@ -21,11 +21,14 @@
 //!   errors of the joiner's records name files after the code's lookup, so
 //!   they are reported in fixed words, never by their text.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use mousse_net_core::control::DIRECT_MINOR_VERSION;
+use mousse_net_core::identity::IdentityPublicKey;
 use mousse_net_core::pairing::{DirectAddress, DirectPaired, InvitationId};
 use mousse_net_io::pipe::{AddrPolicy, LocalRoute};
 use mousse_net_io::store::{
@@ -33,7 +36,7 @@ use mousse_net_io::store::{
     APPROVAL_SOURCE_OWNER,
 };
 use mousse_net_io::tls::DeniedCheck;
-use mousse_net_io::{DirectPins, DirectRecordStore, DirectSetup, NetError};
+use mousse_net_io::{DirectPins, DirectRecordStore, DirectRecords, DirectSetup, NetError};
 use serde::{Deserialize, Serialize};
 
 /// Whether Pair with IP is on: this build speaks wire minor 4. Must-fail
@@ -175,19 +178,47 @@ impl Completions {
     }
 }
 
+/// Whether a join that started earlier may still store `identity`, checked
+/// under the peers lock: `Some(peer generation)` when it may (the
+/// generation a path it publishes must still match), `None` when the host
+/// was removed meanwhile (`peer.forget`, or a removal of its grant here).
+pub type JoinFence = Arc<dyn Fn(&IdentityPublicKey) -> Option<u64> + Send + Sync>;
+
 /// The joiner's Pair with IP writes in one state directory.
-#[derive(Clone, Debug)]
 pub struct DirectStore {
     dir: PathBuf,
     policy: AddrPolicy,
+    fence: Option<JoinFence>,
+    /// The peer generation each stored host had when it was stored.
+    stored: Mutex<HashMap<IdentityPublicKey, u64>>,
+    /// A store was refused because its host was removed meanwhile.
+    fenced: AtomicBool,
 }
 
 impl DirectStore {
-    pub fn new(dir: &Path, policy: AddrPolicy) -> Self {
+    pub fn new(dir: &Path, policy: AddrPolicy, fence: Option<JoinFence>) -> Self {
         Self {
             dir: dir.to_path_buf(),
             policy,
+            fence,
+            stored: Mutex::new(HashMap::new()),
+            fenced: AtomicBool::new(false),
         }
+    }
+
+    /// The peer generation `identity` had when this store wrote it.
+    pub fn stored_gen(&self, identity: &IdentityPublicKey) -> Option<u64> {
+        self.stored
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(identity)
+            .copied()
+    }
+
+    /// Whether a store was refused because its host was removed while the
+    /// join ran.
+    pub fn was_fenced(&self) -> bool {
+        self.fenced.load(Ordering::SeqCst)
     }
 
     fn store_paired(&self, paired: &DirectPaired) -> Result<(), NetError> {
@@ -199,6 +230,24 @@ impl DirectStore {
         let at = crate::peer::now_secs();
         let peers = PeerStore::in_dir(&self.dir);
         let held = peers.lock()?;
+        // Under the peers lock, which a removal advances the generations
+        // under: the join stores before the removal or not at all.
+        // Must-fail control (tests only): not checked.
+        let gen = match &self.fence {
+            Some(fence) if !cfg!(mousse_control = "direct-pin-after-removal") => {
+                match fence(&paired.identity) {
+                    Some(gen) => Some(gen),
+                    None => {
+                        self.fenced.store(true, Ordering::SeqCst);
+                        return Err(NetError::Refused(
+                            "the host was removed while the join ran".into(),
+                        ));
+                    }
+                }
+            }
+            Some(fence) => fence(&paired.identity).or(Some(0)),
+            None => None,
+        };
         held.update(
             |list| match list.iter_mut().find(|p| p.identity == identity) {
                 Some(p) => {
@@ -247,7 +296,14 @@ impl DirectStore {
             route,
             at,
         };
-        Completions::in_dir(&self.dir).save(&paired.invitation, &record)
+        Completions::in_dir(&self.dir).save(&paired.invitation, &record)?;
+        if let Some(gen) = gen {
+            self.stored
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(paired.identity, gen);
+        }
+        Ok(())
     }
 }
 
@@ -258,12 +314,85 @@ impl DirectPins for DirectStore {
 }
 
 /// What a Pair with IP join uses in `dir`: the records on disk, the pins
-/// written by [`DirectStore`], and the profile's denied identities.
-pub fn setup(dir: &Path, policy: AddrPolicy, denied: DeniedCheck) -> DirectSetup {
-    DirectSetup {
+/// written by the returned [`DirectStore`] (fenced by `fence` against a
+/// removal of the host while the join runs), and the profile's denied
+/// identities.
+pub fn setup(
+    dir: &Path,
+    policy: AddrPolicy,
+    denied: DeniedCheck,
+    fence: Option<JoinFence>,
+) -> (DirectSetup, Arc<DirectStore>) {
+    let store = Arc::new(DirectStore::new(dir, policy, fence));
+    let setup = DirectSetup {
         records: Arc::new(DirectRecordStore::in_dir(dir)),
-        pins: Arc::new(DirectStore::new(dir, policy)),
+        pins: store.clone(),
         denied,
+    };
+    (setup, store)
+}
+
+/// Delete, durably, every kept Pair with IP pending record whose host is
+/// `identity` (hex), under the peers lock: the host was removed, and no
+/// recovery, now or after a restart, may pair with it again. A running flow
+/// on such a record finds it gone at its next write and ends. Must-fail
+/// control (tests only): the records stay.
+pub fn forget_pending(dir: &Path, _held: &PeersLock<'_>, identity: &str) -> Result<(), NetError> {
+    if cfg!(mousse_control = "direct-pending-outlives-removal") {
+        return Ok(());
+    }
+    let records = DirectRecordStore::in_dir(dir);
+    let found = records.pending_slots()?;
+    for slot in found.slots {
+        // A record that does not read is never recovered (its recovery
+        // fails and keeps it), so it pairs with nobody; it stays.
+        let Ok((_, pending)) = records.load(&slot.lookup, &slot.address) else {
+            continue;
+        };
+        if let Some(p) = pending.filter(|p| hex(p.host.as_bytes()) == identity) {
+            records.swap_pending(&slot.lookup, &slot.address, Some(&p), None)?;
+        }
+    }
+    Ok(())
+}
+
+/// Wipe the `code` field of an app or control message (a Pair with IP
+/// code, or a link's 6-digit code) once it was serialized or read: the
+/// string's bytes are overwritten before it is freed. Copies serde made
+/// while parsing (its scratch buffer for escaped strings) are out of
+/// reach.
+pub fn wipe_code(value: &mut serde_json::Value) {
+    use zeroize::Zeroize;
+    if let Some(serde_json::Value::String(code)) = value.get_mut("code") {
+        code.zeroize();
+    }
+}
+
+/// A request map whose `code` field is wiped when it is dropped, however
+/// the request was answered.
+pub struct WipeCode(pub serde_json::Map<String, serde_json::Value>);
+
+impl std::ops::Deref for WipeCode {
+    type Target = serde_json::Map<String, serde_json::Value>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl WipeCode {
+    /// The map, for a request handled on a task of its own (one with no
+    /// code to wipe).
+    pub fn take(mut self) -> serde_json::Map<String, serde_json::Value> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl Drop for WipeCode {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        if let Some(serde_json::Value::String(code)) = self.0.get_mut("code") {
+            code.zeroize();
+        }
     }
 }
 
@@ -304,23 +433,36 @@ pub async fn join_cli(
     use mousse_net_io::store::{short_id, GrantStore};
     use mousse_net_io::{DirectDialFailure, DirectJoinEvent};
 
+    if !enabled() {
+        return Err(UNSUPPORTED.into());
+    }
     let dir = side.endpoint.dir().to_path_buf();
     let policy = side.caller.addr_policy().clone();
     let address = typed_address(&policy, address).map_err(str::to_owned)?;
+    // A far end this profile denied is refused before this device's
+    // certificate goes out, so a deny list that does not read stops the
+    // join before anything is asked or dialled. Must-fail control (tests
+    // only): taken as empty.
+    let denied = match GrantStore::in_dir(&dir).load() {
+        Ok(table) => Some(table),
+        Err(_) if cfg!(mousse_control = "direct-cli-denied-unread") => None,
+        Err(_) => {
+            return Err(
+                "this device's grant list could not be read, so the join was not started".into(),
+            )
+        }
+    };
     let code = tokio::task::spawn_blocking(prompt_code)
         .await
         .ok()
         .flatten()
         .ok_or("no code was typed")?;
-    // A far end this profile denied is refused before this device's
-    // certificate goes out.
-    let denied = GrantStore::in_dir(&dir).load().ok();
     let denied: DeniedCheck = Arc::new(move |identity| {
         denied
             .as_ref()
             .is_some_and(|table| table.is_denied(identity))
     });
-    let setup = setup(&dir, policy, denied);
+    let (setup, _) = setup(&dir, policy, denied, None);
     let started = side
         .caller
         .join_direct(&setup, &address.to_string(), code.trim(), name);

@@ -2258,13 +2258,29 @@ where
     /// the next start.
     pub fn remove_grant(&self, grant: GrantId) -> Result<bool, NetError> {
         let mut inner = lock(&self.shared);
-        if inner.grants.get(grant).is_none() {
+        let provisional = inner.grants.is_provisional(grant);
+        if inner.grants.get(grant).is_none() && !provisional {
             return Ok(false);
         }
         if cfg!(mousse_control = "keep-removed-grant") {
             // The control build (tests only) reports success and changes
             // nothing.
             return Ok(true);
+        }
+        // A Pair with IP grant not committed yet: its enrollment goes too,
+        // so no first stream commits it, and the removal is saved before
+        // it is reported (`EnrollmentUndone`). An older committed grant of
+        // the identity stays. Must-fail control (tests only): only
+        // committed grants can be removed.
+        if provisional && !cfg!(mousse_control = "direct-remove-committed-only") {
+            let inner = &mut *inner;
+            let before = inner.checkpoint();
+            let actions = inner.direct.remove_provisional(grant, &mut inner.grants);
+            inner.settle_direct(before, actions)?;
+            return Ok(true);
+        }
+        if provisional {
+            return Ok(false);
         }
         let events = inner.grants.remove(grant);
         inner.apply_grant_events(events);

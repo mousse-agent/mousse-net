@@ -1047,10 +1047,10 @@ fn join_ack(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
     }
 }
 
-/// Recover the kept Pair with IP records. Runs once at start, after the
-/// channel is up.
-pub async fn resume_direct(shared: Arc<Shared>) {
-    direct::resume(&shared);
+/// Recover the kept Pair with IP records, at start, before the first
+/// request is read.
+pub fn resume_direct_now(shared: &Arc<Shared>) {
+    direct::resume(shared);
 }
 
 /// Drop the completion records whose ticket expired more than
@@ -1105,7 +1105,7 @@ fn forget_completions(shared: &Shared, identity: &str) -> Result<(), NetError> {
     let peers = peers(shared);
     let held = peers.lock()?;
     if let Ok(pin) = identity_from_hex(identity) {
-        *super::lock(&shared.core).join_gen.entry(pin).or_default() += 1;
+        super::lock(&shared.core).void_joins(pin);
     }
     let ended = super::relay::end_pairings(shared, &held, identity);
     let removed = crate::peer::drop_completions(&shared.info.state_dir, &held, identity);
@@ -1168,12 +1168,24 @@ fn remove_grant(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value 
     let Some(grant) = map.get("grant").and_then(Value::as_u64) else {
         return error(id, "bad_request", "grant.remove needs grant");
     };
-    let identity = shared
-        .host
-        .grants()
+    let committed = shared.host.grants();
+    // A provisional (Pair with IP) grant names its device too, unless the
+    // device keeps an older committed grant, which stays with its records.
+    let provisional = || {
+        shared
+            .host
+            .provisional_grants()
+            .into_iter()
+            .find(|g| g.id == GrantId(grant))
+            .filter(|p| !committed.iter().any(|g| g.identity == p.identity))
+            .map(|g| g.identity)
+    };
+    let identity = committed
         .iter()
         .find(|g| g.id == GrantId(grant))
-        .map(|g| hex(g.identity.as_bytes()));
+        .map(|g| g.identity)
+        .or_else(provisional)
+        .map(|identity| hex(identity.as_bytes()));
     let removed = shared.removal.remove(GrantId(grant));
     if matches!(removed, Ok(Removed::Saved | Removed::Paused)) {
         super::reset_unserved(shared);
@@ -1280,7 +1292,7 @@ fn forget_peer(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
         {
             let mut core = super::lock(&shared.core);
             *core.peer_gen.entry(identity).or_default() += 1;
-            *core.join_gen.entry(identity).or_default() += 1;
+            core.void_joins(identity);
         }
         crate::peer::drop_completions(&shared.info.state_dir, &held, &key)
     });
@@ -1405,6 +1417,12 @@ pub fn host_event(shared: &Shared, event: HostEvent) {
 /// connections this channel opened (the host closes its own).
 pub async fn watch_pause(shared: Arc<Shared>) {
     let mut changes = shared.removal.watch();
+    // Paused before this watch began (a removal replay that failed at
+    // startup): a Pair with IP flow that started stops at once. Must-fail
+    // control (tests only): the pause at startup is not seen.
+    if shared.removal.is_paused() && !cfg!(mousse_control = "direct-resume-while-paused") {
+        direct::pause(&shared);
+    }
     while changes.changed().await.is_ok() {
         let now = changes.borrow_and_update().clone();
         match now {

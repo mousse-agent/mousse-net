@@ -264,9 +264,14 @@ impl LineReader {
     pub async fn recv(&mut self) -> Result<Option<Value>, String> {
         match self.read_line().await {
             Ok(None) => Ok(None),
-            Ok(Some(line)) => serde_json::from_slice(&line)
-                .map(Some)
-                .map_err(|e| format!("bad control message: {e}")),
+            Ok(Some(mut line)) => {
+                let parsed = serde_json::from_slice(&line)
+                    .map(Some)
+                    .map_err(|e| format!("bad control message: {e}"));
+                // A line may carry a code: wiped once read.
+                zeroize::Zeroize::zeroize(&mut line);
+                parsed
+            }
             // A pipe whose other end went away reads as an error on Windows.
             Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(None),
             Err(e) => Err(e.to_string()),
@@ -349,7 +354,10 @@ impl Channel {
     pub async fn send(&mut self, value: &Value) -> Result<(), String> {
         let mut line = serde_json::to_vec(value).map_err(|e| e.to_string())?;
         line.push(b'\n');
-        self.wr.write_all(&line).await.map_err(|e| e.to_string())?;
+        let written = self.wr.write_all(&line).await;
+        // A line may carry a code: wiped once written.
+        zeroize::Zeroize::zeroize(&mut line);
+        written.map_err(|e| e.to_string())?;
         self.wr.flush().await.map_err(|e| e.to_string())
     }
 

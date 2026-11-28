@@ -273,7 +273,11 @@ impl Removal {
     /// Remove `grant` (§5.4 step 2).
     pub fn remove(self: &Arc<Self>, grant: GrantId) -> Result<Removed, JournalFailed> {
         let _steps = self.steps.lock().unwrap_or_else(|e| e.into_inner());
-        if !self.host.grants().iter().any(|g| g.id == grant) {
+        // A provisional (Pair with IP) grant is removed the same way: the
+        // app got its id with `enrolled`.
+        let known = self.host.grants().iter().any(|g| g.id == grant)
+            || self.host.provisional_grants().iter().any(|g| g.id == grant);
+        if !known {
             return Ok(Removed::Gone);
         }
         if !cfg!(mousse_control = "no-revoke-journal") {
@@ -476,6 +480,49 @@ mod tests {
 
     fn peer() -> mousse_net_core::identity::IdentityPublicKey {
         SoftwareKey::generate(&mut os_rng()).public_key()
+    }
+
+    /// A provisional (Pair with IP) grant is removed by the id the app got
+    /// with `enrolled`: Remove finds it, journals it, and it goes, saved;
+    /// the device's older committed grant stays.
+    #[tokio::test]
+    async fn a_provisional_grant_is_removed_by_its_id() {
+        use mousse_net_core::grants::{NewGrant, Role};
+        use mousse_net_core::pairing::InvitationId;
+        use mousse_net_io::store::GrantStore;
+        use mousse_net_io::Clock;
+        let dir = temp_dir("provisional");
+        let first = host(&dir);
+        let device = peer();
+        let (older, _) = first.add_grant(device, "laptop".into(), None).unwrap();
+        drop(first);
+        let store = GrantStore::in_dir(&dir);
+        let mut table = store.load().unwrap();
+        let (provisional, _) = table
+            .add_provisional(
+                NewGrant {
+                    identity: device,
+                    name: "laptop".into(),
+                    role: Role::owner(),
+                    authorizing_owner: OwnerRef::from_bytes([7; 16]),
+                    expires_at: None,
+                    enrolled_by: Some(InvitationId([1; 16])),
+                },
+                mousse_net_core::ConnectionId(1),
+                SystemClock::new().now(),
+            )
+            .unwrap();
+        store.save(&table).unwrap();
+
+        let second = host(&dir);
+        assert_eq!(second.provisional_grants().len(), 1);
+        let removal = Removal::start(second.clone(), &dir);
+        assert_eq!(removal.remove(provisional).unwrap(), Removed::Saved);
+        assert!(second.provisional_grants().is_empty());
+        let ids: Vec<_> = second.grants().iter().map(|g| g.id).collect();
+        assert_eq!(ids, vec![older.id], "the older grant stays");
+        assert!(host(&dir).provisional_grants().is_empty(), "saved");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The journal names a grant whose removal was never saved: the start

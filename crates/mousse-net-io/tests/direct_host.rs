@@ -1652,3 +1652,47 @@ async fn after_a_commit_the_enrolled_connection_keeps_the_one_proof_rule() {
     assert_eq!(fourth.admitted(&next.code).await, next.invitation);
     host.stop().await;
 }
+
+/// The owner removes the provisional grant `Enrolled` named, before its
+/// first stream: it goes (saved, then reported as `EnrollmentUndone`), its
+/// connection closes, nothing can commit it any more, and the device's
+/// older committed grant stays with its connection.
+#[tokio::test]
+async fn removing_a_provisional_grant_undoes_it_and_keeps_the_older_grant() {
+    minor_4();
+    let mut host = DirectHost::start(new_signer(), None).await;
+    let joiner = Joiner::new();
+    host.host
+        .add_grant(joiner.identity, "laptop".into(), None)
+        .unwrap();
+    let older: Vec<_> = host.host.grants().iter().map(|g| g.id).collect();
+    let mut kept = ordinary(&host, &joiner).await;
+    // The same device pairs again by code, on a connection of its own.
+    let invite = host.invite();
+    let mut peer = ordinary(&host, &joiner).await;
+    let invitation = peer.admitted(&invite.code).await;
+    assert!(peer.attempt(&invite.code, invitation).await);
+    let request = prompted(&mut host).await;
+    host.host.allow_direct(&request, None).unwrap();
+    assert!(matches!(
+        peer.control().await,
+        ControlMessage::Paired { .. }
+    ));
+    let provisional = host.host.provisional_grants()[0].id;
+
+    assert!(host.host.remove_grant(provisional).unwrap(), "removed");
+    host.until(
+        "the undo",
+        |e| matches!(e, DirectEvent::EnrollmentUndone { grant, .. } if *grant == provisional),
+    )
+    .await;
+    assert_eq!(peer.closed_with().await, ErrorCode::GrantRevoked);
+    assert!(!host.provisional_of(&joiner.identity));
+    assert_eq!(
+        host.host.grants().iter().map(|g| g.id).collect::<Vec<_>>(),
+        older,
+        "the older grant stays"
+    );
+    kept.echo().await;
+    host.stop().await;
+}

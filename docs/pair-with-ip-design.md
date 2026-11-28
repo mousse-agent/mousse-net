@@ -533,57 +533,95 @@ What the helper serves until phase 4 lists `pair-with-ip`:
   "unsupported"}` unless the helper speaks wire minor 4: a release build
   only once `PROTOCOL_MINOR_VERSION` is 4, a debug build with
   `MOUSSE_NET_TEST_HELLO_MINOR=4`. Startup recovery runs only then too.
-  The CLI (`invite --direct`, `join-direct`) follows the same rule.
+  The CLI checks its own build first: `join-direct` refuses before it
+  opens the endpoint, asks for a code or dials, and `invite --direct`
+  before it asks the running host, which checks again.
 - **Host.** `invite.create {kind: "direct", way, route?, role?}` takes the
   way's IPv4 candidates in inventory order (`route` picks one; a `route`
   the way does not offer is `way_unavailable` with `route_not_offered`).
+  `invite --direct` chooses from the same uncapped, way-aware candidates,
+  so it never shows a public forward or a capped-off address.
   `invite.code {invitation, code, attempts_left}` follows every attempt,
   with the same code. `enrolled` adds `kind: "direct"` and `provisional:
   true`; the grant commits on the device's first stream
-  (`grant.committed {grant, identity}`) or goes with a cancel
-  (`enrollment.undone {invitation, grant, identity}`). `approval` adds
-  `kind: "direct"`, `role`, `state`, `decision` and `answer_by` (unix
-  seconds, the end of its Allow window); its id is
+  (`grant.committed {grant, identity}`) or goes with a cancel, or with
+  `grant.remove` on the id `enrolled` gave (`enrollment.undone
+  {invitation, grant, identity}`; an older committed grant of the device
+  stays). `approval` adds `kind: "direct"`, `role`, `state`, `decision`
+  and `answer_by` (unix seconds, the end of its Allow window); its id is
   `direct-<I hex>-<full fingerprint hex>`. `approval.answer` on a kind 3
   request answers `stale` once the request is over, `paused` while
   networking is paused, `store_failed` when the enrollment cannot be
   stored. `approval.ended {request, invitation, reason}` gives `enrolled`,
   `cancelled`, `declined`, `dismissed` or `window_ended`. `invite.ended`
   gives the same reasons as for tickets (an expired invitation:
-  `invitation_invalid`).
-- **Joiner.** `join.direct {address, code}` answers later. Each flow has a
-  `flow` id, carried by every `join.progress` and by the reply. The reply
-  is `{flow, identity, name, role, invitation, already: false, conn}`
-  (`conn`: the pairing connection, published like a `dial`'s, or null).
-  Errors besides those listed above: `own_device` (the address is this
-  device), `not_received {attempts_left}` (the connection dropped before
-  the code's answer), `settled` (another flow on this device settled
-  it), `store_failed`, `bad_name`, `bad_request`. A flow already running
-  for the same typed lookup and address, such as a startup recovery,
-  takes the request; a second request for it is `busy`.
-  `join.direct.cancel {flow}` answers the flow's request `cancelled` at
-  once, then `{}`; a flow that is away keeps running only to deliver the
-  cancel. A flow with no request (a startup recovery, or one already
-  cancelled) ends with `join.direct.ended {flow, ...}`, the reply's fields
-  or its error. A pause stops every flow where it is (its records stay)
-  and answers each waiting request `paused`; resume starts the kept ones
+  `invitation_invalid`). The CLI host drops the answer to a question
+  whose request ended, and asks again when the device passes the code
   again.
+- **Joiner.** `join.direct {address, code}` answers later. Each flow has a
+  `flow` id, carried by every `join.progress` and by the reply;
+  `join.progress` also carries `request`, the `join.direct` it answers,
+  when it answers one (not for a startup recovery nobody took yet). The
+  reply is `{flow, identity, name, role, invitation, already: false,
+  conn}` (`conn`: the pairing connection, published like a `dial`'s, or
+  null). Errors besides those listed above: `own_device` (the address is
+  this device), `not_received {attempts_left}` (the connection dropped
+  before the code's answer), `settled` (another flow on this device
+  settled it), `removed` (the host was removed, or networking paused,
+  while the join ran: nothing was stored), `store_failed`, `bad_name`,
+  `bad_request`. A flow already running for the same typed lookup and
+  address, such as a startup recovery, takes the request; a second
+  request for it, or one for a flow already cancelled, is `busy`.
+  `join.direct.cancel {flow}` answers only once the cancel is safe: its
+  mark is stored in the pending record (or nothing of the flow is left to
+  pair). It then answers the flow's request `cancelled`, then `{}`; a flow
+  that is away keeps running only to deliver the cancel. A cancel whose
+  lookup another flow holds waits for the next recovery that gets it. A
+  cancel that cannot be stored answers `store_failed` (and so does the
+  flow's request): the flow stops and is not started again in this
+  process. A flow with no request (a startup recovery, or one already
+  cancelled) ends with `join.direct.ended {flow, ...}`, the reply's fields
+  or its error.
+- **Startup and pause.** The kept records are recovered, and their flows
+  registered, before the first request is read, and never while
+  networking is paused (a removal journal that does not replay pauses it
+  from the start); the pause's end starts them. A pause stops every flow
+  where it is (its records stay) and answers each waiting request
+  `paused`. Flows start, stop and resume under one lock, and a store
+  refuses while paused.
+- **Removal.** `peer.forget` of a host, or a removal of its grant here,
+  wins over every join to it that started before: the join stores no pin,
+  address or completion (`removed`), and publishes no path. Every kept
+  pending record of a join to that host is deleted durably, so no
+  recovery pairs with it after a restart either.
 - **Completions.** `join.status {}` answers `{direct: [{invitation,
   identity, name, role, route}], direct_unreadable}`;
-  `direct_unreadable` counts kept pending records whose files did not
-  read at the last start (logged by number only). `join.ack {invitation}`
-  answers `{removed}`. Removing the host drops its completions too.
+  `direct_unreadable` counts kept pending records whose names or contents
+  did not read at the last start (logged by number only; the files
+  stay). `join.ack {invitation}` answers `{removed}`. Removing the host
+  drops its completions too.
 - **The typed address and the address policy.** The typed address is read
   with the route grammar and checked against the address policy as an
   owner address is (`peer.addresses.set`): the person typed it, so it
   counts as approved, and it is refused with `bad_address` only where the
   policy never dials (unspecified, multicast, reserved and documentation
-  ranges, and loopback outside tests). After `PAIRED` it is stored as the host's owner address,
-  with an owner approval when the automatic rule does not cover it (a
-  tailnet address). The pin, the address and approval, then the
-  completion record are each written durably before the join is reported
-  paired; a crash part way leaves the pending record, and the next
-  recovery writes them again.
+  ranges, and loopback outside tests). The same check runs again before
+  every dial, a recovery's included, so a record kept under another
+  policy is never dialled when the current one forbids it. After
+  `PAIRED` the address is stored as the host's owner address, with an
+  owner approval when the automatic rule does not cover it (a tailnet
+  address). The pin, the address and approval, then the completion record
+  are each written durably before the join is reported paired; a crash
+  part way leaves the pending record, and the next recovery writes them
+  again.
+- **The code in memory.** The helper wipes the copies of a code it holds:
+  the app channel's read buffers once a frame is used, the `code` field
+  of a request once it is answered and of a reply or event once it is
+  serialized, control frames once written, and the control channel's
+  lines. Out of reach: copies `serde_json` makes while parsing a string
+  with escapes, the read buffers of the standard input and of the control
+  channel's reader, a control frame still queued when the channel ends,
+  and the CLI prompt's line in the standard input buffer.
 - **No new limits.** The flows use the existing `DIRECT_*` limits.
 - **Not yet:** ranking physical interfaces before virtual adapters (waits
   for the hand check on Windows); the `pair-with-ip` feature and minor 4

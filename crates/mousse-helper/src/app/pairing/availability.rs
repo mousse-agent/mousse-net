@@ -25,7 +25,7 @@ use mousse_net_io::routes::{RoutesConfig, RoutesStore, Way};
 use serde_json::{json, Map, Value};
 
 use super::super::{error, Shared};
-use crate::serve::ListenState;
+use crate::serve::{served_way, ListenState};
 
 /// The ways, in the order `routes.available` lists them.
 pub const WAYS: [&str; 5] = ["lan", "tailnet", "public", "tunnel", "relay"];
@@ -78,42 +78,6 @@ fn tunnel_origins(shared: &Shared, listen: &ListenState) -> Vec<String> {
     out
 }
 
-/// The way of an address the listener serves without `routes.json`:
-/// IPv4 literals of class `lan` or `tailnet` under `policy`.
-fn served_way(policy: &AddrPolicy, route: &LocalRoute) -> Option<Way> {
-    let (Some(ip), Some(port)) = (route.ip(), route.port()) else {
-        return None;
-    };
-    if !ip.is_ipv4() || !matches!(route, LocalRoute::Tcp { .. }) {
-        return None;
-    }
-    match policy.class_of(SocketAddr::new(ip, port)) {
-        AddrClass::Lan => Some(Way::Lan),
-        AddrClass::Tailnet => Some(Way::Tailnet),
-        _ => None,
-    }
-}
-
-/// The `lan` and `tailnet` candidates of a listener on `ip`:`port` without
-/// `routes.json`: every address it serves (for `0.0.0.0`, each usable one
-/// of `addrs`), uncapped, with the way of its class. The 1.1 advertisement
-/// ([`crate::serve::route_hints`]) is the same list cut to eight before it
-/// is classed; selection must not inherit that cut.
-fn listener_candidates(
-    policy: &AddrPolicy,
-    ip: IpAddr,
-    port: u16,
-    addrs: &[IpAddr],
-) -> Vec<(Way, String)> {
-    crate::serve::served_hints(ip, port, addrs)
-        .iter()
-        .filter_map(|hint| {
-            let route = LocalRoute::parse(hint).ok()?;
-            Some((served_way(policy, &route)?, route.uri()))
-        })
-        .collect()
-}
-
 /// Whether a port forward is served: by the 0.0.0.0 socket, or by the
 /// socket on the forwarded-to address.
 fn public_served(listen: &ListenState) -> bool {
@@ -153,27 +117,11 @@ pub fn inventory(shared: &Shared) -> Inventory {
         .clone();
     let interfaces = super::super::changes::listed_interface_ips();
     let mut all: Vec<(Way, String)> = Vec::new();
-    match listen.listen_ip {
-        // No `routes.json`: what `--listen-ip` serves, whatever the
-        // synthesized config says.
-        Some(ip) => {
-            let addrs = interfaces.as_deref().unwrap_or_default();
-            all.extend(listener_candidates(
-                shared.caller.addr_policy(),
-                ip,
-                listen.port,
-                addrs,
-            ));
-        }
-        None => {
-            let ips = interfaces.as_deref().unwrap_or_default();
-            for c in listen.config.candidates(ips, &listen.bound, listen.port) {
-                if matches!(c.way, Way::Lan | Way::Tailnet) {
-                    all.push((c.way, c.route));
-                }
-            }
-        }
-    }
+    // The same selection `invite --direct` makes.
+    all.extend(listen.private_candidates(
+        shared.caller.addr_policy(),
+        interfaces.as_deref().unwrap_or_default(),
+    ));
     if public_served(&listen) {
         for c in listen.config.candidates(&[], &listen.bound, listen.port) {
             if c.way == Way::Public {
@@ -505,6 +453,7 @@ pub fn available(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::serve::listener_candidates;
 
     /// A `0.0.0.0` listener with eight LAN addresses that sort before a
     /// tailnet one still offers the tailnet address: selection sees every

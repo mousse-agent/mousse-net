@@ -15,7 +15,7 @@ id = "pair-with-ip.host-io"
 title = "The host side in mousse-net-io over loopback TLS at minor 4: Allow before any grant, a provisional grant committed and saved on the first stream, every attempt debited, the full miss hold with its place kept, lookups only on the TCP listener (never relay circuits or ws), a granted device's lookup counted against its source, Allow while away enrolled on recovery, a cancel crossing Allow (by abort or GOAWAY, stored before it is answered, ahead of a later first stream, still possible after a failed save, and a grant whose cancel was not stored commits nothing), failed saves that put the grant table and enrollment records back together without dropping earlier unsaved changes, a provisional grant across a restart, an Allow whose enrollment cannot be stored, ticket re-pair and receipts over relay within the TCP pool"
 plan = "docs/pair-with-ip-design.md §1.4, §1.6 and §7 (phase 2, host side)"
 targets = ["windows-x64", "macos-arm64", "linux-x64"]
-min_tests = 25
+min_tests = 26
 local = [
   { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-net-io", "--test", "direct_host", "--no-fail-fast"] },
   { target = "macos-arm64", host = "macos-aarch64", command = ["cargo", "test", "-p", "mousse-net-io", "--test", "direct_host", "--no-fail-fast"] },
@@ -30,6 +30,7 @@ control = [
   { name = "direct-miss-closes-at-once", breaks = "a lookup that finds nothing closes at once, freeing its place", env = { RUSTFLAGS = '--cfg mousse_control="direct-miss-closes-at-once"' } },
   { name = "direct-live-place-without-source", breaks = "a granted device's lookup takes a place counted against no source", env = { RUSTFLAGS = '--cfg mousse_control="direct-live-place-without-source"' } },
   { name = "direct-commit-unsaved", breaks = "the first stream runs before the commit is saved", env = { RUSTFLAGS = '--cfg mousse_control="direct-commit-unsaved"' } },
+  { name = "direct-remove-committed-only", breaks = "Remove cannot remove a provisional grant, so its device can still commit it", env = { RUSTFLAGS = '--cfg mousse_control="direct-remove-committed-only"' } },
 ]
 
 [[check]]
@@ -37,7 +38,7 @@ id = "pair-with-ip.helper"
 title = "The helper's app channel at minor 4 over loopback, from the ops: a wrong code costing one attempt on both sides, Allow with the joiner's short id on both screens, the same connection carrying the first stream that commits the grant, Remove; Allow while away kept on the same request and enrolled only when a restarted joiner recovers its pending record and a join with the same address and code takes it; a joiner cancel crossing Allow leaving no grant and nothing stored; decline; expiry; the completion listed by join.status until join.ack; every Pair with IP op unsupported without minor 4; ticket approvals unchanged"
 plan = "docs/pair-with-ip-design.md §4, §1.4 steps 8 and 9, §1.6 and §7 (phase 2, helper)"
 targets = ["windows-x64", "macos-arm64", "linux-x64"]
-min_tests = 9
+min_tests = 20
 local = [
   { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_pair_ip", "--no-fail-fast"] },
   { target = "macos-arm64", host = "macos-aarch64", command = ["cargo", "test", "-p", "mousse-helper", "--test", "app_pair_ip", "--no-fail-fast"] },
@@ -50,6 +51,16 @@ control = [
   { name = "direct-ops-ungated", breaks = "the Pair with IP ops answer without wire minor 4", env = { RUSTFLAGS = '--cfg mousse_control="direct-ops-ungated"' } },
   { name = "direct-done-pin-only", breaks = "the joiner stores the pin with no completion record for join.status", env = { RUSTFLAGS = '--cfg mousse_control="direct-done-pin-only"' } },
   { name = "direct-approval-per-connection", breaks = "an approval request gets a new id when its device comes back", env = { RUSTFLAGS = '--cfg mousse_control="direct-approval-per-connection"' } },
+  { name = "direct-cli-ungated", breaks = "join-direct and invite --direct run on a build that does not speak minor 4", env = { RUSTFLAGS = '--cfg mousse_control="direct-cli-ungated"' } },
+  { name = "direct-cli-denied-unread", breaks = "join-direct takes a grant list it cannot read as an empty deny list", env = { RUSTFLAGS = '--cfg mousse_control="direct-cli-denied-unread"' } },
+  { name = "direct-cli-echoes-args", breaks = "a join-direct command line error echoes the argument after the address", env = { RUSTFLAGS = '--cfg mousse_control="direct-cli-echoes-args"' } },
+  { name = "direct-cli-any-route", breaks = "invite --direct shows any IPv4 listener address that is not tailnet as the local network one", env = { RUSTFLAGS = '--cfg mousse_control="direct-cli-any-route"' } },
+  { name = "direct-cli-stale-answer", breaks = "the CLI host sends a late answer to a request that ended", env = { RUSTFLAGS = '--cfg mousse_control="direct-cli-stale-answer"' } },
+  { name = "direct-pin-after-removal", breaks = "a join stores its host after peer.forget of that host", env = { RUSTFLAGS = '--cfg mousse_control="direct-pin-after-removal"' } },
+  { name = "direct-pending-outlives-removal", breaks = "a removal of the host keeps the kept pending record of a join to it", env = { RUSTFLAGS = '--cfg mousse_control="direct-pending-outlives-removal"' } },
+  { name = "direct-resume-while-paused", breaks = "startup recovery runs while networking is paused", env = { RUSTFLAGS = '--cfg mousse_control="direct-resume-while-paused"' } },
+  { name = "direct-no-startup-recovery", breaks = "nothing is recovered at startup", env = { RUSTFLAGS = '--cfg mousse_control="direct-no-startup-recovery"' } },
+  { name = "direct-unreadable-names-only", breaks = "join.status counts only kept records whose names do not read", env = { RUSTFLAGS = '--cfg mousse_control="direct-unreadable-names-only"' } },
 ]
 
 [[check]]
@@ -95,3 +106,20 @@ args = ["--bug", "direct-ledger-ignored"]
 name = "direct-debit-after-send"
 breaks = "the simulated joiner stores a debit only after the attempt's first share went out"
 args = ["--bug", "direct-debit-after-send"]
+
+[[check]]
+id = "pair-with-ip.joiner-io"
+title = "The joiner side in mousse-net-io over loopback TLS at minor 4: unpinned first contact, records, recovery and cancel; a cancel is confirmed only once its mark is stored, a cancel whose lookup another flow holds is kept for the next recovery, and the address policy is applied before every dial"
+plan = "docs/pair-with-ip-design.md §1.4, §1.6 and §7 (phase 2, joiner side)"
+targets = ["windows-x64", "macos-arm64", "linux-x64"]
+min_tests = 21
+local = [
+  { target = "windows-x64", host = "windows-x86_64", command = ["cargo", "test", "-p", "mousse-net-io", "--test", "direct_joiner", "--no-fail-fast"] },
+  { target = "macos-arm64", host = "macos-aarch64", command = ["cargo", "test", "-p", "mousse-net-io", "--test", "direct_joiner", "--no-fail-fast"] },
+  { target = "linux-x64", host = "linux-x86_64", command = ["cargo", "test", "-p", "mousse-net-io", "--test", "direct_joiner", "--no-fail-fast"] },
+]
+control = [
+  { name = "direct-cancel-unrecorded", breaks = "a cancel is confirmed whether or not its mark was stored", env = { RUSTFLAGS = '--cfg mousse_control="direct-cancel-unrecorded"' } },
+  { name = "direct-cancel-dropped-on-busy-hold", breaks = "a cancel while away is dropped when another flow holds the lookup", env = { RUSTFLAGS = '--cfg mousse_control="direct-cancel-dropped-on-busy-hold"' } },
+  { name = "direct-dial-unchecked", breaks = "a Pair with IP dial skips the address policy", env = { RUSTFLAGS = '--cfg mousse_control="direct-dial-unchecked"' } },
+]

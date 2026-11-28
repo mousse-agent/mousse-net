@@ -1280,6 +1280,30 @@ impl<F: CodeExchangeFactory> DirectHostPairing<F> {
         actions
     }
 
+    /// The owner removed the provisional grant `grant` (Remove on the
+    /// grant the `Enrolled` action named, before its first stream): it
+    /// goes with its connections, its enrollment is forgotten so no first
+    /// stream can commit it, and it is reported removed
+    /// ([`DirectHostAction::EnrollmentUndone`]). An older committed grant
+    /// of the identity stays. Nothing for a grant that is not provisional.
+    pub fn remove_provisional(
+        &mut self,
+        grant: GrantId,
+        grants: &mut GrantTable,
+    ) -> Vec<DirectHostAction> {
+        let Some(undone) = grants.provisional(grant).map(|g| removal(g, grant)) else {
+            return Vec::new();
+        };
+        self.enrolled.retain(|_, e| e.grant != grant);
+        let mut actions: Vec<DirectHostAction> = grants
+            .remove(grant)
+            .into_iter()
+            .map(DirectHostAction::Grant)
+            .collect();
+        actions.extend(undone);
+        actions
+    }
+
     /// When [`DirectHostPairing::tick`] next has something to do.
     pub fn next_deadline(&self) -> Option<UnixTime> {
         let window = self.allow_window_secs;

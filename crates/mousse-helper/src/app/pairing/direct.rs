@@ -42,7 +42,7 @@
 //! errors of the joiner's records name files after the lookup, so they are
 //! reported in fixed words.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -55,7 +55,8 @@ use mousse_net_core::ErrorCode;
 use mousse_net_io::pipe::LocalRoute;
 use mousse_net_io::store::{hex, short_id};
 use mousse_net_io::{
-    DirectDialFailure, DirectEvent, DirectJoin, DirectJoinEvent, Reached, RouteClass,
+    DirectCancelFailed, DirectDialFailure, DirectEvent, DirectJoin, DirectJoinEvent, Reached,
+    RouteClass,
 };
 use serde_json::{json, Map, Value};
 use tokio::sync::{mpsc, oneshot};
@@ -74,8 +75,13 @@ pub struct State {
     /// Joiner flows running, by flow id.
     flows: HashMap<String, Flow>,
     next_flow: u64,
-    /// Kept pending records whose names did not read at the last start.
+    /// Kept pending records whose names or contents did not read at the
+    /// last start.
     unreadable: usize,
+    /// Flows (by typed lookup and address) whose cancel could not be
+    /// stored: never started again in this process, so a crossing Allow
+    /// cannot pair them.
+    blocked: HashSet<String>,
 }
 
 /// A joiner flow running.
@@ -88,10 +94,28 @@ struct Flow {
     /// The last progress step shown.
     step: Option<&'static str>,
     cmds: mpsc::UnboundedSender<Cmd>,
+    /// Where the flow stores the pairing; says whether a removal of the
+    /// host refused it.
+    store: Arc<crate::direct::DirectStore>,
+    /// Cancelled: it runs on only to deliver the cancel, and no request
+    /// takes it.
+    cancelled: bool,
+}
+
+/// What a cancel came to.
+enum Cancelled {
+    /// The cancel is stored (or nothing of the flow is left to cancel).
+    Safe,
+    /// It could not be stored: the flow stopped.
+    NotRecorded,
+    /// The flow paired first.
+    Paired,
+    /// The flow can no longer be cancelled.
+    WrongState,
 }
 
 enum Cmd {
-    Cancel(oneshot::Sender<bool>),
+    Cancel(oneshot::Sender<Cancelled>),
     Stop,
 }
 
@@ -170,17 +194,8 @@ pub fn invite(shared: &Shared, id: &Value, map: &Map<String, Value>) -> Value {
     // ranked after physical ones yet (that waits for a check by hand on
     // Windows).
     let shown = |route: Option<&str>| -> Vec<SocketAddr> {
-        availability::select(&inventory, way, route)
-            .iter()
-            .filter_map(|r| {
-                let parsed = LocalRoute::parse(r).ok()?;
-                if !matches!(parsed, LocalRoute::Tcp { .. }) {
-                    return None;
-                }
-                let addr = SocketAddr::new(parsed.ip()?, parsed.port()?);
-                addr.is_ipv4().then_some(addr)
-            })
-            .collect()
+        let selected = availability::select(&inventory, way, route);
+        crate::serve::direct_addresses(selected.iter().map(String::as_str))
     };
     let addresses = shown(route);
     let Some(&address) = addresses.first() else {
@@ -444,11 +459,17 @@ pub fn join(shared: &Arc<Shared>, id: &Value, map: &Map<String, Value>) -> Optio
         Err(e) => return Some(error(id, "bad_code", e.to_string())),
     };
     let key = flow_key(lookup.as_str(), &address.to_string());
+    // Under the gate a pause stops flows under: this join starts before
+    // the pause, which then stops it, or sees it and is refused.
+    let _gate = shared.direct_gate.lock().unwrap_or_else(|e| e.into_inner());
+    if shared.removal.is_paused() {
+        return Some(paused(shared, id));
+    }
     let name = {
         let mut st = state(shared);
         let attached = st.direct.flows.iter_mut().find(|(_, f)| f.key == key);
         if let Some((flow, entry)) = attached {
-            if entry.request.is_some() {
+            if entry.request.is_some() || entry.cancelled {
                 return Some(error(
                     id,
                     "busy",
@@ -461,15 +482,16 @@ pub fn join(shared: &Arc<Shared>, id: &Value, map: &Map<String, Value>) -> Optio
             let flow = flow.clone();
             drop(st);
             if let Some(step) = step {
-                progress(shared, &flow, step);
+                progress(shared, &flow, step, Some(id));
             }
             return None;
         }
         st.name.clone()
     };
+    let (setup, store) = flow_setup(shared);
     let join = match shared
         .caller
-        .join_direct(&shared.direct, &address.to_string(), code, &name)
+        .join_direct(&setup, &address.to_string(), code, &name)
     {
         Ok(join) => join,
         Err(e) => {
@@ -480,13 +502,42 @@ pub fn join(shared: &Arc<Shared>, id: &Value, map: &Map<String, Value>) -> Optio
             return Some(error(id, code, e.to_string()));
         }
     };
-    start(shared, join, Some(id.clone()), false);
+    start(shared, join, Some(id.clone()), false, store);
     None
+}
+
+/// What a flow starting now uses: the records, the denied identities, and
+/// a store fenced against a removal of the host from now on (and against
+/// a pause).
+fn flow_setup(
+    shared: &Arc<Shared>,
+) -> (mousse_net_io::DirectSetup, Arc<crate::direct::DirectStore>) {
+    let fence = shared.direct_fence();
+    let paused_by = Arc::downgrade(shared);
+    let fence: crate::direct::JoinFence = Arc::new(move |identity| {
+        // Networking paused: nothing is stored until it resumes.
+        if paused_by.upgrade().is_none_or(|s| s.removal.is_paused()) {
+            return None;
+        }
+        fence(identity)
+    });
+    crate::direct::setup(
+        &shared.info.state_dir,
+        shared.caller.addr_policy().clone(),
+        shared.direct_denied.clone(),
+        Some(fence),
+    )
 }
 
 /// Register a running flow and drive it. `recovery`: it recovers a kept
 /// pending record (its code passed before).
-fn start(shared: &Arc<Shared>, join: DirectJoin, request: Option<Value>, recovery: bool) -> String {
+fn start(
+    shared: &Arc<Shared>,
+    join: DirectJoin,
+    request: Option<Value>,
+    recovery: bool,
+    store: Arc<crate::direct::DirectStore>,
+) -> String {
     let key = flow_key(join.lookup().as_str(), &join.address().to_string());
     let (cmds, rx) = mpsc::unbounded_channel();
     let flow = {
@@ -500,6 +551,8 @@ fn start(shared: &Arc<Shared>, join: DirectJoin, request: Option<Value>, recover
                 key,
                 step: None,
                 cmds,
+                store,
+                cancelled: false,
             },
         );
         flow
@@ -508,13 +561,19 @@ fn start(shared: &Arc<Shared>, join: DirectJoin, request: Option<Value>, recover
     flow
 }
 
-fn progress(shared: &Shared, flow: &str, step: &str) {
-    shared.event(json!({
+/// A progress event; `request` is the `join.direct` the flow answers, if
+/// any, so the app can tell its own join from another or a recovery.
+fn progress(shared: &Shared, flow: &str, step: &str, request: Option<&Value>) {
+    let mut event = json!({
         "ev": "join.progress",
         "flow": flow,
         "step": step,
         "short_id": short_id(&shared.caller.identity()),
-    }));
+    });
+    if let Some(request) = request {
+        event["request"] = request.clone();
+    }
+    shared.event(event);
 }
 
 /// The progress step of `state`; `passed`: the code passed on this flow
@@ -537,7 +596,7 @@ fn step_of(state: DirectJoinerState, passed: bool) -> Option<&'static str> {
 /// Show `step` for `flow` if it is new.
 fn show(shared: &Shared, flow: &str, step: Option<&'static str>) {
     let Some(step) = step else { return };
-    {
+    let request = {
         let mut st = state(shared);
         let Some(entry) = st.direct.flows.get_mut(flow) else {
             return;
@@ -546,8 +605,9 @@ fn show(shared: &Shared, flow: &str, step: Option<&'static str>) {
             return;
         }
         entry.step = Some(step);
-    }
-    progress(shared, flow, step);
+        entry.request.clone()
+    };
+    progress(shared, flow, step, request.as_ref());
 }
 
 async fn drive(
@@ -589,9 +649,21 @@ async fn drive(
                 Err(_) => watching = false,
             },
             cmd = cmds.recv() => match cmd {
-                Some(Cmd::Cancel(done)) => {
-                    let _ = done.send(join.cancel().is_ok());
-                }
+                Some(Cmd::Cancel(done)) => match join.cancel() {
+                    // Answered once the cancel is safe, never before.
+                    Ok(pending) => {
+                        tokio::spawn(async move {
+                            let _ = done.send(match pending.confirmed().await {
+                                Ok(()) => Cancelled::Safe,
+                                Err(DirectCancelFailed::NotRecorded) => Cancelled::NotRecorded,
+                                Err(DirectCancelFailed::Paired) => Cancelled::Paired,
+                            });
+                        });
+                    }
+                    Err(_) => {
+                        let _ = done.send(Cancelled::WrongState);
+                    }
+                },
                 Some(Cmd::Stop) | None => {
                     join.stop();
                     state(&shared).direct.flows.remove(&flow);
@@ -601,16 +673,22 @@ async fn drive(
         }
     }
     let result = join.finish().await;
-    let request = match state(&shared).direct.flows.remove(&flow) {
-        Some(entry) => entry.request,
+    let (request, store) = match state(&shared).direct.flows.remove(&flow) {
+        Some(entry) => (entry.request, entry.store),
         // Stopped meanwhile (a pause answered it).
         None => return,
     };
     let body = match result {
         Ok(joined) if joined.end == DirectEnd::Paired => match paired {
-            Some(p) => paired_body(&shared, &flow, &p, joined.connection),
+            Some(p) => paired_body(&shared, &flow, &p, joined.connection, &store),
             None => failure(&flow, "store_failed", "the pairing was not stored", None),
         },
+        Ok(_) if store.was_fenced() => failure(
+            &flow,
+            "removed",
+            "the host was removed, or networking paused, while the join ran; nothing was stored",
+            None,
+        ),
         Ok(joined) => end_body(&flow, joined.end, joined.dial),
         Err(_) => {
             applog::line("a Pair with IP join stopped: its records could not be read or stored");
@@ -724,6 +802,9 @@ fn end_body(flow: &str, end: DirectEnd, dial: Option<DirectDialFailure>) -> Valu
                 None,
             ),
             None => match dial {
+                Some(DirectDialFailure::Forbidden) => {
+                    failure(flow, "bad_address", "that address is never dialled", None)
+                }
                 Some(DirectDialFailure::NotMousse) => failure(
                     flow,
                     "not_mousse",
@@ -743,6 +824,7 @@ fn paired_body(
     flow: &str,
     p: &DirectPaired,
     connection: Option<mousse_net_io::Connection>,
+    store: &crate::direct::DirectStore,
 ) -> Value {
     applog::line(format!("joined {} by Pair with IP", short_id(&p.identity)));
     shared.forget_routes(&p.identity);
@@ -763,7 +845,14 @@ fn paired_body(
             "role": role,
             "route": super::super::paths::route_json(&reached),
         });
-        let gen = shared.peer_gen(&p.identity);
+        // The generation the host had when it was stored, under the peers
+        // lock: a `peer.forget` since closes this path instead. Must-fail
+        // control (tests only): read now.
+        let gen = if cfg!(mousse_control = "direct-pin-after-removal") {
+            shared.peer_gen(&p.identity)
+        } else {
+            store.stored_gen(&p.identity)?
+        };
         shared.add_outbound(conn, gen, fields).ok()
     });
     json!({
@@ -812,21 +901,52 @@ pub fn cancel(shared: &Arc<Shared>, id: &Value, map: &Map<String, Value>) -> Opt
     }
     let (shared, id, flow) = (shared.clone(), id.clone(), flow.to_owned());
     tokio::spawn(async move {
-        if !taken.await.unwrap_or(false) {
-            shared.event(error(
-                &id,
-                "no_join",
-                "that join can no longer be cancelled",
-            ));
-            return;
+        match taken.await.unwrap_or(Cancelled::NotRecorded) {
+            Cancelled::Safe => {}
+            Cancelled::WrongState => {
+                shared.event(error(
+                    &id,
+                    "no_join",
+                    "that join can no longer be cancelled",
+                ));
+                return;
+            }
+            Cancelled::Paired => {
+                shared.event(error(&id, "no_join", "that join paired before the cancel"));
+                return;
+            }
+            // Not stored: the flow stops, is never started again here, and
+            // its request is answered with the store failure.
+            Cancelled::NotRecorded => {
+                let entry = {
+                    let mut st = state(&shared);
+                    let entry = st.direct.flows.remove(&flow);
+                    if let Some(entry) = &entry {
+                        st.direct.blocked.insert(entry.key.clone());
+                    }
+                    entry
+                };
+                let reason = "the cancel could not be stored; the join is stopped";
+                if let Some(entry) = entry {
+                    let _ = entry.cmds.send(Cmd::Stop);
+                    if let Some(request) = entry.request {
+                        let mut reply = failure(&flow, "store_failed", reason, None);
+                        reply["re"] = request;
+                        shared.event(reply);
+                    }
+                }
+                applog::line("a Pair with IP cancel could not be stored; the join is stopped");
+                shared.event(error(&id, "store_failed", reason));
+                return;
+            }
         }
-        // The request is answered now; a flow that is away keeps running
-        // to deliver the cancel, and ends with `join.direct.ended`.
-        let request = state(&shared)
-            .direct
-            .flows
-            .get_mut(&flow)
-            .and_then(|f| f.request.take());
+        // The cancel is stored: the request is answered now; a flow that
+        // is away keeps running to deliver it, and ends with
+        // `join.direct.ended`.
+        let request = state(&shared).direct.flows.get_mut(&flow).and_then(|f| {
+            f.cancelled = true;
+            f.request.take()
+        });
         if let Some(request) = request {
             let mut reply = failure(&flow, "cancelled", "the join was cancelled", None);
             reply["re"] = request;
@@ -895,10 +1015,25 @@ pub fn resume(shared: &Arc<Shared>) {
     if !crate::direct::enabled() {
         return;
     }
+    // Under the gate a pause stops flows under, and never while paused:
+    // the pause's end starts them. Must-fail control (tests only): the
+    // pause is not checked.
+    let _gate = shared.direct_gate.lock().unwrap_or_else(|e| e.into_inner());
+    if shared.removal.is_paused() && !cfg!(mousse_control = "direct-resume-while-paused") {
+        return;
+    }
     let name = state(shared).name.clone();
-    match shared.caller.resume_direct(&shared.direct, &name) {
+    let (setup, store) = flow_setup(shared);
+    match shared.caller.resume_direct(&setup, &name) {
         Ok(resumed) => {
-            let unreadable = resumed.unreadable.len();
+            // Bad names and bad contents alike; never their file names.
+            // Must-fail control (tests only): bad contents not counted.
+            let damaged = if cfg!(mousse_control = "direct-unreadable-names-only") {
+                0
+            } else {
+                resumed.damaged
+            };
+            let unreadable = resumed.unreadable.len() + damaged;
             state(shared).direct.unreadable = unreadable;
             if unreadable > 0 {
                 applog::line(format!(
@@ -906,7 +1041,13 @@ pub fn resume(shared: &Arc<Shared>) {
                 ));
             }
             for join in resumed.joins {
-                start(shared, join, None, true);
+                let key = flow_key(join.lookup().as_str(), &join.address().to_string());
+                // A flow whose cancel could not be stored stays stopped.
+                if state(shared).direct.blocked.contains(&key) {
+                    join.stop();
+                    continue;
+                }
+                start(shared, join, None, true, store.clone());
             }
         }
         Err(_) => applog::line("listing the kept Pair with IP records failed"),
@@ -917,6 +1058,7 @@ pub fn resume(shared: &Arc<Shared>) {
 /// the next start or resume), and each waiting request is answered
 /// `paused`.
 pub fn pause(shared: &Shared) {
+    let _gate = shared.direct_gate.lock().unwrap_or_else(|e| e.into_inner());
     let flows: Vec<Flow> = state(shared).direct.flows.drain().map(|(_, f)| f).collect();
     for flow in flows {
         let _ = flow.cmds.send(Cmd::Stop);

@@ -700,6 +700,12 @@ impl<F: CodeExchangeFactory> DirectJoinerPairing<F> {
         self.pending.as_ref()
     }
 
+    /// The pending record as last stored (loaded, or acknowledged by
+    /// [`Self::on_persisted`]): what a restart or another flow would find.
+    pub fn saved_pending(&self) -> Option<&DirectPending> {
+        self.pending_saved.as_ref()
+    }
+
     /// The last persist action is durable. Returns what waited for it.
     pub fn on_persisted(&mut self) -> Vec<DirectJoinerAction> {
         match self.in_flight.take() {

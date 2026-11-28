@@ -142,6 +142,7 @@ fn pairs_from_the_ops_end_to_end() {
     assert_eq!(ask["decision"], "pending", "{ask}");
     assert_eq!(ask["identity"], r.b.identity.as_str(), "{ask}");
     assert_eq!(ask["device"], waiting["short_id"], "both show B's short id");
+    assert_eq!(waiting["request"], json!(id), "progress names its request");
     none_within(
         &r.b,
         Duration::from_millis(500),
@@ -198,10 +199,9 @@ fn pairs_from_the_ops_end_to_end() {
 
 /// Allow while the joiner is away marks the same request allowed, and the
 /// grant is made only when the joiner is back: here a restarted helper
-/// recovering its pending record, and a `join.direct` with the same address
-/// and code taking that recovery.
+/// whose startup recovery, with no request from the app, claims it.
 #[test]
-fn allow_while_away_enrolls_on_reconnect_after_a_restart() {
+fn allow_while_away_is_claimed_by_the_startup_recovery() {
     let mut r = rig("pip-away", MINOR4);
     let inv = invite(&mut r.a);
     let invitation = inv["invitation"].as_str().unwrap().to_owned();
@@ -230,15 +230,64 @@ fn allow_while_away_enrolls_on_reconnect_after_a_restart() {
     );
     assert!(!has_grant(&mut r.a, &r.b.identity), "no grant while away");
 
-    // B is back: it recovers, and the same join takes the recovery.
+    // B is back: its startup recovery alone claims the enrollment.
     restart_b(&mut r);
-    let id = join(&mut r.b, &inv, &code);
-    let joined = r.b.reply(id);
-    assert!(joined.get("error").is_none(), "{joined}");
-    assert_eq!(joined["identity"], r.a.identity.as_str(), "{joined}");
+    let ended = r.b.event("join.direct.ended", |_| true);
+    assert!(ended.get("error").is_none(), "{ended}");
+    assert_eq!(ended["identity"], r.a.identity.as_str(), "{ended}");
     let enrolled =
         r.a.event("enrolled", |m| m["invitation"] == invitation.as_str());
     assert_eq!(enrolled["identity"], r.b.identity.as_str(), "{enrolled}");
+}
+
+/// After a restart the startup recovery runs before any request (the host
+/// sees the device back), and a `join.direct` with the same address and
+/// code takes that very flow: the same flow id, its progress now naming
+/// the request, and no new code attempt.
+#[test]
+fn a_join_takes_the_recovery_started_at_startup() {
+    let mut r = rig("pip-take", MINOR4);
+    let inv = invite(&mut r.a);
+    let invitation = inv["invitation"].as_str().unwrap().to_owned();
+    let code = inv["code"].as_str().unwrap().to_owned();
+    join(&mut r.b, &inv, &code);
+    progress(&r.b, "awaiting_approval", 0);
+    let ask = approval_for(&r.a, &invitation, |m| m["state"] == "connected");
+    r.b.kill();
+    approval_for(&r.a, &invitation, |m| m["state"] == "away");
+    let attempts = r.a.events("invite.code").len();
+    let asked = r.a.events("approval").len();
+
+    restart_b(&mut r);
+    // Back with no request from the app: the startup recovery.
+    r.a.wait("B back by its recovery", WAIT, |st| {
+        st.messages
+            .iter()
+            .filter(|m| m["ev"] == "approval")
+            .skip(asked)
+            .find(|m| m["state"] == "connected")
+            .cloned()
+    });
+    let recovered = progress(&r.b, "awaiting_approval", 0);
+    assert!(recovered.get("request").is_none(), "{recovered}");
+
+    let seen = progress_count(&r.b);
+    let id = join(&mut r.b, &inv, &code);
+    let taken = progress(&r.b, "awaiting_approval", seen);
+    assert_eq!(taken["flow"], recovered["flow"], "the same flow");
+    assert_eq!(taken["request"], json!(id), "{taken}");
+    r.a.call(
+        "approval.answer",
+        json!({"request": ask["request"], "yes": true}),
+    );
+    let joined = r.b.reply(id);
+    assert!(joined.get("error").is_none(), "{joined}");
+    assert_eq!(joined["flow"], recovered["flow"], "{joined}");
+    assert_eq!(
+        r.a.events("invite.code").len(),
+        attempts,
+        "no new code attempt"
+    );
 }
 
 /// A joiner's cancel that crosses the host's Allow wins: whichever arrives
@@ -442,5 +491,321 @@ fn the_cli_pairs_with_the_code_typed_at_a_prompt() {
     join.wait_for("paired with hostA");
     assert_eq!(join.exit_within(WAIT), Some(0), "{}", join.err());
     assert_eq!(invite.exit_within(WAIT), Some(0), "{}", invite.err());
+    drop(serve);
+}
+
+/// A host A and a joiner B at minor 4, B with `b_env` besides.
+fn rig_with(tag: &str, b_env: &[(&str, &str)]) -> Rig {
+    let a_end = Endpoint::init(&format!("{tag}a"));
+    let b_end = Endpoint::init(&format!("{tag}b"));
+    let mut a = a_end.app("hostA", MINOR4);
+    a.hello();
+    let mut env = MINOR4.to_vec();
+    env.extend_from_slice(b_env);
+    let mut b = b_end.app("peerB", &env);
+    b.hello();
+    Rig { a, b, a_end, b_end }
+}
+
+/// `peer.forget` of the host while a re-pair by code waits for Allow wins:
+/// the Allow that follows stores nothing on the joiner, which answers
+/// `removed`, lists no completion and keeps the host forgotten.
+#[test]
+fn a_forget_while_a_repair_waits_stores_nothing() {
+    let mut r = rig("pip-fgt", MINOR4);
+    pair_apps(&mut r.a, &mut r.b);
+    let inv = invite(&mut r.a);
+    let invitation = inv["invitation"].as_str().unwrap().to_owned();
+    let id = join(&mut r.b, &inv, inv["code"].as_str().unwrap());
+    let ask = approval_for(&r.a, &invitation, |m| m["state"] == "connected");
+    let a_identity = r.a.identity.clone();
+    r.b.call("peer.forget", json!({"identity": a_identity}));
+    let ups = outbound_ups(&r.b, &a_identity);
+
+    r.a.call(
+        "approval.answer",
+        json!({"request": ask["request"], "yes": true}),
+    );
+    let refused = r.b.reply(id);
+    assert_eq!(refused["error"], "removed", "{refused}");
+    assert_eq!(peer_of(&mut r.b, &a_identity), Value::Null);
+    let status = r.b.call("join.status", json!({}));
+    assert_eq!(status["direct"], json!([]), "{status}");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(outbound_ups(&r.b, &a_identity), ups, "no path to A");
+}
+
+/// A removal of the host also drops the kept record of a join to it: after
+/// the next restart no recovery reaches the host or pairs with it.
+#[test]
+fn a_forget_drops_the_kept_record_of_a_join_to_that_host() {
+    let fast = [("DIRECT_RETRY_FIRST_MS", "100")];
+    let mut r = rig_with("pip-fgtrec", &fast);
+    let inv = invite(&mut r.a);
+    let invitation = inv["invitation"].as_str().unwrap().to_owned();
+    join(&mut r.b, &inv, inv["code"].as_str().unwrap());
+    let ask = approval_for(&r.a, &invitation, |m| m["state"] == "connected");
+    let a_identity = r.a.identity.clone();
+    r.b.call("peer.forget", json!({"identity": a_identity}));
+    r.b.kill();
+    approval_for(&r.a, &invitation, |m| m["state"] == "away");
+    r.a.call(
+        "approval.answer",
+        json!({"request": ask["request"], "yes": true}),
+    );
+    approval_for(&r.a, &invitation, |m| m["decision"] == "allowed");
+    let asked = r.a.events("approval").len();
+
+    let mut env = MINOR4.to_vec();
+    env.extend_from_slice(&fast);
+    let mut b = r.b_end.app("peerB", &env);
+    b.hello();
+    r.b = b;
+    std::thread::sleep(Duration::from_millis(1500));
+    let back: Vec<Value> = r.a.events("approval").into_iter().skip(asked).collect();
+    assert!(back.is_empty(), "a recovery reached A: {back:?}");
+    assert!(r.a.events("enrolled").is_empty());
+    assert_eq!(peer_of(&mut r.b, &a_identity), Value::Null);
+}
+
+/// Networking paused at startup (a removal journal that does not read):
+/// no kept record is recovered, so nothing dials, until the pause ends;
+/// then the recovery runs.
+#[test]
+fn a_helper_paused_at_startup_recovers_nothing_until_it_resumes() {
+    let b_env = [("DIRECT_RETRY_FIRST_MS", "100"), ("REMOVAL_RETRY_MS", "50")];
+    let mut r = rig_with("pip-pause", &b_env);
+    let inv = invite(&mut r.a);
+    let invitation = inv["invitation"].as_str().unwrap().to_owned();
+    join(&mut r.b, &inv, inv["code"].as_str().unwrap());
+    approval_for(&r.a, &invitation, |m| m["state"] == "connected");
+    r.b.kill();
+    approval_for(&r.a, &invitation, |m| m["state"] == "away");
+    let asked = r.a.events("approval").len();
+
+    let journal = r.b_end.dir.join("revoke.journal");
+    std::fs::write(&journal, b"not a journal").unwrap();
+    let mut env = MINOR4.to_vec();
+    env.extend_from_slice(&b_env);
+    let mut b = r.b_end.app("peerB", &env);
+    let hello = b.hello();
+    assert!(hello["paused"].is_string(), "{hello}");
+    r.b = b;
+    std::thread::sleep(Duration::from_millis(1500));
+    let back: Vec<Value> = r.a.events("approval").into_iter().skip(asked).collect();
+    assert!(back.is_empty(), "a recovery dialled while paused: {back:?}");
+
+    // The pause ends: the recovery runs.
+    std::fs::remove_file(&journal).unwrap();
+    r.b.event("net.resumed", |_| true);
+    r.a.wait("B back after the pause", WAIT, |st| {
+        st.messages
+            .iter()
+            .filter(|m| m["ev"] == "approval")
+            .skip(asked)
+            .find(|m| m["state"] == "connected")
+            .cloned()
+    });
+}
+
+/// A kept pending record whose contents do not read is counted by
+/// `join.status` (with those whose names do not read) and left in place.
+#[test]
+fn join_status_counts_a_kept_record_that_does_not_read() {
+    let mut r = rig("pip-unread", MINOR4);
+    let inv = invite(&mut r.a);
+    let invitation = inv["invitation"].as_str().unwrap().to_owned();
+    join(&mut r.b, &inv, inv["code"].as_str().unwrap());
+    approval_for(&r.a, &invitation, |m| m["state"] == "connected");
+    r.b.kill();
+    let pending: Vec<_> = std::fs::read_dir(r.b_end.dir.join("direct"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "pending"))
+        .collect();
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    std::fs::write(&pending[0], b"damaged").unwrap();
+
+    restart_b(&mut r);
+    let status = r.b.call("join.status", json!({}));
+    assert_eq!(status["direct_unreadable"], 1, "{status}");
+    assert_eq!(std::fs::read(&pending[0]).unwrap(), b"damaged", "kept");
+}
+
+/// Two devices pass the code of one invitation: two requests with ids of
+/// their own. Allowing one with its own role enrolls that device with that
+/// role on both sides and takes the other request away.
+#[test]
+fn two_devices_get_their_own_requests_and_the_allowed_one_its_role() {
+    let mut r = rig("pip-two", MINOR4);
+    let c_end = Endpoint::init("pip-twoc");
+    let mut c = c_end.app("peerC", MINOR4);
+    c.hello();
+    let inv = invite(&mut r.a);
+    let invitation = inv["invitation"].as_str().unwrap().to_owned();
+    let code = inv["code"].as_str().unwrap().to_owned();
+    let b_id = join(&mut r.b, &inv, &code);
+    let c_id = join(&mut c, &inv, &code);
+    let b_ask = approval_for(&r.a, &invitation, |m| {
+        m["identity"] == r.b.identity.as_str()
+    });
+    let c_ask = approval_for(&r.a, &invitation, |m| m["identity"] == c.identity.as_str());
+    assert_ne!(b_ask["request"], c_ask["request"], "a request each");
+
+    r.a.call(
+        "approval.answer",
+        json!({"request": c_ask["request"], "yes": true, "role": "viewer"}),
+    );
+    let joined = c.reply(c_id);
+    assert!(joined.get("error").is_none(), "{joined}");
+    assert_eq!(joined["role"], "viewer", "{joined}");
+    let enrolled =
+        r.a.event("enrolled", |m| m["invitation"] == invitation.as_str());
+    assert_eq!(enrolled["identity"], c.identity.as_str(), "{enrolled}");
+    assert_eq!(enrolled["role"], "viewer", "{enrolled}");
+    r.a.event("approval.ended", |m| {
+        m["request"] == b_ask["request"] && m["reason"] == "dismissed"
+    });
+    let other = r.b.reply(b_id);
+    assert!(other.get("error").is_some(), "{other}");
+    assert!(!has_grant(&mut r.a, &r.b.identity));
+    drop(c);
+}
+
+const CLI_HELLO: &[(&str, &str)] = &[("MOUSSE_NET_TEST_HELLO_MINOR", "4")];
+
+/// Without wire minor 4 the CLI refuses before anything happens:
+/// `join-direct` asks for no code, and `invite --direct` asks the running
+/// host (which speaks minor 4) for nothing.
+#[test]
+fn the_cli_refuses_pair_with_ip_without_minor_4() {
+    let a_end = Endpoint::init("pip-cliofa");
+    let b_end = Endpoint::init("pip-cliofb");
+    let serve = a_end.cli_env(
+        &["serve", "--name", "hostA", "--no-mdns", "--port", "0"],
+        CLI_HELLO,
+    );
+    serve.wait_for("ready ");
+    let mut invite = a_end.cli_env(&["invite", "--direct"], &[]);
+    assert_ne!(invite.exit_within(WAIT), Some(0));
+    assert!(invite.err().contains("wire minor 4"), "{}", invite.err());
+    assert!(!invite.out().contains("CODE "), "{}", invite.out());
+
+    let mut join = b_end.cli_env(&["join-direct", "127.0.0.1:9"], &[]);
+    assert_ne!(join.exit_within(WAIT), Some(0));
+    assert!(join.err().contains("wire minor 4"), "{}", join.err());
+    assert!(!join.out().contains("Type the code"), "{}", join.out());
+    drop(serve);
+}
+
+/// `join-direct` with a grant list it cannot read stops before it asks for
+/// the code or dials: a denied host must never see this device's
+/// certificate.
+#[test]
+fn the_cli_join_stops_when_the_deny_list_does_not_read() {
+    let b_end = Endpoint::init("pip-clideny");
+    std::fs::write(b_end.dir.join("grants.json"), b"not a grant list").unwrap();
+    let mut join = b_end.cli_env(&["join-direct", "127.0.0.1:9"], CLI_HELLO);
+    join.end_stdin();
+    assert_ne!(join.exit_within(WAIT), Some(0));
+    assert!(join.err().contains("grant list"), "{}", join.err());
+    assert!(!join.out().contains("Type the code"), "{}", join.out());
+}
+
+/// A code typed after the address is never echoed: the error is in fixed
+/// words.
+#[test]
+fn the_cli_never_echoes_a_code_given_as_an_argument() {
+    let b_end = Endpoint::init("pip-cliarg");
+    let mut join = b_end.cli_env(&["join-direct", "127.0.0.1:9", "QQQQ-RRRR-SSSS"], CLI_HELLO);
+    assert_eq!(join.exit_within(WAIT), Some(2));
+    for text in [join.out(), join.err()] {
+        assert!(!text.contains("QQQQ"), "{text}");
+    }
+    assert!(join.err().contains("type the code"), "{}", join.err());
+}
+
+/// `invite --direct` shows a local network address only: a listener whose
+/// address is not one (here relabelled public) has none to show.
+#[test]
+fn the_cli_invite_shows_no_address_that_is_not_local() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let a_end = Endpoint::init("pip-clipub");
+    let map = format!("{port}=public");
+    let env = [
+        ("MOUSSE_NET_TEST_HELLO_MINOR", "4"),
+        ("MOUSSE_NET_TEST_CLASS_MAP", map.as_str()),
+    ];
+    let port = port.to_string();
+    let serve = a_end.cli_env(
+        &["serve", "--name", "hostA", "--no-mdns", "--port", &port],
+        &env,
+    );
+    serve.wait_for("ready ");
+    let mut invite = a_end.cli_env(&["invite", "--direct"], &env);
+    assert_ne!(invite.exit_within(WAIT), Some(0));
+    assert!(!invite.out().contains("ADDRESS"), "{}", invite.out());
+    assert!(invite.err().contains("local network"), "{}", invite.err());
+    drop(serve);
+}
+
+/// The CLI host retires a question whose request ended: its late answer is
+/// not sent, and the same device passing the code again gets a new
+/// question.
+#[test]
+fn the_cli_invite_asks_again_after_a_request_ends() {
+    let a_end = Endpoint::init("pip-cliaska");
+    let b_end = Endpoint::init("pip-cliaskb");
+    let serve = a_end.cli_env(
+        &["serve", "--name", "hostA", "--no-mdns", "--port", "0"],
+        CLI_HELLO,
+    );
+    serve.wait_for("ready ");
+    let mut invite = a_end.cli_env(&["invite", "--direct"], CLI_HELLO);
+    let address = invite.wait_for("ADDRESS ")["ADDRESS ".len()..].to_owned();
+    let code = invite.wait_for("CODE ")["CODE ".len()..]
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+    let mut b = b_end.app("peerB", MINOR4);
+    b.hello();
+    let first = b.start("join.direct", json!({"address": address, "code": code}));
+    let waiting = progress(&b, "awaiting_approval", 0);
+    invite.wait_for("Allow it?");
+
+    // B cancels: the question on screen no longer counts.
+    b.call("join.direct.cancel", json!({"flow": waiting["flow"]}));
+    assert_eq!(b.reply(first)["error"], "cancelled");
+    invite.wait_for("no longer counts");
+    // The cancelled flow ends once the host has it; then B joins again.
+    b.event("join.direct.ended", |m| m["flow"] == waiting["flow"]);
+    let seen = progress_count(&b);
+    let again = b.start("join.direct", json!({"address": address, "code": code}));
+    progress(&b, "awaiting_approval", seen);
+    // The stale answer is dropped; the new question gets its own.
+    invite.type_line("y\n");
+    invite.wait_for("nothing was sent");
+    let start = Instant::now();
+    while invite.out().matches("Allow it?").count() < 2 {
+        assert!(start.elapsed() < WAIT, "no new question: {}", invite.out());
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    none_within(
+        &b,
+        Duration::from_millis(300),
+        "a pairing before the answer",
+        |m| m.get("re") == Some(&json!(again)) && m.get("error").is_none(),
+    );
+    invite.type_line("y\n");
+    let joined = b.reply(again);
+    assert!(joined.get("error").is_none(), "{joined}");
+    invite.wait_for("paired: grant ");
+    drop(b);
     drop(serve);
 }

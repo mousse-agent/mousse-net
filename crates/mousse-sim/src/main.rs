@@ -3,7 +3,6 @@
 //! ```text
 //! mousse-sim run pairing-limits --seeds 5000 [--bug NAME] [--full-verify] [--jobs N]
 //! mousse-sim run --drill all --seeds 1000..2000
-//! mousse-sim run pairing-direct
 //! mousse-sim replay --drill handshake --seed 42 [--bug NAME] [--full-verify]
 //! mousse-sim must-fail [--drill pairing-direct] [--seeds 0..500]
 //! mousse-sim list
@@ -14,9 +13,9 @@
 //! seeds side by side.
 //!
 //! `--seeds N` means seeds `0..N`; `--seeds A..B` a range; `--seed N` one
-//! seed. `run` without seeds runs `0..1000`, `must-fail` `0..500`. The drill
-//! is the first plain argument or `--drill`; `must-fail` with a drill plants
-//! only that drill's bugs.
+//! seed; `must-fail` without seeds runs `0..500`. The drill is the first
+//! plain argument or `--drill`; `must-fail` with a drill plants only that
+//! drill's bugs.
 //!
 //! `run` ends each drill with `PASS sim <drill>` or `FAIL sim <drill>`. With
 //! `--bug`, the verdict counts only the invariant that bug must break, so a
@@ -34,16 +33,13 @@ use std::time::Instant;
 use mousse_sim::{run, Bug, Drill, Invariant, RunConfig, RunOutcome};
 
 const USAGE: &str = "usage:
-  mousse-sim run <drill|all> [--seeds <N|A..B>] [--bug <name>] [--full-verify] [--jobs <N>]
+  mousse-sim run <drill|all> --seeds <N|A..B> [--bug <name>] [--full-verify] [--jobs <N>]
   mousse-sim replay --drill <name> --seed <N> [--bug <name>] [--full-verify]
   mousse-sim must-fail [--drill <name>] [--seeds <A..B>] [--jobs <N>]
   mousse-sim list";
 
 /// How many failures `run` prints in full.
 const SHOWN_FAILURES: usize = 20;
-
-/// The seeds `run` uses when none are given.
-const RUN_SEEDS: Range<u64> = 0..1_000;
 
 /// The seeds `must-fail` uses when none are given.
 const MUST_FAIL_SEEDS: Range<u64> = 0..500;
@@ -178,11 +174,10 @@ fn main() -> ExitCode {
 }
 
 fn cmd_run(args: &Args) -> ExitCode {
-    if args.drills.is_empty() {
-        eprintln!("run needs a drill\n{USAGE}");
+    let (Some(seeds), false) = (args.seeds.clone(), args.drills.is_empty()) else {
+        eprintln!("run needs a drill and --seeds\n{USAGE}");
         return ExitCode::from(2);
-    }
-    let seeds = args.seeds.clone().unwrap_or(RUN_SEEDS);
+    };
     let mut failed = false;
     for &drill in &args.drills {
         let started = Instant::now();

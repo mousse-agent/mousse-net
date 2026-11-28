@@ -30,7 +30,7 @@ use mousse_net_core::pairing::{
     DirectJoinerPairing, DirectJoinerState, DirectLookup, DirectPaired, EXPORTER_LEN,
 };
 use mousse_net_core::{ConnectionId, ErrorCode, Millis};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use super::{lock, Caller, Paths};
 use crate::clock::Clock;
@@ -88,6 +88,36 @@ pub enum DirectDialFailure {
     /// A TCP connection, but no Mousse TLS handshake (or a far end this
     /// profile denied).
     NotMousse,
+    /// The address policy never dials the address (unspecified, multicast,
+    /// reserved or documentation ranges, loopback outside tests): checked
+    /// before every dial, a recovery's included, so nothing was sent.
+    Forbidden,
+}
+
+/// Why a cancel was not confirmed ([`DirectCancel::confirmed`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectCancelFailed {
+    /// The cancel mark could not be stored, and the flow ended with its
+    /// pending record unmarked: a later recovery of that record would not
+    /// carry the cancel.
+    NotRecorded,
+    /// The flow paired first.
+    Paired,
+}
+
+/// A cancel handed to a flow: confirmed once it is safe, that is once the
+/// pending record's cancel mark is stored, or once the flow ended with no
+/// pending record of its own left unmarked. A cancel that waits for the
+/// lookup's hold (another flow has it) stays wanted and is taken with the
+/// flow's next recovery.
+pub struct DirectCancel(oneshot::Receiver<Result<(), DirectCancelFailed>>);
+
+impl DirectCancel {
+    /// Wait for the outcome. A flow that ended without confirming (a store
+    /// failure, a stop) reads as [`DirectCancelFailed::NotRecorded`].
+    pub async fn confirmed(self) -> Result<(), DirectCancelFailed> {
+        self.0.await.unwrap_or(Err(DirectCancelFailed::NotRecorded))
+    }
 }
 
 /// How a Pair with IP join ended.
@@ -115,6 +145,9 @@ pub struct DirectResumed {
     /// Files kept as pending records whose names do not read: each may
     /// hold a code that passed. They are left as they are.
     pub unreadable: Vec<NetError>,
+    /// Pending records whose names read but whose contents did not: each
+    /// has a recovery in `joins`, which fails and keeps the record.
+    pub damaged: usize,
 }
 
 impl std::fmt::Debug for DirectJoined {
@@ -133,7 +166,7 @@ pub struct DirectJoin {
     state: watch::Receiver<DirectJoinerState>,
     lookup: DirectLookup,
     address: DirectAddress,
-    cancel: Box<dyn Fn() -> Result<(), DirectJoinError> + Send + Sync>,
+    cancel: Box<dyn Fn() -> Result<DirectCancel, DirectJoinError> + Send + Sync>,
     stop: Box<dyn Fn() + Send + Sync>,
     task: tokio::task::JoinHandle<Result<DirectJoined, NetError>>,
 }
@@ -167,8 +200,9 @@ impl DirectJoin {
     /// and the cancel reaches the host now (connected) or with the next
     /// recovery (away). A flow that has not loaded its records yet (it is
     /// starting, or a recovery at startup waits for its lookup's hold)
-    /// takes the cancel once it has.
-    pub fn cancel(&self) -> Result<(), DirectJoinError> {
+    /// takes the cancel once it has. The returned [`DirectCancel`] says
+    /// when the cancel is safe: report it to the person only then.
+    pub fn cancel(&self) -> Result<DirectCancel, DirectJoinError> {
         (self.cancel)()
     }
 
@@ -217,6 +251,11 @@ struct DirectFlow<F: CodeExchangeFactory> {
     waiting_hold: bool,
     /// The handle cancelled before the records were loaded.
     cancel_wanted: bool,
+    /// The handle cancelled and the cancel is not confirmed yet: kept
+    /// across a refused hold, and taken by the next recovery.
+    cancel_asked: bool,
+    /// Who waits for the cancel's confirmation.
+    cancel_waiters: Vec<oneshot::Sender<Result<(), DirectCancelFailed>>>,
     /// Why the last dial failed, if it did; cleared by a dial that
     /// connects.
     dial: Option<DirectDialFailure>,
@@ -294,6 +333,40 @@ impl<F: CodeExchangeFactory> DirectFlow<F> {
         #[cfg(test)]
         self.trace.push("publish");
         self.state.send_replace(self.pairing.state());
+        self.settle_cancel();
+    }
+
+    /// Confirm or refuse a waiting cancel once its outcome is known: safe
+    /// when the stored pending record carries the cancel, or when the flow
+    /// ended with no stored record of its own left unmarked.
+    fn settle_cancel(&mut self) {
+        if !self.cancel_asked {
+            return;
+        }
+        let saved = self.pairing.saved_pending();
+        let safe = saved.is_none_or(|p| p.cancelled);
+        let marked = saved.is_some_and(|p| p.cancelled);
+        // Must-fail control (tests only): a cancel is confirmed as soon as
+        // it is asked, stored or not.
+        let outcome = if cfg!(mousse_control = "direct-cancel-unrecorded") {
+            Some(Ok(()))
+        } else {
+            match self.pairing.state() {
+                DirectJoinerState::Paired | DirectJoinerState::Ended(DirectEnd::Paired) => {
+                    Some(Err(DirectCancelFailed::Paired))
+                }
+                DirectJoinerState::Ended(_) if safe => Some(Ok(())),
+                DirectJoinerState::Ended(_) => Some(Err(DirectCancelFailed::NotRecorded)),
+                _ if marked => Some(Ok(())),
+                _ => None,
+            }
+        };
+        if let Some(outcome) = outcome {
+            self.cancel_asked = false;
+            for waiter in self.cancel_waiters.drain(..) {
+                let _ = waiter.send(outcome);
+            }
+        }
     }
 
     /// Carry out `actions` in order: the hold, the loads, every write (each
@@ -396,7 +469,13 @@ impl<F: CodeExchangeFactory> DirectFlow<F> {
                     }
                     let now = self.clock.now();
                     let mut actions = self.pairing.on_records(ledger.as_ref(), &pending, now);
-                    if std::mem::take(&mut self.cancel_wanted)
+                    // A cancel asked before the records were loaded, or one
+                    // whose hold another flow had: taken now, before any
+                    // dial. Must-fail control (tests only): a refused hold
+                    // drops the cancel.
+                    let kept = self.cancel_asked
+                        && !cfg!(mousse_control = "direct-cancel-dropped-on-busy-hold");
+                    if (std::mem::take(&mut self.cancel_wanted) || kept)
                         && self.pairing.state() == DirectJoinerState::Connecting
                     {
                         actions.extend(self.pairing.cancel().unwrap_or_default());
@@ -446,16 +525,21 @@ impl<F: CodeExchangeFactory> DirectFlow<F> {
     }
 
     /// The handle's cancel.
-    fn cancel(&mut self) -> Result<(), DirectJoinError> {
+    fn cancel(&mut self) -> Result<DirectCancel, DirectJoinError> {
         if self.stopped {
             return Err(DirectJoinError::WrongState);
         }
+        let (tx, rx) = oneshot::channel();
         // Nothing loaded yet: the cancel is taken once the records are.
         if self.pairing.state() == DirectJoinerState::Holding {
             self.cancel_wanted = true;
-            return Ok(());
+            self.cancel_asked = true;
+            self.cancel_waiters.push(tx);
+            return Ok(DirectCancel(rx));
         }
         let actions = self.pairing.cancel()?;
+        self.cancel_asked = true;
+        self.cancel_waiters.push(tx);
         let wire = self.run(actions);
         // The abort and the close are queued before the state goes out: the
         // driver, seeing the flow away, drops the connection, and that
@@ -463,13 +547,18 @@ impl<F: CodeExchangeFactory> DirectFlow<F> {
         self.hand_to_connection(wire);
         self.leave_connection_if_done();
         self.publish();
-        Ok(())
+        Ok(DirectCancel(rx))
     }
 
     /// The handle's stop: from here nothing reaches the pairing, the
     /// connection closes, then the hold goes.
     fn stop(&mut self) {
         self.stopped = true;
+        // A cancel not confirmed by now never is.
+        self.cancel_asked = false;
+        for waiter in self.cancel_waiters.drain(..) {
+            let _ = waiter.send(Err(DirectCancelFailed::NotRecorded));
+        }
         if let Some((_, tx)) = self.active.take() {
             let _ = tx.send(Cmd::Close(ErrorCode::NoError));
         }
@@ -767,6 +856,7 @@ where
         name: &str,
     ) -> Result<DirectResumed, NetError> {
         let found = setup.records.pending_slots()?;
+        let damaged = found.slots.iter().filter(|s| s.attempt.is_none()).count();
         let mut joins = Vec::new();
         for slot in found.slots {
             let pairing = DirectJoinerPairing::resume(
@@ -783,6 +873,7 @@ where
         Ok(DirectResumed {
             joins,
             unreadable: found.unreadable,
+            damaged,
         })
     }
 
@@ -808,6 +899,8 @@ where
             startup,
             waiting_hold: false,
             cancel_wanted: false,
+            cancel_asked: false,
+            cancel_waiters: Vec::new(),
             dial: None,
             #[cfg(test)]
             trace: Vec::new(),
@@ -928,6 +1021,14 @@ where
             }
         };
         let addr = SocketAddr::new(address.ip, address.port);
+        // The address policy applies to every Pair with IP dial, a
+        // recovery of a record kept under another policy included. Must-fail
+        // control (tests only): not checked.
+        if self.addr_policy().class_of(addr) == crate::pipe::AddrClass::Forbidden
+            && !cfg!(mousse_control = "direct-dial-unchecked")
+        {
+            return failed(flow, DirectDialFailure::Forbidden);
+        }
         let Ok(pipe) = connect_addr(addr, ms(self.limits.io().connect_timeout_ms())).await else {
             return failed(flow, DirectDialFailure::Unreachable);
         };
@@ -1204,6 +1305,8 @@ mod tests {
             startup,
             waiting_hold: false,
             cancel_wanted: false,
+            cancel_asked: false,
+            cancel_waiters: Vec::new(),
             dial: None,
             trace: Vec::new(),
         }));

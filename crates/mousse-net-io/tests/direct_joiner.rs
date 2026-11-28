@@ -1434,3 +1434,157 @@ async fn the_events_end_when_the_flow_panics() {
     assert_eq!(drain(&mut join).await, Vec::new());
     assert!(within("the panic", join.finish()).await.is_err());
 }
+
+/// A record store whose pending-record writes fail once `failing` is set:
+/// a disk that stops taking writes.
+struct FailPending {
+    inner: Arc<dyn DirectRecords>,
+    failing: AtomicBool,
+}
+
+impl DirectRecords for FailPending {
+    fn hold(
+        &self,
+        lookup: &DirectLookup,
+    ) -> Result<Option<mousse_net_io::store::FlowHold>, NetError> {
+        self.inner.hold(lookup)
+    }
+
+    fn load(
+        &self,
+        lookup: &DirectLookup,
+        address: &DirectAddress,
+    ) -> Result<
+        (
+            Option<mousse_net_core::pairing::DirectLedger>,
+            Option<DirectPending>,
+        ),
+        NetError,
+    > {
+        self.inner.load(lookup, address)
+    }
+
+    fn swap_ledger(
+        &self,
+        expected: Option<&mousse_net_core::pairing::DirectLedger>,
+        record: &mousse_net_core::pairing::DirectLedger,
+    ) -> Result<(), NetError> {
+        self.inner.swap_ledger(expected, record)
+    }
+
+    fn swap_pending(
+        &self,
+        lookup: &DirectLookup,
+        address: &DirectAddress,
+        expected: Option<&DirectPending>,
+        record: Option<&DirectPending>,
+    ) -> Result<(), NetError> {
+        if self.failing.load(Ordering::SeqCst) {
+            return Err(NetError::Store("the disk is full".into()));
+        }
+        self.inner.swap_pending(lookup, address, expected, record)
+    }
+
+    fn pending_slots(&self) -> Result<mousse_net_io::PendingSlots, NetError> {
+        self.inner.pending_slots()
+    }
+}
+
+/// A cancel whose mark cannot be stored is not confirmed: the flow ends
+/// with its record unmarked, and says so, so the person is never told the
+/// join was cancelled when a crossing Allow could still pair it.
+#[tokio::test]
+async fn a_cancel_that_cannot_be_stored_is_not_confirmed() {
+    minor_4();
+    let host = TestHost::start(new_signer(), None, DIRECT_MINOR_VERSION).await;
+    let memory: Arc<dyn DirectRecords> = Arc::new(MemoryDirectRecords::default());
+    let records = Arc::new(FailPending {
+        inner: memory.clone(),
+        failing: AtomicBool::new(false),
+    });
+    let joiner = Joiner::new(records.clone());
+    let mut join = joiner.join(&host, &host.code);
+    assert_eq!(next(&mut join).await, DirectJoinEvent::CodePassed);
+    records.failing.store(true, Ordering::SeqCst);
+    let cancel = join.cancel().unwrap();
+    assert_eq!(
+        within("the cancel's outcome", cancel.confirmed()).await,
+        Err(mousse_net_io::DirectCancelFailed::NotRecorded)
+    );
+    assert!(!pending_at(&*memory, &host).unwrap().cancelled);
+    let joined = within("the end", join.finish()).await.unwrap();
+    assert_eq!(
+        joined.end,
+        DirectEnd::Closed(Some(ErrorCode::InternalError))
+    );
+}
+
+/// A cancel while away whose lookup another flow holds is kept, not
+/// dropped: it is confirmed only once a later recovery has the hold and
+/// stores the mark, and the host then hears it.
+#[tokio::test]
+async fn a_cancel_while_away_outlasts_a_busy_hold() {
+    minor_4();
+    let host = TestHost::start(new_signer(), None, DIRECT_MINOR_VERSION).await;
+    let records: Arc<dyn DirectRecords> = Arc::new(MemoryDirectRecords::default());
+    let joiner = Joiner::new(records.clone());
+    let mut join = joiner.join(&host, &host.code);
+    assert_eq!(next(&mut join).await, DirectJoinEvent::CodePassed);
+    wait_for("the request", || host.logged("approval:")).await;
+    // Another flow takes the lookup as soon as this one gives it back.
+    let lookup = DirectLookup::from_canonical(&host.code[..4]).unwrap();
+    let held = Arc::new(Mutex::new(None));
+    let taker = {
+        let (records, lookup, held) = (records.clone(), lookup.clone(), held.clone());
+        tokio::spawn(async move {
+            loop {
+                if let Ok(Some(hold)) = records.hold(&lookup) {
+                    *held.lock().unwrap() = Some(hold);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+    };
+    host.break_all();
+    assert_eq!(next(&mut join).await, DirectJoinEvent::Away);
+    within("the other flow's hold", taker).await.unwrap();
+    let cancel = join.cancel().unwrap();
+    let outcome = tokio::spawn(cancel.confirmed());
+    // Several recoveries are refused the hold meanwhile.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !outcome.is_finished(),
+        "confirmed while another flow held the lookup"
+    );
+    assert!(!pending_at(&*records, &host).unwrap().cancelled);
+    held.lock().unwrap().take();
+    assert_eq!(
+        within("the cancel's outcome", outcome).await.unwrap(),
+        Ok(())
+    );
+    let joined = within("the end", join.finish()).await.unwrap();
+    assert_eq!(joined.end, DirectEnd::Closed(Some(ErrorCode::Cancelled)));
+    assert!(host.logged("approval_ended:Cancelled"));
+    assert!(joiner.pins.stored.lock().unwrap().is_empty());
+}
+
+/// The address policy is applied before every Pair with IP dial: an
+/// address it never dials (here a documentation range) is refused with
+/// nothing sent, also when the helper's own check was skipped.
+#[tokio::test]
+async fn a_dial_the_policy_forbids_sends_nothing() {
+    minor_4();
+    let records: Arc<dyn DirectRecords> = Arc::new(MemoryDirectRecords::default());
+    let joiner = Joiner::new(records);
+    let join = joiner
+        .caller
+        .join_direct(&joiner.setup, "192.0.2.1:7443", "ABCD-EFGH-JKMN", "laptop")
+        .unwrap();
+    let joined = within("the refusal", join.finish()).await.unwrap();
+    assert_eq!(joined.end, DirectEnd::Closed(None));
+    assert_eq!(
+        joined.dial,
+        Some(mousse_net_io::DirectDialFailure::Forbidden)
+    );
+}
