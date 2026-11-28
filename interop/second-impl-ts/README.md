@@ -42,7 +42,7 @@ npm test
 
 The tests print case counts by vector file and end with `PASS second-impl` or
 `FAIL second-impl`. They replay sixteen pairing flows,
-twelve attempt sequences and the thirty-six Pair with IP host sequences
+twelve attempt sequences and the forty-six Pair with IP host sequences
 of `direct-host.json` (with its `before_msg_a` section) with the supplied
 random draws, and compare the resulting messages and host events byte for
 byte. The two kind-3 CPace runs (`pairing_runs`) are rebuilt from their

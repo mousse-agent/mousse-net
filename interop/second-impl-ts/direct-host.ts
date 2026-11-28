@@ -61,7 +61,7 @@ export type DirectEffect =
       reason: 'enrolled' | 'declined' | 'cancelled' | 'dismissed' | 'window_ended' } }
   | { enrolled: { conn: number; grant: number; identity: string; role: string } }
   | { bound: { conn: number; grant: number; provisional: boolean } }
-  | { committed: { conn: number; grant: number; identity: string } }
+  | { committed: { conn: number; grant: number; identity: string; bound: number[] } }
   | { enrollment_undone: { grant: number; identity: string } }
   | { grant_closes: { grant: number; code: ErrorName; conns: number[] } }
   | { invitation_ended: { invitation: string; code: ErrorName } };
@@ -201,7 +201,7 @@ export class DirectHost {
   // Whether the invitation still takes anything: lookups, attempts, or a request's Allow or recovery.
   private takesAnything(invitation: Invitation, now: number) {
     return invitation.status === 'allowed' ||
-      (invitation.status === 'open' && (now < invitation.expiresAt || invitation.requests.size > 0));
+      (invitation.status === 'open' && (now < invitation.expiresAt || this.waiting(invitation, now)));
   }
 
   // A request may be answered and claimed until its Allow window ends, whether or not the timer has run.
@@ -331,10 +331,15 @@ export class DirectHost {
     return false;
   }
 
+  // A request inside its Allow window, whether or not the timer has run.
+  private waiting(invitation: Invitation, now: number) {
+    return [...invitation.requests.values()].some(request => this.inWindow(request, now));
+  }
+
   // No attempts left, none running and no request inside its Allow window: the invitation ends.
-  private settle(invitation: Invitation): DirectEffect[] {
+  private settle(invitation: Invitation, now: number): DirectEffect[] {
     if (invitation.status !== 'open' || invitation.attemptsLeft > 0 || this.running(invitation) ||
-        invitation.requests.size > 0) return [];
+        this.waiting(invitation, now)) return [];
     return this.end(invitation, 'attempts_exhausted');
   }
 
@@ -349,12 +354,13 @@ export class DirectHost {
   private enroll(invitation: Invitation, request: Request, conn: number, now: number, role: string): DirectEffect[] {
     const connection = this.connections.get(conn)!;
     const output: DirectEffect[] = [];
-    // A provisional grant another direct invitation made for this identity is removed.
+    // Making it never closes the connection it is made on: detach that connection from any grant first.
+    this.unbind(conn, connection);
+    // A provisional grant another direct invitation made for this identity is removed; its connections close.
     const replaced = this.provisional.get(request.identity);
     if (replaced) {
       this.provisional.delete(request.identity);
-      output.push({ enrollment_undone: { grant: replaced.id, identity: replaced.identity } },
-        ...this.grantCloses(replaced, 'grant_revoked'));
+      output.push(...this.grantCloses(replaced, 'grant_revoked'));
     }
     const grant: DirectGrant = { id: this.nextGrant++, identity: request.identity, role,
       expires_at: invitation.policy.grantExpiresAt, enrolled_by: invitation.key,
@@ -398,9 +404,9 @@ export class DirectHost {
   /** Commit a provisional grant (10.9 "Provisional grant"); the first stream frame waits for it. */
   private commit(conn: number, grant: DirectGrant, now: number): DirectEffect[] {
     if (this.denials.has(grant.identity) || !live(grant, now)) {
+      // The grant's other connections close first, then the committing one, with GRANT_REVOKED (8.1).
       this.provisional.delete(grant.identity);
-      return [{ enrollment_undone: { grant: grant.id, identity: grant.identity } },
-        ...this.grantCloses(grant, 'grant_revoked')];
+      return [...this.grantCloses(grant, 'grant_revoked', conn), ...this.close(conn, 'grant_revoked')];
     }
     const output: DirectEffect[] = [];
     const old = this.grants.get(grant.identity);
@@ -410,7 +416,8 @@ export class DirectHost {
     }
     this.provisional.delete(grant.identity);
     this.grants.set(grant.identity, grant);
-    output.push({ committed: { conn, grant: grant.id, identity: grant.identity } });
+    // Every connection bound to it is now live as any other (8.1).
+    output.push({ committed: { conn, grant: grant.id, identity: grant.identity, bound: [...grant.bound_connections] } });
     return output;
   }
 
@@ -445,7 +452,7 @@ export class DirectHost {
       request.conn = undefined;
       output.push(this.prompt(invitation, request));
     }
-    return [...output, ...this.settle(invitation)];
+    return [...output, ...this.settle(invitation, now)];
   }
 
   drop(conn: number, now: number): DirectEffect[] { return this.lost(conn, now); }
@@ -459,13 +466,6 @@ export class DirectHost {
         connection.closed = true;
         output.push({ conn: id, close: code });
       }
-    }
-    // A provisional grant is removed at its expiry.
-    for (const grant of [...this.provisional.values()]) {
-      if (live(grant, now)) continue;
-      this.provisional.delete(grant.identity);
-      output.push({ enrollment_undone: { grant: grant.id, identity: grant.identity } },
-        ...this.grantCloses(grant, 'grant_revoked'));
     }
     for (const invitation of this.invitations.values()) {
       for (const [identity, outcome] of invitation.outcomes) if (now >= outcome.until) invitation.outcomes.delete(identity);
@@ -482,7 +482,7 @@ export class DirectHost {
         }
         if (invitation.requests.size === 0) output.push(...this.end(invitation, 'invitation_invalid'));
       } else if (invitation.status === 'open') {
-        output.push(...this.settle(invitation));
+        output.push(...this.settle(invitation, now));
       } else if (invitation.status === 'allowed' && invitation.requests.size === 0) {
         output.push(...this.end(invitation, 'invitation_invalid'));
       }
@@ -490,6 +490,14 @@ export class DirectHost {
       if (!this.isOpen(invitation) && invitation.outcomes.size === 0) {
         invitation.status = 'gone';
         invitation.passed.clear();
+      }
+    }
+    // Then the grant table: a grant, committed or provisional, is removed at its expiry; its connections close.
+    for (const table of [this.grants, this.provisional]) {
+      for (const grant of [...table.values()]) {
+        if (live(grant, now)) continue;
+        table.delete(grant.identity);
+        output.push(...this.grantCloses(grant, 'grant_revoked'));
       }
     }
     return output;
@@ -561,7 +569,8 @@ export class DirectHost {
   /** The joiner opens a stream on conn: the gate's verdict, and "commit first" while provisional. */
   stream(conn: number, now: number): DirectEffect[] {
     const connection = this.connections.get(conn);
-    if (!connection || connection.closed) return [{ ignored: true }];
+    // A closed connection, or one in the miss hold, lets no stream frame through and commits nothing.
+    if (!connection || connection.closed || connection.held) return [{ stream: { conn, verdict: 'ignore' } }];
     const verdict = this.gateCheck(connection, 'stream');
     if (verdict === 'commit') {
       const output: DirectEffect[] = [{ stream: { conn, verdict } },
@@ -662,29 +671,34 @@ export class DirectHost {
     if (!invitation || invitation.status === 'gone' || invitation.code.lookup !== msg.lookup) {
       return this.missHold(conn, connection);
     }
-    // 3. A kept outcome for this identity.
-    const outcome = invitation.outcomes.get(connection.identity);
-    if (outcome && now < outcome.until) return this.close(conn, outcome.code);
     const found = invitation.requests.get(connection.identity);
     const request = found && this.inWindow(found, now) ? found : undefined;
-    // 4. The cancel flag.
+    // From here on, with the cancel flag: retire this identity's attempts and pairing connections first,
+    // whatever the answer, so a confirmation on its way opens nothing.
+    const retired: DirectEffect[] = [];
     if (msg.cancel) {
-      if (!this.takesAnything(invitation, now)) return this.missHold(conn, connection);
-      const output: DirectEffect[] = [];
-      // Retire this identity's attempts and pairing connections first: a confirmation on its way opens nothing.
       for (const [id, other] of this.connections) {
         if (id === conn || other.closed || other.identity !== connection.identity ||
             other.invitation !== invitation.key || other.gate.state !== 'join_only') continue;
-        if (request?.conn === id) request.conn = undefined;
-        output.push(...this.close(id, 'cancelled'));
+        if (found?.conn === id) found.conn = undefined;
+        retired.push(...this.close(id, 'cancelled'));
       }
+    }
+    // 3. A kept outcome for this identity.
+    const outcome = invitation.outcomes.get(connection.identity);
+    if (outcome && now < outcome.until) return [...retired, ...this.close(conn, outcome.code)];
+    // 4. The cancel flag.
+    if (msg.cancel) {
+      if (!this.takesAnything(invitation, now)) return [...retired, ...this.missHold(conn, connection)];
+      const output = retired;
       if (request) output.push(...this.cancelRequest(invitation, request));
-      return [...output, ...this.close(conn, 'cancelled'), ...this.settle(invitation)];
+      return [...output, ...this.close(conn, 'cancelled'), ...this.settle(invitation, now)];
     }
     // 5. Its request is allowed: enroll on this connection (the claim checks what can fail first).
     if (request && request.decision === 'allowed' && invitation.status === 'allowed') {
       if (this.refusal(request.identity, invitation, now)) {
-        return [...this.end(invitation, 'invitation_invalid'), ...this.close(conn, 'invitation_invalid')];
+        // Nothing is sent before the close; then the invitation ends.
+        return [...this.close(conn, 'invitation_invalid'), ...this.end(invitation, 'invitation_invalid')];
       }
       return [...this.admit(conn, connection, invitation, msg.name), this.ended(invitation, request, 'enrolled'),
         ...this.enroll(invitation, request, conn, now, request.role),
@@ -723,13 +737,13 @@ export class DirectHost {
       try {
         responder.finish(msg.payload).isk.fill(0);
       } catch {
-        return [abort, ...this.settle(invitation)];
+        return [abort, ...this.settle(invitation, now)];
       }
       return this.passed(conn, connection, invitation, now);
     }
     if (!this.takesAttempts(invitation, now)) return this.close(conn, 'invitation_invalid');
     if (attempt) return this.close(conn, 'protocol_error');
-    if (invitation.attemptsLeft === 0) return [...this.close(conn, 'attempts_exhausted'), ...this.settle(invitation)];
+    if (invitation.attemptsLeft === 0) return [...this.close(conn, 'attempts_exhausted'), ...this.settle(invitation, now)];
     invitation.attemptsLeft--;
     const output: DirectEffect[] = [{ attempts_left: { invitation: invitation.key, left: invitation.attemptsLeft } }];
     connection.attempt = { id: Uint8Array.from(msg.attempt) };
@@ -741,7 +755,7 @@ export class DirectHost {
       output.push(send(conn, { type: 'CODE_EXCHANGE', attempt: msg.attempt, payload: responder.message }));
     } catch (error) {
       if (!['Malformed', 'InvalidPoint'].includes((error as Error).message)) throw error;
-      output.push(abort, ...this.settle(invitation));
+      output.push(abort, ...this.settle(invitation, now));
     } finally { inputs.prs.fill(0); }
     return output;
   }
@@ -780,7 +794,7 @@ export class DirectHost {
     }
     if (!attempt.responder) return [];
     this.stopAttempt(connection);
-    return this.settle(invitation);
+    return this.settle(invitation, now);
   }
 
   snapshot(invitationId: Uint8Array) {

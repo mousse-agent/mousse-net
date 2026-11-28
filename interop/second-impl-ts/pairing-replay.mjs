@@ -492,7 +492,7 @@ function directParties(conventions, draws) {
     }
     return joiners.get(label);
   };
-  return { host, hostKey, hostDraws, joinerOf, joiners, labels };
+  return { host, hostKey, hostDraws, joinerOf, joiners, labels, policy };
 }
 
 // One step's I/O: every message each side sent (no HELLOs), host closes and host events.
@@ -535,8 +535,8 @@ function directWire(host, labels, now, conns) {
         const { grant, identity } = effect.enrollment_undone;
         out.push({ enrollment_undone: { grant, joiner: label(identity) } });
       } else if ('committed' in effect) {
-        const { conn, grant, identity } = effect.committed;
-        out.push({ committed: { conn, grant, joiner: label(identity) } });
+        const { bound, conn, grant, identity } = effect.committed;
+        out.push({ committed: { bound, conn, grant, joiner: label(identity) } });
       } else if ('grant_closes' in effect) {
         // Grant-table closes are listed as one event, not in `closed`.
         out.push(effect);
@@ -615,8 +615,10 @@ function directAttempt(wire, conn, code, invitation, hostKey, lose, hold) {
 }
 
 export function replayDirectSequence(sequence, conventions) {
-  const { host, hostKey, hostDraws, joinerOf, joiners, labels } = directParties(conventions, sequence.draws);
-  const created = host.invite(conventions.time);
+  const { host, hostKey, hostDraws, joinerOf, joiners, labels, policy } = directParties(conventions, sequence.draws);
+  // `grant_expires_at` (seconds after conventions.time) sets the invitation's grant expiry.
+  const created = host.invite(conventions.time, sequence.grant_expires_at === undefined ? policy
+    : { ...policy, grantExpiresAt: conventions.time + sequence.grant_expires_at });
   assert.equal(hex(created.invitation), sequence.invitation);
   assert.equal(displayDirectCode(created.code), sequence.code);
   const code = directCode(created.code);
@@ -665,6 +667,11 @@ export function replayDirectSequence(sequence, conventions) {
         connection.heldMessage = undefined;
         if (connection.closed) wire.out.push({ undelivered: { conn: step.conn } });
         else wire.toHost(step.joiner, step.conn, message);
+        break;
+      }
+      case 'abort': {
+        const attempt = bytes(step.attempt);
+        wire.toHost(step.joiner, step.conn, { type: 'CODE_ABORT', attempt, code: errorNumber(step.code) });
         break;
       }
       case 'inject': {
@@ -726,7 +733,8 @@ export function replayDirectSequence(sequence, conventions) {
         assert.fail(`unknown operation ${step.op}`);
     }
     assert.deepEqual(wire.out, step.out, `${name} out`);
-    assert.deepEqual(wire.closed, step.closed ?? [], `${name} closed`);
+    // `closed` is listed by connection, not in close order.
+    assert.deepEqual([...wire.closed].sort(([x], [y]) => x - y), step.closed ?? [], `${name} closed`);
     assert.deepEqual(wire.held, step.held ?? [], `${name} held`);
     const snapshot = host.snapshot(invitation);
     const order = (x, y) => {
