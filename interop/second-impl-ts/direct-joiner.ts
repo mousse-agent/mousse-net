@@ -131,7 +131,9 @@ export type DirectJoinerEffect =
   | { close: ErrorName; conn: number }
   | { persist_ledger: { expected: string | null; record: string | null } }
   | { persist_pending: { expected: string | null; record: string | null } }
-  | { joiner: DirectJoinerEvent };
+  | { joiner: DirectJoinerEvent }
+  // The app's first stream on the paired connection (it commits the host's provisional grant).
+  | { stream: number };
 
 export type DirectJoinerState = 'ready' | 'hello' | 'joining' | 'exchanging' | 'recovering' |
   'awaiting_allow' | 'away' | `ended:${string}`;
@@ -147,6 +149,8 @@ interface Connection {
   exporter: Uint8Array;
   open: boolean;
   recovery: boolean;
+  // A recovery whose JOIN_DIRECT carried the cancel flag.
+  cancelling?: boolean;
   // The attempt this connection ran: its id stays for a cancel after the code passed.
   attempt?: { id: Uint8Array; initiator?: ReturnType<typeof initiate> };
 }
@@ -167,6 +171,8 @@ export class DirectJoiner {
   private pending?: DirectPending;
   private invitation?: Uint8Array;
   private connection?: Connection;
+  // The connection the flow ended paired on, live, until the app opens its first stream there.
+  private paired_?: Connection;
 
   private constructor(context: DirectJoinerContext, lookup: string, address: string, code: DirectCode | undefined,
     ledgerBytes: Uint8Array | undefined, pendingBytes: Uint8Array | undefined, pending: DirectPending | undefined) {
@@ -333,6 +339,7 @@ export class DirectJoiner {
     }
     const pending = this.pending!;
     connection.gate.sentJoinProof(0);
+    connection.cancelling = pending.cancelled;
     this.state = 'recovering';
     return [{ conn: connection.id, send: { type: 'JOIN_DIRECT', lookup: this.lookup, name,
       receipt: pending.invitation, ...(pending.cancelled ? { cancel: true } : {}) } }];
@@ -419,10 +426,11 @@ export class DirectJoiner {
     return [{ joiner: 'code_passed' }];
   }
 
-  // Step 7: PAIRED, only after the host's confirmation verified (or on a recovery), never once cancelled.
+  // Step 7: PAIRED, only after the host's confirmation verified (or on a recovery), never once cancelled,
+  // except as the settling answer to the recovery that carries the cancel flag (the grant committed first).
   private paired(connection: Connection, msg: Extract<Control, { type: 'PAIRED' }>): DirectJoinerEffect[] {
     const pending = this.pending;
-    if (pending?.cancelled) return [];
+    if (pending?.cancelled && !(connection.recovery && connection.cancelling)) return [];
     const expected = connection.recovery ? this.state === 'recovering' || this.state === 'awaiting_allow'
       : this.state === 'awaiting_allow';
     if (!pending || !expected) return this.fail('protocol_error');
@@ -438,11 +446,29 @@ export class DirectJoiner {
     this.pending = undefined;
     // The connection is live and stays up; the flow is done with it.
     this.connection = undefined;
+    this.paired_ = connection;
     return [...effects, ...this.end('paired')];
+  }
+
+  /** Once paired, the app opens its first stream on that connection if it is still up; none before. */
+  openStream(): DirectJoinerEffect[] {
+    const connection = this.paired_;
+    if (!connection?.open || !connection.gate.canOpenStream('caller')) return [];
+    connection.gate.openedStream('caller');
+    this.paired_ = undefined;
+    return [{ stream: connection.id }];
+  }
+
+  // The paired connection ended before the app opened a stream on it.
+  private pairedGone(id: number) {
+    if (this.paired_?.id !== id) return;
+    this.paired_.open = false;
+    this.paired_ = undefined;
   }
 
   /** The host closed connection `id` (its GOAWAY). */
   hostClosed(id: number, code: ErrorName): DirectJoinerEffect[] {
+    this.pairedGone(id);
     const connection = this.connection;
     if (!connection || connection.id !== id || !connection.open || this.ended) return [];
     connection.gate.close(code);
@@ -457,6 +483,7 @@ export class DirectJoiner {
 
   /** Connection `id` broke. */
   broken(id: number): DirectJoinerEffect[] {
+    this.pairedGone(id);
     const connection = this.connection;
     if (!connection || connection.id !== id || !connection.open || this.ended) return [];
     connection.gate.close('no_error');

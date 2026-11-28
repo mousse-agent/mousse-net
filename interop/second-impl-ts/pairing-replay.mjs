@@ -896,6 +896,9 @@ export function replayDirectJoinerSequence(sequence, conventions) {
           out.push({ close: { code: 'invitation_invalid', conn, from: party.label } });
           party.host.lost(conn, now);
           queue.push({ conn, close: 'invitation_invalid' });
+        } else if ('committed' in effect) {
+          const { conn, grant } = effect.committed;
+          out.push({ committed: { conn, grant } });
         }
       }
     }
@@ -935,7 +938,16 @@ export function replayDirectJoinerSequence(sequence, conventions) {
           out.push({ close: { code: effect.close, conn: effect.conn, from: 'joiner' } });
           const party = conns.get(effect.conn)?.party;
           if (party) fromHost(party, party.host.lost(effect.conn, now, effect.close));
-        } else out.push(effect);
+        } else if ('stream' in effect) {
+          // The app's first stream frame reaches the host's gate.
+          out.push(effect);
+          const { party } = conns.get(effect.stream);
+          fromHost(party, party.host.stream(effect.stream, now));
+        } else {
+          out.push(effect);
+          // Paired with the connection still up: the app opens its first stream on it.
+          if (effect.joiner?.ended === 'paired') fromJoiner(flow.openStream());
+        }
       }
     }
 
@@ -1035,13 +1047,16 @@ export function replayDirectJoinerSequence(sequence, conventions) {
     };
     const ledger = stored('ledger');
     const pending = stored('pending');
-    const grant = real.host.grants.get(hex(joinerIdentity));
+    // A grant this direct invitation made for the joiner: committed, provisional, or none.
+    const made = grant => grant?.direct && grant.enrolled_by === hex(real.invitation);
+    const granted = made(real.host.grants.get(hex(joinerIdentity))) ? 'committed'
+      : made(real.host.provisional.get(hex(joinerIdentity))) ? 'provisional' : null;
     const actual = {
       state: flow?.state,
       ledger: ledger === null ? null : Number(ledger.get(3n)),
       pending: pending === null ? null : pending.get(7n) === 1n ? 'cancelled' : 'pending',
       pinned: store.pins.size > 0,
-      granted: grant?.enrolled_by === hex(real.invitation),
+      granted,
       result,
     };
     for (const key of Object.keys(actual)) {

@@ -11,7 +11,8 @@ stream frame, the host gate's "commit first" and cancel exception of
 wire.md 8.1, and recovery), runs the joiner side
 (`direct-joiner.ts`: the typed address and code, the attempt ledger and
 the pending record with their compare-and-swap writes, first contact,
-recovery and cancel), and runs the caller's
+recovery and cancel, and the first stream once paired, which commits the
+host's provisional grant), and runs the caller's
 pairing-only gate (wire.md 8.2). A TLS transport supplies the peer identity and the two TLS
 exporters. The package issues and verifies session certificates,
 signs and verifies TLS CertificateVerify bytes, and checks the negotiated

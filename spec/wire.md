@@ -1749,9 +1749,11 @@ and the flow ends.
    it has cancelled (except as the answer to its cancelling recovery,
    below). It then stores the pin, the typed address as an owner route and
    a completion record keyed by `I`, makes the connection live (8.2,
-   pairing only), and only then deletes the pending record. Its first
-   stream frame on a connection to the host commits the host's provisional
-   grant (8.1); it opens none before this point.
+   pairing only), and only then deletes the pending record. It opens no
+   stream before this point. Its first stream frame on a connection to the
+   host commits the host's provisional grant (8.1); when it opens one is up
+   to the application (`direct-joiner.json` has it open one at once on the
+   pairing connection).
 
 **Ends that settle a pending record.** A close by the host with
 `PAIRING_DECLINED`, `CANCELLED`, `INVITATION_INVALID` or
