@@ -51,3 +51,47 @@ control = [
   { name = "direct-done-pin-only", breaks = "the joiner stores the pin with no completion record for join.status", env = { RUSTFLAGS = '--cfg mousse_control="direct-done-pin-only"' } },
   { name = "direct-approval-per-connection", breaks = "an approval request gets a new id when its device comes back", env = { RUSTFLAGS = '--cfg mousse_control="direct-approval-per-connection"' } },
 ]
+
+[[check]]
+id = "pair-with-ip.sim"
+title = "Simulator: Pair with IP over many seeds (wrong codes, Allow connected and away, a cancel crossing Allow, decline, expiry, faults, host restart, two joiners)"
+plan = "docs/pair-with-ip-design.md §7 (phase 2, sim drills)"
+targets = ["windows-x64"]
+judge = "marker"
+pass_marker = "PASS sim pairing-direct"
+fail_marker = "FAIL sim pairing-direct"
+
+[[check.local]]
+target = "windows-x64"
+host = "windows-x86_64"
+command = ["cargo", "run", "--release", "-p", "mousse-sim", "--", "run", "pairing-direct", "--seeds", "1000"]
+
+[[check.control]]
+name = "direct-auto-allow"
+breaks = "the simulated host answers each new approval prompt with Allow itself, without the owner"
+args = ["--bug", "direct-auto-allow"]
+
+[[check.control]]
+name = "direct-lost-close"
+breaks = "the simulated host misses a connection's close, so Allow enrolls a device with no live connection"
+args = ["--bug", "direct-lost-close"]
+
+[[check.control]]
+name = "direct-drop-cancel"
+breaks = "the simulated host drops the joiner's cancel on an enrolled connection"
+args = ["--bug", "direct-drop-cancel"]
+
+[[check.control]]
+name = "direct-pin-on-code-passed"
+breaks = "the simulated joiner pins the host as soon as the code passes, before the owner allowed"
+args = ["--bug", "direct-pin-on-code-passed"]
+
+[[check.control]]
+name = "direct-ledger-ignored"
+breaks = "the simulated joiner loads its records without the attempt ledger and stores each debit over the old one"
+args = ["--bug", "direct-ledger-ignored"]
+
+[[check.control]]
+name = "direct-debit-after-send"
+breaks = "the simulated joiner stores a debit only after the attempt's first share went out"
+args = ["--bug", "direct-debit-after-send"]
