@@ -64,7 +64,8 @@ export type DirectEffect =
   | { committed: { conn: number; grant: number; identity: string; bound: number[] } }
   | { enrollment_undone: { grant: number; identity: string } }
   | { grant_closes: { grant: number; code: ErrorName; conns: number[] } }
-  | { invitation_ended: { invitation: string; code: ErrorName } };
+  | { invitation_ended: { invitation: string; code: ErrorName } }
+  | { proof_timeout: number };
 
 /** A grant-table entry: a committed grant, or a provisional one (wire.md 10.9). */
 export interface DirectGrant extends Grant {
@@ -84,6 +85,8 @@ interface Request {
   name: string;
   role: string;
   firstPassed: number;
+  // The attempt that passed; a recovery that moves the request keeps it.
+  passed?: Uint8Array;
   conn?: number;
   decision: Decision;
 }
@@ -114,6 +117,8 @@ interface Connection {
   closed: boolean;
   held: boolean;
   sentJoin: boolean;
+  // When the gate opened, in ms: its join-proof timer counts from here.
+  openedAt: number;
   invitation?: string;
   name?: string;
   attempt?: Attempt;
@@ -239,7 +244,7 @@ export class DirectHost {
     const grant = denied ? undefined : live(this.provisional.get(identity), now) ?? live(this.grants.get(identity), now);
     const gate = new Gate('host', denied ? 'close:not_authorized' : grant ? 'live' : 'await_join_proof', now * 1000);
     const connection: Connection = { gate, peer, identity, exporters, tcp: transport === 'tcp',
-      closed: false, held: false, sentJoin: false };
+      closed: false, held: false, sentJoin: false, openedAt: now * 1000 };
     this.connections.set(conn, connection);
     const output: DirectEffect[] = [send(conn, directHello)];
     if (denied) {
@@ -354,14 +359,6 @@ export class DirectHost {
   private enroll(invitation: Invitation, request: Request, conn: number, now: number, role: string): DirectEffect[] {
     const connection = this.connections.get(conn)!;
     const output: DirectEffect[] = [];
-    // Making it never closes the connection it is made on: detach that connection from any grant first.
-    this.unbind(conn, connection);
-    // A provisional grant another direct invitation made for this identity is removed; its connections close.
-    const replaced = this.provisional.get(request.identity);
-    if (replaced) {
-      this.provisional.delete(request.identity);
-      output.push(...this.grantCloses(replaced, 'grant_revoked'));
-    }
     const grant: DirectGrant = { id: this.nextGrant++, identity: request.identity, role,
       expires_at: invitation.policy.grantExpiresAt, enrolled_by: invitation.key,
       authorizing_owner: invitation.policy.authorizingOwner, bound_connections: [], granted_at: now,
@@ -372,11 +369,25 @@ export class DirectHost {
     connection.gate.promote();
     this.bind(conn, connection, grant);
     connection.enrolled = grant.id;
-    if (connection.attempt && !connection.attempt.responder) connection.enrolledAttempt = connection.attempt.id;
+    // The cancel exception holds for the attempt that passed, when it passed on this connection.
+    if (connection.attempt && !connection.attempt.responder && request.passed &&
+        equalBytes(connection.attempt.id, request.passed)) connection.enrolledAttempt = connection.attempt.id;
     this.stopAttempt(connection);
     output.push({ enrolled: { conn, grant: grant.id, identity: request.identity, role } },
       send(conn, { type: 'PAIRED', name: this.endpoint.name, role }));
     return output;
+  }
+
+  // Before a new provisional grant is made: detach the connection it is made on from any grant (it is never
+  // closed), then remove an older provisional grant of the identity: its connections close, then the removal is
+  // reported, also when no connection was bound.
+  private replaceProvisional(identity: string, conn: number): DirectEffect[] {
+    this.unbind(conn, this.connections.get(conn)!);
+    const replaced = this.provisional.get(identity);
+    if (!replaced) return [];
+    this.provisional.delete(identity);
+    return [...this.grantCloses(replaced, 'grant_revoked'),
+      { enrollment_undone: { grant: replaced.id, identity: replaced.identity } }];
   }
 
   // Remove a provisional grant (the joiner's cancel): the cancelling connection closes with CANCELLED.
@@ -406,7 +417,8 @@ export class DirectHost {
     if (this.denials.has(grant.identity) || !live(grant, now)) {
       // The grant's other connections close first, then the committing one, with GRANT_REVOKED (8.1).
       this.provisional.delete(grant.identity);
-      return [...this.grantCloses(grant, 'grant_revoked', conn), ...this.close(conn, 'grant_revoked')];
+      return [...this.grantCloses(grant, 'grant_revoked', conn),
+        { enrollment_undone: { grant: grant.id, identity: grant.identity } }, ...this.close(conn, 'grant_revoked')];
     }
     const output: DirectEffect[] = [];
     const old = this.grants.get(grant.identity);
@@ -459,14 +471,6 @@ export class DirectHost {
 
   tick(now: number): DirectEffect[] {
     const output: DirectEffect[] = [];
-    for (const [id, connection] of this.connections) {
-      if (connection.closed || connection.sentJoin) continue;
-      const code = connection.gate.timeout(now * 1000);
-      if (code) {
-        connection.closed = true;
-        output.push({ conn: id, close: code });
-      }
-    }
     for (const invitation of this.invitations.values()) {
       for (const [identity, outcome] of invitation.outcomes) if (now >= outcome.until) invitation.outcomes.delete(identity);
       for (const request of [...invitation.requests.values()]) {
@@ -492,15 +496,35 @@ export class DirectHost {
         invitation.passed.clear();
       }
     }
-    // Then the grant table: a grant, committed or provisional, is removed at its expiry; its connections close.
+    // Then the grant table: committed grants, then provisional ones, each in grant id order, are removed at
+    // their expiry, their connections closing; then each expired provisional grant's removal is reported.
+    const removed: DirectGrant[] = [];
     for (const table of [this.grants, this.provisional]) {
-      for (const grant of [...table.values()]) {
+      for (const grant of [...table.values()].sort((x, y) => x.id - y.id)) {
         if (live(grant, now)) continue;
         table.delete(grant.identity);
         output.push(...this.grantCloses(grant, 'grant_revoked'));
+        if (table === this.provisional) removed.push(grant);
       }
     }
+    for (const grant of removed) output.push({ enrollment_undone: { grant: grant.id, identity: grant.identity } });
     return output;
+  }
+
+  // The 10 s wait for a JOIN_PROOF (section 8, step 2); it stops for a connection in the miss hold.
+  private proofTimers(elapsed: (connection: Connection) => number): DirectEffect[] {
+    const output: DirectEffect[] = [];
+    for (const [id, connection] of this.connections) {
+      if (connection.closed || connection.held) continue;
+      const code = connection.gate.timeout(connection.openedAt + elapsed(connection));
+      if (code) output.push({ proof_timeout: id }, ...this.close(id, code));
+    }
+    return output;
+  }
+
+  /** Every gate's join-proof timer runs `ms` milliseconds after its gate opened. */
+  gateTimer(ms: number): DirectEffect[] {
+    return this.proofTimers(() => ms);
   }
 
   private request(invitationId: Uint8Array, identity: Uint8Array, now: number) {
@@ -527,7 +551,7 @@ export class DirectHost {
     }
     // 10.8: enroll and send PAIRED, then end the other requests and close the other connections.
     const conn = request.conn;
-    const effects = [this.ended(invitation, request, 'enrolled'),
+    const effects = [...this.replaceProvisional(request.identity, conn), this.ended(invitation, request, 'enrolled'),
       ...this.enroll(invitation, request, conn, now, role ?? request.role),
       ...this.dismissOthers(invitation, 'invitation_invalid', request)];
     return { result: 'ok', effects };
@@ -686,7 +710,10 @@ export class DirectHost {
     }
     // 3. A kept outcome for this identity.
     const outcome = invitation.outcomes.get(connection.identity);
-    if (outcome && now < outcome.until) return [...retired, ...this.close(conn, outcome.code)];
+    if (outcome && now < outcome.until) {
+      // With the cancel flag, an invitation its retirements leave with nothing to take then ends, as in 4.
+      return [...retired, ...this.close(conn, outcome.code), ...(msg.cancel ? this.settle(invitation, now) : [])];
+    }
     // 4. The cancel flag.
     if (msg.cancel) {
       if (!this.takesAnything(invitation, now)) return [...retired, ...this.missHold(conn, connection)];
@@ -700,7 +727,8 @@ export class DirectHost {
         // Nothing is sent before the close; then the invitation ends.
         return [...this.close(conn, 'invitation_invalid'), ...this.end(invitation, 'invitation_invalid')];
       }
-      return [...this.admit(conn, connection, invitation, msg.name), this.ended(invitation, request, 'enrolled'),
+      return [...this.admit(conn, connection, invitation, msg.name),
+        ...this.replaceProvisional(request.identity, conn), this.ended(invitation, request, 'enrolled'),
         ...this.enroll(invitation, request, conn, now, request.role),
         ...this.dismissOthers(invitation, 'invitation_invalid', request)];
     }
@@ -764,8 +792,10 @@ export class DirectHost {
   private passed(conn: number, connection: Connection, invitation: Invitation, now: number): DirectEffect[] {
     invitation.passed.add(connection.identity);
     const output: DirectEffect[] = [];
+    const attempt = Uint8Array.from(connection.attempt!.id);
     const existing = invitation.requests.get(connection.identity);
     if (existing) {
+      existing.passed = attempt;
       const old = existing.conn;
       existing.conn = conn;
       if (old !== undefined && old !== conn) output.push(...this.close(old, 'path_replaced'));
@@ -774,7 +804,7 @@ export class DirectHost {
     }
     invitation.outcomes.delete(connection.identity);
     const request: Request = { id: this.nextRequest++, identity: connection.identity, name: connection.name!,
-      role: invitation.policy.role, firstPassed: now, conn, decision: 'pending' };
+      role: invitation.policy.role, firstPassed: now, passed: attempt, conn, decision: 'pending' };
     invitation.requests.set(request.identity, request);
     return [this.prompt(invitation, request)];
   }
@@ -784,15 +814,16 @@ export class DirectHost {
     // Cancel crossing Allow: the provisional grant enrolled here after this attempt passed.
     const enrolled = this.enrolledProvisional(connection);
     if (enrolled) return msg.code === errorNumber('cancelled') ? this.undo(enrolled, conn) : [];
-    const attempt = connection.attempt;
-    if (!attempt || !equalBytes(attempt.id, msg.attempt)) return [];
     const invitation = this.invitations.get(connection.invitation!)!;
+    // Only the attempt that passed, the one the request remembers, ends a waiting request.
     const request = [...invitation.requests.values()].find(r => r.conn === conn);
-    if (msg.code === errorNumber('cancelled') && request) {
+    if (msg.code === errorNumber('cancelled') && request?.passed && equalBytes(request.passed, msg.attempt)) {
       request.conn = undefined;
       return [...this.cancelRequest(invitation, request), ...this.close(conn, 'cancelled')];
     }
-    if (!attempt.responder) return [];
+    // An abort of an attempt merely running here stops that attempt and nothing else.
+    const attempt = connection.attempt;
+    if (!attempt || !equalBytes(attempt.id, msg.attempt) || !attempt.responder) return [];
     this.stopAttempt(connection);
     return this.settle(invitation, now);
   }

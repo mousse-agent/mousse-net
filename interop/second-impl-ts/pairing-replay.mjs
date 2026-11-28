@@ -617,12 +617,12 @@ function directAttempt(wire, conn, code, invitation, hostKey, lose, hold) {
 export function replayDirectSequence(sequence, conventions) {
   const { host, hostKey, hostDraws, joinerOf, joiners, labels, policy } = directParties(conventions, sequence.draws);
   // `grant_expires_at` (seconds after conventions.time) sets the invitation's grant expiry.
-  const created = host.invite(conventions.time, sequence.grant_expires_at === undefined ? policy
-    : { ...policy, grantExpiresAt: conventions.time + sequence.grant_expires_at });
-  assert.equal(hex(created.invitation), sequence.invitation);
-  assert.equal(displayDirectCode(created.code), sequence.code);
-  const code = directCode(created.code);
-  const invitation = created.invitation;
+  const invitePolicy = sequence.grant_expires_at === undefined ? policy
+    : { ...policy, grantExpiresAt: conventions.time + sequence.grant_expires_at };
+  const created = host.invite(conventions.time, invitePolicy);
+  // Every invitation of the sequence (the first is 0); later ops act on the one in use.
+  const invitations = [{ invitation: created.invitation, code: directCode(created.code) }];
+  let { invitation, code } = invitations[0];
   const conns = new Map();
   let now = conventions.time;
   const label = identity => labels.get(identity) ?? identity;
@@ -670,10 +670,26 @@ export function replayDirectSequence(sequence, conventions) {
         break;
       }
       case 'abort': {
-        const attempt = bytes(step.attempt);
+        // `last`: the joiner's last attempt.
+        const attempt = step.attempt === 'last' ? joiner.attempt : bytes(step.attempt);
         wire.toHost(step.joiner, step.conn, { type: 'CODE_ABORT', attempt, code: errorNumber(step.code) });
         break;
       }
+      case 'invite': {
+        // Another invitation with the same parameters, from the host's draws.
+        const another = host.invite(now, invitePolicy);
+        invitations.push({ invitation: another.invitation, code: directCode(another.code) });
+        ({ invitation, code } = invitations.at(-1));
+        wire.out.push({ invited: invitations.length - 1 });
+        break;
+      }
+      case 'use':
+        assert.ok(step.invitation in invitations, `${name}: no invitation ${step.invitation}`);
+        ({ invitation, code } = invitations[step.invitation]);
+        break;
+      case 'gate_timer':
+        wire.fromHost(host.gateTimer(step.ms));
+        break;
       case 'inject': {
         const attempt = bytes(step.attempt);
         joiner.attempt = attempt;
@@ -755,6 +771,10 @@ export function replayDirectSequence(sequence, conventions) {
       if (key in step) assert.deepEqual(actual[key], step[key], `${name} ${key}`);
     }
   }
+  // The sequence's `invitation` and `code` are those of its last invitation.
+  const last = invitations.at(-1);
+  assert.equal(hex(last.invitation), sequence.invitation);
+  assert.equal(displayDirectCode(last.code.code), sequence.code);
   for (const { draws } of joiners.values()) draws.done();
   hostDraws.done();
 }
