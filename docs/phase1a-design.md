@@ -180,8 +180,14 @@ and a final write stalled on credit with FIN queued behind it.
   - With up to 1,024 peer streams (`MAX_PEER_STREAMS`), that is 256 MiB per
     connection, which app credit cannot bound.
   - E2 therefore caps open streams at 32 per connection (both directions
-    counted) and 128 per helper. That keeps initial credit at or below
-    8 MiB per connection and 32 MiB per helper.
+    counted) and 128 per helper. Bot streams (`mousse.botsub`,
+    `mousse.botrpc`, `mousse.botview`) have places of their own, 16 per
+    connection and 64 per helper, and engine streams 4 per connection.
+    That keeps initial credit at or below 13 MiB per connection (52
+    streams) and 48 MiB per helper for app and bot streams (192 streams),
+    plus 1 MiB per connection for engine streams. `MAX_PEER_STREAMS`
+    must hold all of a connection's places (52 by default), so the mux
+    never refuses an open before its room's cap is looked at.
   - A peer's open beyond a cap is reset; E2 names the reset code in
     `spec/wire.md`. The app session queues its own opens past the cap.
   - Credit beyond the initial grant returns only as the app reads (see
@@ -190,10 +196,12 @@ and a final write stalled on credit with FIN queued behind it.
     and asserts they stay within these bounds.
 - **App credit.** Each side grants app-channel credit from an 8 MiB budget,
   at most 256 KiB per stream, with 1 MiB reserved for interactive streams.
-  A stream that cannot get credit waits. A further 4 MiB on top of the
-  budget is kept for a bot's chat and calls (`mousse.botsub`,
-  `mousse.botrpc`), which thread streams can't use; `mousse.botview`
-  counts as bulk and can't use either reserve.
+  A stream that cannot get credit waits. A bot's chat and calls
+  (`mousse.botsub`, `mousse.botrpc`) draw on a 4 MiB pool of their own
+  instead, apart from the budget: threads can't use it and bots can't use
+  the budget. One bot stream holds at most a quarter of that pool, so a
+  stalled reader can't pin it. `mousse.botview` counts as bulk and uses
+  neither reserve nor the bot pool.
 - **Control.** 1 MiB of queue is reserved for control. `conn.*` events are
   coalesced per connection.
 - **Read-ahead.** The engine's `StreamReader::read` returns wire credit

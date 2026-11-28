@@ -79,8 +79,8 @@ mousse_net_core::define_limits! {
         app_credit_budget_bytes = "APP_CREDIT_BUDGET_BYTES": 8_388_608, [262_144, 1_073_741_824];
         /// App channel: part of that budget only interactive streams may use.
         app_credit_interactive_reserve_bytes = "APP_CREDIT_INTERACTIVE_RESERVE_BYTES": 1_048_576, [0, 1_073_741_824];
-        /// App channel: credit on top of that budget only a bot's chat and calls (`mousse.botsub`, `mousse.botrpc`) may use, so thread streams filling the budget never stall them; not the browser view (`mousse.botview`, always bulk). Default: one connection's BOT_STREAMS_PER_CONNECTION (16) at APP_STREAM_CREDIT_BYTES each; at most 16 MiB, so the whole pool stays within the budget plus 16 MiB.
-        app_credit_bot_reserve_bytes = "APP_CREDIT_BOT_RESERVE_BYTES": 4_194_304, [65_536, 16_777_216];
+        /// App channel: a pool of its own, apart from that budget, for a bot's chat and calls (`mousse.botsub`, `mousse.botrpc`), which draw on nothing else: thread streams can't take it and bot streams can't take the budget. Not for the browser view (`mousse.botview`, always bulk). One bot stream holds at most a quarter of it (and at most APP_STREAM_CREDIT_BYTES), so a stalled reader can't pin it. Default: one connection's BOT_STREAMS_PER_CONNECTION (16) at 256 KiB each. At least 1 MiB, four full 256 KiB windows; at most 16 MiB, so all app credit stays within the budget plus 16 MiB.
+        app_credit_bot_reserve_bytes = "APP_CREDIT_BOT_RESERVE_BYTES": 4_194_304, [1_048_576, 16_777_216];
         /// App channel: most credit one stream holds at a time, in each direction the helper grants it.
         app_stream_credit_bytes = "APP_STREAM_CREDIT_BYTES": 262_144, [65_536, 16_777_216];
         /// App channel: a stream is read from the engine only while the app's credit covers what is buffered plus this much (at least one engine chunk, 64 KiB).
@@ -648,10 +648,10 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(err.contains("APP_STREAM_CREDIT_BYTES"), "{err}");
-        // The bot credit reserve is bounded: the pool stays within the
-        // budget plus 16 MiB, and bot chat always has at least a message's
-        // worth.
-        for bad in ["16777217", "65535", "0"] {
+        // The bot credit pool is bounded: all app credit stays within the
+        // budget plus 16 MiB, and the pool holds at least four full 256 KiB
+        // windows, so one stalled bot stream leaves room for the others.
+        for bad in ["16777217", "1048575", "65536", "0"] {
             let err = Limits::from_vars(vars(&[("MOUSSE_NET_APP_CREDIT_BOT_RESERVE_BYTES", bad)]))
                 .unwrap_err();
             assert!(err.contains("APP_CREDIT_BOT_RESERVE_BYTES"), "{err}");

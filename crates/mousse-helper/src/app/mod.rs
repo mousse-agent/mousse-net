@@ -1401,11 +1401,15 @@ impl Core {
     /// Grant credit to streams that can take more: bot chat and calls,
     /// then interactive, then bulk, streams taking turns within a kind.
     fn regrant(&mut self, limits: &HelperLimits) {
-        let max = limits.app_stream_credit_bytes();
         for (slot, credit) in [Credit::Bot, Credit::Interactive, Credit::Bulk]
             .into_iter()
             .enumerate()
         {
+            // A bot stream holds at most a share of the bot pool, so one
+            // whose reader stalls can't pin all of it.
+            let max = self
+                .budget
+                .stream_max(credit, limits.app_stream_credit_bytes());
             let wanting: Vec<u32> = self
                 .streams
                 .iter()

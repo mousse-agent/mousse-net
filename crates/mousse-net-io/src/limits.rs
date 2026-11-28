@@ -166,6 +166,25 @@ impl Limits {
                 out.io.cert_lifetime_secs()
             )));
         }
+        // The mux refuses a peer's open past MAX_PEER_STREAMS before the
+        // places below are looked at, so it must hold all of them: a peer
+        // filling the app's places then still reaches the bot and engine
+        // places. Each room keeps its own cap, so memory stays bounded by
+        // their sum.
+        let places = out.io.streams_per_connection()
+            + out.io.bot_streams_per_connection()
+            + out.io.engine_streams_per_connection();
+        if out.core.max_peer_streams() < places {
+            return Err(LimitError::Conflict(format!(
+                "MAX_PEER_STREAMS ({}) is below the places a connection has: \
+                 STREAMS_PER_CONNECTION ({}) + BOT_STREAMS_PER_CONNECTION ({}) + \
+                 OWN_STREAMS_PER_CONNECTION ({})",
+                out.core.max_peer_streams(),
+                out.io.streams_per_connection(),
+                out.io.bot_streams_per_connection(),
+                out.io.engine_streams_per_connection()
+            )));
+        }
         Ok(out)
     }
 
@@ -267,6 +286,28 @@ mod tests {
             l.with_overrides(&[("NOPE", 1)]),
             Err(LimitError::Unknown(_))
         ));
+    }
+
+    #[test]
+    fn the_mux_holds_every_place_a_connection_has() {
+        // 32 app + 16 bot + 4 engine places.
+        assert!(matches!(
+            Limits::DEFAULT.with_overrides(&[("MAX_PEER_STREAMS", 51)]),
+            Err(LimitError::Conflict(_))
+        ));
+        assert!(Limits::DEFAULT
+            .with_overrides(&[("MAX_PEER_STREAMS", 52)])
+            .is_ok());
+        assert!(matches!(
+            Limits::DEFAULT.with_overrides(&[("STREAMS_PER_CONNECTION", 1_024)]),
+            Err(LimitError::Conflict(_))
+        ));
+        assert!(Limits::DEFAULT
+            .with_overrides(&[
+                ("STREAMS_PER_CONNECTION", 1_004),
+                ("BOT_STREAMS_PER_CONNECTION", 16),
+            ])
+            .is_ok());
     }
 
     #[test]
