@@ -43,7 +43,7 @@ pub mod store;
 pub mod tls;
 pub mod watch;
 
-pub use admission::{HelloSeen, StreamAdmission};
+pub use admission::{HelloSeen, Room, StreamAdmission, BOT_LABELS};
 pub use caller::{
     is_lan_route, route_rank, Caller, CandidateSource, CodeEntry, JoinOutcome, LaterCandidates,
     NoCode, PathEvent, Reached, RouteClass, Search, Step1Failures,
