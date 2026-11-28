@@ -282,6 +282,13 @@ nothing reached the app.
   directory) instead. Only file permissions protect it: root on that
   server, a backup or a copy of its disk has the key, and can act as that
   endpoint until its grants are removed on the devices that trust it.
+- **macOS builds with no stable signature** (ad hoc or unsigned, such as
+  nightlies) keep the identity key, the Plus key and the relay seed in the
+  same owner-only files, never in the Keychain: the Keychain trusts such a
+  build only until the next one, and would ask the user again for every
+  item after each update. A secret an earlier build kept in the Keychain is
+  read once and moved to its file. These keys have the headless server's
+  protection: file permissions only. A Developer ID build uses the Keychain.
 - Identity keys must sign without a user-presence prompt while the device is
   unlocked ([`wire.md`](wire.md) 4.1), so that renewal works; a hardware key
   therefore protects against copying, not against use by code running as
