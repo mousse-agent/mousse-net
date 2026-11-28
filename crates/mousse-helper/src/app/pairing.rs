@@ -213,7 +213,17 @@ fn grant_json(shared: &Shared, g: &Grant) -> Value {
         "expires_at": g.expires_at.map(|t| t.secs()),
         "receipt": g.enrolled_by.as_ref().map(invitation_hex),
         "connections": shared.host.connections_for(g.id),
+        "version_refusal": version_refusal(shared, &hex(g.identity.as_bytes())),
     })
+}
+
+/// The device's last refusal for version (`docs/pair-with-ip-design.md`
+/// §5), or null.
+fn version_refusal(shared: &Shared, identity: &str) -> Value {
+    shared
+        .refusals
+        .get(identity)
+        .map_or(Value::Null, |r| r.json())
 }
 
 fn peer_json(shared: &Shared, p: &PeerRecord) -> Value {
@@ -227,6 +237,7 @@ fn peer_json(shared: &Shared, p: &PeerRecord) -> Value {
         "offered": p.offered,
         "last_route": p.last_route,
         "paired_at": p.paired_at,
+        "version_refusal": version_refusal(shared, &p.identity),
     })
 }
 

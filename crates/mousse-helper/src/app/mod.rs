@@ -38,6 +38,7 @@ mod lan;
 mod out;
 mod pairing;
 mod paths;
+mod refusals;
 mod relay;
 mod relay_store;
 mod routes;
@@ -66,7 +67,7 @@ use mousse_net_core::{ErrorCode, BOTH_WAYS_MIN_MINOR};
 use mousse_net_io::pipe::RouteKind;
 use mousse_net_io::store::{hex, short_id};
 use mousse_net_io::{
-    Caller, CloseReason, Connection, Host, HostEvent, ListenerKind, MuxStream, NetError,
+    Caller, CloseReason, Connection, HelloSeen, Host, HostEvent, ListenerKind, MuxStream, NetError,
     RouteClass, StreamAdmission, StreamReader, StreamWriter,
 };
 use serde_json::{json, Map, Value};
@@ -96,6 +97,9 @@ pub const FEATURES: &[&str] = &[
     GRANT_ROLES,
     GRANT_ADD_CONNECTED,
     "managed-tunnel",
+    // `unsupported_version {peer_minor}`, `peer.incompatible` and
+    // `version_refusal` on peer and grant rows (`refusals.rs`).
+    "version-refusals",
 ];
 
 /// The feature an app lists in its hello `features` to take streams of
@@ -192,6 +196,8 @@ struct Shared {
     admission: Arc<StreamAdmission>,
     pairing: Mutex<pairing::State>,
     keep: paths::Keep,
+    /// The last refusal for version, per paired device.
+    refusals: refusals::Refusals,
     relay: relay::State,
     /// SSH routes: `ssh.*` and the connection window (Phase 1b §3).
     ssh: Arc<crate::ssh::Ssh>,
@@ -336,6 +342,21 @@ fn error(id: &Value, error: &str, reason: impl Into<String>) -> Value {
     json!({"re": id, "error": error, "reason": reason.into()})
 }
 
+/// Every connection's version decision, as its driver made it
+/// (`refusals.rs`): an agreement clears the device's refusal, a refusal is
+/// kept, whether or not the connection was then authorized or announced.
+async fn watch_hellos(shared: Arc<Shared>, mut hellos: mpsc::UnboundedReceiver<HelloSeen>) {
+    while let Some(seen) = hellos.recv().await {
+        let paired = || shared.paired(&seen.peer);
+        if shared
+            .refusals
+            .record(&seen, paired, crate::peer::now_secs())
+        {
+            shared.version_refused(&seen);
+        }
+    }
+}
+
 impl App {
     /// Start the channel on stdin and stdout.
     pub fn start(
@@ -378,12 +399,17 @@ impl App {
             removal,
             pairing: Mutex::new(pairing::State::new(info.name.clone())),
             keep,
+            refusals: refusals::Refusals::in_dir(&info.state_dir),
             relay: relay::State::new(&info),
             ssh: info.ssh.clone(),
             info,
             limits,
             engine,
         });
+        tokio::spawn(watch_hellos(
+            shared.clone(),
+            shared.admission.watch_hellos(),
+        ));
         tokio::spawn(read_stdin(shared.clone()));
         tokio::spawn(write_stdout(shared.clone()));
         tokio::spawn(pairing::watch_pause(shared.clone()));
@@ -555,6 +581,52 @@ impl Shared {
         self.queued(&core);
     }
 
+    /// A connection with `identity` agreed a version, seen at `seen`: its
+    /// refusal for version goes, unless one seen later was kept.
+    fn clear_refusal(&self, identity: &IdentityPublicKey, seen: tokio::time::Instant) {
+        if self.refusals.clear(identity, seen) {
+            applog::line(format!(
+                "{} agreed a version: its refusal is cleared",
+                short_id(identity)
+            ));
+        }
+    }
+
+    /// Whether `identity` holds a grant here or this computer pins it.
+    fn paired(&self, identity: &IdentityPublicKey) -> bool {
+        if self.host.live_grant(identity).is_some() {
+            return true;
+        }
+        let key = hex(identity.as_bytes());
+        mousse_net_io::store::PeerStore::in_dir(&self.info.state_dir)
+            .load()
+            .is_ok_and(|list| list.iter().any(|p| p.identity == key))
+    }
+
+    /// A paired device's refusal for version was kept: an incoming one
+    /// also raises `peer.incompatible`, at most once per
+    /// `PEER_INCOMPATIBLE_GAP_MS`.
+    fn version_refused(&self, seen: &HelloSeen) {
+        let identity = seen.peer;
+        applog::line(format!(
+            "{} speaks minor versions up to {}: no common version",
+            short_id(&identity),
+            seen.peer_minor
+        ));
+        let gap = crate::limits::ms(self.limits.peer_incompatible_gap_ms());
+        if seen.inbound
+            && self
+                .refusals
+                .take_turn(&identity, crate::peer::now_secs(), gap)
+        {
+            self.event(json!({
+                "ev": "peer.incompatible",
+                "identity": hex(identity.as_bytes()),
+                "peer_minor": seen.peer_minor,
+            }));
+        }
+    }
+
     /// Publish a connection: `conn.up`. While networking is paused it is
     /// closed instead.
     fn add_conn(
@@ -683,6 +755,12 @@ impl Shared {
                     gen,
                 },
             );
+            // A connection that agreed a version clears the device's
+            // refusal for version before the app hears of it.
+            let agreed_at = conn.minor().and(conn.hello_at());
+            if let Some(seen) = agreed_at {
+                self.clear_refusal(&identity, seen);
+            }
             fields["ev"] = json!("conn.up");
             fields["conn"] = json!(no);
             fields["identity"] = json!(hex(identity.as_bytes()));
@@ -692,6 +770,18 @@ impl Shared {
             core.out.conn_event(no, &fields);
             self.queued(&core);
             tokio::spawn(conn_task(self.clone(), no, conn.clone(), inbound));
+            if agreed_at.is_none() {
+                // The peer's `HELLO` is still on its way: its agreement
+                // clears the refusal when it comes.
+                let (shared, conn) = (self.clone(), conn.clone());
+                tokio::spawn(async move {
+                    if conn.hello_minor().await.is_some() {
+                        if let Some(seen) = conn.hello_at() {
+                            shared.clear_refusal(&identity, seen);
+                        }
+                    }
+                });
+            }
             if !inbound {
                 let shared = self.clone();
                 tokio::spawn(async move { relay::ensure_keys(&shared, &conn).await });

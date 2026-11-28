@@ -35,7 +35,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 use mousse_net_core::authz::{Traffic, Verdict};
@@ -52,7 +52,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 use tokio_rustls::TlsStream;
 
-use crate::admission::{ConnStreams, StreamAdmission, StreamPermit};
+use crate::admission::{ConnStreams, HelloSeen, StreamAdmission, StreamPermit};
 use crate::clock::Clock;
 use crate::error::NetError;
 use crate::limits::{ms, Limits};
@@ -100,6 +100,12 @@ fn local_version() -> VersionSupport {
         };
     }
     local
+}
+
+/// The newest minor version this side sends in `HELLO`: the build's own, or
+/// in a debug build the one [`TEST_HELLO_MINOR_VAR`] names.
+pub fn local_minor() -> u64 {
+    local_version().minor
 }
 
 impl DriverLimits {
@@ -626,6 +632,9 @@ pub struct Connection {
     incoming: tokio::sync::Mutex<mpsc::UnboundedReceiver<MuxStream>>,
     /// The minor version both sides agreed, once the peer's `HELLO` came.
     minor: watch::Receiver<Option<u64>>,
+    /// The newest minor version the peer's first `HELLO` named, whether or
+    /// not it was accepted, and when that `HELLO` was read.
+    peer_hello: Arc<OnceLock<(u64, Instant)>>,
     /// Set by [`Connection::close`] at once and by the driver when the
     /// connection starts to close for any reason.
     shutting: Arc<Liveness>,
@@ -667,6 +676,33 @@ impl Connection {
     /// caller's `HELLO` arrives ([`Connection::hello_minor`] waits).
     pub fn minor(&self) -> Option<u64> {
         *self.minor.borrow()
+    }
+
+    /// The newest minor version the peer's first `HELLO` named, once it
+    /// arrived, also when no version was agreed. Set before the connection
+    /// reads as closed, so a connection that closed with
+    /// `UNSUPPORTED_VERSION` after that `HELLO` always has it.
+    pub fn peer_minor(&self) -> Option<u64> {
+        self.peer_hello.get().map(|(minor, _)| *minor)
+    }
+
+    /// When the peer's first `HELLO` was read: on a connection that agreed
+    /// a version, when that became known.
+    pub fn hello_at(&self) -> Option<Instant> {
+        self.peer_hello.get().map(|(_, at)| *at)
+    }
+
+    /// The error for a connection that closed with `reason` before it
+    /// reached the state its caller waited for: [`NetError::Version`] when
+    /// either side closed it with `UNSUPPORTED_VERSION` after the peer's
+    /// `HELLO` was read, otherwise [`NetError::Closed`].
+    pub fn closed_error(&self, reason: CloseReason) -> NetError {
+        match (reason.code(), self.peer_minor()) {
+            (Some(ErrorCode::UnsupportedVersion), Some(peer_minor)) => {
+                NetError::Version { reason, peer_minor }
+            }
+            _ => NetError::Closed(reason),
+        }
     }
 
     /// Wait for the peer's first `HELLO` and return the agreed minor
@@ -879,6 +915,7 @@ pub(crate) fn spawn<P: Pipe>(
     let (closing_tx, _) = watch::channel(false);
     let (accept_tx, accept_rx) = mpsc::unbounded_channel();
     let (minor, minor_rx) = watch::channel(None);
+    let peer_hello = Arc::new(OnceLock::new());
     let shutting = Arc::new(Liveness::default());
     let connection = Connection {
         id: start.conn,
@@ -889,6 +926,7 @@ pub(crate) fn spawn<P: Pipe>(
         status: status_rx,
         incoming: tokio::sync::Mutex::new(accept_rx),
         minor: minor_rx,
+        peer_hello: peer_hello.clone(),
         shutting: shutting.clone(),
     };
     let driver = Driver {
@@ -910,6 +948,10 @@ pub(crate) fn spawn<P: Pipe>(
         pings: Vec::new(),
         hello: HelloState::new(local_version()),
         minor,
+        peer_hello,
+        own_hello_out: false,
+        peer: start.peer,
+        inbound: start.side == MuxRole::Host,
         reason: None,
         before_close: VecDeque::new(),
         fences: Vec::new(),
@@ -946,6 +988,16 @@ struct Driver {
     hello: HelloState,
     /// Where the agreed minor version is published for the handle.
     minor: watch::Sender<Option<u64>>,
+    /// Where the minor version the peer's first `HELLO` named, and when it
+    /// was read, are kept for the handle.
+    peer_hello: Arc<OnceLock<(u64, Instant)>>,
+    /// This side's own `HELLO`, the mux's first frame, has gone to the
+    /// writer. Closing drops what the mux still holds.
+    own_hello_out: bool,
+    /// The peer's identity, proven in step 1.
+    peer: IdentityPublicKey,
+    /// The peer dialled this endpoint.
+    inbound: bool,
     reason: Option<CloseReason>,
     /// Encoded frames a closing step produced, sent before the GOAWAY.
     before_close: VecDeque<Vec<u8>>,
@@ -1116,9 +1168,33 @@ impl Driver {
     /// The next frame to send: the messages a closing step produced, then
     /// the mux's frames.
     fn next_frame(&mut self) -> Option<Vec<u8>> {
-        self.before_close
-            .pop_front()
-            .or_else(|| self.mux.poll_transmit(self.clock.mono()))
+        if let Some(frame) = self.before_close.pop_front() {
+            return Some(frame);
+        }
+        let frame = self.mux.poll_transmit(self.clock.mono());
+        // The first `HELLO` is queued before anything else.
+        self.own_hello_out |= frame.is_some();
+        frame
+    }
+
+    /// Close with `UNSUPPORTED_VERSION`. The peer learns this side's newest
+    /// minor from its `HELLO`; if that still waits in the mux, which
+    /// closing empties, it goes out ahead of the `GOAWAY` instead.
+    fn refuse_version(&mut self) -> Verdict {
+        if !self.own_hello_out && !self.mux.is_closing() {
+            let local = local_version();
+            let hello = ControlMessage::Hello {
+                major_version: local.major,
+                minor_version: local.minor,
+            };
+            self.before_close.push_back(
+                Frame::Control {
+                    payload: hello.encode(),
+                }
+                .encode(),
+            );
+        }
+        Verdict::Close(ErrorCode::UnsupportedVersion)
     }
 
     fn next_wake(&self) -> Instant {
@@ -1491,7 +1567,22 @@ impl Driver {
                 else {
                     return Verdict::Close(ErrorCode::ProtocolError);
                 };
-                match self.hello.on_hello(*major_version, *minor_version) {
+                // Kept before the verdict, so whoever sees the close can
+                // tell how new the peer is. Only the first `HELLO` sets it.
+                let at = Instant::now();
+                let _ = self.peer_hello.set((*minor_version, at));
+                let outcome = self.hello.on_hello(*major_version, *minor_version);
+                if outcome != HelloOutcome::Ignored {
+                    // Reported whatever follows: authorization, publication.
+                    self.admit.admission().hello_seen(HelloSeen {
+                        peer: self.peer,
+                        peer_minor: *minor_version,
+                        agreed: self.hello.agreed(),
+                        at,
+                        inbound: self.inbound,
+                    });
+                }
+                match outcome {
                     HelloOutcome::Agreed(minor) => {
                         self.minor.send_if_modified(|m| {
                             let first = m.is_none();
@@ -1502,7 +1593,9 @@ impl Driver {
                         });
                     }
                     HelloOutcome::Ignored => return Verdict::Ignore,
-                    HelloOutcome::Close(code) => return Verdict::Close(code),
+                    // No common version, or one the peer refuses (wire.md
+                    // 2): refused here, before any step-2 answer counts.
+                    HelloOutcome::Close(_) => return self.refuse_version(),
                 }
             }
             Traffic::Keepalive | Traffic::GoAway => {}

@@ -289,6 +289,30 @@ pub fn negotiate_version(
     Ok(agreed)
 }
 
+/// Whether a peer whose `HELLO` named `peer_minor` accepts `agreed`. A peer
+/// speaks its newest minor and the one before it (wire.md 2), so it closes
+/// with `UNSUPPORTED_VERSION` below that. A side that sees this may close
+/// first: a caller then never goes live on a connection the host refuses
+/// as soon as it reads the caller's `HELLO`.
+pub fn peer_accepts(agreed: u64, peer_minor: u64) -> bool {
+    agreed >= peer_minor.saturating_sub(1)
+}
+
+/// The decision a connection makes on the peer's first `HELLO`:
+/// [`negotiate_version`], then `UNSUPPORTED_VERSION` too when the peer
+/// would refuse the result ([`peer_accepts`]). What [`HelloState`] applies.
+pub fn connection_version(
+    local: VersionSupport,
+    peer_major: u64,
+    peer_minor: u64,
+) -> Result<u64, ErrorCode> {
+    let agreed = negotiate_version(local, peer_major, peer_minor)?;
+    if !peer_accepts(agreed, peer_minor) {
+        return Err(ErrorCode::UnsupportedVersion);
+    }
+    Ok(agreed)
+}
+
 /// What one received `HELLO` did to a connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HelloOutcome {
@@ -302,7 +326,7 @@ pub enum HelloOutcome {
 
 /// The version state of one connection. Only the peer's first `HELLO`
 /// counts (spec `wire.md`, "Versions"): it fixes the minor version or closes
-/// the connection. Later ones are ignored.
+/// the connection ([`connection_version`]). Later ones are ignored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HelloState {
     local: VersionSupport,
@@ -328,7 +352,7 @@ impl HelloState {
         if self.decided.is_some() {
             return HelloOutcome::Ignored;
         }
-        let result = negotiate_version(self.local, peer_major, peer_minor);
+        let result = connection_version(self.local, peer_major, peer_minor);
         self.decided = Some(result);
         match result {
             Ok(minor) => HelloOutcome::Agreed(minor),
@@ -366,6 +390,15 @@ mod tests {
             negotiate_version(local, 0, 4),
             Err(ErrorCode::UnsupportedVersion)
         );
+    }
+
+    #[test]
+    fn a_peer_accepts_its_newest_minor_and_the_one_before() {
+        assert!(peer_accepts(3, 3));
+        assert!(peer_accepts(2, 3));
+        assert!(!peer_accepts(1, 3));
+        assert!(peer_accepts(0, 0));
+        assert!(peer_accepts(0, 1));
     }
 
     #[test]

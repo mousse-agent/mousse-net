@@ -1094,7 +1094,7 @@ where
                 self.promote_first(&conn);
                 Ok(conn)
             }
-            ConnStatus::Closed(reason) => Err(NetError::Closed(reason)),
+            ConnStatus::Closed(reason) => Err(conn.closed_error(reason)),
             other => Err(NetError::Refused(format!("unexpected state {other:?}"))),
         }
     }
@@ -1467,7 +1467,7 @@ where
                     let conn = self.start(id, stream, handshake, pin, None);
                     return match conn.settled(false).await {
                         status if status.is_live() => Ok((conn, Reached { route, class }, taken)),
-                        ConnStatus::Closed(reason) => Err(NetError::Closed(reason)),
+                        ConnStatus::Closed(reason) => Err(conn.closed_error(reason)),
                         other => Err(NetError::Refused(format!("unexpected state {other:?}"))),
                     };
                 }
@@ -1818,7 +1818,7 @@ where
                     self.promote_first(&connection);
                     return Ok((connection, JoinOutcome::AlreadyPaired));
                 }
-                ConnStatus::Closed(reason) => return Err(NetError::Closed(reason)),
+                ConnStatus::Closed(reason) => return Err(connection.closed_error(reason)),
                 other => {
                     return Err(NetError::Refused(format!("unexpected state {other:?}")));
                 }
