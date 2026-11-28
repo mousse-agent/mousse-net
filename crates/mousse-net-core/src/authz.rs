@@ -386,6 +386,8 @@ impl ConnectionGate {
     /// ([`crate::pairing::DirectHostAction::MissHold`]): until the I/O
     /// layer closes it, only keepalive, `HELLO` and `GOAWAY` pass; nothing
     /// else, a stream frame included, is let through or commits anything.
+    /// The join-proof timer stops: the hold's own close
+    /// (`INVITATION_INVALID`, after the full hold) is the only one.
     pub fn hold(&mut self) {
         self.held = true;
     }
@@ -401,7 +403,7 @@ impl ConnectionGate {
     /// When [`ConnectionGate::on_timeout`] must next run.
     pub fn poll_timeout(&self) -> Option<Millis> {
         match self.state {
-            GateState::AwaitingJoinProof { deadline } => Some(deadline),
+            GateState::AwaitingJoinProof { deadline } if !self.held => Some(deadline),
             _ => None,
         }
     }
@@ -409,7 +411,7 @@ impl ConnectionGate {
     /// Close a connection whose join proof is overdue.
     pub fn on_timeout(&mut self, mono: Millis) -> Option<ErrorCode> {
         match self.state {
-            GateState::AwaitingJoinProof { deadline } if mono >= deadline => {
+            GateState::AwaitingJoinProof { deadline } if mono >= deadline && !self.held => {
                 self.state = GateState::Closed(ErrorCode::NotAuthorized);
                 Some(ErrorCode::NotAuthorized)
             }
@@ -983,6 +985,18 @@ mod tests {
         assert_eq!(
             gate.on_timeout(Millis(100 + Limits::DEFAULT.join_proof_wait_ms())),
             Some(ErrorCode::NotAuthorized)
+        );
+    }
+
+    #[test]
+    fn a_held_connection_has_no_join_proof_timer() {
+        let mut grants = GrantTable::new();
+        let mut gate = ConnectionGate::open(ConnectionId(1), id(2), &mut grants, NOW, Millis(100));
+        gate.hold();
+        assert_eq!(gate.poll_timeout(), None);
+        assert_eq!(
+            gate.on_timeout(Millis(100 + Limits::DEFAULT.join_proof_wait_ms())),
+            None
         );
     }
 

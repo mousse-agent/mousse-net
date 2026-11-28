@@ -1485,8 +1485,10 @@ connection's source address; with none free the host closes with
   join-only for it and the host answers `AUTHORIZED {1: join_only, 2: I}`;
 - anything else: the host holds the connection, and with it its
   pre-authorization place, for `DIRECT_MISS_HOLD_MS` (1000 ms), then closes
-  it with `INVITATION_INVALID`. A device that holds a grant here gets the
-  same answer. Every "no open invitation" (another endpoint's code, a typo
+  it with `INVITATION_INVALID`. The 10 s wait for a `JOIN_PROOF` (section 8,
+  step 2) stops for a held connection: the hold's close, after the full
+  hold, is the only one. A device that holds a grant here gets the same
+  answer. Every "no open invitation" (another endpoint's code, a typo
   in `L`, expired, used up, cancelled, a restart) looks the same.
 
 #### Attempt
@@ -1545,8 +1547,11 @@ the role the owner picks with the answer goes to that enrollment only.
   `INVITATION_INVALID`.
 - **The joiner cancels.** Connected: `CODE_ABORT {A, CANCELLED}`, then a
   close with `CANCELLED`; the host ends the request and closes the
-  connection with `CANCELLED`. Only the attempt that passed on that
-  connection counts: a `CODE_ABORT` naming another attempt ends nothing. Away: the cancel comes with its recovery.
+  connection with `CANCELLED`. Only the attempt that passed
+  counts, the one the request remembers (a recovery that moves the request
+  to another connection keeps it): a `CODE_ABORT` naming another attempt,
+  one merely running on the request's connection included, ends no
+  request (that running attempt still counts as failed). Away: the cancel comes with its recovery.
   Only a close without `CANCELLED` keeps a request.
 - **Cancel crossing Allow.** The cancel wins while the grant is
   provisional. A `CODE_ABORT {A, CANCELLED}` for the attempt that passed
@@ -1595,7 +1600,7 @@ connections bound to that grant.
   expiry, and when another direct invitation makes a new provisional grant
   for the identity. Its connections close with `GRANT_REVOKED` (the
   cancelling connection with `CANCELLED`), before the host reports the
-  removal.
+  removal; the removal is reported also when no connection was bound.
 - On the enrolled connection, a `CODE_ABORT` for the attempt that passed
   with any code other than `CANCELLED` passes the gate and is ignored.
 
@@ -1625,12 +1630,15 @@ host answers, in this order:
    attempt and pairing connection of this identity on the invitation (they
    close with `CANCELLED`), whatever the answer below;
 3. a kept outcome for this identity: close with `PAIRING_DECLINED` or
-   `CANCELLED`;
+   `CANCELLED`; with the cancel flag, an invitation its retirements leave
+   with nothing to take then ends, as in 4;
 4. with the cancel flag (its attempts and connections retired, so a
    confirmation still on its way opens no request after the cancel): the
    request, if any, ends; then the host closes with
    `CANCELLED` (an invitation that no longer takes anything gets the miss
-   hold instead). An allowed request that is cancelled ends the invitation;
+   hold instead: one neither allowed nor open with its own deadline ahead or
+   a request inside its Allow window, whether or not the host's timer has
+   run). An allowed request that is cancelled ends the invitation;
    so does any cancel that leaves it with no attempts, no running attempt
    and no request inside its Allow window (`ATTEMPTS_EXHAUSTED`);
 5. this identity's request is allowed: `AUTHORIZED {join_only, I}`,
