@@ -239,7 +239,22 @@ fn inbound_passes_only_app_labels_and_outbound_refuses_host_opened_streams() {
     let incoming = p.a.event("stream.incoming", |m| m["handle"] == tunnel);
     assert_eq!(incoming["label"], "mousse.tunnel");
 
-    assert_eq!(p.a.events("stream.incoming").len(), 2);
+    // The bot labels, the live browser view among them, reach the app
+    // with their label; a near miss is still refused.
+    for (n, label) in ["mousse.botview", "mousse.botsub", "mousse.botrpc"]
+        .into_iter()
+        .enumerate()
+    {
+        p.b.open(p.b_conn, label, "bulk");
+        let h = p.a.incoming(p.a_conn, 2 + n);
+        let incoming = p.a.event("stream.incoming", |m| m["handle"] == h);
+        assert_eq!(incoming["label"], label);
+    }
+    let near = p.b.open(p.b_conn, "mousse.botviewer", "bulk");
+    let reset = p.b.event("stream.reset", |m| m["handle"] == near);
+    assert_eq!(reset["code"], "refused_stream");
+
+    assert_eq!(p.a.events("stream.incoming").len(), 5);
     assert!(p.b.events("stream.incoming").is_empty());
     p.a.assert_clean();
     p.b.assert_clean();

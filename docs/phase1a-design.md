@@ -180,8 +180,15 @@ and a final write stalled on credit with FIN queued behind it.
   - With up to 1,024 peer streams (`MAX_PEER_STREAMS`), that is 256 MiB per
     connection, which app credit cannot bound.
   - E2 therefore caps open streams at 32 per connection (both directions
-    counted) and 128 per helper. That keeps initial credit at or below
-    8 MiB per connection and 32 MiB per helper.
+    counted) and 128 per helper. Bot streams (`mousse.botsub`,
+    `mousse.botrpc`, `mousse.botview`) have places of their own, 16 per
+    connection and 64 per helper, and engine streams 4 per connection.
+    That keeps initial credit at or below 13 MiB per connection (52
+    streams) and 48 MiB per helper for app and bot streams (192 streams),
+    plus 1 MiB per connection for engine streams. Each connection raises
+    its mux's `MAX_PEER_STREAMS`, where lower, to all of the places its
+    admission gives (52 by default), so the mux never refuses an open
+    before its room's cap is looked at.
   - A peer's open beyond a cap is reset; E2 names the reset code in
     `spec/wire.md`. The app session queues its own opens past the cap.
   - Credit beyond the initial grant returns only as the app reads (see
@@ -190,7 +197,12 @@ and a final write stalled on credit with FIN queued behind it.
     and asserts they stay within these bounds.
 - **App credit.** Each side grants app-channel credit from an 8 MiB budget,
   at most 256 KiB per stream, with 1 MiB reserved for interactive streams.
-  A stream that cannot get credit waits.
+  A stream that cannot get credit waits. A bot's chat and calls
+  (`mousse.botsub`, `mousse.botrpc`) draw on a 4 MiB pool of their own
+  instead, apart from the budget: threads can't use it and bots can't use
+  the budget. One bot stream holds at most a quarter of that pool, so a
+  stalled reader can't pin it. `mousse.botview` counts as bulk and uses
+  neither reserve nor the bot pool.
 - **Control.** 1 MiB of queue is reserved for control. `conn.*` events are
   coalesced per connection.
 - **Read-ahead.** The engine's `StreamReader::read` returns wire credit
@@ -279,6 +291,15 @@ import `NetSyncSession` or `link/mux`.
 | `mousse.sub` | interactive | caller, one per subscription | `subscribe {stream, cursor}`, then `head`, `records`, `delta`, `snapshot*`, `end` |
 | `mousse.blob` | bulk | caller, one per fetch | `get {stream, blob}`, then raw bytes, then `FIN` |
 | `mousse.put` | bulk | caller, for staging | `append {stream, event, envelope}` or `blob.put {stream, blob}` followed by the bytes; only into the caller's own `node.artifact` input streams (§4.4) |
+| `mousse.botsub` | interactive | caller, one per bot subscription | as `mousse.sub`, for a bot's feed and chat |
+| `mousse.botrpc` | interactive | caller, one per bot call | as `mousse.rpc`, for bot methods |
+| `mousse.botview` | bulk | caller, one per watched bot browser | a bot's live browser pictures, newest only: the sender skips stale pictures when credit runs short; nothing is stored or retried |
+
+The three bot labels take places of their own in the receiver's stream
+admission (`BOT_STREAMS_PER_CONNECTION`, `BOT_STREAMS_PER_ENDPOINT`), apart
+from the caps of §2.2, so thread traffic never refuses a bot's chat, call or
+browser view. The helper passes them like the others; which methods and
+kinds each may carry is the app's to check.
 
 Each message is `u32 BE length | JSON header | binary parts`.
 
