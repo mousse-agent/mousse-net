@@ -1705,7 +1705,9 @@ key) gives the hold back: a first contact ends (closed, with no code), a
 recovery stays away with its record for a later try. A flow keeps the hold while its pin is being
 stored (step 7): nothing on the connection, a second `PAIRED` or a
 protocol error included, ends the flow or gives the hold back before the
-pin is stored. A start with no attempts left for the
+pin is stored. A pin that cannot be stored is a failed write: the pending
+record stays, the joiner closes with `INTERNAL_ERROR`, gives the hold back,
+and the flow ends. A start with no attempts left for the
 typed lookup ends with `ATTEMPTS_EXHAUSTED` before dialing.
 
 **Ledger.** The joiner counts its attempts per **typed lookup**, not per key
@@ -1802,7 +1804,10 @@ record resumes it as a recovery instead of starting a new attempt. Any
 other Connect starts a new flow; pending records at other addresses stay as
 they are, each recovered on its own. A recovery sends `JOIN_DIRECT` and
 waits for the answer for 10 s, as a first contact does (8.2); an
-`AUTHORIZED {live}` alone does not end that wait. The answers:
+`AUTHORIZED {live}` alone does not end that wait. A host that now agrees a
+minor below 4 does not end a recovery: the joiner closes with
+`UNSUPPORTED_VERSION` and stays away with its record, for a later try. The
+answers:
 
 - `AUTHORIZED {live}` (step 2's, or the host's own when it binds the
   connection to a grant that appeared after step 2), then `PAIRED`:

@@ -551,3 +551,74 @@ fn a_failed_dial_gives_the_hold_back() {
     assert_eq!(recovery.state(), DirectJoinerState::Away);
     assert_eq!(recovery.pending(), Some(&pending));
 }
+
+fn paired_recovery() -> (DirectJoinerPairing<CpaceExchangeFactory>, DirectPending) {
+    let pending = DirectPending {
+        lookup: lookup(),
+        host: key(1),
+        invitation: InvitationId([7; 16]),
+        address: DirectAddress::parse("10.0.0.2:47100").unwrap(),
+        verified_at: T,
+        cancelled: false,
+        attempt: AttemptId([5; 16]),
+    };
+    let flow = start("10.0.0.2:47100", CODE, None, Some(&pending), T).unwrap();
+    (flow, pending)
+}
+
+/// A pin that cannot be stored: the receipt stays, the connection closes
+/// with `INTERNAL_ERROR`, the hold goes back and the flow ends.
+#[test]
+fn a_failed_pin_write_keeps_the_receipt_and_gives_the_hold_back() {
+    let (mut flow, pending) = paired_recovery();
+    flow.on_connected(key(1), [9; 32]);
+    flow.on_hello(4);
+    flow.on_authorized(AuthorizedState::Live);
+    let paired = flow.on_paired("Desk".into(), Role::owner());
+    assert!(matches!(paired.as_slice(), [DirectJoinerAction::Paired(_)]));
+    // An ordinary write acknowledgement does not stand for the pin.
+    assert!(flow.on_persisted().is_empty());
+    assert_eq!(
+        flow.on_persist_failed(),
+        vec![
+            DirectJoinerAction::Close(ErrorCode::InternalError),
+            DirectJoinerAction::Ended(DirectEnd::Closed(Some(ErrorCode::InternalError))),
+            DirectJoinerAction::ReleaseHold(lookup()),
+        ]
+    );
+    assert_eq!(flow.pending(), Some(&pending));
+    assert!(flow.on_pin_stored().is_empty());
+}
+
+/// A recovery whose host now agrees minor 3 keeps its receipt and goes back
+/// away for a later try; a first contact ends as needs update.
+#[test]
+fn a_minor_3_host_sends_a_recovery_away() {
+    let (mut flow, pending) = paired_recovery();
+    flow.on_connected(key(1), [9; 32]);
+    assert_eq!(
+        flow.on_hello(3),
+        vec![
+            DirectJoinerAction::Close(ErrorCode::UnsupportedVersion),
+            DirectJoinerAction::Away,
+            DirectJoinerAction::ReleaseHold(lookup()),
+        ]
+    );
+    assert_eq!(flow.state(), DirectJoinerState::Away);
+    assert_eq!(flow.pending(), Some(&pending));
+    assert_eq!(
+        flow.start(),
+        vec![DirectJoinerAction::AcquireHold(lookup())]
+    );
+
+    let mut first = start("10.0.0.2:47100", CODE, None, None, T).unwrap();
+    first.on_connected(key(1), [9; 32]);
+    assert_eq!(
+        first.on_hello(3),
+        vec![
+            DirectJoinerAction::Close(ErrorCode::UnsupportedVersion),
+            DirectJoinerAction::Ended(DirectEnd::NeedsUpdate),
+            DirectJoinerAction::ReleaseHold(lookup()),
+        ]
+    );
+}

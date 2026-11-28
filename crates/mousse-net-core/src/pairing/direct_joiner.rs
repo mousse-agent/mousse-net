@@ -398,7 +398,10 @@ pub enum DirectJoinerAction {
     /// The host allowed this device. Store the pin, the typed address as an
     /// owner route and the completion record keyed by the invitation, set
     /// the connection's pairing-only gate live, then call
-    /// [`DirectJoinerPairing::on_pin_stored`].
+    /// [`DirectJoinerPairing::on_pin_stored`]. If storing fails, call
+    /// [`DirectJoinerPairing::on_persist_failed`] instead: the pending record
+    /// stays, the connection closes with `INTERNAL_ERROR`, the hold goes
+    /// back and the flow ends.
     Paired(DirectPaired),
     /// The pending record stays: connect again later, pinned to
     /// [`DirectJoinerPairing::pinned_host`] at the typed address, to learn
@@ -413,6 +416,8 @@ pub enum DirectJoinerAction {
 enum Write {
     Ledger(DirectLedger),
     Pending(Option<DirectPending>),
+    /// The pin, route and completion record of [`DirectJoinerAction::Paired`].
+    Pin,
 }
 
 struct Attempt<E> {
@@ -700,6 +705,11 @@ impl<F: CodeExchangeFactory> DirectJoinerPairing<F> {
         match self.in_flight.take() {
             Some(Write::Ledger(l)) => self.ledger_saved = Some(l),
             Some(Write::Pending(p)) => self.pending_saved = p,
+            // The pin is acknowledged by [`Self::on_pin_stored`].
+            Some(Write::Pin) => {
+                self.in_flight = Some(Write::Pin);
+                return Vec::new();
+            }
             None => return Vec::new(),
         }
         let released = std::mem::take(&mut self.held);
@@ -713,9 +723,11 @@ impl<F: CodeExchangeFactory> DirectJoinerPairing<F> {
     }
 
     /// The last persist action did not happen (the write failed, or another
-    /// flow changed the stored record first). Nothing that waited for it is
-    /// sent; the connection closes with `INTERNAL_ERROR` and the flow ends.
-    /// What is stored stays as it was.
+    /// flow changed the stored record first), or the pin of
+    /// [`DirectJoinerAction::Paired`] could not be stored. Nothing that
+    /// waited for it is sent; the connection closes with `INTERNAL_ERROR`,
+    /// the hold goes back and the flow ends. What is stored stays as it was,
+    /// a pending record (the receipt) included.
     pub fn on_persist_failed(&mut self) -> Vec<DirectJoinerAction> {
         if self.in_flight.take().is_none() {
             return Vec::new();
@@ -787,7 +799,11 @@ impl<F: CodeExchangeFactory> DirectJoinerPairing<F> {
             return Vec::new();
         }
         if agreed < DIRECT_MINOR_VERSION {
-            // A pending record stays: only the host's answer settles it.
+            // A pending record stays: only the host's answer settles it. A
+            // recovery goes back away for a later try; a first contact ends.
+            if self.recovering {
+                return self.broken(Some(ErrorCode::UnsupportedVersion), true);
+            }
             return self.end_connected(ErrorCode::UnsupportedVersion, DirectEnd::NeedsUpdate);
         }
         let recovery = if self.recovering {
@@ -1044,6 +1060,8 @@ impl<F: CodeExchangeFactory> DirectJoinerPairing<F> {
         }
         self.state = DirectJoinerState::Paired;
         self.attempt = None;
+        // The hold stays until the pin is stored or its write fails.
+        self.in_flight = Some(Write::Pin);
         vec![DirectJoinerAction::Paired(DirectPaired {
             identity: pending.host,
             name: host_name,
@@ -1056,9 +1074,10 @@ impl<F: CodeExchangeFactory> DirectJoinerPairing<F> {
     /// The pin, route and completion record from
     /// [`DirectJoinerAction::Paired`] are durable: the pending record goes.
     pub fn on_pin_stored(&mut self) -> Vec<DirectJoinerAction> {
-        if self.state != DirectJoinerState::Paired {
+        if self.state != DirectJoinerState::Paired || !matches!(self.in_flight, Some(Write::Pin)) {
             return Vec::new();
         }
+        self.in_flight = None;
         self.pending = None;
         self.state = DirectJoinerState::Ended(DirectEnd::Paired);
         self.commit_pending(vec![DirectJoinerAction::Ended(DirectEnd::Paired)])
@@ -1282,6 +1301,11 @@ impl<F: CodeExchangeFactory> DirectJoinerPairing<F> {
                 expected: self.pending_saved.clone(),
                 record: record.clone(),
             },
+            // The pin is asked for by [`DirectJoinerAction::Paired`] itself.
+            Write::Pin => {
+                self.in_flight = Some(Write::Pin);
+                return then;
+            }
         };
         self.in_flight = Some(write);
         self.held = then;
