@@ -17,6 +17,15 @@ pub enum NetError {
     Tls(String),
     /// The connection was closed before it reached the expected state.
     Closed(CloseReason),
+    /// The connection was closed with `UNSUPPORTED_VERSION` (by either
+    /// side) after the peer's `HELLO` was read: the two sides share no
+    /// version. `peer_minor` is the newest minor version that `HELLO` named.
+    Version {
+        /// How it closed.
+        reason: CloseReason,
+        /// The newest minor version the peer speaks.
+        peer_minor: u64,
+    },
     /// A step took too long.
     Timeout(&'static str),
     /// The pairing ticket cannot be used (bad form).
@@ -76,6 +85,10 @@ impl fmt::Display for NetError {
             NetError::PeerCertificate(e) => write!(f, "peer certificate refused: {e}"),
             NetError::Tls(e) => write!(f, "TLS handshake failed: {e}"),
             NetError::Closed(reason) => write!(f, "connection closed: {reason}"),
+            NetError::Version { reason, peer_minor } => write!(
+                f,
+                "connection closed: {reason}; the peer speaks minor versions up to {peer_minor}"
+            ),
             NetError::Timeout(what) => write!(f, "timed out: {what}"),
             NetError::Ticket(e) => write!(f, "pairing ticket: {e}"),
             NetError::Join(e) => match e.code() {

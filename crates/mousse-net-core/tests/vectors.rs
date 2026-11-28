@@ -538,6 +538,13 @@ fn hello_negotiation() {
             Err(code) => J::from(format!("close:{}", code.name())),
         };
         assert_eq!(got, case["result"], "{}", s(&case["name"]));
+        // What a connection does: the state its driver keeps.
+        let got = match HelloState::new(local).on_hello(u(&peer["major"]), u(&peer["minor"])) {
+            HelloOutcome::Agreed(minor) => J::from(minor),
+            HelloOutcome::Close(code) => J::from(format!("close:{}", code.name())),
+            HelloOutcome::Ignored => J::from("ignored"),
+        };
+        assert_eq!(got, case["connection"], "{}", s(&case["name"]));
     }
     for seq in list(&doc["repeated"]) {
         let name = s(&seq["name"]);

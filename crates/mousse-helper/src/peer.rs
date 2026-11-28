@@ -318,6 +318,7 @@ pub fn reason_of(e: &NetError) -> String {
             Some(code) => code.name().to_lowercase(),
             None => "connection_dropped".into(),
         },
+        NetError::Version { .. } => "unsupported_version".into(),
         // A ticket past its expiry, refused before dialling.
         NetError::Join(mousse_net_core::pairing::JoinerError::Expired) => "expired".into(),
         NetError::Join(e) => match e.code() {
@@ -895,7 +896,7 @@ pub(crate) fn drop_completions(
 /// A readable reason for a failed or closed connection.
 pub fn describe(e: &NetError) -> String {
     match e {
-        NetError::Closed(reason) => describe_close(reason),
+        NetError::Closed(reason) | NetError::Version { reason, .. } => describe_close(reason),
         NetError::PeerCertificate(c) => format!("the host's identity was refused: {c}"),
         NetError::Join(e) => match e.code() {
             Some(code) => format!("pairing: {e} ({})", code.name().to_uppercase()),

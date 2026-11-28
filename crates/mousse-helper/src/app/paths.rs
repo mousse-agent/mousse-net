@@ -36,7 +36,10 @@
 //!   `KEEP_RETRY_MAX_MS`; each failure is a `dial.failed` event. A host
 //!   that refuses this device (`not_authorized`, `grant_revoked`) is not
 //!   tried again until something changes: `dial`, `peer.add`,
-//!   `peer.addresses.set`, networking resuming, or a restart.
+//!   `peer.addresses.set`, networking resuming, or a restart. A host that
+//!   shares no version with this computer (`unsupported_version`) is never
+//!   parked: it is tried again at `KEEP_RETRY_MAX_MS`, so it is found once
+//!   it updates, and `dial` tries it at once ("Check again").
 //! - **Browse file.** Debug builds read hosts from the file named by
 //!   `MOUSSE_HELPER_BROWSE_FILE` instead of mDNS: one `ip:port` per line.
 
@@ -463,13 +466,13 @@ async fn reach(shared: &Shared, record: &PeerRecord) -> Result<(Connection, Via)
     if relay_first {
         match super::relay::reach(shared, &pin).await {
             Ok((conn, route)) => return Ok((conn, Via::Relay(route))),
-            Err(e @ NetError::Closed(_)) => return Err(e),
+            Err(e @ (NetError::Closed(_) | NetError::Version { .. })) => return Err(e),
             Err(_) => {}
         }
     }
     let first = match reach_local(shared, record).await {
         Ok((conn, used)) => return Ok((conn, Via::Local(used))),
-        Err(e @ NetError::Closed(_)) => return Err(e),
+        Err(e @ (NetError::Closed(_) | NetError::Version { .. })) => return Err(e),
         Err(e) => e,
     };
     let mut read_slot = false;
@@ -479,7 +482,7 @@ async fn reach(shared: &Shared, record: &PeerRecord) -> Result<(Connection, Via)
         if !std::mem::take(&mut skip_relay) && !super::relay::candidates(shared, &pin).is_empty() {
             match super::relay::reach(shared, &pin).await {
                 Ok((conn, route)) => return Ok((conn, Via::Relay(route))),
-                Err(e @ NetError::Closed(_)) => return Err(e),
+                Err(e @ (NetError::Closed(_) | NetError::Version { .. })) => return Err(e),
                 Err(_) => {}
             }
         }
@@ -559,6 +562,8 @@ pub enum DialError {
 pub struct Failure {
     pub why: String,
     pub reason: String,
+    /// Refused for version: the newest minor version the host speaks.
+    pub peer_minor: Option<u64>,
 }
 
 impl Failure {
@@ -566,8 +571,33 @@ impl Failure {
         Failure {
             why: crate::peer::reason_of(e),
             reason: crate::peer::describe(e),
+            peer_minor: peer_minor_of(e),
         }
     }
+}
+
+/// The newest minor version of a host that refused for version.
+fn peer_minor_of(e: &NetError) -> Option<u64> {
+    match e {
+        NetError::Version { peer_minor, .. } => Some(*peer_minor),
+        _ => None,
+    }
+}
+
+/// A failed dial's reply: `unsupported_version {peer_minor}` when the host
+/// shares no version with this computer, else `unreachable`.
+fn dial_failed(id: &Value, f: Failure) -> Value {
+    let mut reply = json!({
+        "re": id,
+        "error": "unreachable",
+        "reason": f.reason,
+        "why": f.why,
+    });
+    if let Some(peer_minor) = f.peer_minor {
+        reply["error"] = json!("unsupported_version");
+        reply["peer_minor"] = json!(peer_minor);
+    }
+    reply
 }
 
 /// What a dial gave.
@@ -842,7 +872,7 @@ async fn upgrade(shared: Arc<Shared>, pin: IdentityPublicKey, relay: u64, gen: u
                 conn.close(mousse_net_core::ErrorCode::NoError);
             }
             // The host itself refused this device: nothing to move to.
-            Err(NetError::Closed(_)) => return,
+            Err(NetError::Closed(_) | NetError::Version { .. }) => return,
             Err(_) => {}
         }
         tokio::time::sleep(wait).await;
@@ -930,18 +960,8 @@ pub async fn dial_op(shared: Arc<Shared>, id: Value, identity: String) {
                 Ok(d) => json!({"re": id, "conn": d.conn, "already": d.already}),
                 Err(DialError::NoPeer(why)) => error(&id, "no_peer", why),
                 Err(DialError::Paused) => super::pairing::paused(&shared, &id),
-                Err(DialError::Failed(e)) => json!({
-                    "re": id,
-                    "error": "unreachable",
-                    "reason": crate::peer::describe(&e),
-                    "why": crate::peer::reason_of(&e),
-                }),
-                Err(DialError::Same(f)) => json!({
-                    "re": id,
-                    "error": "unreachable",
-                    "reason": f.reason,
-                    "why": f.why,
-                }),
+                Err(DialError::Failed(e)) => dial_failed(&id, Failure::of(&e)),
+                Err(DialError::Same(f)) => dial_failed(&id, f),
             }
         }
     };
@@ -1144,17 +1164,27 @@ pub async fn keep_connected(shared: Arc<Shared>, mut kicks: mpsc::UnboundedRecei
                     Err(e) => {
                         let parked = refused(&e);
                         r.parked = parked;
+                        // Refused for version: never parked, so the host is
+                        // found once it updates, but tried at the longest
+                        // wait only (a `dial` tries at once).
+                        if matches!(e, NetError::Version { .. }) {
+                            r.wait = longest;
+                        }
                         r.due = Instant::now() + r.wait;
                         let retry_ms = (!parked).then_some(r.wait.as_millis() as u64);
                         r.wait = (r.wait * 2).min(longest);
                         applog::line(format!("dial {} failed: {e}", short_id(&pin)));
-                        shared.event(json!({
+                        let mut event = json!({
                             "ev": "dial.failed",
                             "identity": hex(pin.as_bytes()),
                             "why": crate::peer::reason_of(&e),
                             "reason": crate::peer::describe(&e),
                             "retry_ms": retry_ms,
-                        }));
+                        });
+                        if let Some(peer_minor) = peer_minor_of(&e) {
+                            event["peer_minor"] = json!(peer_minor);
+                        }
+                        shared.event(event);
                     }
                 }
             }
